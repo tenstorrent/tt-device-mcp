@@ -55,7 +55,7 @@ each rung fires only when the gentler one failed or cannot apply.
 - **I5 — One reset at a time.** Before starting a reset, a live `ttdev-reset-*` scope or held local
   reset lock — including one owned by a predecessor broker process — is adopted and its result
   verified (`await_foreign_scope`); a second reset is never raced into a mesh one is already
-  cycling. The surgical bridge reset and the tray walk likewise decline while a reset is live.
+  cycling. The surgical bridge reset likewise declines while a reset is live.
 - **I6 — The reset gate.** An operator reset (`tt_device_reset`, `tt-device-mcp reset`) is refused
   while any foreign tenant — a holder with `uid >= MIN_TENANT_UID` (1000) other than the caller —
   holds `/dev/tenstorrent`, and an incomplete holder scan fails closed (an unreadable holder may be
@@ -98,8 +98,7 @@ each rung fires only when the gentler one failed or cannot apply.
   tenant.
 - **I7 — No automatic action over a tenant.** The idle/forced escalation ladders and every
   host-level rung re-scan holders before acting and stand down on a live tenant; on the unforced
-  paths an incomplete scan counts as a tenant. A rung the forced pass calls (the per-tray walk
-  included) reads the same forced guard as the pass: an incomplete scan does not stop it, a
+  paths an incomplete scan counts as a tenant. A rung the forced pass calls reads the same forced guard as the pass: an incomplete scan does not stop it, a
   readable tenant or a RUNNING broker job does. `auto_recovery_allowed` makes the tenant check
   absolute for reboot/power-cycle — a tenant outranks every other signal.
 
@@ -220,8 +219,7 @@ each rung fires only when the gentler one failed or cannot apply.
   the next rung is late by at most the settle plus one reset (`DEVICE_RESET_TIMEOUT_SEC`) if the retried reset exits non-zero, and by that plus the full check (bounded by the existing verify and fabric-retry limits) if it exits 0 but the check fails. No other
   class changes: a chip off the bus, a per-target `-r`, a running job or a tenant gets no retry); the
   idle ladders latch once per hold episode (the latch
-  expires after `HOLD_ESCALATION_REARM_SEC` so a hold never becomes permanent); the tray walk runs
-  at most once per episode. Host rungs are reachable only after a `tt-smi` reset has already run
+  expires after `HOLD_ESCALATION_REARM_SEC` so a hold never becomes permanent). Host rungs are reachable only after a `tt-smi` reset has already run
   and failed — at the gate additionally only with a prior failed cycle on record (`was_failing`,
   the two-strikes rule).
 - **I12 — Quiesce around every reset.** `reset_with_quiesce` stops the MMIO pollers and sets
@@ -320,7 +318,7 @@ each rung fires only when the gentler one failed or cannot apply.
   order, which need not follow PCI order: on a Blackhole Galaxy chips 16-23 sit on buses `0xc1`-`0xc8`
   (tray 3) and chips 24-31 on `0x81`-`0x88` (tray 4), while tt-smi's snapshot lists chips in PCI
   order (`0x8X` before `0xCX`). So `index // 8` is not the map, and neither is "the Nth bus id in
-  the snapshot is chip N": both transpose trays 3 and 4 and build a bitmap that re-powers a tray
+  the snapshot is chip N": both transpose trays 3 and 4 and name a tray
   the drop never touched (issue #27). The tray map is keyed by chip index and built from the
   kernel's own `{chip index: PCI address}`, read from sysfs (`tenstorrent!N/device`); a positional
   list is refused. The bitmap bit is `tray - 1`; the tables are 1-based and the BMC's bits are
@@ -329,12 +327,12 @@ each rung fires only when the gentler one failed or cannot apply.
 
   **The map is cached, and no map means no fire.** A chip that has left the bus is absent from the
   tt-smi snapshot and has no sysfs node, so its bus cannot be read at the moment the rung wants
-  it — which is every moment this rung fires. The chip→bus map is therefore banked from a trusted
+  it — which is every moment a tray must be named. The chip→bus map is therefore banked from a trusted
   full read and held until the next one: a full-count snapshot (every chip present, every `bus_id`
   non-empty) and, in the same pass, a sysfs map that names the same set of buses. When the two
   disagree (one read raced the bus) nothing is banked, `chip_bus_map_mismatch` journals both once,
   and a later full pass that agrees banks the map. A broker that restarted after the drop and
-  never saw a full-mesh snapshot has no map, and then the tray rung DECLINES rather than fall back
+  never saw a full-mesh snapshot has no map, and then tray placement DECLINES rather than fall back
   to arithmetic: the same rule as I15's mesh reset, which never fires on a guessed mode. A decline
   here is `not_applicable`, not `blocked` — it is a missing fact, not an operator's kill switch.
 
@@ -342,9 +340,9 @@ each rung fires only when the gentler one failed or cannot apply.
   but the index the kernel gives it can: tt-kmd derives a Galaxy chip's index from its PCI address
   but takes a free one when that index is still in use, and older drivers always take a free one,
   so a chip can come back from a drop, a rescan or a tray reset under another index — the cycles
-  this rung exists for. A map that names the old index re-powers the wrong tray. So every trusted
+  recovery handles. A map that names the old index names the wrong tray. So every trusted
   full read is compared with the banked map, and one that differs replaces it in the gate's own
-  pass, before any rung computes a BMC mask from it, and journals `chip_bus_map_drift` with the
+  pass, before anything names a tray from it, and journals `chip_bus_map_drift` with the
   old and the new map — on every change, not once per process, since each one moves a tray. A
   read that is short, has a chip without a readable bus, or disagrees with the snapshot never
   overwrites a banked map: a chip off the bus has no node to read, so that read cannot place it,
@@ -379,10 +377,7 @@ each rung fires only when the gentler one failed or cannot apply.
 
   The boot inventory applies both columns; a rung's arming predicate applies only privilege.
   Off-platform the fire paths already decline as `not_applicable` (a missing fact, not a kill
-  switch), and a platform conjunct in the predicate would report that as `blocked`. A platform
-  boot left unresolved counts as either: `_is_galaxy` answers None on exactly the degraded Galaxy
-  the tray rung recovers. So only a host committed to per-target reads `auto-tray-reset` OFF, and
-  its cause names the platform, never a privilege the host has.
+  switch), and a platform conjunct in the predicate would report that as `blocked`.
 
   Privilege also picks the reset backend (I4), not just the rungs: `systemd-run --scope` refuses
   an unprivileged caller, and that rc would arm the cooldown against a reset that never ran.
@@ -476,54 +471,40 @@ each rung fires only when the gentler one failed or cannot apply.
   the last-chance sweep (SBR, per-tray re-power, mesh reset) ran COMPLETE and the one verify after
   it failed, or once this episode's ladder already ran its mesh reset and it failed on an unchanged
   off-bus set (I38: the sweep would repeat that reset, which I36 forbids). A sweep that was skipped (a reset already cycling in its own scope, a tenant) or
-  incomplete (the I24 gate refused it, or the I23 envelope refused the tray fire) holds the host
+  incomplete (the I24 gate refused it) holds the host
   rung for that pass: `_settle_and_verify_before_host_rung` returns None and every caller holds.
   I70 is the other exception: under an unkillable leftover every reset is fenced (I21), so its host
   rung runs with no ladder and no sweep.
 
-- **I23 — A per-tray re-power runs inside a host-safety envelope** (`pcie_guard.safe_tray_repower`).
-  In order: the tray map is cross-checked against sysfs (each chip's bus against tt-smi's tray
-  table) and a disagreement refuses the fire, so a mis-mapped tray is never cut (issue #27); it
-  waits up to `TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC` for every process to let go of EVERY
-  chip on the box (`TrayPlan.box_chips`: each chip sysfs or tt-kmd's `/proc` list names, on the bus
-  or not), not only the tray's, else refuses: one tray's pulse has dropped every other tray of a
-  Galaxy within seconds, so the box must be as idle as for a whole-box cycle (the broker's own pid
-  never counts); the device pollers are stopped as for a mesh reset; AER and DPC are
-  masked on EVERY Tenstorrent root port, the sibling trays' included (a mask that cannot be applied
-  is put back and refuses the fire, before any chip is touched); the chips are quiesced
-  (USER_RESET); the tray's PCI functions are removed; the BMC pulse fires; then, even if the
-  quiesce or the pulse failed, only the re-powered tray's root ports are rescanned (each port's
-  `pci_bus/<bus>/rescan`; the global `/sys/bus/pci/rescan` only when no port of the tray is known),
-  the chips re-inited (POST_RESET), and every chip on another tray that read a live heartbeat
-  before the pulse and all-ones after it gets one `remove` and a rescan of its own root port
-  (`tray_repower_sibling_offbus`; one still all-ones is left to the walk's regression check), then
-  each port's error status is cleared and watched for `TT_DEVICE_MCP_AER_QUIET_CHECK_SEC`. On a
-  Galaxy every per-tray re-power with a global rescan left the slot-6 chip of each other tray
-  reading all-ones. "Every root
-  port" includes the ports of chips already off the bus: the broker remembers each root port and
-  chip arch it has seen (`tt_pci_topology.json` in the health dir) and masks a remembered port
-  that still exists in sysfs. It looks at broker start and in every between-jobs check (sysfs
+- **I23 — No BMC tray re-power.** The broker never re-powers a single UBB tray: no
+  `ipmitool raw 0x30 0x8b`, and no other per-tray UBB or BMC power action, on any path (the
+  between-jobs gate, the idle and stuck-hold escalations, the last-chance sweep, the I76 ladder at
+  10 min, startup). No flag, env var, config key or CLI option brings it back. Measured across
+  Galaxy hosts it ran 190 times with 0 heals, and 4 times it broke the box: it took other trays off
+  the bus with it or took host storage down. Below the galaxy floor the router answers
+  `BELOW_FLOOR`, a decision, not a rung: a `TRAY_DOWN_NO_WINDOW` hold runs the kept back-to-back
+  sweep (bridge reset, then the mesh reset, one verify, then the power cycle); any other whole-tray
+  drop goes to the I27 power cycle with no grace (I37); anything else holds, and the I76 bound runs
+  the full ladder at 10 min and requests the power cycle if the full check, fabric included, still
+  fails. Only a passing full health check, fabric included, lifts the hold.
+  The broker remembers each Tenstorrent root port and chip arch it has seen
+  (`tt_pci_topology.json` in the health dir), so an AER mask (I24 `guard`) also covers a remembered
+  port that still exists in sysfs. It looks at broker start and in every between-jobs check (sysfs
   reads; the file is rewritten, through a temp file and a rename, only when a look adds a port or
-  an arch), so one healthy start covers the first tray drop after it and every later restart.
+  an arch), so one healthy start covers the first drop after it and every later restart.
   Known limit: a root port never seen with its chip present on this host (the broker's first start
   here already found that chip off the bus) is not known and is not masked; every other port is.
-  With every chip off the bus there is no healthy tray to cut and nothing to cross-check, so the
-  fire goes ahead without a tray table. Sysfs that cannot be read (the PCI device list, the
+  Sysfs that cannot be read (the PCI device list, the
   tenstorrent class list, or the vendor or address of a Tenstorrent function or of a port above
-  one) is no answer, never "every chip off the bus": the plan refuses the fire and names what it
-  could not read, and a look at start or between jobs keeps the recorded topology and leaves a
+  one) is no answer, never "every chip off the bus": a look at start or between jobs keeps the recorded topology and leaves a
   `pci_topology_unreadable` event; the I24 gate counts every chip off the bus then, so `hold`
   holds, and a `guard` mesh-reset mask logs `aer_mask_failed` and masks the recorded ports. Any
   other entry it cannot read is skipped. PCI domains of 5+ hex digits (Intel VMD) are addresses,
-  and a chip's root port is the first port above it in its own domain. A quiet port gets its
-  exact saved settings back; one that errors again stays masked, starts the AER flood window and stops the tray
-  walk. A refused fire re-powers nothing. `TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN=1` logs the planned
-  sequence and refuses; `python -m tt_device_mcp.health.recovery.pcie_guard <bitmap> [chip ...]`
-  prints the plan from sysfs and touches nothing.
+  and a chip's root port is the first port above it in its own domain.
 
 - **I24 — A per-host gate on automatic host-affecting resets** (`TT_DEVICE_MCP_HOST_RESET_GATE`).
   `off` (default) keeps the behaviour above. `guard` masks AER on every Tenstorrent root port around
-  each automatic mesh reset and refuses an automatic mesh reset, tray walk or last-chance sweep
+  each automatic mesh reset and refuses an automatic mesh reset or last-chance sweep
   while the root ports' AER counters rise at `TT_DEVICE_MCP_AER_FLOOD_THRESHOLD` or more errors per
   `TT_DEVICE_MCP_AER_FLOOD_PERIOD_SEC` (a rate, so a trickle between looks hours apart is not a
   flood), or within `TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC` of one (the first look after a recent boot
@@ -531,16 +512,15 @@ each rung fires only when the gentler one failed or cannot apply.
   function but its ARC heartbeat reads all-ones (its BAR reads return nothing: it has left the bus
   too), so a reset that dropped a chip is not re-issued over it. A chip whose heartbeat read fails
   with ENODATA while its KMD node is there and its PCI endpoint is bound to the driver is on the bus
-  with its ARC not ready (mid-boot after a reset or re-power), not off it: the heartbeat verdict
+  with its ARC not ready (mid-boot after a reset), not off it: the heartbeat verdict
   reads it UNHEALTHY and names it `arc_not_ready`, but no off-bus count includes it (this gate, the
-  reset and reboot floors, the tray walk plan, the bridge and gone-chip rungs, the hold-deadline
+  reset and reboot floors, the bridge and gone-chip rungs, the hold-deadline
   climbs, `/health` `off_bus`). An unbound endpoint, a missing node or any other read error still
   counts the chip off the bus. Under every mode, `off` included, an automatic reset is refused while
-  the flood window an I23 port that stayed masked opened is still open: with the gate `off` that
-  holds every automatic mesh reset, tray walk and last-chance sweep (and so the host rung above
+  the flood window a port that errored again after its mask opened is still open: with the gate `off` that
+  holds every automatic mesh reset and last-chance sweep (and so the host rung above
   them, I22) for `TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC`. The one exception is inside a last-chance
-  sweep that already started: its mesh reset still follows its tray fire, even one that left a port
-  masked, because no host rung fires without the full ladder (I22); the erroring port stays masked
+  sweep that already started: its mesh reset still follows its bridge reset, because no host rung fires without the full ladder (I22); the erroring port stays masked
   across that reset. The gate is checked before
   the reset is recorded (`reset_begin`, the cooldown clock): a refused reset did not happen. A
   refusal is handed to an operator, never a climb (I22), bounded by I27 and, with no power cycle
@@ -548,27 +528,14 @@ each rung fires only when the gentler one failed or cannot apply.
   The per-chip bridge SBR is gated the same way, counting its target chips as off the bus: under
   `hold` (or the I25 latch) it does not fire, and the PCI rescan still runs.
 
-- **I25 — Re-power only affected trays; latch hold after an off-bus reset hung the host.** The
-  automatic tray walk and the last-chance sweep re-power only trays that hold an off-bus chip (read
-  from the heartbeats when the caller names none), each through the I23 envelope and its sysfs
-  cross-check. The sweep's `last_chance_reset_sweep` event and line name each off-bus chip it
-  planned around, with its banked PCI address and its tray, so the trays it re-powers can be checked
-  against the chips that drove them. A tray whose chips are all on the bus is never re-powered automatically; if chips are
-  still off after their trays, the next rung runs as the I24 gate allows (no rung is skipped before
-  a power cycle, I22). Re-powering tray X alone recovers chips off on tray X, as the old walk did.
-  The walk never re-powers a single tray for a below-floor drop that sits on that one tray: a
-  one-tray BMC re-power has taken the other trays off the bus with it (1 chip off -> 24 off), so it
-  emits `ubb_reset_declined_single_tray`, spends no walk latch, holds for self-heal, and the stuck-hold
-  ladder's next rung owns it. Nor does it re-power a tray whose chips are all off the bus in a
-  below-floor drop, in the post-job gate or the idle escalation: a whole tray off the bus is a power
-  problem a re-power has made worse (one tray re-power took 20 more chips off, three times on one
-  Galaxy host in an hour), so it emits `ubb_reset_declined_whole_tray` and hands the hold straight to
-  the I27 power cycle with no grace (`offbus_gated_hold` phase `whole_tray_down`). No walk ran, so
-  the idle escalation journals it as `galaxy_reset_skipped_whole_tray` (`fault_class` `whole_tray`),
-  never as a failed walk, and starts no walk-failed clock. A partial drop (no tray wholly off) keeps
-  the walk. `TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK=1` turns the single-tray
-  and whole-tray walks back on; the tray-down-no-window sweep is not affected.
-  Before an automatic mesh reset, tray re-power or sweep with a chip off the bus, the broker writes
+- **I25 — Latch hold after an off-bus reset hung the host.** The last-chance sweep's
+  `last_chance_reset_sweep` event and line name each off-bus chip it planned around, with its
+  banked PCI address and its tray. A whole tray off the bus in a below-floor drop, in the post-job
+  gate or the idle escalation, hands the hold straight to the I27 power cycle with no grace
+  (`offbus_gated_hold` phase `whole_tray_down`); the idle escalation journals it as
+  `galaxy_reset_skipped_whole_tray` (`fault_class` `whole_tray`). A partial drop holds, and the I76
+  bound runs the full ladder at 10 min. No tray is re-powered (I23).
+  Before an automatic mesh reset or sweep with a chip off the bus, the broker writes
   `offbus_reset_intent.json` (with the boot id) to the health dir and removes it after the reset's
   verify, fsyncing the directory so a power loss right after cannot undo the removal. Before the
   broker's own reboot or power cycle fires (after its ledger row), it removes any intent still there
@@ -662,8 +629,7 @@ each rung fires only when the gentler one failed or cannot apply.
   the bounded exceptions stated in I65 and I76. A read the map cannot place keeps the
   whole-tray verdict. The
   `firing` event names `fault_class` (`whole_tray`, `all_off`, `tray_partial` for 4 or more chips,
-  `partial_offbus` for 1-3), `handoff` (`whole_tray`, `ipmi_unavailable`, `tray_walk_failed`,
-  `tray_rung_regressed`, `gate_refused`) and `hold_age_sec`, the hold's time to this cycle.
+  `partial_offbus` for 1-3), `handoff` (`whole_tray`, `gate_refused`) and `hold_age_sec`, the hold's time to this cycle.
   Each attempt is written, fsync'd, to
   `offbus_power_cycle.json` in the health dir before the command runs; a failed command keeps its
   error there. Attempts are spaced by the I65 cooldown alone (the gated fire goes through the
@@ -687,39 +653,18 @@ each rung fires only when the gentler one failed or cannot apply.
   attempt or a page within grace + that bound, never an open-ended silent hold. The gate's refusal,
   including the I25 latch, never holds this rung: it is what the rung answers.
   The hold watchdog forces one escalation pass per episode the moment the grace runs out, so the
-  cycle fires at the grace and not at the next ceiling window. **A failed BMC IPMI is bounded the
-  same way.** When the gate allows resets but the BMC's IPMI failed a tray re-power this episode
-  (`BmcIpmiError`: `ipmitool` exits non-zero, cannot start or times out; a refused or mis-mapped
-  re-power does not count), no IPMI rung can end the hold, so the first such failure starts a clock
-  and, once the ladder ran once this episode (whether the failure came from its own tray rung or
-  not), the same power cycle runs `TT_DEVICE_MCP_IPMI_UNAVAILABLE_HANDOFF_SEC` (default 300 s) after
-  it, with every check above; the watchdog forces one pass at that bound. The idle relift, the
-  watchdog and the between-jobs gate's tray rung (for a whole tray off the bus) reach it; the device
-  is already held there and no reset runs, so it adds no time to a job that could have run. **A failed tray
-  walk is bounded the same way, and no below-floor mesh reset follows it.** When the I25 walk fired
-  this episode and did not recover the mesh, or took chips on other trays off the bus with it, the
-  idle off-bus escalation does not try the below-floor mesh reset (with a tray still off the bus it
-  cannot re-enumerate it, and with 8 chips off it overran its 180 s and failed). It holds and starts
-  a clock instead: the same power cycle runs `TT_DEVICE_MCP_TRAY_WALK_FAILED_HANDOFF_SEC` (default
-  300 s) after the walk failed, with every check above, and the watchdog forces one pass at that
-  bound. When the power cycle cannot fire (no command, or it is not guarded), the hold climbs to the
-  host rung without the last-chance sweep, whose resets include the same mesh reset. The device
-  stays held throughout: it is released only by the full health check, fabric included.
-  **A regressed tray rung is bounded the same way.** When the gate allows resets but a tray
-  re-power on this host (within the latch window below) took chips on other trays off the bus (the per-tray rung is declined, I25
-  and the tray rung's walk below), no IPMI rung will run, so the off-bus hold takes the same grace
-  and then the same power cycle, with every check above.
+  cycle fires at the grace and not at the next ceiling window.
   Unset, the behaviour is I24's plus the I33 hand-off. `deploy/tt-manual-recovery-check.sh` is a template for the
   manual-recovery command: exit 0 when the sudo journal or auth.log shows a sudo-run reboot,
   poweroff, shutdown, halt, kexec or ipmitool power/reset in the last 30 min, 1 when not, 2 when it
   cannot read the journal.
 - **I28 — An operator's outage hold holds every automatic mesh reset.** With
   `TT_DEVICE_MCP_AUTO_MESH_RESET=0`, or with it unset and `TT_DEVICE_MCP_AUTO_REBOOT`,
-  `TT_DEVICE_MCP_AUTO_POWER_CYCLE` and `TT_DEVICE_MCP_AUTO_UBB_RESET` all `0` (an outage hold), no
+  `TT_DEVICE_MCP_AUTO_POWER_CYCLE` both `0` (an outage hold), no
   automatic mesh reset fires: not the between-jobs gate's, the idle relift's or the hold
   watchdog's, and no last-chance sweep. `TT_DEVICE_MCP_AUTO_MESH_RESET=1` arms it whatever the
-  others say. Any one of the three alone is a per-host choice and still climbs through the mesh
-  reset (the tray rung off only names its command). A held reset did not happen, as for I24: it is
+  others say. Either one alone is a per-host choice and still climbs through the mesh
+  reset. A held reset did not happen, as for I24: it is
   checked before `reset_begin` and the cooldown clock, sets no failed-reset flag, and the episode
   holds. This covers a chip off the bus in the startup and pre-job gates: under the hold they run no
   `tt-smi -glx_reset` and leave the device HELD (a mesh reset over an off-bus mesh is what drops
@@ -862,7 +807,7 @@ each rung fires only when the gentler one failed or cannot apply.
 - **I34 — Once a host reboot or power cycle is requested, the hold watchdog starts no device reset
   until the host acts or the request expires.** A cycle handed to a `TT_DEVICE_MCP_POWER_CYCLE_CMD`
   wrapper can run some time after the request returns; a forced escalation (the off-bus one-shot, a
-  ceiling window, any other hold-deadline trigger) that ran a bridge reset, tray re-power or galaxy
+  ceiling window, any other hold-deadline trigger) that ran a bridge reset or galaxy
   reset in that gap would race the host going down. The request is marked once its I9 ledger record
   is written; while it is pending the forced ladder declines without spending its window latch and
   logs one `hold_escalation_suppressed_host_action` line per request. The device stays held and the
@@ -924,9 +869,9 @@ each rung fires only when the gentler one failed or cannot apply.
   classified again, for class A only
   (`class_a_unreadable_survivors`, naming them); every other answer, and every rung's own off-bus
   count, is the one the set as read gives. Without this, such survivors of a whole-tray drop make it
-  read all-off (one mesh reset, then class C) or partial (the full ladder). With no map the tray
-  rung itself runs the same presence read (EIO survivors included) for a below-floor drop: a clean
-  whole-tray drop emits `ubb_reset_declined_whole_tray` and goes to the power cycle as in I25,
+  read all-off (one mesh reset, then class C) or partial (the full ladder). With no map the below-floor
+  branch runs the same presence read (EIO survivors included): a clean
+  whole-tray drop goes to the power cycle as in I25,
   where before it declined for want of a map and held to the ceiling; a partial drop keeps the
   ladder. So a whole-tray drop at the startup gate or at the hold
   deadline requests the cycle at its first pass, not after the hold ceiling and a mesh reset; inside
@@ -939,12 +884,12 @@ each rung fires only when the gentler one failed or cannot apply.
   time: the startup gate also runs after a broker restart, and one mesh reset has healed an all-off
   bus there and at run time. When the power cycle is opted in, `escalate()` requests it for these
   classes before any rung fires (after the I19 rescan and capture, which still run once per
-  episode): no mesh reset, no SBR, no tray re-power and no last-chance sweep, and the host rung's
+  episode): no mesh reset, no SBR and no last-chance sweep, and the host rung's
   own sweep skips itself for these classes (`last_chance_sweep_skipped`). The request keeps every
   guard of the host rung: a reset cycling in
   its scope, a tenant or an unreadable holder scan, an operator stand-back marker or check, and the
   power-cycle rate limits (journaled as denied) each hold and fire nothing; the next window asks
-  again. The hold-deadline climb (`offbus-forced`) waives an unreadable scan, as the tray rung does,
+  again. The hold-deadline climb (`offbus-forced`) waives an unreadable scan,
   but never a readable tenant or a running job. A missing manual-recovery check does not hold it, as
   it does not hold the host rung this replaces. With no power cycle opted in, the ordinary ladder runs as before (I36 still stops a repeat
   of a failed reset). The host that comes back runs the startup gate, which waits for the hugepage
@@ -955,7 +900,7 @@ each rung fires only when the gentler one failed or cannot apply.
   130-262 s and exited 1.
 - **I38 — Once this hold episode's mesh reset has failed on an unchanged off-bus set, the host rung
   fires in the same pass: no hold-ceiling deferral and no last-chance sweep.** Every rung below the
-  host pair (the per-chip bridge reset, the tray rung where it applies, the mesh reset) has then had
+  host pair (the per-chip bridge reset, the mesh reset) has then had
   its one try, and I36 forbids the mesh reset again on that set, which is the last step of the I22
   sweep. So the climb that follows the failed reset (or any later window's I36 skip) journals
   `host_rung_not_deferred` (reason `mesh_reset_failed_unchanged`) when the hold is younger than the
@@ -1237,8 +1182,7 @@ each rung fires only when the gentler one failed or cannot apply.
     forced spawn declines until the pending window ends, so the time is the window's end (source
     `host_action_pending`);
   - otherwise the earliest of: the off-bus forced pass at the bound
-    `offbus_power_cycle.watchdog_due_at` reports for this episode (the gated off-bus grace, the BMC
-    IPMI hand-off bound, the failed tray walk hand-off bound, or with no power-cycle command the
+    `offbus_power_cycle.watchdog_due_at` reports for this episode (the gated off-bus grace, or with no power-cycle command the
     I33 operator hand-off deadline; each named in the source); the I65 retry of a power cycle the
     governor refused, only while that retry is armed for this hold episode (`power cycle`, source
     `power_cycle_cooldown`, or `power_cycle_missed_retry` / `ac_power_needed` when the refusal
@@ -1306,8 +1250,8 @@ each rung fires only when the gentler one failed or cannot apply.
   by then fires nothing. The rung is chosen by `_host_escalation_for_drop` with the warm reboot
   futile whenever a chip is off the bus on a multi-chip host (a reboot does not bring an off-bus
   Galaxy chip back), so that case takes the power cycle; with every chip present the chooser's own
-  order holds (the warm reboot, which ends every process, then the power cycle). No reset, sweep or
-  tray re-power runs first (an exception to I22). Guards kept: a host action already pending (I34)
+  order holds (the warm reboot, which ends every process, then the power cycle). No reset or sweep
+  runs first (an exception to I22). Guards kept: a host action already pending (I34)
   asks nothing more (re-read under the device lock, so a try spawned before another path's request,
   such as the I76 bound's host rung, asks nothing: one power-cycle request per episode even when
   that launch timed out and retracted its governor record), a reset cycling in its scope, a running broker job or a readable tenant other
@@ -1589,9 +1533,8 @@ each rung fires only when the gentler one failed or cannot apply.
   or not), once the hold has stood `CLASS_A_LADDER_AFTER_SEC` (600 s) since the later of the last
   cycle or boot and the hold's start, the hold-deadline watchdog starts one forced pass at that mark
   (not at the next ceiling window) and the broker's own off-bus ladder runs once, as its gates allow:
-  for a whole-tray drop that is the per-tray re-power only (`glx_reset` is suppressed after a failed
-  tray walk below the galaxy-reset floor, and the last-chance sweep is skipped for class A and C,
-  I37). It runs once per anchor (the later of the last cycle or boot and the hold's start). Each
+  for a whole-tray drop that is the kept sweep, the bridge reset then the mesh reset, with no tray
+  step (I23). It runs once per anchor (the later of the last cycle or boot and the hold's start). Each
   reset is followed by the full health check, fabric included; a check that fails keeps the hold,
   and the cycle follows at the cooldown's end. The bounded I65 cooldown is the only longer hold. A tray that came back takes the
   ordinary reset path, and the device is released only after the full post-reset health check,
@@ -1727,8 +1670,8 @@ Class structure: see the diagram in 03-health.md.
   `server.select_recovery` is the module-global alias (`fsm.select_recovery`) the gate and the
   reset routes call.
 - **`Recovery.next_stage(ev: Evidence) -> str`** — the one rung `ev` justifies: a stage name
-  (`bridge_reset`, `smi_reset`, `ubb_tray`, `host_reboot`, `power_cycle` — `constants.STAGE_NAMES`)
-  or a non-stage decision (`WAIT`, `DEFER`, `RELEASE`, `HOLD_FABRIC_UNVERIFIED`, `BLOCKED`). Pure:
+  (`bridge_reset`, `smi_reset`, `host_reboot`, `power_cycle` — `constants.STAGE_NAMES`)
+  or a non-stage decision (`BELOW_FLOOR`, `WAIT`, `DEFER`, `RELEASE`, `HOLD_FABRIC_UNVERIFIED`, `BLOCKED`). Pure:
   the caller acts. The gate steers on `GalaxyRecovery.next_stage` on every platform (the ladder at
   a job boundary is one ladder; only the reset argv is platform-specific);
   `PerTargetRecovery.next_stage` is the strictly smaller platform-own view (cooling → WAIT, live
@@ -1758,9 +1701,7 @@ Class structure: see the diagram in 03-health.md.
 - **Stage fire functions (the argv seams).** Each stage isolates the destructive action in one
   function the test suite stubs and asserts argv on: `stages/bridge_reset.reset_chip_via_bridge`
   (setpci Secondary Bus Reset on the parent bridge; tri-state result — recovered / retryable /
-  structurally inapplicable), `stages/ubb_tray._ubb_reset_argv` + `_fire_ubb_reset` (`ipmitool raw
-  0x30 0x8b <bitmap> 0xff 0x00 0x0f`, wrapped in tt-smi's USER_RESET/POST_RESET ioctl handshake,
-  compatible with both tt-smi surfaces), `stages/host_reboot._fire_host_reboot` (`systemctl
+  structurally inapplicable), `stages/host_reboot._fire_host_reboot` (`systemctl
   reboot`), `stages/power_cycle._fire_power_cycle` (`ipmitool chassis power cycle`),
   `stages/smi_reset` (the per-chip reset ioctl binding). A fire that raises is a launch failure the
   ladder reports and falls past; it never masks as success.
@@ -1800,11 +1741,10 @@ what arrives here is: healthy/fault/fabric verdicts, off-bus and ARC-frozen coun
 cooldown/scope/was-failing state, and — on the post-action ask — which action this pass already ran
 and whether it recovered). `_route` (galaxy.py) is THE escalation policy, in order: a recovered
 action → `RELEASE`; a failed `smi_reset` → host rung / `BLOCKED` / `WAIT` (host rung only with
-opt-in, two strikes, no live scope, and a mass drop or a still-unhealthy present mesh); a failed
-tray walk → `WAIT` (the next rung is the cold one, never the suppressed mesh reset); a healthy
+opt-in, two strikes, no live scope, and a mass drop or a still-unhealthy present mesh); a healthy
 fault-free mesh → `RELEASE`, except a fabric pass that ran without a verdict on a dirty/multi-chip
 host → `HOLD_FABRIC_UNVERIFIED`; eth-frozen → `WAIT`; cooling → `WAIT`; live scope → `DEFER`
-(adopt, never start a second); SBR candidates → `bridge_reset`; below the floor → `ubb_tray`;
+(adopt, never start a second); SBR candidates → `bridge_reset`; below the floor → `BELOW_FLOOR` (not a rung, I23);
 otherwise `smi_reset`. The platform derives its own floors from `expected` — a caller cannot hand
 it stale ones.
 
@@ -1822,64 +1762,22 @@ spec 03 I40 bounds. The bridge-reset rung
 retries up to `BRIDGE_RESET_MAX_TRIES` with a settle (the first shot races link retrain), treats a
 structurally inapplicable chip (no bridge, no setpci) as fall-through rather than spin, tries a
 bare PCI rescan before anything heavier, and refuses a stale cached address whose target bus now
-holds live silicon. The tray rung walks only the affected trays (I25), one at a time,
-holding `reset_in_flight` and the device pollers stopped across the walk (restored after it, as in
-I12), and never applies to a fully-off-bus mesh (that is the cold rung's case). After each tray's
-re-power it rescans that tray's root ports (the whole bus only when none is known) and settles
-(`UBB_WALK_RESCAN_SETTLE_SEC`) before re-verifying,
-fabric included: a re-power does not undo a chip's sysfs `remove`. After a failed verify it re-reads
-the bus. If a chip that was on the bus before the walk is now off, the walk stops at once
-(`ubb_reset_regressed_offbus`) rather than re-power more trays, and the per-tray rung is declined
-on this host for `TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS` (default 7) days (`ubb_tray_rung_disabled`,
-with `latch_days` and `clear_with`, the operator's re-arm command). The decline is host-wide, not per
-tray: a single-tray re-power has taken the other trays off the bus with it.
-The record goes, fsync'd, to `ubb_tray_rung_disabled.json` in the health dir with the boot id, the
-host name and the time. A broker restart or a host power cycle keeps it
-(`ubb_tray_rung_disabled_restored`, with the boot id it was latched on): a power cycle does not
-repair the UBB whose re-power regressed, and a per-boot latch let the rung regress the mesh again
-after every cycle. A record older than the window, or written by another host, is removed and the
-rung re-arms (`ubb_tray_rung_rearmed`); one with no time of its own is aged by the file's mtime, and
-one whose age cannot be read counts. After the UBB is repaired an operator re-arms the rung with
-`python -m tt_device_mcp.health.recovery.pcie_guard --clear-tray-rung-latch [--health-dir DIR]`
-as root (`ubb_tray_rung_cleared`, `by` `operator`; exit 1 when the record cannot be removed, 2 on
-bad usage); a running broker whose written record is gone re-arms on its next look
-(`ubb_tray_rung_cleared`, `by` `file_removed`), without a restart. A delayed cross-tray drop latches the same record: when chips that were on the
-bus before the last tray re-power, on trays it did not re-power, leave the bus within
-`TRAY_PULSE_WINDOW_SEC` (900 s) of it and every one sits at in-tray position 5 (chips 5/13/21/29 on
-a Galaxy), the next look (the tray rung's evidence or the sweep) disables the rung; any other drop
-pattern, such as a mesh reset's, does not. The drop often lands after the pulse's own hold was
-released, so the match spans hold episodes inside the window; the record names the pulse's episode
-(`episode`) and, when it differs, the one the drop was seen in (`seen_in`), so an operator can tell
-an outside drop from the pulse's and re-arm the rung. While the rung is declined the walk holds (the next
-generic drop names the command), and the back-to-back sweep (TRAY_DOWN_NO_WINDOW and the
-last-chance sweep before a host rung) skips the tray re-power (`ubb_reset_skipped_regressed`), as
-when opted out: its SBR and mesh reset still run and the sweep still counts as complete (I22), so
-the ladder is never cut short; the off-bus hold then takes the bounded end of I27. Skipping the
-re-power changes no release rule: only a passing full health check, fabric included, after the
-sweep's resets counts as recovered. A healthy tray is never swept (I25):
-re-powering it cannot bring back a chip on another tray and can knock its own chips off, so a mesh
-that still fails once every affected tray was re-powered (an off-bus chip or a fabric fault) goes to
-the next rung. Either way the walk returns False, so the ladder climbs to the same next rungs as an
-exhausted walk; no rung is skipped. Every tray it names — the affected
-set, the walk order, the bitmap, and the chip ids the ioctl handshake quiesces — comes from the
-banked chip→bus map of I16, so the trays in the `ubb_reset_required` event are the ones an operator
-would read off `tt-smi -glx_list_tray_to_device`.
+holds live silicon.
 
-**The tray rung's two branches.** The below-floor tray rung splits on the hold's *class*, chosen
+**The two below-floor branches.** `BELOW_FLOOR` splits on the hold's *class*, chosen
 once at fire time by `_classify_hold` (never in `_route`, which stays a pure function of its
 inputs). A whole UBB tray off the bus with *no bridge window on any of its chips* — every off-bus
 chip's per-chip SBR reported `no_bridge`, recorded by the bridge rung on
 `Recovery.last_bridge_reset_reasons` and threaded onto `Evidence.bridge_reset_failed` by the gate's
 `replace(ev, …)` *after* that rung fires — is the `TRAY_DOWN_NO_WINDOW` class: the one drop measured
 never to return by any single reset (0/40 episodes). It fires every reset type back-to-back with no
-verify between (`_fire_tray_down_no_window`) — SBR, per-tray BMC re-power of the affected trays,
-then the mesh-wide reset — then exactly ONE settle and ONE verify, and if the mesh is still bad goes
+verify between (`_fire_tray_down_no_window`) — SBR, then the mesh-wide reset (no tray step, I23) — then exactly ONE settle and ONE verify, and if the mesh is still bad goes
 straight to the cold power cycle (a whole tray off the bus is warm-reboot-futile — a Galaxy reboot
 does not re-power the UBBs); no retries, no ceiling wait, no rung skipped, because there is nothing
 to lose before the power cycle. Everything else — a partial-tray drop, a chip that still has a
 bridge window, or a window left *unknown* because no bridge rung ran this pass — is
-`HOLD_CLASS_GENERIC` and takes the verify-between per-tray walk above. The no-window branch honours
-the same `TT_DEVICE_MCP_AUTO_UBB_RESET=0` name-and-hold opt-in, the tenant guard, and the
+`HOLD_CLASS_GENERIC`: a whole-tray drop goes to the I27 power cycle, anything else holds for the
+I76 ladder at 10 min. The no-window branch honours the same tenant guard and the
 power-cycle cooldown/boot-loop denials as the generic path; the classification is journalled
 (`hold_classified`, with the class, the off-bus set and the trays). A chip absent from
 `bridge_reset_failed` reads as *unknown*, never `no_bridge`, so the aggressive sweep can never fire
@@ -1909,14 +1807,9 @@ fails); it is log-only, and `off_bus`, the count at onset, still drives every de
 down and costs minutes, so before paying that the ladder re-issues every reset type once more,
 back-to-back, then takes ONE settle and ONE verify — and fires the host rung only if the mesh is
 still bad (`_settle_and_verify_before_host_rung` → `_issue_all_resets_back_to_back`, the same
-implementation the `TRAY_DOWN_NO_WINDOW` branch uses, so the two can never drift). The sweep's
-per-tray BMC re-power is auditable from the journal alone: before the fire it logs one line per tray
-naming the tray, its BMC bit and its chips (from the I16 map) beside the exact `ipmitool` command;
-after it, a `ubb_reset_fired` event (`trays`, `ubb_bitmap`, `chips`, `command`) on success, or a
-`ubb_reset_failed` event with the same fields, the BMC's exit code as `rc` (null when ipmitool never
-exited) and the error. The single-tray walk journals each clean pulse the same way (`tray` in place of
-`trays`). This is logging only: it changes no tray fired, no timing and no hold, and the full health
-check still has to pass after the sweep before anything is released. This holds on
+implementation the `TRAY_DOWN_NO_WINDOW` branch uses, so the two can never drift). The sweep
+fires no tray step (I23): its resets are the bridge reset and the mesh reset, and the full health
+check, fabric included, still has to pass after the sweep before anything is released. This holds on
 every road to a host rung, not just the tray branch: the gate ladder's own rung, the idle/stuck-hold
 escalation (`_climb_to_host_recovery_after_failed_reset` — the road most measured power cycles
 actually took), and the post-reboot cold climb (`_verify_post_reboot_recovery`, where the warm reboot
@@ -2031,27 +1924,24 @@ sees a silent fabric pass.
   aborts their run mid-op, and MMIO from a half-dead holder during the reset is how a wedge
   escalates to a bus fault and a reboot. Scanning holders, quiescing pollers, and refusing over an
   unprovable scan is what keeps an operator reset a repair instead of an outage.
-- **The per-tray reset is the broker's own.** tt-smi offers no per-tray reset: `-glx_reset` is
-  all-or-nothing, and UMD's tray entry point takes only the full 32-chip bitmap. So this rung
-  issues `ipmitool raw 0x30 0x8b` itself and drives the USER_RESET/POST_RESET ioctls around it,
-  which it can only do because the gate's pass already banked every chip's bus (I16).
-  It exists because nothing else covers a below-floor tray-down — I8's floor suppresses the mesh
-  reset and a warm reboot does not re-enumerate a dropped ASIC — so without it that drop holds
-  until a human arrives. The cost is ownership: a BMC change that alters the command reaches us as
-  a rung that stopped firing, not as a tt-smi release note.
+- **No per-tray re-power.** tt-smi offers no per-tray reset, and the broker's own BMC tray
+  re-power (`ipmitool raw 0x30 0x8b`) was removed: across Galaxy hosts it ran 190 times with 0 heals
+  and 4 times broke the box (other trays dropped with it, host storage went down). A below-floor
+  drop the bridge reset cannot fix now holds or goes to the power cycle (I23), which is the step
+  that heals a whole-tray drop.
 - **Floors before resets.** Both floors exist because the heavy rungs are measured hazards, not
   hypothetical ones: a galaxy reset against a single-chip wedge took the other 31 chips to
   all-ones until a power cycle; a warm Galaxy reboot does not re-power the UBBs, so dropped ASICs
-  stay dropped across it. The gentle-first order (rescan → bridge → tray → mesh → reboot → power
+  stay dropped across it. The gentle-first order (rescan → bridge → mesh → reboot → power
   cycle) is ordered by blast radius, and each hazard has a rung below it that avoids it.
-- **Two named tray branches, split at fire not in the router.** The one drop the data says no single
+- **Two named below-floor branches, split at fire not in the router.** The one drop the data says no single
   reset recovers — a whole tray off the bus with no bridge window on any chip (0/40 episodes) —
-  earns a back-to-back reset sweep straight to the power cycle, where every other drop keeps the
-  gentle verify-between walk. The class is decided from evidence the gate *already has* (the per-chip
+  earns a back-to-back reset sweep straight to the power cycle, where every other drop holds for the
+  I76 ladder or, for a whole tray, takes the I27 power cycle. The class is decided from evidence the gate *already has* (the per-chip
   SBR `no_bridge` result the bridge rung produced, threaded on `Evidence.bridge_reset_failed`), not
   recomputed in `_route`: the router stays pure, and the destructive branch fires only on a *proven*
   no-window whole-tray drop — a chip whose window was never tested reads unknown and takes the
-  generic walk, so the sweep can never fire on a guess. This is why the evidence is threaded through
+  generic class, so the sweep can never fire on a guess. This is why the evidence is threaded through
   `replace(ev, …)` rather than re-derived: `_route` must not grow a side effect, and the fire must
   not re-probe a bus the gate just read.
 
@@ -2060,7 +1950,7 @@ sees a silent fabric pass.
 | Claim | Test(s) |
 |---|---|
 | I22 a host rung holds when the last-chance sweep was skipped or gated; it fires after a full sweep | `tests/test_ladder_v2.py::test_settle_and_verify_gates_the_power_cycle_host_rung`, `tests/test_pcie_guard.py::test_a_gated_sweep_never_reaches_the_power_cycle` |
-| I25 a regressed walk disables the tray rung on this host; the back-to-back sweep skips the tray re-power and stays complete | `tests/test_ladder_v2.py::test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep` |
+| I23 the back-to-back sweep fires no tray step and stays complete | `tests/test_ladder_v2.py::test_gate_tray_down_no_window_dispatches_the_back_to_back_sweep` |
 | I25/I27 a below-floor drop with a whole tray off is never re-powered: the post-job gate and the idle escalation hand it to the power cycle at once and keep the device held; a partial drop still walks and is released only after the full check, fabric included | `tests/test_offbus_power_cycle.py::test_the_post_job_gate_hands_a_whole_tray_drop_to_the_power_cycle` |
 | I27 a whole tray that came back in part is not cycled at grace 0 and stays held, once per episode (a flapping tray fires on the next whole-tray read); one still wholly off, or a re-read the map cannot place, fires at once | `tests/test_offbus_power_cycle.py::test_a_whole_tray_that_comes_back_in_part_is_not_cycled_at_grace_0`, `::test_a_flapping_whole_tray_still_reaches_the_power_cycle`, `::test_the_whole_tray_deferral_is_per_episode`, `::test_a_tray_still_wholly_off_at_the_re_read_still_fires_at_once`, `::test_a_re_read_the_tray_map_cannot_place_keeps_the_whole_tray_verdict` |
 | I27 with a power cycle configured, a whole tray down goes straight to it; a partial drop gets one lifted ladder pass (the mesh reset) past the grace, spent only when its climb reaches the rungs (a pass declined by scope, tenant or the ceiling stays due), then the power cycle on the next forced pass only if the hold stands; each reset releases only after the full check, fabric included, and the cycle releases nothing | `tests/test_gated_hold_handoff.py::test_a_whole_tray_down_goes_straight_to_the_power_cycle`, `::test_a_partial_drop_gets_the_mesh_reset_first_and_the_power_cycle_only_if_it_fails`, `::test_a_partial_drop_the_mesh_reset_heals_never_gets_the_power_cycle`, `::test_a_partial_drop_with_no_tray_map_gets_the_mesh_reset_first`, `::test_before_the_grace_a_partial_drop_gets_no_lifted_reset`, `::test_a_declined_lifted_pass_is_not_spent_and_the_mesh_reset_still_runs_first`, `::test_the_partial_drops_mesh_reset_releases_only_after_a_passing_fabric_check`, `::test_the_power_cycle_releases_nothing`, `tests/test_startup_fabric_hugepages.py::test_startup_fabric_pass_waits_for_hugepages_then_runs` |
@@ -2281,9 +2171,9 @@ sees a silent fabric pass.
 | I16 tray identity is the bus group, per architecture, never the chip index or list position | `tests/test_ubb_tray_map.py::test_a_blackhole_tray_comes_from_the_bus_group_not_the_chip_index`, `::test_a_positional_bus_list_is_refused_not_read_by_position`, `::test_a_wormhole_tray_uses_the_wormhole_table_for_the_same_buses` |
 | I16 the map is all-or-nothing (unreadable bus, unknown group, non-Galaxy or unknown board) | `tests/test_ubb_tray_map.py::test_an_unreadable_bus_id_yields_no_map_rather_than_a_partial_one`, `::test_a_bus_group_outside_the_table_yields_no_map`, `::test_a_non_galaxy_board_type_yields_no_map`, `::test_an_unknown_board_type_yields_no_map` |
 | I16 a missing chip never shifts another chip's tray | `tests/test_ubb_tray_map.py::test_a_missing_chip_does_not_shift_any_other_chips_tray` |
-| I16 the bitmap, the affected set and the walk all key on the real tray | `tests/test_ubb_tray_map.py::test_affected_trays_names_the_tray_an_operator_would_read_from_tt_smi` |
-| I16 no map means the rung declines, never arithmetic | `tests/test_ubb_tray_map.py::test_without_a_map_every_tray_decision_declines`, `::test_a_chip_the_map_does_not_place_declines_rather_than_resetting_the_rest` |
-| I16 the chip→bus map comes from sysfs, is banked by the gate's own pass, and reaches the fire and the log line | `tests/test_ubb_tray_map.py::test_the_snapshot_caches_every_chips_bus_id`, `::test_the_tray_map_keys_on_the_kernels_chip_ids_not_the_snapshots_list_order` |
+| I16 the affected set keys on the real tray | `tests/test_ubb_tray_map.py::test_affected_trays_names_the_tray_an_operator_would_read_from_tt_smi` |
+| I16 no map means tray placement declines, never arithmetic | `tests/test_ubb_tray_map.py::test_without_a_map_every_tray_decision_declines`, `::test_a_chip_the_map_does_not_place_declines_rather_than_resetting_the_rest` |
+| I16 the chip→bus map comes from sysfs, is banked by the gate's own pass, and reaches the log line | `tests/test_ubb_tray_map.py::test_the_snapshot_caches_every_chips_bus_id`, `::test_the_tray_map_keys_on_the_kernels_chip_ids_not_the_snapshots_list_order` |
 | I16 sysfs and tt-smi disagreeing banks nothing and journals `chip_bus_map_mismatch` | `tests/test_ubb_tray_map.py::test_sysfs_and_tt_smi_disagreeing_banks_no_map_and_logs_both` |
 | I16 a boot platform probe (`expected_count=0`), a degraded first pass, or any short snapshot never freezes the map | `tests/test_ubb_tray_map.py::test_a_partial_boot_snapshot_never_freezes_the_map`, `::test_a_degraded_first_normal_snapshot_cannot_freeze_the_map`, `tests/test_reset.py::test_bank_bus_ids_once_rejects_a_snapshot_shorter_than_the_mesh`, `::test_bank_bus_ids_once_rejects_a_boot_probe_that_did_not_ask_the_question`, `::test_bank_bus_ids_once_rejects_a_chip_enumerated_without_a_bus_id`, `::test_bank_bus_ids_once_rejects_an_empty_list`, `::test_bank_bus_ids_once_first_full_read_stands`, `::test_bank_bus_ids_once_stays_open_after_a_rejected_snapshot` |
 | I16 the board type is normalized before selecting the table (WH ` L`/` R` suffix) | `tests/test_ubb_tray_map.py::test_a_wormhole_snapshot_with_l_r_suffixes_still_produces_a_tray_map`, `::test_a_wormhole_lookup_survives_the_snapshot_suffix_inside_tray_map` |

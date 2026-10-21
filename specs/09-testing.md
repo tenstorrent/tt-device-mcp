@@ -66,8 +66,8 @@ gets through anyway.
     reset per test so one test's outcome never steers the next test's gate.
   - **Host rungs**: `TT_DEVICE_MCP_AUTO_REBOOT=0`, `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0`
     (both default ON, so they are pinned off, never merely deleted),
-    `TT_DEVICE_MCP_AUTO_UBB_RESET` and `TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK` cleared; `_fire_host_reboot` and `_fire_ubb_reset` are
-    replaced with functions that raise `AssertionError` — loud tripwires, so a test that
+    `_fire_host_reboot` is
+    replaced with a function that raise `AssertionError` — loud tripwires, so a test that
     reaches a real fire fails instead of taking the box down. `shutil.which("tt-smi")` answers
     None: it is a device tool, so an unmarked test must not find one, and preflight verdicts keyed
     on it otherwise differ between a developer box and CI. A test whose subject needs it present
@@ -114,10 +114,9 @@ gets through anyway.
   because gate paths genuinely need them.
 - **I3** — A test that needs a forbidden command MUST stub the function that composes the
   argv and assert on the argv itself — never on a mocked spawn. The established seams:
-  `Recovery.reset_argv` (`health/recovery/__init__.py`), `_ubb_reset_argv`
-  (`health/recovery/stages/ubb_tray.py`), `systemd_run_prefix` (`privsep.py`), and the
+  `Recovery.reset_argv` (`health/recovery/__init__.py`), `systemd_run_prefix` (`privsep.py`), and the
   stage fire fns (`_fire_host_reboot` in `stages/host_reboot.py`, `_fire_power_cycle` in
-  `stages/power_cycle.py`, `_fire_ubb_reset` in `stages/ubb_tray.py` — a test exercising a
+  `stages/power_cycle.py` — a test exercising a
   fire path re-patches the fire itself).
 - **I4** — The suite MUST pass device-free, with every `device`-marked test skipped and no
   other test skipped. Passing on a device box proves nothing about CI; the docker check under
@@ -169,9 +168,8 @@ gets through anyway.
     needs to run at usable speed, so they point at one session-scoped temp dir shared by all
     device tests rather than a fresh per-test one.
   - **Never lifted — the destructive rungs.** `TT_DEVICE_MCP_AUTO_REBOOT=0` and
-    `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0` stay pinned off, `TT_DEVICE_MCP_AUTO_UBB_RESET` stays
-    cleared, and `_fire_host_reboot` / `_fire_ubb_reset` stay `AssertionError` tripwires. The
-    ladder above the warm rung takes the whole host or a whole tray down; nothing in a pytest
+    `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0` stay pinned off, and `_fire_host_reboot` stays an `AssertionError` tripwire. The
+    ladder above the warm rung takes the whole host down; nothing in a pytest
     run may reboot or power-cycle the machine it is running on. `tt-smi -r` is the ceiling.
 
 ## What the suite guarantees
