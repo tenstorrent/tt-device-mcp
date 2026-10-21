@@ -339,7 +339,6 @@ async def test_a_kill_reset_whose_full_check_still_finds_the_port_missing_never_
     I76) the ladder runs once more, its full check fails the same way, and the broker asks for exactly
     one power cycle. Nothing releases the device at any step."""
     wrapper["reset_heals"] = False
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = _stub_power_cycle(monkeypatch)
     fsm_dirty(srv, "job 7 ended timeout")
@@ -369,7 +368,6 @@ async def test_a_latched_topology_hold_whose_bound_ladder_leaves_the_port_missin
     ``fabric_known_fault``) and nothing releases the device."""
     mon = srv.health_monitor
     wrapper["reset_heals"] = False
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = _stub_power_cycle(monkeypatch)
     monkeypatch.setattr(mon, "topology_lift_pending", True)
@@ -478,7 +476,6 @@ async def test_a_reset_that_brings_the_port_back_releases_on_a_passing_verdict(w
     on the monitor's own fabric pass: the reset brings the cabled port back, the full check passes, and
     every release event carries that pass with no link short. No power cycle is asked for."""
     wrapper["reset_heals"] = True
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = _stub_power_cycle(monkeypatch)
     if path == "kill-reset":

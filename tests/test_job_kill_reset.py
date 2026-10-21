@@ -54,14 +54,14 @@ async def test_a_timeout_resets_then_runs_the_full_check_before_release(killed):
 
 
 @pytest.mark.asyncio
-async def test_a_failed_post_kill_check_stays_held_and_climbs(killed):
+async def test_a_failed_post_kill_check_stays_held_and_climbs(killed, armed_power_cycle):
     killed["reset_heals"] = False
-    srv.recovery_mechanism.last_reset_failed = True  # a prior cycle failed: the host rung is armed
+    srv.recovery_mechanism.last_reset_failed = True  # a prior cycle failed: the host rung is due
     await _gate()
     assert killed["resets"][0] == ["tt-smi", "-glx_reset"]
     assert killed["fabric"] and min(killed["fabric"]) >= 1, "every fabric pass ran after the reset"
     assert srv.fsm.state is ServerState.RECOVERING, "a failed post-kill check never releases"
-    assert killed["reboots"] == 1, "it climbs to the opted-in host rung"
+    assert armed_power_cycle == ["power-cycle"], "it climbs to the power cycle"
 
 
 @pytest.mark.asyncio
@@ -489,6 +489,35 @@ async def test_a_failed_job_that_left_the_clock_busy_owes_the_reset(runner_env, 
     debt = srv._kill_reset_debt()
     assert debt.startswith("job 936 failed with 2 chip(s) left at the busy AI clock (max 1350 MHz)")
     assert "kill_reset_owed" in runner_env["events"]
+
+
+OFF_BUS = 0xFFFFFFFF
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "clocks, want_debt",
+    [
+        ({"0": OFF_BUS, "1": 800}, ""),
+        ({"0": 6000, "1": 800}, ""),
+        ({"0": OFF_BUS, "1": 1350}, "job 938 failed with 1 chip(s) left at the busy AI clock (max 1350 MHz)"),
+    ],
+    ids=["off-bus-chip", "implausible-clock", "off-bus-beside-a-busy-chip"],
+)
+async def test_an_off_bus_clock_read_is_not_a_busy_clock(runner_env, monkeypatch, clocks, want_debt):
+    """An off-bus chip reads 0xFFFFFFFF for its AI clock. That is not a chip left open: it owes no
+    kill reset and no aiclk_busy_after_job record, and takes the off-bus path instead. A real busy
+    chip beside it still owes the reset, counted and maxed without the off-bus read."""
+    monkeypatch.setattr(srv, "chip_snapshot", lambda: {i: {"tt_aiclk": v} for i, v in clocks.items()})
+    job, runner = await _start("938", "exit 1")
+    try:
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert job.status is srv.JobStatus.FAILED and job.exit_code == 1
+    assert srv._kill_reset_debt().startswith(want_debt) and bool(srv._kill_reset_debt()) == bool(want_debt)
+    assert ("kill_reset_owed" in runner_env["events"]) == bool(want_debt)
+    assert ("aiclk_busy_after_job" in runner_env["events"]) == bool(want_debt)
 
 
 @pytest.mark.asyncio

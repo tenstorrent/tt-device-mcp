@@ -119,7 +119,7 @@ SchedulerParameters=nohold_on_prolog_fail
   (~15 s) plus a fabric traffic pass (45–100 s), let alone a bridge or mesh reset. A periodic
   SIGKILL mid-reset wedges the device it was meant to check.
 - **Un-draining after a repair is manual.** Drain survives a reboot, so a node the broker's
-  reboot rung fixed comes back still drained with a stale reason. Return it with
+  power cycle fixed comes back still drained with a stale reason. Return it with
   `scontrol update NodeName=<node> State=RESUME`.
 - **The hooks resolve `tt-device-mcp` themselves — PATH is a fallback, not the primary source.**
   Slurm's own docs: "these programs do not have a search path set." Because these hooks run as

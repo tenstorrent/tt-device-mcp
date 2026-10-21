@@ -78,7 +78,7 @@ FAULTS = (
     "operator_reset_unhealthy",
 )
 
-# constants.STAGE_NAMES, in severity order (0..3) — imported, not copied. It lives in
+# constants.STAGE_NAMES, in severity order (0..2) — imported, not copied. It lives in
 # constants.py rather than the health.recovery.stages package the names actually name: importing
 # THAT package, even one with an empty __init__.py, still runs health/recovery/__init__.py first
 # (Python always executes a parent package before a submodule), which imports this module —

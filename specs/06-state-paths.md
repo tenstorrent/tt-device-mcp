@@ -251,7 +251,6 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_STUCK_HOLD_RESET` | 1 | Kill switch: idle escalation may reset a stuck hold | 03 |
 | `TT_DEVICE_MCP_OFFBUS_HOLD_SEC` | 120 | Off-bus one-shot wait while a tenant holds the device (a tenant-free hold runs it after one sampler interval) | 03 |
 | `TT_DEVICE_MCP_OFFBUS_HOLD_ESCALATE` | 1 | Kill switch: off-bus holds escalate early | 03 |
-| `TT_DEVICE_MCP_PROGRESS_RETRY_SEC` | 60 | Delay of the one retry after a failed mesh reset that brought chips back (capped at the hold ceiling) | 04 |
 | `TT_DEVICE_MCP_PRESENT_MESH_RESET_GRACE_SEC` | 300 | Present-mesh eth/fabric hold grace before reset | 03 |
 | `TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE` | 1 | Kill switch: generic holds join the idle escalation | 03 |
 | `TT_DEVICE_MCP_IDLE_HOLDER_SEC` | 900 | Seconds a foreign holder's CPU time stays flat before it is named (event + alert, never signalled); 0 turns it off | 03 |
@@ -266,12 +265,11 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_RESET_MODE` | unset (derived from boards) | Declared platform: `galaxy`/`per-target`/`loudbox` | 04 |
 | `TT_DEVICE_MCP_RESET_ARGS` | unset | Full reset-command override (argv) | 04 |
 | `TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC` | unset → 0.5 floor | Off-bus fraction below which the gate holds instead of resetting; 0 disables the floor | 04 |
-| `TT_DEVICE_MCP_REBOOT_MIN_DEAD_FRAC` | 0.5 | Dead fraction gating the host-reboot rung | 04 |
-| `TT_DEVICE_MCP_AUTO_REBOOT` | 1 | Arm the warm host-reboot rung | 04 |
+| `TT_DEVICE_MCP_REBOOT_MIN_DEAD_FRAC` | 0.5 | Dead fraction gating the power cycle (the floor below which it never fires; the name is kept from the removed reboot rung) | 04 |
 | `TT_DEVICE_MCP_AUTO_POWER_CYCLE` | 1 | Arm the BMC power-cycle rung | 04 |
 | `TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK` | unset (off) | Opt-in command the broker runs and waits for before an auto power cycle (drain other workloads) | 04 |
 | `TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK_TIMEOUT_SEC` | 300 (max 3600) | Pre-power-cycle hook timeout; its process group is killed past it and the cycle goes ahead | 04 |
-| `TT_DEVICE_MCP_AUTO_MESH_RESET` | unset | `0` holds every automatic mesh reset, `1` arms it; unset, an outage hold (reboot and power cycle both `0`) holds it | 04 |
+| `TT_DEVICE_MCP_AUTO_MESH_RESET` | unset | `0` (the outage hold) holds every automatic mesh reset; unset or `1` arms it | 04 |
 | `TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC` | 3600 | While a held mesh reset stands, page again after this long; `0` pages once per hold | 03, 04 |
 | `TT_DEVICE_MCP_TRAY_DOWN_CAPTURE` | `1` | `0` turns off the tray-down prelude (one PCI rescan and the read-only BMC/CPLD/PCIe capture before the ladder at a tray-down onset); the ladder is the same either way | 04 |
 | `TT_DEVICE_MCP_TRAY_CPLD_BUSES` | unset | Site data for the tray-down capture: each tray's CPLD BMC I2C bus, `tray:0xNN,...`. All three CPLD vars must be set and well formed; otherwise the CPLD reads are skipped | 04 |
@@ -300,9 +298,8 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET` | 0 | Opt-in bridge reset for a gone chip | 04 |
 | `TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES` | 1 | Fabric re-check retries after a reset | 04 |
 | `TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC` | 60 | Sleep between post-reset fabric retries | 04 |
-| `TT_DEVICE_MCP_POST_REBOOT_VERIFY` | 1 | Verify the mesh actually came back after a reboot | 04 |
-| `TT_DEVICE_MCP_AUTO_RECOVERY_INTERVAL_SEC` | 3600 | Durable rate limit between auto reboot/power-cycle rungs | 04 |
-| `TT_DEVICE_MCP_BOOT_ATTRIBUTION_WINDOW_SEC` | 900 | Window to attribute a boot to our own reboot rung | 04 |
+| `TT_DEVICE_MCP_AUTO_RECOVERY_INTERVAL_SEC` | 3600 | Durable rate limit between automatic power cycles | 04 |
+| `TT_DEVICE_MCP_BOOT_ATTRIBUTION_WINDOW_SEC` | 900 | Window to attribute a boot to our own power cycle | 04 |
 | `TT_DEVICE_MCP_POLLER_SERVICES` | `tt-telemetry.service,tt-metrics-exporter.service` | Pollers quiesced around a reset; a unit the host lacks is skipped. The idle-time probe re-arms the same list, with the same default | 04, 08 |
 | `TT_DEVICE_MCP_PRE_STEP_DEADLINE_SEC` | `120` | Wall-clock cap on the reply to an external read-only health pass, **and** the base the CLI derives its pre-step client timeout from (+60 s margin) | 03/07 |
 | `TT_DEVICE_MCP_POST_STEP_DEADLINE_SEC` | `600` | Wall-clock cap on the reply to the whole post-step route — the straggler reclaim and the recovering health pass together, not the pass alone — **and** the base the CLI derives its post-step client timeout from (+60 s margin) | 03/07 |
@@ -341,7 +338,7 @@ Behavior).
 | `TTDEV_LOCK` | 0 | Apply the udev device lock at install (shared host) |
 | `TTDEV_HEALTH_PROBE` | 1 | Read by `apply-host-config.sh` from the config file: `0` disables `tt-device-health-probe.timer` (spec 08 I17), anything else enables it |
 | `TTDEV_NO_LOCK` | unset | Back-compat: force cooperative (no lock) |
-| `TTDEV_RESET_MODE`, `TTDEV_FABRIC_CHECK_CMD`, `TTDEV_ETH_HEARTBEAT_CMD`, `TTDEV_RESET_MIN_DEAD_FRAC`, `TTDEV_SELFHEAL_RELIFT`, `TTDEV_EXPECTED_CHIPS`, `TTDEV_AUTO_REBOOT`, `TTDEV_AUTO_POWER_CYCLE`, `TTDEV_PREJOB_DISPATCH`, `TTDEV_AICLK_CEILING_MHZ`, `TTDEV_AICLK_CEILING_CMD`, `TTDEV_POLLER_SERVICES` | unset | Per-host config keys; each renders the same-named `TT_DEVICE_MCP_*` unit env line (values already in the unit survive an update) |
+| `TTDEV_RESET_MODE`, `TTDEV_FABRIC_CHECK_CMD`, `TTDEV_ETH_HEARTBEAT_CMD`, `TTDEV_RESET_MIN_DEAD_FRAC`, `TTDEV_SELFHEAL_RELIFT`, `TTDEV_EXPECTED_CHIPS`, `TTDEV_AUTO_POWER_CYCLE`, `TTDEV_PREJOB_DISPATCH`, `TTDEV_AICLK_CEILING_MHZ`, `TTDEV_AICLK_CEILING_CMD`, `TTDEV_POLLER_SERVICES` | unset | Per-host config keys; each renders the same-named `TT_DEVICE_MCP_*` unit env line (values already in the unit survive an update) |
 | `TTDEV_FABRIC_DESCRIPTOR` | galaxy: shipped descriptor; else unset | Cabling descriptor for the fabric check (src, fabric.py) |
 | `TTDEV_FABRIC_BIN` | validator `run_cluster_validation` | Fabric validator binary override (src) |
 | `TTDEV_FABRIC_RUNTIME_ROOT` | validator `current/` | `TT_METAL_HOME` for the fabric check (src) |

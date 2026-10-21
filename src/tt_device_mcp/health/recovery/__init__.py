@@ -65,7 +65,6 @@ BLOCKED = "blocked"
 BELOW_FLOOR = "below_floor"
 STAGE_BRIDGE_RESET = constants.STAGE_BRIDGE_RESET
 STAGE_SMI_RESET = constants.STAGE_SMI_RESET
-STAGE_HOST_REBOOT = constants.STAGE_HOST_REBOOT
 STAGE_POWER_CYCLE = constants.STAGE_POWER_CYCLE
 
 # Recovery.escalate's outcome.
@@ -80,7 +79,7 @@ OUTCOME_TERMINAL = "terminal"
 BRIDGE_RESET_MAX_TRIES = 3
 BRIDGE_RESET_SETTLE_SEC = 4
 # The bridge rung's reason for a removed chip whose every recorded-bridge SBR fired and left it off
-# the bus (spec 04 I69); _classify_hold reads it as no window, like no_bridge.
+# the bus (spec 04 I69): no SBR brings it back, the same no-window fact as no_bridge.
 NO_WINDOW_REMOVED_REASON = "removed_not_reenumerated"
 
 # A reset returns before the eth links re-train, so the immediate post-reset fabric pass can find
@@ -159,14 +158,6 @@ class Evidence:
     # Spec 03 I55: the fabric passed traffic but mesh dispatch failed over a present mesh, and this
     # hold episode has not had its one present-mesh reset yet (nor does the outage hold forbid it).
     dispatch_reset_due: bool = False
-    # ladder-v2: the per-chip SBR outcome the bridge rung produced THIS pass — chip id ->
-    # ``{"reason": "no_bridge"}`` for every chip whose secondary bus reset could not fire because
-    # the endpoint left the bus (no bridge to write to). Threaded by the server's ``replace(ev, …)``
-    # AFTER the bridge rung fires (from ``Recovery.last_bridge_reset_reasons``), read only by the
-    # BELOW_FLOOR gate decision to classify the hold (:func:`galaxy._classify_hold`). ``next_stage``
-    # never reads it — the router stays pure; only the gate's below-floor handling does. None when no bridge
-    # rung ran this pass, which reads as "window unknown" -> the generic branch.
-    bridge_reset_failed: Optional[dict] = None
     # This hold episode's galaxy reset already REGRESSED the off-bus count (spec 04 I31): a failed
     # reset on it is warm-reboot-futile even when this pass's own count did not grow.
     episode_reset_regressed: bool = False
@@ -201,8 +192,7 @@ class RecoveryDeps:
     begin_action_row: Callable[[str, str], None]
     write_action_log: Callable[[str, str, float, str, Optional[int]], None]
     device_hold_episode_since: Callable[[], str]
-    # GalaxyRecovery's host-escalation ladder (reboot/power-cycle opt-ins + the loop-guard read):
-    auto_reboot_enabled: Callable[[], bool]
+    # GalaxyRecovery's host-escalation ladder (the power-cycle opt-in; spec 04 I71):
     auto_power_cycle_enabled: Callable[[], bool]
     # HealthMonitor's own probes (verify_fabric_health/verify_eth_heartbeat): the job-killing
     # ladder and the module logger both live in server.py, not in the health package, so they are
@@ -252,11 +242,10 @@ class RecoveryDeps:
     # recover, not just the one (_reset_and_verify_device) that happens to also flip a
     # RecoveryMechanism-wide flag another, unrelated reset could have set.
     device_degraded: Callable[[], bool]
-    # The two host-level rungs' OTHER half — GalaxyRecovery gets _auto_reboot_host (it is
-    # Galaxy-only in practice); the chassis power cycle and the loud whole-bus event stay
+    # The host rung's OTHER half — the chassis power cycle and the loud whole-bus event stay
     # server-owned (the gate journals that event itself, and the power cycle's ledger row and job
     # entry are server state), so they are injected rather than moved.
-    # Returns False when the cycle certainly did not launch (spec 04 I71: the in-band fallback).
+    # Returns False when the cycle certainly did not launch (spec 04 I71: hold, page, retry).
     auto_power_cycle_host: Callable[[Callable, str], Awaitable[Optional[bool]]]
     emit_all_off_bus_power_cycle_required: Callable[[Callable, int, int, str], None]
     host_escalation_kwargs: Callable[[], dict]
@@ -459,8 +448,7 @@ class Recovery(ABC):
         """
         # ladder-v2: the per-chip SBR window this rung reads, chip id -> {"reason": "no_bridge"} for
         # every chip whose reset could not fire because the endpoint left the bus. Reset FRESH every
-        # call (before the empty-set early return), so a later gate never classifies a hold on a
-        # stale prior pass; the server threads it onto Evidence.bridge_reset_failed after this fires.
+        # call (before the empty-set early return), so a later reader never sees a stale prior pass.
         self.last_bridge_reset_reasons: dict = {}
         isolated_chips = self.deps.isolated_chips()
         # Spec 04 I69: every chip the broker removed is off the bus and un-reset, so it is a target
@@ -560,10 +548,8 @@ class Recovery(ABC):
                 continue
             if not sbr:
                 inapplicable.append(idx)
-                # NOT no_bridge: that means the endpoint left the bus, which is the drop measured
-                # never to return and the one _classify_hold escalates straight to a power cycle
-                # on. Nothing was written here, so the window is unproven — a distinct reason
-                # keeps it out of that class rather than licensing the sweep on an untested chip.
+                # NOT no_bridge: that means the endpoint left the bus. Nothing was written here,
+                # so the window is unproven, and a distinct reason says so.
                 self.last_bridge_reset_reasons[idx] = {"reason": "no_privilege"}
                 # blocked, not not_applicable: metrics.STAGE_OUTCOMES reserves not_applicable for
                 # a platform fact that will never change. A missing euid or package is the most
@@ -617,8 +603,8 @@ class Recovery(ABC):
                 lost.append(idx)
                 if idx in reset_this_pass:
                     # A chip the broker removed, reset through its recorded bridge on every try and
-                    # still off the bus: no SBR brings it back, the same no-window fact as no_bridge,
-                    # so its hold keeps its off-bus class (galaxy._classify_hold, spec 04 I69).
+                    # still off the bus: no SBR brings it back, the same no-window fact as no_bridge
+                    # (spec 04 I69).
                     self.last_bridge_reset_reasons[idx] = {"reason": NO_WINDOW_REMOVED_REASON}
                 metrics.stage_fired("bridge_reset", "failed")
 
@@ -900,7 +886,7 @@ class Recovery(ABC):
             if rc is not None:
                 self.mechanism.last_reset_failed = True
                 self.mechanism.last_reset_exit_nonzero = True
-                self.mechanism.mesh_reset_failed_since_release = True
+                self.mechanism.mark_mesh_reset_failed()
             metrics.stage_fired("smi_reset", "timeout" if rc is None else "failed")
             if rc is not None and arc_retry and await self._arc_not_ready_retry_due(argv, expected, log):
                 # The retry is this same gated path (host gate, outage hold, cooldown clock, full verify
@@ -948,7 +934,7 @@ class Recovery(ABC):
         )
         self.mechanism.last_reset_failed = not healthy
         if not healthy:
-            self.mechanism.mesh_reset_failed_since_release = True
+            self.mechanism.mark_mesh_reset_failed()
         if healthy:
             log("reset complete + health verified")
             return True

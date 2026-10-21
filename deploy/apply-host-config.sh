@@ -114,16 +114,14 @@ AICLK_CEILING="${TTDEV_AICLK_CEILING_MHZ:-}"
 [ -z "$AICLK_CEILING" ] && [ -r "$UNIT" ] && AICLK_CEILING="$(sed -n 's/^Environment=TT_DEVICE_MCP_AICLK_CEILING_MHZ=//p' "$UNIT" 2>/dev/null | head -1)"
 AICLK_CEILING_CMD="${TTDEV_AICLK_CEILING_CMD:-}"
 [ -z "$AICLK_CEILING_CMD" ] && [ -r "$UNIT" ] && AICLK_CEILING_CMD="$(sed -n 's/^Environment=TT_DEVICE_MCP_AICLK_CEILING_CMD=//p' "$UNIT" 2>/dev/null | head -1)"
-# The cold rungs — the TOP of the recovery cascade. server.py reads TT_DEVICE_MCP_AUTO_REBOOT (warm
-# reboot) and TT_DEVICE_MCP_AUTO_POWER_CYCLE (BMC power cycle), each default ON (unset or any value
-# but "0" leaves the rung armed; only "0" disarms it). Unset renders no line, leaving both rungs armed
-# at their code default, so a host never ends in a permanent hold because nobody armed them. This
-# passthrough is the opt-OUT path for a host where an unattended reboot or power cycle is worse than a
-# stuck queue (nothing else sources /etc/default into the broker process). The power-cycle preflight
-# still requires ipmitool wherever AUTO_POWER_CYCLE is on. Unit-read fallback mirrors the others so an
-# auto-update never drops a value an operator already set.
-AUTO_REBOOT="${TTDEV_AUTO_REBOOT:-}"
-[ -z "$AUTO_REBOOT" ] && [ -r "$UNIT" ] && AUTO_REBOOT="$(sed -n 's/^Environment=TT_DEVICE_MCP_AUTO_REBOOT=//p' "$UNIT" 2>/dev/null | head -1)"
+# The host rung — the TOP of the recovery cascade. server.py reads TT_DEVICE_MCP_AUTO_POWER_CYCLE (BMC
+# power cycle, the only host rung), default ON (unset or any value but "0" leaves the rung armed; only
+# "0" disarms it). Unset renders no line, leaving the rung armed at its code default, so a host never
+# ends in a permanent hold because nobody armed it. Nothing else sources /etc/default into the broker
+# process. The power-cycle preflight still requires ipmitool wherever AUTO_POWER_CYCLE is on. Unit-read
+# fallback mirrors the others so an auto-update never drops a value an operator already set. There is
+# no warm reboot rung, so no TT_DEVICE_MCP_AUTO_REBOOT line is rendered and a stale TTDEV_AUTO_REBOOT
+# key is dropped from /etc/default below.
 AUTO_POWER_CYCLE="${TTDEV_AUTO_POWER_CYCLE:-}"
 [ -z "$AUTO_POWER_CYCLE" ] && [ -r "$UNIT" ] && AUTO_POWER_CYCLE="$(sed -n 's/^Environment=TT_DEVICE_MCP_AUTO_POWER_CYCLE=//p' "$UNIT" 2>/dev/null | head -1)"
 # The pre-job dispatch probe opt-in. server.py reads TT_DEVICE_MCP_PREJOB_DISPATCH ("1" arms it),
@@ -155,7 +153,6 @@ hb_env=""; [ -n "$HEARTBEAT" ] && hb_env="Environment=TT_DEVICE_MCP_ETH_HEARTBEA
 floor_env=""; [ -n "$RESET_FLOOR" ] && floor_env="Environment=TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC=$RESET_FLOOR"
 relift_env=""; [ -n "$RELIFT" ] && relift_env="Environment=TT_DEVICE_MCP_SELFHEAL_RELIFT=$RELIFT"
 expected_env=""; [ -n "$EXPECTED_CHIPS" ] && expected_env="Environment=TT_DEVICE_MCP_EXPECTED_CHIPS=$EXPECTED_CHIPS"
-autoreboot_env=""; [ -n "$AUTO_REBOOT" ] && autoreboot_env="Environment=TT_DEVICE_MCP_AUTO_REBOOT=$AUTO_REBOOT"
 autopc_env=""; [ -n "$AUTO_POWER_CYCLE" ] && autopc_env="Environment=TT_DEVICE_MCP_AUTO_POWER_CYCLE=$AUTO_POWER_CYCLE"
 prejobdispatch_env=""; [ -n "$PREJOB_DISPATCH" ] && prejobdispatch_env="Environment=TT_DEVICE_MCP_PREJOB_DISPATCH=$PREJOB_DISPATCH"
 pollers_env=""; [ -n "$POLLER_SERVICES" ] && pollers_env="Environment=TT_DEVICE_MCP_POLLER_SERVICES=$POLLER_SERVICES"
@@ -188,7 +185,7 @@ if [ -z "$RENDER_ONLY" ]; then
     ensure_default TTDEV_RESET_MIN_DEAD_FRAC "$RESET_FLOOR"
     ensure_default TTDEV_SELFHEAL_RELIFT "$RELIFT"
     ensure_default TTDEV_EXPECTED_CHIPS "$EXPECTED_CHIPS"
-    ensure_default TTDEV_AUTO_REBOOT "$AUTO_REBOOT"
+    sed -i '/^TTDEV_AUTO_REBOOT=/d' /etc/default/tt-device-broker 2>/dev/null || true
     ensure_default TTDEV_AUTO_POWER_CYCLE "$AUTO_POWER_CYCLE"
     ensure_default TTDEV_PREJOB_DISPATCH "$PREJOB_DISPATCH"
     ensure_default TTDEV_ETH_CHECK_PYTHON "$ETH_PYTHON"
@@ -239,7 +236,6 @@ $hb_env
 $floor_env
 $relift_env
 $expected_env
-$autoreboot_env
 $autopc_env
 $prejobdispatch_env
 $pollers_env

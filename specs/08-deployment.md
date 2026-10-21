@@ -265,7 +265,7 @@ table. Two key groups: pipeline config (`TTDEV_ROOT`, `TTDEV_VENV`, `TTDEV_AUTOU
 `TTDEV_BRANCH`) consumed by the scripts themselves, and per-host
 broker knobs (`TTDEV_RESET_MODE`, `TTDEV_FABRIC_CHECK_CMD`, `TTDEV_FABRIC_DESCRIPTOR`,
 `TTDEV_ETH_HEARTBEAT_CMD`, `TTDEV_RESET_MIN_DEAD_FRAC`, `TTDEV_SELFHEAL_RELIFT`,
-`TTDEV_EXPECTED_CHIPS`, `TTDEV_AUTO_REBOOT`, `TTDEV_AUTO_POWER_CYCLE`,
+`TTDEV_EXPECTED_CHIPS`, `TTDEV_AUTO_POWER_CYCLE`,
 `TTDEV_PREJOB_DISPATCH`, `TTDEV_ETH_CHECK_PYTHON`, `TTDEV_POLLER_SERVICES`) that `apply-host-config.sh` renders into
 same-named `Environment=TT_DEVICE_MCP_*` (or `TTDEV_*`) unit lines. An unset knob renders **no
 line** (the code default rules); a set knob reaches the unit verbatim. This rendering is the ONLY

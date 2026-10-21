@@ -23,7 +23,6 @@ from tests.test_no_repeat_failed_rung import (
     ONE_SHOT,
     RESET_SEC,
     _beats_with_off,
-    _drive_progress_retry_watchdog,
     _episode,
     _false,
     _window,
@@ -33,7 +32,6 @@ from tt_device_mcp.health.recovery import base
 
 RESCAN = Path("/sys/bus/pci/rescan")
 GLX_OK_SEC = 62  # a mesh reset whose driver wait finds every chip
-PROGRESS_RETRY_SEC = 60  # spec 04 I39: the retry comes due 60 s after the failed reset
 B1_BUDGET_SEC = 6 * 60
 SETTLE = "\x1b[93mWaiting for 30 seconds: 0\x1b[0m" + "".join(
     f"\r\x1b[93mWaiting for 30 seconds: {i}\x1b[0m" for i in range(1, 31)
@@ -117,8 +115,6 @@ async def test_b1_replay_one_mesh_reset_heals_an_isolated_chip_inside_the_budget
     ONE_SHOT + 263 + 60 + 62 = 505 s against a 360 s budget."""
     clock = [ONE_SHOT]
     counters, events, _ = _episode(monkeypatch, power_cycle=True, clock=clock, off_bus=1)
-    monkeypatch.setattr(srv.recovery_mechanism, "progress_retry", None)
-    monkeypatch.setattr(srv.recovery_mechanism, "progress_retry_spent_since", "")
     hw = _hw()
     monkeypatch.setattr(srv, "read_heartbeats", lambda: _beats_with_off(hw["off"]))
     srv.isolated_chips = {"31"}
@@ -141,10 +137,6 @@ async def test_b1_replay_one_mesh_reset_heals_an_isolated_chip_inside_the_budget
     _real_reset_path(monkeypatch, hw, clock)
 
     assert await _window() is True
-    if srv.recovery_mechanism.progress_retry is not None:  # the old path: the first reset failed
-        assert _drive_progress_retry_watchdog(monkeypatch) == ["progress_retry"]
-        clock[0] += PROGRESS_RETRY_SEC
-        assert await _window() is True
 
     assert clock[0] <= B1_BUDGET_SEC, f"B1 time to recover {clock[0]:.0f}s is over its {B1_BUDGET_SEC}s budget"
     assert [r for r in hw["resets"] if "-glx_reset" in r] == hw["resets"]
