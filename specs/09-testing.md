@@ -78,6 +78,14 @@ gets through anyway.
     pinned True (the default-armed shape the ladder tests assert) and
     `recovery_mechanism.scope_active` pinned False (unstubbed it asks the real host's
     systemd, which failed three sampler tests on a box mid-incident and nowhere else).
+  - **Holder scan**: `device_holders.DRIVER_PROC_DIR` (tt-kmd's holder record) and
+    `device_holders.DEVICE_DIR` (the real `/dev/tenstorrent` that the `/proc` fd walk matches
+    each fd against) point at paths that cannot exist; the cgroup reads (`SCOPE_PROC_DIR`,
+    `job_reap.LEFTOVER_PROC_DIR`) at empty dirs. Without the `DEVICE_DIR` seal, any real process
+    of uid >= 1000 holding the device on the host running the suite read as a live tenant: the
+    runner's holder wait kept a test's job queued and the hold bound's host rung was blocked, so
+    tests failed only while the host ran device work. A test about holders stages its own dir and
+    points these at it.
 - **I2** — A spawn tripwire hard-fails any test that would hand a device-touching command
   to the kernel. The seam is the process-spawn layer — `subprocess.Popen.__init__` and
   `asyncio.create_subprocess_exec` are both wrapped — rather than each caller, so a caller
@@ -129,7 +137,14 @@ gets through anyway.
 - **I7** — Process globals are isolated per test. The autouse `isolate_process_globals`
   fixture restores `os.environ` and `sys.argv` around every test, because code under test
   (`cmd_daemon_start`, `start-fg`) writes them directly and `monkeypatch` cannot undo a
-  write to a name it did not set.
+  write to a name it did not set. The autouse `init_async_primitives` fixture clears the
+  broker's process-wide job, hold, hold-bound (spec 04 I76) and escalation state before and
+  after every test through `server._reset_for_testing`: the queue and lock, the jobs dict, the
+  hold and action rows, hold-episode latches, the hold-escalation buckets, latches and kind,
+  the hold-bound ladder, host-rung and tenant latches, the shared recovery mechanism's class-A
+  ladder anchor and kill-reset debt; the autouse `isolate_device_state` resets `chip_state`
+  (lost/recovering marks and its configured chip sources). No result depends on test order or on the xdist
+  worker a test lands on. A new global of this kind is added to `_reset_for_testing` with it.
 - **I8** — Real hardware is reachable only under the `device` marker, and only for the
   non-destructive-to-the-host subset. A bare-metal, privsep, systemd-managed broker cannot be
   proved correct entirely in a sandbox; `@pytest.mark.device` is how a test says it needs the
@@ -211,8 +226,8 @@ owning spec's `## Test anchors` table with the new node ids.
   pokes. Fake probe evidence is a plain dict folded through `HealthState.from_evidence`.
 - `health_deps` (fixture) builds a `RecoveryDeps` late-bound onto `srv`'s own globals, so a
   `Recovery`/`HealthMonitor` constructed in a test still sees the test's monkeypatches.
-- `clear_job_state` (fixture, not autouse) resets the jobs dict, queue, and async
-  primitives for runner tests.
+- `clear_job_state` (fixture, not autouse) only adds a drain of the job queue before and
+  after a runner test; the autouse reset (I7) already clears the rest.
 - Shell-script tests use `tests/deploy_helpers.py`: `_statements()` joins
   backslash-continued lines into logical statements, `_one(script, *needles)` asserts
   exactly one statement matches — tests assert on the statement, they never execute the
@@ -447,6 +462,7 @@ own claims that are pinned:
 | I5 (state dir overridable so tests never touch the live one) | `tests/test_install_modes.py::test_the_state_dir_is_overridable_so_tests_never_touch_the_live_one` |
 | I6 (import purity — boot off import) | `tests/test_boot_platform.py::test_importing_the_server_never_touches_the_device` |
 | I1 (probe reads sealed sysfs, not silicon) | `tests/test_device_safety.py::test_heartbeat_probe_touches_no_device` |
+| I1 (holder scan sealed: a real holder of the host's `/dev/tenstorrent` is no holder in a test) | `tests/test_test_isolation.py::test_a_real_device_holder_on_the_host_is_not_a_holder_in_a_test` |
 | I1 (env seal: armed flag never inherited from a stale environment) | `tests/test_rung_arming.py::test_the_armed_flag_is_not_inherited_from_a_stale_environment` |
 | I2 (never-list refused even under the marker) | `tests/test_device_marker.py::test_the_never_spawn_list_is_refused_even_under_the_device_marker` |
 | I2 (`tt-smi`/`systemd-run` refused unmarked, permitted marked) | `tests/test_device_marker.py::test_the_device_only_list_is_refused_unmarked_and_permitted_marked` |
@@ -454,6 +470,8 @@ own claims that are pinned:
 | I2 (quiescing a declared poller is the one systemctl exception) | `tests/test_device_marker.py::test_quiescing_a_declared_poller_is_permitted_only_under_the_marker` |
 | I2 (the poller exception cannot launder another unit) | `tests/test_device_marker.py::test_the_poller_exception_does_not_extend_to_other_units` |
 | I2 (`systemd-run` cannot launder a never-list payload) | `tests/test_device_marker.py::test_systemd_run_is_permitted_under_the_marker_only_for_what_it_wraps` |
+| I7 (the per-test reset clears every job, hold, hold-bound and escalation global) | `tests/test_test_isolation.py::test_the_per_test_reset_clears_every_hold_bound_and_escalation_global` |
+| I7 (the pairs that leaked state pass with the leaking test first: `tests/test_hold_bound.py::test_a_stuck_hold_event_past_the_bound_never_reads_escalated_false` then `::test_a_latched_i42_hold_still_escalates_and_its_latch_is_lifted`; `tests/test_power_cycle_ac_needed.py::test_the_watchdog_starts_the_class_a_ladder_at_the_10_min_mark` then `::test_the_full_ladder_runs_10_min_after_the_last_cycle_or_boot_then_the_cycle`; `tests/test_chip_state.py::test_the_published_state_is_atomic_and_names_every_expected_chip` then `::test_a_re_created_node_is_read_at_once_and_a_valid_read_clears_lost`) | `tests/test_test_isolation.py::test_the_leaking_pairs_pass_with_the_leaking_test_first` |
 | I8 (the gate reads real `/dev`, never the sandboxed attribute) | `tests/test_device_marker.py::test_the_device_gate_reads_the_real_dev_dir_not_the_sandboxed_one` |
 | I8 (no chips, or no dir, means no device) | `tests/test_device_marker.py::test_no_chips_means_no_device`, `::test_an_absent_dev_dir_means_no_device` |
 | I8 (the marker is registered, so `-m device` selects it) | `tests/test_device_marker.py::test_the_device_marker_is_registered` |

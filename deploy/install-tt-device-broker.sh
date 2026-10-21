@@ -139,6 +139,28 @@ echo "==> apply host config (unit + watchdog + sudoers + reconcile units + hooks
 # manual installer re-run.
 bash "$REPO/deploy/apply-host-config.sh" "$REPO"
 
+# Spec 08 I25: the broker's first start comes only after the pinned fabric validator is built. A
+# broker started without it gets a 77 from its startup fabric pass and holds the device
+# fabric-unverified until the build lands, so a fresh install never comes up verified. On an
+# upgrade the old `current` stays in place until the new build flips it, so only a host with no
+# validator at all waits here. apply-host-config kicked the build with --no-block; this `start`
+# joins that run (or starts one) and returns when it ends. A failed build fails the install, and
+# the broker is not (re)started on a host whose fabric it cannot check.
+validator_built() {
+    local cur="$R/validator/current"
+    [ -x "$cur/build/tools/scaleout/run_cluster_validation" ] \
+        && [ -x "$cur/build/programming_examples/distributed/distributed_program_dispatch" ] \
+        && [ -x "$cur/build/programming_examples/metal_example_add_2_integers_in_compute" ] \
+        && { [ -z "$FABRIC_DESCRIPTOR" ] || [ -f "$FABRIC_DESCRIPTOR" ]; }
+}
+if ! validator_built; then
+    echo "==> build the pinned fabric validator before the broker starts (first install: can take tens of minutes)"
+    systemctl start tt-device-fabric-validator.service \
+        || { echo "install: fabric validator build failed — broker NOT started. Check: journalctl -u tt-device-fabric-validator -e" >&2; exit 1; }
+    validator_built \
+        || { echo "install: fabric validator build finished but $R/validator/current is incomplete — broker NOT started. Check: journalctl -u tt-device-fabric-validator -e" >&2; exit 1; }
+fi
+
 # `enable --now` does not restart an already-active unit, so an upgrade needs the explicit restart
 # to leave the rebuilt venv running.
 systemctl enable tt-device-broker

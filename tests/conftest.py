@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -62,8 +63,21 @@ def reset_post_reset_fabric_debt():
     from tt_device_mcp.health.post_reset import FABRIC_DEBT
 
     FABRIC_DEBT.owed = ""
+    FABRIC_DEBT.pass_monotonic = 0.0
     yield
     FABRIC_DEBT.owed = ""
+    FABRIC_DEBT.pass_monotonic = 0.0
+
+
+@pytest.fixture(autouse=True)
+def reset_removed_chip_records():
+    """Clear the record of chips the broker removed (spec 04 I69) around every test: a chip one test
+    isolated must not read as removed, and so withhold the rescan, in the next."""
+    from tt_device_mcp.health.monitors import pci
+
+    pci.REMOVED_CHIPS.clear()
+    yield
+    pci.REMOVED_CHIPS.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -163,13 +177,35 @@ def device_marked(request) -> bool:
     return True
 
 
+class _FlatTmpDirs:
+    """A fresh empty dir per call, made in one session dir without listing it.
+
+    `tmp_path_factory.mktemp()` lists its whole base dir to pick the next number, so its cost grows
+    with every dir the run has made. The isolation below makes about 20 dirs per test; through
+    `mktemp` that made each test slower than the last (about 1 s each by the end of a CI run, and
+    the job hit its time limit). `tempfile.mkdtemp` picks a random name instead: constant cost.
+    """
+
+    def __init__(self, root: Path):
+        self._root = root
+
+    def mktemp(self, basename: str) -> Path:
+        return Path(tempfile.mkdtemp(prefix=f"{basename}-", dir=self._root))
+
+
+@pytest.fixture(scope="session")
+def isolation_tmp_root(tmp_path_factory):
+    """The one dir every test's isolation dirs go in; pytest's basetemp retention cleans it."""
+    return tmp_path_factory.mktemp("isolation")
+
+
 @pytest.fixture(scope="session")
 def device_probe_cache_root(tmp_path_factory):
     """One tt-metal cache dir for every device test in the run — see _redirect_probe_caches."""
     return tmp_path_factory.mktemp("device-probe-cache")
 
 
-def _seal_real_hardware(monkeypatch, tmp_path_factory):
+def _seal_real_hardware(monkeypatch, tmp_dirs):
     """Hide the host's real hardware from a test that did not declare it needs hardware.
 
     Every patch here answers the same question — can this test see or reach real silicon —
@@ -177,7 +213,7 @@ def _seal_real_hardware(monkeypatch, tmp_path_factory):
     fixture body for exactly that reason: the seals that remain there are about durable
     broker state and the destructive rungs, which no marker ever lifts.
     """
-    monkeypatch.setattr(pci, "SYSFS_CLASS_DIR", tmp_path_factory.mktemp("sysfs"))
+    monkeypatch.setattr(pci, "SYSFS_CLASS_DIR", tmp_dirs.mktemp("sysfs"))
     # A host running this suite may have the real pinned fabric validator installed at the
     # default TTDEV_VALIDATOR_ROOT (see health.monitors.fabric.build_command) — point it at an
     # empty dir so an unset TT_DEVICE_MCP_FABRIC_CHECK_CMD reliably resolves to "no built-in
@@ -186,7 +222,7 @@ def _seal_real_hardware(monkeypatch, tmp_path_factory):
     # so clearing VROOT alone is not a real sandbox while any of them could be ambient (a leaked
     # setenv from another test, a host-level env file) — clear all three, and the override
     # command itself, so every test starts from the same "nothing configured or installed" floor.
-    monkeypatch.setenv("TTDEV_VALIDATOR_ROOT", str(tmp_path_factory.mktemp("no-fabric-validator")))
+    monkeypatch.setenv("TTDEV_VALIDATOR_ROOT", str(tmp_dirs.mktemp("no-fabric-validator")))
     monkeypatch.delenv("TTDEV_FABRIC_BIN", raising=False)
     monkeypatch.delenv("TTDEV_FABRIC_RUNTIME_ROOT", raising=False)
     monkeypatch.delenv("TTDEV_FABRIC_DESCRIPTOR", raising=False)
@@ -214,7 +250,7 @@ def _seal_real_hardware(monkeypatch, tmp_path_factory):
     # and a leaked armed flag flips every disarmed-skip test into the armed path.
     monkeypatch.delenv("TTDEV_ETH_CHECK_ARMED", raising=False)
     monkeypatch.delenv("TTDEV_ETH_CHECK_ALLOW_KNOWN_BROKEN", raising=False)
-    monkeypatch.setattr(eth, "DEFAULT_ETH_VENV_PYTHON", str(tmp_path_factory.mktemp("no-eth-venv") / "bin" / "python"))
+    monkeypatch.setattr(eth, "DEFAULT_ETH_VENV_PYTHON", str(tmp_dirs.mktemp("no-eth-venv") / "bin" / "python"))
     # eth._probe_path()'s two remaining candidates, same rationale: TTDEV_ROOT defaults to
     # /opt/tt-device-broker, and this box's real broker install genuinely has a real
     # eth-heartbeat-probe.py staged there — sandboxed to an empty dir so that candidate misses.
@@ -222,17 +258,17 @@ def _seal_real_hardware(monkeypatch, tmp_path_factory):
     # has deploy/tt-device-eth-heartbeat-probe.py too — patched to an empty dir for the same
     # reason DEFAULT_ETH_VENV_PYTHON is: a test must never resolve a real, executable probe path
     # by construction, not by this box happening not to have one where a candidate looks.
-    monkeypatch.setenv("TTDEV_ROOT", str(tmp_path_factory.mktemp("no-eth-install-root")))
-    monkeypatch.setattr(eth, "_REPO_ROOT", tmp_path_factory.mktemp("no-eth-repo-checkout"))
+    monkeypatch.setenv("TTDEV_ROOT", str(tmp_dirs.mktemp("no-eth-install-root")))
+    monkeypatch.setattr(eth, "_REPO_ROOT", tmp_dirs.mktemp("no-eth-repo-checkout"))
     # PCI_DEVICES_DIR defaults to the REAL /sys/bus/pci/devices, read at import time (so an env
     # var set here would arrive too late) — every test that reaches chip_node_present() without
     # patching this itself would otherwise read this box's own live PCI topology. A default here
     # does not disturb the ~14 tests that already patch it to their own scenario-specific dir:
     # their own monkeypatch.setattr runs later, in the test body, and simply overrides this one.
-    monkeypatch.setattr(pci, "PCI_DEVICES_DIR", tmp_path_factory.mktemp("no-pci-devices"))
+    monkeypatch.setattr(pci, "PCI_DEVICES_DIR", tmp_dirs.mktemp("no-pci-devices"))
     # pcie_guard reads sysfs under SYS_ROOT (the between-jobs check records the PCI topology):
     # an empty root, for the same reason.
-    monkeypatch.setattr(pcie_guard, "SYS_ROOT", tmp_path_factory.mktemp("no-sys-root"))
+    monkeypatch.setattr(pcie_guard, "SYS_ROOT", tmp_dirs.mktemp("no-sys-root"))
     # TT_DEV_DIR defaults to the REAL /dev/tenstorrent and is read fresh by _present_chip_indices()
     # on every call — on a build host with actual hardware (unlike CI, which has none) a test that
     # never sets this itself silently probes the real device count instead of the scenario it
@@ -240,7 +276,7 @@ def _seal_real_hardware(monkeypatch, tmp_path_factory):
     # an empty dir here for the same reason PCI_DEVICES_DIR is above; the ~40+ tests that already
     # patch it to their own scenario-specific dir are unaffected — their own monkeypatch.setattr
     # runs later, in the test body, and simply overrides this default.
-    monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path_factory.mktemp("no-dev-tenstorrent")))
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_dirs.mktemp("no-dev-tenstorrent")))
     # reclaim_foreign_holders' default identity check reads the REAL /proc/<pid>/stat for
     # whatever pid a test's fake HolderScan names — a fake pid that happens to exist as a real
     # process on the host running the suite (kernel threads like 100/200 are common, and 4242 has
@@ -259,16 +295,22 @@ def _seal_real_hardware(monkeypatch, tmp_path_factory):
     # machine ran it. Pointed at a path that cannot exist, which makes _driver_holder_pids decline
     # and every unmarked test exercise the walk, exactly as before this route existed. A test about
     # the driver route stages its own directory and points this at it.
-    monkeypatch.setattr(device_holders, "DRIVER_PROC_DIR", str(tmp_path_factory.mktemp("no-tt-driver-proc") / "absent"))
+    monkeypatch.setattr(device_holders, "DRIVER_PROC_DIR", str(tmp_dirs.mktemp("no-tt-driver-proc") / "absent"))
     # The leftover fence (01 I16) reads the REAL /proc/<pid>/cgroup of whatever holder a scan names
     # — on a broker host a live job's pid sits in a real ttdev-job-<id>.scope this suite never
     # started, and would read as a reaped job's leftover that refuses the test's reset. Pointed at
     # an empty dir; a test about the fence stages its own. Its per-process state starts empty.
-    monkeypatch.setattr(job_reap, "LEFTOVER_PROC_DIR", str(tmp_path_factory.mktemp("no-leftover-proc")))
+    monkeypatch.setattr(job_reap, "LEFTOVER_PROC_DIR", str(tmp_dirs.mktemp("no-leftover-proc")))
     # The tenant rule reads a holder's REAL /proc/<pid>/cgroup at scan time for the same reason: on a
     # broker host a live job's pid would read as scoped. Empty dir; a test about scopes stages its own.
-    monkeypatch.setattr(device_holders, "SCOPE_PROC_DIR", str(tmp_path_factory.mktemp("no-scope-proc")))
+    monkeypatch.setattr(device_holders, "SCOPE_PROC_DIR", str(tmp_dirs.mktemp("no-scope-proc")))
     monkeypatch.delenv(device_holders.TENANT_UIDS_ENV, raising=False)
+    # The fd walk reads the REAL /proc and matches each fd against DEVICE_DIR, which defaults to the
+    # REAL /dev/tenstorrent: on a device host, any real job or service of a uid >= 1000 that has the
+    # device open reads as a live tenant, so a test that runs a job, a rung or a hold through the
+    # holder gate waits on it or sees its rung blocked, depending on what the host runs right then.
+    # Pointed at a path that cannot exist, like DRIVER_PROC_DIR; a test about holders stages its own.
+    monkeypatch.setattr(device_holders, "DEVICE_DIR", "/nonexistent/tt-device-mcp-test/dev-tenstorrent")
     monkeypatch.setattr(srv, "reaped_survivors", {})
     monkeypatch.setattr(srv, "_leftover_fence_detail", "")
     monkeypatch.setattr(srv, "_leftover_unkillable_since", None)
@@ -278,6 +320,8 @@ def _seal_real_hardware(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(srv, "_leftover_rung_stage", "")
     monkeypatch.setattr(srv, "_leftover_rung_detail", "")
     monkeypatch.setattr(srv, "_leftover_rung_task", None)
+    # The pollers a quiesce stopped and owes a restore. None: read again from the per-test health dir.
+    monkeypatch.setattr(srv, "_pollers_to_restore", None)
     # The reset argv/mode env vars are read live (never cached), so an operator's own shell/CI
     # environment leaks straight into whatever argv a test builds — cleared here for a
     # deterministic floor; a test exercising a declared mode/override sets it itself afterward.
@@ -317,7 +361,7 @@ def _seal_real_hardware(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
 
 
-def _redirect_probe_caches(monkeypatch, tmp_path_factory, device_marked, session_root):
+def _redirect_probe_caches(monkeypatch, tmp_dirs, device_marked, session_root):
     """Keep the fabric and eth probes off the real /var/cache, marker or not.
 
     Both default to a hardcoded real /var/cache/tt-device-broker path and mkdir it, so this is
@@ -328,14 +372,14 @@ def _redirect_probe_caches(monkeypatch, tmp_path_factory, device_marked, session
     if device_marked:
         fabric, eth_cache = session_root / "fabric", session_root / "eth"
     else:
-        fabric = tmp_path_factory.mktemp("no-fabric-cache")
-        eth_cache = tmp_path_factory.mktemp("no-eth-cache")
+        fabric = tmp_dirs.mktemp("no-fabric-cache")
+        eth_cache = tmp_dirs.mktemp("no-eth-cache")
     monkeypatch.setenv("TTDEV_FABRIC_CACHE", str(fabric))
     monkeypatch.setenv("TTDEV_ETH_CHECK_CACHE", str(eth_cache))
 
 
 @pytest.fixture(autouse=True)
-def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_probe_cache_root):
+def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_probe_cache_root):
     """Point the health probe and journal at empty temp dirs for every test.
 
     Without this the suite reads the host's real /sys/class/tenstorrent, so on a
@@ -348,10 +392,11 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # Everything that exists only to hide the host's real hardware (spec 09 I8): lifted for a
     # device-marked test, which needs the silicon it declared. The durable-state and
     # destructive-rung seals below are NOT part of this and run either way.
+    tmp_dirs = _FlatTmpDirs(isolation_tmp_root)
     if not device_marked:
-        _seal_real_hardware(monkeypatch, tmp_path_factory)
-    _redirect_probe_caches(monkeypatch, tmp_path_factory, device_marked, device_probe_cache_root)
-    health_tmp = tmp_path_factory.mktemp("health")
+        _seal_real_hardware(monkeypatch, tmp_dirs)
+    _redirect_probe_caches(monkeypatch, tmp_dirs, device_marked, device_probe_cache_root)
+    health_tmp = tmp_dirs.mktemp("health")
     monkeypatch.setattr(health, "HEALTH_DIR", health_tmp)
     monkeypatch.setattr(heartbeat, "_heartbeat_supported", None)
     # raising=False so a base tree without the re-arm latch (a fails-on-base stash) still sets up.
@@ -362,12 +407,12 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # Prometheus's textfile dir defaults to the REAL /var/lib/prometheus/node-exporter and is read
     # fresh on every write_textfile() call (never cached), so any path through the stats
     # persistence loop that reaches it in a test would mkdir a real host path.
-    monkeypatch.setenv("TT_DEVICE_MCP_TEXTFILE_DIR", str(tmp_path_factory.mktemp("no-textfile-dir")))
+    monkeypatch.setenv("TT_DEVICE_MCP_TEXTFILE_DIR", str(tmp_dirs.mktemp("no-textfile-dir")))
     # The device-op flock defaults to /run/tt-device-broker/device-op.flock, the file the host's own
     # broker holds during its resets. A test that took it there would stall that broker's device op.
-    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_FLOCK", str(tmp_path_factory.mktemp("flock") / "device-op.flock"))
-    monkeypatch.setenv("TT_DEVICE_MCP_DISPATCH_HOLD", str(tmp_path_factory.mktemp("hold") / "dispatch-hold"))
-    monkeypatch.setenv("TT_DEVICE_MCP_JOB_SPOOL_DIR", str(tmp_path_factory.mktemp("spool") / "spool"))
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_FLOCK", str(tmp_dirs.mktemp("flock") / "device-op.flock"))
+    monkeypatch.setenv("TT_DEVICE_MCP_DISPATCH_HOLD", str(tmp_dirs.mktemp("hold") / "dispatch-hold"))
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_SPOOL_DIR", str(tmp_dirs.mktemp("spool") / "spool"))
     # The gate's history lives in module globals — whether a reset just failed, when the
     # fabric was last proved. A test that leaves those set silently changes what the NEXT
     # test's gate decides to do, which is a debugging session nobody wants.
@@ -398,7 +443,7 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(srv, "isolated_chips", set())
     # Spec 03 I66: the lost/recovering registry is process-wide; each test starts with none, and
     # publishes into its own tmp file, never /run.
-    monkeypatch.setenv("TT_DEVICE_MCP_CHIP_STATE_FILE", str(tmp_path_factory.mktemp("chipstate") / "chip-state.json"))
+    monkeypatch.setenv("TT_DEVICE_MCP_CHIP_STATE_FILE", str(tmp_dirs.mktemp("chipstate") / "chip-state.json"))
     from tt_device_mcp.health import chip_state
 
     chip_state.reset()
@@ -415,6 +460,8 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # A host reboot/power cycle a test requested (with a stub fire) must not suppress the NEXT
     # test's forced escalation. raising=False so a base tree without the marker still sets up.
     monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None, raising=False)
+    # A power cycle a test failed to launch must not hand the NEXT test's chooser the reboot (04 I10).
+    monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_unlaunched_at", None, raising=False)
     monkeypatch.setattr(srv, "_host_action_suppressed_logged", None, raising=False)
     monkeypatch.setattr(srv, "last_fabric_check_monotonic", 0.0)
     # When the last job's device work ended, the anchor the inter-job cooldown measures from.
@@ -427,6 +474,9 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     monkeypatch.setattr(srv, "eth_rearm_retryable", False, raising=False)
     monkeypatch.setattr(srv, "_last_eth_rearm_monotonic", 0.0, raising=False)
     monkeypatch.setattr(srv, "_eth_rearm_task", None, raising=False)
+    monkeypatch.setattr(srv, "eth_rearm_no_reader", False, raising=False)
+    monkeypatch.setattr(srv, "eth_check_armed_late", None, raising=False)
+    monkeypatch.setattr(srv, "_eth_selftest_runs", 0, raising=False)
     # The owed startup fabric pass (spec 03 I39): left set, a later test's 77-only hold that
     # happened to share its `since` would arm a relift it never asked for.
     monkeypatch.setattr(srv, "_startup_fabric_owed_since", None, raising=False)
@@ -686,15 +736,36 @@ def _install_spawn_tripwire(monkeypatch, allow_device_spawns: bool = False):
     monkeypatch.setattr(asyncio, "create_subprocess_exec", guarded_exec)
 
 
+def _reset_server_state():
+    """Drop the broker's process-wide job and hold state (see init_async_primitives)."""
+    _reset_for_testing()
+    srv.job_runner_task = None
+    srv.stats_task = None
+    srv.runner_job_id = None
+    jobs.clear()
+
+
 @pytest.fixture(autouse=True)
 def init_async_primitives():
-    """Initialize async primitives before any test runs."""
+    """Give every test fresh broker job and hold state, and fresh async primitives.
+
+    The queue, lock, runner and stats tasks, the jobs dict and the hold/action rows, hold-episode
+    latches, the hold-escalation buckets, latches and kind, the spec 04 I76 hold-bound latches, the
+    shared recovery mechanism's class-A ladder anchor and kill-reset debt are module globals. Left
+    over, they steer the next test: a queue bound to the previous test's closed loop fails the next
+    lifespan's job runner (which then marks the device dirty and holds it), a hold row one test
+    opened shows up in another's recent-jobs list, and a bound host-rung latch one test set skips
+    the next test's ladder. Everything _reset_for_testing names is reset around every test (spec 09
+    I7); a new global of this kind goes there too. Tasks a test started die with its own loop."""
+    _reset_server_state()
     _ensure_async_primitives()
+    yield
+    _reset_server_state()
 
 
 @pytest.fixture
 def clear_job_state(init_async_primitives):
-    """Clear jobs dict and queue before and after each test."""
+    """Drain the job queue before and after a runner test (the autouse reset does the rest)."""
     # Reset global queue and lock to None so they get recreated in current event loop
     _reset_for_testing()
 

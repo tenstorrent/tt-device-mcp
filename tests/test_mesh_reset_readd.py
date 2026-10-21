@@ -180,7 +180,11 @@ async def test_a_cancelled_reset_stops_the_repeats(monkeypatch):
 
     mechanism.run_scoped = run_scoped
     task = asyncio.create_task(mechanism.reset_with_quiesce(MESH_RESET, lambda _m: None))
-    await _real_sleep(0.05)
+    # Each repeat hops through the thread pool twice, so a loaded runner can take longer than a
+    # fixed few tens of ms to reach the second rescan: wait for it, bounded.
+    deadline = time.monotonic() + 5
+    while sysfs.rescans < 2 and time.monotonic() < deadline:
+        await _real_sleep(0.01)
     assert sysfs.rescans >= 2, "the repeat ran while the reset did"
     task.cancel()
     with pytest.raises(asyncio.CancelledError):

@@ -792,7 +792,7 @@ def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
     pollers = 2 * n_services * literal(srv._set_device_pollers, r"timeout=(\d+)")
     rescan = literal(recovery_base.RecoveryMechanism.reset_with_quiesce, r"asyncio\.sleep\((\d+)\)")
     kill = constants.GRACEFUL_KILL_GRACE_SEC + constants.SIGTERM_GRACE_SEC
-    candidates = re.search(r"for c in \((.*?)\n\s*\)\n", inspect.getsource(eth.resolve_python), re.S).group(1)
+    candidates = re.search(r"for c in \((.*?)\n\s*\)\n", inspect.getsource(eth._python_candidates), re.S).group(1)
     n_candidates = len([line for line in candidates.splitlines() if line.strip()])
     eth_setup = n_candidates * default(eth.resolve_python, "import_timeout_sec")
     finished_pass = (
@@ -825,6 +825,7 @@ def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
 
 def test_an_operator_reset_whose_fabric_cannot_verify_holds_fabric_unverified(monkeypatch, tmp_path):
     _mesh_with_fabric_check(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)  # built: a 77 is a link verdict
     calls = _verify_seam(monkeypatch, fabric_ok=None)
     monkeypatch.setattr(srv, "device_fault_reported", "job 7 waiting for active ethernet core")
 
