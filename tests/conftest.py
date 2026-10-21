@@ -4,6 +4,7 @@
 """Pytest fixtures for tt-device-mcp tests."""
 
 import asyncio
+import fnmatch
 import os
 import shutil
 import subprocess
@@ -701,6 +702,39 @@ _DEVICE_ONLY_SPAWN = ("tt-smi", "systemd-run")
 # systemctl is both a read-only query (scope liveness, which several gate paths genuinely need) and
 # a way to stop the host's services. Only the mutating verbs are refused.
 _FORBIDDEN_SYSTEMCTL_VERBS = ("stop", "start", "restart", "reload", "enable", "disable", "mask", "kill")
+# The units a broker runs its jobs and direct execs in (spec 09 I10). On a broker host the live
+# broker's ttdev-job-<id>.scope can share its id with a test's job, so no test may reach them:
+# a query reads none live, an action or a systemd-run in that namespace is refused, marker or not.
+_BROKER_UNIT_SAMPLES = ("ttdev-job-1.scope", "ttdev-exec-1-1.scope")
+_READ_ONLY_SYSTEMCTL_VERBS = ("is-active", "is-failed", "is-enabled", "status", "show", "list-units", "cat")
+
+
+def _names_broker_unit(parts) -> bool:
+    """Whether a systemctl/systemd-run argv names a broker job or exec unit, a glob included."""
+    if not any(os.path.basename(p) in ("systemctl", "systemd-run") for p in parts):
+        return False
+    for tok in parts:
+        if tok.startswith("-"):
+            if "=" not in tok:
+                continue
+            tok = tok.split("=", 1)[1]
+        if "ttdev-job-" in tok or "ttdev-exec-" in tok:
+            return True
+        if any(ch in tok for ch in "*?[") and any(fnmatch.fnmatchcase(u, tok) for u in _BROKER_UNIT_SAMPLES):
+            return True
+    return False
+
+
+def _argv_parts(argv) -> list:
+    if isinstance(argv, (str, bytes)):
+        return (argv.decode() if isinstance(argv, bytes) else argv).split()
+    return [a.decode() if isinstance(a, bytes) else str(a) for a in argv]
+
+
+def _is_broker_unit_query(argv) -> bool:
+    """A read-only systemctl naming a broker unit: it runs, but never against the host (I10)."""
+    parts = _argv_parts(argv)
+    return _names_broker_unit(parts) and _spawn_is_forbidden(parts, allow_device_spawns=True) is None
 
 
 def _only_touches_device_pollers(parts, verb_at: int) -> bool:
@@ -719,20 +753,27 @@ def _only_touches_device_pollers(parts, verb_at: int) -> bool:
 
 def _spawn_is_forbidden(argv, allow_device_spawns: bool = False) -> "str | None":
     """The reason this spawn must not reach the kernel, or None when it is harmless."""
-    if isinstance(argv, (str, bytes)):
-        parts = (argv.decode() if isinstance(argv, bytes) else argv).split()
-    else:
-        parts = [a.decode() if isinstance(a, bytes) else str(a) for a in argv]
+    parts = _argv_parts(argv)
     if not parts:
         return None
+    broker_unit = _names_broker_unit(parts)
     for tok in parts:
         prog = os.path.basename(tok)
         if prog in _NEVER_SPAWN:
             return f"{prog} would reboot, power-cycle, or escape this test run"
+        if prog == "systemd-run" and broker_unit:
+            return "systemd-run would start a unit in the host broker's ttdev-job/ttdev-exec namespace"
         if prog in _DEVICE_ONLY_SPAWN and not allow_device_spawns:
             return f"{prog} touches the device; declare @pytest.mark.device or assert on the argv"
         if prog == "systemctl":
             at = parts.index(tok)
+            if broker_unit:
+                # Fail closed: on a broker unit only a known query verb runs (answered by the
+                # stand-in); every other verb, kill/stop or one not listed here, is refused.
+                rest = {os.path.basename(p) for p in parts[at + 1 :]}
+                if not rest & set(_READ_ONLY_SYSTEMCTL_VERBS) or rest & set(_FORBIDDEN_SYSTEMCTL_VERBS):
+                    return "systemctl would act on the host broker's live job or exec unit"
+                return None
             for offset, p in enumerate(parts[at + 1 :]):
                 v = os.path.basename(p)
                 if v in _FORBIDDEN_SYSTEMCTL_VERBS:
@@ -753,6 +794,13 @@ def _install_spawn_tripwire(monkeypatch, allow_device_spawns: bool = False):
 
     `allow_device_spawns` moves _DEVICE_ONLY_SPAWN from refused to permitted for a
     device-marked test. _NEVER_SPAWN and the mutating systemctl verbs are unaffected by it.
+
+    A read-only systemctl naming a broker job or exec unit (spec 09 I10) is not refused but
+    answered here, marker or not: it runs a stand-in that prints nothing and exits 3 (systemctl's
+    "inactive"), so every caller reads no such unit live and never the host broker's. A test that
+    means a live scope stubs the query (`srv._scope_active`, `srv.list_active_job_scopes`) or
+    `subprocess.run` itself. asyncio's subprocess transport spawns through Popen, so it is
+    answered the same way.
     """
 
     def _refuse(argv, kind):
@@ -768,6 +816,10 @@ def _install_spawn_tripwire(monkeypatch, allow_device_spawns: bool = False):
 
     def guarded_popen_init(self, args, *a, **k):
         _refuse(args, "subprocess.Popen")
+        if _is_broker_unit_query(args):
+            k.pop("executable", None)
+            a = a[:1] + (None,) + a[2:] if len(a) >= 2 else a
+            args = "exit 3" if k.get("shell") else ["/bin/sh", "-c", "exit 3"]
         return real_popen_init(self, args, *a, **k)
 
     real_exec = asyncio.create_subprocess_exec
