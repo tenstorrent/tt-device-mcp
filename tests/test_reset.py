@@ -974,6 +974,47 @@ def test_a_failed_operator_reset_arms_the_cooldown_and_the_two_strikes(
 
 
 @pytest.mark.parametrize("route", ["tool", "stream"])
+@pytest.mark.parametrize(
+    "rc,fabric_ok,spent",
+    [(1, None, True), (0, False, True), (0, None, False), (0, True, False), (None, None, False)],
+)
+def test_a_failed_operator_mesh_reset_spends_the_episodes_mesh_reset(
+    monkeypatch, tmp_path, route, rc, fabric_ok, spent
+):
+    """A failed operator -glx_reset is marked as the broker marks its own failed mesh reset, so an
+    all-off mesh after it is class C and no path fires a second mesh reset in the episode (spec 04
+    I37, I87). A persistent 77, a verified reset or one that never finished marks nothing."""
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
+    _mesh_with_fabric_check(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)
+    calls = _fake_scoped_reset(monkeypatch, rc, "tt-smi: reset failed" if rc else "Re-initialized boards\n")
+    _verify_seam(monkeypatch, fabric_ok=fabric_ok)
+    monkeypatch.setattr(srv.recovery_mechanism, "mesh_reset_failed_since_release", False)
+    monkeypatch.setattr(srv.recovery_mechanism, "mesh_reset_failed_episode", None)
+
+    if route == "tool":
+        _reset_tool(monkeypatch, tmp_path)
+    else:
+        _reset_stream(monkeypatch, tmp_path)
+
+    assert calls and "-glx_reset" in calls[-1], calls
+    assert srv.recovery_mechanism.mesh_reset_failed_since_release is spent
+    assert srv.recovery_mechanism.mesh_reset_spent("") is spent
+
+
+def test_a_failed_operator_chip_reset_does_not_spend_the_mesh_reset(monkeypatch):
+    """Only a mesh reset (-glx_reset) is the episode's one mesh reset; a failed chip reset is not."""
+    monkeypatch.setattr(srv.recovery_mechanism, "mesh_reset_failed_since_release", False)
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 0.0)
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", False)
+
+    srv._note_operator_reset_outcome(1, None, srv.time.monotonic(), ["tt-smi", "-r", "0"])
+
+    assert srv.recovery_mechanism.last_reset_failed is True
+    assert srv.recovery_mechanism.mesh_reset_failed_since_release is False
+
+
+@pytest.mark.parametrize("route", ["tool", "stream"])
 def test_an_operator_reset_that_did_not_finish_leaves_the_cooldown_alone(monkeypatch, tmp_path, route):
     """A timed-out reset may still be cycling (the next caller adopts it), and a refused one never ran."""
     _mesh_with_fabric_check(monkeypatch, tmp_path)

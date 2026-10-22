@@ -3986,7 +3986,7 @@ def _note_operator_reset_outcome(rc: Optional[int], verdict: Optional[bool], beg
         return
     recovery_mechanism.last_reset_monotonic = max(recovery_mechanism.last_reset_monotonic, began)
     recovery_mechanism.last_reset_failed = rc != 0 or verdict is False
-    if recovery_mechanism.last_reset_failed and "-glx_reset" in argv:
+    if recovery_mechanism.last_reset_failed and any(a in ("-glx_reset", "-glx_reset_auto") for a in argv):
         recovery_mechanism.mark_mesh_reset_failed()
 
 
