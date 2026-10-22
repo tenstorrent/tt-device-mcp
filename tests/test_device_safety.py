@@ -3629,7 +3629,8 @@ async def test_a_dirty_flag_dropped_without_a_check_leaves_a_durable_trace(monke
     assert (
         srv.fsm.record.why == "foreign_holder"
     ), "the gate did not reword the hold once a foreign tenant blocked the verify"
-    cleared = [f for k, f in events if k == "device_dirty_cleared"]
+    assert not [f for k, f in events if k == "device_dirty_cleared"], "the hold stays: nothing was cleared"
+    cleared = [f for k, f in events if k == "device_dirty_dropped_held"]
     assert cleared, "the dirty flag was dropped with no durable trace on the health timeline"
     assert cleared[0]["prior_reason"] == "job 511 ended killed (exit -9)"
     assert "foreign holder" in cleared[0]["why"]
