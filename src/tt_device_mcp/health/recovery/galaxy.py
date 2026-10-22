@@ -1275,6 +1275,20 @@ class GalaxyRecovery(Recovery):
             return OUTCOME_TERMINAL
         return OUTCOME_WAITING
 
+    async def power_cycle_direct_in_cooldown(
+        self, gate_phase: str, expected: int, beats: Optional[dict], log
+    ) -> Optional[str]:
+        """Spec 04 I3/I37 on the gate's cooldown WAIT: the cooldown stops a repeat MMIO reset, and a
+        power cycle is not one, so an off-bus set of class A or C still goes to its direct power cycle
+        on this pass. No rung runs here, and no tray-down prelude: an off set seen after a failed reset
+        is never an onset. None when no class applies or no power cycle is opted in (the gate waits
+        out the cooldown as before); else WAITING, the cycle requested or held off (a tenant, a reset
+        in scope, a stand-back, a rate limit). The boot that follows passes the full check, fabric
+        included, before anything is released (goal 8)."""
+        if self.mechanism.host_action_blocks_reset(log, context=f"gate/{gate_phase} cooldown"):
+            return None
+        return await self._power_cycle_direct_from_escalate("gate", gate_phase, WAIT, expected, beats, log)
+
     async def _power_cycle_direct(
         self, fault_class: str, offbus_chips: set, expected: int, log, *, context: str, force: bool = False
     ) -> Optional[bool]:

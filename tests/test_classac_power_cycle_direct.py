@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.conftest import patch_health_event
+from tests.conftest import fsm_dirty, patch_health_event, patch_recovery
 from tests.test_arc_not_ready import _fake_sysfs
 from tests.test_startup_fabric_hugepages import _shortfalls, _startup, _systemctl  # noqa: F401 - the fixtures
 from tt_device_mcp import server as srv
@@ -717,3 +717,114 @@ async def test_a_listed_node_whose_link_is_down_does_not_fill_a_tray(short_boot)
     assert 0 not in present_buses and 1 in present_buses
     await _gate(rig, galaxy.BELOW_FLOOR, phase="startup")
     assert "power_cycle" not in rig["order"], "the read does not add up to whole trays: the ladder decides"
+
+
+# ---- a failed reset's cooldown never delays the class A/C power cycle (spec 04 I3) ---------------
+#
+# The cooldown WAIT returned before the off-bus class was read, so a whole tray off the bus after a
+# failed operator reset waited for the forced ladder at the hold bound instead of its power cycle.
+
+
+async def _gate_in_cooldown(rig, monkeypatch, tmp_path, off: set, argv=("tt-smi", "-glx_reset")):
+    """A failed operator reset arms the cooldown, then a post-job gate runs end to end on ``off``.
+    An all-off set keeps its device nodes (lingering): with none at all the gate holds and leaves the
+    climb to the idle off-bus escalation."""
+    (tmp_path / "dev").mkdir()
+    for i in range(EXPECTED):
+        if i not in off or len(off) == EXPECTED:
+            (tmp_path / "dev" / str(i)).write_text("")
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path / "dev"))
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
+    srv.device_op_lock = None
+    monkeypatch.setattr(srv.health_monitor, "expected", lambda present: EXPECTED)
+    monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: {})
+    monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.setattr(srv, "device_pci_map", {})
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+    monkeypatch.setattr(rig["g"].mechanism, "last_reset_failed", False)
+    monkeypatch.setattr(rig["g"].mechanism, "last_reset_monotonic", 0.0)
+    fsm_dirty(srv, "", why="gate_error")
+
+    async def unhealthy(expected, log, run_fabric=True, **_):
+        return False, {"snapshot": {"ok": False, "detail": "chips off the bus"}}
+
+    patch_recovery(monkeypatch, "_verify_device", unhealthy)
+    rungs = []
+    monkeypatch.setattr(
+        galaxy.GalaxyRecovery, "_fire_gate_rung", lambda self, gate_phase, stage, *a, **k: _record(rungs, stage)
+    )
+    rig["beats"] = _beats_without(off)
+    rig["g"]._td_reset_seen = True  # the off set follows a reset: no tray-down onset
+    srv._note_operator_reset_outcome(1, None, srv.time.monotonic(), list(argv))
+    assert rig["g"].mechanism.cooling(), "the failed operator reset armed the cooldown"
+
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+    return rungs
+
+
+def _no_release(rig):
+    """Goal 11: nothing here passed a full check, fabric included, so nothing is released."""
+    assert "released" not in rig["order"]
+    assert srv.fsm.state is not srv.ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec", [{3: 8}, {1: 8, 4: 8}])
+async def test_a_whole_tray_in_a_failed_resets_cooldown_cycles_on_the_next_gate_pass(
+    rig, monkeypatch, tmp_path, clear_job_state, spec
+):
+    rungs = await _gate_in_cooldown(rig, monkeypatch, tmp_path, _off(rig["map"], spec))
+    assert rig["order"] == ["power_cycle"], "no reset, no sweep, no wait for the forced ladder"
+    assert rungs == []
+    ((_, fired),) = [(k, f) for k, f in rig["events"] if k == "power_cycle_direct"]
+    assert fired["fault_class"] == galaxy.FAULT_CLASS_WHOLE_TRAY
+    assert "reset_suppressed_cooldown" not in _kinds(rig)
+    _no_release(rig)
+
+
+@pytest.mark.asyncio
+async def test_all_off_after_a_failed_operator_mesh_reset_cycles_in_its_cooldown(
+    rig, monkeypatch, tmp_path, clear_job_state
+):
+    """The failed operator -glx_reset was the episode's one mesh reset: class C, no second one."""
+    rungs = await _gate_in_cooldown(rig, monkeypatch, tmp_path, set(range(EXPECTED)))
+    assert rig["order"] == ["power_cycle"] and rungs == []
+    ((_, fired),) = [(k, f) for k, f in rig["events"] if k == "power_cycle_direct"]
+    assert fired["fault_class"] == galaxy.FAULT_CLASS_ALL_OFF
+    _no_release(rig)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "off, argv",
+    [
+        (lambda m: _off(m, {3: 4}), ("tt-smi", "-glx_reset")),  # part of a tray: the ladder
+        (lambda m: set(), ("tt-smi", "-glx_reset")),  # a present mesh: the 120 s grace
+        (lambda m: set(range(EXPECTED)), ("tt-smi", "-r", "0")),  # all off, no mesh reset spent yet
+    ],
+    ids=["partial", "present", "all-off-no-mesh-reset"],
+)
+async def test_any_other_set_still_waits_out_the_cooldown(rig, monkeypatch, tmp_path, clear_job_state, off, argv):
+    rungs = await _gate_in_cooldown(rig, monkeypatch, tmp_path, off(rig["map"]), argv=argv)
+    assert rig["order"] == [] and rungs == [], "no reset, no power cycle inside the cooldown"
+    assert "reset_suppressed_cooldown" in _kinds(rig)
+    assert "power_cycle_direct" not in _kinds(rig)
+    _no_release(rig)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec", [{2: 8}, None], ids=["whole-tray", "all-off"])
+async def test_an_idle_off_bus_hold_in_a_failed_resets_cooldown_cycles(rig, monkeypatch, spec):
+    """The idle off-bus escalation reads the class before its own cooldown check: a whole tray is
+    class A, and every chip off after the failed operator mesh reset is class C."""
+    ladders = []
+    monkeypatch.setattr(rig["g"], "_escalate_offbus_stuck_hold", lambda *a, **k: _record(ladders, "offbus"))
+    monkeypatch.setattr(rig["g"].mechanism, "last_reset_monotonic", 0.0)
+    srv._note_operator_reset_outcome(1, None, srv.time.monotonic(), ["tt-smi", "-glx_reset"])
+    assert rig["g"].mechanism.cooling()
+    rig["beats"] = _beats_without(_off(rig["map"], spec)) if spec else {}
+    rig["g"]._td_reset_seen = True
+    assert await rig["g"].escalate("offbus", [], EXPECTED, lambda m: None) == galaxy.OUTCOME_TERMINAL
+    assert rig["order"] == ["power_cycle"] and ladders == []
+    assert "released" not in rig["order"]
