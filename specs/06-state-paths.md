@@ -127,6 +127,7 @@ and job exit statuses never hit disk.
 | Device-op inhibit lock | `/run/tt-device-broker/device-op.lock` | `<state>/device-op.lock` (exported by the CLI) | `TT_DEVICE_MCP_DEVICE_OP_LOCK` |
 | Job output spool | `/run/tt-device-broker-spool/` (0700; outside the unit's RuntimeDirectory, so it survives a broker restart) | `<state>/jobspool/` (exported by the CLI) | `TT_DEVICE_MCP_JOB_SPOOL_DIR` |
 | Dispatch hold (autoupdate) | `/run/tt-device-broker/dispatch-hold` | `<state>/dispatch-hold` (sibling of the inhibit lock) | `TT_DEVICE_MCP_DISPATCH_HOLD` |
+| Autoupdate decision log (spec 08 I22) | `/var/log/tt-device-broker/autoupdate.log` (+ `.1`), and the journal tag `tt-device-autoupdate` | n/a (system autoupdate only) | follows `TTDEV_LOG_DIR` |
 | Device-op advisory flock (I8) | `/run/tt-device-broker/device-op.flock` | `<state>/device-op.flock` (sibling of the inhibit lock) | `TT_DEVICE_MCP_DEVICE_OP_FLOCK` |
 | Chip state (published, 03 I66) | `/run/tt-device-broker/chip-state.json` (0644, atomic rename) | `<state>/chip-state.json` (sibling of the inhibit lock) | `TT_DEVICE_MCP_CHIP_STATE_FILE` |
 | Daemon pid / daemon stdout | n/a (systemd / journald) | `<state>/daemon.pid`, `<state>/daemon.log` | follows the state base |
@@ -339,6 +340,7 @@ Behavior).
 | `TTDEV_UNIT_PATH` | `/etc/systemd/system/tt-device-broker.service` | Unit path (render seam) |
 | `TTDEV_BRANCH` | `main` | Branch autoupdate tracks — the **only** settable part of the update source (08 I16); the repository itself is a constant in `autoupdate.sh`, not configuration |
 | `TTDEV_AUTOUPDATE` | `1` | Autoupdate master switch. Read at install to seed the config file, and by every lap; `sudo TTDEV_AUTOUPDATE=0 ./install.sh` turns a host off outright (after `sudo`, which resets the environment) |
+| `TTDEV_RECOVERY_DEFER_SEC` | 1200 (capped at 1800; 0 off) | Seconds an update waits while the broker is held or recovering: it applies once the hold is that old or the update has waited that long (spec 08 I23). Delays only the update's restart, never a recovery step |
 | `TTDEV_MIN_APPLY_INTERVAL_SEC` | 1800 (0 = off) | Minimum seconds between autoupdate applies (each one restarts the broker and runs the startup fabric pass); a newer sha waits, so a burst of pushes is one restart. Last apply kept in `$ROOT/last-apply`, its `NRestarts` baseline in `$ROOT/last-apply-nrestarts`; a broken broker (not active, crash-looping, held, failing health) is never rate-limited; one in its startup check stays limited for at most 600 s after the apply. By-hand escape: `rm $ROOT/last-apply` (the sourced config file wins over an env override) (spec 08 I21) |
 | `TTDEV_LOCK` | 0 | Apply the udev device lock at install (shared host) |
 | `TTDEV_BOARD_TYPES` | set by the installer | Board type of each chip that answered `tt-smi -s`, one per line; input to the expected-count derivation only (spec 08 I28) |

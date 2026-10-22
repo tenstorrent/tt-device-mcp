@@ -46,7 +46,7 @@ def _lap(tmp_path, *, now, sha, interval=None, active="active", nrestarts="0", h
     restarts = tmp_path / "restarts"
     prelude = f"""set -u
 ROOT={root}; STATE={root}/installed.sha; VENV={tmp_path}/venv; BR=main; src_desc=test
-idle=true; drained_s=0; TT_DEVICE_MCP_HEALTH_DIR={root}
+idle=true; drained_s=0; TT_DEVICE_MCP_HEALTH_DIR={root}; RECOVERY_PENDING={root}/recovery.defer
 remote_sha={sha}
 date() {{ echo {now}; }}
 chmod() {{ :; }}
@@ -58,8 +58,9 @@ systemctl() {{
     esac
 }}
 curl() {{ printf '%s' '{quoted_health}'; }}
+logger() {{ :; }}
 """
-    env = {"PATH": "/usr/bin:/bin"}
+    env = {"PATH": "/usr/bin:/bin", "TTDEV_LOG_DIR": str(tmp_path / "logs")}
     if interval is not None:
         env["TTDEV_MIN_APPLY_INTERVAL_SEC"] = str(interval)
     done = subprocess.run(["bash", "-c", prelude + head + tail], capture_output=True, text=True, env=env, timeout=30)
@@ -119,6 +120,17 @@ def test_the_wait_names_the_time_left(tmp_path):
     _lap(tmp_path, now=5000, sha="a1", interval=3600)
     done, _, _ = _lap(tmp_path, now=5600, sha="b2", interval=3600)
     assert "last apply 600s ago (min 3600s); b2 applies in 3000s" in done.stderr, done.stderr
+
+
+def test_a_rate_limited_lap_logs_its_deferral(tmp_path):
+    """Spec 08 I22: the rate limit's deferral is a decision like any other, logged with its gate and
+    its deadline; the apply that set the stamp is logged as applied."""
+    _lap(tmp_path, now=5000, sha="a1", interval=3600)
+    _lap(tmp_path, now=5600, sha="b2", interval=3600)
+    log = (tmp_path / "logs" / "autoupdate.log").read_text().splitlines()
+    assert len(log) == 2 and "decision=applied" in log[0] and "new=a1" in log[0], log
+    assert "decision=deferred" in log[1] and "new=b2" in log[1], log
+    assert "reason=apply rate limit: last apply 600s ago (min 3600s); apply_by=" in log[1], log
 
 
 def test_no_stamp_a_bad_stamp_or_a_future_stamp_bars_nothing(tmp_path):

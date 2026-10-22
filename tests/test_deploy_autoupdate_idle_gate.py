@@ -104,6 +104,7 @@ sleep() {{ seen "sleep $*"; }}
 pgrep() {{ seen pgrep; }}
 ls() {{ :; }}  # no real /proc holders
 job_scopes() {{ [ -n "{scopes}" ] && echo "{scopes}"; }}
+recovery_gate() {{ recovery_why=""; return 1; }}  # a healthy broker: spec 08 I23 has its own tests
 systemctl() {{
     case "$*" in
         *list-units*ttdev-job-*) seen scopes; job_scopes ;;
@@ -568,6 +569,7 @@ def _apply_event(tmp_path, health_dir, idle="true", drained_s=0, restart_rc=0):
     script = (
         f"set -u\ninstalled_sha=old111; remote_sha=new222; src_desc=test; idle={idle}; drained_s={drained_s}\n"
         f"LAST_APPLY_NRESTARTS={tmp_path}/last-apply.nrestarts\n"
+        f"RECOVERY_PENDING={tmp_path}/recovery.defer\nau_log() {{ :; }}\n"
         f"systemctl() {{ return {restart_rc}; }}\n" + block
     )
     env = {"PATH": "/usr/bin:/bin", "TT_DEVICE_MCP_HEALTH_DIR": str(health_dir)}

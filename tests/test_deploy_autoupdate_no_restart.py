@@ -16,6 +16,7 @@ to record what ran.
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -177,6 +178,10 @@ def test_a_docs_tests_and_ci_only_update_moves_the_tree_and_installed_sha_with_n
     assert _installed(box) == new == _head(box)
     assert "broker not restarted" in done.stderr, done.stderr
     assert not (box["tmp"] / "root" / "last-apply").exists(), "a no-restart apply moved the rate limit"
+    # The decision log (I22) records it as an apply, with both shas and no restart.
+    (logged,) = (box["tmp"] / "logs" / "autoupdate.log").read_text().splitlines()
+    assert "decision=applied" in logged and "no restart" in logged, logged
+    assert f"old={box['installed']}" in logged and f"new={new}" in logged, logged
     (ev,) = events
     assert ev["kind"] == "autoupdate_applied_no_restart"
     assert ev["from_sha"] == box["installed"] and ev["to_sha"] == new
@@ -301,3 +306,33 @@ def test_the_allowlist_is_the_one_the_spec_names():
     assert "docs/*|tests/*|.github/*|*.md) ;;" in text
     i = text.index("src/*) echo")
     assert i < text.index("docs/*|tests/*|.github/*|*.md) ;;"), "src/ must be refused before *.md matches"
+
+
+def test_a_no_restart_apply_clears_the_recovery_deferral_clock(box):
+    """Spec 08 I23: $ROOT/recovery.defer clocks an update not yet applied. A no-restart apply
+    clears it like a restart does, so a later update in a fresh hold is deferred from its own
+    first deferral, not let through on the stale clock of one already applied."""
+    (box["tmp"] / "venv" / "bin" / "python").symlink_to(sys.executable)  # broker_hold parses /health
+    marker = box["tmp"] / "root" / "recovery.defer"
+    log = box["tmp"] / "logs" / "autoupdate.log"
+
+    def held(age):
+        return '{"status":"degraded","held":true,"fsm_state":"recovering","held_age_sec":%d}' % age
+
+    docs = _push(box, {"docs/guide.md": "g\n"})
+    done, lines, _ = _lap(box, docs, now=10_000, health=held(30))
+    assert done.returncode == 0 and "deferring" in done.stderr, done.stderr
+    assert marker.exists() and _installed(box) == box["installed"] and lines == []
+
+    done, lines, _ = _lap(box, docs, now=10_300)
+    assert done.returncode == 0 and "broker not restarted" in done.stderr, done.stderr
+    assert _installed(box) == docs and _restarts(lines) == []
+    assert not marker.exists(), "the applied update's deferral clock outlived it"
+
+    box["installed"] = docs
+    code = _push(box, {"src/tt_device_mcp/server.py": "x = 2\n"})
+    done, lines, _ = _lap(box, code, now=200_000, health=held(30))
+    assert done.returncode == 0, done.stderr
+    assert _restarts(lines) == [] and _installed(box) == docs, (done.stderr, lines)
+    assert "decision=deferred" in log.read_text().splitlines()[-1], log.read_text()
+    assert marker.read_text().split() == [code, "200000"]
