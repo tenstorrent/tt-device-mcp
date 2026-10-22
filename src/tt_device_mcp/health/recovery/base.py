@@ -2310,7 +2310,7 @@ class RecoveryMechanism:
         if btime - at > host_action_pending_sec() + BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC:
             return None
         argv = offbus_power_cycle.power_cycle_argv() or list(power_cycle_stage.DEFAULT_POWER_CYCLE_ARGV)
-        cause = power_cycle_stage.read_restart_cause(argv)
+        cause, cause_why = power_cycle_stage.read_restart_cause_why(argv)
         stamp = health_dir() / POWER_CYCLE_CAUSE_CAPABLE_FILE
         capable = stamp.exists()
         # An unmapped (reserved) code says nothing about how the host restarted: it neither proves the
@@ -2343,6 +2343,8 @@ class RecoveryMechanism:
             "host_rebooted": True,
             "power_cycled": power_cycled,
         }
+        if cause is None:
+            mark["restart_cause_unavailable"] = cause_why
         if sel_off is not None:
             mark["sel_power_off"] = _local_time(sel_off)
         if verdict == "refuted":
@@ -2355,13 +2357,16 @@ class RecoveryMechanism:
         requested = rec.get("at")
         if verdict == "confirmed":
             extra = {"sel_power_off": mark["sel_power_off"]} if sel_off is not None else {}
+            if cause is None:
+                extra["restart_cause_unavailable"] = cause_why
             health_event("power_cycle_confirmed", requested_at=requested, restart_cause=cause, **extra)
         elif verdict == "unconfirmed":
             log.warning(
                 f"power cycle requested at {requested} not confirmed by the BMC (restart cause "
-                f"{cause or 'unreadable'}): counted as a cycle (spec 04 I88)"
+                f"{cause or 'unreadable: ' + cause_why}): counted as a cycle (spec 04 I88)"
             )
-            health_event("power_cycle_unconfirmed", requested_at=requested, restart_cause=cause)
+            extra = {"restart_cause_unavailable": cause_why} if cause is None else {}
+            health_event("power_cycle_unconfirmed", requested_at=requested, restart_cause=cause, **extra)
         else:
             retry = self.power_cycle_miss_state(ledger, now_epoch=now_epoch)
             retry_at = _local_time(retry["until"]) if retry else "the next escalation"

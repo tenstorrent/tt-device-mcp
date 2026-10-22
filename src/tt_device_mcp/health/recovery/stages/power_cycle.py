@@ -267,21 +267,35 @@ def read_restart_cause(argv: list) -> Optional[str]:
     PREFLIGHT_TIMEOUT_SEC) named from :data:`RESTART_CAUSES`, or ``unmapped code 0x..`` for a
     reserved code. None when there is no query to derive, the BMC does not answer, does not support
     it (some answer "Unspecified error") or the answer does not parse."""
+    return read_restart_cause_why(argv)[0]
+
+
+# The longest BMC answer kept in a "why the cause is unavailable" reason.
+_CAUSE_WHY_MAX = 160
+
+
+def read_restart_cause_why(argv: list) -> tuple:
+    """``(cause, why)``: the cause as :func:`read_restart_cause` reads it with ``why`` empty, or None
+    and a short reason it could not be read (no query for the command, no executable, no answer in
+    time, the BMC's error, an answer that does not parse), so a record says why it has no cause."""
     probe = bmc_query_argv(argv, ["raw", "0x00", "0x07"])
     if probe is None:
-        return None
+        return None, "the cycle command is not ipmitool chassis power cycle: no BMC query to derive"
     exe = _resolve_command(probe[0])
     if exe is None:
-        return None
+        return None, f"{probe[0]} not found"
     rc, out = _run_step([exe, *probe[1:]], PREFLIGHT_TIMEOUT_SEC)
+    last = next((ln.strip() for ln in reversed((out or "").splitlines()) if ln.strip()), "")
+    if rc is None:
+        return None, f"the BMC query did not finish in {PREFLIGHT_TIMEOUT_SEC}s: {last}"[:_CAUSE_WHY_MAX]
     if rc != 0:
-        return None
+        return None, f"the BMC refused the query (rc {rc}): {last or 'no output'}"[:_CAUSE_WHY_MAX]
     # The response bytes are the last all-hex line (stdout follows any stderr warning).
     lines = [ln.split() for ln in (out or "").splitlines() if _HEX_BYTES.match(ln)]
     if not lines:
-        return None
+        return None, f"the BMC answer does not parse: {last or 'no output'}"[:_CAUSE_WHY_MAX]
     code = int(lines[-1][0], 16) & 0x0F
-    return RESTART_CAUSES.get(code, f"unmapped code 0x{code:02x}")
+    return RESTART_CAUSES.get(code, f"unmapped code 0x{code:02x}"), ""
 
 
 # The SEL fallback for a BMC that answers no restart cause: the last records are enough (the power-off
