@@ -197,8 +197,8 @@ from tt_device_mcp.job_reap import (
     find_reaped_leftovers,
     job_processes,
     reap_job_survivors,
-    stuck_device_holder,
     still_stuck,
+    stuck_device_holder,
 )
 from tt_device_mcp.job_spool import (
     SpoolOffsets,
