@@ -86,6 +86,7 @@ def os_first(monkeypatch, tmp_path):
         return rc[key], out.get(key, "" if rc[key] == 0 else f"{key} failed")
 
     monkeypatch.setattr(pc, "_run_step", step)
+    monkeypatch.setattr(pc, "_run_query", step)
     return {"calls": calls, "events": events, "rc": rc, "out": out, "req": req}
 
 
@@ -819,6 +820,31 @@ def test_no_power_off_in_the_window_leaves_the_cycle_unconfirmed_never_refuted(s
     assert sel_booted["mech"].confirm_power_cycle_on_boot(now_epoch=SEL_CHECK) == "unconfirmed", why
     row = _row(sel_booted)
     assert row["power_cycled"] is None and "took_host_down" not in row and "sel_power_off" not in row
+
+
+def test_the_power_off_is_found_under_later_records_in_the_whole_query_output(monkeypatch):
+    """Boot-time records after the power-on push the power-off far from the end: the SEL query keeps
+    its whole output, never a tail."""
+    later = "".join(
+        f" {0x493 + i:x} | 10/22/2026 | 03:05:{10 + i:02d} | Critical Interrupt #0x8f | Bus Correctable error | Asserted\n"
+        for i in range(30)
+    )
+    answers = {"get": "10/22/2026 03:05:50\n", "last": SEL_TAIL + later}
+    seen = []
+
+    def run(argv, **kw):
+        seen.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=answers[argv[-2] if argv[-2] == "last" else argv[-1]], stderr=""
+        )
+
+    monkeypatch.setattr(pc, "_resolve_command", lambda c: f"/usr/bin/{c}")
+    monkeypatch.setattr(pc.subprocess, "run", run)
+    monkeypatch.setattr(
+        pc, "time", type("T", (), {"time": staticmethod(lambda: SEL_CHECK), "strptime": staticmethod(time.strptime)})
+    )
+    assert pc.read_sel_power_off(CYCLE, SEL_REQUEST, SEL_BTIME) == 1792638194 + (SEL_CHECK - 1792638350)
+    assert [a[-3:] for a in seen] == [["sel", "time", "get"], ["list", "last", str(pc.SEL_TAIL_RECORDS)]]
 
 
 def test_a_failed_sel_read_leaves_the_cycle_unconfirmed(sel_booted):

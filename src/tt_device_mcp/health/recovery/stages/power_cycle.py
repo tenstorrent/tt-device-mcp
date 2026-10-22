@@ -320,7 +320,7 @@ def read_sel_power_off(argv: list, since: float, until: float) -> Optional[float
     exe = _resolve_command(clock[0])
     if exe is None:
         return None
-    rc, out = _run_step([exe, *clock[1:]], SEL_TIMEOUT_SEC)
+    rc, out = _run_query([exe, *clock[1:]], SEL_TIMEOUT_SEC)
     host_now = time.time()
     bmc_now = None
     for ln in reversed((out or "").splitlines()) if rc == 0 else ():
@@ -330,7 +330,7 @@ def read_sel_power_off(argv: list, since: float, until: float) -> Optional[float
     if bmc_now is None:
         return None
     offset = host_now - bmc_now
-    rc, out = _run_step([exe, *tail[1:]], SEL_TIMEOUT_SEC)
+    rc, out = _run_query([exe, *tail[1:]], SEL_TIMEOUT_SEC)
     if rc != 0:
         return None
     found = None
@@ -363,6 +363,16 @@ def _run_step(argv: list, timeout: float = STEP_TIMEOUT_SEC) -> tuple:
     except (OSError, subprocess.TimeoutExpired) as e:
         return None, repr(e)[:200]
     return r.returncode, ((r.stderr or "") + (r.stdout or "")).strip()[-200:]
+
+
+def _run_query(argv: list, timeout: float) -> tuple:
+    """``(rc, whole stdout)`` of a read-only query whose every line counts (``_run_step`` keeps only a
+    tail); rc None when it could not start or timed out. Tests replace it."""
+    try:
+        r = subprocess.run(argv, timeout=timeout, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, repr(e)[:200]
+    return r.returncode, r.stdout or ""
 
 
 def _write_request(argv: list, reason: str, timeout: float) -> None:
