@@ -2264,7 +2264,8 @@ class RecoveryMechanism:
           beside the ledger): "refuted". The hook's command failed and the host rebooted warm, so the
           row is marked missed (I72: no I65 anchor or doubling, no I73 streak, its retry and page) with
           ``cycle_refuted``;
-        - no answer, or "unknown" from a BMC never seen to report one: "unconfirmed", journalled; it
+        - no answer, or "unknown" from a BMC never seen to report one: "confirmed" when the BMC's SEL
+          holds a power-off between the request and this boot, else "unconfirmed", journalled; it
           counts as a cycle, the boot-loop-safe side (one I65 cooldown).
 
         Each row is checked once (``cycle_checked``). Returns the verdict, or None when nothing was
@@ -2300,9 +2301,8 @@ class RecoveryMechanism:
             return None
         if btime - at > host_action_pending_sec() + BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC:
             return None
-        cause = power_cycle_stage.read_restart_cause(
-            offbus_power_cycle.power_cycle_argv() or list(power_cycle_stage.DEFAULT_POWER_CYCLE_ARGV)
-        )
+        argv = offbus_power_cycle.power_cycle_argv() or list(power_cycle_stage.DEFAULT_POWER_CYCLE_ARGV)
+        cause = power_cycle_stage.read_restart_cause(argv)
         stamp = health_dir() / POWER_CYCLE_CAUSE_CAPABLE_FILE
         capable = stamp.exists()
         # An unmapped (reserved) code says nothing about how the host restarted: it neither proves the
@@ -2318,6 +2318,14 @@ class RecoveryMechanism:
             verdict = "refuted"
         else:
             verdict = "unconfirmed"
+        # A BMC that cannot tell the cause (some answer the query "Unspecified error") may still have
+        # logged the power-off in its SEL: one between the request and this boot confirms the cycle.
+        # The SEL only confirms; a missing record leaves the row unconfirmed, never refuted.
+        sel_off = None
+        if verdict == "unconfirmed":
+            sel_off = power_cycle_stage.read_sel_power_off(argv, at, btime)
+            if sel_off is not None:
+                verdict = "confirmed"
         # This boot came up from the request (checked above), so the host rebooted whatever the verdict;
         # whether the power went off and on is the BMC's answer, None when it cannot tell.
         power_cycled = {"confirmed": True, "refuted": False}.get(verdict)
@@ -2327,6 +2335,8 @@ class RecoveryMechanism:
             "host_rebooted": True,
             "power_cycled": power_cycled,
         }
+        if sel_off is not None:
+            mark["sel_power_off"] = _local_time(sel_off)
         if verdict == "refuted":
             mark.update(took_host_down=False, cycle_refuted=cause)
         rec.update(mark)
@@ -2336,7 +2346,8 @@ class RecoveryMechanism:
             log.warning(f"auto-recovery ledger not rewritten, power-cycle check kept in memory (spec 04 I88): {e}")
         requested = rec.get("at")
         if verdict == "confirmed":
-            health_event("power_cycle_confirmed", requested_at=requested, restart_cause=cause)
+            extra = {"sel_power_off": mark["sel_power_off"]} if sel_off is not None else {}
+            health_event("power_cycle_confirmed", requested_at=requested, restart_cause=cause, **extra)
         elif verdict == "unconfirmed":
             log.warning(
                 f"power cycle requested at {requested} not confirmed by the BMC (restart cause "
