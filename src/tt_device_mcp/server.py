@@ -198,6 +198,7 @@ from tt_device_mcp.job_reap import (
     job_processes,
     reap_job_survivors,
     stuck_device_holder,
+    still_stuck,
 )
 from tt_device_mcp.job_spool import (
     SpoolOffsets,
@@ -5861,8 +5862,22 @@ async def _kill_device_holders(reason: str) -> list:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
             killed.append({"pid": proc.pid, "user": who})
+            signalled = True
         except (ProcessLookupError, OSError):
-            pass
+            signalled = False
+        if signalled:
+            # Every member the killpg reached, not only its leader: a child can map a BAR with no
+            # device fd, so the holder scan never lists it, and the stuck-holder check reads only the
+            # pids named here (spec 04 I77). Read after the signal, so the kill waits on no /proc
+            # walk; a member that already exited held nothing.
+            try:
+                group = await asyncio.to_thread(job_processes, proc.pid)
+            except Exception:  # noqa: BLE001 - an unreadable /proc leaves the leader named
+                group = {}
+            named = {k["pid"] for k in killed}
+            for pid, info in sorted(group.items()):
+                if info.pgid == proc.pid and pid not in named and pid != os.getpid():
+                    killed.append({"pid": pid, "user": who})
         if who == "[broker]fabric-check":
             # Its -9 is ours, not the fabric's: no verdict, a full pass owed (spec 03 I82). Marked
             # even when killpg raised (the group already gone): conservative on purpose, as a pass
@@ -10648,20 +10663,47 @@ def _dead_chip_isolation_pending_reason() -> str:
     )
 
 
+# The re-enumeration fence's last scan (spec 04 I77): (monotonic time, the registry after it, the
+# reason, the stuck (pid, starttime) pairs). Every rung asking within one sampler tick reuses it.
+_dead_chip_stuck_seen: Optional[tuple] = None
+
+
 def _dead_chip_stuck_reason() -> str:
     """The re-enumeration fence (spec 04 I77, ``mechanism.reenumerate_fence``): why no bridge reset,
     PCI rescan, tray re-power or reset sweep may run — '' when no killed holder is stuck on a dead
-    chip. Refreshes the I70 episode as it reads. Never raises."""
+    chip. Refreshes the I70 episode as it reads, at most once per sampler tick: within the tick the
+    last scan's reason stands while the registry is unchanged and each holder it named is still
+    stuck in the kernel (a /proc stat read, no holder scan, no maps read), so a holder that exits or
+    leaves the kernel lifts the fence at once. Never raises."""
+    global _dead_chip_stuck_seen
     if not _dead_chip_stuck:
+        _dead_chip_stuck_seen = None
         return ""
+    now = time.monotonic()
+    seen = _dead_chip_stuck_seen
+    if seen is not None and now - seen[0] < max(1.0, float(SAMPLE_INTERVAL_SEC)):
+        with _dead_chip_stuck_lock:
+            unchanged = dict(_dead_chip_stuck) == seen[1]
+        try:
+            if unchanged and all(still_stuck(pid, start) for pid, start in seen[3]):
+                return seen[2]
+        except Exception:  # noqa: BLE001 - a failed re-read scans again
+            pass
+    _dead_chip_stuck_seen = None
     stuck = [f for f in _reaped_leftovers() if f.job_id.startswith(DEAD_CHIP_LABEL_PREFIX)]
     if not stuck:
         return ""
-    return (
+    reason = (
         "killed holder(s) stuck in the kernel on a removed chip: "
         + "; ".join(f.describe() for f in stuck)
         + "; re-enumerating PCI under them can stall the host (spec 04 I77)"
     )
+    with _dead_chip_stuck_lock:
+        registry = dict(_dead_chip_stuck)
+    named = [(f.pid, registry[f.pid][1]) for f in stuck if f.pid in registry]
+    if len(named) == len(stuck):
+        _dead_chip_stuck_seen = (now, registry, reason, named)
+    return reason
 
 
 def _tenant_holder_reason() -> str:
