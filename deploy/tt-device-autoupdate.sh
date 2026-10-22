@@ -9,7 +9,7 @@
 #   TTDEV_AUTOUPDATE=1                 # master switch
 #   TTDEV_BRANCH=<branch>              # branch to track (main in prod)
 #   TTDEV_VENV=/path/to/broker/venv    # venv we pip-install into
-#   TTDEV_MIN_APPLY_INTERVAL_SEC=3600  # optional: min seconds between applies (0/unset = off)
+#   TTDEV_MIN_APPLY_INTERVAL_SEC=1800  # optional: min seconds between applies (default 1800; 0 = off)
 #
 # THE SOURCE IS NOT CONFIGURABLE (spec 08 I16). It is the constant below, and the only
 # lever an operator has is which branch of it to track. That is what keeps this path
@@ -90,10 +90,11 @@ installed_sha="$(cat "$STATE" 2>/dev/null || true)"
 
 echo "autoupdate: $BR ${installed_sha:0:9} -> ${remote_sha:0:9} via $src_desc" >&2
 
-# Apply rate limit (spec 08 I21), OFF by default. Every apply restarts the broker, and every start
-# runs the full startup check, fabric traffic pass included (spec 03 I4) -- a burst of pushes is a
-# burst of fabric passes on a galaxy. With TTDEV_MIN_APPLY_INTERVAL_SEC set, a new sha waits until
-# that long has passed since the last apply, so the burst becomes one restart onto its newest sha.
+# Apply rate limit (spec 08 I21), ON by default (1800 s). Every apply restarts the broker, and every
+# start runs the full startup check, fabric traffic pass included (spec 03 I4) -- a burst of pushes
+# is a burst of restarts and fabric passes, each holding the queue. A new sha waits until
+# TTDEV_MIN_APPLY_INTERVAL_SEC (0 = off) has passed since the last apply, so the burst becomes one
+# restart onto its newest sha.
 # Checked before the device-op bar and the dispatch hold: a lap that will not apply holds nothing.
 # Only the timing of an apply moves; the startup check after it is never skipped or shortened.
 # The stamp is written just before the restart, so a failed apply retries on the next lap.
@@ -104,7 +105,7 @@ echo "autoupdate: $BR ${installed_sha:0:9} -> ${remote_sha:0:9} via $src_desc" >
 # config file sourced above wins over an env override on the command line).
 LAST_APPLY="$ROOT/last-apply"
 LAST_APPLY_NRESTARTS="$ROOT/last-apply-nrestarts"
-MIN_APPLY="${TTDEV_MIN_APPLY_INTERVAL_SEC:-0}"
+MIN_APPLY="${TTDEV_MIN_APPLY_INTERVAL_SEC:-1800}"
 # Every start opens RECOVERING(startup_unverified) and holds the device until the startup check
 # passes: the hugepage wait (STARTUP_HUGEPAGES_WAIT_SEC, 120 s, spec 03 I33) and then one full gate
 # pass with its fabric check (436 s at most, spec 04 reset duration bound). That is a broker

@@ -4,8 +4,8 @@
 """Spec 08 I21: the apply rate limit.
 
 Every apply restarts the broker, and every start runs the full startup check, fabric traffic pass
-included. With TTDEV_MIN_APPLY_INTERVAL_SEC set, a burst of pushes becomes one restart onto its
-newest sha. The laps below run the script's own lines, cut from it, under a fake clock and a stub
+included. The limit is on by default (TTDEV_MIN_APPLY_INTERVAL_SEC, 1800 s; 0 turns it off), so a
+burst of pushes becomes one restart onto its newest sha. The laps below run the script's own lines, cut from it, under a fake clock and a stub
 `systemctl restart` that records each restart. The limit is for a healthy broker only: one that is
 down, restarting itself, holding the device or failing its health check applies a new sha at once.
 A broker in its startup check is booting, not broken, and stays limited for a bounded time.
@@ -68,11 +68,36 @@ curl() {{ printf '%s' '{quoted_health}'; }}
     return done, lines, root
 
 
-def test_the_rate_limit_is_off_by_default(tmp_path):
-    assert 'MIN_APPLY="${TTDEV_MIN_APPLY_INTERVAL_SEC:-0}"' in _SCRIPT.read_text()
+def test_the_rate_limit_is_on_by_default_at_1800s(tmp_path):
+    assert 'MIN_APPLY="${TTDEV_MIN_APPLY_INTERVAL_SEC:-1800}"' in _SCRIPT.read_text()
     _lap(tmp_path, now=1000, sha="a1")
-    _, restarts, _ = _lap(tmp_path, now=1001, sha="b2")
+    done, restarts, _ = _lap(tmp_path, now=1060, sha="b2")
+    assert restarts == ["1000 a1"], done.stderr
+    assert "(min 1800s); b2 applies in 1740s" in done.stderr, done.stderr
+    _, restarts, _ = _lap(tmp_path, now=2800, sha="b2")
+    assert restarts == ["1000 a1", "2800 b2"]
+
+
+def test_an_interval_of_0_turns_the_rate_limit_off(tmp_path):
+    _lap(tmp_path, now=1000, sha="a1", interval=0)
+    _, restarts, _ = _lap(tmp_path, now=1001, sha="b2", interval=0)
     assert restarts == ["1000 a1", "1001 b2"]
+
+
+def test_a_push_burst_under_the_default_is_paced_to_one_restart_per_interval(tmp_path):
+    # Nine pushes over about two hours, a lap a minute, no interval configured: one restart per
+    # 1800 s at most, each onto the newest sha, and the last push still applies.
+    t0 = 1_700_000_000
+    pushes = [t0 + m * 60 for m in (0, 8, 15, 31, 47, 60, 79, 95, 128)]
+    sha = None
+    for now in range(t0, pushes[-1] + 1800 + 120, 60):
+        sha = f"s{sum(p <= now for p in pushes)}"
+        _, restarts, _ = _lap(tmp_path, now=now, sha=sha)
+    assert restarts[-1].endswith(f" {sha}"), restarts
+    # The first push applies at once; the rest wait out the interval: 6 restarts, not 9.
+    assert len(restarts) <= 1 + -(-(pushes[-1] - t0) // 1800) == 6, restarts
+    times = [int(r.split()[0]) for r in restarts]
+    assert all(b - a >= 1800 for a, b in zip(times, times[1:])), restarts
 
 
 def test_a_burst_of_pushes_becomes_one_restart_onto_the_newest_sha(tmp_path):
@@ -149,6 +174,15 @@ def test_a_broken_broker_applies_a_new_sha_inside_the_interval(tmp_path, state):
     assert "rate limit skipped: the broker" in done.stderr and "b2 applies now" in done.stderr, done.stderr
 
 
+@pytest.mark.parametrize("state", sorted(_BROKEN))
+def test_a_broken_broker_applies_at_once_under_the_default_interval(tmp_path, state):
+    # The default is on, so a fix for a broken broker must not wait for it either.
+    _lap(tmp_path, now=10_000, sha="a1")
+    done, restarts, _ = _lap(tmp_path, now=10_060, sha="b2", **_BROKEN[state])
+    assert restarts == ["10000 a1", "10060 b2"], done.stderr
+    assert "rate limit skipped: the broker" in done.stderr and "b2 applies now" in done.stderr, done.stderr
+
+
 @pytest.mark.parametrize(
     "broker",
     [
@@ -221,6 +255,12 @@ def test_a_startup_check_past_its_bound_or_held_applies_at_once(tmp_path, monkey
     done, restarts, _ = _lap(tmp_path, now=t, sha="b2", interval=3600, health=health)
     assert restarts == ["10000 a1", f"{t} b2"], done.stderr
     assert "rate limit skipped: the broker" in done.stderr and "b2 applies now" in done.stderr, done.stderr
+    # The same under the default interval, which is longer than the bound.
+    assert _startup_bound() < 1800
+    (tmp_path / "default").mkdir()
+    _lap(tmp_path / "default", now=10_000, sha="a1")
+    done, restarts, _ = _lap(tmp_path / "default", now=t, sha="b2", health=health)
+    assert restarts == ["10000 a1", f"{t} b2"], done.stderr
 
 
 def test_the_crash_loop_baseline_is_the_count_after_the_last_apply(tmp_path):
