@@ -495,6 +495,8 @@ if [ -z "$why_restart" ]; then
     # Nothing to install or stage: the venv, the staged scripts and the host config already match
     # the new tree, which is now the one on disk.
     printf '%s\n' "$remote_sha" > "$STATE"
+    # I23: the deferral clock belongs to an update not yet applied; a later one starts its own.
+    rm -f "$RECOVERY_PENDING" 2>/dev/null || true
     echo "autoupdate: ${installed_sha:0:9} -> ${remote_sha:0:9} changes only ${NO_RESTART_PATHS}; tree and installed.sha moved, broker not restarted" >&2
     EVENTS="${TT_DEVICE_MCP_HEALTH_DIR:-/var/lib/tt-device-broker/health}/health_events.jsonl"
     now="$(date +%s.%N)"
