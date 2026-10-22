@@ -70,7 +70,7 @@ def test_health_stays_held_while_a_forced_rung_runs(held, monkeypatch):
     assert during["status"] == "degraded" and during["fsm_state"] != ServerState.HEALTHY.value
     assert during["held_since"] == before["held_since"], "the hold keeps its clock across the op"
     assert during["held_age_sec"] >= before["held_age_sec"]
-    assert during["held_reason"] == f"device unverified: {REASON}", "the hold's own reason, not the op's"
+    assert during["held_reason"].startswith(f"device unverified: {REASON} ["), "the hold's own reason, not the op's"
     assert "broker device op in flight" in during["device_degraded"]
     assert not [
         r for r in srv._recent_jobs(20) if r["job_id"] == "--" and "HELD" in r["command"]

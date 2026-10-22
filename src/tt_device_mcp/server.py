@@ -1089,6 +1089,12 @@ device_hold_job_bound_escalated: bool = False
 # spawn so the escalation reports the clock that actually fired rather than the general ceiling.
 device_hold_escalation_trigger: str = ""
 device_hold_escalation_kind: str = ""  # machine-readable twin of the trigger text, for the event
+# Spec 03 I85: where this episode's forced escalation stands, for /health: the hold's opening reason
+# never changes, so without this a hold the ladder is climbing reads as unbounded. Set on every line
+# the forced escalation logs (each rung, the bound's host rung) and when its ladder ends. Cleared with
+# the episode.
+device_hold_escalation_stage: str = ""
+device_hold_escalation_stage_at: str = ""
 _forced_escalation_task: "Optional[asyncio.Task]" = None
 # The host-action request (see RecoveryMechanism.host_action_requested) whose suppression of the
 # forced ladder was already logged: one line per request, not one per sampler tick.
@@ -2789,6 +2795,7 @@ def _reset_for_testing():
     device_hold_job_bound_escalated = False
     device_hold_escalation_trigger = ""
     device_hold_escalation_kind = ""
+    _note_escalation_stage("")
     _forced_escalation_task = None
     _host_action_suppressed_logged = None
     reset_killed_job_ids.clear()
@@ -8206,6 +8213,106 @@ def _hold_report(now: Optional[datetime] = None) -> dict:
     return out
 
 
+def _note_escalation_stage(stage: str, now: Optional[datetime] = None) -> None:
+    """Record where this hold's forced escalation stands (spec 03 I85; see device_hold_escalation_stage)."""
+    global device_hold_escalation_stage, device_hold_escalation_stage_at
+    device_hold_escalation_stage = " ".join(stage.split())[:240]
+    device_hold_escalation_stage_at = (now or datetime.now()).isoformat(timespec="seconds") if stage else ""
+
+
+def _hold_power_cycle_request(episode: str, started: float) -> Optional[float]:
+    """Epoch of this episode's latest power-cycle request, or None: the off-bus path's attempt record
+    for the episode, or a power-cycle row of the auto-recovery ledger written since the episode began.
+    Both are on disk before the cycle fires, so the answer survives the cycle. Read-only."""
+    stamps = []
+    for rec in offbus_power_cycle.load_state().get("attempts") or []:
+        if isinstance(rec, dict) and rec.get("episode") == episode:
+            stamps.append(rec.get("at_epoch"))
+    read = getattr(recovery_mechanism, "read_auto_recovery_ledger", None)
+    for rec in (read() if callable(read) else None) or []:
+        if isinstance(rec, dict) and rec.get("action") == "power-cycle":
+            stamps.append(rec.get("at_epoch"))
+    found = []
+    for at in stamps:
+        try:
+            at = float(at)
+        except (TypeError, ValueError):
+            continue
+        if at >= started:
+            found.append(at)
+    return max(found) if found else None
+
+
+def _hold_escalation_status(now: Optional[datetime] = None) -> Optional[dict]:
+    """Where the open hold episode's escalation stands (spec 03 I85), for /health: the last step taken,
+    the next step and when it is due, and whether a power cycle was requested. None while not held.
+
+    The next step is the hold watchdog's own next rung (_hold_next_rung, the clock /health's
+    ``next_rung`` reads: the 10-min full ladder, then the power cycle, the boot/post-cycle cooldown it
+    waits on), else the 10-min bound's deadline; no second clock. Reporting only: no device touch,
+    and it moves, claims or releases nothing."""
+    episode = device_hold_episode_since
+    if not episode:
+        return None
+    try:
+        started = datetime.fromisoformat(episode).timestamp()
+    except ValueError:
+        return None
+    now = now or datetime.now()
+    now_epoch = now.timestamp()
+    requested = _hold_power_cycle_request(episode, started)
+    stage, stage_at = device_hold_escalation_stage, device_hold_escalation_stage_at or None
+    if not stage:
+        # Nothing logged in this process (a restart, the cycle's reboot included): the episode's
+        # recorded steps still say how far it got.
+        if requested is not None:
+            stage = "power cycle requested"
+            stage_at = datetime.fromtimestamp(requested).isoformat(timespec="seconds")
+        elif _hold_bound_ladder_age is not None:
+            stage = f"full recovery ladder ran at hold age {int(_hold_bound_ladder_age)}s"
+        else:
+            stage = "held, no forced escalation yet"
+    out: dict = {"stage": stage, "stage_at": stage_at, "next_step": None, "next_deadline": None, "next_in_sec": None}
+    if _forced_escalation_task is not None and not _forced_escalation_task.done():
+        out["next_step"] = "the forced recovery ladder is running"
+    elif _hold_bound_tenant_blocker is not None:
+        # Spec 04 I76: the one wait past the bound with no deadline of its own.
+        out["next_step"] = f"waits for the tenant to leave ({_describe_bound_blocker(_hold_bound_tenant_blocker)})"
+    else:
+        rung = _hold_next_rung(now_epoch)
+        if rung is not None:
+            when, what = rung.at, f"{rung.rung} ({rung.source})"
+        else:
+            deadline = hold_bound_deadline(now)
+            when = deadline.timestamp() if deadline is not None else None
+            what = "full recovery ladder (10-min hold bound)"
+        if when is not None:
+            out["next_step"] = what
+            out["next_deadline"] = datetime.fromtimestamp(when).isoformat(timespec="seconds")
+            out["next_in_sec"] = max(0, int(when - now_epoch))
+    out["power_cycle_requested"] = requested is not None
+    out["power_cycle_requested_at"] = (
+        datetime.fromtimestamp(requested).isoformat(timespec="seconds") if requested is not None else None
+    )
+    return out
+
+
+def _hold_escalation_suffix(status: Optional[dict]) -> str:
+    """:func:`_hold_escalation_status` as one bracketed line for the hold reason, or '' when none."""
+    if not status:
+        return ""
+    parts = [f"escalation: {status['stage']}"]
+    if status["next_deadline"]:
+        parts.append(f"next: {status['next_step']} at {status['next_deadline']} (in {status['next_in_sec']}s)")
+    elif status["next_step"]:
+        parts.append(f"next: {status['next_step']}")
+    if status["power_cycle_requested"]:
+        parts.append(f"power cycle requested at {status['power_cycle_requested_at']}")
+    else:
+        parts.append("no power cycle requested")
+    return " [" + "; ".join(parts) + "]"
+
+
 def _health_payload(now: Optional[datetime] = None) -> dict:
     """The /health body. Beyond broker liveness it reports the DEVICE hold state, so a poller
     cannot read a box sitting held-and-refused as 'ok' — the gap that let a stuck hold go
@@ -8256,7 +8363,12 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
     if hold:
         reason, since = hold
         payload["held_since"] = since
-        payload["held_reason"] = reason
+        # Spec 03 I85: the reason the hold opened with, plus where its escalation stands now, so a hold
+        # the ladder is climbing never reads as unbounded; ``hold_escalation`` gives the same as fields.
+        escalation = _hold_escalation_status(now)
+        payload["held_reason"] = reason + _hold_escalation_suffix(escalation)
+        if escalation is not None:
+            payload["hold_escalation"] = escalation
         try:
             payload["held_age_sec"] = int(((now or datetime.now()) - datetime.fromisoformat(since)).total_seconds())
         except ValueError:
@@ -8376,6 +8488,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         # ...and the alert hook's backoff for that same episode, so a restart does not page again.
         device_hold_alert_next_bucket, device_hold_alert_gap = _restore_hold_alert_backoff(device_hold_episode_since)
         device_hold_episode_reason = reason
+        _note_escalation_stage("")  # a fresh episode starts with no escalation behind it
         # Reserve the ledger row now, so the live row and the durable one share id, start, and name.
         # Its start is THIS process's segment (row_since), NOT the restored escalation clock: a hold
         # split by a restart then reads as adjacent rows — the orphaned-close for the prior segment,
@@ -8464,8 +8577,9 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         device_hold_alert_next_bucket = 0
         device_hold_alert_gap = 0
         _persist_hold_alert_backoff("", 0, 0)
-        # ...and its own forced-escalation windows.
+        # ...and its own forced-escalation windows, and where the last one stood.
         device_hold_escalate_bucket = 0
+        _note_escalation_stage("")
         # ...and its own early off-bus attempt.
         device_hold_offbus_escalated = False
         device_hold_offbus_prior_bucket = None
@@ -8500,6 +8614,7 @@ async def _force_escalate_stuck_hold() -> None:
     global device_hold_tenant_deferred, _fabric_link_short_declined
 
     def log(msg: str) -> None:
+        _note_escalation_stage(msg)  # each rung's line is also the hold's current stage in /health
         if logger:
             logger.error(f"HOLD-DEADLINE-ESCALATE {msg}")
 
@@ -8678,6 +8793,7 @@ async def _force_escalate_stuck_hold() -> None:
             if blocker is not None:
                 _hold_bound_tenant_blocked(blocker, log)
         _fold_rung_outcome(outcome, log)
+        _note_escalation_stage(f"forced recovery ladder ({kind or 'ceiling_window'}) ended: {outcome}")
         if stood_down and _rearm_tenant_deferred_window(kind):
             log(f"{kind} re-armed: it runs on the first sampler tick with no tenant, not at the next window")
             return
