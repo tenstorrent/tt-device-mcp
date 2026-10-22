@@ -45,6 +45,10 @@ def _key(argv):
         return "preflight"
     if argv[-3:] == ["raw", "0x00", "0x07"]:
         return "restart_cause"
+    if argv[-3:] == ["sel", "time", "get"]:
+        return "sel_time"
+    if argv[-4:-1] == ["sel", "list", "last"]:
+        return "sel_list"
     for k in ("is-active", "kill", "stop"):
         if k in argv:
             return k
@@ -56,7 +60,17 @@ def os_first(monkeypatch, tmp_path):
     """The clean path wired to stubs: available, its request in tmp_path, each step recorded and
     answered from ``rc`` (step name -> rc), commands resolved under /usr/bin."""
     calls, events = [], []
-    rc = {"systemd-run": 0, "reboot": 0, "stop": 0, "kill": 0, "is-active": 3, "preflight": 0, "restart_cause": 0}
+    rc = {
+        "systemd-run": 0,
+        "reboot": 0,
+        "stop": 0,
+        "kill": 0,
+        "is-active": 3,
+        "preflight": 0,
+        "restart_cause": 0,
+        "sel_time": 0,
+        "sel_list": 0,
+    }
     out = {"restart_cause": " 01 0f"}  # chassis power control command
     req = tmp_path / "power-cycle.request"
     monkeypatch.setattr(pc, "REQUEST_FILE", str(req))
@@ -706,6 +720,133 @@ def test_a_boot_long_after_the_request_is_not_checked(booted, monkeypatch):
     monkeypatch.setattr(booted["mech"], "_boot_btime_id", lambda: str(int(BOOT_NOW + 7200)))
     assert booted["mech"].confirm_power_cycle_on_boot(now_epoch=BOOT_NOW + 7300) is None
     assert booted["calls"] == []
+
+
+# A Galaxy BMC that answers no restart cause ("Unspecified error") still logs the power-off in its
+# SEL. Measured: the request at 03:02:49 UTC, the hook's TTPC record at 03:03:09 and the power-off at
+# 03:03:14 on the BMC clock (about 2 s behind the host's), the boot at 03:05:29, the broker's check at
+# 03:05:51.
+SEL_REQUEST = 1792638169.550994
+SEL_BTIME = 1792638329
+SEL_CHECK = 1792638351.98
+SEL_TAIL = """\
+ 487 | 10/22/2026 | 03:01:54 | Critical Interrupt #0x8f | Bus Correctable error | Asserted
+ 488 | 10/22/2026 | 03:01:54 | Critical Interrupt #0x8f | Bus Correctable error | Asserted
+ 489 | 10/22/2026 | 03:02:05 | Critical Interrupt #0x8f | Bus Correctable error | Asserted
+ 48e | 10/22/2026 | 03:02:06 | Critical Interrupt #0x8f | Bus Correctable error | Asserted
+ 48f | 10/22/2026 | 03:03:09 | OEM record c0 | 000000 | 545450430101
+ 491 | 10/22/2026 | 03:03:14 | Power Unit #0x02 | Power off/down | Asserted
+ 492 | 10/22/2026 | 03:03:48 | Power Unit #0x02 | Power off/down | Deasserted
+"""
+
+
+@pytest.fixture
+def sel_booted(booted, monkeypatch, tmp_path):
+    """That boot: the restart-cause query fails, the SEL tail and BMC clock as read there."""
+    mech = booted["mech"]
+    monkeypatch.setattr(mech, "_boot_btime_id", lambda: str(SEL_BTIME))
+    row = {
+        "action": "power-cycle",
+        "reason": REASON,
+        "at": "2026-10-22T03:02:49.550994",
+        "at_epoch": SEL_REQUEST,
+        "boot_id": "boot-1",
+    }
+    (tmp_path / recovery_base.AUTO_RECOVERY_LEDGER).write_text(json.dumps(row) + "\n")
+    booted["rc"]["restart_cause"] = 1
+    booted["out"][
+        "restart_cause"
+    ] = "Unable to send RAW command (channel=0x0 netfn=0x0 lun=0x0 cmd=0x7 rsp=0xff): Unspecified error"
+    booted["out"]["sel_time"] = "10/22/2026 03:05:50"
+    booted["out"]["sel_list"] = SEL_TAIL
+    booted["host_now"] = SEL_CHECK
+    monkeypatch.setattr(
+        pc,
+        "time",
+        type("T", (), {"time": staticmethod(lambda: booted["host_now"]), "strptime": staticmethod(time.strptime)}),
+    )
+    return booted
+
+
+def test_a_bmc_with_no_restart_cause_confirms_the_cycle_from_its_sel(sel_booted):
+    """The cycle really happened (SEL Power off/down between the request and the boot): confirmed,
+    never left unconfirmed because the restart-cause query is unsupported."""
+    assert sel_booted["mech"].confirm_power_cycle_on_boot(now_epoch=SEL_CHECK) == "confirmed"
+    row = _row(sel_booted)
+    assert row["cycle_checked"] == "confirmed" and row["restart_cause"] is None
+    assert row["host_rebooted"] is True and row["power_cycled"] is True and "took_host_down" not in row
+    # 03:03:14 on the BMC clock, 1.98 s behind the host's.
+    assert row["sel_power_off"] == recovery_base._local_time(1792638194 + 1.98)
+    assert sel_booted["mech"]._cycles_that_ran([row], SEL_CHECK) == [row]
+    assert [c[1] for c in sel_booted["calls"]][-2:] == [
+        ["/usr/bin/ipmitool", "sel", "time", "get"],
+        ["/usr/bin/ipmitool", "sel", "list", "last", str(pc.SEL_TAIL_RECORDS)],
+    ]
+    assert all(c[3] <= pc.SEL_TIMEOUT_SEC for c in sel_booted["calls"][-2:])
+    names = [n for n, _ in sel_booted["hevents"]]
+    assert "power_cycle_confirmed" in names and "power_cycle_unconfirmed" not in names
+    assert not (sel_booted["tmp"] / recovery_base.POWER_CYCLE_CAUSE_CAPABLE_FILE).exists()
+
+
+def test_the_sel_is_read_on_the_bmc_clock_whatever_its_zone(sel_booted):
+    """A BMC that keeps local time (UTC-7) and runs 2 s slow: the offset to its own clock places it."""
+    sel_booted["out"]["sel_time"] = "10/21/2026 20:05:50"
+    sel_booted["out"]["sel_list"] = SEL_TAIL.replace("10/22/2026 | 03:", "10/21/2026 | 20:")
+    assert sel_booted["mech"].confirm_power_cycle_on_boot(now_epoch=SEL_CHECK) == "confirmed"
+
+
+@pytest.mark.parametrize(
+    "sel_time,sel_list,why",
+    [
+        (
+            "10/22/2026 03:05:50",
+            SEL_TAIL.replace("10/22/2026 | 03:03:14", "10/21/2026 | 22:03:14"),
+            "an older power-off",
+        ),
+        (
+            "10/22/2026 03:05:50",
+            SEL_TAIL.replace("| Power off/down | Asserted", "| Power off/down | Deasserted"),
+            "power-on only",
+        ),
+        ("10/22/2026 03:05:50", "\n".join(SEL_TAIL.splitlines()[:5]), "no power record"),
+        ("", SEL_TAIL, "no BMC clock"),
+        ("Get SEL Time command failed: Unspecified error", SEL_TAIL, "unreadable BMC clock"),
+    ],
+)
+def test_no_power_off_in_the_window_leaves_the_cycle_unconfirmed_never_refuted(sel_booted, sel_time, sel_list, why):
+    sel_booted["out"]["sel_time"] = sel_time
+    sel_booted["out"]["sel_list"] = sel_list
+    assert sel_booted["mech"].confirm_power_cycle_on_boot(now_epoch=SEL_CHECK) == "unconfirmed", why
+    row = _row(sel_booted)
+    assert row["power_cycled"] is None and "took_host_down" not in row and "sel_power_off" not in row
+
+
+def test_a_failed_sel_read_leaves_the_cycle_unconfirmed(sel_booted):
+    sel_booted["rc"]["sel_list"] = 1
+    assert sel_booted["mech"].confirm_power_cycle_on_boot(now_epoch=SEL_CHECK) == "unconfirmed"
+
+
+def test_the_sel_queries_keep_the_cycle_commands_bmc_options(os_first, monkeypatch):
+    monkeypatch.setattr(
+        pc, "time", type("T", (), {"time": staticmethod(lambda: SEL_CHECK), "strptime": staticmethod(time.strptime)})
+    )
+    os_first["out"].update(sel_time="10/22/2026 03:05:50", sel_list=SEL_TAIL)
+    argv = ["ipmitool", "-I", "lanplus", "-H", "bmc", "-U", "u", "-P", "p", "chassis", "power", "cycle"]
+    assert pc.read_sel_power_off(argv, SEL_REQUEST, SEL_BTIME) is not None
+    opts = ["-I", "lanplus", "-H", "bmc", "-U", "u", "-P", "p"]
+    assert [c[1] for c in os_first["calls"]] == [
+        ["/usr/bin/ipmitool", *opts, "sel", "time", "get"],
+        ["/usr/bin/ipmitool", *opts, "sel", "list", "last", str(pc.SEL_TAIL_RECORDS)],
+    ]
+    os_first["calls"].clear()
+    assert pc.read_sel_power_off(["/opt/site/cycle.sh"], SEL_REQUEST, SEL_BTIME) is None
+    assert os_first["calls"] == [], "an opaque command has no BMC to query"
+
+
+def test_a_cause_the_bmc_answers_never_reads_the_sel(booted):
+    booted["out"]["restart_cause"] = " 0a 0f"
+    assert booted["mech"].confirm_power_cycle_on_boot(now_epoch=BOOT_NOW) == "refuted"
+    assert not any(c[0].startswith("sel_") for c in booted["calls"])
 
 
 # F3: the I27 contract on both paths.

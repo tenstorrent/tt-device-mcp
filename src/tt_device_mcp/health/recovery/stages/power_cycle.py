@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import calendar
 import logging
 import os
 import re
@@ -281,6 +282,72 @@ def read_restart_cause(argv: list) -> Optional[str]:
         return None
     code = int(lines[-1][0], 16) & 0x0F
     return RESTART_CAUSES.get(code, f"unmapped code 0x{code:02x}")
+
+
+# The SEL fallback for a BMC that answers no restart cause: the last records are enough (the power-off
+# is logged moments before the boot) and `sel list last N` reads only those, about 40 ms each.
+SEL_TAIL_RECORDS = 40
+SEL_TIMEOUT_SEC = 5
+# Slack around [request, boot] once the record time is moved onto the host's clock (1 s SEL
+# resolution, the query's own latency).
+SEL_WINDOW_SLACK_SEC = 30
+# Power Unit (sensor type 09h) offsets 0 and 1: the power went off, or the BMC cycled it.
+SEL_POWER_OFF_EVENTS = ("power off/down", "power cycle")
+_SEL_TIME_FORMATS = ("%m/%d/%Y %H:%M:%S", "%m/%d/%y %H:%M:%S")
+
+
+def _sel_naive_epoch(text: str) -> Optional[float]:
+    """A SEL date and time as ipmitool prints them, read as UTC whatever zone the BMC keeps: only its
+    difference to the BMC's own clock (``sel time get``, printed the same way) is used."""
+    for fmt in _SEL_TIME_FORMATS:
+        try:
+            return float(calendar.timegm(time.strptime(" ".join(text.split()), fmt)))
+        except ValueError:
+            continue
+    return None
+
+
+def read_sel_power_off(argv: list, since: float, until: float) -> Optional[float]:
+    """The host-clock epoch of the last Power Unit "Power off/down" or "Power cycle" record (asserted)
+    the BMC that the cycle command ``argv`` drives logged within ``[since, until]`` (host epochs, with
+    :data:`SEL_WINDOW_SLACK_SEC`), or None. Read-only and bounded: ``sel time get`` gives the BMC
+    clock's offset to the host's (zone and skew), then ``sel list last N``. None when there is no
+    query to derive, the BMC does not answer or no such record is in the window."""
+    clock = bmc_query_argv(argv, ["sel", "time", "get"])
+    tail = bmc_query_argv(argv, ["sel", "list", "last", str(SEL_TAIL_RECORDS)])
+    if clock is None or tail is None:
+        return None
+    exe = _resolve_command(clock[0])
+    if exe is None:
+        return None
+    rc, out = _run_step([exe, *clock[1:]], SEL_TIMEOUT_SEC)
+    host_now = time.time()
+    bmc_now = None
+    for ln in reversed((out or "").splitlines()) if rc == 0 else ():
+        bmc_now = _sel_naive_epoch(ln)
+        if bmc_now is not None:
+            break
+    if bmc_now is None:
+        return None
+    offset = host_now - bmc_now
+    rc, out = _run_step([exe, *tail[1:]], SEL_TIMEOUT_SEC)
+    if rc != 0:
+        return None
+    found = None
+    # " 491 | 10/22/2026 | 03:03:14 | Power Unit #0x02 | Power off/down | Asserted"
+    for ln in (out or "").splitlines():
+        f = [x.strip() for x in ln.split("|")]
+        if len(f) < 5 or not f[3].lower().startswith("power unit") or f[4].lower() not in SEL_POWER_OFF_EVENTS:
+            continue
+        if len(f) > 5 and f[5].lower() != "asserted":
+            continue
+        at = _sel_naive_epoch(f"{f[1]} {f[2]}")
+        if at is None:
+            continue
+        at += offset
+        if since - SEL_WINDOW_SLACK_SEC <= at <= until + SEL_WINDOW_SLACK_SEC:
+            found = at
+    return found
 
 
 def _resolve_command(cmd: str) -> Optional[str]:
