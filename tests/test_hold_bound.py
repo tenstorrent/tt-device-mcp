@@ -1837,3 +1837,99 @@ async def test_the_idle_relift_runs_no_check_while_a_host_power_cycle_is_pending
         await asyncio.sleep(0.01)
         await srv._attempt_idle_relift()
         assert observed == [True], "past the pending window the relift runs again"
+
+
+def _bound_hold_with_a_governed_host_rung(monkeypatch, state, cycles, until):
+    """A generic hold at the bound whose host rung the real governor path decides: denied by the boot
+    cooldown while ``state["cooling"]``, granted after. Returns the ladder log and event names."""
+    escalations, _alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why="eth_frozen", detail="gate/post-job: eth/fabric fault on a present mesh", age_min=10.1
+    )
+    monkeypatch.setattr(srv, "_hold_bound_host_rung", _REAL_HOST_RUNG)
+    _watchdog(monkeypatch)
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    monkeypatch.setattr(srv.galaxy_recovery, "tenant_holds", lambda: False)
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv.recovery_mechanism, "_journal_auto_recovery_denied", lambda *a: None)
+    monkeypatch.setattr(srv.PCI_WRITER, "on_latch", None)  # the hold is driven by hand here
+
+    def allowed(action, tenant_active=False, **k):
+        if state["cooling"]:
+            return srv.recovery_mechanism._deny_power_cycle(
+                {"until": until, "last": until - 1800, "cause": "boot", "interval_sec": 1800, "why": "cooldown"}
+            )
+        return True, ""
+
+    async def power_cycle(log, reason):
+        cycles.append(reason)
+
+    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", allowed)
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    return escalations, events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cooldown", [False, True])
+async def test_a_bound_ladder_that_latches_the_pci_wedge_is_not_reported_as_skipped(
+    monkeypatch, clear_job_state, cooldown
+):
+    """Spec 04 I76: a bound ladder's rung blocks in the kernel and latches PCI-wedged, which stops the
+    pass. The power-cycle request after it (at once, or as the cooldown's retry, which takes the
+    latched route) says that ladder ran and met the blocked write, never that it was skipped. Report
+    text only: one ladder, then one power cycle, at the same times."""
+    state, cycles, until = {"cooling": cooldown}, [], datetime.now().timestamp() + 900
+    escalations, _events = _bound_hold_with_a_governed_host_rung(monkeypatch, state, cycles, until)
+
+    async def wedging_ladder(kind, indices, expected, log, **_):
+        escalations.append(kind)
+        srv.PCI_WRITER._latch("bridge reset of chip 3 blocked in the kernel")
+        return OUTCOME_TERMINAL
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", wedging_ladder)
+    await srv._force_escalate_stuck_hold()
+    assert escalations == ["present-forced"] and srv.PCI_WRITER.latched
+    if cooldown:
+        assert cycles == [] and srv.recovery_mechanism.power_cycle_retry is not None
+        state["cooling"] = False
+        srv._check_hold_deadline(now=datetime.fromtimestamp(until + 1))
+        await _drain()
+    assert escalations == ["present-forced"], "no second ladder over a blocked PCI lock"
+    assert len(cycles) == 1, cycles
+    assert "skipped" not in cycles[0] and "did not heal" not in cycles[0], cycles[0]
+    assert "the ladder ran and a PCI write blocked" in cycles[0], cycles[0]
+    assert "chip 3 blocked in the kernel" in cycles[0], cycles[0]
+    assert srv._recovery_degraded() and srv.fsm.state != ServerState.HEALTHY, "the request lifts no hold"
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_ladders_reason_survives_the_cooldown_retry(monkeypatch, clear_job_state):
+    """A leftover holder skips the bound's ladder and the boot cooldown denies the host rung. The
+    cooldown's retry run takes the host-rung route, which reads no leftover itself: its request still
+    names the skip, never 'the full ladder did not heal it', since no ladder ran. Once a bound ladder
+    runs, the kept skip is spent."""
+    state, cycles, until = {"cooling": True}, [], datetime.now().timestamp() + 900
+    escalations, _events = _bound_hold_with_a_governed_host_rung(monkeypatch, state, cycles, until)
+    leftover = {"why": "job 7 pid 42 still holds the device"}
+    monkeypatch.setattr(srv, "_reaped_leftover_reason", lambda scan=None: leftover["why"])
+
+    async def ladder(kind, indices, expected, log, **_):
+        escalations.append(kind)
+        return OUTCOME_TERMINAL
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", ladder)
+    await srv._force_escalate_stuck_hold()
+    assert escalations == [] and cycles == [] and srv.recovery_mechanism.power_cycle_retry is not None
+    leftover["why"] = ""
+    state["cooling"] = False
+    monkeypatch.setattr(srv, "device_hold_escalation_kind", "power_cycle_cooldown")  # the retry's run
+    assert srv._forced_run_route("power_cycle_cooldown", srv._hold_age_now()).action == srv.ROUTE_HOST_RUNG
+    await srv._force_escalate_stuck_hold()
+    assert escalations == [], "the retry asks the host rung, no ladder"
+    assert len(cycles) == 1, cycles
+    assert "the ladder was skipped: job 7 pid 42 still holds the device" in cycles[0], cycles[0]
+    assert "did not heal" not in cycles[0], cycles[0]
+    assert srv._recovery_degraded() and srv.fsm.state != ServerState.HEALTHY, "the request lifts no hold"
+
+    srv._note_hold_bound_ladder(srv._hold_age_now(), OUTCOME_TERMINAL)  # a bound ladder ran since
+    await _REAL_HOST_RUNG(srv._hold_age_now(), lambda *a: None)
+    assert len(cycles) == 2 and "the full ladder did not heal it" in cycles[1], cycles

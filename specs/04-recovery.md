@@ -1504,8 +1504,10 @@ each rung fires only when the gentler one failed or cannot apply.
   cooldown ends, not at the 10-min mark. That request's reason names the skip, never a failed
   ladder: `PCI-wedged hold: held <n>s and the ladder was skipped (<latch reason>)`, or, for any
   other request asked with no ladder run (leftover chips, a refused kill), `the ladder was skipped:
-  <why>`; only a request after a bound ladder that ran says the full ladder did not heal it. This is
-  report text only: when and whether the cycle is asked is unchanged. No hold lifts while latched unless no write is pending
+  <why>`, kept for the episode's later retries of it until a bound ladder runs. A request after a
+  bound ladder that ran says so: `the ladder ran and a PCI write blocked (<latch reason>)` when one of
+  its rungs latched the wedge (the first timeout stops the pass), else that the full ladder did not
+  heal it. This is report text only: when and whether the cycle is asked is unchanged. No hold lifts while latched unless no write is pending
   and the full check with fabric has just passed; that lift clears the latch
   (`pci_wedged_cleared`). Bound: one PCI timeout per ladder, at most one leaked thread per host.
   Time to recover for a blocked PCI lock: one timeout (about 91 s for a bridge reset, 30 s for a
