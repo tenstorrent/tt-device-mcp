@@ -60,8 +60,8 @@ def _run(tmp_path, bus, validator_rc=0, fail_on="", probe_rc=1, validator_out="v
         f'echo "${{TT_VISIBLE_DEVICES-UNSET}}" >>"{calls}"\n'
         'echo "probe opened ${TT_VISIBLE_DEVICES-the whole mesh}"\n'
         f'if [ -n "{fail_on}" ] && [[ "${{TT_VISIBLE_DEVICES-}}" == *"{fail_on}"* ]]; then\n'
-        f'  [ {probe_rc} -eq 137 ] && kill -9 $$\n'
-        "  echo \"  what():  TT_THROW: chip did not run the program\"\n"
+        f"  [ {probe_rc} -eq 137 ] && kill -9 $$\n"
+        '  echo "  what():  TT_THROW: chip did not run the program"\n'
         f"  exit {probe_rc}\n"
         "fi\n"
         "exit 0\n"
