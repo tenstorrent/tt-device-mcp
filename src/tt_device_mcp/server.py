@@ -104,6 +104,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     CEILING,
     DEFER,
     FABRIC_DEBT,
+    FABRIC_KILLED_BY_ISOLATION,
     HOLD_ESCALATION_REARM_SEC,
     HOLD_FABRIC_UNVERIFIED,
     OUTCOME_RECOVERED,
@@ -3875,6 +3876,18 @@ def _hold_device_fabric_unverified(why: str) -> None:
     fsm.on_fault("fabric_unverified", detail=why, dirty=False)
 
 
+def _isolation_unverified_reason(evidence: "dict | None") -> str:
+    """Why an enum+ARC healthy read proves nothing (spec 03 I82), or ''. A chip the dead-chip
+    isolation took off the bus, or a fabric run in ``evidence`` that isolation killed, leaves the
+    mesh unknown: the gate logs it unhealthy and keeps the hold dirty."""
+    if isolated_chips:
+        return f"chip(s) {sorted(isolated_chips, key=int)} isolated off the bus"
+    detail = str(((evidence or {}).get("fabric") or {}).get("detail") or "")
+    if detail.startswith(FABRIC_KILLED_BY_ISOLATION):
+        return "fabric check killed by dead-chip isolation"
+    return ""
+
+
 def _reopen_boot_carried_fabric_hold() -> bool:
     """Hand a DOWN fabric-unverified episode an earlier boot left behind back to this boot's bounded
     77 path (spec 03 I49). Called by the startup gate right after it placed the 77 hold.
@@ -6982,11 +6995,18 @@ async def device_health_gate(
         # The full chip state behind every decision, and the bus-error totals inline so a
         # rising trend is visible without opening the chip journal. If the theory that a
         # wedged chip walks the root complex to a fatal error is right, it shows here.
-        chips = await asyncio.to_thread(chip_snapshot_event, f"gate/{phase}", healthy=healthy, dirty=dirty)
+        # Spec 03 I82: enum+ARC can read healthy while a chip sits isolated off the bus or this pass's
+        # fabric run was killed by that isolation. Neither is a verdict, so the record says unhealthy.
+        unverified = _isolation_unverified_reason(evidence)
+        chips = await asyncio.to_thread(
+            chip_snapshot_event, f"gate/{phase}", healthy=healthy and not unverified, dirty=dirty
+        )
         health_event(
             "gate",
             phase=phase,
-            healthy=healthy,
+            healthy=healthy and not unverified,
+            enum_arc_healthy=healthy,
+            unverified=unverified,
             dirty=dirty,
             dirty_reason=dirty_reason,
             dirty_job=dirty_job,
@@ -7157,6 +7177,16 @@ async def device_health_gate(
                 _note_full_check_passed(prior_carry)  # spec 04 I82; before the release below saves one
             if released and device_hold_logged:
                 _note_tenant_gate_verdict("")
+            return
+
+        if stage == HOLD_FABRIC_UNVERIFIED and unverified:
+            # Spec 03 I82: a chip is isolated off the bus, or the isolation killed this pass's fabric
+            # run. That is no 77: keep (or open) the dirty hold the isolation's recovery owns, never
+            # swap it for a clean fabric-unverified one, and journal no device_dirty_cleared.
+            _log(f"enum+ARC healthy but {unverified} — device stays held dirty; no release")
+            if not fsm.record.dirty or fsm.state is ServerState.HEALTHY:
+                _mark_device_dirty(f"gate/{phase}: {unverified}", why="heartbeat")
+            _note_tenant_gate_verdict(f"device unverified: gate/{phase}: {unverified}")
             return
 
         if stage == HOLD_FABRIC_UNVERIFIED:

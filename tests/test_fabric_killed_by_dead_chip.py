@@ -14,6 +14,7 @@ import signal
 
 import pytest
 
+from tests.conftest import fsm_dirty, fsm_healthy, patch_health_event, patch_recovery
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.fsm import ServerState
@@ -194,3 +195,105 @@ async def test_isolation_with_no_fabric_check_in_flight_marks_nothing(monkeypatc
     await srv._kill_device_holders(REASON)
     assert srv.health_monitor._fabric_killed == ""
     assert not FABRIC_DEBT.owed
+
+
+# ---- the gate: an enum+ARC healthy read with a chip isolated, or a killed pass, keeps the hold dirty ----
+
+_KILLED = {
+    "snapshot": {"ok": True},
+    "fabric": {"ok": None, "detail": f"{mon.FABRIC_KILLED_BY_ISOLATION} (40s, exit -9): {REASON}; no verdict"},
+}
+
+
+@pytest.fixture
+def gate(monkeypatch, tmp_path, clear_job_state):
+    """A 32-chip broker whose every verify reads enum+ARC healthy with a fabric run the isolation
+    killed. Nothing spawns: verify, resets and host rungs are stubbed."""
+    for i in range(32):
+        (tmp_path / str(i)).write_text("")
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
+    monkeypatch.setattr(srv.health_monitor, "expected", lambda present: 32)
+    monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "")
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "true")
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    monkeypatch.setattr(srv, "device_op_lock", None)
+    monkeypatch.setattr(srv, "device_op_active", "")
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+    monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
+    monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: {})
+    monkeypatch.setattr(srv, "_hugepages_shortfall", lambda: None)
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 0.0)
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", False)
+    monkeypatch.setattr(srv.alert, "send_alert", lambda *a, **k: None)
+    events = []
+    patch_health_event(monkeypatch, lambda kind, *a, **f: events.append((kind, f)))
+    seen = {"resets": 0, "rungs": []}
+
+    async def verify(expected, log, run_fabric=True, **_):
+        return True, dict(_KILLED)
+
+    async def reset(indices, log):
+        seen["resets"] += 1
+        return True
+
+    async def escalate(rung, *a, **k):
+        seen["rungs"].append(rung)
+        return srv.OUTCOME_WAITING
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    patch_recovery(monkeypatch, "_reset_and_verify_device", reset)
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
+    return events, seen
+
+
+def _gate_event(events):
+    return [f for k, f in events if k == "gate"][-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["post-job", "startup"])
+async def test_the_gate_never_logs_healthy_nor_clears_dirty_while_a_chip_is_isolated(gate, monkeypatch, phase):
+    """The field case: chip 15 left the bus, the isolation killed the fabric pass, and the next gate
+    read enum+ARC healthy. It logged healthy=true and swapped the dirty hold for a clean
+    fabric-unverified one (device_dirty_cleared). The record must stay dirty and unhealthy."""
+    events, _ = gate
+    monkeypatch.setattr(srv, "isolated_chips", {"15"})
+    fsm_dirty(srv, REASON, why="heartbeat")
+    kwargs = {"force_fabric": True} if phase == "startup" else {}
+    await srv._device_health_gate(None, phase=phase, run_fabric=True, **kwargs)
+    ev = _gate_event(events)
+    assert ev["healthy"] is False and ev["enum_arc_healthy"] is True
+    assert "isolated off the bus" in ev["unverified"]
+    assert "device_dirty_cleared" not in [k for k, _ in events]
+    assert srv.fsm.record.dirty and srv.fsm.record.why == "heartbeat"
+    assert srv.fsm.state is not ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_a_killed_pass_with_no_chip_still_isolated_keeps_the_hold_dirty(gate, monkeypatch):
+    """The chip came back (isolated_chips is empty) but this pass's fabric run was the one the
+    isolation killed: still no verdict, so the gate logs unhealthy and the release funnel refuses."""
+    events, _ = gate
+    fsm_dirty(srv, REASON, why="heartbeat")
+    await srv._device_health_gate(None, phase="post-job", run_fabric=True)
+    ev = _gate_event(events)
+    assert ev["healthy"] is False and ev["unverified"] == "fabric check killed by dead-chip isolation"
+    assert "device_dirty_cleared" not in [k for k, _ in events]
+    assert srv.fsm.record.dirty and srv.fsm.record.why == "heartbeat"
+    FABRIC_DEBT.note_fabric(None)  # the killed pass owes one (note_fabric_check_killed)
+    assert srv._clear_device_dirty(verified=True, why="gate/post-job: verified healthy") is False
+    assert srv.fsm.state is not ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_a_clean_record_with_a_chip_isolated_is_marked_dirty_not_held_clean(gate, monkeypatch):
+    """A HEALTHY record when the gate finds a chip isolated opens the dirty hold, not a clean 77 one."""
+    events, _ = gate
+    monkeypatch.setattr(srv, "isolated_chips", {"15"})
+    fsm_healthy(srv)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=True)
+    assert srv.fsm.record.dirty and srv.fsm.record.why == "heartbeat"
+    assert srv.fsm.record.why != srv.FABRIC_RELIFT_WHY
+    assert srv.fsm.state is not ServerState.HEALTHY

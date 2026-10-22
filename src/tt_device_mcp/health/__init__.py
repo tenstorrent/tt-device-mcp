@@ -47,6 +47,7 @@ from tt_device_mcp.health.evidence import (
     read_health_events,
 )
 from tt_device_mcp.health.monitor import (
+    FABRIC_KILLED_BY_ISOLATION,
     HealthMonitor,
     _normalized_board,
     eth_read_timed_out,
@@ -183,6 +184,7 @@ __all__ = [
     "CEILING",
     # construction pieces ServerFsm.boot assembles into the process singletons
     "HealthMonitor",
+    "FABRIC_KILLED_BY_ISOLATION",  # spec 03 I82: the gate holds a pass the isolation killed dirty
     "journal_interrupted_fabric_check",
     "note_broker_stopping",
     "eth_read_timed_out",  # spec 03 I61: the stuck eth read the post-job present-mesh reset answers
