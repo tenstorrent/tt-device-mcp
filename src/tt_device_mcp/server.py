@@ -3974,17 +3974,20 @@ async def _verify_operator_reset(present: int, recovery, log, source: str) -> tu
     return verdict, detail
 
 
-def _note_operator_reset_outcome(rc: Optional[int], verdict: Optional[bool], began: float) -> None:
+def _note_operator_reset_outcome(rc: Optional[int], verdict: Optional[bool], began: float, argv: list) -> None:
     """Settle an operator reset's cooldown as the broker settles its own (spec 04 I3). One that ran and
     failed (a non-zero exit, or a clean exit whose verify failed) arms the cooldown and the gate's two
     strikes (``was_failing``), so a failed operator reset counts as the first failed reset; a verified
     one, or a persistent 77 (unknown, not failed), clears them. One that never ran or is still cycling
     (``rc`` None) changes neither. The clock is the reset's start, as the broker's: a fabric pass its
-    verify stamped stays newer than it."""
+    verify stamped stays newer than it. A failed mesh reset (``-glx_reset``) is also marked as the
+    broker marks its own, so class C and the episode's one mesh reset see it (spec 04 I37, I87)."""
     if rc is None:
         return
     recovery_mechanism.last_reset_monotonic = max(recovery_mechanism.last_reset_monotonic, began)
     recovery_mechanism.last_reset_failed = rc != 0 or verdict is False
+    if recovery_mechanism.last_reset_failed and "-glx_reset" in argv:
+        recovery_mechanism.mark_mesh_reset_failed()
 
 
 def _reset_health_label(verdict: Optional[bool]) -> str:
@@ -7273,7 +7276,18 @@ async def device_health_gate(
             elif ev.cooling:
                 # A reset we already tried and that already failed to revive the mesh will not
                 # revive it now, and hammering a dead endpoint is precisely what escalates a PCIe
-                # error to fatal and reboots the host. Sit out the cooldown instead.
+                # error to fatal and reboots the host. Sit out the cooldown instead — but only for a
+                # reset: a whole tray or the whole bus off the bus (spec 04 I37 class A/C) still goes
+                # to its direct power cycle on this pass, since the cooldown guards no power cycle (I3).
+                direct = await galaxy_recovery.power_cycle_direct_in_cooldown(
+                    phase, expected, await asyncio.to_thread(_decision_heartbeats), _log
+                )
+                if direct is not None:
+                    if fsm.state is ServerState.HEALTHY:
+                        _mark_device_dirty(f"gate/{phase}: off the bus in a reset cooldown", why="probe_unhealthy")
+                    _fold_rung_outcome(direct, _log)
+                    _note_tenant_gate_verdict(f"device unverified: gate/{phase}: off the bus — power cycle (I37)")
+                    return
                 since = int(time.monotonic() - recovery_mechanism.last_reset_monotonic)
                 left = RESET_COOLDOWN_SEC - (time.monotonic() - recovery_mechanism.last_reset_monotonic)
                 _log(
@@ -14594,7 +14608,7 @@ def create_mcp_server() -> MCPServer:
                     output_queue.put_nowait(output if output.endswith("\n") else output + "\n")
                 output_queue.put_nowait(f"exit code: {rc}\n")
                 if rc != 0:
-                    _note_operator_reset_outcome(rc, None, began)
+                    _note_operator_reset_outcome(rc, None, began, argv)
                     return rc, False, ""
                 # Exit 0 says tt-smi ran, not that the mesh came back, so verify before the door
                 # reopens — still under the device-op lock, because on a mesh the verify is a fabric
@@ -14603,7 +14617,7 @@ def create_mcp_server() -> MCPServer:
                 verdict, detail = await _verify_operator_reset(
                     len(indices), recovery, lambda m: output_queue.put_nowait(f"{m}\n"), "operator reset stream"
                 )
-                _note_operator_reset_outcome(rc, verdict, began)
+                _note_operator_reset_outcome(rc, verdict, began, argv)
                 return rc, verdict, detail
 
         reset_task = asyncio.create_task(run_reset())
@@ -16201,7 +16215,7 @@ def create_mcp_server() -> MCPServer:
                     status = "reset_unverified"  # the reset ran; no pass proved the fabric moves data
                 elif not health_ok:
                     status = "reset_unhealthy"  # reset ran but the mesh is not back
-            _note_operator_reset_outcome(rc, verdict, began)
+            _note_operator_reset_outcome(rc, verdict, began, argv)
 
         return {
             "status": status,
