@@ -45,6 +45,16 @@ each rung fires only when the gentler one failed or cannot apply.
   recover is the failed pass, the reset (~4 min) and the power cycle within the 15 min class budget.
   The one stated exception is spec 03 I42's watchdog path: with no idle relift reset first, the reset
   starts at 600 s and the host rung follows about 4-6 min later.
+  An operator reset (`tt_device_reset`, tool and stream) settles the cooldown the same way, on the
+  clock of its start: `reset_failed` (a non-zero exit) and `reset_unhealthy` (I13) arm it and set
+  `last_reset_failed`, so a failed operator reset is the first of the gate's two strikes (I11);
+  `reset_complete` and `reset_unverified` (a persistent 77 is unknown, not failed, as for the broker's own resets) clear the
+  flag; a refused or timed-out one changes neither. Before, a failed operator reset armed nothing:
+  the next gate fired a back-to-back broker reset at the mesh it had just failed on, and that
+  broker reset's failure counted as the first strike, not the second. Time to recover: the hold
+  bound (I76) is unchanged for every class, since its forced ladder runs through the cooldown; the
+  gate's own path reaches the host rung one failed reset sooner after a failed operator reset, and
+  a gate below the bound waits out the rest of the cooldown instead of repeating that reset.
 - **I4 — Every reset survives its broker.** For root on a systemd host, `RecoveryMechanism.run_scoped` wraps
   reset argv in `systemd-run --scope --unit=ttdev-reset-<pid>-<seq>
   --property=KillMode=mixed`. Otherwise it starts a new-session child with an inherited
@@ -2508,7 +2518,7 @@ sees a silent fabric pass.
 | I15 CPLD banner: the check itself mutates nothing; the caller latches | `tests/test_reset.py::TestCpldTooOldBanner::test_the_check_itself_mutates_nothing` |
 | I15 CPLD latch answers the mode and selects the galaxy ladder | `tests/test_reset.py::TestCpldTooOldBanner::test_the_latch_makes_the_reset_mode_known`, `::test_the_latch_selects_the_galaxy_ladder` |
 | I15 an operator declaration still outranks the CPLD latch | `tests/test_reset.py::TestCpldTooOldBanner::test_an_operator_declaration_still_outranks_the_latch` |
-| I3 cooldown arming rules | `tests/test_device_safety.py::test_a_timed_out_reset_does_not_arm_the_cooldown`, `tests/test_device_safety.py::test_a_reset_that_exits_nonzero_still_arms_the_cooldown`, `tests/test_device_safety.py::test_an_adopted_foreign_reset_that_failed_arms_the_cooldown`, `tests/test_device_safety.py::test_stuck_hold_escalation_holds_within_the_reset_cooldown` |
+| I3 cooldown arming rules | `tests/test_device_safety.py::test_a_timed_out_reset_does_not_arm_the_cooldown`, `tests/test_device_safety.py::test_a_reset_that_exits_nonzero_still_arms_the_cooldown`, `tests/test_device_safety.py::test_an_adopted_foreign_reset_that_failed_arms_the_cooldown`, `tests/test_device_safety.py::test_stuck_hold_escalation_holds_within_the_reset_cooldown`, `tests/test_reset.py::test_a_failed_operator_reset_arms_the_cooldown_and_the_two_strikes`, `tests/test_reset.py::test_an_operator_reset_that_did_not_finish_leaves_the_cooldown_alone`, `tests/test_hold_bound.py::test_a_failed_resets_cooldown_never_delays_the_ladder_at_the_bound` |
 | I4 restart-safe scope/local child; overrun waited out; timeout leaves reset | `tests/test_device_safety.py::test_reset_runs_in_its_own_systemd_scope`, `tests/test_reset.py::test_a_reset_scope_argv_is_scoped_and_outlives_us`, `tests/test_reset.py::test_a_reset_without_systemd_runs_detached_and_returns_its_output`, `tests/test_reset.py::test_a_daemon_without_systemd_resets_through_the_local_backend`, `tests/test_reset.py::test_cancelling_the_waiter_does_not_kill_a_local_reset`, `tests/test_reset.py::test_a_reset_that_overruns_is_waited_out_not_failed`, `tests/test_reset.py::test_a_reset_that_never_ends_is_still_a_failure`, `tests/test_device_safety.py::test_reset_timeout_leaves_the_scope_running`, `tests/test_device_safety.py::test_the_reset_without_systemd_runs_bare_never_through_systemd_run` |
 | I5 adopt, never race, a live scope or local lock | `tests/test_reset.py::test_a_restarted_daemon_adopts_the_local_reset_lock`, `tests/test_device_safety.py::test_bridge_reset_is_skipped_while_a_reset_scope_is_in_flight`, `tests/test_device_safety.py::test_stuck_hold_climb_defers_when_a_reset_is_still_cycling`, `tests/test_device_safety.py::test_stuck_offbus_hold_skips_the_surgical_reset_when_a_scope_opened` |
 | I6 reset gate: foreign deny, incomplete fail-closed, force, carve-outs | `tests/test_reset_gate.py::TestResetGateDeny::test_denies_on_foreign_holder`, `tests/test_reset_gate.py::TestResetGateIncompleteScan::test_incomplete_scan_fails_closed_when_no_visible_foreign`, `tests/test_reset_gate.py::TestResetGateForce::test_force_overrides_foreign`, `tests/test_reset_gate.py::TestResetGateSystemHolders::test_allows_over_system_holder`, `tests/test_reset_gate.py::TestForeignHolders::test_ignores_system_holders`, `tests/test_reset_gate.py::TestResetGateAllow::test_allows_when_only_own_holders` |

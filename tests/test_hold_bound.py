@@ -110,6 +110,28 @@ async def test_every_hold_kind_runs_the_ladder_at_the_bound_then_the_host_rung(m
 
 
 @pytest.mark.asyncio
+async def test_a_failed_resets_cooldown_never_delays_the_ladder_at_the_bound(monkeypatch, clear_job_state):
+    """A failed reset (an operator's included, spec 04 I3) arms the 600 s cooldown; the bound's forced
+    ladder runs through it, then the host rung."""
+    why, detail, output, beats, ladder = _KINDS["generic"]
+    escalations, _alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why=why, detail=detail, fabric_output=output, beats=beats, age_min=BOUND / 60 + 0.05
+    )
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", True)
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", time.monotonic())
+    assert srv.recovery_mechanism.cooling()
+
+    async def failed_ladder(kind, indices, expected, log, **_):
+        escalations.append(kind)
+        return OUTCOME_TERMINAL
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", failed_ladder)
+    await srv._force_escalate_stuck_hold()
+    assert escalations == [ladder], "the cooldown held the ladder at the bound"
+    assert events.count("host_rung") == 1
+
+
+@pytest.mark.asyncio
 async def test_below_the_bound_a_no_reset_hold_keeps_its_fast_path(monkeypatch, clear_job_state):
     """I30 still holds a topology mismatch without a reset below the bound; I76 changes nothing there."""
     escalations, alerts, events = _arm_fabric_only_deadline_hold(
