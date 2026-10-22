@@ -53,6 +53,7 @@ from tt_device_mcp.health.recovery.base import (
     HOLD_ESCALATION_REARM_SEC,
     drop_returned_isolated,
     pci_rescan,
+    reenumerate_withheld,
     refuse_mesh_reset,
 )
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
@@ -1274,6 +1275,20 @@ class GalaxyRecovery(Recovery):
             return OUTCOME_TERMINAL
         return OUTCOME_WAITING
 
+    async def power_cycle_direct_in_cooldown(
+        self, gate_phase: str, expected: int, beats: Optional[dict], log
+    ) -> Optional[str]:
+        """Spec 04 I3/I37 on the gate's cooldown WAIT: the cooldown stops a repeat MMIO reset, and a
+        power cycle is not one, so an off-bus set of class A or C still goes to its direct power cycle
+        on this pass. No rung runs here, and no tray-down prelude: an off set seen after a failed reset
+        is never an onset. None when no class applies or no power cycle is opted in (the gate waits
+        out the cooldown as before); else WAITING, the cycle requested or held off (a tenant, a reset
+        in scope, a stand-back, a rate limit). The boot that follows passes the full check, fabric
+        included, before anything is released (goal 8)."""
+        if self.mechanism.host_action_blocks_reset(log, context=f"gate/{gate_phase} cooldown"):
+            return None
+        return await self._power_cycle_direct_from_escalate("gate", gate_phase, WAIT, expected, beats, log)
+
     async def _power_cycle_direct(
         self, fault_class: str, offbus_chips: set, expected: int, log, *, context: str, force: bool = False
     ) -> Optional[bool]:
@@ -1377,15 +1392,23 @@ class GalaxyRecovery(Recovery):
 
     async def _leftover_scan_guard(self, leftovers: set) -> Optional[tuple[str, str]]:
         """The I70 rung's scan guards on a fresh scan, or None to go on: ``gone`` once none of
-        ``leftovers`` still holds the device, ``held`` while a reset cycles in its own scope or a
+        ``leftovers`` still holds the device (in the holder scan, or a dead chip's stuck holder that
+        its own check still finds stuck, spec 04 I77), ``held`` while a reset cycles in its own scope or a
         running broker job or a readable tenant other than the leftovers holds it."""
         if await asyncio.to_thread(self.mechanism.scope_active):
             return "held", "a reset is cycling in its own scope"
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
-        if not leftovers & {int(h.pid) for h in scan.holders}:
+        held = {int(h.pid) for h in scan.holders}
+        if self.deps.stuck_holder_pids is not None:
+            # A dead chip's stuck holder (spec 04 I77) may map only the removed chip's BAR or node,
+            # which the holder scan does not list: it holds while its own fresh check says stuck.
+            held |= {int(p) for p in await asyncio.to_thread(self.deps.stuck_holder_pids)}
+        if not leftovers & held:
             return "gone", "the leftover no longer holds the device; nothing fired"
         others = dataclasses.replace(scan, holders=[h for h in scan.holders if int(h.pid) not in leftovers])
-        blocker = self._tenant_blocker(others, force=True)
+        # A job the broker killed for recovery and whose process is stuck is the leftover's own
+        # victim, not a running job: it would hold the rung for as long as the host lives (I77).
+        blocker = self._tenant_blocker(others, force=True, job_running=self.deps.live_job_running)
         if blocker is not None:
             return "held", self._describe_blocker(blocker)
         return None
@@ -1662,6 +1685,8 @@ class GalaxyRecovery(Recovery):
         if not td["rescanned"]:
             if tenant_active:
                 rescan = "waiting (a tenant holds the device)"
+            elif reenumerate_withheld(self.mechanism, "tray-down PCI rescan", log):
+                rescan = "withheld (a killed holder is stuck on a removed chip)"
             elif removed:
                 td["rescanned"] = True
                 rescan = "withheld (removed chip not reset)"
@@ -1875,13 +1900,21 @@ class GalaxyRecovery(Recovery):
         dead-chip valve refused (spec 03 I84): the bound sends it to the host rung, never a reset."""
         return self._tenant_blocker(scan, force=force, waive_job=waive_job) is not None
 
-    def _tenant_blocker(self, scan, *, force: bool = False, waive_job: bool = False) -> Optional[dict]:
+    def _tenant_blocker(
+        self,
+        scan,
+        *,
+        force: bool = False,
+        waive_job: bool = False,
+        job_running: Optional[Callable[[], bool]] = None,
+    ) -> Optional[dict]:
         """Which check of :meth:`_tenant_active` blocks, as health_event fields, or None when none does:
         ``blocker`` is ``job_running``, ``startup_verify`` (the running escalate's I75 stand-down), ``tenant``
         (with the first tenant's pid, uid, user and comm) or ``scan_incomplete`` (with the scan's source
         and gaps). A deferral that names its blocker tells a
-        real tenant apart from a scan that merely could not see."""
-        if not waive_job and self.deps.job_running():
+        real tenant apart from a scan that merely could not see. ``job_running`` replaces
+        ``deps.job_running`` for the running-job check when given."""
+        if not waive_job and (job_running or self.deps.job_running)():
             return {"blocker": "job_running"}
         if self._stand_down is not None and self._stand_down():
             self.startup_verify_deferred = True
@@ -2003,6 +2036,9 @@ class GalaxyRecovery(Recovery):
 
         ``mesh_reset=False`` fires SBR only, so the last-chance sweep can re-probe the bus before the
         mesh reset (spec 04 I86); the caller then fires the mesh reset with ``do_sbr=False``."""
+        # Every step re-enumerates PCI: none runs under a stuck holder of a removed chip (I77).
+        if reenumerate_withheld(self.mechanism, "back-to-back reset sweep", log):
+            return False
         off_bus = pcie_guard.chips_off_bus(expected)
         allowed, why = pcie_guard.host_reset_gate(off_bus)
         if not allowed:

@@ -207,8 +207,8 @@ job log, so every "installed" claim below is verified, not assumed.
   broker start, so the queue opens only once the startup check (spec 03 I4: the forced fabric
   pass, after the 1G hugepage pool is ready) has passed.
 - **I21 — Applies are rate-limited per box, and the limit only moves when an apply happens.**
-  Every apply restarts the broker, and every start runs the full startup check, fabric traffic
-  pass included (spec 03 I4), so a burst of pushes is a burst of restarts and fabric passes, each
+  Every apply restarts the broker (except a docs/tests/CI-only one, I29), and every start runs the
+  full startup check, fabric traffic pass included (spec 03 I4), so a burst of pushes is a burst of restarts and fabric passes, each
   holding the queue. The limit is on by default: `TTDEV_MIN_APPLY_INTERVAL_SEC` defaults to 1800 s
   in the script itself, so no box needs config to get it (0 turns it off). A lap that finds
   a new sha less than that long after the last apply exits 0 and says when the sha will apply; the
@@ -252,7 +252,7 @@ job log, so every "installed" claim below is verified, not assumed.
   for the rate limit, a device op, a reset scope or a recovery also names its deadline,
   `apply_by=`: for the rate limit the end of its interval, for a recovery the time its deferral ends (the bound from the hold's start or from
   the first deferral, whichever is sooner), for a device op or reset scope the end of that bounded
-  op; an apply records the restart, and a lap that stops after it decided to apply, or
+  op; an apply records the restart (a no-restart apply, I29, records `applied` and says no restart), and a lap that stops after it decided to apply, or
   whose restart fails, records `failed` with the exit code. At 1 MiB the file moves to
   `autoupdate.log.1`. A lap with nothing to update writes nothing.
 - **I23 — An update never restarts the broker into a recovery it is in the middle of, and waits
@@ -357,6 +357,24 @@ job log, so every "installed" claim below is verified, not assumed.
   a high-water mark of chips seen; a whole-tray drop already present at the first start became the
   bar and was never detected. With 32 declared, fewer chips present fails the check (03) and the
   hold takes its normal recovery path.
+- **I29 — An update that changes no file the broker uses moves the tree and installed.sha without
+  restarting the broker.** Once a lap has passed every gate above (the I21 rate limit, the
+  device-op bar, the I18 hold and the I24/I20 idle gate and drain, all unchanged), it diffs the
+  installed sha against the new one in the clone. When every changed path is on an explicit
+  allowlist, `docs/**`, `tests/**`, `.github/**` or a `*.md` outside `src/`, and the broker is
+  healthy (none of I21's reasons), the lap resets the clone to the new sha, writes it to
+  `installed.sha`, appends one `autoupdate_applied_no_restart` event (`from_sha`, `to_sha`,
+  `changed_paths`, `idle`, `drained_s`) to the broker's journal, and installs, stages and restarts
+  nothing; `last-apply` is left alone, so the rate limit still counts from the last restart. Any
+  other path (package code and data under `src/`, `deploy/` scripts and units, the validator pin,
+  `pyproject.toml`, anything unknown), a path git has to quote, a diff that cannot be computed, an
+  installed sha that is not a commit, a clone not at the installed sha (an earlier apply that
+  stopped after its reset may have left a newer venv or staged script) or a broker that is not
+  healthy takes the full apply and restart as before, and the lap logs why. Reason: every restart
+  reruns the full startup check, fabric pass included, and on a box whose chips can drop that
+  check is an exposure; a restart that changes no byte the broker, its job subprocesses, its staged
+  scripts or the host config read buys nothing for it. The restarts that remain run the startup
+  check unchanged (spec 03 I4).
 ## Interfaces
 
 **`/etc/default/tt-device-broker`** — written by the installer, sourced by `apply-host-config.sh`,
@@ -708,6 +726,7 @@ script exists, the claim stands on the script (listed below).
 | I22 (each decision: time with offset, branch, old and new sha, reason, in the log dir and the journal tag; failed applies logged; kept to 1 MiB) | `tests/test_deploy_autoupdate_recovery_defer.py::test_each_decision_line_has_time_both_shas_and_a_reason`, `tests/test_deploy_autoupdate_recovery_defer.py::test_an_apply_that_stops_is_logged_as_failed`, `tests/test_deploy_autoupdate_recovery_defer.py::test_the_log_is_kept_to_about_a_mebibyte`, `tests/test_deploy_autoupdate_recovery_defer.py::test_the_log_lives_in_the_broker_log_dir`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_clean_apply_restarts_and_logs_it`, `tests/test_deploy_autoupdate_recovery_defer.py::test_each_deferral_names_its_deadline`, `tests/test_deploy_autoupdate_rate_limit.py::test_a_rate_limited_lap_logs_its_deferral` |
 | I23 (a hold, or a recovering or down FSM, defers the update; bounded by the hold age and by the update's own wait, 20 min default, 30 min cap, 0 off; no answer is no deferral; the I7 bar still comes first; no recovery switch touched; after the drain and before the install a new hold defers, dropping the dispatch hold; once the install has run nothing defers for a recovery, only the I7 device-op bar stops the restart) | `tests/test_deploy_autoupdate_recovery_defer.py::test_a_fresh_hold_defers_the_update`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_recovering_or_down_fsm_defers_without_a_held_flag`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_healthy_broker_is_not_deferred_for`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_broker_that_does_not_answer_is_not_deferred_for`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_hold_older_than_the_bound_lets_the_update_apply`, `tests/test_deploy_autoupdate_recovery_defer.py::test_an_update_waits_at_most_the_bound_across_holds`, `tests/test_deploy_autoupdate_recovery_defer.py::test_the_bound_is_capped_at_30_minutes_and_0_turns_it_off`, `tests/test_deploy_autoupdate_recovery_defer.py::test_the_default_bound_is_20_minutes`, `tests/test_deploy_autoupdate_recovery_defer.py::test_the_device_op_bar_still_comes_first_and_is_logged`, `tests/test_deploy_autoupdate_recovery_defer.py::test_the_deferral_touches_no_recovery_switch`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_clean_apply_restarts_and_logs_it`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_hold_that_began_during_the_drain_defers_before_the_install`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_hold_that_began_during_the_install_does_not_stop_the_restart`, `tests/test_deploy_autoupdate_recovery_defer.py::test_no_recovery_deferral_comes_after_the_install_starts`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_device_op_at_restart_time_is_waited_out`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_device_op_that_outlives_the_wait_is_never_restarted_over`, `tests/test_deploy_autoupdate_recovery_defer.py::test_the_restart_still_comes_after_the_last_look`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_running_reset_scope_always_defers_even_past_the_bound`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_running_job_on_a_healthy_broker_is_left_to_the_idle_rule` |
 | I24 (no restart under a running tenant job: busy gate always on with no setting, old defer settings inert; a job running at the restart point is waited out to the job cap, and one past it blocks the restart; a device op there blocks the restart and installed.sha stays old; MainPID 0 counts no children) | `tests/test_deploy_autoupdate_idle_gate.py::test_the_idle_gate_is_always_on_with_no_setting`, `tests/test_deploy_autoupdate_idle_gate.py::test_old_defer_settings_do_not_turn_the_drain_off`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_job_running_at_the_restart_point_is_waited_out_to_its_cap`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_job_that_ends_at_the_restart_point_is_waited_out`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_job_past_its_cap_at_the_restart_point_gets_no_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_at_the_restart_point_blocks_the_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_stopped_broker_has_no_children_to_count` |
+| I29 (no restart for a docs/tests/CI-only update; any other path, an uncomputable diff, a clone off the installed sha or an unhealthy broker restarts; rate limit and idle gate still apply) | `tests/test_deploy_autoupdate_no_restart.py::test_a_docs_tests_and_ci_only_update_moves_the_tree_and_installed_sha_with_no_restart`, `tests/test_deploy_autoupdate_no_restart.py::test_a_mixed_update_restarts`, `tests/test_deploy_autoupdate_no_restart.py::test_an_update_touching_anything_the_broker_uses_restarts`, `tests/test_deploy_autoupdate_no_restart.py::test_a_diff_that_cannot_be_computed_restarts`, `tests/test_deploy_autoupdate_no_restart.py::test_an_unreadable_installed_sha_restarts`, `tests/test_deploy_autoupdate_no_restart.py::test_a_clone_left_ahead_by_an_unfinished_apply_restarts`, `tests/test_deploy_autoupdate_no_restart.py::test_a_broker_that_is_not_healthy_still_gets_its_restart`, `tests/test_deploy_autoupdate_no_restart.py::test_the_rate_limit_still_gates_a_no_restart_apply`, `tests/test_deploy_autoupdate_no_restart.py::test_the_idle_gate_still_drains_before_a_no_restart_apply`, `tests/test_deploy_autoupdate_no_restart.py::test_the_allowlist_is_the_one_the_spec_names` |
 | Autoupdate flow: one `autoupdate_apply` event per apply, in the broker's journal dir and schema; `restart_rc` records a failed restart; `idle`/`drained_s` come from the lap's own drain; a failed write only warns | `tests/test_deploy_autoupdate_idle_gate.py::test_apply_appends_one_autoupdate_apply_event_in_the_broker_schema`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_failed_restart_is_recorded_as_failed`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_event_goes_to_the_brokers_journal_dir`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_failed_event_write_only_warns`, `tests/test_deploy_autoupdate_idle_gate.py::test_an_idle_lap_reports_idle_and_no_drain`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_lap_that_drains_reports_busy_and_its_drain_time`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_wait_at_the_restart_point_adds_to_the_drain_time` |
 
 **Unanchored (the claim stands on the script):** I2 (wheel/venv from this tree —

@@ -111,9 +111,10 @@ au_log() {  # <decision> <reason>
     } 2>/dev/null || true
 }
 
-# Apply rate limit (spec 08 I21), ON by default (1800 s). Every apply restarts the broker, and every
-# start runs the full startup check, fabric traffic pass included (spec 03 I4) -- a burst of pushes
-# is a burst of restarts and fabric passes, each holding the queue. A new sha waits until
+# Apply rate limit (spec 08 I21), ON by default (1800 s). Every apply but a docs/tests/CI-only one
+# (I29, below) restarts the broker, and every start runs the full startup check, fabric traffic
+# pass included (spec 03 I4) -- a burst of pushes is a burst of restarts and fabric passes, each
+# holding the queue. A new sha waits until
 # TTDEV_MIN_APPLY_INTERVAL_SEC (0 = off) has passed since the last apply, so the burst becomes one
 # restart onto its newest sha.
 # Checked before the device-op bar and the dispatch hold: a lap that will not apply holds nothing.
@@ -440,11 +441,72 @@ fi
 
 echo "autoupdate: applying ${remote_sha:0:9}" >&2
 trap au_exit EXIT
+
+# No-restart apply (spec 08 I29). A diff from the installed sha that touches only files no running
+# broker, job subprocess, staged script or host config ever reads moves the tree and installed.sha
+# and restarts nothing: every restart reruns the full startup check, fabric pass included, and a
+# restart that changes no loaded byte buys nothing for that exposure. An explicit allowlist, and
+# fail-safe: any other path, a path git has to quote (no pattern matches it), a diff that cannot
+# be computed, a clone not at the installed sha (an earlier apply that stopped after
+# its reset may have left the venv or a staged script newer than the running broker), or a broker
+# that is not healthy (I21's reasons; the restart may be its fix) restarts as before. Nothing here
+# moves the rate limit or the gates above: this runs after them, and leaves last-apply alone.
+NO_RESTART_PATHS='docs/** tests/** .github/** *.md (outside src/)'
+# Prints why this apply needs the restart, or nothing when it does not.
+restart_needed() {
+    local p head paths la age
+    case "$installed_sha" in
+        ''|*[!0-9a-f]*) echo "installed sha '${installed_sha}' is not a commit"; return ;;
+    esac
+    head="$(git -C "$clone" rev-parse --verify -q HEAD 2>/dev/null)"
+    [ "$head" = "$installed_sha" ] || { echo "the clone is at ${head:0:9}, not the installed ${installed_sha:0:9}"; return; }
+    paths="$(git -C "$clone" diff --name-only --no-renames "$installed_sha" "$remote_sha" 2>/dev/null)" \
+        || { echo "cannot diff ${installed_sha:0:9}..${remote_sha:0:9}"; return; }
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        case "$p" in
+            src/*) echo "changes $p"; return ;;   # package data: never by extension
+            docs/*|tests/*|.github/*|*.md) ;;
+            *) echo "changes $p"; return ;;
+        esac
+    done <<< "$paths"
+    la=""; { read -r la < "$LAST_APPLY"; } 2>/dev/null || true
+    case "$la" in ''|*[!0-9]*) age=0 ;; *) age=$(( $(date +%s) - 10#$la )) ;; esac
+    [ "$age" -ge 0 ] || age=0
+    p="$(broker_broken "$age")"
+    [ -z "$p" ] || { echo "the broker $p"; return; }
+}
+# Decided before the reset below: restart_needed reads where the clone was left.
+why_restart="$(restart_needed)"
+changed_paths=""
+if [ -z "$why_restart" ]; then
+    # For the event: restart_needed ran in a subshell, so its list is listed again here.
+    changed_paths="$(git -C "$clone" diff --name-only --no-renames "$installed_sha" "$remote_sha" 2>/dev/null)" \
+        || why_restart="cannot diff ${installed_sha:0:9}..${remote_sha:0:9}"
+fi
+
 # Reset to the sha this lap decided on, NOT to origin/$BR: the drain above can wait for
 # minutes, and a branch that moved in the meantime would otherwise install something this lap
 # never looked at and never announced — and installed.sha would then name the wrong commit.
 git -C "$clone" reset --hard -q "$remote_sha" \
     || { echo "autoupdate: reset failed" >&2; exit 1; }
+
+if [ -z "$why_restart" ]; then
+    # Nothing to install or stage: the venv, the staged scripts and the host config already match
+    # the new tree, which is now the one on disk.
+    printf '%s\n' "$remote_sha" > "$STATE"
+    echo "autoupdate: ${installed_sha:0:9} -> ${remote_sha:0:9} changes only ${NO_RESTART_PATHS}; tree and installed.sha moved, broker not restarted" >&2
+    EVENTS="${TT_DEVICE_MCP_HEALTH_DIR:-/var/lib/tt-device-broker/health}/health_events.jsonl"
+    now="$(date +%s.%N)"
+    paths_json="$(printf '%s\n' "$changed_paths" | sed -e '/^$/d' -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/.*/"&"/' | paste -sd, -)"
+    printf '{"ts": %s, "iso": "%s", "kind": "autoupdate_applied_no_restart", "from_sha": "%s", "to_sha": "%s", "idle": %s, "drained_s": %s, "changed_paths": [%s]}\n' \
+        "$now" "$(date -u -d "@${now%.*}" +%Y-%m-%dT%H:%M:%SZ)" "$installed_sha" "$remote_sha" "$idle" "$drained_s" "$paths_json" \
+        >> "$EVENTS" 2>/dev/null \
+        || echo "autoupdate: warning: could not append autoupdate_applied_no_restart to $EVENTS" >&2
+    au_log applied "no restart: changes only ${NO_RESTART_PATHS}"
+    exit 0
+fi
+echo "autoupdate: restart needed: $why_restart" >&2
 
 if ! "$VENV/bin/pip" install -q "$clone"; then
     # Recover from a venv left half-installed by an earlier crash/race: pip refuses

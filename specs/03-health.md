@@ -200,6 +200,17 @@ cooldown (spec 04 I65) holds longer.
   is due, and it stops the device pollers on the first hung sample, not the second, unless a chip
   on that sample reads all-ones and its remove is not tried yet: that stop waits for I84's
   detach-first valve, which stops them after the remove whether it worked or not.
+  After the remove and the kill it marks the device dirty at once, before any wait. It then waits
+  for the killed pids to drop out of the `/dev/tenstorrent` holder scan, through the spec 01 I67
+  helper, for at most `HOLDER_RELEASE_WAIT_SEC` (30 s). The wait runs as its own task, off the
+  sampler loop, so the loop keeps checking the other chips and keeps driving the hold deadline
+  (I76's 10-min ladder) meanwhile; while it is pending, every reset and every re-enumerating rung is
+  fenced (`reset_fence`, `reenumerate_fence`). A pid still listed at the bound is journaled
+  (`dead_chip_holders_lingering`); the device stays held until recovery's reset and full post-reset
+  check, fabric included, pass. Time to recover (dead chip): zero added when the killed holders are
+  already gone (one scan), the release time when one lingers, at most 30 s. A killed holder still
+  alive and stuck in the kernel on the chip at the bound is spec 04 I77: no rung re-enumerates PCI
+  under it, and the host rung follows within 120 s.
 - **I20 — A stalled sampler withholds the systemd watchdog ping.** The escalation ladder must
   never sit silently behind a dead sampler; a stall past `STALL_SEC` gets the broker restarted.
 - **I21 — The idle relift lifts a hold only on proof, read-only for self-heal holds.**
@@ -1375,7 +1386,8 @@ cooldown (spec 04 I65) holds longer.
   | foreign holder gone, hugepages ready | ~2 s | one full check (~45-100 s) |
 - **I80 — A hold stays held through its own recovery.** A broker op that runs while a hold episode
   is open (a forced ladder rung such as a glx_reset, any reset, the check after it) keeps `/health`
-  `held: true` and `status: degraded`, with the hold's own `held_since` and `held_reason`, until
+  `held: true` and `status: degraded`, with the hold's own `held_since` and `held_reason` (its
+  opening reason, plus I85's escalation line), until
   the full gate, fabric included, passes and closes the episode. Neither the op starting nor the op
   ending lifts it, and `held_since` stays one clock for the whole episode: a hold opened inside the
   op keeps the start `/health` reported during it after the op ends. A closed episode's clock never
@@ -1537,6 +1549,23 @@ cooldown (spec 04 I65) holds longer.
   fail) lifts the hold and clears it. Time to recover, refused kill: 10 min plus the power cycle.
   The poller stop that follows a failed remove runs after the hold is marked, so it moves no rung.
 
+- **I85 — A held device says where its escalation stands.** While the device is held, `/health`
+  `held_reason` is the reason the hold opened with plus one bracketed line, and `hold_escalation`
+  carries the same as fields: `stage` (the last step of this episode's forced escalation: each rung
+  line the forced pass logs, and the outcome it ended with; after a broker restart, "power cycle
+  requested" or the hold bound's ladder age when those are on record; else "held, no forced
+  escalation yet") with `stage_at`; `next_step` with `next_deadline` and `next_in_sec`; and
+  `power_cycle_requested` with `power_cycle_requested_at`. The next step is the hold watchdog's own
+  next rung, the one `/health` `next_rung` reads (`_hold_next_rung`: the spec 04 I76 10-min full
+  ladder, then the power cycle, and the boot/post-cycle cooldown end it waits on), else the I76
+  bound's deadline (`hold_bound_deadline`); while the forced ladder runs, or a tenant blocks the
+  bound, it says so with no deadline. No second clock. The power-cycle request is read from disk,
+  so it survives the cycle: this episode's off-bus attempt record, or a power-cycle row of the
+  auto-recovery ledger written since the episode began. Reporting only: it opens, lifts, resets,
+  power-cycles and releases nothing, moves no escalation clock, and leaves time to recover as it
+  was; only a just-passed full check with fabric lifts the hold. The stage clears with the episode
+  (a new episode or the release). The jobs-list hold row keeps the name it opened with.
+
 ## Interfaces
 
 **What the main loop consumes.** `server.py` owns the job runner and the gate; it drives the
@@ -1570,7 +1599,8 @@ subsystem through the root:
   open hold, I80), `startup_verify` (non-null while that hold is only a startup hold behind a live
   re-adopted job or its startup gate, I76), `fsm_state`, `fsm_why`,
   `held`/`held_since`/`held_reason`/`held_age_sec`, `device_degraded`, queue counts, version.
-  `held_reason` and `fsm_why` keep the reason the hold opened with; the live fields say where it
+  `held_reason` and `fsm_why` keep the reason the hold opened with (`held_reason` plus I85's
+  bracketed escalation line, which `hold_escalation` gives as fields); the live fields say where it
   stands now, read fresh from sysfs on every call with no device touch: `isolated_chips` (always),
   and where the heartbeat detector and a chip baseline exist, `off_bus` (chips off the PCIe bus now,
   the count the rungs use), `arc_not_ready` (on the bus, heartbeat ENODATA on a bound endpoint, 04
@@ -2077,6 +2107,7 @@ refuses.
 | I17 | `tests/test_device_safety.py::test_dirty_device_is_not_reset_when_the_fabric_cannot_be_checked`, `tests/test_device_safety.py::test_an_unverified_fabric_is_never_recorded_as_verified_healthy`, `tests/test_fabric_probe.py::test_fabric_classification[77-cannot check-None]`, `tests/test_fabric_check_reason.py::test_first_reason_prefers_the_cause_over_the_terminate_banner`, `tests/test_fabric_check_reason.py::test_builtin_path_skip_detail_names_the_cause`, `tests/test_fabric_check_reason.py::test_override_path_reason_names_the_cause`, `tests/test_fabric_check_reason.py::test_wrapper_77_final_line_keeps_the_validators_first_error_line`, `tests/test_startup_fabric_hugepages.py::test_override_reason_prefers_the_cause_over_the_terminate_banner`, `tests/test_startup_fabric_hugepages.py::test_a_77_run_keeps_its_stderr_tail_and_exit_code_in_an_incident_bundle` |
 | I18 | `tests/test_device_safety.py::test_a_healthy_device_is_not_reset_just_because_a_job_timed_out`, `tests/test_device_safety.py::test_a_runtime_reported_fault_holds_the_device` |
 | I19 | `tests/test_device_safety.py::test_a_dead_chip_is_isolated_without_waiting_for_the_device_lock`, `tests/test_device_safety.py::test_a_chip_dead_on_two_consecutive_samples_is_isolated`, `tests/test_device_safety.py::test_a_transient_all_ones_does_not_amputate_a_chip`, `tests/test_device_safety.py::test_a_reset_in_flight_must_not_look_like_dead_chips`, `tests/test_device_safety.py::test_a_reset_that_outlives_our_wait_still_shields_its_chips`, `tests/test_device_safety.py::test_every_chip_at_once_is_a_global_event_not_32_dead_chips`, `tests/test_device_safety.py::test_a_dead_chip_kills_the_processes_that_still_map_it` |
+| I19 (the release wait follows the remove and the kill and ends when the killed holders let go; one gone costs one scan; one still holding at the bound is named and the device stays dirty; the wait is bounded; the device is dirty and resets are fenced before the wait; the wait runs off the sampler loop) | `tests/test_holder_release_wait.py::test_the_release_wait_follows_the_remove_and_kill_and_ends_when_the_holder_lets_go`, `tests/test_holder_release_wait.py::test_a_dead_chip_whose_killed_holders_are_gone_costs_one_scan`, `tests/test_holder_release_wait.py::test_a_killed_holder_still_holding_at_the_bound_goes_on_to_removal_and_a_dirty_hold`, `tests/test_holder_release_wait.py::test_the_device_is_held_before_the_release_wait_starts`, `tests/test_holder_release_wait.py::test_the_release_wait_runs_off_the_sampler_loop` |
 | I20 | `tests/test_device_safety.py::test_watchdog_ping_gates_on_sampler_liveness` |
 | I21 | `tests/test_device_safety.py::test_idle_relift_lifts_a_self_healed_hold`, `tests/test_device_safety.py::test_idle_relift_lifts_an_off_bus_floor_hold_without_the_eth_reader`, `tests/test_device_safety.py::test_idle_relift_still_holds_an_off_bus_hold_whose_eth_is_frozen`, `tests/test_device_safety.py::test_idle_relift_holds_an_off_bus_hold_while_the_fabric_is_unhealthy`, `tests/test_device_safety.py::test_idle_relift_holds_when_eth_read_is_inconclusive`, `tests/test_device_safety.py::test_idle_relift_holds_a_still_frozen_eth_core`, `tests/test_device_safety.py::test_idle_relift_holds_a_still_off_bus_chip_without_resetting`, `tests/test_device_safety.py::test_idle_relift_bails_if_a_chip_drops_during_the_verify`, `tests/test_device_safety.py::test_idle_relift_bails_on_a_re_dirtied_hold`, `tests/test_device_safety.py::test_idle_relift_is_rate_limited`, `tests/test_device_safety.py::test_maybe_spawn_idle_relift_gates_and_single_flights`, `tests/test_device_safety.py::test_idle_relift_is_inert_when_kill_switched` |
 | I22 | `tests/test_device_safety.py::test_fabric_relift_is_off_by_default`, `tests/test_device_safety.py::test_idle_relift_lifts_a_fabric_unverified_hold_when_fabric_reverifies`, `tests/test_device_safety.py::test_idle_relift_holds_a_fabric_unverified_hold_when_the_check_still_cannot_run`, `tests/test_device_safety.py::test_idle_relift_holds_a_fabric_unverified_hold_when_fabric_now_fails`, `tests/test_device_safety.py::test_idle_relift_escalates_a_fabric_unverified_hold_when_relift_is_off` |
@@ -2230,6 +2261,7 @@ refuses.
 | I83 (cut after tt-smi exits, before the bounded closing rescan, which re-adds a removed chip that answers; the broker and the reset are never cut) | `tests/test_inflight_reader_cut.py::test_the_mechanism_is_wired_to_the_samplers_cut`, `tests/test_inflight_reader_cut.py::test_a_post_reset_failure_is_cut_after_tt_smi_exits_and_before_the_closing_rescan`, `tests/test_inflight_reader_cut.py::test_a_chip_the_cut_removes_is_readded_by_the_closing_rescan_when_it_answers`, `tests/test_inflight_reader_cut.py::test_a_closing_rescan_that_blocks_is_bounded`, `tests/test_inflight_reader_cut.py::test_the_cut_never_selects_the_broker_the_reset_or_their_children`, `tests/test_inflight_reader_cut.py::test_reclaim_select_replaces_the_tenant_rule`, `tests/test_inflight_reader_cut.py::test_a_cancel_during_the_cut_still_settles_the_pollers` |
 | I84 | `tests/test_deadchip_detach_before_kill.py::test_every_kill_and_poller_stop_comes_after_the_detach`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_detach_kills_nobody_and_keeps_the_hold`, `tests/test_deadchip_detach_before_kill.py::test_one_failed_detach_of_two_kills_nobody`, `tests/test_deadchip_detach_before_kill.py::test_with_no_detach_wired_nobody_is_killed`, `tests/test_deadchip_detach_before_kill.py::test_a_hung_detach_is_bounded_and_the_loop_stays_responsive`, `tests/test_deadchip_detach_before_kill.py::test_a_reset_that_started_before_the_kill_keeps_every_holder`, `tests/test_deadchip_detach_before_kill.py::test_another_all_ones_chip_not_yet_detached_defers_the_kill_to_its_own_valve`, `tests/test_deadchip_detach_before_kill.py::test_a_chip_whose_earlier_detach_failed_blocks_every_later_kill`, `tests/test_deadchip_detach_before_kill.py::test_the_broker_never_signals_itself`, `tests/test_deadchip_detach_before_kill.py::test_the_first_all_ones_sample_leaves_the_poller_stop_to_the_detach`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_or_timed_out_detach_stops_the_pollers_once_and_kills_nobody`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_remove_beside_an_untried_chip_stops_the_pollers_on_the_next_sample`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_remove_under_a_live_reset_leaves_the_poller_stop_to_the_reset` |
 | I84 a refusal's holders reach the power cycle at the I76 bound; the record lifts nothing and only a passing full check with fabric clears it | `tests/test_deadchip_refused_bound.py::test_a_refused_holder_gets_the_power_cycle_at_the_bound`, `tests/test_deadchip_refused_bound.py::test_the_refusal_record_lifts_nothing_and_only_a_passing_full_check_clears_it` |
+| I85 | `tests/test_hold_escalation_status.py::test_a_fresh_hold_names_the_watchdogs_own_next_rung`, `tests/test_hold_escalation_status.py::test_the_ten_minute_mark_and_the_cooldown_come_from_the_broker_clocks`, `tests/test_hold_escalation_status.py::test_each_logged_step_moves_the_stage`, `tests/test_hold_escalation_status.py::test_a_power_cycle_request_is_read_from_disk_and_survives_a_restart`, `tests/test_hold_escalation_status.py::test_another_episodes_power_cycle_is_not_this_ones`, `tests/test_hold_escalation_status.py::test_the_bound_ladder_ran_before_a_restart`, `tests/test_hold_escalation_status.py::test_a_running_ladder_and_a_tenant_say_so`, `tests/test_hold_escalation_status.py::test_reading_it_moves_no_clock`, `tests/test_hold_escalation_status.py::test_the_hold_row_keeps_its_name`, `tests/test_hold_escalation_status.py::test_a_new_episode_and_the_release_clear_the_stage`, `tests/test_hold_escalation_status.py::test_not_held_reports_no_escalation`, `tests/test_hold_escalation_status.py::test_a_forced_pass_updates_the_stage_and_keeps_the_hold` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
