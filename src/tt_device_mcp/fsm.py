@@ -62,7 +62,9 @@ if TYPE_CHECKING:
 # A boot-attribution clause names how THIS boot came up; it must not ride forward on a long episode's
 # carried detail (an 18h-old reboot then reads as this boot's cause). Stripped on carry so only the
 # current boot's adjacency-guarded attribution, if any, is present. action may be hyphenated (power-cycle).
-_BOOT_ATTRIBUTION_RE = re.compile(r"\s*boot attributed to a broker-fired [\w-]+ recorded at \S+")
+_BOOT_ATTRIBUTION_RE = re.compile(
+    r"\s*boot attributed to a (?:broker-fired [\w-]+|warm reboot \([^)]*\)) recorded at \S+"
+)
 
 
 def _strip_boot_attribution(detail: str) -> str:
@@ -737,8 +739,15 @@ class ServerFsm:
         if attributed_boot and not self.restarted_this_boot:
             action = attributed_boot.get("action", "?")
             at = attributed_boot.get("at", "?")
+            refuted = attributed_boot.get("cycle_refuted")
+            # Spec 04 I88: the BMC refuted the cycle, so this boot is a warm reboot, not a power cycle.
+            cause = (
+                f"warm reboot (the broker-fired {action} did not happen: BMC restart cause {refuted})"
+                if refuted
+                else f"broker-fired {action}"
+            )
             self._record.detail = (f"{self._record.detail} " if self._record.detail else "") + (
-                f"boot attributed to a broker-fired {action} recorded at {at}"
+                f"boot attributed to a {cause} recorded at {at}"
             )
         self._persist()
         return self._record.state
