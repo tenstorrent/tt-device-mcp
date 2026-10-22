@@ -280,6 +280,11 @@ def _normalized_board(raw) -> str:
     return board.lower()
 
 
+# The detail every fabric pass the dead-chip isolation killed starts with (spec 03 I82): the gate reads
+# it off its own evidence to keep the off-bus hold dirty rather than hold it as a plain 77.
+FABRIC_KILLED_BY_ISOLATION = "fabric check KILLED by dead-chip isolation"
+
+
 class HealthMonitor:
     """Runs the probe pass and holds its state: the board-type snapshot cache, the fabric probe's
     last-real-verdict latch, the in-flight fabric-check process handle, and the last ``readings``
@@ -1287,7 +1292,7 @@ class HealthMonitor:
         self.last_fabric_ok = None
         self.last_fabric_skipped = False
         detail = (
-            f"fabric check KILLED by dead-chip isolation ({dt:.0f}s, exit {rc}): {why}; no verdict, "
+            f"{FABRIC_KILLED_BY_ISOLATION} ({dt:.0f}s, exit {rc}): {why}; no verdict, "
             "fabric unknown, a full pass is owed after recovery"
         )
         health_event("fabric_check_no_verdict", cause="killed_by_dead_chip_isolation", reason=why[:400], rc=rc)
