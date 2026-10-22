@@ -41,6 +41,24 @@ uses `/opt/tt-device-broker/manual-recovery-check.sh` (staged from
 auth.log). With neither, or a check that cannot read its sources, the cycle never fires and the
 broker pages instead. The broker runs as root, so it can read both.
 
+**Clean shutdown before a power cycle (spec 04 I88).** Every broker power cycle (the auto
+cycle and `TT_DEVICE_MCP_POWER_CYCLE_CMD`) first reboots the OS cleanly; the system-shutdown hook
+`tt-device-mcp-power-cycle.shutdown`, installed by `apply-host-config.sh`, cuts power once the
+filesystems are read-only. A fallback unit cuts it anyway after
+`TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC` (default 120 s), even if the shutdown hangs after
+systemd hands over to systemd-shutdown. The configured command then runs with the network down, so
+it must be in-band (for example local `ipmitool`); the hook gives it 5-15 s per try
+(`TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC`, clamped), 3 tries. A service that unloads the IPMI
+drivers on its stop (the OpenIPMI init script does, and deletes `/dev/ipmi0`) would leave in-band
+`ipmitool` no way to the BMC, so the hook and the fallback load `ipmi_msghandler`, `ipmi_devintf` and
+`ipmi_si` again and make `/dev/ipmi0` from sysfs when it is missing; the hook also leaves an OEM SEL
+record (`TTPC`) before the cycle and after a cycle that failed. The broker never cuts power with
+the OS up: for an `ipmitool ... chassis power cycle` command it first checks the BMC read-only
+(`mc info`, 10 s), and if that, the hook, `systemd-run` or the reboot request is missing or fails,
+nothing fires, the device stays held and the broker pages `power_cycle_not_launched`. On the next
+boot it reads `ipmitool chassis restart_cause` to confirm the cycle; a BMC that reports no cause
+cannot confirm it, and then a warm reboot in its place still counts as a cycle.
+
 ## What is verified vs. what needs on-box validation
 
 Unit-tested (no hardware): the privsep gating + `systemd-run` argv construction
@@ -116,10 +134,10 @@ SchedulerParameters=nohold_on_prolog_fail
 - **`PrologFlags=Alloc`** runs the prologue when the allocation is granted rather than at the
   first job step. Without it the health check happens later than you think it does.
 - **No `HealthCheckProgram`.** slurmd kills it at 60 s, which cannot contain a `tt-smi -r`
-  (~15 s) plus a fabric traffic pass (45–100 s), let alone a bridge or tray rung. A periodic
+  (~15 s) plus a fabric traffic pass (45–100 s), let alone a bridge or mesh reset. A periodic
   SIGKILL mid-reset wedges the device it was meant to check.
 - **Un-draining after a repair is manual.** Drain survives a reboot, so a node the broker's
-  reboot rung fixed comes back still drained with a stale reason. Return it with
+  power cycle fixed comes back still drained with a stale reason. Return it with
   `scontrol update NodeName=<node> State=RESUME`.
 - **The hooks resolve `tt-device-mcp` themselves — PATH is a fallback, not the primary source.**
   Slurm's own docs: "these programs do not have a search path set." Because these hooks run as

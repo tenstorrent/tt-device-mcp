@@ -13,7 +13,7 @@ import pytest
 import tt_device_mcp.server as srv
 from tt_device_mcp import privileges
 from tt_device_mcp.health.recovery import base as recovery_base
-from tt_device_mcp.health.recovery import galaxy
+from tt_device_mcp.health.recovery import galaxy, pcie_guard
 from tt_device_mcp.health.recovery.stages import bridge_reset
 
 
@@ -39,8 +39,7 @@ def privileged(monkeypatch):
     The opt-outs come off too: conftest seals them to 0 suite-wide, which would make every
     assertion below pass on the env var alone and prove nothing about privilege."""
     _latch(monkeypatch, root=True, systemd=True, setpci_bin=True, ipmitool=True, ipmi_node=True)
-    for var in ("TT_DEVICE_MCP_AUTO_REBOOT", "TT_DEVICE_MCP_AUTO_POWER_CYCLE", "TT_DEVICE_MCP_AUTO_UBB_RESET"):
-        monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", raising=False)
 
 
 @pytest.fixture
@@ -62,33 +61,11 @@ def said(monkeypatch):
     return lines
 
 
-def test_a_non_root_daemon_has_no_reboot_rung(monkeypatch, privileged):
-    """`systemctl reboot` needs root. Armed-by-default is about the operator's intent, not about
-    whether the call would be permitted."""
-    assert srv._auto_reboot_enabled() is True
-    _latch(monkeypatch, systemd=True, setpci_bin=True, ipmitool=True, ipmi_node=True)
-    assert srv._auto_reboot_enabled() is False
-
-
-def test_a_host_without_systemd_has_no_reboot_rung(monkeypatch, privileged):
-    """The reboot is issued through systemctl, so a container with root but no init cannot fire
-    it either."""
-    _latch(monkeypatch, root=True, setpci_bin=True, ipmitool=True, ipmi_node=True)
-    assert srv._auto_reboot_enabled() is False
-
-
 def test_an_unreachable_bmc_has_no_power_cycle_rung(monkeypatch, privileged):
     """Already true for a missing binary; now also for a binary with no node to talk to."""
     assert srv._auto_power_cycle_enabled() is True
     _latch(monkeypatch, root=True, systemd=True, setpci_bin=True, ipmitool=True)
     assert srv._auto_power_cycle_enabled() is False
-
-
-def test_an_unreachable_bmc_has_no_tray_rung(monkeypatch, privileged):
-    """The per-tray re-power goes out over the same `ipmitool raw` as the cold rung."""
-    assert galaxy._ubb_reset_enabled() is True
-    _latch(monkeypatch, root=True, systemd=True, setpci_bin=True, ipmitool=True)
-    assert galaxy._ubb_reset_enabled() is False
 
 
 def _commit_platform(monkeypatch, which):
@@ -104,34 +81,17 @@ def _inventory(said):
     return dict(item.split("=") for item in line.removeprefix("RUNG INVENTORY: ").split(", "))
 
 
-def test_a_per_target_host_has_no_tray_rung(monkeypatch, privileged, said):
-    """A per-target host has no UBB trays, so full privilege still leaves nothing to re-power. The
-    inventory must say so, and must name the platform rather than a privilege the host has."""
-    _commit_platform(monkeypatch, "per-target")
+@pytest.mark.parametrize("platform", ["per-target", "galaxy", None])
+def test_no_platform_lists_a_tray_rung(monkeypatch, privileged, said, platform):
+    """There is no BMC tray re-power rung (spec 04 I23), so no platform lists one, on or off, even with
+    full privilege."""
+    _commit_platform(monkeypatch, platform)
 
     srv.log_rung_inventory()
 
-    assert _inventory(said)["auto-tray-reset"] == "OFF"
-    assert any("RUNG OFF auto-tray-reset" in m and "per-target" in m for lvl, m in said if lvl == "warning")
-
-
-def test_an_unresolved_platform_keeps_the_tray_rung(monkeypatch, privileged, said):
-    """A degraded Galaxy is exactly the host whose board reads fail and whose platform stays
-    unresolved, and a below-floor tray-down is what this rung recovers. Unresolved is not
-    per-target."""
-    _commit_platform(monkeypatch, None)
-
-    srv.log_rung_inventory()
-
-    assert _inventory(said)["auto-tray-reset"] == "on"
-
-
-def test_a_galaxy_keeps_the_tray_rung(monkeypatch, privileged, said):
-    _commit_platform(monkeypatch, "galaxy")
-
-    srv.log_rung_inventory()
-
-    assert _inventory(said)["auto-tray-reset"] == "on"
+    assert not [name for name in _inventory(said) if "tray" in name]
+    assert not [m for lvl, m in said if "tray" in m.lower()]
+    assert not hasattr(galaxy, "_ubb_reset_enabled")
 
 
 def test_a_non_root_daemon_has_no_bridge_rung(monkeypatch, privileged):
@@ -145,13 +105,9 @@ def test_a_non_root_daemon_has_no_bridge_rung(monkeypatch, privileged):
 def test_the_opt_out_still_wins_where_the_privilege_exists(monkeypatch, privileged):
     """Privilege is a second conjunct, never a replacement: an operator who turned a rung off on a
     fully privileged host still has it off."""
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "0")
 
-    assert srv._auto_reboot_enabled() is False
     assert srv._auto_power_cycle_enabled() is False
-    assert galaxy._ubb_reset_enabled() is False
 
 
 def test_the_device_scoped_resets_survive_without_systemd(monkeypatch):
@@ -167,15 +123,13 @@ def test_the_device_scoped_resets_survive_without_systemd(monkeypatch):
 def test_the_inventory_names_the_privilege_a_rung_lacked(monkeypatch, said):
     """A rung reported OFF is only actionable with its cause. An operator who never set the env
     var must not read their own opt-out back at them when the real reason is euid."""
-    for var in ("TT_DEVICE_MCP_AUTO_REBOOT", "TT_DEVICE_MCP_AUTO_POWER_CYCLE"):
-        monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", raising=False)
 
     srv.log_rung_inventory()
 
     warnings = [m for lvl, m in said if lvl == "warning"]
-    assert any("RUNG OFF auto-reboot" in m and "root" in m for m in warnings)
     assert any("RUNG OFF auto-power-cycle" in m and "ipmitool is not on PATH" in m for m in warnings)
-    assert not any("TT_DEVICE_MCP_AUTO_REBOOT=0" in m for m in warnings), "the opt-out was never set"
+    assert not any("TT_DEVICE_MCP_AUTO_POWER_CYCLE=0" in m for m in warnings), "the opt-out was never set"
 
 
 def test_boot_states_the_privileges_it_measured(said):
@@ -203,14 +157,10 @@ def test_the_bridge_rung_names_which_half_it_lacks(monkeypatch, privileged, said
 def test_the_forced_ladder_cannot_fire_a_rung_privilege_denies(monkeypatch):
     """The hold-deadline watchdog's forced escalation bypasses the fail-closed DEFERS, not the
     arming. An unprivileged daemon whose hold outlives the ceiling must still not reach for a
-    reboot it cannot issue — otherwise the bypass would route to a rung that raises."""
+    power cycle it cannot issue — otherwise the bypass would route to a rung that raises."""
     from tt_device_mcp.health.recovery.galaxy import _choose_recovery_escalation
 
-    chosen = _choose_recovery_escalation(
-        auto_reboot_enabled=srv._auto_reboot_enabled,
-        auto_power_cycle_enabled=srv._auto_power_cycle_enabled,
-        reboot_already_attempted=lambda: False,
-    )
+    chosen = _choose_recovery_escalation(auto_power_cycle_enabled=srv._auto_power_cycle_enabled)
 
     assert chosen is None, "no host rung is reachable unprivileged, forced or not"
 
@@ -262,7 +212,8 @@ async def test_without_setpci_the_rescan_still_runs_and_no_chip_is_called_no_bri
     the endpoint left the bus, which `_classify_hold` escalates straight to a power cycle."""
     _latch(monkeypatch, root=True, systemd=True, ipmitool=True, ipmi_node=True)  # no setpci
     rescanned = []
-    monkeypatch.setattr(recovery_base.Path, "write_text", lambda self, text: rescanned.append(str(self)), raising=False)
+    # The bare rescan writes only the Tenstorrent root ports' buses (spec 04 I95).
+    monkeypatch.setattr(pcie_guard, "rescan_tt_root_ports", lambda: rescanned.append("tt root ports") or ["p"])
     mech = srv.galaxy_recovery
     monkeypatch.setattr(mech.deps, "isolated_chips", lambda: {"0", "1"})
     monkeypatch.setattr(mech.deps, "device_pci_map", lambda: {"0": "0000:31:00.0", "1": "0000:4b:00.0"})
@@ -276,7 +227,7 @@ async def test_without_setpci_the_rescan_still_runs_and_no_chip_is_called_no_bri
     assert set(reasons) == {"0", "1"}, "every target needs a recorded window"
     assert all(r["reason"] == "no_privilege" for r in reasons.values()), reasons
     assert ("bridge_reset", "blocked") in fired, "operator-fixable, so not not_applicable"
-    assert any("rescan" in path for path in rescanned), f"the cheap rung was skipped: {rescanned}"
+    assert rescanned, "the cheap rung was skipped"
 
 
 def test_the_force_escalate_kill_switch_warns_that_the_hold_bound_ignores_it(monkeypatch, said):

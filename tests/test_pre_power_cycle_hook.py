@@ -18,7 +18,6 @@ import pytest
 from tests.conftest import patch_health_event
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.recovery import base as recovery_base
-from tt_device_mcp.health.recovery import galaxy
 from tt_device_mcp.health.recovery.stages import power_cycle as pc
 
 REASON = "reset and reboot could not recover it"
@@ -198,18 +197,6 @@ async def test_cancelled_while_waiting_on_the_hook_retracts_the_ledger_entry(cyc
         release.set()
     assert cycle["order"] == []
     assert _ledger_actions() == []
-
-
-@pytest.mark.asyncio
-async def test_the_warm_reboot_does_not_run_the_power_cycle_hook(cycle, monkeypatch):
-    ran = cycle["dir"] / "ran"
-    hook = _script(cycle["dir"], "hook", f"touch {ran}\n")
-    monkeypatch.setenv("TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK", str(hook))
-    fired = []
-    monkeypatch.setattr(galaxy, "_fire_host_reboot", lambda: fired.append(True))
-    await srv.galaxy_recovery._auto_reboot_host(lambda _m: None, REASON)
-    assert fired == [True]
-    assert not ran.exists()
 
 
 @pytest.mark.parametrize(

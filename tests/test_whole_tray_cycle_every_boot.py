@@ -93,8 +93,8 @@ async def test_inside_the_cooldown_the_hold_shows_its_deadline_and_cycles_when_i
     mark = CYCLE_2 + 600
     assert _bound_watchdog(cool, monkeypatch, mark) == ["ceiling_window"], "one run: the I76 bound's"
     assert _bound_watchdog(cool, monkeypatch, mark + 10) == [], "once per bound window"
-    await cool["g"].escalate("offbus-forced", [], EXPECTED, lambda m: None, hold_bound=True)
-    assert cool["order"][-2:] == ["denied", "ubb_tray"] and _cycles(cool) == 0, "the full ladder, cycle still gated"
+    await cool["g"].escalate("offbus-forced", [], EXPECTED, lambda m: None, bound=True)
+    assert cool["order"][-2:] == ["denied", "sweep"] and _cycles(cool) == 0, "the full ladder, cycle still gated"
     assert _watchdog(cool, monkeypatch, until - 1) == []
     assert _watchdog(cool, monkeypatch, until) == [until]
     cool["clk"][0] = until

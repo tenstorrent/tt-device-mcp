@@ -352,6 +352,31 @@ def test_reset_failure_surfaces_returncode_and_output(monkeypatch, tmp_path):
     assert "reset failed" in d["stdout"]
 
 
+def test_an_operator_reset_refuses_while_another_reset_is_in_flight(monkeypatch, tmp_path):
+    """Spec 04 I92: a second reset into a mesh still cycling (a scope from before a restart, another
+    broker's, or a local-backend reset) is refused, and the in-flight reset is never signalled."""
+    (tmp_path / "0").write_text("")
+    calls = _fake_scoped_reset(monkeypatch, 0, "Resetting...\n")
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: "ttdev-reset-7-1")
+    d = _client(monkeypatch, tmp_path).post("/api/tt_device_reset", json={"force": True}).json()
+
+    assert d["status"] == "refused" and d["reason"] == "reset_in_flight"
+    assert "ttdev-reset-7-1" in d["detail"]
+    assert calls == [], "a second reset ran into one already in flight"
+
+
+def test_a_streaming_operator_reset_refuses_while_another_reset_is_in_flight(monkeypatch, tmp_path):
+    (tmp_path / "0").write_text("")
+    calls = _fake_scoped_reset(monkeypatch, 0, "Resetting...\n")
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: "ttdev-reset-7-1")
+    resp = _client(monkeypatch, tmp_path).post("/api/tt_device_reset_stream", json={"force": True})
+
+    assert resp.status_code == 200
+    assert "REFUSED: a reset is already in flight (ttdev-reset-7-1)" in resp.text
+    assert resp.text.rstrip().endswith("::status::refused")
+    assert calls == [], "a second reset ran into one already in flight"
+
+
 def _intercept_scoped_subprocess(monkeypatch, rc=0, output="Resetting...\n"):
     """Intercept the reset at the systemd-run/create_subprocess_exec seam, NOT at
     _run_reset_scoped — so the real scoped runner runs, including the action-log row it
@@ -792,7 +817,7 @@ def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
     pollers = 2 * n_services * literal(srv._set_device_pollers, r"timeout=(\d+)")
     rescan = literal(recovery_base.RecoveryMechanism.reset_with_quiesce, r"asyncio\.sleep\((\d+)\)")
     kill = constants.GRACEFUL_KILL_GRACE_SEC + constants.SIGTERM_GRACE_SEC
-    candidates = re.search(r"for c in \((.*?)\n\s*\)\n", inspect.getsource(eth.resolve_python), re.S).group(1)
+    candidates = re.search(r"for c in \((.*?)\n\s*\)\n", inspect.getsource(eth._python_candidates), re.S).group(1)
     n_candidates = len([line for line in candidates.splitlines() if line.strip()])
     eth_setup = n_candidates * default(eth.resolve_python, "import_timeout_sec")
     finished_pass = (
@@ -825,6 +850,7 @@ def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
 
 def test_an_operator_reset_whose_fabric_cannot_verify_holds_fabric_unverified(monkeypatch, tmp_path):
     _mesh_with_fabric_check(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)  # built: a 77 is a link verdict
     calls = _verify_seam(monkeypatch, fabric_ok=None)
     monkeypatch.setattr(srv, "device_fault_reported", "job 7 waiting for active ethernet core")
 
@@ -1062,7 +1088,9 @@ def test_a_streaming_local_reset_is_visible_to_a_restarted_daemon(monkeypatch, t
     (tmp_path / "0").touch()
     release = tmp_path / "release"
     started = tmp_path / "started"
-    reset_script = tmp_path / "reset"
+    # Named as tt-smi's module file: spec 04 I91 never runs an override that names neither tt-smi nor
+    # the Galaxy flag, and the spawn tripwire refuses a program named tt-smi.
+    reset_script = tmp_path / "tt_smi.py"
     reset_script.write_text(
         "#!/usr/bin/env python3\n"
         "import pathlib, time\n"
@@ -1704,6 +1732,37 @@ async def test_a_readopted_job_killed_by_a_forced_reset_does_not_flag_the_device
     assert not srv._device_unavailable_for_tenant(), "a reset-killed job must not flag the device"
     assert "907-1" not in srv.reset_killed_job_ids and "907-1" not in srv.readopted_scopes
     assert "[KILLED by device reset]" in log.read_text()
+
+
+@pytest.mark.asyncio
+async def test_a_readopted_job_recovery_killed_ends_killed_with_its_cause(monkeypatch, tmp_path, clear_job_state):
+    """Spec 01 I70: a dead-chip holder-kill of a re-adopted job leaves no exit status. The monitor
+    must still say KILLED with recovery's cause, never FAILED with "the broker restarted"."""
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    log = tmp_path / "run_909.log"
+    log.write_text("... running ...\nown-stderr\n")
+    job = srv.Job(
+        id="909-1", owner="carol", workspace="/w", command="pytest", queued_at="", status=srv.JobStatus.RUNNING
+    )
+    job.log_file = str(log)
+    srv.jobs["909-1"] = job
+    scope = srv.job_scope_unit("909-1")
+    monkeypatch.setattr(srv, "readopted_scopes", {"909-1": scope})
+    srv._mark_job_device_fault_failed("909-1", "device recovery kill: chip 5 left the PCIe bus")
+
+    await srv._monitor_readopted_scope("909-1", scope)
+
+    assert job.status == srv.JobStatus.KILLED and "chip 5 left the PCIe bus" in job.error
+    assert "restarted" not in job.error
+    assert not srv._device_unavailable_for_tenant(), "a recovery-killed job must not flag the device"
+    text = log.read_text()
+    assert f"{srv.RECOVERY_KILL_MARKER} killed by device recovery (chip 5 left the PCIe bus)" in text
+    assert srv.RESET_KILL_MARKER not in text, "one kill line, not two"
+    assert "909-1" not in srv.reset_killed_job_ids and "909-1" not in srv.reset_killed_causes
 
 
 def test_killing_a_readopted_job_holds_the_device_until_its_scope_ends(monkeypatch, tmp_path):
