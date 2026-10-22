@@ -795,3 +795,13 @@ def reclaim_foreign_holders(
         survivors=[h for h in final.holders if wanted(h)],
         scan_complete=final.complete,
     )
+
+
+def proc_uid(pid: int) -> int | None:
+    """``pid``'s real uid, or None when unreadable."""
+    return _proc_uid(pid)
+
+
+def read_proc_starttime(pid: int) -> str | None:
+    """``pid``'s starttime (field 22 of /proc/<pid>/stat), or None when unreadable."""
+    return _read_proc_starttime(pid)

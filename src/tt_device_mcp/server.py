@@ -37,6 +37,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -59,6 +60,7 @@ from tt_device_mcp.constants import (
     FABRIC_CHECK_CANNOT_CHECK_RC,
     FABRIC_CHECK_TIMEOUT_SEC,
     GRACEFUL_KILL_GRACE_SEC,
+    HOLDER_RELEASE_WAIT_SEC,
     HUNG_SIGINT_GRACE_SEC,
     JOB_RETENTION_SEC,
     POST_STEP_DEADLINE_DEFAULT_SEC,
@@ -92,8 +94,11 @@ from tt_device_mcp.device_holders import (
     is_broker_internal,
     is_tenant,
     note_broker_internal,
+    proc_uid,
     read_proc_cpu,
+    read_proc_starttime,
     reclaim_foreign_holders,
+    wait_device_released,
 )
 from tt_device_mcp.exit_witness import ExitWitness
 from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState, _episode_elapsed_sec, add_close_listener
@@ -185,11 +190,14 @@ from tt_device_mcp.health import (
 )
 from tt_device_mcp.job_preflight import preflight_output_dirs
 from tt_device_mcp.job_reap import (
+    DEAD_CHIP_LABEL_PREFIX,
     JOB_TAG_ENV,
     ReapedLeftover,
     _leftover_state,
     find_reaped_leftovers,
+    job_processes,
     reap_job_survivors,
+    stuck_device_holder,
 )
 from tt_device_mcp.job_spool import (
     SpoolOffsets,
@@ -1081,6 +1089,12 @@ device_hold_job_bound_escalated: bool = False
 # spawn so the escalation reports the clock that actually fired rather than the general ceiling.
 device_hold_escalation_trigger: str = ""
 device_hold_escalation_kind: str = ""  # machine-readable twin of the trigger text, for the event
+# Spec 03 I85: where this episode's forced escalation stands, for /health: the hold's opening reason
+# never changes, so without this a hold the ladder is climbing reads as unbounded. Set on every line
+# the forced escalation logs (each rung, the bound's host rung) and when its ladder ends. Cleared with
+# the episode.
+device_hold_escalation_stage: str = ""
+device_hold_escalation_stage_at: str = ""
 _forced_escalation_task: "Optional[asyncio.Task]" = None
 # The host-action request (see RecoveryMechanism.host_action_requested) whose suppression of the
 # forced ladder was already logged: one line per request, not one per sampler tick.
@@ -1129,6 +1143,9 @@ _recovery_deps = RecoveryDeps(
     present_chip_indices=lambda: _present_chip_indices(),
     enumerate_device_holders=lambda: enumerate_device_holders(),
     job_running=lambda: any(j.status == JobStatus.RUNNING for j in jobs.values()),
+    live_job_running=lambda: any(
+        j.status == JobStatus.RUNNING and j.id not in reset_killed_job_ids for j in jobs.values()
+    ),
     isolated_chips=lambda: isolated_chips,
     device_pci_map=lambda: device_pci_map,
     device_hold_episode_reason=lambda: device_hold_episode_reason,
@@ -1155,6 +1172,9 @@ _recovery_deps = RecoveryDeps(
     chip_pci_bdf=lambda idx: chip_pci_bdf(idx),
     health_event=lambda kind, **f: health_event(kind, **f),
     kill_device_holders=lambda reason: _kill_device_holders(reason),
+    wait_device_released=lambda pids: wait_device_released(pids, HOLDER_RELEASE_WAIT_SEC),
+    note_stuck_holders=lambda chips, killed, bdfs: _note_dead_chip_stuck_holders(chips, killed, bdfs),
+    stuck_holder_pids=lambda: {f.pid for f in _dead_chip_stuck_leftovers()},
     owe_device_pollers=lambda reason: _owe_device_pollers(reason),
     read_inflight_heartbeats=lambda only: read_heartbeats(only=only),
     find_inflight_readers=lambda: _find_inflight_readers(),
@@ -1245,7 +1265,10 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
         # that died mid-recovery left in the file (a per-user daemon's state dir outlives it).
         chip_state.publish()
         _reload_removed_chips()
-        recovery_mechanism.reset_fence = lambda: _reaped_leftover_reason()
+        recovery_mechanism.reset_fence = lambda: _dead_chip_isolation_pending_reason() or _reaped_leftover_reason()
+        recovery_mechanism.reenumerate_fence = (
+            lambda: _dead_chip_isolation_pending_reason() or _dead_chip_stuck_reason()
+        )
         PCI_WRITER.on_latch = _on_pci_wedged
         recovery_mechanism.pre_reset_scan = _pre_reset_holder_scan
         recovery_mechanism.owe_device_pollers = lambda after: _owe_device_pollers(
@@ -1824,6 +1847,21 @@ _leftover_rung_last_try: float = 0.0  # monotonic
 _leftover_rung_stage: str = ""
 _leftover_rung_detail: str = ""
 _leftover_rung_task: "Optional[asyncio.Task]" = None
+# Spec 04 I77, class J-dead-chip-stuck-holder: a process the dead-chip path killed that is still
+# alive stuck in the kernel with the removed chip referenced (state D, most often a read of the dead
+# BAR). It joins the I70 leftovers, so every reset and every dispatch is fenced and the same host-rung
+# escalation applies, on the shorter DEAD_CHIP_STUCK_BUDGET_SEC (the kernel's hung-task threshold: a
+# D state that long does not end on its own), and it fences every rung that re-enumerates PCI.
+DEAD_CHIP_STUCK_BUDGET_SEC = 120
+DEAD_CHIP_STUCK_CLASS = "J-dead-chip-stuck-holder"
+_dead_chip_stuck: dict[int, tuple[str, str, int, tuple]] = {}  # pid -> (label, starttime, uid, bdfs)
+_dead_chip_stuck_lock = threading.Lock()
+# The registry and the episode's wall-clock start, so a broker restart keeps the fence and the 120 s
+# clock (spec 04 I77). Read once at startup; a different boot id means every pid in it is gone.
+DEAD_CHIP_STUCK_FILE = "dead_chip_stuck.json"
+_dead_chip_stuck_save_lock = threading.Lock()  # one snapshot+write of the record at a time
+_dead_chip_page_pending: Optional[dict] = None  # a page the alert hook dropped, sent again next scan
+_leftover_dead_chip: bool = False  # the open I70 episode names a dead-chip stuck holder
 stats: Stats | None = None  # Session statistics
 stats_dir: Path | None = None  # Directory for stats files
 stats_file: Path | None = None  # Current stats file
@@ -2757,6 +2795,7 @@ def _reset_for_testing():
     device_hold_job_bound_escalated = False
     device_hold_escalation_trigger = ""
     device_hold_escalation_kind = ""
+    _note_escalation_stage("")
     _forced_escalation_task = None
     _host_action_suppressed_logged = None
     reset_killed_job_ids.clear()
@@ -3972,6 +4011,22 @@ async def _verify_operator_reset(present: int, recovery, log, source: str) -> tu
             f"{source}: the mesh did not verify after the reset: {detail}", why="operator_reset_unhealthy"
         )
     return verdict, detail
+
+
+def _note_operator_reset_outcome(rc: Optional[int], verdict: Optional[bool], began: float, argv: list) -> None:
+    """Settle an operator reset's cooldown as the broker settles its own (spec 04 I3). One that ran and
+    failed (a non-zero exit, or a clean exit whose verify failed) arms the cooldown and the gate's two
+    strikes (``was_failing``), so a failed operator reset counts as the first failed reset; a verified
+    one, or a persistent 77 (unknown, not failed), clears them. One that never ran or is still cycling
+    (``rc`` None) changes neither. The clock is the reset's start, as the broker's: a fabric pass its
+    verify stamped stays newer than it. A failed mesh reset (``-glx_reset``) is also marked as the
+    broker marks its own, so class C and the episode's one mesh reset see it (spec 04 I37, I87)."""
+    if rc is None:
+        return
+    recovery_mechanism.last_reset_monotonic = max(recovery_mechanism.last_reset_monotonic, began)
+    recovery_mechanism.last_reset_failed = rc != 0 or verdict is False
+    if recovery_mechanism.last_reset_failed and any(a in ("-glx_reset", "-glx_reset_auto") for a in argv):
+        recovery_mechanism.mark_mesh_reset_failed()
 
 
 def _reset_health_label(verdict: Optional[bool]) -> str:
@@ -7260,7 +7315,18 @@ async def device_health_gate(
             elif ev.cooling:
                 # A reset we already tried and that already failed to revive the mesh will not
                 # revive it now, and hammering a dead endpoint is precisely what escalates a PCIe
-                # error to fatal and reboots the host. Sit out the cooldown instead.
+                # error to fatal and reboots the host. Sit out the cooldown instead — but only for a
+                # reset: a whole tray or the whole bus off the bus (spec 04 I37 class A/C) still goes
+                # to its direct power cycle on this pass, since the cooldown guards no power cycle (I3).
+                direct = await galaxy_recovery.power_cycle_direct_in_cooldown(
+                    phase, expected, await asyncio.to_thread(_decision_heartbeats), _log
+                )
+                if direct is not None:
+                    if fsm.state is ServerState.HEALTHY:
+                        _mark_device_dirty(f"gate/{phase}: off the bus in a reset cooldown", why="probe_unhealthy")
+                    _fold_rung_outcome(direct, _log)
+                    _note_tenant_gate_verdict(f"device unverified: gate/{phase}: off the bus — power cycle (I37)")
+                    return
                 since = int(time.monotonic() - recovery_mechanism.last_reset_monotonic)
                 left = RESET_COOLDOWN_SEC - (time.monotonic() - recovery_mechanism.last_reset_monotonic)
                 _log(
@@ -8105,7 +8171,7 @@ def _leftover_rung_candidates(now_epoch: float) -> list:
     episode closed or no host rung is opted in. Read-only (spec 04 I75)."""
     if _leftover_unkillable_mono is None or _leftover_rung_stage == "no-host-rung":
         return []
-    due = _leftover_unkillable_mono + LEFTOVER_UNKILLABLE_BUDGET_SEC
+    due = _leftover_unkillable_mono + _leftover_budget_sec()
     if _leftover_rung_last_try:
         due = max(due, _leftover_rung_last_try + LEFTOVER_HOST_RUNG_RETRY_SEC)
     at = now_epoch + max(0.0, due - time.monotonic())
@@ -8174,6 +8240,106 @@ def _hold_report(now: Optional[datetime] = None) -> dict:
     return out
 
 
+def _note_escalation_stage(stage: str, now: Optional[datetime] = None) -> None:
+    """Record where this hold's forced escalation stands (spec 03 I85; see device_hold_escalation_stage)."""
+    global device_hold_escalation_stage, device_hold_escalation_stage_at
+    device_hold_escalation_stage = " ".join(stage.split())[:240]
+    device_hold_escalation_stage_at = (now or datetime.now()).isoformat(timespec="seconds") if stage else ""
+
+
+def _hold_power_cycle_request(episode: str, started: float) -> Optional[float]:
+    """Epoch of this episode's latest power-cycle request, or None: the off-bus path's attempt record
+    for the episode, or a power-cycle row of the auto-recovery ledger written since the episode began.
+    Both are on disk before the cycle fires, so the answer survives the cycle. Read-only."""
+    stamps = []
+    for rec in offbus_power_cycle.load_state().get("attempts") or []:
+        if isinstance(rec, dict) and rec.get("episode") == episode:
+            stamps.append(rec.get("at_epoch"))
+    read = getattr(recovery_mechanism, "read_auto_recovery_ledger", None)
+    for rec in (read() if callable(read) else None) or []:
+        if isinstance(rec, dict) and rec.get("action") == "power-cycle":
+            stamps.append(rec.get("at_epoch"))
+    found = []
+    for at in stamps:
+        try:
+            at = float(at)
+        except (TypeError, ValueError):
+            continue
+        if at >= started:
+            found.append(at)
+    return max(found) if found else None
+
+
+def _hold_escalation_status(now: Optional[datetime] = None) -> Optional[dict]:
+    """Where the open hold episode's escalation stands (spec 03 I85), for /health: the last step taken,
+    the next step and when it is due, and whether a power cycle was requested. None while not held.
+
+    The next step is the hold watchdog's own next rung (_hold_next_rung, the clock /health's
+    ``next_rung`` reads: the 10-min full ladder, then the power cycle, the boot/post-cycle cooldown it
+    waits on), else the 10-min bound's deadline; no second clock. Reporting only: no device touch,
+    and it moves, claims or releases nothing."""
+    episode = device_hold_episode_since
+    if not episode:
+        return None
+    try:
+        started = datetime.fromisoformat(episode).timestamp()
+    except ValueError:
+        return None
+    now = now or datetime.now()
+    now_epoch = now.timestamp()
+    requested = _hold_power_cycle_request(episode, started)
+    stage, stage_at = device_hold_escalation_stage, device_hold_escalation_stage_at or None
+    if not stage:
+        # Nothing logged in this process (a restart, the cycle's reboot included): the episode's
+        # recorded steps still say how far it got.
+        if requested is not None:
+            stage = "power cycle requested"
+            stage_at = datetime.fromtimestamp(requested).isoformat(timespec="seconds")
+        elif _hold_bound_ladder_age is not None:
+            stage = f"full recovery ladder ran at hold age {int(_hold_bound_ladder_age)}s"
+        else:
+            stage = "held, no forced escalation yet"
+    out: dict = {"stage": stage, "stage_at": stage_at, "next_step": None, "next_deadline": None, "next_in_sec": None}
+    if _forced_escalation_task is not None and not _forced_escalation_task.done():
+        out["next_step"] = "the forced recovery ladder is running"
+    elif _hold_bound_tenant_blocker is not None:
+        # Spec 04 I76: the one wait past the bound with no deadline of its own.
+        out["next_step"] = f"waits for the tenant to leave ({_describe_bound_blocker(_hold_bound_tenant_blocker)})"
+    else:
+        rung = _hold_next_rung(now_epoch)
+        if rung is not None:
+            when, what = rung.at, f"{rung.rung} ({rung.source})"
+        else:
+            deadline = hold_bound_deadline(now)
+            when = deadline.timestamp() if deadline is not None else None
+            what = "full recovery ladder (10-min hold bound)"
+        if when is not None:
+            out["next_step"] = what
+            out["next_deadline"] = datetime.fromtimestamp(when).isoformat(timespec="seconds")
+            out["next_in_sec"] = max(0, int(when - now_epoch))
+    out["power_cycle_requested"] = requested is not None
+    out["power_cycle_requested_at"] = (
+        datetime.fromtimestamp(requested).isoformat(timespec="seconds") if requested is not None else None
+    )
+    return out
+
+
+def _hold_escalation_suffix(status: Optional[dict]) -> str:
+    """:func:`_hold_escalation_status` as one bracketed line for the hold reason, or '' when none."""
+    if not status:
+        return ""
+    parts = [f"escalation: {status['stage']}"]
+    if status["next_deadline"]:
+        parts.append(f"next: {status['next_step']} at {status['next_deadline']} (in {status['next_in_sec']}s)")
+    elif status["next_step"]:
+        parts.append(f"next: {status['next_step']}")
+    if status["power_cycle_requested"]:
+        parts.append(f"power cycle requested at {status['power_cycle_requested_at']}")
+    else:
+        parts.append("no power cycle requested")
+    return " [" + "; ".join(parts) + "]"
+
+
 def _health_payload(now: Optional[datetime] = None) -> dict:
     """The /health body. Beyond broker liveness it reports the DEVICE hold state, so a poller
     cannot read a box sitting held-and-refused as 'ok' — the gap that let a stuck hold go
@@ -8224,7 +8390,12 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
     if hold:
         reason, since = hold
         payload["held_since"] = since
-        payload["held_reason"] = reason
+        # Spec 03 I85: the reason the hold opened with, plus where its escalation stands now, so a hold
+        # the ladder is climbing never reads as unbounded; ``hold_escalation`` gives the same as fields.
+        escalation = _hold_escalation_status(now)
+        payload["held_reason"] = reason + _hold_escalation_suffix(escalation)
+        if escalation is not None:
+            payload["hold_escalation"] = escalation
         try:
             payload["held_age_sec"] = int(((now or datetime.now()) - datetime.fromisoformat(since)).total_seconds())
         except ValueError:
@@ -8344,6 +8515,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         # ...and the alert hook's backoff for that same episode, so a restart does not page again.
         device_hold_alert_next_bucket, device_hold_alert_gap = _restore_hold_alert_backoff(device_hold_episode_since)
         device_hold_episode_reason = reason
+        _note_escalation_stage("")  # a fresh episode starts with no escalation behind it
         # Reserve the ledger row now, so the live row and the durable one share id, start, and name.
         # Its start is THIS process's segment (row_since), NOT the restored escalation clock: a hold
         # split by a restart then reads as adjacent rows — the orphaned-close for the prior segment,
@@ -8432,8 +8604,9 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         device_hold_alert_next_bucket = 0
         device_hold_alert_gap = 0
         _persist_hold_alert_backoff("", 0, 0)
-        # ...and its own forced-escalation windows.
+        # ...and its own forced-escalation windows, and where the last one stood.
         device_hold_escalate_bucket = 0
+        _note_escalation_stage("")
         # ...and its own early off-bus attempt.
         device_hold_offbus_escalated = False
         device_hold_offbus_prior_bucket = None
@@ -8468,6 +8641,7 @@ async def _force_escalate_stuck_hold() -> None:
     global device_hold_tenant_deferred, _fabric_link_short_declined
 
     def log(msg: str) -> None:
+        _note_escalation_stage(msg)  # each rung's line is also the hold's current stage in /health
         if logger:
             logger.error(f"HOLD-DEADLINE-ESCALATE {msg}")
 
@@ -8646,6 +8820,7 @@ async def _force_escalate_stuck_hold() -> None:
             if blocker is not None:
                 _hold_bound_tenant_blocked(blocker, log)
         _fold_rung_outcome(outcome, log)
+        _note_escalation_stage(f"forced recovery ladder ({kind or 'ceiling_window'}) ended: {outcome}")
         if stood_down and _rearm_tenant_deferred_window(kind):
             log(f"{kind} re-armed: it runs on the first sampler tick with no tenant, not at the next window")
             return
@@ -9975,7 +10150,7 @@ def _reaped_leftovers(scan: Optional[HolderScan] = None) -> list[ReapedLeftover]
     naming each holder) and closes it once none remain. Never raises: a scan bug must not fence a
     free device, so it reads as no leftover."""
     global _leftover_fence_detail, _leftover_unkillable_since, _leftover_unkillable_mono
-    global _leftover_deadline_paged, _leftover_rung_stage, _leftover_rung_detail
+    global _leftover_deadline_paged, _leftover_rung_stage, _leftover_rung_detail, _leftover_dead_chip
     try:
         if scan is None:
             scan = enumerate_device_holders()
@@ -9984,6 +10159,12 @@ def _reaped_leftovers(scan: Optional[HolderScan] = None) -> list[ReapedLeftover]
             held = {h.pid for h in scan.holders}
             for pid in [p for p in reaped_survivors if p not in held]:
                 reaped_survivors.pop(pid, None)
+        # A registered dead-chip stuck holder (spec 04 I77) wins over its job's label, whether its
+        # job's scope outlived the job or the sweep named it a survivor: the label carries the 120 s
+        # budget, the fault class and the re-enumeration fence.
+        dead = _dead_chip_stuck_leftovers()
+        dead_pids = {d.pid for d in dead}
+        found = [f for f in found if f.pid not in dead_pids] + dead
     except Exception as e:
         if logger:
             logger.error(f"LEFTOVER scan error: {e}")
@@ -10016,6 +10197,7 @@ def _reaped_leftovers(scan: Optional[HolderScan] = None) -> list[ReapedLeftover]
             logger.info(f"LEFTOVER released the device: {_leftover_fence_detail}")
         health_event("reaped_leftover_released", leftovers=_leftover_fence_detail)
     _leftover_fence_detail = detail
+    _leftover_dead_chip = any(f.unkillable and f.job_id.startswith(DEAD_CHIP_LABEL_PREFIX) for f in found)
     if any(f.unkillable for f in found):
         if _leftover_unkillable_mono is None:
             _leftover_unkillable_since, _leftover_unkillable_mono = time.time(), time.monotonic()
@@ -10035,7 +10217,7 @@ def _maybe_spawn_leftover_escalation(now: Optional[float] = None) -> bool:
     if _leftover_unkillable_mono is None:
         return False
     now = time.monotonic() if now is None else now
-    if now - _leftover_unkillable_mono < LEFTOVER_UNKILLABLE_BUDGET_SEC:
+    if now - _leftover_unkillable_mono < _leftover_budget_sec():
         return False
     if _leftover_rung_last_try and now - _leftover_rung_last_try < LEFTOVER_HOST_RUNG_RETRY_SEC:
         return False
@@ -10073,13 +10255,13 @@ async def _escalate_unkillable_leftover() -> None:
             _leftover_deadline_paged = True
             health_event(
                 "leftover_unkillable_deadline",
-                fault_class="J-unkillable-leftover",
+                fault_class=_leftover_fault_class(),
                 since=_leftover_unkillable_since,
-                budget_sec=LEFTOVER_UNKILLABLE_BUDGET_SEC,
+                budget_sec=_leftover_budget_sec(),
                 leftovers=detail,
             )
             log(
-                f"an unkillable leftover has fenced the device past its {LEFTOVER_UNKILLABLE_BUDGET_SEC}s "
+                f"an unkillable leftover has fenced the device past its {_leftover_budget_sec()}s "
                 f"budget: {detail}; only a host reboot clears it"
             )
         async with _device_op("leftover-host-rung"):
@@ -10188,11 +10370,12 @@ def _leftover_fence_payload() -> Optional[dict]:
     if _leftover_unkillable_mono is None:
         return None
     since = _leftover_unkillable_since or time.time()
+    budget = _leftover_budget_sec()
     return {
-        "fault_class": "J-unkillable-leftover",
+        "fault_class": _leftover_fault_class(),
         "since": datetime.fromtimestamp(since).isoformat(timespec="seconds"),
-        "budget_sec": LEFTOVER_UNKILLABLE_BUDGET_SEC,
-        "deadline": datetime.fromtimestamp(since + LEFTOVER_UNKILLABLE_BUDGET_SEC).isoformat(timespec="seconds"),
+        "budget_sec": budget,
+        "deadline": datetime.fromtimestamp(since + budget).isoformat(timespec="seconds"),
         "escalation_stage": _leftover_rung_stage or "waiting-budget",
         "detail": _leftover_rung_detail or None,
         "leftovers": _leftover_fence_detail,
@@ -10216,6 +10399,268 @@ def _reaped_leftover_reason(scan: Optional[HolderScan] = None) -> str:
         + "; ".join(f.describe() for f in found)
         + reboot
         + "; no reset runs and no job is dispatched until it closes its /dev/tenstorrent fds"
+    )
+
+
+def _leftover_budget_sec() -> int:
+    """The open I70 episode's budget: DEAD_CHIP_STUCK_BUDGET_SEC once it names a killed holder stuck
+    on a dead chip (spec 04 I77), else LEFTOVER_UNKILLABLE_BUDGET_SEC."""
+    return DEAD_CHIP_STUCK_BUDGET_SEC if _leftover_dead_chip else LEFTOVER_UNKILLABLE_BUDGET_SEC
+
+
+def _leftover_fault_class() -> str:
+    return DEAD_CHIP_STUCK_CLASS if _leftover_dead_chip else "J-unkillable-leftover"
+
+
+def _note_dead_chip_stuck_holders(chips: list, killed: list, bdfs: Optional[tuple] = None) -> list[int]:
+    """The dead-chip path's check after its release wait (spec 04 I77): each pid it killed that is
+    still alive stuck in the kernel (state D or SIGKILL pending) with a /dev/tenstorrent fd or a
+    mapping of the dead chips' node or BARs (unreadable counts as held) is registered as a leftover,
+    journaled ``dead_chip_holder_stuck`` with host_at_risk, and paged at once. The I70 episode opens
+    with it. ``bdfs``: the chips' PCI addresses, read before their removal (None: read them now).
+    Returns the stuck pids. Never raises."""
+    global _dead_chip_page_pending
+    label = DEAD_CHIP_LABEL_PREFIX + ",".join(str(c) for c in chips)
+    bdfs = _dead_chip_bdfs(chips) if bdfs is None else tuple(bdfs)
+    stuck: list[ReapedLeftover] = []
+    for k in killed:
+        pid = k.get("pid") if isinstance(k, dict) else None
+        if not isinstance(pid, int):
+            continue
+        try:
+            uid = proc_uid(pid)
+            f = stuck_device_holder(pid, label, -1 if uid is None else uid, bdfs)
+            if f is None:
+                continue
+            with _dead_chip_stuck_lock:
+                _dead_chip_stuck[pid] = (label, read_proc_starttime(pid) or "", f.uid, bdfs)
+            stuck.append(f)
+        except Exception as e:  # noqa: BLE001 - one unreadable pid must not hide the others
+            if logger:
+                logger.error(f"DEAD-CHIP stuck-holder check of pid {pid} failed: {e}")
+    if not stuck:
+        return []
+    detail = "; ".join(f.describe() for f in stuck)
+    message = (
+        f"killed holder(s) of dead chip(s) {','.join(str(c) for c in chips)} survived SIGKILL stuck in "
+        f"the kernel: {detail}. The host is at risk: no rung re-enumerates PCI while they live, and past "
+        f"{DEAD_CHIP_STUCK_BUDGET_SEC}s the broker requests the host rung (spec 04 I77)"
+    )
+    if logger:
+        logger.error(f"DEAD-CHIP {message}")
+    fields = {
+        "chips": [str(c) for c in chips],
+        "holders": [
+            {"pid": f.pid, "uid": f.uid, "state": f.state, "wchan": f.wchan, "sigkill_pending": f.sigkill_pending}
+            for f in stuck
+        ],
+        "fault_class": DEAD_CHIP_STUCK_CLASS,
+        "budget_sec": DEAD_CHIP_STUCK_BUDGET_SEC,
+    }
+    health_event("dead_chip_holder_stuck", message=message, host_at_risk=True, severity="high", **fields)
+    _dead_chip_page_pending = {
+        "kind": "dead_chip_holder_stuck",
+        "message": message,
+        "host": socket.gethostname(),
+        "host_at_risk": True,
+        "severity": "high",
+        **fields,
+    }
+    _send_dead_chip_page()
+    _reaped_leftovers()  # open the I70 episode now: its clock and /health's leftover_fence
+    _save_dead_chip_stuck()
+    return [f.pid for f in stuck]
+
+
+def _save_dead_chip_stuck() -> None:
+    """Write the I77 registry under the health dir (atomic rename) with this boot's id and the open
+    I70 episode's wall-clock start; an empty registry removes the file. The snapshot and the write
+    run under one lock, so a slower writer never puts back a registry a later one emptied. Never
+    raises: the registry in memory still holds."""
+    with _dead_chip_stuck_save_lock:
+        _write_dead_chip_stuck()
+
+
+def _write_dead_chip_stuck() -> None:
+    with _dead_chip_stuck_lock:
+        entries = dict(_dead_chip_stuck)
+    path = health_dir() / DEAD_CHIP_STUCK_FILE
+    try:
+        if not entries:
+            path.unlink(missing_ok=True)
+            return
+        record = {
+            "boot_id": _current_boot_id(),
+            "since": _leftover_unkillable_since or time.time(),
+            "holders": [
+                {"pid": pid, "label": label, "starttime": starttime, "uid": uid, "bdfs": list(bdfs)}
+                for pid, (label, starttime, uid, bdfs) in entries.items()
+            ],
+        }
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(record))
+        os.replace(tmp, path)
+    except OSError as e:
+        if logger:
+            logger.error(f"DEAD-CHIP could not record the stuck holders in {path}: {e}")
+
+
+def _restore_dead_chip_stuck() -> list[int]:
+    """At broker start (spec 04 I77): reload the stuck holders the last broker registered, keeping
+    only those on this boot whose pid still has the recorded start time, and resume the I70 episode
+    from its recorded wall-clock start, so the fence holds and the 120 s budget is not restarted.
+    Returns the kept pids. Never raises: an unreadable record keeps nothing."""
+    global _leftover_unkillable_since, _leftover_unkillable_mono
+    path = health_dir() / DEAD_CHIP_STUCK_FILE
+    kept: list[int] = []
+    try:
+        record = json.loads(path.read_text())
+        if record.get("boot_id") == _current_boot_id():
+            for h in record.get("holders", []):
+                pid, starttime = int(h["pid"]), str(h.get("starttime") or "")
+                if starttime and read_proc_starttime(pid) == starttime:
+                    entry = (str(h["label"]), starttime, int(h["uid"]), tuple(h.get("bdfs") or ()))
+                    with _dead_chip_stuck_lock:
+                        _dead_chip_stuck[pid] = entry
+                    kept.append(pid)
+        since = _restored_episode_since(record.get("since"))
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as e:
+        if logger:
+            logger.error(f"DEAD-CHIP stuck-holder record {path} unreadable, nothing restored: {e}")
+        kept = []
+    if kept:
+        _leftover_unkillable_since = since
+        _leftover_unkillable_mono = time.monotonic() - (time.time() - since)
+        if logger:
+            logger.error(f"DEAD-CHIP stuck holder(s) {kept} still alive after the broker restart; fence kept")
+        try:
+            health_event(
+                "dead_chip_holder_stuck_restored",
+                pids=kept,
+                since=datetime.fromtimestamp(since).isoformat(timespec="seconds"),
+                fault_class=DEAD_CHIP_STUCK_CLASS,
+                budget_sec=DEAD_CHIP_STUCK_BUDGET_SEC,
+            )
+            _reaped_leftovers()  # the episode, its class and budget, and /health's leftover_fence
+        except Exception as e:  # noqa: BLE001 - the restored fence and clock hold; the next scan opens it
+            if logger:
+                logger.error(f"DEAD-CHIP restoring the stuck-holder episode failed: {e}")
+    _save_dead_chip_stuck()
+    return kept
+
+
+def _restored_episode_since(raw) -> float:
+    """The recorded episode start, as a wall-clock time no later than now. One that is missing, not
+    a number, not finite or out of range is logged and taken as now: the 120 s budget then runs from
+    this start (bounded), and the holders are restored all the same."""
+    now = time.time()
+    try:
+        since = float(raw)
+        datetime.fromtimestamp(since)
+        if math.isfinite(since) and since > 0:
+            return min(since, now)
+    except (TypeError, ValueError, OverflowError, OSError):
+        pass
+    if logger:
+        logger.error(f"DEAD-CHIP stuck-holder record has no usable episode start ({raw!r}); the budget runs from now")
+    return now
+
+
+def _dead_chip_victim_pids(scope: str) -> list[int]:
+    """The live pids of ``scope`` when every one is a registered dead-chip stuck holder (spec 04 I77)
+    with its recorded starttime, else []. A scope with no live process, or any other live process,
+    is a running job. Never raises."""
+    with _dead_chip_stuck_lock:
+        registered = {pid: entry[1] for pid, entry in _dead_chip_stuck.items()}
+    if not registered:
+        return []
+    try:
+        procs = job_processes(None, scope=scope)
+    except Exception:  # noqa: BLE001 - an unreadable scope counts as a running job
+        return []
+    if procs and all(p in registered and registered[p] in ("", info.starttime) for p, info in procs.items()):
+        return sorted(procs)
+    return []
+
+
+def _dead_chip_bdfs(chips: list) -> tuple:
+    """The chips' PCI addresses, read once while they are still enumerated: after the removal the
+    sysfs link is gone and resolves to no address. One that cannot be read is left out (the fd and
+    device-node checks still apply)."""
+    bdfs = []
+    for c in chips:
+        try:
+            bdf = chip_pci_bdf(c)
+        except Exception:  # noqa: BLE001 - an unknown BAR path still leaves the fd and node checks
+            bdf = None
+        if bdf and ":" in bdf:
+            bdfs.append(bdf)
+    return tuple(bdfs)
+
+
+def _send_dead_chip_page() -> None:
+    """Send the pending I77 page; one the alert hook drops (a run still in flight) is sent again on
+    the next leftover scan."""
+    global _dead_chip_page_pending
+    event = _dead_chip_page_pending
+    if event is None:
+        return
+    if alert.send_alert(event, logger) is not None or alert.alert_argv() is None:
+        _dead_chip_page_pending = None
+
+
+def _dead_chip_stuck_leftovers() -> list[ReapedLeftover]:
+    """The registered dead-chip stuck holders still stuck (spec 04 I77), as leftovers. One that is gone (or a reused pid), a zombie, or no longer
+    stuck with a device reference is dropped and journaled ``dead_chip_holder_released``."""
+    _send_dead_chip_page()
+    with _dead_chip_stuck_lock:
+        entries = list(_dead_chip_stuck.items())
+    found = []
+    for pid, (label, starttime, uid, bdfs) in entries:
+        f = None
+        if not starttime or read_proc_starttime(pid) == starttime:
+            f = stuck_device_holder(pid, label, uid, bdfs)
+        if f is None:
+            with _dead_chip_stuck_lock:
+                _dead_chip_stuck.pop(pid, None)
+            _save_dead_chip_stuck()
+            if logger:
+                logger.info(f"DEAD-CHIP stuck holder pid {pid} ({label}) is gone")
+            health_event("dead_chip_holder_released", pid=pid, label=label)
+        else:
+            found.append(f)
+    return found
+
+
+def _dead_chip_isolation_pending_reason() -> str:
+    """Why no reset may run yet (spec 03 I19): the dead-chip path is still waiting, off the sampler,
+    for the holders it killed (after the removal) to let go, and its stuck-holder check (spec 04 I77)
+    has not run. The device is already dirty; the wait is bounded by HOLDER_RELEASE_WAIT_SEC. ''
+    when none is pending."""
+    pending = getattr(sampler, "isolations", None) or ()
+    if not any(not t.done() for t in pending):
+        return ""
+    return (
+        "a dead chip's killed holders are still being waited for, before the stuck-holder check "
+        f"(at most {HOLDER_RELEASE_WAIT_SEC}s, spec 03 I19)"
+    )
+
+
+def _dead_chip_stuck_reason() -> str:
+    """The re-enumeration fence (spec 04 I77, ``mechanism.reenumerate_fence``): why no bridge reset,
+    PCI rescan, tray re-power or reset sweep may run — '' when no killed holder is stuck on a dead
+    chip. Refreshes the I70 episode as it reads. Never raises."""
+    if not _dead_chip_stuck:
+        return ""
+    stuck = [f for f in _reaped_leftovers() if f.job_id.startswith(DEAD_CHIP_LABEL_PREFIX)]
+    if not stuck:
+        return ""
+    return (
+        "killed holder(s) stuck in the kernel on a removed chip: "
+        + "; ".join(f.describe() for f in stuck)
+        + "; re-enumerating PCI under them can stall the host (spec 04 I77)"
     )
 
 
@@ -12049,6 +12494,15 @@ async def reconcile_running_scopes():
         readopted_scopes[job_id] = scope
         if logger:
             logger.info(f"RE-ADOPT job_id={job_id} from {scope} (owner={job.owner})")
+        victim = _dead_chip_victim_pids(scope)
+        if victim:
+            # The dead-chip path's victim, re-adopted by a later restart (the first one consumed its
+            # device-fault record): every live process left in its scope is a registered stuck holder.
+            # It is the broker's own kill, not a running job, so it never holds the I70 rung (04 I77).
+            reset_killed_job_ids.add(job_id)
+            if logger:
+                logger.warning(f"RE-ADOPT job_id={job_id} is the dead-chip path's victim: pid(s) {victim} stuck")
+            health_event("scope_readopted_dead_chip_victim", job_id=job_id, scope=scope, pids=victim)
         asyncio.create_task(_monitor_readopted_scope(job_id, scope))
     # A spool no job claims is the output of a job that ended while no broker ran: the log has what
     # was copied, and the uncopied tail is appended to it before the spool goes (spec 01 I17).
@@ -14210,6 +14664,9 @@ async def run_startup_tasks() -> None:
     if _startup_tasks_done:
         return
     _startup_tasks_done = True
+    # A dead chip's killed holder still stuck in the kernel keeps its fence and its 120 s clock
+    # across this restart, before anything here could reset or re-enumerate (spec 04 I77).
+    _restore_dead_chip_stuck()
     # A fabric check the last broker had in flight was cut off by its stop: journal it, once.
     interrupted = journal_interrupted_fabric_check()
     if interrupted and logger:
@@ -14575,11 +15032,13 @@ def create_mcp_server() -> MCPServer:
                     return None, None, ""
                 health_event("reset_begin", argv=argv, expected_chips=len(indices))
                 _void_fabric_ok("operator reset")
+                began = time.monotonic()
                 rc, output = await recovery_mechanism.reset_with_quiesce(argv, _plog, reset_owner, on_reset_output)
                 if output and not reset_streamed:
                     output_queue.put_nowait(output if output.endswith("\n") else output + "\n")
                 output_queue.put_nowait(f"exit code: {rc}\n")
                 if rc != 0:
+                    _note_operator_reset_outcome(rc, None, began, argv)
                     return rc, False, ""
                 # Exit 0 says tt-smi ran, not that the mesh came back, so verify before the door
                 # reopens — still under the device-op lock, because on a mesh the verify is a fabric
@@ -14588,6 +15047,7 @@ def create_mcp_server() -> MCPServer:
                 verdict, detail = await _verify_operator_reset(
                     len(indices), recovery, lambda m: output_queue.put_nowait(f"{m}\n"), "operator reset stream"
                 )
+                _note_operator_reset_outcome(rc, verdict, began, argv)
                 return rc, verdict, detail
 
         reset_task = asyncio.create_task(run_reset())
@@ -16144,6 +16604,7 @@ def create_mcp_server() -> MCPServer:
         # and KillMode=control-group took the running tt-smi down with it — a reset
         # stopped partway through 32 ASICs. It also raced the gate's own reset.
         health_ok: Optional[bool] = None
+        verdict: Optional[bool] = None
         health_detail = "not checked (reset did not succeed)"
         reset_owner = _reset_action_owner()
         async with _device_op("reset", owner=reset_owner):
@@ -16166,6 +16627,7 @@ def create_mcp_server() -> MCPServer:
                 step(f"REFUSED: {in_flight}", "warning")
                 return {"status": "refused", "reason": "reset_in_flight", "detail": in_flight, "steps": steps}
             _void_fabric_ok("operator reset")
+            began = time.monotonic()
             rc, reset_out = await recovery_mechanism.reset_with_quiesce(argv, lambda m: step(m), reset_owner)
             status = "reset_complete" if rc == 0 else "reset_failed"
             step(f"{command} exited {rc} -> {status}", "info" if rc == 0 else "error")
@@ -16183,6 +16645,7 @@ def create_mcp_server() -> MCPServer:
                     status = "reset_unverified"  # the reset ran; no pass proved the fabric moves data
                 elif not health_ok:
                     status = "reset_unhealthy"  # reset ran but the mesh is not back
+            _note_operator_reset_outcome(rc, verdict, began, argv)
 
         return {
             "status": status,

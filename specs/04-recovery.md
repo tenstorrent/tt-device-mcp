@@ -45,6 +45,25 @@ each rung fires only when the gentler one failed or cannot apply.
   recover is the failed pass, the reset (~4 min) and the power cycle within the 15 min class budget.
   The one stated exception is spec 03 I42's watchdog path: with no idle relift reset first, the reset
   starts at 600 s and the host rung follows about 4-6 min later.
+  An operator reset (`tt_device_reset`, tool and stream) settles the cooldown the same way, on the
+  clock of its start: `reset_failed` (a non-zero exit) and `reset_unhealthy` (I13) arm it and set
+  `last_reset_failed`, so a failed operator reset is the first of the gate's two strikes (I11);
+  `reset_complete` and `reset_unverified` (a persistent 77 is unknown, not failed, as for the broker's own resets) clear the
+  flag; a refused or timed-out one changes neither. Before, a failed operator reset armed nothing:
+  the next gate fired a back-to-back broker reset at the mesh it had just failed on, and that
+  broker reset's failure counted as the first strike, not the second. A failed operator mesh reset
+  (`-glx_reset`, `-glx_reset_auto`) is also the episode's one mesh reset, marked as the broker marks
+  its own (I37 class C, I87); a failed chip reset (`-r`) is not.
+  The cooldown stops a repeat MMIO reset only, and a power cycle is not one: on its WAIT the gate
+  first runs the I37 class check (no rung, no tray-down prelude), and the idle off-bus escalation
+  runs it before its own cooldown check. Time to recover, per class, after a failed operator reset:
+  class A (whole trays off) and class C (all off, the failed mesh reset spent) go to the power cycle
+  on the next gate or idle pass, as without the cooldown, or faster where the failed operator mesh
+  reset now counts as class C's one reset; a partial drop or a present mesh (class D) waits out the
+  rest of the cooldown, re-checked on the hold's ~120 s grace, with no repeat reset, then climbs as
+  above; the hold bound (I76) is unchanged for every class, since its forced ladder and power cycle
+  run through the cooldown. Nothing lifts the hold on any of these paths without a just-passed full
+  check, fabric included (I13; the boot after a cycle runs the startup gate's).
 - **I4 — Every reset survives its broker.** For root on a systemd host, `RecoveryMechanism.run_scoped` wraps
   reset argv in `systemd-run --scope --unit=ttdev-reset-<pid>-<seq>
   --property=KillMode=mixed`. Otherwise it starts a new-session child with an inherited
@@ -442,7 +461,7 @@ each rung fires only when the gentler one failed or cannot apply.
   checks the broker's `reset_fence` first and returns without a rung (`reset_fenced` event), so
   no caller (the gate, the ladder, a tool) can reset over one. A reset cannot free such a
   process and only hits the chips under it. The fence lifts once the holder is gone; one stuck
-  in the kernel is bounded by I70.
+  in the kernel is bounded by I70 (I77 when it held a dead chip: 120 s).
 
 - **I22 — No host rung without the full reset ladder.** The power cycle fires only after
   the last-chance sweep (SBR, mesh reset) ran COMPLETE and the one verify after
@@ -451,7 +470,7 @@ each rung fires only when the gentler one failed or cannot apply.
   incomplete (the I24 gate refused it) holds the host
   rung for that pass: `_settle_and_verify_before_host_rung` returns None and every caller holds.
   I70 is the other exception: under an unkillable leftover every reset is fenced (I21), so its host
-  rung runs with no ladder and no sweep.
+  rung runs with no ladder and no sweep (also I77's).
 
 - **I23 — No BMC tray re-power.** The broker never re-powers a single UBB tray: no
   `ipmitool raw 0x30 0x8b`, and no other per-tray UBB or BMC power action, on any path (the
@@ -1254,7 +1273,9 @@ each rung fires only when the gentler one failed or cannot apply.
   forced climb), the operator stand-back for the power cycle, and the governor (I9/I10 rate limits,
   the I65 cooldown). After the stand-back and the governor (the stand-back command can run for its
   whole timeout) the rung scans again and fires only if a reset scope still does not cycle, no
-  tenant arrived and a leftover is still in that scan. A leftover that left at any point before the
+  tenant arrived and a leftover is still in that scan (a dead chip's stuck holder, I77, counts while
+  its own fresh check still finds it stuck: it may map only the removed chip's BAR or node, which the
+  holder scan does not list). A leftover that left at any point before the
   fire (between the try's first scan and the device lock, or during the last checks) fires nothing:
   the stage is `gone` and the try's own re-scan closes the episode. A guard holds and fires nothing; the next try asks again, so a denial ends when
   its cause does (the cooldown at its stated end). With no host rung opted in the episode goes to an
@@ -2193,6 +2214,67 @@ each rung fires only when the gentler one failed or cannot apply.
   has no port to rescan, so it loses the rescan rung (there is no global fallback) and goes on to
   the next rung.
 
+- **I77 — A killed holder stuck on a dead chip withholds every PCI re-enumeration and escalates in
+  120 s (fault class `J-dead-chip-stuck-holder`).** The class: the dead-chip path (03 I19) killed a
+  process that mapped the chip, and once the release wait ends the process is still alive, stuck in
+  the kernel (state D, or SIGKILL pending), with a `/dev/tenstorrent` fd or mapping, or a mapping of
+  one of the chip's PCI BARs. Detection, `note_stuck_holders` right after the release wait: each
+  killed pid is checked once (`job_reap.stuck_device_holder`); its BARs are read once, before the
+  removal (a removed chip's sysfs link is gone), and its maps read is bounded by
+  `STUCK_MAPS_READ_SEC` (2 s, a D-state task can hold its mmap lock). A pid that exited, is not
+  stuck, or is stuck on nothing of ours is not the class; one whose fds and maps are both unreadable
+  counts (fail closed). Each such pid is journaled `dead_chip_holder_stuck` (`host_at_risk`,
+  `severity: high`, the chips, the holders, the class and budget) and paged through the alert hook
+  once; a page the hook drops is retried on the next scan. The process is registered (pid,
+  starttime, uid, BARs) as a reaped leftover (01 I16), so I21 fences every reset and dispatch over
+  it; a reused pid (other starttime) or a process that let go is pruned
+  (`dead_chip_holder_released`) and the fences lift with it. The registered entry wins over the same
+  pid found as a job's leftover (its job's scope outlived the job, or the sweep named it a
+  survivor): it keeps the dead-chip label, so the budget, the class and the fence below hold. The
+  registry is recorded under the health dir (`dead_chip_stuck.json`, atomic rename, with the boot id
+  and the episode's wall-clock start; one snapshot and write at a time, so a slower save never puts
+  back a registry a later one emptied) and removed once empty; a broker restart reloads it before
+  anything else at startup, keeps only an entry on the same boot whose pid still has the recorded
+  starttime, and resumes the episode from its recorded start (journaled
+  `dead_chip_holder_stuck_restored`), so neither the fence nor the 120 s clock restarts; an
+  unreadable record restores nothing, and a recorded start that is missing, not finite or out of
+  range restores the holders with the episode starting now (logged; the budget stays bounded and
+  startup goes on). On top of I21, the broker's
+  `reenumerate_fence` withholds every rung that re-enumerates PCI: the bridge reset (the chip stays
+  isolated, its bridge reason `stuck_holder`), the TRAY_DOWN prelude rescan (it runs once the holder is gone) and
+  the back-to-back sweep (an incomplete sweep, so the ladder does not climb on it, I22). Each refusal
+  is logged and journaled `reenumerate_withheld` (`host_at_risk`) once per reason. The whole-tray
+  power-cycle hand-off is not withheld: it re-powers nothing itself and its cycle clears the holder.
+  Escalation is I70's, with the budget `DEAD_CHIP_STUCK_BUDGET_SEC`, 120 s, while a dead-chip
+  holder is among the unkillable leftovers (a job's leftover alone keeps 600 s): the holder already
+  outlived its kill and the 30 s release wait, a re-enumeration under it can take the host down, and
+  120 s is the kernel's own hung-task bound; the slot cannot heal before the holder is gone. Past
+  the budget the host rung is requested on I70's terms (the power cycle when a chip is off the bus,
+  as here once the chip is removed; at most one 60 s retry tick; every guard, the I65 cooldown
+  included, holds and retries). The rung's running-job guard does not count a RUNNING job the
+  broker itself killed for recovery (`reset_killed_job_ids`, which the dead-chip path's victim
+  joins): its process is the stuck holder, so it stays RUNNING for as long as the host lives and
+  would hold the rung forever; any other RUNNING job still holds it. This holds across repeated
+  restarts: the victim's scope stays active while its process is stuck, and once the first restart
+  has used the job's device-fault record (01 I6) a later one re-adopts the scope as RUNNING with no
+  in-memory kill marker. A re-adopted job whose scope's live processes are all registered stuck
+  holders (pid and starttime) rejoins `reset_killed_job_ids` (journaled
+  `scope_readopted_dead_chip_victim`); a scope with any other live process, or none, is a running
+  job and still holds the rung. `/health` `leftover_fence` carries the class, `budget_sec` 120 and
+  its deadline. Nothing on the path releases the device: the boot runs the startup gate, which waits
+  for the 1G hugepage pool and passes the full health check, fabric included, before any release
+  (03 I4); a failed check keeps the hold and climbs the bounded ladder. Every new wait is bounded:
+  2 s per maps read, the 120 s budget, the 60 s retry. Time to recover for this class: before,
+  either a bridge reset or rescan re-enumerated PCI under the stuck reader (a host-stall risk) or the
+  hold stayed open until an operator rebooted; after, the 30 s release wait, 120 s, at most one
+  sampler tick, then the power cycle (about 5-8 min) and the startup check (about 3 min): about
+  10-13 min, later only by the bounded I65 cooldown. The same 120 s holds for a stuck holder in its
+  job's scope or named a job's survivor (before: that job's 600 s leftover budget), for one whose
+  killed job is still RUNNING (before: unbounded, the running-job guard held the rung), and across a
+  broker restart (before: the registry and the clock were lost, so the fence lifted and a restart
+  delayed or dropped the request), and across a second restart that re-adopts the victim's scope
+  (before: unbounded, the re-adopted RUNNING victim held the rung).
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -2508,7 +2590,8 @@ sees a silent fabric pass.
 | I15 CPLD banner: the check itself mutates nothing; the caller latches | `tests/test_reset.py::TestCpldTooOldBanner::test_the_check_itself_mutates_nothing` |
 | I15 CPLD latch answers the mode and selects the galaxy ladder | `tests/test_reset.py::TestCpldTooOldBanner::test_the_latch_makes_the_reset_mode_known`, `::test_the_latch_selects_the_galaxy_ladder` |
 | I15 an operator declaration still outranks the CPLD latch | `tests/test_reset.py::TestCpldTooOldBanner::test_an_operator_declaration_still_outranks_the_latch` |
-| I3 cooldown arming rules | `tests/test_device_safety.py::test_a_timed_out_reset_does_not_arm_the_cooldown`, `tests/test_device_safety.py::test_a_reset_that_exits_nonzero_still_arms_the_cooldown`, `tests/test_device_safety.py::test_an_adopted_foreign_reset_that_failed_arms_the_cooldown`, `tests/test_device_safety.py::test_stuck_hold_escalation_holds_within_the_reset_cooldown` |
+| I3 cooldown arming rules | `tests/test_device_safety.py::test_a_timed_out_reset_does_not_arm_the_cooldown`, `tests/test_device_safety.py::test_a_reset_that_exits_nonzero_still_arms_the_cooldown`, `tests/test_device_safety.py::test_an_adopted_foreign_reset_that_failed_arms_the_cooldown`, `tests/test_device_safety.py::test_stuck_hold_escalation_holds_within_the_reset_cooldown`, `tests/test_reset.py::test_a_failed_operator_reset_arms_the_cooldown_and_the_two_strikes`, `tests/test_reset.py::test_an_operator_reset_that_did_not_finish_leaves_the_cooldown_alone`, `tests/test_hold_bound.py::test_a_failed_resets_cooldown_never_delays_the_ladder_at_the_bound`, `tests/test_reset.py::test_a_failed_operator_mesh_reset_spends_the_episodes_mesh_reset`, `tests/test_reset.py::test_a_failed_operator_chip_reset_does_not_spend_the_mesh_reset` |
+| I3 the cooldown never delays a class A/C power cycle; other sets wait | `tests/test_classac_power_cycle_direct.py::test_a_whole_tray_in_a_failed_resets_cooldown_cycles_on_the_next_gate_pass`, `tests/test_classac_power_cycle_direct.py::test_all_off_after_a_failed_operator_mesh_reset_cycles_in_its_cooldown`, `tests/test_classac_power_cycle_direct.py::test_any_other_set_still_waits_out_the_cooldown`, `tests/test_classac_power_cycle_direct.py::test_an_idle_off_bus_hold_in_a_failed_resets_cooldown_cycles`, `tests/test_hold_bound.py::test_a_failed_resets_cooldown_never_delays_the_ladder_at_the_bound` |
 | I4 restart-safe scope/local child; overrun waited out; timeout leaves reset | `tests/test_device_safety.py::test_reset_runs_in_its_own_systemd_scope`, `tests/test_reset.py::test_a_reset_scope_argv_is_scoped_and_outlives_us`, `tests/test_reset.py::test_a_reset_without_systemd_runs_detached_and_returns_its_output`, `tests/test_reset.py::test_a_daemon_without_systemd_resets_through_the_local_backend`, `tests/test_reset.py::test_cancelling_the_waiter_does_not_kill_a_local_reset`, `tests/test_reset.py::test_a_reset_that_overruns_is_waited_out_not_failed`, `tests/test_reset.py::test_a_reset_that_never_ends_is_still_a_failure`, `tests/test_device_safety.py::test_reset_timeout_leaves_the_scope_running`, `tests/test_device_safety.py::test_the_reset_without_systemd_runs_bare_never_through_systemd_run` |
 | I5 adopt, never race, a live scope or local lock | `tests/test_reset.py::test_a_restarted_daemon_adopts_the_local_reset_lock`, `tests/test_device_safety.py::test_bridge_reset_is_skipped_while_a_reset_scope_is_in_flight`, `tests/test_device_safety.py::test_stuck_hold_climb_defers_when_a_reset_is_still_cycling`, `tests/test_device_safety.py::test_stuck_offbus_hold_skips_the_surgical_reset_when_a_scope_opened` |
 | I6 reset gate: foreign deny, incomplete fail-closed, force, carve-outs | `tests/test_reset_gate.py::TestResetGateDeny::test_denies_on_foreign_holder`, `tests/test_reset_gate.py::TestResetGateIncompleteScan::test_incomplete_scan_fails_closed_when_no_visible_foreign`, `tests/test_reset_gate.py::TestResetGateForce::test_force_overrides_foreign`, `tests/test_reset_gate.py::TestResetGateSystemHolders::test_allows_over_system_holder`, `tests/test_reset_gate.py::TestForeignHolders::test_ignores_system_holders`, `tests/test_reset_gate.py::TestResetGateAllow::test_allows_when_only_own_holders` |
@@ -2551,6 +2634,13 @@ sees a silent fabric pass.
 | I76 with spec 03 I83: one in-flight PCI writer; the first timeout or refusal latches PCI-wedged, stops the pass, skips later PCI rungs and the valve, asks the power cycle at once (cooldown permitting), and no hold lifts while latched without a just-passed full check | `tests/test_pci_wedged_latch.py::test_a_blocked_bridge_reset_stops_the_pass_after_one_call`, `tests/test_pci_wedged_latch.py::test_b_a_later_rescan_behind_a_blocked_write_fails_fast_and_starts_no_thread`, `tests/test_pci_wedged_latch.py::test_c_the_valve_skips_a_dead_chip_while_pci_wedged`, `tests/test_pci_wedged_latch.py::test_d_the_latch_asks_for_the_power_cycle_at_once_outside_the_cooldown`, `tests/test_pci_wedged_latch.py::test_d_inside_the_cooldown_the_latch_asks_when_it_ends`, `tests/test_pci_wedged_latch.py::test_e_no_hold_lifts_while_pci_wedged_without_a_just_passed_full_check`, `tests/test_below_floor_offbus_ladder.py::test_a_remove_blocked_in_the_kernel_still_lets_the_bound_reach_the_power_cycle`, `tests/test_device_safety.py::test_an_isolated_chip_rung_blocked_in_the_kernel_fails_in_bounded_time` |
 | I70/I76 a killed job's leftover past 600 s and the 10-min hold bound request one power cycle per episode, in either order, with a leftover try spawned before the bound's request, and whether the launch ran or timed out; the device stays held with the full check owed | `tests/test_unkillable_leftover_escalation.py::test_replay_the_bound_and_the_leftover_budget_request_one_power_cycle` |
 | I70 `/health` `leftover_fence`, the sampler wiring, and the bounded time to request (at most 660 s) with nothing on the path releasing the device | `tests/test_unkillable_leftover_escalation.py::test_the_health_fields`, `tests/test_unkillable_leftover_escalation.py::test_the_sampler_drives_the_escalation`, `tests/test_unkillable_leftover_escalation.py::test_time_to_request_is_bounded_and_nothing_releases_the_device` |
+| I77 detection: D or SIGKILL pending with the node, a node map or a BAR map; not stuck, stuck on nothing of ours, zombie or gone is not the class; unreadable fails closed; the maps read is bounded | `tests/test_dead_chip_stuck_holder.py::test_refs_name_device_fds_node_maps_and_bar_maps`, `tests/test_dead_chip_stuck_holder.py::test_stuck_device_holder`, `tests/test_dead_chip_stuck_holder.py::test_a_gone_pid_is_not_stuck`, `tests/test_dead_chip_stuck_holder.py::test_a_maps_read_that_blocks_is_bounded_and_fds_still_count` |
+| I77 journaled host_at_risk and paged once (a dropped page retried), the I70 episode opens with the class and 120 s in `/health`; a holder that exited or is not stuck names nothing; BARs read before the removal | `tests/test_dead_chip_stuck_holder.py::test_a_stuck_holder_is_journaled_host_at_risk_paged_once_and_opens_the_episode`, `tests/test_dead_chip_stuck_holder.py::test_a_dropped_page_is_sent_on_the_next_scan`, `tests/test_dead_chip_stuck_holder.py::test_a_killed_holder_that_exited_or_is_not_stuck_names_nothing`, `tests/test_dead_chip_stuck_holder.py::test_the_bars_are_read_at_registration_not_after_the_removal` |
+| I77 the re-enumeration fence withholds the bridge reset, the prelude rescan and the sweep (incomplete), not the whole-tray power-cycle hand-off; `reset_with_quiesce` is fenced; a released or reused pid lifts it | `tests/test_dead_chip_stuck_holder.py::test_the_broker_wires_both_fences`, `tests/test_dead_chip_stuck_holder.py::test_the_bridge_rung_is_withheld`, `tests/test_dead_chip_stuck_holder.py::test_the_tray_down_rescan_is_withheld`, `tests/test_dead_chip_stuck_holder.py::test_the_back_to_back_sweep_is_withheld_and_reports_incomplete`, `tests/test_dead_chip_stuck_holder.py::test_a_whole_tray_still_goes_to_the_power_cycle_hand_off`, `tests/test_dead_chip_stuck_holder.py::test_reset_with_quiesce_is_fenced_until_the_holder_is_gone`, `tests/test_dead_chip_stuck_holder.py::test_a_released_holder_is_pruned_and_lifts_the_fence`, `tests/test_dead_chip_stuck_holder.py::test_a_reused_pid_is_not_the_stuck_holder` |
+| I77 no rung before 120 s, then the power cycle with the chip off the bus (the I70 fresh-scan check counts a stuck holder the holder scan misses, and one that exits before the fire fires nothing); the I65 cooldown holds and the rung fires once it ends; time to request 120 s with nothing releasing the device; a job leftover alone keeps 600 s; the dead-chip path calls it | `tests/test_dead_chip_stuck_holder.py::test_no_rung_before_120s_then_a_power_cycle_with_the_chip_off_the_bus`, `tests/test_dead_chip_stuck_holder.py::test_the_i65_cooldown_holds_the_rung_and_it_fires_once_the_cooldown_ends`, `tests/test_dead_chip_stuck_holder.py::test_time_to_request_is_bounded_and_nothing_releases_the_device`, `tests/test_dead_chip_stuck_holder.py::test_a_job_leftover_alone_keeps_the_600s_budget`, `tests/test_dead_chip_stuck_holder.py::test_the_dead_chip_path_notes_stuck_holders_and_says_the_host_is_still_at_risk`, `tests/test_dead_chip_stuck_holder.py::test_the_rung_counts_a_stuck_holder_the_scan_misses_and_fires_nothing_once_it_left` |
+| I77 a stuck holder that is also a job's leftover (job scope or survivor) keeps the dead-chip label and 120 s; the dead-chip victim job still RUNNING does not hold the rung, any other running job does | `tests/test_dead_chip_stuck_holder.py::test_a_dead_chip_holder_that_is_also_a_job_leftover_keeps_the_dead_chip_label`, `tests/test_dead_chip_stuck_holder.py::test_the_dead_chip_victim_job_still_running_does_not_hold_the_rung`, `tests/test_dead_chip_stuck_holder.py::test_a_live_job_the_broker_did_not_kill_still_holds_the_rung` |
+| I77 the registry is recorded and removed once empty; a restart reloads it first, keeps the fence and resumes the 120 s clock; another boot, a reused pid, no starttime or an unreadable record restores nothing | `tests/test_dead_chip_stuck_holder.py::test_the_registry_is_recorded_and_removed_once_the_holder_is_gone`, `tests/test_dead_chip_stuck_holder.py::test_a_restart_keeps_the_fence_and_resumes_the_120s_clock`, `tests/test_dead_chip_stuck_holder.py::test_a_restart_drops_holders_that_are_not_the_recorded_process`, `tests/test_dead_chip_stuck_holder.py::test_an_unreadable_record_restores_nothing`, `tests/test_dead_chip_stuck_holder.py::test_the_broker_start_restores_before_anything_else` |
+| I77 the record's snapshot and write are serialised; a bad recorded start restores the holders with the clock from now and never aborts startup; across repeated restarts the re-adopted victim (all its scope's live pids registered stuck holders) does not hold the rung, the request comes by the original start + 120 s + one tick (at once if past), and a re-adopted job with its own live process still holds it; boot_broker wires the pending endpoint removal into both fences | `tests/test_dead_chip_stuck_holder.py::test_a_concurrent_save_never_puts_back_a_registry_a_later_one_emptied`, `tests/test_dead_chip_stuck_holder.py::test_a_bad_episode_start_restores_the_holders_with_the_clock_from_now`, `tests/test_dead_chip_stuck_holder.py::test_a_bad_episode_start_does_not_abort_the_broker_start`, `tests/test_dead_chip_stuck_holder.py::test_a_second_restart_readopts_the_victim_and_the_rung_still_fires`, `tests/test_dead_chip_stuck_holder.py::test_a_scope_with_any_other_live_process_is_not_the_victim`, `tests/test_dead_chip_stuck_holder.py::test_the_broker_wires_the_isolation_wait_into_both_fences` |
 | I14 the host rung is the power cycle or a loud hold; blocked climbs are loud | `tests/test_device_safety.py::test_host_escalation_for_drop_is_the_power_cycle_or_a_loud_hold`, `tests/test_device_safety.py::test_gate_all_off_bus_holds_loudly_never_reboots`, `tests/test_device_safety.py::test_gate_reset_regression_holds_loudly_never_reboots`, `tests/test_device_safety.py::test_gate_all_off_bus_power_cycles_when_opted_in` |
 | Cold rung fireable-or-off (ipmitool) | `tests/test_device_safety.py::test_a_host_without_ipmitool_serves_with_the_cold_rung_off`, `tests/test_device_safety.py::test_ipmitool_present_leaves_the_cold_rung_armed` |
 | I26 pre-power-cycle hook: opt-in, runs between record and fire, bounded, never gates the cycle | `tests/test_pre_power_cycle_hook.py::test_unset_hook_runs_nothing_and_the_cycle_is_unchanged`, `tests/test_pre_power_cycle_hook.py::test_the_hook_runs_after_the_record_and_before_the_fire`, `tests/test_pre_power_cycle_hook.py::test_a_failing_hook_still_power_cycles`, `tests/test_pre_power_cycle_hook.py::test_a_hook_that_cannot_run_still_power_cycles`, `tests/test_pre_power_cycle_hook.py::test_a_hung_hook_is_killed_with_its_children_and_the_cycle_goes_ahead`, `tests/test_pre_power_cycle_hook.py::test_a_background_child_holding_output_does_not_stretch_the_wait`, `tests/test_pre_power_cycle_hook.py::test_the_hook_never_runs_when_the_ledger_aborts_the_cycle`, `tests/test_pre_power_cycle_hook.py::test_a_hook_that_raises_still_power_cycles`, `tests/test_pre_power_cycle_hook.py::test_cancelled_while_waiting_on_the_hook_retracts_the_ledger_entry`, `tests/test_pre_power_cycle_hook.py::test_the_timeout_is_always_finite_and_positive` |

@@ -319,6 +319,8 @@ async def reap_job_survivors(
 # Read through their own root, not PROC_DIR: the sweep above is exercised against real
 # processes, while the fence below is tested against staged /proc trees.
 LEFTOVER_PROC_DIR = "/proc"
+# The job_id of a leftover the dead-chip path killed (spec 04 I77): "dead-chip:<chip,...>".
+DEAD_CHIP_LABEL_PREFIX = "dead-chip:"
 JOB_SCOPE_PREFIX = "ttdev-job-"
 _SIGKILL_BIT = 1 << (signal.SIGKILL - 1)
 
@@ -336,8 +338,13 @@ class ReapedLeftover:
 
     def describe(self) -> str:
         kill = {True: "SIGKILL pending", False: "no SIGKILL pending", None: "signals unreadable"}
+        owner = (
+            f"killed holder of chip(s) {self.job_id[len(DEAD_CHIP_LABEL_PREFIX) :]}"
+            if self.job_id.startswith(DEAD_CHIP_LABEL_PREFIX)
+            else f"job {self.job_id}"
+        )
         return (
-            f"job {self.job_id} pid {self.pid} ({device_holders.username_for_uid(self.uid)}) "
+            f"{owner} pid {self.pid} ({device_holders.username_for_uid(self.uid)}) "
             f"state {self.state} wchan {self.wchan}, {kill[self.sigkill_pending]}"
         )
 
@@ -425,3 +432,71 @@ def find_reaped_leftovers(
             )
         )
     return found
+
+
+# Spec 04 I77: how long one read of /proc/<pid>/maps may take. A process stuck in the kernel can
+# hold its mmap lock, and a maps read waits on that lock, so the read runs on its own thread and an
+# unanswered read counts as unreadable (fail closed: the holder is kept as stuck).
+STUCK_MAPS_READ_SEC = 2.0
+
+
+def _bounded_read(pid: int, name: str, timeout: float) -> Optional[str]:
+    """``_read_leftover`` on a daemon thread, or None when it has not answered in ``timeout``."""
+    import threading
+
+    box: list = []
+    t = threading.Thread(target=lambda: box.append(_read_leftover(pid, name)), daemon=True)
+    t.start()
+    t.join(timeout)
+    return box[0] if box else None
+
+
+def device_refs(pid: int, bdfs: Iterable[str], *, maps_timeout: float = STUCK_MAPS_READ_SEC) -> Optional[list[str]]:
+    """What of the device ``pid`` still references (spec 04 I77): open fds on a /dev/tenstorrent node
+    and mappings of a device node or of one of ``bdfs``' PCI BARs (``.../<bdf>/resource<n>``),
+    deleted ones included. [] when both fds and maps were read and name nothing; None when neither
+    could be read (the caller fails closed)."""
+    bars = [f"/{b}/resource" for b in bdfs if b]
+    node = device_holders.DEVICE_DIR + "/"
+    refs: list[str] = []
+    readable = False
+    try:
+        fds = os.listdir(f"{LEFTOVER_PROC_DIR}/{pid}/fd")
+        readable = True
+    except OSError:
+        fds = []
+    for fd in fds:
+        try:
+            target = os.readlink(f"{LEFTOVER_PROC_DIR}/{pid}/fd/{fd}")
+        except OSError:
+            continue
+        if target.startswith(node) or any(b in target for b in bars):
+            refs.append(f"fd {fd} -> {target}")
+    maps = _bounded_read(pid, "maps", maps_timeout)
+    if maps is not None:
+        readable = True
+        for line in maps.splitlines():
+            parts = line.split(None, 5)
+            path = parts[5].strip() if len(parts) == 6 else ""
+            if path and (path.startswith(node) or any(b in path for b in bars)) and f"map {path}" not in refs:
+                refs.append(f"map {path}")
+    if refs or readable:
+        return refs
+    return None
+
+
+def stuck_device_holder(pid: int, label: str, uid: int, bdfs: Iterable[str]) -> Optional[ReapedLeftover]:
+    """``pid`` as a leftover named ``label`` when it survived its SIGKILL stuck in the kernel with a
+    reference on the device (spec 04 I77), else None. Stuck: state D, or SIGKILL queued and not yet
+    acted on. A zombie or a gone process holds nothing. Refs that cannot be read count as held."""
+    state, _ = _leftover_state(pid)
+    if state in ("?", "Z", "X"):
+        return None
+    pending = _sigkill_pending(pid)
+    if state != "D" and not pending:
+        return None
+    refs = device_refs(pid, bdfs)
+    if refs == []:
+        return None
+    wchan = (_read_leftover(pid, "wchan") or "").strip() or "?"
+    return ReapedLeftover(job_id=label, pid=pid, uid=uid, state=state, wchan=wchan, sigkill_pending=pending)
