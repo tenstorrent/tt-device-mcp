@@ -2772,7 +2772,6 @@ def _reset_for_testing():
     if recovery_mechanism is not None:
         recovery_mechanism.regressed_reset_since = None
         recovery_mechanism._class_a_ladder_anchor = None
-        recovery_mechanism._class_a_ladder_spawned = None
     _fabric_77_streak_since = None
     _fabric_77_streak = 0
     _fabric_77_paged_since = None
@@ -8118,9 +8117,6 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
     retry = getattr(m, "power_cycle_retry", None) if m is not None else None
     if retry is not None and retry[1] and retry[1] == episode:
         add(candidates, hold_report.cooldown_candidate(cooldown, float(retry[0])), "power_cycle_cooldown")
-    class_a = m.class_a_ladder_watch_at(now_epoch) if m is not None else None
-    if class_a is not None:
-        add(candidates, hold_report.RungCandidate(class_a, "forced ladder", "class A 10-min ladder"), "class_a_ladder")
     # Spec 04 I70: the sampler's own host rung for an unkillable leftover; no forced spawn, so no floor.
     fed = fed + _leftover_rung_candidates(now_epoch)
     age = now_epoch - started
@@ -9657,13 +9653,6 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         device_hold_escalation_trigger = "a PCI sysfs write blocked in the kernel (PCI-wedged)"
         if _maybe_spawn_forced_escalation():
             _pci_wedged_asked = PCI_WRITER.latched_at
-    # Spec 04 I73: a whole tray whose cycle the cooldown refuses gets the full ladder at the 10-min
-    # mark after its last cycle or boot, not at the next ceiling window (up to a window late).
-    if not only_77 and recovery_mechanism.class_a_ladder_watch_due(now.timestamp() if now else None):
-        device_hold_escalation_kind = "class_a_ladder"
-        device_hold_escalation_trigger = "10 min since the last power cycle or boot (whole tray off)"
-        if _maybe_spawn_forced_escalation():
-            recovery_mechanism.class_a_ladder_spawned(now.timestamp() if now else None)
     if _hold_bound_cycle_due(age):
         # Spec 04 I76: the bound ladder brought the mesh back but its full check has not released the
         # hold — the host rung now.

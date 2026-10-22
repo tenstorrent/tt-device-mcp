@@ -48,7 +48,6 @@ from tt_device_mcp.health.recovery import (
     pcie_guard,
 )
 from tt_device_mcp.health.recovery.base import (
-    CLASS_A_LADDER_AFTER_SEC,
     CYCLE_LAUNCH_REPAGE_SEC,
     HOLD_ESCALATION_REARM_SEC,
     drop_returned_isolated,
@@ -1099,7 +1098,8 @@ class GalaxyRecovery(Recovery):
 
         ``bound`` (spec 04 I89) marks the I76 10-min bound's own ladder: a below-floor off-bus hold
         then runs its full kept ladder even when an earlier forced run already failed its mesh reset
-        on the same chips."""
+        on the same chips. A whole tray whose power cycle the cooldown refuses gets its full ladder
+        only in this run, once per cycle or boot (I73)."""
         self._stand_down = stand_down
         self._bound = bound
         self.startup_verify_deferred = False
@@ -1265,10 +1265,10 @@ class GalaxyRecovery(Recovery):
             fired is False
             and rung == "offbus-forced"
             and fault_class == FAULT_CLASS_WHOLE_TRAY
-            and self.mechanism.class_a_ladder_due(consume=False)
+            and self.mechanism.class_a_ladder_due(hold_bound=self._bound, consume=False)
         ):
-            # Spec 04 I73: the cooldown refused the cycle, and the hold has stood 10 min since its last
-            # cycle or boot. The sweep runs once now (SBR, then the mesh reset), then the full health
+            # Spec 04 I73/I76: the cooldown refused the cycle, and this is the 10-min hold bound's run.
+            # The sweep runs once per cycle or boot (SBR, then the mesh reset), then the full health
             # check, fabric included; the cycle still fires the moment the cooldown ends.
             return await self._class_a_cooldown_sweep(offbus, expected, log)
         if fired and rung != "gate":
@@ -2316,14 +2316,14 @@ class GalaxyRecovery(Recovery):
         return healthy, evidence
 
     async def _class_a_cooldown_sweep(self, offbus: set, expected: int, log) -> str:
-        """Spec 04 I73 at the 10-min mark: a whole-tray (class A) hold whose power cycle the boot or
-        post-cycle cooldown refused has stood CLASS_A_LADDER_AFTER_SEC since its last cycle or boot. Fire
+        """Spec 04 I73 at the 10-min hold bound (I76): a whole-tray (class A) hold whose power cycle the
+        boot or post-cycle cooldown refused, in the bound's own forced run, once per cycle or boot. Fire
         the resets that remain (:meth:`_issue_all_resets_back_to_back`: SBR on any chip still bridged,
         then the mesh-wide reset; no tray step exists, I23), then ONE settle and ONE full health check,
         fabric included. Only a passing check releases the device; a failed one keeps it held, and the
         power cycle fires the moment the cooldown ends (I65). Never under a live tenant or over a reset
         already cycling in its own scope: a guard that holds it leaves the once-per-cycle-or-boot mark
-        unspent, so the next forced pass inside the cooldown runs it.
+        unspent, so the bound's next forced run inside the cooldown runs it.
 
         OUTCOME_RECOVERED on a passing check, OUTCOME_TERMINAL when the sweep ran and the check failed,
         OUTCOME_WAITING when a guard held it or the sweep was refused (nothing ran)."""
@@ -2337,13 +2337,13 @@ class GalaxyRecovery(Recovery):
             log(f"class A 10-min sweep: {self._describe_blocker(blocker)} — holding; sweeps once idle")
             health_event("stuck_hold_deferred", mesh="offbus", forced=True, **blocker)
             return OUTCOME_WAITING
-        if not self.mechanism.class_a_ladder_due():
+        if not self.mechanism.class_a_ladder_due(hold_bound=self._bound):
             return OUTCOME_WAITING  # once per cycle or boot: taken only now that the guards let it run
         trays = _affected_trays(offbus, expected, self._tray_map_now()) or []
         settle = _settle_before_host_rung_sec()
         log(
-            f"whole tray(s) {trays} off and the power cycle in cooldown {CLASS_A_LADDER_AFTER_SEC}s after the "
-            f"last cycle or boot — SBR then the mesh reset, one {settle}s settle and one full check; the "
+            f"whole tray(s) {trays} off and the power cycle in cooldown at the 10-min hold bound "
+            f"— SBR then the mesh reset, one {settle}s settle and one full check; the "
             f"cycle follows at the cooldown's end if it fails"
         )
         health_event("class_a_cooldown_ladder", off_bus=sorted(offbus, key=int), expected=expected, trays=trays)

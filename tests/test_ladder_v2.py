@@ -455,7 +455,7 @@ async def test_escalate_carries_the_stand_down_only_for_its_own_run(monkeypatch)
     async def no_latch(expected, beats):
         return None
 
-    async def no_direct(*a):
+    async def no_direct(*a, **_):
         return None
 
     monkeypatch.setattr(g, "_tray_down_latch", no_latch)

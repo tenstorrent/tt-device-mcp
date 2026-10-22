@@ -25,7 +25,6 @@ from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy
 from tt_device_mcp.health.recovery.base import (
     AUTO_RECOVERY_LEDGER,
-    CLASS_A_LADDER_AFTER_SEC,
     POWER_CYCLE_MIN_INTERVAL_SEC,
 )
 
@@ -86,6 +85,25 @@ def _watchdog(r, monkeypatch, at):
     return spawned
 
 
+_HOLD_BOUND_CEILING = srv._stuck_hold_ceiling_sec  # the real I76 bound, kept past a ``_watchdog`` patch
+
+
+def _bound_watchdog(r, monkeypatch, at):
+    """One watchdog tick at ``at`` with the real 10-min hold bound (spec 04 I76) and every other
+    forced-escalation window out of reach. Returns the kind of each forced run it starts."""
+    spawned = []
+    monkeypatch.setattr(srv, "_stuck_hold_ceiling_sec", _HOLD_BOUND_CEILING)
+    monkeypatch.setattr(srv, "_offbus_hold_ceiling_sec", lambda: 10**9)
+    monkeypatch.setattr(srv, "_hold_deadline_sec", lambda: 10**9)
+    monkeypatch.setattr(srv, "_offbus_one_shot_sec", lambda: 10**9)
+    monkeypatch.setattr(srv.offbus_power_cycle, "due_for_watchdog", lambda *a, **k: False)
+    monkeypatch.setattr(
+        srv, "_maybe_spawn_forced_escalation", lambda: spawned.append(srv.device_hold_escalation_kind) or True
+    )
+    srv._check_hold_deadline(now=datetime.fromtimestamp(at))
+    return spawned
+
+
 # ---- (a) a manual cycle or boot just before startup ----------------------------------------------
 
 
@@ -93,8 +111,8 @@ def _watchdog(r, monkeypatch, at):
 async def test_a_boot_3_min_before_startup_holds_to_a_deadline_then_cycles_once(cool, monkeypatch):
     """The box came up 3 min ago from a cycle the broker did not fire (manual, BMC, datacenter): a
     whole tray is off at startup. The hold stays with its deadline on /health; no ladder rung runs
-    before the 10-min mark, where the watchdog starts the full ladder once (spec 04 I73); at the
-    deadline it asks once more and exactly one cycle fires."""
+    before the 10-min hold bound, whose forced run (spec 04 I76) is the one that runs the full ladder
+    (I73); at the deadline the watchdog asks once more and exactly one cycle fires."""
     cool["boot"]["btime"] = T0 - 180
     _tray_off(cool)
     assert await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup") == galaxy.OUTCOME_WAITING
@@ -112,16 +130,21 @@ async def test_a_boot_3_min_before_startup_holds_to_a_deadline_then_cycles_once(
     cool["clk"][0] = T0 + 600
     await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
     assert _cycles(cool) == 0 and not LADDER & set(cool["order"])
-    mark = cool["g"].mechanism._class_a_ladder_anchor_now(T0 + 600) + CLASS_A_LADDER_AFTER_SEC
+    mark = datetime.fromisoformat(srv.device_hold_episode_since).timestamp() + srv._stuck_hold_ceiling_sec()
     assert T0 < mark < until
-    assert _watchdog(cool, monkeypatch, mark - 1) == []
-    assert _watchdog(cool, monkeypatch, mark) == [mark], "the full ladder at the 10-min mark"
+    for name in ("device_hold_escalate_bucket", "device_hold_deadline_bucket"):
+        monkeypatch.setattr(srv, name, 0)
+    assert _bound_watchdog(cool, monkeypatch, mark - 1) == []
+    assert _bound_watchdog(cool, monkeypatch, mark) == ["ceiling_window"], "one run: the I76 bound's"
+    cool["clk"][0] = mark
+    await cool["g"].escalate("offbus-forced", [], EXPECTED, lambda m: None, bound=True)
+    assert cool["order"][-2:] == ["denied", "sweep"] and _cycles(cool) == 0, "the full ladder, cycle still gated"
     assert _watchdog(cool, monkeypatch, until - 1) == []
     assert _watchdog(cool, monkeypatch, until) == [until], "asked the moment the cooldown ends"
     assert _watchdog(cool, monkeypatch, until + 30) == [], "once per denial"
     cool["clk"][0] = until
     assert await cool["g"].escalate("offbus-forced", [], EXPECTED, lambda m: None) == galaxy.OUTCOME_TERMINAL
-    assert _cycles(cool) == 1 and not LADDER & set(cool["order"])
+    assert _cycles(cool) == 1
 
 
 def test_health_carries_the_cooldown_deadline_while_held(cool, monkeypatch):

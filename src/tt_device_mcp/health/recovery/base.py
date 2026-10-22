@@ -289,14 +289,13 @@ POWER_CYCLE_MISS_REPAGE_SEC = 3600
 # Spec 04 I73: a whole tray (class A) still off the bus after this many broker power cycles that took
 # the host down, with no verified release since, may need AC removal (no in-band cycle healed some such
 # drops on this hardware). The broker says so on /health, pages once and then hourly, and keeps
-# recovering: a cycle at the end of each cooldown (I65), and the full ladder once the hold has stood
-# CLASS_A_LADDER_AFTER_SEC since its last cycle or boot. Nothing stops the cycles but the cooldown.
+# recovering: a cycle at the end of each cooldown (I65), and the full ladder in the 10-min hold bound's
+# run (I76) once per cycle or boot. Nothing stops the cycles but the cooldown.
 POWER_CYCLE_AC_NEEDED_AFTER = 2
 AC_POWER_REPAGE_SEC = 3600
 # Spec 04 I71: a power cycle that does not launch pages once per hold episode, then at most this often
 # while it keeps failing; every failure is still journaled and the cycle asked again each pass.
 CYCLE_LAUNCH_REPAGE_SEC = 3600
-CLASS_A_LADDER_AFTER_SEC = 600
 
 
 def _power_cycle_missed(rec: dict, boot_id: str, now: float) -> bool:
@@ -614,11 +613,10 @@ class RecoveryMechanism:
         self._ac_power_paged: float = 0.0
         self._ac_power_logged: set = set()
         # The AC-needed state the last power-cycle ask found (None: not reached); a cooldown denial
-        # carries it to /health. And the anchor (last cycle, boot or hold start) the class-A 10-min
-        # ladder last ran for, and the one the watchdog last started a pass for: once per anchor.
+        # carries it to /health. And the anchor (last cycle, boot or hold start) the class-A ladder at
+        # the 10-min hold bound last ran for: once per anchor.
         self._ac_power_info: Optional[dict] = None
         self._class_a_ladder_anchor: Optional[float] = None
-        self._class_a_ladder_spawned: Optional[float] = None
 
         # True while a reset is actually executing. A reset TAKES THE CHIPS OFF THE BUS — that is
         # what a reset is — so during one they read all-ones exactly like a dead chip, and isolating
@@ -2055,7 +2053,7 @@ class RecoveryMechanism:
         why = (
             f"AC power removal may be needed: chips {','.join(str(c) for c in chips)} (whole tray) still off the "
             f"bus after {len(rows)} broker power cycle(s) (last {_local_time(last)}). The broker keeps "
-            f"recovering: the full ladder {CLASS_A_LADDER_AFTER_SEC}s after each cycle or boot, then the next "
+            f"recovering: the full ladder at the 10-min hold bound after each cycle or boot, then the next "
             f"power cycle as soon as its cooldown ends; the device is released only after the full health "
             f"check passes"
         )
@@ -2087,9 +2085,9 @@ class RecoveryMechanism:
         return info
 
     def _class_a_ladder_anchor_now(self, now: float) -> Optional[float]:
-        """The anchor of the class-A 10-min ladder (spec 04 I73): the later of the last cycle or boot
-        the cooldown counts from and this hold's start, while a whole tray is off and the cooldown
-        refuses its cycle; None otherwise (no cooldown, or its end has come and the cycle is due)."""
+        """The anchor of the class-A ladder (spec 04 I73): the later of the last cycle or boot the
+        cooldown counts from and this hold's start, while a whole tray is off and the cooldown refuses
+        its cycle; None otherwise (no cooldown, or its end has come and the cycle is due)."""
         state = self.power_cycle_cooldown_state
         if state is None or not self.whole_tray_off or now >= state["until"]:
             return None
@@ -2100,42 +2098,22 @@ class RecoveryMechanism:
         except ValueError:
             return anchor
 
-    def class_a_ladder_watch_due(self, now_epoch: Optional[float] = None) -> bool:
-        """True once the class-A 10-min mark is reached and no forced pass has been started for it:
-        the hold watchdog then starts one at the mark, not at its next ceiling window. Call
-        :meth:`class_a_ladder_spawned` once that pass started (a declined spawn asks again)."""
-        now = time.time() if now_epoch is None else now_epoch
-        anchor = self._class_a_ladder_anchor_now(now)
-        if anchor is None or now - anchor < CLASS_A_LADDER_AFTER_SEC:
+    def class_a_ladder_due(
+        self, now_epoch: Optional[float] = None, *, hold_bound: bool = False, consume: bool = True
+    ) -> bool:
+        """Spec 04 I73 with I76: a class-A hold whose power cycle the cooldown refused gets the full
+        ladder in the 10-min hold bound's forced run (``hold_bound``), once per anchor (the later of
+        the last cycle or boot and the hold's start). That run's reset is followed by the full health
+        check (fabric included) and, if it fails, by the bound's host rung, which the cooldown releases
+        at its end. The I76 watchdog is the one trigger; this only lets its run reach the ladder.
+        False below the bound, past the cooldown (the cycle itself is due) and with no cooldown.
+        ``consume=False`` only asks: the caller takes the anchor once its guards (tenant, scope) let
+        the sweep run."""
+        if not hold_bound:
             return False
-        return anchor not in (self._class_a_ladder_anchor, self._class_a_ladder_spawned)
-
-    def class_a_ladder_watch_at(self, now_epoch: Optional[float] = None) -> Optional[float]:
-        """When :meth:`class_a_ladder_watch_due` turns (or turned) true for the current anchor, for the
-        /health hold report (spec 04 I75); None when it will not (no anchor, its pass already started,
-        or the cooldown ends first and the cycle itself is due). Read-only: moves no clock."""
         now = time.time() if now_epoch is None else now_epoch
         anchor = self._class_a_ladder_anchor_now(now)
-        if anchor is None or anchor in (self._class_a_ladder_anchor, self._class_a_ladder_spawned):
-            return None
-        at = anchor + CLASS_A_LADDER_AFTER_SEC
-        return at if at < float(self.power_cycle_cooldown_state["until"]) else None
-
-    def class_a_ladder_spawned(self, now_epoch: Optional[float] = None) -> None:
-        now = time.time() if now_epoch is None else now_epoch
-        self._class_a_ladder_spawned = self._class_a_ladder_anchor_now(now)
-
-    def class_a_ladder_due(self, now_epoch: Optional[float] = None, *, consume: bool = True) -> bool:
-        """Spec 04 I73 / user rule: a class-A hold whose power cycle the cooldown refused never stands
-        past CLASS_A_LADDER_AFTER_SEC since its last cycle or boot (or its own start, if later) without
-        the full ladder. True once per such anchor, when that mark is reached inside the cooldown: the
-        hold watchdog's forced pass then runs the ladder, whose reset is followed by the full health
-        check (fabric included) and, if that fails, the power cycle the cooldown releases at its end.
-        False past the cooldown (the cycle itself is due) and with no cooldown standing. ``consume=False``
-        only asks: the caller takes the anchor once its guards (tenant, scope) let the sweep run."""
-        now = time.time() if now_epoch is None else now_epoch
-        anchor = self._class_a_ladder_anchor_now(now)
-        if anchor is None or now - anchor < CLASS_A_LADDER_AFTER_SEC or self._class_a_ladder_anchor == anchor:
+        if anchor is None or self._class_a_ladder_anchor == anchor:
             return False
         if consume:
             self._class_a_ladder_anchor = anchor
@@ -2621,7 +2599,6 @@ class RecoveryMechanism:
         self._ac_power_logged = set()
         self._ac_power_info = None
         self._class_a_ladder_anchor = None
-        self._class_a_ladder_spawned = None
         now_epoch = time.time() if now_epoch is None else now_epoch
         ledger = self.read_auto_recovery_ledger() or []
         healed = self._power_cycle_healed_at(now_epoch)
