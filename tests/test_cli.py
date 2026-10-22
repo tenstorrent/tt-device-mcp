@@ -377,7 +377,7 @@ def _stub_lock_env(monkeypatch, cli, tmp_path, deny_rc):
     from types import SimpleNamespace
 
     monkeypatch.setattr(cli, "_require_root_broker", lambda: True)
-    monkeypatch.setattr(cli, "_set_service_device_group", lambda enable: None)
+    monkeypatch.setattr(cli, "_set_service_device_group", lambda enable: True)
     monkeypatch.setattr(cli, "_install_smi_ro_wrapper", lambda: None)
     monkeypatch.setattr(cli, "_remove_smi_ro_wrapper", lambda: None)
     monkeypatch.setattr(cli, "device_nodes", lambda: ["/dev/tenstorrent/0"])
@@ -435,6 +435,136 @@ def test_cmd_lock_locks_when_deny_probe_is_refused(monkeypatch, tmp_path, capsys
 
     assert rc == 0
     assert "LOCKED:" in out
+
+
+_UNIT_NO_GROUP = (
+    "[Service]\nEnvironment=TT_DEVICE_MCP_PRIVSEP=1\nExecStart=/opt/tt-device-broker/venv/bin/tt-device-mcp\n"
+)
+_UNIT_WITH_GROUP = _UNIT_NO_GROUP.replace("PRIVSEP=1\n", "PRIVSEP=1\nEnvironment=TT_DEVICE_MCP_DEVICE_GROUP=ttdev\n")
+
+
+def _stub_lock_restart_env(monkeypatch, cli, tmp_path, unit_text, main_pid="4242", live_env=None):
+    """Like _stub_lock_env (deny probe refused), but keeps the real unit/env logic:
+    the unit lives in tmp_path, `systemctl show` reports ``main_pid`` and the broker's
+    /proc environ holds ``live_env``. Returns (issued argv lists, unit path)."""
+    from types import SimpleNamespace
+
+    real_set = cli._set_service_device_group
+    issued = _stub_lock_env(monkeypatch, cli, tmp_path, deny_rc=13)
+    unit = tmp_path / "tt-device-broker.service"
+    unit.write_text(unit_text)
+    monkeypatch.setattr(cli, "_BROKER_UNIT", str(unit))
+    monkeypatch.setattr(cli, "_set_service_device_group", real_set)
+    proc = tmp_path / "proc"
+    monkeypatch.setattr(cli, "_PROC_ROOT", str(proc))
+    if live_env is not None:
+        (proc / main_pid).mkdir(parents=True)
+        (proc / main_pid / "environ").write_bytes(b"\0".join(e.encode() for e in live_env) + b"\0")
+    inner = cli.subprocess.run
+
+    def fake_run(cmd, *a, **k):
+        if cmd[:2] == ["systemctl", "show"]:
+            issued.append(cmd)
+            return SimpleNamespace(returncode=0, stdout=main_pid + "\n")
+        return inner(cmd, *a, **k)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    return issued, unit
+
+
+def _restarted(issued):
+    return ["systemctl", "restart", "tt-device-broker"] in issued
+
+
+def test_cmd_lock_skips_restart_when_already_locked(monkeypatch, tmp_path, capsys):
+    """A repeat `lock` on a locked box (unit already sets the group, live broker env has
+    it) must not restart the broker: a restart reruns the startup fabric pass on a
+    healthy device. It still verifies the lock and returns 0."""
+    sys.path.insert(0, SRC_PATH)
+    from tt_device_mcp import cli
+
+    issued, unit = _stub_lock_restart_env(
+        monkeypatch, cli, tmp_path, _UNIT_WITH_GROUP, live_env=["TT_DEVICE_MCP_DEVICE_GROUP=ttdev"]
+    )
+
+    rc = cli.cmd_lock(object())
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "already locked" in out
+    assert "LOCKED:" in out
+    assert not _restarted(issued)
+    assert ["systemctl", "daemon-reload"] not in issued
+    assert unit.read_text() == _UNIT_WITH_GROUP
+
+
+def test_cmd_lock_skips_restart_when_a_drop_in_sets_the_group(monkeypatch, tmp_path, capsys):
+    """The group set by a unit drop-in counts too: no unit edit, no restart."""
+    sys.path.insert(0, SRC_PATH)
+    from tt_device_mcp import cli
+
+    issued, unit = _stub_lock_restart_env(
+        monkeypatch, cli, tmp_path, _UNIT_NO_GROUP, live_env=["PATH=/usr/bin", "TT_DEVICE_MCP_DEVICE_GROUP=ttdev"]
+    )
+    dropin = tmp_path / "tt-device-broker.service.d"
+    dropin.mkdir()
+    (dropin / "zz-group.conf").write_text('[Service]\nEnvironment="TT_DEVICE_MCP_DEVICE_GROUP=ttdev" FOO=1\n')
+
+    rc = cli.cmd_lock(object())
+
+    assert rc == 0
+    assert "already locked" in capsys.readouterr().out
+    assert not _restarted(issued)
+    assert unit.read_text() == _UNIT_NO_GROUP
+
+
+def test_cmd_lock_skips_restart_when_broker_is_stopped_and_unit_is_set(monkeypatch, tmp_path, capsys):
+    """A stopped broker (MainPID 0) picks the env up when it starts; `lock` must not
+    start it as a side effect."""
+    sys.path.insert(0, SRC_PATH)
+    from tt_device_mcp import cli
+
+    issued, _ = _stub_lock_restart_env(monkeypatch, cli, tmp_path, _UNIT_WITH_GROUP, main_pid="0")
+
+    assert cli.cmd_lock(object()) == 0
+    assert "already locked" in capsys.readouterr().out
+    assert not _restarted(issued)
+
+
+def test_cmd_lock_restarts_when_it_adds_the_group(monkeypatch, tmp_path, capsys):
+    """A real change (unit had no group) still edits the unit, daemon-reloads and
+    restarts the broker, as before."""
+    sys.path.insert(0, SRC_PATH)
+    from tt_device_mcp import cli
+
+    issued, unit = _stub_lock_restart_env(monkeypatch, cli, tmp_path, _UNIT_NO_GROUP, live_env=["PATH=/usr/bin"])
+
+    rc = cli.cmd_lock(object())
+
+    assert rc == 0
+    assert "already locked" not in capsys.readouterr().out
+    assert unit.read_text() == _UNIT_WITH_GROUP
+    assert ["systemctl", "daemon-reload"] in issued
+    assert _restarted(issued)
+
+
+@pytest.mark.parametrize(
+    "live_env",
+    [["PATH=/usr/bin"], ["TT_DEVICE_MCP_DEVICE_GROUP=other"], None],
+    ids=["live-env-lacks-group", "live-env-other-group", "environ-unreadable"],
+)
+def test_cmd_lock_restarts_when_live_broker_lacks_the_group(monkeypatch, tmp_path, capsys, live_env):
+    """The unit already sets the group but the running broker was never restarted onto
+    it (or its env can't be read): `lock` restarts it, so privsep jobs get gid=ttdev."""
+    sys.path.insert(0, SRC_PATH)
+    from tt_device_mcp import cli
+
+    issued, unit = _stub_lock_restart_env(monkeypatch, cli, tmp_path, _UNIT_WITH_GROUP, live_env=live_env)
+
+    assert cli.cmd_lock(object()) == 0
+    assert "already locked" not in capsys.readouterr().out
+    assert unit.read_text() == _UNIT_WITH_GROUP
+    assert _restarted(issued)
 
 
 def test_daemon_start_refuses_on_broker_host(monkeypatch, tmp_path):

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -445,19 +446,21 @@ def test_device_op_lock_reads_the_broker_inhibit_file(tmp_path, monkeypatch):
 def test_the_broker_device_op_flock_is_tested_and_the_rescan_written_under_it(tmp_path, monkeypatch):
     import fcntl
 
+    from tt_device_mcp.health.recovery import pcie_guard
+
+    rescans: list = []
+    monkeypatch.setattr(pcie_guard, "rescan_tt_root_ports", lambda: rescans.append(1) or ["0000:00:01.0"])
     p = hp.Probe(tmp_path)
-    p.rescan_path.parent.mkdir(parents=True)
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", str(tmp_path / "device-op.lock"))
     monkeypatch.delenv("TT_DEVICE_MCP_DEVICE_OP_FLOCK", raising=False)
     flock = tmp_path / "device-op.flock"  # the broker's default: a sibling of the inhibit file
     assert p.device_op_lock() is None and p.rescan() is True  # no lock on offer (older broker)
-    assert p.rescan_path.read_text() == "1"
-    p.rescan_path.unlink()
+    assert rescans == [1]
     flock.touch()
     held = os.open(flock, os.O_RDONLY)
     fcntl.flock(held, fcntl.LOCK_EX)  # a broker device op in flight
     assert p.device_op_lock() == "unnamed (device-op flock held)"
-    assert p.rescan() is False and not p.rescan_path.exists()
+    assert p.rescan() is False and rescans == [1]
     (tmp_path / "device-op.lock").write_text("999999 galaxy_reset\n")  # a killed broker's file
     assert p.device_op_lock() == "unnamed (device-op flock held)"  # the flock still counts
     os.close(held)
@@ -602,8 +605,26 @@ def _shell_fn(name: str) -> str:
     return m.group(0)
 
 
-def _arm(tmp_path, *, opt_out: bool = False, arms: bool = True, old: bool = True):
+def _venv(tmp_path, *, ships: bool = True) -> Path:
+    """A stand-in broker venv whose python sees a tt_device_mcp package with or without the probe
+    module. -S and the package dir as cwd keep the real install off the path, so the guard is
+    exercised as written, against an import that really succeeds or fails."""
+    pkgroot = tmp_path / "pkgroot"
+    (pkgroot / "tt_device_mcp").mkdir(parents=True)
+    (pkgroot / "tt_device_mcp" / "__init__.py").write_text("")
+    if ships:
+        (pkgroot / "tt_device_mcp" / "health_probe.py").write_text("")
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    py = venv / "bin" / "python"
+    py.write_text(f'#!/bin/sh\ncd {pkgroot} && exec {sys.executable} -S "$@"\n')
+    py.chmod(0o755)
+    return venv
+
+
+def _arm(tmp_path, *, opt_out: bool = False, arms: bool = True, old: bool = True, ships: bool = True):
     """Run arm_health_probe on a sandbox unit dir with a recorded systemctl."""
+    venv = _venv(tmp_path, ships=ships)
     units = tmp_path / "units"
     units.mkdir()
     if old:
@@ -617,6 +638,8 @@ systemctl() {{
     [ "$*" = "is-active --quiet tt-device-health-probe.timer" ] && return {0 if arms else 3}
     return 0
 }}
+VENV={venv}
+{_shell_fn("health_probe_ships")}
 {_shell_fn("arm_health_probe")}
 arm_health_probe {units}
 """
@@ -657,19 +680,50 @@ def test_a_host_without_the_old_timer_only_arms(tmp_path):
     assert list(units.iterdir()) == []
 
 
-def test_the_probe_unit_runs_the_broker_venv(tmp_path):
+def test_a_venv_without_the_probe_module_stops_a_stale_timer(tmp_path):
+    # An older build replacing one that shipped the probe: the timer it left armed could only fail
+    # every 2 minutes, so it is stopped, and the old probe (if any) keeps its coverage.
+    units, calls, err = _arm(tmp_path, ships=False)
+    assert calls == ["disable --now tt-device-health-probe.timer"]
+    assert sorted(p.name for p in units.iterdir()) == ["tt-health-probe.service", "tt-health-probe.timer"]
+    assert "warn:" in err and "no tt_device_mcp.health_probe" in err
+
+
+def test_a_venv_with_the_probe_module_is_never_skipped(tmp_path):
+    units, calls, err = _arm(tmp_path, old=False, ships=True)
+    assert "enable --now tt-device-health-probe.timer" in calls
+    assert "disable --now tt-device-health-probe.timer" not in calls
+    assert "no tt_device_mcp.health_probe" not in err
+
+
+def _install_units(tmp_path, *, ships: bool = True):
+    venv = _venv(tmp_path, ships=ships)
+    units = tmp_path / "units"
+    units.mkdir()
     script = f"""set -euo pipefail
-VENV=/srv/broker/venv
+VENV={venv}
 DEPLOY={APPLY.parent}
+{_shell_fn("health_probe_ships")}
 {_shell_fn("install_health_probe_units")}
-install_health_probe_units {tmp_path}
+install_health_probe_units {units}
 """
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
-    svc = (tmp_path / "tt-device-health-probe.service").read_text()
-    assert "ExecStart=/srv/broker/venv/bin/python -m tt_device_mcp.health_probe" in svc
+    return venv, units, r.stderr
+
+
+def test_the_probe_unit_runs_the_broker_venv(tmp_path):
+    venv, units, _ = _install_units(tmp_path)
+    svc = (units / "tt-device-health-probe.service").read_text()
+    assert f"ExecStart={venv}/bin/python -m tt_device_mcp.health_probe" in svc
     assert "@VENV@" not in svc.replace("# @VENV@", "")
-    assert (tmp_path / "tt-device-health-probe.timer").exists()
+    assert (units / "tt-device-health-probe.timer").exists()
+
+
+def test_a_venv_without_the_probe_module_gets_no_probe_units(tmp_path):
+    _, units, err = _install_units(tmp_path, ships=False)
+    assert list(units.iterdir()) == []
+    assert "warn:" in err and "not installed" in err
 
 
 def test_the_probe_unit_runs_the_module_as_a_oneshot():

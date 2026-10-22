@@ -37,14 +37,15 @@ from tt_device_mcp.health.monitors.pci import chip_pci_bdf
 HEARTBEAT_SETTLE_SEC = 0.5
 
 
-def read_heartbeats(*, probe_lost: bool = False) -> dict[str, int]:
+def read_heartbeats(*, probe_lost: bool = False, only: Optional[frozenset] = None) -> dict[str, int]:
     """Per-chip ARC heartbeat counters, keyed by device index.
 
     Each attribute read is a PCIe read of the chip (the KMD reads the counter from the chip's
     BAR), so a chip the broker has confirmed lost is not read again until :func:`chip_state.may_read`
     allows it (spec 03 I66); it reports ALL_ONES, what its last real read said. ``probe_lost`` is for
     a health check's decision read: each lost chip is read for real once, so a chip that answers
-    again is judged on its answer, not on the mark.
+    again is judged on its answer, not on the mark. ``only``, when given, limits the read to those
+    chips (spec 03 I83: the chips that just failed POST_RESET, and no other).
 
     A chip whose attribute is missing or unreadable is omitted rather than zeroed,
     so the caller sees it as an absent chip (a real fault) and not as a chip whose
@@ -58,7 +59,7 @@ def read_heartbeats(*, probe_lost: bool = False) -> dict[str, int]:
     for ent in entries:
         # KMD names these `tenstorrent!N`; the index is what tt-smi and /dev agree on.
         idx = ent.name.rsplit("!", 1)[-1]
-        if not idx.isdigit():
+        if not idx.isdigit() or (only is not None and idx not in only):
             continue
         if not chip_state.may_read(idx, ent, probe=probe_lost):
             beats[idx] = ALL_ONES
@@ -184,7 +185,7 @@ def offbus_count(
 def returned_chips(ids) -> list[str]:
     """Of ``ids``, the chips back on the bus by a fresh sysfs read: the KMD node is there and its
     heartbeat is a counter that is not all-ones, or it is ARC-not-ready on a bound endpoint. Read
-    after every tray re-power, mesh reset and PCI rescan so a chip that came back leaves
+    after every mesh reset and PCI rescan so a chip that came back leaves
     ``isolated_chips`` at once, whatever the verify that follows says."""
     want = {str(i) for i in ids}
     if not want:
@@ -194,6 +195,24 @@ def returned_chips(ids) -> list[str]:
     if want - back:
         back |= want & arc_not_ready_chips(beats)
     return sorted(back, key=int)
+
+
+def arc_live_chips(ids) -> list[str]:
+    """Of ``ids``, the chips whose ARC heartbeat reads as a counter now: not all-ones, not an
+    ENODATA (ARC not ready) or other failed read. Stricter than :func:`returned_chips`: a chip a
+    bridge reset re-enumerated with its ARC dead is back on the bus but not recovered (spec 04 I94)."""
+    want = {str(i) for i in ids}
+    if not want:
+        return []
+    # Only these chips, and a lost-marked one too: a decision read, so it is judged on its answer.
+    beats = read_heartbeats(probe_lost=True, only=frozenset(want))
+    return sorted((i for i in want if i in beats and beats[i] != ALL_ONES), key=int)
+
+
+def heartbeat_attr_present(ids) -> bool:
+    """Does any of ``ids``' sysfs nodes expose ``tt_heartbeat``? A stat, no chip read. False on a
+    host whose KMD predates the counter."""
+    return any((pci.SYSFS_CLASS_DIR / f"tenstorrent!{i}" / "tt_heartbeat").exists() for i in ids)
 
 
 def heartbeat_absence_reason() -> Optional[str]:

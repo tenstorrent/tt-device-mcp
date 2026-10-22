@@ -12,7 +12,7 @@ confirmed a chip lost, nothing of the broker's keeps reading it on a poll clock 
   sampler isolates the chip from the kernel). Every gated read of a lost chip (:func:`may_read`) is refused and reads
   as all-ones, which is what its last real read said, so every count and rung decides exactly as on
   a real read. A lost chip is read again only when (a) its sysfs node was re-created (a remove and
-  rescan, a tray re-power or a hotplug: a new node is a new endpoint, so the read is safe to try),
+  rescan, an external tray re-power or a hotplug: a new node is a new endpoint, so the read is safe to try),
   (b) a broker reset or recovery step on it has just ended (one read per :data:`GRACE_REPROBE_SEC`
   for :data:`GRACE_SEC`, so the post-reset health check reads the chip for real), or (c) as a
   backstop, once per :data:`LOST_REPROBE_SEC`. A real read that is not all-ones clears ``lost``.
@@ -98,12 +98,14 @@ _expected: Callable[[], int] = _no_baseline
 
 def reset() -> None:
     """Forget everything (tests; a fresh process starts here)."""
-    global _grace_until, _last_written
+    global _grace_until, _last_written, _present, _expected
     with _lock:
         _lost.clear()
         _recovering.clear()
         _grace_until = 0.0
         _last_written = None
+        _present = _sysfs_indices
+        _expected = _no_baseline
 
 
 def configure(*, present: Optional[Callable[[], list]] = None, expected: Optional[Callable[[], int]] = None) -> None:
@@ -255,15 +257,18 @@ def may_read(idx, node: Path, *, probe: bool = False) -> bool:
     return True
 
 
-def reprobe_due() -> None:
+def reprobe_due(ids: Optional[Iterable] = None) -> None:
     """Make each lost chip's next read real for a decision read through a plain reader (spec 03 I66):
     the reset gate's and the recovery ladder's off-bus counts, the DOWN off-bus recheck, the
     hold-deadline escalation, and job admission, exec and a Slurm step's verdict. A read already due
     stays due; one whose last real read is younger than :data:`PROBE_MIN_SEC` stays gated, so
-    back-to-back decisions read a dead chip once."""
+    back-to-back decisions read a dead chip once. ``ids`` limits it to those chips (the sampler's
+    pending FAST_CONFIRM_SEC proof, I79)."""
+    want = None if ids is None else {str(i) for i in ids}
     with _lock:
-        for rec in _lost.values():
-            rec["next"] = min(rec["next"], rec["read"] + PROBE_MIN_SEC)
+        for idx, rec in _lost.items():
+            if want is None or idx in want:
+                rec["next"] = min(rec["next"], rec["read"] + PROBE_MIN_SEC)
 
 
 def observe(idx, value) -> None:
