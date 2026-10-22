@@ -89,7 +89,9 @@ that did not come through the broker at all.
   directions before claiming success: an admitted (gid=ttdev) open must succeed — else it reverts
   rather than brick the host — and a non-ttdev open must be denied — else it reverts rather than
   print a false LOCKED. An inconclusive deny probe is reported as UNVERIFIED, not claimed.
-  `unlock` restores world-rw. Both are idempotent.
+  `unlock` restores world-rw. Both are idempotent: a repeat `lock` on a locked host never
+  restarts the broker (a restart reruns the startup gate, fabric pass included, on a healthy
+  device).
 - **I10 — Read-only telemetry on a locked host stays read-only.** The `smi` path grants no write
   or reset capability: the client CLI rejects non-allowlisted flags before invoking anything, and
   the root-owned NOPASSWD wrapper installed by `lock` re-enforces the same read-only allowlist
@@ -213,7 +215,10 @@ an allocation over is not a tenant's.
 
 **Lock mechanics.** `lock`: create the `ttdev` system group; write the device-group line into the
 broker unit and restart it *first* (privsep jobs must already carry gid=ttdev before the node
-locks, or admitted work is denied in the gap); write the udev rule and re-trigger the subsystem;
+locks, or admitted work is denied in the gap). The restart happens only when it changes something:
+when the unit or a drop-in already sets the group and the running broker's env carries it (or the
+broker is stopped), `lock` prints "already locked" and leaves the unit and the broker alone.
+Then write the udev rule and re-trigger the subsystem;
 then self-check on a real device node — positive (systemd-run as `nobody:ttdev` must open the
 node; failure reverts via `unlock`) and negative (same uid without the group must get EACCES,
 distinguished by a dedicated exit code from a probe that never ran; an open reverts, an
@@ -299,6 +304,7 @@ job-side record to the one case with no alternative.
 | I8 (force alongside foreign, audited) | `tests/test_device_safety.py::test_exec_force_runs_a_diagnostic_alongside_a_foreign_job` |
 | I8 (scoped exec reaping) | `tests/test_device_safety.py::test_exec_timeout_scope_routes_a_privsep_diagnostic`, `tests/test_device_safety.py::test_exec_timeout_kills_the_command_it_gave_up_on` |
 | I9 (self-checks decide) | `tests/test_cli.py::test_cmd_lock_locks_when_deny_probe_is_refused`, `tests/test_cli.py::test_cmd_lock_refuses_when_deny_probe_opens_the_node` |
+| I9 (repeat lock never restarts the broker) | `tests/test_cli.py::test_cmd_lock_skips_restart_when_already_locked`, `tests/test_cli.py::test_cmd_lock_skips_restart_when_a_drop_in_sets_the_group`, `tests/test_cli.py::test_cmd_lock_skips_restart_when_broker_is_stopped_and_unit_is_set`, `tests/test_cli.py::test_cmd_lock_restarts_when_it_adds_the_group`, `tests/test_cli.py::test_cmd_lock_restarts_when_live_broker_lacks_the_group` |
 | I9 (banner tracks state) | `tests/test_cli.py::test_refresh_banner_tracks_lock_state` |
 | I10 (wrapper + sudoers) | `tests/test_cli.py::test_install_smi_ro_wrapper_creates_wrapper_and_sudoers`, `tests/test_cli.py::test_install_smi_ro_wrapper_skips_sudoers_on_visudo_failure`, `tests/test_cli.py::test_smi_ro_wrapper_rejects_reset_flag`, `tests/test_cli.py::test_remove_smi_ro_wrapper_is_idempotent` |
 | I10 (streaming smi allowlist) | `tests/test_reset.py::test_smi_args_ok_allows_readonly_rejects_reset` |
