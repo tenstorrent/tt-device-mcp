@@ -300,45 +300,20 @@ async def test_the_back_to_back_sweep_is_withheld_and_reports_incomplete(stuck, 
 
     monkeypatch.setattr(g, "_recover_isolated_chips", no_sbr)
     monkeypatch.setattr(galaxy.pcie_guard, "host_reset_gate", lambda off: pytest.fail("the sweep got past its fence"))
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda *a, **k: pytest.fail("a tray re-power under a stuck holder"))
-    assert await type(g)._issue_all_resets_back_to_back(g, 0b1000, [3], [4], 4, lambda m: None) is False
+    assert await type(g)._issue_all_resets_back_to_back(g, [3], 4, lambda m: None) is False
 
 
-def _ubb_rung(*a):
-    """The real rung: the rig stubs the instance's."""
-    g = srv.galaxy_recovery
-    return type(g)._attempt_ubb_tray_reset(g, *a, lambda m: None)
-
-
-@pytest.fixture
-def tray_rung(stuck, galaxy_seen, monkeypatch):  # noqa: F811 - the imported fixture
-    srv.fsm.set_latch("ubb_reset_fired", False)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
-    fired = []
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: fired.append((bitmap, ids)), raising=False)
-    _note(stuck)
-    return fired
-
-
-async def test_the_per_tray_walk_is_withheld(tray_rung, monkeypatch):
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")
-    beats = {str(i): 100 for i in range(32) if i != 24}
-
-    assert await _ubb_rung(beats, 1, 32) is None
-    assert tray_rung == []
-
-
-async def test_a_whole_tray_still_goes_to_the_power_cycle_hand_off(tray_rung, monkeypatch):
+async def test_a_whole_tray_still_goes_to_the_power_cycle_hand_off(stuck, galaxy_seen, monkeypatch):  # noqa: F811
     """The whole-tray hand-off re-powers nothing and is the rung that clears the holder: not fenced."""
+    _note(stuck)
     noted = []
     monkeypatch.setattr(offbus_power_cycle, "note_whole_tray_down", lambda ep, detail: noted.append(detail))
-    monkeypatch.setattr(srv.galaxy_recovery.deps, "device_hold_episode_since", lambda: "ep-1")
+    g = srv.galaxy_recovery
+    monkeypatch.setattr(g.deps, "device_hold_episode_since", lambda: "ep-1")
     beats = {str(i): 100 for i in range(24)}
 
-    assert await _ubb_rung(beats, 8, 32) is False
-    assert noted and tray_rung == []
+    assert type(g)._note_whole_tray_drop(g, beats, 8, 32, lambda m: None) is True
+    assert noted
 
 
 async def test_reset_with_quiesce_is_fenced_until_the_holder_is_gone(stuck, monkeypatch):

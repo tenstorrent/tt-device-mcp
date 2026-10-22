@@ -168,7 +168,7 @@ run_validator "${desc_argv[@]}"
 
 # TOPOLOGY MISMATCH: the links the validator discovered are not the ones the descriptor names. Its
 # tray ids come from PCI bus numbers, so a tray whose uplink lands on another bus, or a cable that is
-# not there, mismatches on every run, and a board reset cannot change either. Not a measurement:
+# not there, mismatches on every run. Not a measurement by itself:
 # rerun once without the descriptor so traffic still crosses every discovered link, and classify
 # that run with the chain below. A pass carries the marker as the last line before exit 0.
 TOPO=""
@@ -180,7 +180,7 @@ if [ "$rc" -ne 0 ] && [ -n "$DESC" ] && grep -q "Connection mismatch detected" "
         /Physical Discovery found|connections:/        { s = ""; next }
         s != "" && /PhysicalPortEndpoint/              { c[s]++ }
         END { printf "%d %d\n", c["m"], c["e"] }' "$RUNLOG")
-    TOPO="TOPOLOGY MISMATCH vs $DESC: $n_missing missing, $n_extra extra port connections (tray ids come from PCI bus numbers; a board reset cannot change this)"
+    TOPO="TOPOLOGY MISMATCH vs $DESC: $n_missing missing, $n_extra extra port connections (tray ids come from PCI bus numbers)"
     log "$TOPO"
     log "rerunning once without the descriptor: traffic over every discovered link"
     run_validator
@@ -317,8 +317,15 @@ case "$drc" in
     137) save_to_last "$DOUT"
          log "dispatch probe last output: $(grep -vE '^\s*$' "$DOUT" | sed -n '$p' | cut -c1-160)"
          cannot_check "dispatch probe hit its ${DTMO}s cap without a verdict (typical is 14s)" ;;
-    *)   reason="$(grep -m1 -oE 'Timed out.*|TT_THROW.*|what\(\):.*|terminate called.*' "$DOUT")"
+    *)   # what() carries the cause; "terminate called" sits above it and names only the type.
+         reason=""
+         for pat in 'what\(\):.*' 'TT_THROW.*' 'Timed out.*' 'terminate called.*'; do
+             reason="$(grep -m1 -oE "$pat" "$DOUT")"
+             [ -n "$reason" ] && break
+         done
          grep -vE '^\s*$' "$DOUT" | sed -n '1,40p' | sed 's/^/fabric-check|  /' >&2
+         echo "fabric-check|  ... last 20 lines:" >&2
+         grep -vE '^\s*$' "$DOUT" | tail -n 20 | sed 's/^/fabric-check|  /' >&2
          save_to_last "$DOUT"
          log "the bus and the links are fine and the mesh still cannot run a program -> UNHEALTHY, the broker will reset"
          log "dispatch FAILED on a green fabric (rc=$drc)${reason:+: $reason}"

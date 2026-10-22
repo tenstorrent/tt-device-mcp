@@ -124,8 +124,8 @@ isolation knob).
 | `daemon stop` | — | none (pid file + signals) | `Stopped` / `Not running` | always 0 |
 | `daemon status` | — | `GET /health` | `Running (socket ...)` / `Not running` | 0 running; 1 not |
 | `daemon start-fg` | — | none (in-process `server.main`) | server's own output | server's |
-| `run` | `<cmd> [-w dir] [-e file] [-t sec] [-o N]` | `/api/tt_device_job_run_bg`, then poll `/api/tt_device_job_status` | queue banner, streamed log, finish summary (+ last N lines with `-o`) | 0 iff `completed` (I4); 1 otherwise / server down / submit refused |
-| `run-bg` | `<cmd> [-w dir] [-e file] [-t sec]` | `/api/tt_device_job_run_bg` | job id, queue position, log path | 0 queued; 1 refused / server down |
+| `run` | `<cmd> [-w dir] [-e file] [-t sec] [--no-timeout-except-on-contention] [-o N]` | `/api/tt_device_job_run_bg`, then poll `/api/tt_device_job_status` | queue banner, streamed log, finish summary (+ last N lines with `-o`) | 0 iff `completed` (I4); 1 otherwise / server down / submit refused |
+| `run-bg` | `<cmd> [-w dir] [-e file] [-t sec] [--no-timeout-except-on-contention]` | `/api/tt_device_job_run_bg` | job id, queue position, log path | 0 queued; 1 refused / server down |
 | `status` | `[N] [-j ID]` | `/api/tt_device_queue_status` + `/api/tt_device_recent_jobs`; with `-j`: `/api/tt_device_job_status` | overview (RUNNING/QUEUED/RECENT, default 15 recent) or one job's detail | 0; 1 on error / server down |
 | `logs` | `[job_id] [-f] [-n N]` | `/api/tt_device_job_status` (+ queue lookup for default job); plain: `/api/tt_device_job_logs` | log tail (default 100 lines) or a local `tail -f` | 0; 1 no job found / error |
 | `kill` | `[job_id]` | `/api/tt_device_job_status`, `/api/tt_device_queue_status`, `/api/tt_device_job_kill` | confirmation / interactive picker / result | 0 killed, nothing to kill, or user aborted; 1 refused / invalid choice |

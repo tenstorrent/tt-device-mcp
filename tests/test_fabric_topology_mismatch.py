@@ -9,6 +9,7 @@ import json
 
 import pytest
 
+from tt_device_mcp import server as srv
 from tt_device_mcp.health import monitor as monitor_mod
 from tt_device_mcp.health.monitor import HealthMonitor, moved_trays
 from tt_device_mcp.health.monitors import fabric
@@ -86,6 +87,24 @@ async def test_a_mismatch_reruns_traffic_only_and_an_ok_names_it_and_pages_once(
 
 
 @pytest.mark.asyncio
+async def test_the_hold_bound_keeps_the_latch_so_a_discovered_links_pass_is_not_a_pass(topo, monkeypatch):
+    """Spec 03 I42 / 04 I76: a moved tray's lift failed its first job. At the bound the latch stands, so
+    the check after the bound ladder passing on the discovered links again must not release (the next job
+    would fail and latch again, never reaching the power cycle): it fails, so the host rung follows."""
+    m, state = topo
+    m.topology_hw_fault = "hardware fault: the first job after a topology-mismatch lift failed on the fabric (x)"
+    monkeypatch.setattr(srv, "health_monitor", m)
+    srv._lift_hold_bound_latches(lambda line: None)
+    assert m.topology_hw_fault, "the bound does not lift the I42 latch"
+    ok, detail = await m._verify_fabric_health_body(60)
+    assert ok is False and "after the lift's first job failed on the fabric" in detail
+    assert m.topology_lift_pending is False, "no new lift is armed"
+    assert not srv._names_topology_mismatch(detail), "a measured fault, not a no-reset topology hold"
+    m.adopt_fabric_pass("all links ok\n")
+    assert m.topology_hw_fault == "", "a clean pass on the full topology ends it"
+
+
+@pytest.mark.asyncio
 async def test_a_mismatch_whose_rerun_measures_bad_links_is_unhealthy(topo):
     m, state = topo
     state["rerun"] = (1, "TT_THROW: Encountered unhealthy ethernet connections, listed above\n")
@@ -133,11 +152,13 @@ async def test_a_fabric_failure_on_the_first_job_fails_the_next_mismatch_and_nev
 
 
 @pytest.mark.asyncio
-async def test_a_clean_pass_or_an_operator_reset_clears_the_first_job_latch(topo):
+async def test_a_clean_pass_clears_the_first_job_latch(topo):
+    """Only a clean pass on the full topology ends the I42 latch (an operator reset keeps it:
+    tests/test_fabric_links_missing.py::test_an_operator_reset_keeps_the_latch_and_only_a_clean_fabric_pass_ends_it)."""
     m, state = topo
     await m._verify_fabric_health_body(60)
     m.note_job_after_topology_lift(True, "... could not find any forwarding direction ...")
-    m.clear_topology_hw_fault("operator reset")
+    m.clear_topology_hw_fault("a clean fabric pass")
     assert m.topology_hw_fault == ""
     assert state["events"][-1][0] == "fabric_topology_hw_fault_cleared"
     m.topology_hw_fault = "hardware fault: x"

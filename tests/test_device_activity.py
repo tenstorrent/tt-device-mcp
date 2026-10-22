@@ -313,6 +313,27 @@ async def test_job_status_tool_shows_idle_while_running_and_the_total_after(monk
         current_via_mcp.reset(mtok)
 
 
+@pytest.mark.asyncio
+async def test_job_status_tool_keeps_the_idle_total_for_a_finished_job_only(monkeypatch, clear_job_state):
+    """The end-of-run total is a finished job's field: in the window after _stop_job_activity set it
+    and before the runner marks the job finished, the status shows no total (spec 03 I54). The
+    re-adopted job fields (spec 03 I76) sit beside this pairing, not inside it."""
+    from tt_device_mcp.socket_transport import current_peer_uid, current_via_mcp
+
+    job = _running_idle_job(monkeypatch)
+    mcp = srv.create_mcp_server()
+    tok, mtok = current_peer_uid.set(4242), current_via_mcp.set(False)
+    try:
+        srv._stop_job_activity("970", job)
+        assert job.status == srv.JobStatus.RUNNING and job.idle_total_sec is not None
+        out = json.loads((await mcp.call_tool("tt_device_job_status", {"params": {"job_id": "970"}})).content[0].text)
+        assert "idle_total_sec" not in out, "a job still running reports no end-of-run total"
+        assert "readopted" not in out
+    finally:
+        current_peer_uid.reset(tok)
+        current_via_mcp.reset(mtok)
+
+
 def test_the_footer_records_the_idle_total_and_still_parses(tmp_path, clear_job_state):
     job = srv.Job(id="972", owner="tenant", workspace="/tmp", command="x", queued_at="2026-10-14T10:00:00")
     job.status = srv.JobStatus.COMPLETED

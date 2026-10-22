@@ -280,6 +280,11 @@ def _normalized_board(raw) -> str:
     return board.lower()
 
 
+# The detail every fabric pass the dead-chip isolation killed starts with (spec 03 I82): the gate reads
+# it off its own evidence to keep the off-bus hold dirty rather than hold it as a plain 77.
+FABRIC_KILLED_BY_ISOLATION = "fabric check KILLED by dead-chip isolation"
+
+
 class HealthMonitor:
     """Runs the probe pass and holds its state: the board-type snapshot cache, the fabric probe's
     last-real-verdict latch, the in-flight fabric-check process handle, and the last ``readings``
@@ -316,8 +321,8 @@ class HealthMonitor:
         # that has left the bus is absent from every later snapshot AND from sysfs, so the tray
         # rung that needs its bus (spec 04 I16) can only ever read one taken before the drop.
         self._bus_ids: Optional[list] = None
-        # {chip index: PCI address} read from sysfs while every chip was on the bus — the map the
-        # tray rung actually keys on (spec 04 I16). tt-smi lists chips in PCI order and the kernel
+        # {chip index: PCI address} read from sysfs while every chip was on the bus — the map
+        # tray placement actually keys on (spec 04 I16). tt-smi lists chips in PCI order and the kernel
         # numbers them in its own order, so ``_bus_ids`` read by position names the wrong chip.
         # Re-banked by any later trusted full read that differs: the kernel can re-number chips.
         self._chip_buses: Optional[dict] = None
@@ -335,6 +340,9 @@ class HealthMonitor:
         # do, and lifting there admits the next tenant onto a fabric that still cannot move data.
         # A skip (None) never overwrites it: not knowing is not the same as knowing it is fit.
         self.last_fabric_ok: Optional[bool] = None
+        # The last fabric check's verdict as every hold-lift and release event carries it (spec 03 I78):
+        # see fabric_verdict(). Empty until a check runs.
+        self._fabric_verdict: dict = {}
         self.last_fabric_output: str = ""
         # When the run that produced last_fabric_output started (local naive datetime), None until
         # one runs. An incident bundle keeps that output only when this pass produced it (spec 03 I57).
@@ -346,12 +354,13 @@ class HealthMonitor:
         # skipped are the ones a mesh-wide workload routes over (see note_job_after_topology_lift).
         self.topology_lift_pending: bool = False
         # Set once that first job failed on the fabric. The check still runs, but a mismatch now
-        # FAILS it, so the hold takes the ladder (a reset, then a power cycle); cleared by a clean
-        # pass or an operator reset (I42).
+        # FAILS it, so the hold takes the ladder (a reset, then a power cycle); cleared only by a
+        # clean fabric pass on the full topology, never by an operator reset or the 10-min bound (I42).
         self.topology_hw_fault: str = ""
         self._topology_alerted: set[str] = set()
         # The last pass's port connections against the cabling descriptor, by name, for /health
-        # (spec 03 I71): ``{"verdict": "failed"|"lift", "missing_ports", "extra_ports", "marker"}``;
+        # (spec 03 I71): ``{"verdict": "failed"|"lift", "missing_ports", "extra_ports", "accepted_ports",
+        # "marker"}``, ``accepted_ports`` naming the missing ports the accept list excused on a lift;
         # empty after a clean pass on the full topology.
         self.fabric_topology: dict = {}
         # Whether the last fabric pass that ran reached no verdict (a 77). A job that then dies on the
@@ -370,6 +379,9 @@ class HealthMonitor:
         # bus it is the likeliest thing still reading a dead address — and `pci remove` does not
         # revoke its mapping. Tracked so a dead chip can kill it (see server._kill_device_holders).
         self.fabric_check_proc: asyncio.subprocess.Process | None = None
+        # Why the broker's dead-chip isolation killed the in-flight fabric pass ("" when it did not):
+        # that run's exit is no verdict (spec 03 I82). Set by note_fabric_check_killed, read once.
+        self._fabric_killed: str = ""
 
         # The last pass's readings blackboard. None until update() runs once.
         self._readings: Optional[HealthState] = None
@@ -580,7 +592,13 @@ class HealthMonitor:
             reset_due = (
                 eth_timeout_reset and not fabric_asked and eok is None and eth_read_timed_out(edetail) and hp_ok is True
             )
-            if link_drop_held and log:
+            if link_drop_held and log and self.last_fabric_skipped:
+                # A 77 since the green pass (it leaves last_fabric_ok alone) reached no verdict: no cover.
+                log(
+                    "eth links unverified after a clean exit — the last fabric pass reached no verdict, so "
+                    "the fabric stays unverified; any fabric-unverified hold stands until a pass returns healthy"
+                )
+            elif link_drop_held and log:
                 log(
                     "eth links unverified after a clean exit — a recent passing fabric pass covers it, not repeating it"
                 )
@@ -1056,9 +1074,54 @@ class HealthMonitor:
         finally:
             _fabric_inflight_end()
         metrics.probe_observed("fabric", _verdict_label(ok), time.monotonic() - _t0)
+        self._note_fabric_verdict(ok, detail)
         return ok, detail
 
+    def _note_fabric_verdict(self, ok: Optional[bool], detail: str) -> None:
+        """Keep what fabric_verdict() reports: pass/fail/skipped, and how far the links the check found
+        fall short of the cabling descriptor (a topology marker in its detail or kept output)."""
+        text = detail or ""
+        missing, extra = fabric.marker_counts(text)
+        if not (missing or extra) and ok is False:
+            text = self.last_fabric_output or ""
+            missing, extra = fabric.marker_counts(text)
+        self._fabric_verdict = {
+            "result": "pass" if ok is True else "fail" if ok is False else "skipped",
+            "missing_vs_cabling": missing,
+            "extra_vs_cabling": extra,
+            "detail": (detail or "")[:200],
+            "_marker": fabric.find_topology_marker(text) or "",
+            "_at": time.monotonic(),
+        }
+
+    def fabric_verdict(self) -> dict:
+        """The last fabric verdict, for the detail of every hold-lift and release event (spec 03 I78):
+        ``result`` (pass/fail/skipped/none), ``missing_vs_cabling``/``extra_vs_cabling`` (port connections
+        the links found lack, or add, against the cabling descriptor: 0/0 on a clean pass means every
+        cabled link was found), ``links_short`` (True when more are missing than extra and the operator's
+        accept list does not name every missing port, which FAILS the check, I71), ``excused_ports``
+        (only when that list turned a shortfall into a pass: the ports it excused) and ``age_s``. Only
+        the shortfall is logged: the validator prints no link totals. ``result`` "none" once a reset
+        voided it or before any check ran."""
+        v = dict(self._fabric_verdict)
+        if not v or self.last_fabric_ok is None and v["result"] != "skipped":
+            return {"result": "none"}
+        marker = v.pop("_marker", "")
+        v["links_short"] = bool(fabric.links_missing(marker, fabric.accepted_missing_ports()))
+        if v["missing_vs_cabling"] > v["extra_vs_cabling"] and not v["links_short"]:
+            v["excused_ports"] = sorted(fabric.marker_ports(marker)[0])
+        v["age_s"] = round(time.monotonic() - v.pop("_at"), 1)
+        return v
+
+    def note_fabric_check_killed(self, reason: str) -> None:
+        """The broker's dead-chip isolation SIGKILLed the in-flight fabric pass (spec 03 I82). Its exit
+        (-9) then says nothing about the links: the run is no verdict, the fabric unknown, and a full
+        pass is owed before any release (04 I32)."""
+        self._fabric_killed = reason or "dead-chip isolation"
+        FABRIC_DEBT.note_fabric_killed(f"fabric check killed ({self._fabric_killed})")
+
     async def _verify_fabric_health_body(self, timeout_sec: float) -> tuple[Optional[bool], str]:
+        self._fabric_killed = ""
         override = self._fabric_check_cmd()
         built = fabric.build_command()
         if built is None:
@@ -1109,6 +1172,8 @@ class HealthMonitor:
         # the journal carries truncates exactly the part naming them.
         self.last_fabric_output = text
         self.last_fabric_output_at = _t0
+        if self._fabric_killed:
+            return self._fabric_killed_no_verdict(cmd, rc, text, dt)
         last = text.splitlines()[-1][:200] if text else "(no output)"
         if override:
             # An operator's own wrapper has already done its own interpretation and reports it
@@ -1128,6 +1193,10 @@ class HealthMonitor:
                 )
                 self.last_fabric_output = text
                 self.last_fabric_output_at = _t0
+        if self._fabric_killed:
+            # Read again after the traffic-only rerun (I45): a kill there is no verdict either (I82),
+            # never a link fault or a missing-cable verdict (I47) from whatever the killed run printed.
+            return self._fabric_killed_no_verdict(cmd, rc, text, (datetime.now() - _t0).total_seconds())
         # Traffic crossed every discovered link but ports of the descriptor are missing: a FAILED
         # check, never a lift (I71). The cached mismatch goes, so the next pass runs the descriptor
         # again and a reset that brought the link back reads clean.
@@ -1202,6 +1271,7 @@ class HealthMonitor:
                 "verdict": "failed",
                 "missing_ports": missing,
                 "extra_ports": extra,
+                "accepted_ports": [],
                 "marker": marker,
             }
             health_event("fabric_links_missing", detail=lost[:400], missing_ports=missing, extra_ports=extra)
@@ -1212,6 +1282,24 @@ class HealthMonitor:
         if rc is None:
             return False, f"fabric check timed out after {timeout_sec:.0f}s; last line: {last}"
         return False, f"fabric check exited {rc} ({dt:.0f}s): {reason[:400]}"
+
+    def _fabric_killed_no_verdict(self, cmd: str, rc: Optional[int], text: str, dt: float) -> tuple[None, str]:
+        """A pass the dead-chip isolation killed (spec 03 I82): neither a pass nor a link fault, nor a
+        77. No failed verdict, no 77 streak (I46) and no cover from an earlier pass: the fabric is
+        unknown until a later pass measures it."""
+        why, self._fabric_killed = self._fabric_killed, ""
+        self._write_action_log("[broker]fabric-check", cmd, dt, "killed", rc, output=_action_log_output(text))
+        self.last_fabric_ok = None
+        self.last_fabric_skipped = False
+        detail = (
+            f"{FABRIC_KILLED_BY_ISOLATION} ({dt:.0f}s, exit {rc}): {why}; no verdict, "
+            "fabric unknown, a full pass is owed after recovery"
+        )
+        health_event("fabric_check_no_verdict", cause="killed_by_dead_chip_isolation", reason=why[:400], rc=rc)
+        log = self._logger()
+        if log:
+            log.warning(f"FABRIC-CHECK {detail}")
+        return None, detail
 
     async def _keep_skip_output(self, rc: int, text: str, reason: str, cmd: str) -> Optional[str]:
         """Freeze a no-verdict fabric run's exit code and output tail (``FABRIC_SKIP_OUTPUT_TAIL_BYTES``)
@@ -1307,6 +1395,7 @@ class HealthMonitor:
         if unseen:
             return unseen
         self._note_fabric_ok()
+        self._note_fabric_verdict(True, "a clean fabric pass on the full cabling")
         self.topology_lift_pending = False
         self.clear_topology_hw_fault("a clean fabric pass")
         self.fabric_topology = {}
@@ -1342,16 +1431,34 @@ class HealthMonitor:
         next job (the lift is bounded by that one job, see note_job_after_topology_lift)."""
         moved = moved_trays(_load_asic_bus_map(), _asic_bus_map())
         missing, extra = fabric.marker_ports(marker)
-        self.fabric_topology = {"verdict": "lift", "missing_ports": missing, "extra_ports": extra, "marker": marker}
+        # A lift that would have FAILED without the accept list: the ports it excused, by name (I71).
+        excused = bool(fabric.links_missing(marker))
+        accepted = sorted(set(missing) & fabric.accepted_missing_ports()) if excused else []
+        self.fabric_topology = {
+            "verdict": "lift",
+            "missing_ports": missing,
+            "extra_ports": extra,
+            "accepted_ports": accepted,
+            "marker": marker,
+        }
         health_event(
-            "fabric_topology_mismatch", marker=marker, moved_trays=moved, missing_ports=missing, extra_ports=extra
+            "fabric_topology_mismatch",
+            marker=marker,
+            moved_trays=moved,
+            missing_ports=missing,
+            extra_ports=extra,
+            accepted_ports=accepted,
         )
         self.topology_lift_pending = True
         # Only a lift over ports the operator accepted as dead may lower the link mark (I71).
-        self._arm_eth_rebaseline(accepted=bool(fabric.links_missing(marker)))
+        self._arm_eth_rebaseline(accepted=excused)
         log = self._logger()
         if log:
-            log.warning(f"FABRIC TOPOLOGY MISMATCH: {marker}" + (f"; moved: {', '.join(moved)}" if moved else ""))
+            log.warning(
+                f"FABRIC TOPOLOGY MISMATCH: {marker}"
+                + (f"; moved: {', '.join(moved)}" if moved else "")
+                + (f"; excused by TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS: {', '.join(accepted)}" if accepted else "")
+            )
         key = marker + "|" + ",".join(moved)
         if key not in self._topology_alerted:
             self._topology_alerted.add(key)
@@ -1387,8 +1494,9 @@ class HealthMonitor:
         return self.topology_hw_fault
 
     def clear_topology_hw_fault(self, why: str) -> None:
-        """End the I42 latch: on a clean fabric pass, and when an operator reset starts (it re-tests
-        the mesh, no broker restart needed)."""
+        """End the I42 latch. Only a clean fabric pass on the full topology (no mismatch, no link the
+        traffic missed) calls this; an operator reset, a ladder rung or the 10-min bound keeps it, so
+        a post-reset mismatch still FAILS the check."""
         if not self.topology_hw_fault:
             return
         health_event("fabric_topology_hw_fault_cleared", detail=self.topology_hw_fault, why=why)

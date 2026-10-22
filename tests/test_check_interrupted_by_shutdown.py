@@ -142,14 +142,16 @@ def test_tt_smi_killed_during_shutdown_raises_else_fails(monkeypatch, health_dep
         m._verify_device_health_body(32)
 
 
-# ---- the escalation: no reboot, no climb, no release -----------------------------------------
+# ---- the escalation: no host rung, no climb, no release --------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_post_reset_verify_killed_by_shutdown_requests_no_reboot_and_releases_nothing(mesh):  # noqa: F811
+async def test_post_reset_verify_killed_by_shutdown_requests_no_host_rung_and_releases_nothing(
+    mesh, armed_power_cycle  # noqa: F811
+):
     """The field sequence: a prior cycle failed, the reset fires, its post-reset verify is killed by
-    the reboot. Without I63 this climbs to the host rung (see test_dispatch_failure_reset's
-    test_a_failed_post_reset_check_stays_held_and_climbs, the same setup, which reboots once)."""
+    the host shutdown. Without I63 this climbs to the host rung (see test_dispatch_failure_reset's
+    test_a_failed_post_reset_check_stays_held_and_climbs, the same setup, which power-cycles once)."""
     mesh["reset_heals"] = False
     srv.recovery_mechanism.last_reset_failed = True
     real = srv.galaxy_recovery._verify_device
@@ -166,7 +168,7 @@ async def test_post_reset_verify_killed_by_shutdown_requests_no_reboot_and_relea
     before = srv.fsm.state
     with pytest.raises(asyncio.CancelledError):
         await _gate()
-    assert mesh["reboots"] == 0, "no host reboot is requested over a check the shutdown killed"
+    assert armed_power_cycle == [], "no power cycle is requested over a check the shutdown killed"
     assert "stuck_hold_host_escalation" not in mesh["events"]
     assert "last_chance_reset_sweep" not in mesh["events"], "no further rung"
     assert "device_released" not in mesh["events"]

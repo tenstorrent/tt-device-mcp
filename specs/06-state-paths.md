@@ -113,7 +113,9 @@ and job exit statuses never hit disk.
 | Health journal (events, telemetry trace, buslock, chip and eth-link baselines, incidents/, the idle-time probe's `health_probe_state.json`) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | `TT_DEVICE_MCP_HEALTH_DIR` |
 | Off-bus reset intent and host-hang latch (`offbus_reset_intent.json`, `offbus_reset_hold.json`) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Gated off-bus power-cycle attempts (`offbus_power_cycle.json`, spec 04 I27) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
-| Per-tray rung declined on this host for `TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS` (`ubb_tray_rung_disabled.json`, with the boot id, host and time; removed by `pcie_guard --clear-tray-rung-latch`, spec 04 I25) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
+| BMC restart-cause capability stamp (`power_cycle_restart_cause_capable.json`, written the first time the BMC reports a real restart cause; lets a later `unknown` refute a power cycle, spec 04 I88) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
+| Power-cycle request for the shutdown hook (spec 04 I88: epoch, reason, per-try timeout, then one argv word per line, `argv[0]` absolute; 0600) | `/run/tt-device-mcp-power-cycle.request` | same (needs root) | the hook reads `TT_DEVICE_MCP_POWER_CYCLE_REQUEST`; the broker's path is fixed |
+| Power-cycle fallback pid (the I88 fallback records it; the hook stops that pid after checking its cmdline) | `/run/tt-device-mcp-power-cycle.fallback.pid` | same (needs root) | beside the request |
 | Remembered Tenstorrent root ports and chip archs (`tt_pci_topology.json`, spec 04 I23) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Chip-to-PCI-bus map at the last clean fabric pass (`fabric_ok_asic_bus.json`, spec 03 I42) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Topology mismatch cached per chip-to-bus map and descriptor (`fabric_topology_mismatch.json`, spec 03 I45) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
@@ -218,7 +220,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_NOOP_FAILURE_FABRIC_FRESH_SEC` | 300 | A failed job that never reached the device skips the forced fabric pass when a green pass is younger than this (I36) | 03 |
 | `TT_DEVICE_MCP_EXIT1_FABRIC_WINDOW_SEC` | 0 (off) | A failed job that exited 1 with no device fault or hang text in its log tail skips the forced fabric pass when the cheap reads are clean and an OK pass is at most this old with no reset since (I38) | 03 |
 | `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD` | unset (built-in probe) | Operator override for the passive eth-heartbeat read | 03 |
-| `TT_DEVICE_MCP_EXPECTED_CHIPS` | unset (baseline/hwm-derived) | Authoritative chip count for this host | 03 |
+| `TT_DEVICE_MCP_EXPECTED_CHIPS` | unset (baseline/hwm-derived); a Galaxy install renders 32 (spec 08 I28) | Authoritative chip count for this host | 03 |
 | `TT_DEVICE_MCP_AICLK_CEILING_MHZ` | unset (off) | Per-host AICLK ceiling the broker re-applies and proves before any load; a positive integer arms it | 03 |
 | `TT_DEVICE_MCP_AICLK_CEILING_CMD` | unset (built-in helper) | Operator override for the ceiling apply, judged on exit code alone | 03 |
 | `TT_DEVICE_MCP_AICLK_CEILING_TIMEOUT_SEC` | 8 | Bound on one ceiling apply (min 1) | 03 |
@@ -241,7 +243,6 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES` | 3 | Idle-relift 77 retries on one 77-only hold before the startup checks gate it (I40) | 03 |
 | `TT_DEVICE_MCP_FABRIC_77_BOUND_SEC` | 600 | Age of a 77-only hold (at least one retry behind it) past which the startup checks gate it (I40) | 03 |
 | `TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC` | 120,300,600,1200 | Backoff steps between idle re-checks of a 77-only hold, each clamped to 60..1200 s (I48) | 03 |
-| `TT_DEVICE_MCP_FABRIC_77_RELEASE_WINDOW_SEC` | 21600 | At most one I40 fallback release per window; a second 77-only hold inside it climbs the ladder | 03 |
 | `TT_DEVICE_MCP_FABRIC_ROUTE_FAULT_JOBS` | 2 | Jobs in a row that die on the fabric's routing after a 77 pass before a known fabric fault holds without a reset (I46) | 03 |
 | `TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS` | unset (accepts nothing) | Comma-separated port names, exactly as the fabric marker prints them, that an operator accepts as known dead: a pass whose only missing ports are all listed lifts instead of failing, and may lower the eth link mark (I71) | 03 |
 | `TT_DEVICE_MCP_FABRIC_KNOWN_FAULT_HOLD_SEC` | 21600 | Age past which a known fabric fault expires and the usual 77 path gets one more try (I46) | 03 |
@@ -254,7 +255,6 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_STUCK_HOLD_RESET` | 1 | Kill switch: idle escalation may reset a stuck hold | 03 |
 | `TT_DEVICE_MCP_OFFBUS_HOLD_SEC` | 120 | Off-bus one-shot wait while a tenant holds the device (a tenant-free hold runs it after one sampler interval) | 03 |
 | `TT_DEVICE_MCP_OFFBUS_HOLD_ESCALATE` | 1 | Kill switch: off-bus holds escalate early | 03 |
-| `TT_DEVICE_MCP_PROGRESS_RETRY_SEC` | 60 | Delay of the one retry after a failed mesh reset that brought chips back (capped at the hold ceiling) | 04 |
 | `TT_DEVICE_MCP_PRESENT_MESH_RESET_GRACE_SEC` | 300 | Present-mesh eth/fabric hold grace before reset | 03 |
 | `TT_DEVICE_MCP_GENERIC_HOLD_ESCALATE` | 1 | Kill switch: generic holds join the idle escalation | 03 |
 | `TT_DEVICE_MCP_IDLE_HOLDER_SEC` | 900 | Seconds a foreign holder's CPU time stays flat before it is named (event + alert, never signalled); 0 turns it off | 03 |
@@ -267,19 +267,14 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_ALERT_CMD` | unset (off) | Opt-in command run with a stuck-hold event as JSON on stdin | 03 |
 | `TT_DEVICE_MCP_ALERT_TIMEOUT_SEC` | 30 | Alert-hook run timeout | 03 |
 | `TT_DEVICE_MCP_RESET_MODE` | unset (derived from boards) | Declared platform: `galaxy`/`per-target`/`loudbox` | 04 |
-| `TT_DEVICE_MCP_RESET_ARGS` | unset | Full reset-command override (argv) | 04 |
+| `TT_DEVICE_MCP_RESET_ARGS` | unset | Full reset-command override (argv). 04 I91 classifies it: a Galaxy tray reset flag anywhere runs under the ipmitool guard after the BMC preflight; an argv naming neither that flag nor tt-smi is not run | 04 |
 | `TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC` | unset → 0.5 floor | Off-bus fraction below which the gate holds instead of resetting; 0 disables the floor | 04 |
-| `TT_DEVICE_MCP_REBOOT_MIN_DEAD_FRAC` | 0.5 | Dead fraction gating the host-reboot rung | 04 |
-| `TT_DEVICE_MCP_AUTO_REBOOT` | 1 | Arm the warm host-reboot rung | 04 |
+| `TT_DEVICE_MCP_REBOOT_MIN_DEAD_FRAC` | 0.5 | Dead fraction gating the power cycle (the floor below which it never fires; the name is kept from the removed reboot rung) | 04 |
 | `TT_DEVICE_MCP_AUTO_POWER_CYCLE` | 1 | Arm the BMC power-cycle rung | 04 |
 | `TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK` | unset (off) | Opt-in command the broker runs and waits for before an auto power cycle (drain other workloads) | 04 |
 | `TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK_TIMEOUT_SEC` | 300 (max 3600) | Pre-power-cycle hook timeout; its process group is killed past it and the cycle goes ahead | 04 |
-| `TT_DEVICE_MCP_AUTO_UBB_RESET` | 1 | Arm the per-tray UBB reset rung | 04 |
-| `TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK` | 0 | `1` lets the tray walk re-power one tray for a below-floor drop on that tray, and a tray wholly off the bus in a below-floor drop (spec 04 I25) | 04 |
-| `TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS` | 7 | How long a tray re-power that regressed the mesh keeps the per-tray rung disabled on this host, across reboots (spec 04 I25) | 04 |
-| `TT_DEVICE_MCP_AUTO_MESH_RESET` | unset | `0` holds every automatic mesh reset, `1` arms it; unset, an outage hold (reboot, power cycle and tray reset all `0`) holds it | 04 |
+| `TT_DEVICE_MCP_AUTO_MESH_RESET` | unset | `0` (the outage hold) holds every automatic mesh reset; unset or `1` arms it | 04 |
 | `TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC` | 3600 | While a held mesh reset stands, page again after this long; `0` pages once per hold | 03, 04 |
-| `TT_DEVICE_MCP_UBB_RESET_SETTLE_SEC` | 28 | Settle time after a UBB tray reset | 04 |
 | `TT_DEVICE_MCP_TRAY_DOWN_CAPTURE` | `1` | `0` turns off the tray-down prelude (one PCI rescan and the read-only BMC/CPLD/PCIe capture before the ladder at a tray-down onset); the ladder is the same either way | 04 |
 | `TT_DEVICE_MCP_TRAY_CPLD_BUSES` | unset | Site data for the tray-down capture: each tray's CPLD BMC I2C bus, `tray:0xNN,...`. All three CPLD vars must be set and well formed; otherwise the CPLD reads are skipped | 04 |
 | `TT_DEVICE_MCP_TRAY_CPLD_ADDR` | unset | Site data: the tray CPLD's I2C address, `0xNN`; unset = CPLD reads skipped | 04 |
@@ -291,19 +286,16 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_OFFBUS_HANG_LATCH` | 1 | `0` turns off the off-bus reset intent and the host-hang latch (spec 04 I25) | 04 |
 | `TT_DEVICE_MCP_OFFBUS_HANG_LATCH_MAX_SEC` | 21600 | A host-hang latch older than this lifts once every chip is on the bus, even without a clean host-pci look; with a chip off only when `TT_DEVICE_MCP_POWER_CYCLE_CMD` is unset (spec 04 I25) | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_CMD` | unset (off) | The host's own power-cycle command, run to end an off-bus hold the reset gate refuses (spec 04 I27); unset = page and hold | 04 |
-| `TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC` | 120 | Timeout for that command; past it its process group is killed and the attempt counts as failed | 04 |
+| `TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC` | 120 | Timeout for that command when the I88 fallback unit runs it; the shutdown hook clamps it to 5-15 s per try (3 tries, worst case 86 s, inside systemd-shutdown's 90 s). A malformed value reads as the default | 04 |
+| `TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC` | 120 (30-300) | How long a broker power cycle waits for the clean OS shutdown before its fallback cuts power anyway (spec 04 I88); clamped, never off | 04 |
 | `TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC` | 300 | How long a gated off-bus hold stands, from the episode start, before the I27 power cycle may run | 04 |
-| `TT_DEVICE_MCP_IPMI_UNAVAILABLE_HANDOFF_SEC` | 300 | How long after the BMC's IPMI first fails a tray re-power in an off-bus hold before the I27 power cycle may run (the ladder still runs once first) | 04 |
 | `TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC` | 1200 | With no `TT_DEVICE_MCP_POWER_CYCLE_CMD`, how long a gated off-bus hold stands for an operator, from the episode start, before the broker lifts the `hold` gate for one pass of its own reset ladder (I33); `off` keeps the hold for an operator | 04 |
-| `TT_DEVICE_MCP_TRAY_WALK_FAILED_HANDOFF_SEC` | 300 | How long after an off-bus hold's per-tray reset walk failed to recover the mesh (or regressed it) before the I27 power cycle may run; no below-floor mesh reset runs in between | 04 |
 | `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC` | unset (none) | Extra spacing between I27 attempts on top of the I65 cooldown, capped at 14400 (the I65 backoff cap); within it the hold pages and stands to a deadline on /health | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_HISTORY_FILE` | `<state dir>/power_cycle_history.jsonl` | Read-only: a JSON-lines file of power cycles an out-of-band tool fired (`at_epoch`, optional `cause`; a line whose cause ends ` (cycle failed)` never counts and cancels the attempt line with the same `at_epoch` and cause); its latest record is one more anchor of the I65 power-cycle cooldown. Missing or unreadable adds none; it never shortens or skips the cooldown | 04 |
 | `TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC` | 1800 | How long past the grace a tenant, a reset scope or a stand-back may block the I27 power cycle before the broker pages once | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE` | unset | `:`-separated marker paths; any that exists holds the I27 power cycle | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_CMD` | unset | Command; exit 0 holds the I27 power cycle, 1 clears, anything else holds | 04 |
 | `TT_DEVICE_MCP_MANUAL_RECOVERY_CMD` | `$TTDEV_ROOT/manual-recovery-check.sh` if installed | Command; exit 0 means an operator is recovering the host, so the I27 power cycle holds; 1 clears, anything else holds. Neither set nor installed: the power cycle never fires and the broker pages | 04 |
-| `TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN` | unset | `1`: log the per-tray re-power plan and refuse it | 04 |
-| `TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC` | 10 | How long a tray re-power waits for holders of the tray's chips | 04 |
 | `TT_DEVICE_MCP_AER_QUIET_CHECK_SEC` | 2 | How long a root port must stay error-free before its AER settings are restored | 04 |
 | `TT_DEVICE_MCP_AER_FLOOD_THRESHOLD` | 50 | New AER errors on the Tenstorrent root ports per flood period that count as a flood | 04 |
 | `TT_DEVICE_MCP_AER_FLOOD_PERIOD_SEC` | 60 | The period the flood threshold is a rate over | 04 |
@@ -311,9 +303,8 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET` | 0 | Opt-in bridge reset for a gone chip | 04 |
 | `TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES` | 1 | Fabric re-check retries after a reset | 04 |
 | `TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC` | 60 | Sleep between post-reset fabric retries | 04 |
-| `TT_DEVICE_MCP_POST_REBOOT_VERIFY` | 1 | Verify the mesh actually came back after a reboot | 04 |
-| `TT_DEVICE_MCP_AUTO_RECOVERY_INTERVAL_SEC` | 3600 | Durable rate limit between auto reboot/power-cycle rungs | 04 |
-| `TT_DEVICE_MCP_BOOT_ATTRIBUTION_WINDOW_SEC` | 900 | Window to attribute a boot to our own reboot rung | 04 |
+| `TT_DEVICE_MCP_AUTO_RECOVERY_INTERVAL_SEC` | 3600 | Durable rate limit between automatic power cycles | 04 |
+| `TT_DEVICE_MCP_BOOT_ATTRIBUTION_WINDOW_SEC` | 900 | Window to attribute a boot to our own power cycle | 04 |
 | `TT_DEVICE_MCP_POLLER_SERVICES` | `tt-telemetry.service,tt-metrics-exporter.service` | Pollers quiesced around a reset; a unit the host lacks is skipped. The idle-time probe re-arms the same list, with the same default | 04, 08 |
 | `TT_DEVICE_MCP_PRE_STEP_DEADLINE_SEC` | `120` | Wall-clock cap on the reply to an external read-only health pass, **and** the base the CLI derives its pre-step client timeout from (+60 s margin) | 03/07 |
 | `TT_DEVICE_MCP_POST_STEP_DEADLINE_SEC` | `600` | Wall-clock cap on the reply to the whole post-step route — the straggler reclaim and the recovering health pass together, not the pass alone — **and** the base the CLI derives its post-step client timeout from (+60 s margin) | 03/07 |
@@ -348,10 +339,12 @@ Behavior).
 | `TTDEV_UNIT_PATH` | `/etc/systemd/system/tt-device-broker.service` | Unit path (render seam) |
 | `TTDEV_BRANCH` | `main` | Branch autoupdate tracks — the **only** settable part of the update source (08 I16); the repository itself is a constant in `autoupdate.sh`, not configuration |
 | `TTDEV_AUTOUPDATE` | `1` | Autoupdate master switch. Read at install to seed the config file, and by every lap; `sudo TTDEV_AUTOUPDATE=0 ./install.sh` turns a host off outright (after `sudo`, which resets the environment) |
+| `TTDEV_MIN_APPLY_INTERVAL_SEC` | 1800 (0 = off) | Minimum seconds between autoupdate applies (each one restarts the broker and runs the startup fabric pass); a newer sha waits, so a burst of pushes is one restart. Last apply kept in `$ROOT/last-apply`, its `NRestarts` baseline in `$ROOT/last-apply-nrestarts`; a broken broker (not active, crash-looping, held, failing health) is never rate-limited; one in its startup check stays limited for at most 600 s after the apply. By-hand escape: `rm $ROOT/last-apply` (the sourced config file wins over an env override) (spec 08 I21) |
 | `TTDEV_LOCK` | 0 | Apply the udev device lock at install (shared host) |
+| `TTDEV_BOARD_TYPES` | set by the installer | Board type of each chip that answered `tt-smi -s`, one per line; input to the expected-count derivation only (spec 08 I28) |
 | `TTDEV_HEALTH_PROBE` | 1 | Read by `apply-host-config.sh` from the config file: `0` disables `tt-device-health-probe.timer` (spec 08 I17), anything else enables it |
 | `TTDEV_NO_LOCK` | unset | Back-compat: force cooperative (no lock) |
-| `TTDEV_RESET_MODE`, `TTDEV_FABRIC_CHECK_CMD`, `TTDEV_ETH_HEARTBEAT_CMD`, `TTDEV_RESET_MIN_DEAD_FRAC`, `TTDEV_SELFHEAL_RELIFT`, `TTDEV_EXPECTED_CHIPS`, `TTDEV_AUTO_REBOOT`, `TTDEV_AUTO_POWER_CYCLE`, `TTDEV_AUTO_UBB_RESET`, `TTDEV_PREJOB_DISPATCH`, `TTDEV_AICLK_CEILING_MHZ`, `TTDEV_AICLK_CEILING_CMD`, `TTDEV_POLLER_SERVICES` | unset | Per-host config keys; each renders the same-named `TT_DEVICE_MCP_*` unit env line (values already in the unit survive an update) |
+| `TTDEV_RESET_MODE`, `TTDEV_FABRIC_CHECK_CMD`, `TTDEV_ETH_HEARTBEAT_CMD`, `TTDEV_RESET_MIN_DEAD_FRAC`, `TTDEV_SELFHEAL_RELIFT`, `TTDEV_EXPECTED_CHIPS`, `TTDEV_AUTO_POWER_CYCLE`, `TTDEV_PREJOB_DISPATCH`, `TTDEV_AICLK_CEILING_MHZ`, `TTDEV_AICLK_CEILING_CMD`, `TTDEV_POLLER_SERVICES` | unset | Per-host config keys; each renders the same-named `TT_DEVICE_MCP_*` unit env line (values already in the unit survive an update; an unset `TTDEV_EXPECTED_CHIPS` is derived from the machine type, spec 08 I28) |
 | `TTDEV_FABRIC_DESCRIPTOR` | galaxy: shipped descriptor; else unset | Cabling descriptor for the fabric check (src, fabric.py) |
 | `TTDEV_FABRIC_BIN` | validator `run_cluster_validation` | Fabric validator binary override (src) |
 | `TTDEV_FABRIC_RUNTIME_ROOT` | validator `current/` | `TT_METAL_HOME` for the fabric check (src) |

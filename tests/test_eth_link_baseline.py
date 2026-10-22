@@ -206,18 +206,24 @@ async def test_a_selftest_that_could_not_check_is_retryable(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_host_with_no_eth_reader_is_never_retried(monkeypatch):
-    # Nothing a retry can change: re-running it every interval would only take the device-op lock
-    # and log RUNG OFF again on every idle host without ttexalens.
+async def test_a_host_with_no_eth_reader_is_retried_at_the_idle_pace(monkeypatch, clear_job_state):
+    # An eth-venv provisioned after the broker started (an autoupdate that installs it) must arm the
+    # rung without a restart; the pace keeps a box with no ttexalens at one resolve per interval.
     monkeypatch.setattr(srv, "eth_check_armed", False)
     monkeypatch.delenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", raising=False)
     monkeypatch.setattr(eth, "build", lambda: None)
+    monkeypatch.setattr(srv, "device_op_active", "")
+    monkeypatch.setattr(srv, "current_process", None)
+    monkeypatch.setattr(srv, "readopted_scopes", {})
     await srv.selftest_eth_heartbeat()
-    assert srv.eth_rearm_retryable is False
+    assert srv.eth_rearm_retryable is True and srv.eth_rearm_no_reader is True
     fsm_healthy(srv)
+    srv._maybe_spawn_eth_rearm()
+    assert srv._eth_rearm_task is None, "retried inside ETH_CHECK_REARM_INTERVAL_SEC"
     srv._last_eth_rearm_monotonic = time.monotonic() - 2 * srv.ETH_CHECK_REARM_INTERVAL_SEC
     srv._maybe_spawn_eth_rearm()
-    assert srv._eth_rearm_task is None
+    assert srv._eth_rearm_task is not None
+    await srv._eth_rearm_task
 
 
 @pytest.mark.asyncio

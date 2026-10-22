@@ -125,6 +125,7 @@ async def test_a_readopted_job_keeps_printing_and_its_log_gets_every_line_once(m
         queued_at="",
         status=srv.JobStatus.RUNNING,
         log_file=str(log),
+        started_at=srv.datetime.now().isoformat(),
     )
     alive = {"n": 0}
 

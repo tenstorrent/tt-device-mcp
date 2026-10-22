@@ -66,9 +66,10 @@ class DeviceHolder:
         return username_for_uid(self.uid)
 
 
-def in_broker_scope(pid: int) -> bool:
-    """True when ``pid`` sits in a broker job or exec scope. Unreadable reads as False: the uid
-    rule still applies, and /proc/<pid>/cgroup is world-readable, so only an exited pid gets here."""
+def in_broker_scope(pid: int, prefixes: tuple = BROKER_SCOPE_PREFIXES) -> bool:
+    """True when ``pid`` sits in a broker job or exec scope (or, with ``prefixes``, another broker
+    scope such as a reset's). Unreadable reads as False: the uid rule still applies, and
+    /proc/<pid>/cgroup is world-readable, so only an exited pid gets here."""
     try:
         with open(f"{SCOPE_PROC_DIR}/{pid}/cgroup") as f:
             raw = f.read()
@@ -76,7 +77,7 @@ def in_broker_scope(pid: int) -> bool:
         return False
     for line in raw.splitlines():
         for part in line.rsplit(":", 1)[-1].split("/"):
-            if part.endswith(".scope") and part.startswith(BROKER_SCOPE_PREFIXES):
+            if part.endswith(".scope") and part.startswith(prefixes):
                 return True
     return False
 
@@ -663,8 +664,13 @@ def reclaim_foreign_holders(
     getpid=os.getpid,
     getpgid=os.getpgid,
     read_starttime=None,
+    select=None,
 ) -> ReclaimResult:
     """Signal every tenant process still holding the device, then re-scan.
+
+    ``select`` replaces the tenant rule for the targets (and the survivors reported): a caller
+    that must also clear infrastructure, such as the in-flight cut of spec 03 I83, says so itself.
+    This process and its group stay excluded either way.
 
     This does NOT relax the reset gate: it removes the tenant so the gate's ordinary rule
     (04 I6/I7) passes on its own. A survivor or a blind re-scan leaves the gate's fail-closed
@@ -689,6 +695,7 @@ def reclaim_foreign_holders(
     # here, at call time, is what lets tests/conftest.py sandbox the default the same way it
     # already sandboxes `rescan`'s default (`enumerate_device_holders`) and `TT_DEV_DIR`.
     read_starttime = read_starttime or _read_proc_starttime
+    wanted = select or is_tenant
     own_pid = getpid()
     try:
         own_pgid = getpgid(own_pid)
@@ -706,7 +713,7 @@ def reclaim_foreign_holders(
             return False  # pid already gone; not the broker's group either way
 
     scan = rescan()
-    targets = [h for h in scan.holders if is_tenant(h) and not _is_self(h)]
+    targets = [h for h in scan.holders if wanted(h) and not _is_self(h)]
     if not targets:
         return ReclaimResult(signalled=[], survivors=[], scan_complete=scan.complete)
 
@@ -762,7 +769,7 @@ def reclaim_foreign_holders(
         if grace_sec:
             sleep(grace_sec)
         after = rescan()
-        still = [h for h in after.holders if is_tenant(h)]
+        still = [h for h in after.holders if wanted(h)]
         if not still:
             return ReclaimResult(signalled=list(signalled_by_pid.values()), survivors=[], scan_complete=after.complete)
         # No `or still` fallback: a pid that shows up here but was never a target is a NEW
@@ -785,7 +792,7 @@ def reclaim_foreign_holders(
         logger.debug("device-holder reclaim: %d signal(s) targeted an already-gone process", vanished)
     return ReclaimResult(
         signalled=list(signalled_by_pid.values()),
-        survivors=[h for h in final.holders if is_tenant(h)],
+        survivors=[h for h in final.holders if wanted(h)],
         scan_complete=final.complete,
     )
 

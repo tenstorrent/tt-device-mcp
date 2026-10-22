@@ -56,8 +56,9 @@ _LINKS_MISSING_AFTER_RETRAIN = re.compile(r"Encountered unrecoverable state")
 
 # The validator's own throw when the links it discovered do not match the cabling descriptor. Its
 # tray ids come from PCI bus numbers, so a tray whose uplink lands on another bus, or a cable that
-# is simply not there, mismatches on every run: a board reset cannot change either. Never
-# measured-bad; the caller reruns once without the descriptor (traffic over the discovered links).
+# is simply not there, mismatches on every run. Not a measurement by itself; the caller reruns
+# once without the descriptor (traffic over the discovered links). A link missing with none extra
+# is still a failed check (``links_missing``): a reset or power cycle can bring a dead link back.
 _TOPOLOGY_MISMATCH = re.compile(r"Connection mismatch detected")
 # The wrapper's own line once that traffic-only rerun passed. It carries the mismatch onto an OK
 # verdict, so the operator still hears that the cabling is not what the descriptor says.
@@ -128,7 +129,7 @@ def topology_marker(desc: str, missing: int, extra: int, ports: tuple[list[str],
     appends the port names it read (``ports`` from :func:`topology_ports`)."""
     marker = (
         f"TOPOLOGY MISMATCH vs {desc}: {missing} missing, {extra} extra port connections "
-        "(tray ids come from PCI bus numbers; a board reset cannot change this)"
+        "(tray ids come from PCI bus numbers)"
     )
     if ports[0]:
         marker += f"; missing ports: {_names(ports[0])}"
@@ -198,6 +199,14 @@ def links_missing(marker: str, accepted: frozenset[str] = frozenset()) -> str:
     )
 
 
+def marker_counts(text: str) -> tuple[int, int]:
+    """(missing, extra) port connections against the cabling descriptor that the topology marker in
+    ``text`` names, or (0, 0) when it carries none: the validator prints no link totals, only how far
+    the links it found fall short of (or beyond) the cabling."""
+    m = _MARKER_COUNTS.search(find_topology_marker(text or "") or "")
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
+
 def missing_cables(marker: str) -> int:
     """How many port/cable connections a topology marker names missing with none extra, else 0.
 
@@ -224,6 +233,16 @@ DISPATCH_FAILED = "dispatch FAILED on a green fabric"
 def names_dispatch_failure(text: str) -> bool:
     """Whether ``text`` carries the wrapper's green-fabric dispatch failure (spec 03 I55)."""
     return DISPATCH_FAILED in (text or "")
+
+
+# The wrapper's 77 when the links passed and its dispatch probe ran out its cap without a verdict.
+DISPATCH_CAP = "dispatch probe hit its"
+
+
+def names_dispatch_cap(text: str) -> bool:
+    """Whether ``text`` carries the wrapper's dispatch-cap 77: the validator had already moved traffic
+    across every link, so the links were trained when it gave up (spec 04 I84)."""
+    return DISPATCH_CAP in (text or "")
 
 
 def find_topology_marker(output: str) -> Optional[str]:
@@ -259,6 +278,8 @@ _REASON_PATTERNS = (
     # The wrapper's own final verdict on a mesh whose links passed and whose dispatch did not
     # (spec 03 I55): it names the failure the exit code is about, ahead of any validator line above.
     re.compile(r"dispatch FAILED on a green fabric.*"),
+    # Its 77 on the same green fabric, when the dispatch probe ran out its cap (spec 04 I84).
+    re.compile(r"dispatch probe hit its .*"),
     re.compile(r"what\(\):.*"),
     re.compile(r"filesystem error:.*"),
     re.compile(r"(?:\|\s*(?:critical|fatal|error)\s*\||\[(?:critical|error)\]|TT_THROW|TT_FATAL).*", re.IGNORECASE),
@@ -323,7 +344,7 @@ def classify(rc: Optional[int], output: str) -> tuple[Optional[bool], str]:
         missing, extra = topology_counts(output)
         return None, (
             f"{TOPOLOGY_MISMATCH}: {missing} missing, {extra} extra port connections vs the cabling "
-            "descriptor (tray ids come from PCI bus numbers; a board reset cannot change this)"
+            "descriptor (tray ids come from PCI bus numbers)"
         )
     if _LINKS_MISSING_AFTER_RETRAIN.search(output):
         return False, "links the cabling descriptor expects are still missing after the validator's retrains"
@@ -359,6 +380,23 @@ def validator_missing() -> Optional[str]:
     if desc and not os.path.isfile(desc):
         return f"cabling descriptor '{desc}' missing"
     return None
+
+
+# The systemd unit that builds the pinned validator (deploy/tt-device-fabric-validator.service).
+VALIDATOR_BUILD_UNIT = "tt-device-fabric-validator.service"
+# The shipped wrapper: an override naming it runs the same pinned validator, so it 77s on the same paths.
+_SHIPPED_WRAPPER = "tt-device-fabric-check.sh"
+
+
+def validator_not_built() -> Optional[str]:
+    """``validator_missing()`` when the fabric check runs the pinned validator, else ``None`` (spec 03
+    I81). That is with no ``TT_DEVICE_MCP_FABRIC_CHECK_CMD``, or one naming the shipped wrapper. An
+    operator's own command needs none of these paths, so their absence says nothing about it. Stat
+    calls only."""
+    override = os.environ.get("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "").strip()
+    if override and _SHIPPED_WRAPPER not in override:
+        return None
+    return validator_missing()
 
 
 def build_command(descriptor: bool = True) -> Optional[tuple[list[str], dict[str, str]]]:
