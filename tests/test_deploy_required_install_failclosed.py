@@ -32,6 +32,12 @@ def _install_stmt(script: Path, dest: str) -> str:
     return hits[0]
 
 
+def _restart_path_state_write(stmts: list[str]) -> int:
+    """The installed.sha write of an apply that restarts: the last one, just before the restart.
+    The no-restart apply (spec 08 I29) writes it earlier, but stages and installs nothing."""
+    return max(i for i, s in enumerate(stmts) if '> "$STATE"' in s or '>"$STATE"' in s)
+
+
 def test_installer_fabric_check_stage_is_fatal_not_swallowed():
     # Required validator: bare `install` under `set -e` aborts loudly. No `|| true` to
     # swallow it, and no `2>/dev/null` to hide why it failed.
@@ -82,7 +88,7 @@ def test_autoupdate_staged_sources_exist_in_deploy():
     # write; if the order flipped, an aborted stage would still have marked the host current.
     stmts = _statements(_AUTOUPDATE)
     stage_idx = next(i for i, s in enumerate(stmts) if "install -m 0755" in s and '"$ROOT/fabric-check.sh"' in s)
-    sha_idx = next(i for i, s in enumerate(stmts) if '> "$STATE"' in s or '>"$STATE"' in s)
+    sha_idx = _restart_path_state_write(stmts)
     assert stage_idx < sha_idx
 
 
@@ -104,5 +110,5 @@ def test_autoupdate_host_config_apply_precedes_installed_sha():
     # before the installed.sha write, or an aborted apply would still mark the host current.
     stmts = _statements(_AUTOUPDATE)
     apply_idx = next(i for i, s in enumerate(stmts) if "apply-host-config.sh" in s and '"$clone"' in s)
-    sha_idx = next(i for i, s in enumerate(stmts) if '> "$STATE"' in s or '>"$STATE"' in s)
+    sha_idx = _restart_path_state_write(stmts)
     assert apply_idx < sha_idx
