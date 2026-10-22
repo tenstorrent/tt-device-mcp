@@ -3728,17 +3728,20 @@ def _clear_device_reported_fault(why: str) -> None:
     device_fault_reported = ""
 
 
-def _journal_fsm_transition(why: str, *, verified: bool) -> None:
+def _journal_fsm_transition(why: str, *, verified: bool, released: Optional[bool] = None) -> None:
     """Record a ``device_dirty_cleared`` event naming who moved the device off its PRIOR episode
     (``why``) and whether a check actually proved the mesh healthy first (``verified``) — emitted
     only while there WAS a prior episode to move off of. The one state change a postmortem cannot
     reconstruct later: the FSM lives in memory, so a device that reads degraded at 14:00 and fit at
     14:05 with no event between is a hole nothing can close. ``verified`` is the load-bearing field
     — a clear that never touched silicon (a foreign holder, a gate error, a reset checked only by
-    its exit code) must not read the same as one a full snapshot+fabric pass stood behind."""
+    its exit code) must not read the same as one a full snapshot+fabric pass stood behind.
+
+    ``released`` (default: ``verified``) says whether the device leaves the hold. One that stays held
+    with only its dirty bit dropped is journaled as ``device_dirty_dropped_held``, never as a clear."""
     if fsm.state is not ServerState.HEALTHY:
         health_event(
-            "device_dirty_cleared",
+            "device_dirty_cleared" if (verified if released is None else released) else "device_dirty_dropped_held",
             why=why,
             verified=verified,
             prior_reason=fsm.record.detail or fsm.record.why,
@@ -3875,9 +3878,9 @@ def _clear_device_dirty_unverified(why: str, *, holds: bool = True, fault: str =
     the door would shut once and never reopen. Every other unverified clear holds: it
     means we tried and could not tell, which is the case the hold exists for.
     """
-    _journal_fsm_transition(why, verified=False)
     if PCI_WRITER.latched:
         holds = True  # spec 04 I76: PCI-wedged lifts only on a verified full check
+    _journal_fsm_transition(why, verified=False, released=not holds)
     if not holds:
         fsm.on_readings(_healthy_reading())
         return
@@ -8075,7 +8078,10 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
     def done(candidates: list) -> Optional[hold_report.RungCandidate]:
         if floor is not None:
             candidates = [c if c.at >= floor else replace(c, at=floor) for c in candidates]
-        return hold_report.next_rung(fed + candidates + bound)
+        # Spec 04 I65: a power cycle fires no earlier than the governor's backstop and cooldown allow.
+        gates = getattr(m, "power_cycle_gates", None) if m is not None else None
+        waits = gates(now_epoch) if callable(gates) else []
+        return hold_report.next_rung(hold_report.gate_power_cycle(fed + candidates + bound, waits))
 
     def routed(c: hold_report.RungCandidate, kind: str) -> Optional[hold_report.RungCandidate]:
         """``c`` as a forced run of ``kind`` takes it at its time (the floor applied; a past one at the
@@ -8766,7 +8772,7 @@ async def _force_escalate_stuck_hold() -> None:
                 # fenced and only a host rung clears it, so the bound asks for that rung now.
                 health_event("hold_bound_leftover", held_age_sec=int(held_age), held_since=device_hold_episode_since)
                 log(f"10-min hold bound: {leftover} — no reset can run; the host rung is next")
-                await _hold_bound_host_rung(held_age, log)
+                await _hold_bound_host_rung(held_age, log, skipped=leftover)
                 return
             refused = await asyncio.to_thread(_kill_refused_reason) if bound else ""
             if refused:
@@ -8780,7 +8786,7 @@ async def _force_escalate_stuck_hold() -> None:
                     detail=refused,
                 )
                 log(f"10-min hold bound: {refused} — no reset can run over it; the host rung is next")
-                await _hold_bound_host_rung(held_age, log)
+                await _hold_bound_host_rung(held_age, log, skipped=refused)
                 return
         health_event(
             "hold_deadline_forced_escalation",
@@ -8857,6 +8863,9 @@ async def _force_escalate_stuck_hold() -> None:
 # and at which the bound last asked for the host rung, keyed by the episode they belong to.
 _hold_bound_episode: str = ""
 _hold_bound_ladder_age: Optional[float] = None
+# Why the episode's last host-rung request skipped the ladder (a leftover holder, a refused kill), kept
+# until a bound ladder runs, so a retry of that request names the same skip (_hold_bound_cause).
+_hold_bound_skip: str = ""
 _hold_bound_ladder_recovered: bool = False
 # Spec 04 I83: the episode's last counted ladder was the fabric link-short class's at-start pass. It
 # stands in for the bound's ladder only once the host rung after it was granted (or its cooldown retry
@@ -8898,13 +8907,13 @@ def _hold_bound_sync() -> None:
     """Drop the bound's bookkeeping once it belongs to an episode that is no longer open."""
     global _hold_bound_episode, _hold_bound_ladder_age, _hold_bound_cycle_age, _hold_bound_ladder_recovered
     global _hold_bound_check_failed_age, _hold_bound_rung_pending, _hold_bound_denied_why, _hold_bound_tenant_blocker
-    global _hold_bound_early, _hold_bound_granted_age
+    global _hold_bound_early, _hold_bound_granted_age, _hold_bound_skip
     if _hold_bound_episode != device_hold_episode_since:
         _hold_bound_episode = device_hold_episode_since
         _hold_bound_ladder_age = _hold_bound_cycle_age = _hold_bound_check_failed_age = None
         _hold_bound_granted_age = None
         _hold_bound_ladder_recovered = _hold_bound_rung_pending = _hold_bound_early = False
-        _hold_bound_denied_why = ""
+        _hold_bound_denied_why = _hold_bound_skip = ""
         _hold_bound_tenant_blocker = None
 
 
@@ -8942,12 +8951,12 @@ def _note_hold_bound_ladder(age: float, outcome: str, *, early: bool = False) ->
     A host rung still pending from before it (a denial that armed no retry) is spent: the full check
     after this ladder decides whether the host rung is asked again (spec 04 I76)."""
     global _hold_bound_ladder_age, _hold_bound_ladder_recovered, _hold_bound_tenant_blocker, _hold_bound_early
-    global _hold_bound_rung_pending, _hold_bound_denied_why
+    global _hold_bound_rung_pending, _hold_bound_denied_why, _hold_bound_skip
     if age < _hold_bound_sec() and not early:
         return
     _hold_bound_sync()
     _hold_bound_tenant_blocker = None
-    _hold_bound_rung_pending, _hold_bound_denied_why = False, ""
+    _hold_bound_rung_pending, _hold_bound_denied_why, _hold_bound_skip = False, "", ""
     _hold_bound_ladder_age = max(age, _hold_age_now())
     _hold_bound_early = early  # a ladder at the bound is the bound's own, with its full check window
     _hold_bound_ladder_recovered = outcome == OUTCOME_RECOVERED
@@ -9124,16 +9133,41 @@ def _lift_hold_bound_latches(log) -> None:
             log(f"10-min hold bound: lifting the {name} latch ({detail}) so the full check after the ladder decides")
 
 
-async def _hold_bound_host_rung(age: float, log) -> None:
+def _hold_bound_cause(age: float, skipped: str = "", ladder_ran: bool = False) -> str:
+    """The power-cycle request's reason: what led to it. ``skipped`` names why the ladder was skipped
+    (a leftover holder, a refused kill). ``ladder_ran`` says the episode's records show a bound ladder
+    ran first: under a PCI-wedged latch the reason then says that ladder met a blocked PCI write
+    (spec 04 I76: the first timeout latches and stops the pass), and only with no ladder run that every
+    rung was skipped (pci_wedged_rung_skipped). Otherwise a full ladder ran and did not heal the hold."""
+    if skipped:
+        return f"10-min hold bound: held {int(age)}s and the ladder was skipped: {skipped}"
+    if PCI_WRITER.latched and ladder_ran:
+        return (
+            f"PCI-wedged hold: held {int(age)}s; the ladder ran and a PCI write blocked "
+            f"({PCI_WRITER.reason}): no rung can run over the PCI lock it holds"
+        )
+    if PCI_WRITER.latched:
+        return (
+            f"PCI-wedged hold: held {int(age)}s and the ladder was skipped ({PCI_WRITER.reason}): every "
+            "rung needs the PCI lock a blocked write holds"
+        )
+    return f"10-min hold bound: held {int(age)}s and the full ladder did not heal it"
+
+
+async def _hold_bound_host_rung(age: float, log, skipped: str = "") -> None:
     """Spec 04 I76: the step after a bound ladder that did not heal the hold — a BMC power cycle, the
     only host rung. A cycle that does not launch keeps the hold, pages, and is asked again on the next
     watchdog tick; there is no reboot fallback. The governor still decides: a live tenant refuses it (paged
     once), and a cooldown denial arms the retry the watchdog fires the moment the cooldown ends. Until the
-    rung is requested or such a retry is armed it stays pending, and the watchdog asks again each tick."""
+    rung is requested or such a retry is armed it stays pending, and the watchdog asks again each tick.
+    ``skipped`` names why no ladder ran first, for the request's reason (_hold_bound_cause); the
+    episode's own records say whether a bound ladder ran. Neither changes whether or when it is asked."""
     global _hold_bound_cycle_age, _hold_bound_unarmed_paged, _hold_bound_rung_pending, _hold_bound_denied_why
-    global _hold_bound_tenant_blocker, _hold_bound_granted_age
+    global _hold_bound_tenant_blocker, _hold_bound_granted_age, _hold_bound_skip
     _hold_bound_sync()
     _hold_bound_rung_pending = True
+    if skipped:
+        _hold_bound_skip = skipped  # a retry of this request (a cooldown denial) names the same skip
     if await asyncio.to_thread(recovery_mechanism.scope_active):
         log("10-min hold bound: a reset is still cycling in its own scope — the host rung waits for it")
         return
@@ -9181,7 +9215,9 @@ async def _hold_bound_host_rung(age: float, log) -> None:
         log(f"10-min hold bound: {action} held off: {why}")
         recovery_mechanism._journal_auto_recovery_denied(action, why)
         return
-    cause = f"10-min hold bound: held {int(age)}s and the full ladder did not heal it"
+    # _note_hold_bound_ladder records the bound's ladder (and clears a kept skip) before any post-ladder ask.
+    ladder_ran = not _hold_bound_skip and _hold_bound_ladder_age is not None
+    cause = _hold_bound_cause(age, skipped or _hold_bound_skip, ladder_ran)
     log(f"{cause} — firing the {action}")
     if await _auto_power_cycle_host(log, cause) is False:
         _hold_bound_rung_pending = True

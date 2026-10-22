@@ -788,3 +788,65 @@ def test_the_bound_feed_moves_no_clock(held, monkeypatch):
     _payload()
     srv._hold_bound_feed(START, T0, None)
     assert {n: getattr(srv, n) for n in names} == before
+
+
+def test_a_power_cycle_the_governor_still_gates_is_reported_at_the_latest_gate(held, monkeypatch):
+    """Spec 04 I75: window 2 routes to the host rung at 1200 s, but the governor's backstop and then
+    its post-boot cooldown refuse a power cycle until later. next_rung_at and hold_escalation's
+    next_deadline give the later gate's end and the source names both waits, not the window alone."""
+    held["off"] = {3, 4, 5, 6}
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 1)
+    _bound_ladder_ran(monkeypatch, 1000.0, False)
+    backstop, cooldown = START + 1578, START + 1665
+    monkeypatch.setattr(
+        held["m"],
+        "power_cycle_gates",
+        lambda now_epoch=None: [(cooldown, "power-cycle cooldown (host boot)"), (backstop, "power-cycle backstop")],
+        raising=False,
+    )
+    p = srv._health_payload(now=datetime.fromtimestamp(START + 1100))
+    assert p["next_rung"] == "power cycle"
+    assert p["next_rung_at"] == _iso(cooldown)
+    assert p["next_rung_source"].startswith("hold bound host rung")
+    assert p["next_rung_source"].endswith(
+        f", held by the power-cycle backstop until {_iso(backstop)}, "
+        f"then the power-cycle cooldown (host boot) until {_iso(cooldown)}"
+    )
+    assert p["hold_escalation"]["next_deadline"] == _iso(cooldown)
+
+
+def test_the_governor_gates_move_only_a_power_cycle_step():
+    """A ladder or a check keeps its time; a power cycle already past every gate keeps its own."""
+    from tt_device_mcp.health import hold_report
+
+    gates = [(500.0, "power-cycle backstop")]
+    out = hold_report.gate_power_cycle(
+        [
+            hold_report.RungCandidate(100.0, "reset ladder", "class A 10-min ladder"),
+            hold_report.RungCandidate(200.0, "power cycle", "w"),
+            hold_report.RungCandidate(900.0, "power cycle (retry of a missed request)", "r"),
+        ],
+        gates,
+    )
+    assert [(c.at, c.rung) for c in out] == [
+        (100.0, "reset ladder"),
+        (500.0, "power cycle"),
+        (900.0, "power cycle (retry of a missed request)"),
+    ]
+    assert out[1].source.startswith("w, held by the power-cycle backstop until ")
+    assert hold_report.gate_power_cycle(out, []) == out
+
+
+def test_the_power_cycle_gates_read_marks_nothing(held, monkeypatch):
+    """The /health read of the governor's waits is read-only: it sets no refusal record or retry,
+    and a failed ledger read gives no gates rather than raising."""
+    m = held["m"]
+    state, retry = m.power_cycle_cooldown_state, m.power_cycle_retry
+    m.power_cycle_gates(START + 100)
+    assert (m.power_cycle_cooldown_state, m.power_cycle_retry) == (state, retry)
+
+    def _boom():
+        raise OSError("ledger unreadable")
+
+    monkeypatch.setattr(m, "read_auto_recovery_ledger", _boom)
+    assert m.power_cycle_gates(START + 100) == []

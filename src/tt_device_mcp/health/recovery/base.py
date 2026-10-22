@@ -2746,6 +2746,29 @@ class RecoveryMechanism:
                     pass
                 return
 
+    def power_cycle_gates(self, now_epoch: Optional[float] = None) -> list[tuple[float, str]]:
+        """The governor's known waits a power cycle must clear before it may fire, as ``(until, name)``
+        each still ahead of ``now_epoch``: the backstop's end and the boot / post-power-cycle cooldown's
+        (spec 04 I65), the same reads ``auto_recovery_allowed`` makes. For /health's next-rung time
+        (spec 04 I75) only: read-only, it marks, journals and pages nothing, and the governor still
+        decides at the rung. Empty when the ledger cannot be read or a read fails."""
+        now = time.time() if now_epoch is None else now_epoch
+        try:
+            requests = self.read_auto_recovery_ledger()
+            if requests is None:
+                return []
+            ran = self._cycles_that_ran(requests, now)
+            gates = []
+            backstop = _power_cycle_backstop_until(ran + [r for r in requests if r.get("cycle_refuted")], now)
+            if backstop is not None and backstop > now:
+                gates.append((backstop, "power-cycle backstop"))
+            cooldown = self.power_cycle_cooldown(now_epoch=now, ledger=ran, requests=requests)
+            if cooldown is not None:
+                gates.append((float(cooldown["until"]), f"power-cycle cooldown ({cooldown.get('cause')})"))
+        except Exception:  # noqa: BLE001 - a read-only report must never raise
+            return []
+        return gates
+
     def _power_cycle_backstop(self, ledger: list[dict], now_epoch: float) -> Optional[dict]:
         """The refusal when POWER_CYCLE_BACKSTOP_MAX power cycles already ran inside the backstop
         window, verified or not (a refuted one, I88, restarted the host warm and counts too); None
