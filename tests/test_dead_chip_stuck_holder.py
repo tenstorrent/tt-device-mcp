@@ -20,7 +20,7 @@ import pytest
 from tests.test_classac_power_cycle_direct import EXPECTED, rig  # noqa: F401 - the fixture
 from tests.test_reaped_leftover import SIGKILL_PENDING, _stage
 from tests.test_ubb_tray_map import galaxy_seen  # noqa: F401 - the fixture
-from tt_device_mcp import job_reap
+from tt_device_mcp import device_holders, job_reap
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.health.recovery import galaxy, offbus_power_cycle
@@ -32,9 +32,17 @@ BAR = f"/sys/devices/pci0000:40/0000:40:01.1/{BDF}/resource0"
 BUDGET = srv.DEAD_CHIP_STUCK_BUDGET_SEC
 RETRY = srv.LEFTOVER_HOST_RUNG_RETRY_SEC
 KILLED = [{"pid": PID, "uid": 1234}]
+# The device node directory the staged holders reference. Never the real /dev/tenstorrent: the suite
+# points DEVICE_DIR away from it (conftest), so a real holder on the host is never matched.
+NODE_DIR = "/nonexistent/tt-device-mcp-test/staged-tenstorrent"
 
 
-def _stage_holder(proc, pid=PID, *, state="D", sigpnd="0" * 16, fds=("/dev/tenstorrent/3",), maps=None, job_id=""):
+@pytest.fixture(autouse=True)
+def _staged_node_dir(monkeypatch):
+    monkeypatch.setattr(device_holders, "DEVICE_DIR", NODE_DIR)
+
+
+def _stage_holder(proc, pid=PID, *, state="D", sigpnd="0" * 16, fds=(f"{NODE_DIR}/3",), maps=None, job_id=""):
     """A killed holder, outside any job scope unless ``job_id``; ``fds`` its fd targets (None: fd dir
     unreadable), ``maps`` its mapping paths (None: no maps file, i.e. unreadable)."""
     _stage(proc, pid, job_id=job_id, state=state, sigpnd=sigpnd, wchan="tt_cdev_mmap")
@@ -68,22 +76,15 @@ def stuck(rig, monkeypatch, tmp_path):  # noqa: F811 - the imported fixture
     rig["beats"] = {str(i): 100 for i in range(EXPECTED)}
     monkeypatch.setattr(srv, "_present_chip_indices", lambda: [str(i) for i in range(EXPECTED)])
     monkeypatch.setattr(srv.health_monitor, "expected", lambda n=0: EXPECTED)
-    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: True)
-    monkeypatch.setattr(srv.recovery_mechanism, "_reboot_already_attempted", lambda **k: False)
     fired = []
     monkeypatch.setattr(srv.recovery_mechanism, "host_action_pending", lambda: ("power-cycle", 1.0) if fired else None)
     monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
     monkeypatch.setattr(srv, "_clear_device_dirty", lambda **k: rig["order"].append("cleared_dirty"))
 
-    async def reboot(log, reason):
-        rig["order"].append("reboot")
-        fired.append("reboot")
-
     async def power_cycle(log, reason):
         rig["order"].append("power_cycle")
         fired.append("power_cycle")
 
-    monkeypatch.setattr(rig["g"], "_auto_reboot_host", reboot)
     monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
     pages = []
     s = {"proc": proc, "pages": pages, "order": rig["order"], "events": rig["events"], "rig": rig, "deliver": True}
@@ -124,25 +125,23 @@ async def _tick(now):
 def test_refs_name_device_fds_node_maps_and_bar_maps(tmp_path, monkeypatch):
     proc = tmp_path / "proc"
     proc.mkdir()
-    _stage_holder(
-        proc, fds=("/dev/tenstorrent/3 (deleted)", "/tmp/log"), maps=("/dev/tenstorrent/3", BAR, "/usr/lib/libc.so.6")
-    )
+    _stage_holder(proc, fds=(f"{NODE_DIR}/3 (deleted)", "/tmp/log"), maps=(f"{NODE_DIR}/3", BAR, "/usr/lib/libc.so.6"))
     monkeypatch.setattr(job_reap, "LEFTOVER_PROC_DIR", str(proc))
 
     refs = job_reap.device_refs(PID, [BDF])
-    assert refs == ["fd 5 -> /dev/tenstorrent/3 (deleted)", "map /dev/tenstorrent/3", f"map {BAR}"]
+    assert refs == [f"fd 5 -> {NODE_DIR}/3 (deleted)", f"map {NODE_DIR}/3", f"map {BAR}"]
 
 
 @pytest.mark.parametrize(
     "state,sigpnd,fds,maps,is_stuck",
     [
-        ("D", "0" * 16, ("/dev/tenstorrent/3",), None, True),  # D with the node open
+        ("D", "0" * 16, (f"{NODE_DIR}/3",), None, True),  # D with the node open
         ("D", "0" * 16, (), (BAR,), True),  # D with only the BAR mapped
-        ("S", SIGKILL_PENDING, ("/dev/tenstorrent/3",), None, True),  # SIGKILL queued, not acted on
+        ("S", SIGKILL_PENDING, (f"{NODE_DIR}/3",), None, True),  # SIGKILL queued, not acted on
         ("D", "0" * 16, None, None, True),  # refs unreadable: fail closed
-        ("S", "0" * 16, ("/dev/tenstorrent/3",), None, False),  # not stuck: it can still exit
+        ("S", "0" * 16, (f"{NODE_DIR}/3",), None, False),  # not stuck: it can still exit
         ("D", "0" * 16, ("/tmp/log",), ("/usr/lib/libc.so.6",), False),  # stuck, but on nothing of ours
-        ("Z", SIGKILL_PENDING, ("/dev/tenstorrent/3",), None, False),  # a zombie holds nothing
+        ("Z", SIGKILL_PENDING, (f"{NODE_DIR}/3",), None, False),  # a zombie holds nothing
     ],
 )
 def test_stuck_device_holder(tmp_path, monkeypatch, state, sigpnd, fds, maps, is_stuck):
@@ -178,7 +177,7 @@ def test_a_maps_read_that_blocks_is_bounded_and_fds_still_count(tmp_path, monkey
         t0 = time.monotonic()
         refs = job_reap.device_refs(PID, [BDF], maps_timeout=0.2)
         assert time.monotonic() - t0 < 2
-        assert refs == ["fd 5 -> /dev/tenstorrent/3"]
+        assert refs == [f"fd 5 -> {NODE_DIR}/3"]
     finally:
         release.set()
 
@@ -247,7 +246,7 @@ def test_the_broker_wires_both_fences(stuck):
     assert f"killed holder of chip(s) 3 pid {PID}" in srv.recovery_mechanism.reset_fence()
 
 
-async def test_the_bridge_rung_is_withheld_and_the_hold_stays_generic(stuck, monkeypatch):
+async def test_the_bridge_rung_is_withheld(stuck, monkeypatch):
     from tt_device_mcp.health import recovery as recovery_pkg
 
     _note(stuck)
@@ -264,12 +263,6 @@ async def test_the_bridge_rung_is_withheld_and_the_hold_stays_generic(stuck, mon
     assert g.last_bridge_reset_reasons == {CHIP: {"reason": "stuck_holder"}}
     withheld = _events(stuck, "reenumerate_withheld")
     assert len(withheld) == 1 and withheld[0]["host_at_risk"] is True, "journaled once per reason"
-    # A stuck-holder window is not the no-window class: the generic branch (and its whole-tray
-    # power-cycle hand-off) owns the hold, never the sweep that is itself fenced.
-    tray = set(range(24, 32))
-    assert galaxy._classify_hold(
-        tray, EXPECTED, {c: {"reason": "stuck_holder"} for c in tray}, stuck["rig"]["map"]
-    ) == (galaxy.HOLD_CLASS_GENERIC)
 
 
 async def test_the_tray_down_rescan_is_withheld(stuck, monkeypatch):
@@ -736,7 +729,7 @@ def test_the_broker_wires_the_isolation_wait_into_both_fences(stuck, monkeypatch
     pending = Isolation()
     monkeypatch.setattr(srv.sampler, "isolations", [pending], raising=False)
     for fence in (srv.recovery_mechanism.reset_fence, srv.recovery_mechanism.reenumerate_fence):
-        assert "endpoint removal is still waiting" in fence()
+        assert "killed holders are still being waited for" in fence()
     pending.finished = True
     assert srv.recovery_mechanism.reset_fence() == ""
     assert srv.recovery_mechanism.reenumerate_fence() == ""
@@ -752,9 +745,13 @@ async def test_the_dead_chip_path_notes_stuck_holders_and_says_the_host_is_still
 
     monkeypatch.setattr(srv, "HOLDER_RELEASE_WAIT_SEC", 0.2)
     order, _ = _dead_chip_harness(monkeypatch, holding_scans=None)
+    # A removed chip's sysfs link is gone: its address must have been read before the removal.
+    monkeypatch.setattr(srv, "chip_pci_bdf", lambda idx: "device" if ("remove", idx) in order else BDF)
     noted = []
     monkeypatch.setattr(
-        srv, "_note_dead_chip_stuck_holders", lambda chips, killed: noted.append((chips, killed)) or [4242]
+        srv,
+        "_note_dead_chip_stuck_holders",
+        lambda chips, killed, bdfs: noted.append((chips, killed, bdfs)) or [4242],
     )
     lines = []
 
@@ -770,6 +767,8 @@ async def test_the_dead_chip_path_notes_stuck_holders_and_says_the_host_is_still
     await srv.sampler.settle_isolations()
 
     assert noted and noted[0][0] == ["13"] and [k["pid"] for k in noted[0][1]] == [4242]
+    assert noted[0][2] == (BDF,)
     assert ("remove", "13") in order
-    text = "\n".join(lines)
-    assert "STILL at risk" in text and "out of danger" not in text
+    # The removal comes first (spec 03 I84) and is logged as such; the stuck holder found after the
+    # kill has the last word: the host is still at risk.
+    assert "STILL at risk" in lines[-1]

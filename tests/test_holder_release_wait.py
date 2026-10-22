@@ -349,18 +349,18 @@ def _dead_chip_harness(monkeypatch, holding_scans):
 
 
 @pytest.mark.asyncio
-async def test_a_dead_chip_is_removed_right_after_its_killed_holder_lets_go(monkeypatch):
+async def test_the_release_wait_follows_the_remove_and_kill_and_ends_when_the_holder_lets_go(monkeypatch):
     order, events = _dead_chip_harness(monkeypatch, holding_scans=2)
     start = time.monotonic()
     await srv.sampler.isolate_dead_chips(["13"])
     await srv.sampler.settle_isolations()
     elapsed = time.monotonic() - start
 
-    removal = order.index(("remove", "13"))
-    assert order.index(("kill", 4242)) < removal
-    assert ("scan", True) in order[order.index(("kill", 4242)) : removal], "the killed holder was waited for"
-    assert order[removal - 1] == ("scan", False), "the endpoint is removed only once the holder let go"
-    assert elapsed < 5, "the removal follows the release at once, not the 30 s bound"
+    kill = order.index(("kill", 4242))
+    assert order.index(("remove", "13")) < kill, "detach first, then kill (spec 03 I84)"
+    assert ("scan", True) in order[kill + 1 :], "the killed holder was waited for"
+    assert order[-1] == ("scan", False), "the wait ends once the holder let go"
+    assert elapsed < 5, "the wait ends at the release, not the 30 s bound"
     assert not [k for k, _ in events if k == "dead_chip_holders_lingering"]
     assert ("chip_isolated", {"chips": ["13"]}) in events
 
@@ -370,7 +370,7 @@ async def test_a_dead_chip_whose_killed_holders_are_gone_costs_one_scan(monkeypa
     order, _events = _dead_chip_harness(monkeypatch, holding_scans=0)
     await srv.sampler.isolate_dead_chips(["13"])
     await srv.sampler.settle_isolations()
-    after_kill = order[order.index(("kill", 4242)) + 1 : order.index(("remove", "13"))]
+    after_kill = order[order.index(("kill", 4242)) + 1 :]
     assert after_kill == [("scan", False)], "a holder already gone adds one scan and no wait"
 
 
@@ -400,7 +400,7 @@ def _spy_scans(monkeypatch, order, seen):
 
     def spy():
         out = inner()
-        if ("kill", 4242) in order and ("remove", "13") not in order:
+        if ("kill", 4242) in order:
             seen.append((srv.fsm.state, srv.fsm.record.dirty, srv._dead_chip_isolation_pending_reason()))
         return out
 
@@ -411,8 +411,8 @@ def _spy_scans(monkeypatch, order, seen):
 @pytest.mark.asyncio
 async def test_the_device_is_held_before_the_release_wait_starts(monkeypatch):
     """Review fix: while a killed holder lingers the fsm is already out of HEALTHY and dirty, so no
-    gate admits the next job onto the dead chip before its endpoint is removed, and every reset is
-    fenced until the removal ran (spec 03 I19)."""
+    gate admits the next job, and every reset is fenced until the wait and the stuck-holder check
+    ran (spec 03 I19)."""
     monkeypatch.setattr(srv, "HOLDER_RELEASE_WAIT_SEC", 0.4)
     order, _events = _dead_chip_harness(monkeypatch, holding_scans=None)
     fsm_healthy(srv)
@@ -426,9 +426,9 @@ async def test_the_device_is_held_before_the_release_wait_starts(monkeypatch):
     for state, dirty, fence in seen:
         assert state is not ServerState.HEALTHY, "held for the whole release wait"
         assert dirty, "dirty for the whole release wait: only a reset and the full check release it"
-        assert "endpoint removal is still waiting" in fence, "no reset runs under the pending removal"
+        assert "killed holders are still being waited for" in fence, "no reset runs under the pending wait"
     assert ("remove", "13") in order
-    assert srv._dead_chip_isolation_pending_reason() == "", "the fence lifts once the removal ran"
+    assert srv._dead_chip_isolation_pending_reason() == "", "the fence lifts once the wait ended"
     assert srv.fsm.record.dirty
 
 
@@ -436,12 +436,12 @@ async def test_the_device_is_held_before_the_release_wait_starts(monkeypatch):
 async def test_the_release_wait_runs_off_the_sampler_loop(monkeypatch):
     """Review fix: the bounded wait does not stall the sampler. The loop keeps ticking and keeps
     driving the hold deadline (the 10-min ladder, spec 04 I76) and the other chips' dead-chip check
-    while the removal waits; the removal still follows the bound."""
+    while the release wait runs; the wait still runs to its bound."""
     from tt_device_mcp import telemetry
 
     monkeypatch.setattr(srv, "HOLDER_RELEASE_WAIT_SEC", 1.5)
     monkeypatch.setattr(telemetry, "SAMPLE_INTERVAL_SEC", 0.02)
-    order, _events = _dead_chip_harness(monkeypatch, holding_scans=None)
+    order, events = _dead_chip_harness(monkeypatch, holding_scans=None)
     sample = {"0": [1], "13": [telemetry.ALL_ONES]}
     monkeypatch.setattr(srv, "chip_sample", lambda: sample)
     monkeypatch.setattr(srv, "append_trace", lambda s: None)
@@ -461,12 +461,12 @@ async def test_the_release_wait_runs_off_the_sampler_loop(monkeypatch):
         killed_at = time.monotonic()
         ticks, checks = srv.sampler.last_tick, len(deadline_checks)
         await asyncio.sleep(0.5)
-        assert ("remove", "13") not in order, "the removal still waits for the killed holder"
+        assert srv._dead_chip_isolation_pending_reason(), "the wait for the killed holder is still pending"
         assert srv.sampler.last_tick > ticks, "the sampler kept ticking during the wait"
         assert len(deadline_checks) > checks, "the hold-deadline check kept running during the wait"
         await srv.sampler.settle_isolations()
-        assert ("remove", "13") in order
-        assert time.monotonic() - killed_at >= 1.0, "the removal followed the bound"
+        assert [f for k, f in events if k == "dead_chip_holders_lingering"], "the wait ran to its bound"
+        assert time.monotonic() - killed_at >= 1.0, "the wait ended at the bound"
         assert order.count(("kill", 4242)) == 1, "the chip is isolated once, not once per pass"
     finally:
         loop_task.cancel()

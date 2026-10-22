@@ -1167,7 +1167,7 @@ _recovery_deps = RecoveryDeps(
     health_event=lambda kind, **f: health_event(kind, **f),
     kill_device_holders=lambda reason: _kill_device_holders(reason),
     wait_device_released=lambda pids: wait_device_released(pids, HOLDER_RELEASE_WAIT_SEC),
-    note_stuck_holders=lambda chips, killed: _note_dead_chip_stuck_holders(chips, killed),
+    note_stuck_holders=lambda chips, killed, bdfs: _note_dead_chip_stuck_holders(chips, killed, bdfs),
     stuck_holder_pids=lambda: {f.pid for f in _dead_chip_stuck_leftovers()},
     owe_device_pollers=lambda reason: _owe_device_pollers(reason),
     read_inflight_heartbeats=lambda only: read_heartbeats(only=only),
@@ -10269,15 +10269,16 @@ def _leftover_fault_class() -> str:
     return DEAD_CHIP_STUCK_CLASS if _leftover_dead_chip else "J-unkillable-leftover"
 
 
-def _note_dead_chip_stuck_holders(chips: list, killed: list) -> list[int]:
+def _note_dead_chip_stuck_holders(chips: list, killed: list, bdfs: Optional[tuple] = None) -> list[int]:
     """The dead-chip path's check after its release wait (spec 04 I77): each pid it killed that is
     still alive stuck in the kernel (state D or SIGKILL pending) with a /dev/tenstorrent fd or a
     mapping of the dead chips' node or BARs (unreadable counts as held) is registered as a leftover,
     journaled ``dead_chip_holder_stuck`` with host_at_risk, and paged at once. The I70 episode opens
-    with it. Returns the stuck pids. Never raises."""
+    with it. ``bdfs``: the chips' PCI addresses, read before their removal (None: read them now).
+    Returns the stuck pids. Never raises."""
     global _dead_chip_page_pending
     label = DEAD_CHIP_LABEL_PREFIX + ",".join(str(c) for c in chips)
-    bdfs = _dead_chip_bdfs(chips)
+    bdfs = _dead_chip_bdfs(chips) if bdfs is None else tuple(bdfs)
     stuck: list[ReapedLeftover] = []
     for k in killed:
         pid = k.get("pid") if isinstance(k, dict) else None
@@ -10491,14 +10492,15 @@ def _dead_chip_stuck_leftovers() -> list[ReapedLeftover]:
 
 
 def _dead_chip_isolation_pending_reason() -> str:
-    """Why no reset may run yet (spec 03 I19): a dead chip's endpoint removal is still waiting, off
-    the sampler, for the holders it killed to let go. The device is already dirty; the wait is
-    bounded by HOLDER_RELEASE_WAIT_SEC, then the removal runs. '' when none is pending."""
+    """Why no reset may run yet (spec 03 I19): the dead-chip path is still waiting, off the sampler,
+    for the holders it killed (after the removal) to let go, and its stuck-holder check (spec 04 I77)
+    has not run. The device is already dirty; the wait is bounded by HOLDER_RELEASE_WAIT_SEC. ''
+    when none is pending."""
     pending = getattr(sampler, "isolations", None) or ()
     if not any(not t.done() for t in pending):
         return ""
     return (
-        "a dead chip's endpoint removal is still waiting for its killed holders to let go "
+        "a dead chip's killed holders are still being waited for, before the stuck-holder check "
         f"(at most {HOLDER_RELEASE_WAIT_SEC}s, spec 03 I19)"
     )
 

@@ -322,8 +322,8 @@ class RecoveryDeps:
     wait_device_released: Optional[Callable[[list], Awaitable[set]]] = None
     # Spec 04 I77: names each killed pid that is stuck in the kernel still referencing the dead
     # chip(s), journals host_at_risk, pages, and fences every re-enumerating rung while it lives.
-    # Returns the stuck pids.
-    note_stuck_holders: Optional[Callable[[list, list], list]] = None
+    # Returns the stuck pids. Its third argument: the chips' PCI addresses, read before the removal.
+    note_stuck_holders: Optional[Callable[[list, list, tuple], list]] = None
     # Spec 04 I77: the registered dead-chip stuck holders still stuck, by pid, on a fresh /proc read.
     # The I70 rung's 'gone' check counts them as still holding: one with only a removed chip's BAR
     # or deleted node mapped is not in the /dev/tenstorrent holder scan.
