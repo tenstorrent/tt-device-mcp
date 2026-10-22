@@ -84,6 +84,14 @@ before relying on it:
    job under the `systemd-run --scope` wrapper; if a scope lingers, switch the
    kill path to `systemctl stop` the transient unit.
 
+## Autoupdate pacing
+
+`tt-device-autoupdate.sh` applies a new sha of the tracked branch only when the broker is idle, at
+most once per 1800 s, and only once the branch has been quiet for 600 s or the oldest unapplied sha
+has waited 3600 s, whichever comes first. A burst of pushes thus costs about one broker restart (and
+one startup fabric check) per hour, not one per push; a lone push waits 10 min. A broken broker gets
+a new sha at once. Spec 08 I21.
+
 ## Slurm
 
 `deploy/install-tt-device-broker.sh` stages both hooks into `/opt/tt-device-broker/slurm/`;
