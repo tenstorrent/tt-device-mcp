@@ -33,10 +33,12 @@ def _cut(text, start, end):
 _HEALTHY = '{"status":"ok","held":false,"fsm_state":"healthy","fsm_why":null}'
 
 
-def _lap(tmp_path, *, now, sha, interval=None, active="active", nrestarts="0", health=_HEALTHY):
-    """One lap at fake time `now` that has just resolved `sha`: the already-current check and the
-    rate limit, then (as if every gate passed) the tail that marks the sha current and restarts.
-    `active`, `nrestarts` and `health` are what systemd and the broker's /health report."""
+def _lap(tmp_path, *, now, sha, interval=None, quiet=0, active="active", nrestarts="0", health=_HEALTHY):
+    """One lap at fake time `now` that has just resolved `sha`: the already-current check, burst
+    coalescing and the rate limit, then (as if every gate passed) the tail that marks the sha
+    current and restarts. `active`, `nrestarts` and `health` are what systemd and the broker's
+    /health report. `quiet` is TTDEV_APPLY_QUIET_SEC: 0 (coalescing off) for the rate-limit tests
+    here, None for the script's default (tests/test_deploy_autoupdate_coalesce.py)."""
     quoted_health = health.replace("'", "'\\''")  # a /health body may carry single quotes
     text = _SCRIPT.read_text()
     head = _cut(text, 'installed_sha="$(cat "$STATE"', "INHIBIT=/run/")
@@ -63,6 +65,8 @@ logger() {{ :; }}
     env = {"PATH": "/usr/bin:/bin", "TTDEV_LOG_DIR": str(tmp_path / "logs")}
     if interval is not None:
         env["TTDEV_MIN_APPLY_INTERVAL_SEC"] = str(interval)
+    if quiet is not None:
+        env["TTDEV_APPLY_QUIET_SEC"] = str(quiet)
     done = subprocess.run(["bash", "-c", prelude + head + tail], capture_output=True, text=True, env=env, timeout=30)
     assert done.returncode == 0, done.stderr
     lines = restarts.read_text().splitlines() if restarts.exists() else []

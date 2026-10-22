@@ -90,7 +90,8 @@ hold_write() {{ :; }}
 count_busy() {{ kids=0; holders=0; scopes=0; queued=0; busy=0; }}
 {stand_ins}
 """
-    env = {"PATH": "/usr/bin:/bin", "TTDEV_LOG_DIR": str(logs), **(env or {})}
+    # Coalescing off (I21): these laps are about the recovery gate, and the /health answers are in call order.
+    env = {"PATH": "/usr/bin:/bin", "TTDEV_LOG_DIR": str(logs), "TTDEV_APPLY_QUIET_SEC": "0", **(env or {})}
     done = subprocess.run(["bash", "-c", prelude + body], capture_output=True, text=True, env=env, timeout=60)
     lines = trace.read_text().splitlines() if trace.exists() else []
     log = logs / "autoupdate.log"

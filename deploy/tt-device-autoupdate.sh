@@ -11,6 +11,9 @@
 #   TTDEV_VENV=/path/to/broker/venv    # venv we pip-install into
 #   TTDEV_MIN_APPLY_INTERVAL_SEC=1800  # optional: min seconds between applies (default 1800; 0 = off)
 #
+# A new sha also waits for its branch to go quiet (600 s) or for the oldest unapplied sha to
+# have waited 3600 s, whichever comes first (spec 08 I21, burst coalescing). Code defaults.
+#
 # THE SOURCE IS NOT CONFIGURABLE (spec 08 I16). It is the constant below, and the only
 # lever an operator has is which branch of it to track. That is what keeps this path
 # credential-free by construction rather than by convention: a source that can be set can
@@ -86,7 +89,8 @@ remote_sha="$(git -C "$CLONE" rev-parse --verify -q "refs/remotes/origin/$BR" ||
     || { echo "autoupdate: $REPO has no branch $BR" >&2; exit 0; }
 
 installed_sha="$(cat "$STATE" 2>/dev/null || true)"
-[ "$installed_sha" = "$remote_sha" ] && exit 0   # already current
+# Already current. A coalescing record (I21, below) belongs to an unapplied sha: with none left, it goes.
+if [ "$installed_sha" = "$remote_sha" ]; then rm -f "$ROOT/pending-head" 2>/dev/null; exit 0; fi
 
 echo "autoupdate: $BR ${installed_sha:0:9} -> ${remote_sha:0:9} via $src_desc" >&2
 
@@ -168,6 +172,54 @@ broker_broken() {
         echo "fails its health check (fsm $(printf '%s' "$h" | grep -Eo '"fsm_state": *"[a-z]*"' | grep -Eo '[a-z]*"$' | tr -d '"'))"
     fi
 }
+# Burst coalescing (spec 08 I21). The interval above paces restarts but not bursts: a branch that
+# moves every few minutes for hours finds a new sha each time the interval ends, so every box
+# restarts (and runs its full startup check, fabric included) once per interval for the whole
+# burst. So a new sha also waits for the branch to go quiet: it applies once the head has stayed
+# the same for APPLY_QUIET, or once the oldest sha not yet applied has waited APPLY_BOUND,
+# whichever comes first. A lone push waits APPLY_QUIET; a burst becomes one restart per
+# APPLY_BOUND at most, then one onto its last sha APPLY_QUIET after it ends. The interval, the
+# gates below and the startup check after the restart are unchanged; a broken broker (I21's
+# reasons) applies at once. Every lap records the head it saw before any gate can exit, so a sha
+# seen while the interval or another gate defers still counts its time. The record is
+# "<first_seen> <sha> <sha_seen>" in $ROOT/pending-head, removed by an apply and when the branch
+# is back at the installed sha; a missing, bad or future time counts from now.
+# Defaults: 600 s quiet sits above the gap between merges in a landing burst (a few minutes), so
+# a burst is one apply, and adds 10 min to a lone fix; 3600 s bound is twice the interval, so a
+# continuous burst restarts at most once an hour, and no sha waits longer than that plus a lap and
+# the drain (the interval counts from the last apply, before the first sha was seen, so it ends
+# within the bound). TTDEV_APPLY_QUIET_SEC=0 turns coalescing off.
+PENDING_HEAD="$ROOT/pending-head"
+APPLY_QUIET="${TTDEV_APPLY_QUIET_SEC:-600}"
+APPLY_BOUND="${TTDEV_APPLY_BOUND_SEC:-3600}"
+if [ "$APPLY_QUIET" -gt 0 ] 2>/dev/null; then
+    [ "$APPLY_BOUND" -gt 0 ] 2>/dev/null || APPLY_BOUND=3600
+    now="$(date +%s)"
+    p_first=""; p_sha=""; p_seen=""
+    { read -r p_first p_sha p_seen < "$PENDING_HEAD"; } 2>/dev/null || true
+    case "$p_first" in ''|*[!0-9]*) p_first=$now ;; *) p_first=$(( 10#$p_first )) ;; esac
+    case "$p_seen" in ''|*[!0-9]*) p_seen=$now ;; *) p_seen=$(( 10#$p_seen )) ;; esac
+    [ "$p_first" -le "$now" ] || p_first=$now
+    [ "$p_seen" -le "$now" ] || p_seen=$now
+    [ "$p_sha" = "$remote_sha" ] || p_seen=$now
+    { echo "$p_first $remote_sha $p_seen" > "$PENDING_HEAD.$$" && mv -f "$PENDING_HEAD.$$" "$PENDING_HEAD"; } 2>/dev/null || true
+    quiet_left=$(( p_seen + APPLY_QUIET - now ))
+    bound_left=$(( p_first + APPLY_BOUND - now ))
+    if [ "$quiet_left" -gt 0 ] && [ "$bound_left" -gt 0 ]; then
+        la=""; { read -r la < "$LAST_APPLY"; } 2>/dev/null || true
+        case "$la" in ''|*[!0-9]*) age=0 ;; *) age=$(( now - 10#$la )) ;; esac
+        [ "$age" -ge 0 ] || age=0
+        broken="$(broker_broken "$age")"
+        if [ -z "$broken" ]; then
+            left=$quiet_left; [ "$bound_left" -lt "$left" ] && left=$bound_left
+            echo "autoupdate: coalescing: head ${remote_sha:0:9} seen $(( now - p_seen ))s ago (quiet ${APPLY_QUIET}s), oldest unapplied $(( now - p_first ))s ago (bound ${APPLY_BOUND}s); applies in ${left}s if the branch stays put" >&2
+            au_log deferred "burst coalescing: head unchanged $(( now - p_seen ))s (quiet ${APPLY_QUIET}s), oldest unapplied $(( now - p_first ))s (bound ${APPLY_BOUND}s); apply_by=$(date -d "@$(( now + left ))" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || echo $(( now + left )))"
+            exit 0
+        fi
+        echo "autoupdate: coalescing skipped: the broker $broken; ${remote_sha:0:9} goes on to the rate limit" >&2
+    fi
+fi
+
 if [ "$MIN_APPLY" -gt 0 ] 2>/dev/null; then
     last=""; { read -r last < "$LAST_APPLY"; } 2>/dev/null || true
     now="$(date +%s)"
@@ -497,6 +549,7 @@ if [ -z "$why_restart" ]; then
     printf '%s\n' "$remote_sha" > "$STATE"
     # I23: the deferral clock belongs to an update not yet applied; a later one starts its own.
     rm -f "$RECOVERY_PENDING" 2>/dev/null || true
+    rm -f "$ROOT/pending-head" 2>/dev/null || true   # I21 coalescing: so does the bound
     echo "autoupdate: ${installed_sha:0:9} -> ${remote_sha:0:9} changes only ${NO_RESTART_PATHS}; tree and installed.sha moved, broker not restarted" >&2
     EVENTS="${TT_DEVICE_MCP_HEALTH_DIR:-/var/lib/tt-device-broker/health}/health_events.jsonl"
     now="$(date +%s.%N)"
@@ -611,6 +664,7 @@ recovery_gate || :
 [ -n "$recovery_why" ] \
     && echo "autoupdate: broker recovery began during the install ($recovery_why); restarting, the install has changed the broker's code" >&2
 echo "$remote_sha" > "$STATE"
+rm -f "$ROOT/pending-head" 2>/dev/null || true   # I21 coalescing: the next sha starts its own bound
 
 date +%s > "$LAST_APPLY" 2>/dev/null || true   # I21: the rate limit counts from this restart
 systemctl restart tt-device-broker

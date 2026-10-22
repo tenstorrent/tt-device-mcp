@@ -130,7 +130,13 @@ systemctl() {{
 curl() {{ printf '%s' '{health}'; }}
 {stand_ins}
 """
-    run_env = {**_GIT_ENV, "HOME": str(tmp), "TTDEV_HOLD_SETTLE_SEC": "0", "TTDEV_LOG_DIR": str(tmp / "logs")}
+    run_env = {
+        **_GIT_ENV,
+        "HOME": str(tmp),
+        "TTDEV_HOLD_SETTLE_SEC": "0",
+        "TTDEV_APPLY_QUIET_SEC": "0",
+        "TTDEV_LOG_DIR": str(tmp / "logs"),
+    }
     done = subprocess.run(["bash", "-c", prelude + body], capture_output=True, text=True, env=run_env, timeout=60)
     lines = trace.read_text().splitlines() if trace.exists() else []
     trace.unlink(missing_ok=True)
