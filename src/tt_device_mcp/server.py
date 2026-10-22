@@ -8486,6 +8486,10 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     # startup gate took the device; the gate's own run (a device op no sampler verdict reads) counts in
     # the hold's 10-min clock, so a hold its failing verdict opens dates back to then (spec 03 I75).
     deferred_until = _startup_verify_ready_wall if _hold_startup_deferred else None
+    # A re-adopted job past its stated end ended the deferral while it still runs: its service is spent,
+    # so the hold counts from the restart, as any startup hold, and the bound pages the job at once.
+    if _hold_startup_deferred and deferred_until is None and _readopted_job_overran() is not None:
+        deferred_until = _startup_verify_started_wall
     _hold_startup_deferred = False
     if reason and not device_hold_logged:
         device_hold_logged = True
@@ -9080,7 +9084,7 @@ def _forced_run_route(kind: Optional[str], age: float, mono: Optional[float] = N
     the device reads (a reset scope, the off-bus count, a no-reset hold, a leftover holder) stay in
     the run."""
     if _startup_verify_owns_hold(kind, mono):
-        ready = _startup_verify_ready_at
+        ready = _readopted_jobs_end_mono()
         now_mono = time.monotonic() if mono is None else mono
         # Not stopped waiting on the re-adopted jobs yet: that ends within one scope poll.
         left = (ready if ready is not None else now_mono + _SCOPE_POLL_SEC) + STARTUP_VERIFY_DEFER_MAX_SEC - now_mono
@@ -9217,14 +9221,22 @@ def _bound_tenant_blocker(bound: bool) -> Optional[dict]:
         blocker = galaxy_recovery._tenant_blocker(scan, force=True, waive_job=waive_job)
     except Exception:  # noqa: BLE001 - naming the blocker never decides whether one holds
         blocker = None
+    overran = _readopted_job_overran()
+    if overran is not None and (blocker is None or blocker.get("blocker") == "job_running"):
+        # Spec 03 I75: a re-adopted job past its stated end is no longer service; name it.
+        job, end = overran
+        blocker = {"blocker": "job_running", "job_id": job.id, "service_end": end.isoformat(timespec="seconds")}
     return blocker or {"blocker": "tenant"}
 
 
 def _describe_bound_blocker(blocker: dict) -> str:
     try:
-        return galaxy_recovery._describe_blocker(blocker)
+        desc = galaxy_recovery._describe_blocker(blocker)
     except (KeyError, TypeError, AttributeError):
         return "a tenant holds the device"
+    if blocker.get("job_id"):
+        desc += f" (re-adopted job {blocker['job_id']}, past its stated end {blocker.get('service_end')})"
+    return desc
 
 
 def _hold_bound_tenant_blocked(blocker: dict, log) -> None:
@@ -9298,13 +9310,22 @@ def _hold_bound_mark_sec() -> float:
 def hold_bound_deadline(now: Optional[datetime] = None) -> Optional[datetime]:
     """When the open hold escalates under the 10-min bound (spec 04 I76), whatever its kind: the hold's
     start + the bound's next ladder mark (_hold_bound_mark_sec), or the end of a running power-cycle
-    cooldown (I65), whichever is later. None when nothing is held or the episode clock cannot be read."""
+    cooldown (I65), whichever is later. While the startup gate still has the startup hold after re-adopted
+    jobs (spec 03 I75), the later of that and the jobs' end + STARTUP_VERIFY_DEFER_MAX_SEC: the gate's
+    full check runs first, the ladder no later than that. None when nothing is held or the episode clock
+    cannot be read."""
     if not device_hold_episode_since:
         return None
     try:
         deadline = datetime.fromisoformat(device_hold_episode_since) + timedelta(seconds=_hold_bound_mark_sec())
     except ValueError:
         return None
+    if _startup_verify_owns_hold():
+        ended = _readopted_jobs_end()
+        if ended is not None:
+            deadline = max(
+                deadline, ended.replace(tzinfo=deadline.tzinfo) + timedelta(seconds=STARTUP_VERIFY_DEFER_MAX_SEC)
+            )
     cd = recovery_mechanism.power_cycle_cooldown_state if recovery_mechanism is not None else None
     if cd and cd.get("until") and cd["until"] > (now.timestamp() if now else time.time()):
         deadline = max(deadline, datetime.fromtimestamp(cd["until"], deadline.tzinfo))
@@ -9330,6 +9351,8 @@ def _hold_bound_health(now: Optional[datetime] = None) -> Optional[dict]:
     # After the bound's ladder, the host rung is next: now, or at the end of the cooldown it waits on.
     step = "power-cycle" if lad is not None and (cooling or cyc is None or cyc < lad) else "ladder"
     out = {"bound_sec": int(ceiling), "deadline": deadline, "held_age_sec": int(age), "next_step": step}
+    if _startup_verify_owns_hold():
+        out["next_step"] = "startup_check"  # spec 03 I75: the full check first, the ladder if it fails
     if _hold_bound_tenant_blocker is not None:
         # The one hold past the bound with no deadline of its own: it waits for the tenant to leave.
         out["next_step"] = "tenant_blocked"
@@ -11941,12 +11964,17 @@ async def cleanup_finished_jobs():
     completed jobs in memory indefinitely.
 
     Uses lock to prevent race conditions with concurrent job state access.
+
+    A re-adopted job stays while its scope does (`readopted_scopes`): its ``finished_at`` bounds the
+    spec 03 I75 stand-down, and without it the stand-down kept the hold's ladder off for good.
     """
     now = datetime.now()
     to_remove = []
 
     async with get_lock():
         for job_id, job in jobs.items():
+            if job_id in readopted_scopes:
+                continue
             if job.status in (
                 JobStatus.COMPLETED,
                 JobStatus.FAILED,
@@ -14303,6 +14331,8 @@ def _startup_hold_behind_readopted_job() -> bool:
         return False
     if any((job := jobs.get(jid)) is None or job.status is not JobStatus.RUNNING for jid in readopted_scopes):
         return False
+    if _readopted_job_overran() is not None:
+        return False  # past its stated end the job's run is no longer service: the hold opens now
     if _device_liveness_reason():
         return False
     if _hold_episode_restorable:
@@ -14327,8 +14357,109 @@ def _startup_verify_gate_pending(mono: Optional[float] = None) -> bool:
         return False
     if fsm.state is not ServerState.RECOVERING or fsm.record.why != "startup_unverified":
         return False
-    ready = _startup_verify_ready_at
-    return ready is None or (time.monotonic() if mono is None else mono) - ready < STARTUP_VERIFY_DEFER_MAX_SEC
+    end = _readopted_jobs_end_mono()
+    return end is None or (time.monotonic() if mono is None else mono) - end < STARTUP_VERIFY_DEFER_MAX_SEC
+
+
+def _readopted_jobs_end_mono() -> Optional[float]:
+    """The re-adopted jobs' end on the monotonic clock, by which the I75 stand-down is bounded: when the
+    startup gate stopped waiting on their scopes, or, while it still waits on a scope that outlives its
+    job (a killed job's scope still exiting), that job's ``finished_at``. Without that second clock a
+    scope that never ended kept the stand-down, and so the 10-min bound's ladder, off the hold for good.
+    None while no re-adopted job's end is known."""
+    if _startup_verify_ready_at is not None:
+        return _startup_verify_ready_at
+    ended = _readopted_jobs_ended_at()
+    return None if ended is None else time.monotonic() - (datetime.now() - ended).total_seconds()
+
+
+def _readopted_jobs_end() -> Optional[datetime]:
+    """When the re-adopted jobs ended, for the I75 stand-down's bound: the startup gate's own clock once
+    it stopped waiting on their scopes, else the jobs' ``finished_at``; None while unknown."""
+    if _startup_verify_ready_at is not None:
+        return datetime.now() - timedelta(seconds=time.monotonic() - _startup_verify_ready_at)
+    return _readopted_jobs_ended_at()
+
+
+def _readopted_jobs_ended_at() -> Optional[datetime]:
+    """When the last job re-adopted by this broker start whose scope has not been reaped yet ended
+    (its ``finished_at``), or None when none is known to have ended or one still runs. A job no longer
+    in ``jobs`` has ended at an unknown time: it counts from the startup gate's start, so the I75
+    stand-down keeps its bound."""
+    ended: Optional[datetime] = None
+    for jid in readopted_scopes:
+        job = jobs.get(jid)
+        if job is None:
+            if _startup_verify_started_wall is None:
+                return None
+            at = datetime.fromtimestamp(_startup_verify_started_wall)
+            ended = at if ended is None or at > ended else ended
+            continue
+        if job.status == JobStatus.RUNNING or not job.finished_at:
+            return None
+        try:
+            at = datetime.fromisoformat(job.finished_at)
+        except ValueError:
+            return None
+        ended = at if ended is None or at > ended else ended
+    return ended
+
+
+# systemd's default stop timeout for a unit that sets none (DefaultTimeoutStopSec): the longest the
+# blocking `systemctl stop` that ends _terminate_scope's ladder waits before systemd SIGKILLs the scope.
+SCOPE_STOP_TIMEOUT_SEC = 90
+# Past its timeout the broker has stopped a re-adopted job's scope within this: the monitor's poll
+# (_SCOPE_POLL_SEC, counted twice), then SIGINT + GRACEFUL_KILL_GRACE_SEC + the reap's `systemctl stop`
+# (_terminate_scope), or a preempted job's PREEMPT_GRACE_SEC window and its SIGKILL (_preempt_job), plus
+# a margin for the finalize. 180 s. A job still running past it outlived the broker's own SIGKILL.
+READOPTED_SERVICE_GRACE_SEC = (
+    2 * _SCOPE_POLL_SEC + max(GRACEFUL_KILL_GRACE_SEC + SCOPE_STOP_TIMEOUT_SEC, PREEMPT_GRACE_SEC) + 20
+)
+
+
+def _readopted_job_service_end(job: Job) -> Optional[datetime]:
+    """The stated end of a re-adopted job's run as service on the startup hold (spec 03 I75): its start +
+    its timeout (at most MAX_TIMEOUT_SEC) + READOPTED_SERVICE_GRACE_SEC, which covers the broker's whole
+    stop of a job past its timeout (SIGINT, its grace, the reap). A job with no known start (a placeholder
+    rebuilt without its log) counts from the startup gate's start, the broker start it predates. A
+    preemptable job past its soft limit with nothing queued may run on, but no longer as service. None
+    when no clock can be read."""
+    started = job.started_at or _wall_iso(_startup_verify_started_wall) or device_hold_episode_since
+    try:
+        start = datetime.fromisoformat(started)
+    except (TypeError, ValueError):
+        return None
+    run = min(job.timeout_sec or DEFAULT_TIMEOUT_SEC, MAX_TIMEOUT_SEC)
+    return start.replace(tzinfo=None) + timedelta(seconds=run + READOPTED_SERVICE_GRACE_SEC)
+
+
+def _readopted_running_on_startup_hold() -> list[tuple[Job, Optional[datetime]]]:
+    """(job, stated end) of each job this broker start re-adopted that still runs on the startup hold."""
+    if fsm.state is not ServerState.RECOVERING or fsm.record.why != "startup_unverified":
+        return []
+    return [
+        (jobs[jid], _readopted_job_service_end(jobs[jid]))
+        for jid in readopted_scopes
+        if jid in jobs and jobs[jid].status == JobStatus.RUNNING
+    ]
+
+
+def _readopted_service_until(now: Optional[datetime] = None) -> Optional[datetime]:
+    """The stated end of a re-adopted job still serving the startup hold, or None when none does."""
+    at = (now or datetime.now()).replace(tzinfo=None)
+    ends = [end for _, end in _readopted_running_on_startup_hold() if end is not None and end > at]
+    return max(ends, default=None)
+
+
+def _readopted_job_overran(now: Optional[datetime] = None) -> Optional[tuple[Job, datetime]]:
+    """A re-adopted job still running on the startup hold past its stated end, with that end, or None."""
+    if _readopted_service_until(now) is not None:
+        return None
+    at = (now or datetime.now()).replace(tzinfo=None)
+    for job, end in _readopted_running_on_startup_hold():
+        if end is None or end <= at:
+            return job, end or at
+    return None
 
 
 def _startup_verify_view() -> Optional[dict]:
