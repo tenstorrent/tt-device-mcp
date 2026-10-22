@@ -6159,6 +6159,12 @@ def _record_previous_boot_error() -> None:
         why = escalation.get("reason") or "device wedged, reset ineffective"
         reboot_owner = f"[broker]{action}"
         reboot_why = f"{action.replace('-', ' ')} — broker auto-recovery ({why})"
+        if escalation.get("cycle_refuted"):
+            # Spec 04 I88: the BMC refuted the cycle; the host only rebooted warm.
+            reboot_why = (
+                f"warm reboot — the broker's power cycle did not happen (BMC restart cause "
+                f"{escalation['cycle_refuted']}; {why})"
+            )
         reboot_status = action
         _consume_pre_down_escalation_row(action)
     else:

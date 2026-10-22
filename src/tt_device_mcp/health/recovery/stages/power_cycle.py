@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -217,27 +218,55 @@ def preflight_argv(argv: list) -> Optional[list]:
     return bmc_query_argv(argv, ["mc", "info"])
 
 
-# `ipmitool chassis restart_cause` answers that mean the power really went off and on (IPMI 2.0 Get
-# System Restart Cause). A warm reboot is none of these: BMCs report it as "unknown" or a reset.
+# IPMI 2.0 Get System Restart Cause (NetFn chassis 0x00, cmd 0x07, table 28-11): the low nibble of the
+# first response byte. ipmitool's `chassis restart_cause` names only 0x0-0x9 and prints "invalid" for
+# the rest, so the raw code is read and named here. 0xc-0xf are reserved.
+RESTART_CAUSES = {
+    0x0: "unknown",
+    0x1: "chassis power control command",
+    0x2: "reset via pushbutton",
+    0x3: "power-up via pushbutton",
+    0x4: "watchdog expired",
+    0x5: "oem",
+    0x6: "power-up due to always-restore power policy",
+    0x7: "power-up due to restore-previous power policy",
+    0x8: "reset via pef",
+    0x9: "power-cycle via pef",
+    0xA: "soft reset",
+    0xB: "power-up via rtc wakeup",
+}
+# The causes that mean the power really went off and on. A warm reboot is none of these: BMCs report
+# it as "unknown", a soft reset or another reset.
 CYCLE_RESTART_CAUSES = (
     "chassis power control command",
     "power-cycle via pef",
     "power-up via pushbutton",
     "power-up due to always-restore power policy",
     "power-up due to restore-previous power policy",
+    "power-up via rtc wakeup",
 )
+
+
+_HEX_BYTES = re.compile(r"^\s*[0-9a-fA-F]{2}(\s+[0-9a-fA-F]{2})*\s*$")
 
 
 def restart_cause_is_cycle(cause: str) -> bool:
     return cause.strip().lower() in CYCLE_RESTART_CAUSES
 
 
+def restart_cause_is_mapped(cause: str) -> bool:
+    """Whether ``cause`` is one the IPMI spec defines (``unknown`` included); an unmapped code
+    (``unmapped code 0x0c``) says nothing about how the host restarted."""
+    return cause.strip().lower() in RESTART_CAUSES.values()
+
+
 def read_restart_cause(argv: list) -> Optional[str]:
-    """The BMC's last system restart cause, lower case, for the BMC the cycle command ``argv`` drives
-    (``ipmitool chassis restart_cause``, read-only, bounded by PREFLIGHT_TIMEOUT_SEC); None when there
-    is no query to derive, the BMC does not answer or does not support it (some answer "Unspecified
-    error")."""
-    probe = bmc_query_argv(argv, ["chassis", "restart_cause"])
+    """The BMC's last system restart cause, lower case, for the BMC the cycle command ``argv`` drives:
+    the raw Get System Restart Cause (``ipmitool [options] raw 0x00 0x07``, read-only, bounded by
+    PREFLIGHT_TIMEOUT_SEC) named from :data:`RESTART_CAUSES`, or ``unmapped code 0x..`` for a
+    reserved code. None when there is no query to derive, the BMC does not answer, does not support
+    it (some answer "Unspecified error") or the answer does not parse."""
+    probe = bmc_query_argv(argv, ["raw", "0x00", "0x07"])
     if probe is None:
         return None
     exe = _resolve_command(probe[0])
@@ -246,11 +275,12 @@ def read_restart_cause(argv: list) -> Optional[str]:
     rc, out = _run_step([exe, *probe[1:]], PREFLIGHT_TIMEOUT_SEC)
     if rc != 0:
         return None
-    for line in out.splitlines():
-        head, sep, cause = line.partition(":")
-        if sep and head.strip().lower() == "system restart cause" and cause.strip():
-            return cause.strip().lower()
-    return None
+    # The response bytes are the last all-hex line (stdout follows any stderr warning).
+    lines = [ln.split() for ln in (out or "").splitlines() if _HEX_BYTES.match(ln)]
+    if not lines:
+        return None
+    code = int(lines[-1][0], 16) & 0x0F
+    return RESTART_CAUSES.get(code, f"unmapped code 0x{code:02x}")
 
 
 def _resolve_command(cmd: str) -> Optional[str]:

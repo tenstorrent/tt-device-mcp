@@ -328,6 +328,23 @@ def test_boot_merge_attributes_the_escalation_only_on_the_boots_first_broker_sta
     assert "boot attributed to a broker-fired reboot" in next_boot.record.detail
 
 
+def test_boot_merge_names_a_refuted_cycle_a_warm_reboot(tmp_path):
+    """Spec 04 I88: the BMC refuted the broker's power cycle, so this boot was a warm reboot; the
+    attribution must not say a broker-fired power-cycle brought it up. The clause still strips on carry."""
+    f = ServerFsm(tmp_path / "fsm.json", current_boot_id="boot-A")
+    f.boot_merge(
+        open_episode=None, attributed_boot={"action": "power-cycle", "at": "T1", "cycle_refuted": "soft reset"}
+    )
+    d = f.record.detail
+    assert "boot attributed to a warm reboot" in d and "BMC restart cause soft reset" in d
+    assert "broker-fired power-cycle recorded" not in d
+    carried = ServerFsm(tmp_path / "fsm2.json", current_boot_id="boot-B")
+    carried.boot_merge(
+        open_episode=FsmRecord(state=ServerState.RECOVERING, why="eth_frozen", detail=d), attributed_boot=None
+    )
+    assert "boot attributed" not in (carried.record.detail or "")
+
+
 def test_on_next_close_fires_once_on_whichever_path_reaches_healthy(tmp_path):
     """A caller pairing an opening event with its close (the startup hold's release row) registers
     once and must hear about the close exactly once — not on a refreshed fault mid-episode, not
