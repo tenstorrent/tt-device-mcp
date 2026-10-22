@@ -15,10 +15,12 @@ from types import SimpleNamespace
 import pytest
 
 from tests.conftest import patch_health_event
+from tests.test_arc_not_ready import _fake_sysfs
 from tests.test_startup_fabric_hugepages import _shortfalls, _startup, _systemctl  # noqa: F401 - the fixtures
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.health.evidence import health_dir
+from tt_device_mcp.health.monitors import heartbeat
 from tt_device_mcp.health.recovery import galaxy
 from tt_device_mcp.health.recovery.base import RESET_RECORD_FILE
 
@@ -63,12 +65,14 @@ def rig(monkeypatch, tmp_path, galaxy_trays):
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: state["scan"])
     monkeypatch.setattr(srv, "read_heartbeats", lambda: dict(state["beats"]))
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
-    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
     monkeypatch.setattr(g.mechanism, "auto_recovery_allowed", lambda action, tenant_active=False, **k: state["allowed"])
     monkeypatch.setattr(g.mechanism, "_journal_auto_recovery_denied", lambda *a, **k: order.append("denied"))
     monkeypatch.setattr(g.mechanism, "mesh_reset_failed_since_release", False)
     monkeypatch.setattr(g.mechanism, "last_reset_rc", None)
     monkeypatch.setattr(g.mechanism, "_reset_record_cache", None)
+    monkeypatch.setattr(g.mechanism, "whole_tray_off", None)  # spec 04 I73 latch: the mechanism is shared
+    monkeypatch.setattr(g.mechanism, "_ac_power_paged", 0.0)
+    monkeypatch.setattr(g.mechanism, "_ac_power_logged", set())
     monkeypatch.setattr(galaxy, "TRAY_DOWN_RESCAN_SETTLE_SEC", 0)
     monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
     # No operator check installed or configured, and no stand-back marker: nothing objects.
@@ -99,7 +103,7 @@ def rig(monkeypatch, tmp_path, galaxy_trays):
         g.mechanism.last_reset_rc = 1
         return False
 
-    async def sweep(bitmap, ids, trays, expected, log, do_sbr=True):
+    async def sweep(trays, expected, log, do_sbr=True):
         order.append("sweep")
         state["clock"][0] += SWEEP_SEC
         return True
@@ -110,7 +114,6 @@ def rig(monkeypatch, tmp_path, galaxy_trays):
     monkeypatch.setattr(g, "_reset_and_verify_device", mesh_reset)
     monkeypatch.setattr(g, "_issue_all_resets_back_to_back", sweep)
     monkeypatch.setattr(g, "_verify_device", verify)
-    monkeypatch.setattr(g, "_attempt_ubb_tray_reset", lambda *a, **k: _record(order, "ubb_tray"))
     g.tray_down_episode_end()
     yield state
     g.tray_down_episode_end()
@@ -183,6 +186,7 @@ async def test_an_idle_whole_tray_hold_cycles_with_no_reset(rig, monkeypatch, ph
         ("offbus", None, False),  # before the deadline an unreadable scan still holds
         ("offbus-forced", "job_running", False),
         ("offbus-forced", "tenant", False),
+        ("offbus-forced", "startup_verify", False),  # spec 03 I75: the caller's stand-down, re-read here
     ],
 )
 async def test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_tenant(
@@ -201,8 +205,10 @@ async def test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_ten
         rig["scan"] = HolderScan(holders=[SimpleNamespace(pid=4242, uid=1000)], complete=True)
     rig["beats"] = _beats_without(_off(rig["map"], {2: 8}))
     rig["g"]._td_reset_seen = True  # no prelude: only the guard is under test
-    out = await rig["g"].escalate(phase, [], EXPECTED, lambda m: None)
+    stand_down = (lambda: True) if blocker == "startup_verify" else None
+    out = await rig["g"].escalate(phase, [], EXPECTED, lambda m: None, stand_down=stand_down)
     assert rig["order"] == (["power_cycle"] if cycled else [])
+    assert rig["g"].startup_verify_deferred is (blocker == "startup_verify")
     assert out == (galaxy.OUTCOME_TERMINAL if cycled else galaxy.OUTCOME_WAITING)
     assert "released" not in rig["order"]
 
@@ -453,7 +459,8 @@ def _present(groups: dict) -> dict:
 
 def test_whole_trays_absent_reads_class_a_from_bus_presence_alone():
     def absent(groups, off, expected=EXPECTED, tray_groups=GROUPS):
-        return galaxy._whole_trays_absent(_present(groups), expected, off, tray_groups)
+        present = _present(groups)
+        return galaxy._whole_trays_absent(present, expected, set(range(len(present), len(present) + off)), tray_groups)
 
     assert absent({0x00: 8, 0x40: 8, 0x80: 8}, 8), "one tray (0xC0) with no chip on the bus"
     assert absent({0x40: 8}, 24), "three trays off, one still on"
@@ -462,9 +469,19 @@ def test_whole_trays_absent_reads_class_a_from_bus_presence_alone():
     assert not absent({0x00: 8, 0x40: 8, 0x80: 8, 0xC0: 8}, 8), "every tray full: off-bus chips unexplained"
     assert not absent({0x00: 8, 0x40: 8, 0x80: 8}, 8, tray_groups=()), "no tt-smi tables, no class"
     assert not absent({0x00: 8, 0x40: 8, 0x80: 8}, 8, expected=24), "not a four-tray host"
-    assert not galaxy._whole_trays_absent({0: 0x01, 1: 0x21}, EXPECTED, 30, GROUPS), "a bus in no known group"
-    assert not galaxy._whole_trays_absent({}, EXPECTED, 32, GROUPS), "no chip on the bus is class C's, not A's"
-    assert not galaxy._whole_trays_absent({0: None}, EXPECTED, 31, GROUPS)
+    assert not galaxy._whole_trays_absent({0: 0x01, 1: 0x21}, EXPECTED, set(range(2, 32)), GROUPS), "unknown group"
+    assert not galaxy._whole_trays_absent({}, EXPECTED, set(range(32)), GROUPS), "no chip on the bus is class C's"
+    assert not galaxy._whole_trays_absent({0: None}, EXPECTED, set(range(1, 32)), GROUPS)
+
+
+def test_whole_trays_absent_needs_the_off_bus_ids_to_be_the_missing_ones():
+    """Spec 04 I37 id-set match: matching counts are not enough. A heartbeat read and a sysfs read that raced
+    can name different chips; the presence read then says nothing and the ladder decides."""
+    present = _present({0x00: 8, 0x40: 8, 0x80: 8})  # chips 0-23 on the bus
+    assert galaxy._whole_trays_absent(present, EXPECTED, {str(i) for i in range(24, 32)}, GROUPS)
+    raced = {str(i) for i in range(23, 31)}  # 8 ids, but 23 is present and 31 is not named
+    assert not galaxy._whole_trays_absent(present, EXPECTED, raced, GROUPS)
+    assert galaxy._absent_tray_groups(present, EXPECTED, set(range(24, 32)), GROUPS) == [0xC0]
 
 
 def test_the_class_reads_presence_only_with_no_map():
@@ -485,6 +502,8 @@ def short_boot(rig, monkeypatch):
     monkeypatch.setattr(galaxy, "_ubb_bus_id_tables", lambda: UBB_TABLES)
     rig["present"] = _present({0x00: 8, 0x40: 8, 0x80: 8})
     monkeypatch.setattr(galaxy, "chip_pci_bdfs", lambda: {i: f"0000:{b:02x}:00.0" for i, b in rig["present"].items()})
+    rig["link_down"] = set()
+    monkeypatch.setattr(galaxy, "link_down", lambda bdf: bdf in rig["link_down"])
     rig["beats"] = _beats_without(set(range(24, 32)))
     return rig
 
@@ -496,7 +515,7 @@ async def test_a_whole_tray_drop_with_no_map_cycles_at_the_first_gate_pass(short
     class is read from the buses on the bus, so the cycle is requested now, not after the 600 s
     ceiling and a mesh reset that has never healed a whole tray."""
     rig = short_boot
-    assert await _gate(rig, galaxy.STAGE_UBB_TRAY, phase=phase) == galaxy.OUTCOME_WAITING
+    assert await _gate(rig, galaxy.BELOW_FLOOR, phase=phase) == galaxy.OUTCOME_WAITING
     assert "glx_reset" not in rig["order"] and "ubb_tray" not in rig["order"] and "sweep" not in rig["order"]
     assert rig["order"][-1] == "power_cycle"
     ((_, fired),) = [(k, f) for k, f in rig["events"] if k == "power_cycle_direct"]
@@ -515,7 +534,7 @@ async def test_the_hold_deadline_climb_with_no_map_cycles_with_no_reset(short_bo
 async def test_a_partial_drop_with_no_map_keeps_the_ladder(short_boot):
     rig = short_boot
     rig["present"] = _present({0x00: 8, 0x40: 8, 0x80: 7, 0xC0: 1})
-    await _gate(rig, galaxy.STAGE_UBB_TRAY, phase="startup")
+    await _gate(rig, galaxy.BELOW_FLOOR, phase="startup")
     assert "power_cycle" not in rig["order"] and "power_cycle_direct" not in _kinds(rig)
 
 
@@ -534,7 +553,7 @@ async def test_inside_the_cooldown_the_deadline_shows_at_once_and_no_reset_runs(
     monkeypatch.setattr(
         g.mechanism, "auto_recovery_allowed", lambda action, **k: g.mechanism._deny_power_cycle(dict(cooldown))
     )
-    assert await _gate(rig, galaxy.STAGE_UBB_TRAY, phase="startup") == galaxy.OUTCOME_WAITING
+    assert await _gate(rig, galaxy.BELOW_FLOOR, phase="startup") == galaxy.OUTCOME_WAITING
     assert rig["order"][-1] == "denied"
     assert not {"glx_reset", "ubb_tray", "sweep", "power_cycle"} & set(rig["order"]), "no reset meanwhile"
     assert g.mechanism.power_cycle_retry[0] == until
@@ -544,3 +563,157 @@ async def test_inside_the_cooldown_the_deadline_shows_at_once_and_no_reset_runs(
     assert shown == datetime.fromtimestamp(until).isoformat(timespec="seconds")
     note = srv._hold_escalation_note(8)
     assert datetime.fromtimestamp(until).strftime("%H:%M:%S") in note and "~2 min" not in note
+
+
+# ---- class A with unreadable survivors (spec 04 I37) --------------------------------------------
+
+
+def _unreadable(monkeypatch, chips):
+    """These chips are enumerated and bound but their heartbeat read fails (EIO)."""
+    chips = {str(c) for c in chips}
+    monkeypatch.setattr(galaxy, "unreadable_on_bus_chips", lambda ids: chips & {str(i) for i in ids})
+
+
+@pytest.mark.asyncio
+async def test_a_whole_tray_with_eio_survivors_cycles_with_the_map(rig, monkeypatch):
+    """A survivor whose read fails with EIO counts off the bus by the heartbeat; the drop then reads
+    as a whole tray plus a stray chip (the ladder). Taken as on the bus, it is class A."""
+    survivor = sorted(rig["map"][1])[0]
+    rig["beats"] = _beats_without(_off(rig["map"], {3: 8}) | {survivor})
+    _unreadable(monkeypatch, {survivor})
+    assert await _gate(rig, galaxy.STAGE_SMI_RESET) == galaxy.OUTCOME_WAITING
+    assert "glx_reset" not in rig["order"] and rig["order"][-1] == "power_cycle"
+    ((_, ev),) = [(k, f) for k, f in rig["events"] if k == "class_a_unreadable_survivors"]
+    assert ev["unreadable"] == [str(survivor)] and len(ev["off_bus"]) == 8
+
+
+@pytest.mark.asyncio
+async def test_a_whole_tray_with_eio_survivors_cycles_with_no_map(short_boot, monkeypatch):
+    rig = short_boot
+    rig["beats"] = _beats_without(set(range(24, 32)) | {0})  # chip 0's node is there, its read fails
+    _unreadable(monkeypatch, {0})
+    assert await _gate(rig, galaxy.BELOW_FLOOR, phase="startup") == galaxy.OUTCOME_WAITING
+    assert not {"glx_reset", "ubb_tray", "sweep"} & set(rig["order"]) and rig["order"][-1] == "power_cycle"
+
+
+@pytest.mark.asyncio
+async def test_a_no_map_tray_of_lingering_nodes_is_class_a(short_boot):
+    """Chips the heartbeat calls off the bus whose nodes the kernel still lists (all-ones endpoints)
+    cannot fill the tray they left."""
+    rig = short_boot
+    rig["present"] = _present({0x00: 8, 0x40: 8, 0x80: 8, 0xC0: 8})
+    assert await _gate(rig, galaxy.BELOW_FLOOR, phase="startup") == galaxy.OUTCOME_WAITING
+    assert "glx_reset" not in rig["order"] and rig["order"][-1] == "power_cycle"
+
+
+@pytest.mark.asyncio
+async def test_all_chips_unreadable_is_not_class_a(rig, monkeypatch):
+    """Every chip bound but unreadable leaves nothing off the bus to be a tray: the all-off path
+    (one mesh reset, then class C) is unchanged."""
+    rig["beats"] = {}
+    _unreadable(monkeypatch, range(EXPECTED))
+    await _gate(rig, galaxy.STAGE_SMI_RESET)
+    assert "glx_reset" in rig["order"] and "class_a_unreadable_survivors" not in _kinds(rig)
+
+
+@pytest.mark.asyncio
+async def test_a_partial_drop_with_eio_survivors_keeps_the_ladder(rig, monkeypatch):
+    survivor = sorted(rig["map"][1])[0]
+    rig["beats"] = _beats_without(_off(rig["map"], {3: 4}) | {survivor})
+    _unreadable(monkeypatch, {survivor})
+    await _gate(rig, galaxy.STAGE_SMI_RESET)
+    assert "power_cycle_direct" not in _kinds(rig) and "class_a_unreadable_survivors" not in _kinds(rig)
+
+
+def _lingering_link_down(monkeypatch, tmp_path, *, gone=(), eio=(), down=()):
+    """Real sysfs reads: ``gone`` chips have no node, ``eio`` chips are bound with an EIO heartbeat
+    read, and ``down`` of them still listed with their link down (half by speed, half by width)."""
+    down = sorted(down)
+    _fake_sysfs(
+        monkeypatch, tmp_path, missing=set(gone), eio=set(eio), speed_unknown=set(down[::2]), width_63=set(down[1::2])
+    )
+    monkeypatch.setattr(galaxy, "unreadable_on_bus_chips", heartbeat.unreadable_on_bus_chips)
+
+
+@pytest.mark.asyncio
+async def test_lingering_link_down_nodes_leave_an_all_off_bus_its_mesh_reset(rig, monkeypatch, tmp_path):
+    """Spec 03 I9 and 04 I37: one tray's nodes are gone and the other trays' linger, bound, with an EIO
+    read and the link down. Every chip is off the bus, so the one mesh reset still runs; the lingering
+    nodes are not survivors that make the drop look like class A."""
+    gone = set(rig["map"][max(rig["map"])])
+    lingering = set(range(EXPECTED)) - gone
+    _lingering_link_down(monkeypatch, tmp_path, gone=gone, eio=lingering, down=lingering)
+    rig["beats"] = {}
+    await _gate(rig, galaxy.STAGE_SMI_RESET)
+    assert "glx_reset" in rig["order"]
+    assert "class_a_unreadable_survivors" not in _kinds(rig) and "power_cycle_direct" not in _kinds(rig)
+
+
+@pytest.mark.asyncio
+async def test_a_tray_of_link_down_nodes_with_one_eio_survivor_is_class_a(rig, monkeypatch, tmp_path):
+    """A whole tray lingers with its links down and one chip elsewhere reads EIO with its link up: only
+    that chip is on the bus, the tray is off, and the drop is class A (straight to the power cycle)."""
+    tray = set(rig["map"][3])
+    survivor = sorted(rig["map"][1])[0]
+    _lingering_link_down(monkeypatch, tmp_path, eio=tray | {survivor}, down=tray)
+    rig["beats"] = _beats_without(tray | {survivor})
+    assert await _gate(rig, galaxy.STAGE_SMI_RESET) == galaxy.OUTCOME_WAITING
+    assert "glx_reset" not in rig["order"] and rig["order"][-1] == "power_cycle"
+    ((_, ev),) = [(k, f) for k, f in rig["events"] if k == "class_a_unreadable_survivors"]
+    assert ev["unreadable"] == [str(survivor)] and ev["off_bus"] == sorted(map(str, tray), key=int)
+
+
+# ---- the whole-tray check with no map (Part 2 of spec 04 I37) ------------------------------------------
+
+
+@pytest.fixture
+def real_tray_rung(short_boot, monkeypatch):
+    from tt_device_mcp.health.recovery import offbus_power_cycle
+
+    g = short_boot["g"]
+    monkeypatch.setattr(offbus_power_cycle, "_pending", {})
+    monkeypatch.setattr(g.deps, "device_hold_episode_since", lambda: "2026-10-16T12:39:00")
+
+    def rung(beats, off_bus):
+        return type(g)._note_whole_tray_drop(g, beats, off_bus, EXPECTED, lambda m: None)
+
+    return short_boot, rung, offbus_power_cycle
+
+
+@pytest.mark.asyncio
+async def test_the_whole_tray_check_with_no_map_hands_a_whole_tray_to_the_power_cycle(real_tray_rung):
+    rig, rung, opc = real_tray_rung
+    assert rung(rig["beats"], 8) is True
+    assert opc.whole_tray_down_age_sec("2026-10-16T12:39:00") is not None
+    ((_, ev),) = [(k, f) for k, f in rig["events"] if k == "whole_tray_down_power_cycle"]
+    assert ev["trays"] == ["bus group 0xc0"]
+
+
+@pytest.mark.asyncio
+async def test_the_whole_tray_check_with_no_map_and_eio_survivors_hands_off_too(real_tray_rung, monkeypatch):
+    rig, rung, opc = real_tray_rung
+    rig["beats"] = _beats_without(set(range(24, 32)) | {0})
+    _unreadable(monkeypatch, {0})
+    assert rung(rig["beats"], 9) is True
+    assert opc.whole_tray_down_age_sec("2026-10-16T12:39:00") is not None
+
+
+@pytest.mark.asyncio
+async def test_the_whole_tray_check_with_no_map_keeps_a_partial_drop_on_the_ladder(real_tray_rung):
+    rig, rung, opc = real_tray_rung
+    rig["present"] = _present({0x00: 8, 0x40: 8, 0x80: 7, 0xC0: 1})
+    assert rung(rig["beats"], 8) is False
+    assert opc.whole_tray_down_age_sec("2026-10-16T12:39:00") is None
+    assert "whole_tray_down_power_cycle" not in _kinds(rig)
+
+
+@pytest.mark.asyncio
+async def test_a_listed_node_whose_link_is_down_does_not_fill_a_tray(short_boot):
+    """Spec 03 I9 link-down: a node the kernel still lists with its link down (speed Unknown, width 63) is not on
+    the bus. Chips 0-7's heartbeats read, but their tray shows one link down: not whole trays."""
+    rig = short_boot
+    rig["link_down"] = {f"0000:{rig['present'][0]:02x}:00.0"}
+    present_buses, _ = rig["g"]._presence_read(set(range(24, 32)), EXPECTED)
+    assert 0 not in present_buses and 1 in present_buses
+    await _gate(rig, galaxy.BELOW_FLOOR, phase="startup")
+    assert "power_cycle" not in rig["order"], "the read does not add up to whole trays: the ladder decides"

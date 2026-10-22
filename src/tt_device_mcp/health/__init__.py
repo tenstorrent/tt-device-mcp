@@ -19,6 +19,13 @@ both files) — every name either of them needs from here is either:
 
 from __future__ import annotations
 
+# chip_state: the per-chip lost/recovering gate in front of every poller read of a chip (spec 03 I66).
+# hold_report: the /health hold report (spec 03 I72, spec 04 I75): its pure helpers, plus the read-only probes
+# server.py feeds them (board-type normalising, off-bus chip ids, PCI bus numbers, the UBB tray
+# tables and the whole-tray classifier the power-cycle rung itself uses), so the report names a
+# hold the way the ladder does.
+from tt_device_mcp.health import chip_state, hold_report
+
 # The operator's AICLK ceiling state: server.py re-applies it at broker start and at the job door,
 # marks it owed when a job ends, and must be able to kill its helper on the dead-chip path.
 from tt_device_mcp.health.aiclk_ceiling import CEILING
@@ -39,7 +46,13 @@ from tt_device_mcp.health.evidence import (
     previous_boot_error,
     read_health_events,
 )
-from tt_device_mcp.health.monitor import HealthMonitor, eth_read_timed_out, journal_interrupted_fabric_check
+from tt_device_mcp.health.monitor import (
+    FABRIC_KILLED_BY_ISOLATION,
+    HealthMonitor,
+    _normalized_board,
+    eth_read_timed_out,
+    journal_interrupted_fabric_check,
+)
 
 # The fabric probe module itself, not a wrapping function: server.py's own preflight check reads
 # fabric.build_command() directly to warn when no fabric check is configured OR installed, and a
@@ -55,6 +68,7 @@ from tt_device_mcp.health.monitors.heartbeat import (
     dead_chips,
     heartbeat_supported,
     heartbeat_verdict,
+    offbus_chip_ids,
     offbus_count,
     read_heartbeats,
     returned_chips,
@@ -71,17 +85,26 @@ from tt_device_mcp.health.monitors.pci import (
     aer_totals,
     chip_node_present,
     chip_pci_bdf,
+    chip_pci_bdfs,
     chip_sample,
     chip_snapshot,
     chip_snapshot_event,
     isolate_chip,
+    link_signals,
+    load_removed_chips,
+    pci_bus_number,
     sysfs_chip_ids,
 )
 
 # The post-reset fabric debt (spec 04 I32): every reset path and broker start marks it owed, and
 # server.py's release funnel and the gate read it to hold fabric-unverified until a pass settles it.
+# The one in-flight PCI sysfs writer and its PCI-wedged latch (spec 04 I76): server.py wires the latch
+# to the hold and the power-cycle request, and clears it only on a verified lift; telemetry.py's
+# dead-chip valve skips chips while it is set and removes chips only through it.
+from tt_device_mcp.health.pci_writer import PCI_WRITER, PciWedged
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (
+    BELOW_FLOOR,
     BLOCKED,
     DEFER,
     HOLD_FABRIC_UNVERIFIED,
@@ -103,6 +126,7 @@ from tt_device_mcp.health.recovery import select_recovery as _select_recovery  #
 from tt_device_mcp.health.recovery.base import (
     HOLD_ESCALATION_REARM_SEC,
     RESET_COOLDOWN_SEC,
+    RESET_SCOPE_PREFIX,
     RecoveryMechanism,
     host_action_pending_sec,
     mesh_hold_repage_sec,
@@ -116,14 +140,17 @@ from tt_device_mcp.health.recovery.base import (
 # evidence, the hold ceiling it names, and the ledger's own word for a host rung the router chose.
 from tt_device_mcp.health.recovery.galaxy import (
     _HOST_ESCALATION_ACTION,
+    UBB_CHIP_COUNT,
     GalaxyRecovery,
     _eth_freeze_holds,
     _galaxy_reset_min_dead_chips,
     _is_galaxy,
     _offbus_hold_ceiling_sec,
+    _power_cycle_direct_class,
+    _present_mesh_reset_grace_sec,
     _reboot_min_dead_chips,
     _stuck_hold_ceiling_sec,
-    _ubb_reset_enabled,
+    _ubb_bus_id_tables,
 )
 from tt_device_mcp.health.recovery.pcie_guard import pcie_guard_at_start
 from tt_device_mcp.health.recovery.per_target import PerTargetRecovery
@@ -141,10 +168,23 @@ from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle
 from tt_device_mcp.health.shutdown import note_broker_stopping
 
 __all__ = [
+    # the one in-flight PCI sysfs writer and its PCI-wedged latch (spec 04 I76)
+    "PCI_WRITER",
+    "PciWedged",
+    # the /health hold report (spec 03 I72, spec 04 I75) and the read-only probes it is fed
+    "hold_report",
+    "_normalized_board",
+    "offbus_chip_ids",
+    "chip_pci_bdfs",
+    "pci_bus_number",
+    "UBB_CHIP_COUNT",
+    "_power_cycle_direct_class",
+    "_ubb_bus_id_tables",
     # AICLK ceiling state (start, door, job end, dead-chip kill)
     "CEILING",
     # construction pieces ServerFsm.boot assembles into the process singletons
     "HealthMonitor",
+    "FABRIC_KILLED_BY_ISOLATION",  # spec 03 I82: the gate holds a pass the isolation killed dirty
     "journal_interrupted_fabric_check",
     "note_broker_stopping",
     "eth_read_timed_out",  # spec 03 I61: the stuck eth read the post-job present-mesh reset answers
@@ -173,8 +213,10 @@ __all__ = [
     "eth",
     "fabric",
     "ALL_ONES",
+    "chip_state",
     "dead_chips",
     "arc_not_ready_chips",
+    "offbus_chip_ids",
     "offbus_count",
     "returned_chips",
     "heartbeat_supported",
@@ -192,6 +234,8 @@ __all__ = [
     "chip_snapshot",
     "chip_snapshot_event",
     "isolate_chip",
+    "link_signals",
+    "load_removed_chips",
     # recovery selection/state
     "OUTCOME_RECOVERED",
     "OUTCOME_TERMINAL",
@@ -200,6 +244,8 @@ __all__ = [
     "RESET_MODE_TARGET",
     "HOLD_ESCALATION_REARM_SEC",
     "RESET_COOLDOWN_SEC",
+    # the reset's own systemd scope prefix: the in-flight reader cut never kills it (spec 03 I83)
+    "RESET_SCOPE_PREFIX",
     "_declared_reset_mode",
     # how often a standing hardware-fault hold is paged again (spec 03 I42)
     "mesh_hold_repage_sec",
@@ -214,6 +260,7 @@ __all__ = [
     "DEFER",
     "RELEASE",
     "HOLD_FABRIC_UNVERIFIED",
+    "BELOW_FLOOR",
     "BLOCKED",
     # Galaxy escalation ladder: the thresholds and vocabulary the gate reads around the router's
     # decisions
@@ -222,9 +269,9 @@ __all__ = [
     "_galaxy_reset_min_dead_chips",
     "_HOST_ESCALATION_ACTION",
     "_offbus_hold_ceiling_sec",
+    "_present_mesh_reset_grace_sec",
     "_reboot_min_dead_chips",
     "_stuck_hold_ceiling_sec",
-    "_ubb_reset_enabled",
     "bridge_reset_enabled",
     "bridge_reset_unavailable_reason",
     "gone_chip_bridge_reset_enabled",

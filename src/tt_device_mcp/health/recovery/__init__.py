@@ -26,28 +26,43 @@ from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 from tt_device_mcp import constants, metrics
-from tt_device_mcp.device_holders import HolderScan
+from tt_device_mcp.device_holders import HolderScan, is_tenant
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.evidence import health_event
+from tt_device_mcp.health.monitors import fabric, pci
+from tt_device_mcp.health.monitors.heartbeat import (
+    arc_live_chips,
+    arc_not_ready_chips,
+    heartbeat_attr_present,
+    offbus_count,
+)
+from tt_device_mcp.health.pci_writer import PCI_WRITER, PciWedged
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
+from tt_device_mcp.health.recovery import base as _base
 from tt_device_mcp.health.recovery import pcie_guard
 from tt_device_mcp.health.recovery.base import (
     RESET_COOLDOWN_SEC,
     RecoveryMechanism,
     drop_returned_isolated,
+    pci_rescan,
+    pci_wedged_refusal,
     refuse_mesh_reset,
 )
 from tt_device_mcp.health.recovery.stages.bridge_reset import (
+    SBR_RETRAIN_SETTLE_SEC,
     bridge_reset_enabled,
     bridge_reset_unavailable_reason,
     reset_chip_via_bridge,
+    reset_removed_chip,
 )
 
 # A `next_stage` decision that is not a stage name: WAIT (the wedge may self-heal; do nothing),
 # DEFER (a reset is already cycling; adopt and verify it, start nothing new), RELEASE (the door
 # opens — nothing is wrong, or the last action just proved it), HOLD_FABRIC_UNVERIFIED (a fabric
-# pass that ran but reached no verdict; hold without resetting), or BLOCKED (a drop no opted-in
-# rung can recover — distinct from WAIT, which means "it may self-heal"). The stage names below
+# pass that ran but reached no verdict; hold without resetting), BLOCKED (a drop no opted-in
+# rung can recover — distinct from WAIT, which means "it may self-heal"), or BELOW_FLOOR (fewer
+# chips are gone than the mesh-wide reset needs to be worth its blast radius: classify the drop —
+# a whole tray goes straight to the power cycle, anything else waits for the hold bound's ladder). The stage names below
 # are constants.STAGE_NAMES' own values, re-bound here (not re-exported by import: pyflakes reads
 # a bare re-export as an unused import) so a decision routes straight to the name
 # metrics.stage_fired() and _HOST_ESCALATION_STAGE use.
@@ -56,10 +71,9 @@ DEFER = "defer"
 RELEASE = "release"
 HOLD_FABRIC_UNVERIFIED = "hold_fabric_unverified"
 BLOCKED = "blocked"
+BELOW_FLOOR = "below_floor"
 STAGE_BRIDGE_RESET = constants.STAGE_BRIDGE_RESET
 STAGE_SMI_RESET = constants.STAGE_SMI_RESET
-STAGE_UBB_TRAY = constants.STAGE_UBB_TRAY
-STAGE_HOST_REBOOT = constants.STAGE_HOST_REBOOT
 STAGE_POWER_CYCLE = constants.STAGE_POWER_CYCLE
 
 # Recovery.escalate's outcome.
@@ -67,12 +81,35 @@ OUTCOME_RECOVERED = "recovered"
 OUTCOME_WAITING = "waiting"
 OUTCOME_TERMINAL = "terminal"
 
+
+def bridge_reset_call_timeout() -> float:
+    """Bound on one reset_chip_via_bridge call: its three setpci calls (15 s each), the link-retrain
+    settle, its rescan (PCI_SYSFS_WRITE_TIMEOUT_SEC) and its 10 s re-enumeration poll, plus slack."""
+    return 3 * 15 + SBR_RETRAIN_SETTLE_SEC + _base.PCI_SYSFS_WRITE_TIMEOUT_SEC + 10 + 5
+
+
+def _sysfs_rescan() -> None:
+    """The bare sysfs rescan write, scoped to the Tenstorrent root ports; pci_rescan bounds it."""
+    pcie_guard.rescan_tt_root_ports()
+
+
 # A surgical bridge reset fired seconds after a chip leaves the bus can lose the race with the
 # endpoint's link retrain and report failure, yet the same chip re-binds in ~2s once the link
 # settles. Retry a few times before giving up on it (see Recovery._recover_isolated_chips) — this
 # is what turns a ~13 min recovery into a ~seconds one.
 BRIDGE_RESET_MAX_TRIES = 3
 BRIDGE_RESET_SETTLE_SEC = 4
+# The bridge rung's reason for a removed chip whose every recorded-bridge SBR fired and left it off
+# the bus (spec 04 I69): no SBR brings it back, the same no-window fact as no_bridge.
+NO_WINDOW_REMOVED_REASON = "removed_not_reenumerated"
+# Spec 04 I94: a chip the bridge rung brought back counts recovered only once its ARC heartbeat reads
+# as a counter. A live chip reads on the first try; this bounds the wait for one whose ARC is still
+# coming up. One that stays dead stays isolated, so the off-bus one-shot climbs past it.
+BRIDGE_RESET_ARC_POLLS = 10
+BRIDGE_RESET_ARC_POLL_SEC = 0.5
+BRIDGE_RESET_ARC_WAIT_SEC = BRIDGE_RESET_ARC_POLLS * BRIDGE_RESET_ARC_POLL_SEC
+# A KMD without the heartbeat attr cannot answer the I94 check: it is skipped there, said once.
+_arc_check_skip_logged = False
 
 # A reset returns before the eth links re-train, so the immediate post-reset fabric pass can find
 # no trained link (77). Retry (see Recovery._verify_device_after_reset), giving the links time to
@@ -81,6 +118,19 @@ BRIDGE_RESET_SETTLE_SEC = 4
 # neither a recovery nor a failure, and the mesh is held fabric-unverified (spec 03 I34/I40 bound it).
 POST_RESET_FABRIC_RETRIES = int(os.environ.get("TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES", "1"))
 POST_RESET_FABRIC_RETRY_SLEEP_SEC = float(os.environ.get("TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC", "60"))
+# A mesh reset that exits non-zero with every chip back on the bus but some ARC not ready gets ONE more
+# reset, after this settle, on an idle box (:meth:`Recovery._arc_not_ready_retry_due`). Measured on a
+# 32-chip Galaxy: the first -glx_reset brought an off-bus chip back but left 31 chips ARC-not-ready and
+# exited 1; the hold re-observed that for 10 min, and the next -glx_reset recovered it at once.
+ARC_NOT_READY_RETRY_SETTLE_SEC = float(os.environ.get("TT_DEVICE_MCP_ARC_NOT_READY_RETRY_SETTLE_SEC", "5"))
+
+
+def _fabric_of(monitor) -> dict:
+    """The post-reset check's fabric verdict for the reset's own event (spec 03 I78): pass/fail, and
+    how far the links found fall short of the cabling."""
+    verdict = getattr(monitor, "fabric_verdict", None)
+    out = verdict() if callable(verdict) else None
+    return out if isinstance(out, dict) else {"result": "none"}
 
 
 @dataclass(frozen=True)
@@ -137,14 +187,6 @@ class Evidence:
     # Spec 03 I55: the fabric passed traffic but mesh dispatch failed over a present mesh, and this
     # hold episode has not had its one present-mesh reset yet (nor does the outage hold forbid it).
     dispatch_reset_due: bool = False
-    # ladder-v2: the per-chip SBR outcome the bridge rung produced THIS pass — chip id ->
-    # ``{"reason": "no_bridge"}`` for every chip whose secondary bus reset could not fire because
-    # the endpoint left the bus (no bridge to write to). Threaded by the server's ``replace(ev, …)``
-    # AFTER the bridge rung fires (from ``Recovery.last_bridge_reset_reasons``), read only by the
-    # STAGE_UBB_TRAY gate rung to classify the hold (:func:`galaxy._classify_hold`). ``next_stage``
-    # never reads it — the router stays pure; only the tray rung's fire does. None when no bridge
-    # rung ran this pass, which reads as "window unknown" -> the generic branch.
-    bridge_reset_failed: Optional[dict] = None
     # This hold episode's galaxy reset already REGRESSED the off-bus count (spec 04 I31): a failed
     # reset on it is warm-reboot-futile even when this pass's own count did not grow.
     episode_reset_regressed: bool = False
@@ -179,8 +221,7 @@ class RecoveryDeps:
     begin_action_row: Callable[[str, str], None]
     write_action_log: Callable[[str, str, float, str, Optional[int]], None]
     device_hold_episode_since: Callable[[], str]
-    # GalaxyRecovery's host-escalation ladder (reboot/power-cycle opt-ins + the loop-guard read):
-    auto_reboot_enabled: Callable[[], bool]
+    # GalaxyRecovery's host-escalation ladder (the power-cycle opt-in; spec 04 I71):
     auto_power_cycle_enabled: Callable[[], bool]
     # HealthMonitor's own probes (verify_fabric_health/verify_eth_heartbeat): the job-killing
     # ladder and the module logger both live in server.py, not in the health package, so they are
@@ -221,8 +262,6 @@ class RecoveryDeps:
     # flag above, which stays True for the whole episode and is what the journal/reporting read.
     hold_escalation_latched: Callable[[], bool]
     set_device_hold_episode_escalated: Callable[[bool], None]
-    device_hold_episode_ubb_reset_fired: Callable[[], bool]
-    set_device_hold_episode_ubb_reset_fired: Callable[[bool], None]
     clear_device_reported_fault: Callable[[str], None]
     clear_device_dirty: Callable[..., None]
     # Whether the mesh is CURRENTLY dirty, unverified, or carrying a runtime-reported fault —
@@ -232,18 +271,18 @@ class RecoveryDeps:
     # recover, not just the one (_reset_and_verify_device) that happens to also flip a
     # RecoveryMechanism-wide flag another, unrelated reset could have set.
     device_degraded: Callable[[], bool]
-    # The two host-level rungs' OTHER half — GalaxyRecovery gets _auto_reboot_host (it is
-    # Galaxy-only in practice); the chassis power cycle and the loud whole-bus event stay
+    # The host rung's OTHER half — the chassis power cycle and the loud whole-bus event stay
     # server-owned (the gate journals that event itself, and the power cycle's ledger row and job
     # entry are server state), so they are injected rather than moved.
-    auto_power_cycle_host: Callable[[Callable, str], Awaitable[None]]
+    # Returns False when the cycle certainly did not launch (spec 04 I71: hold, page, retry).
+    auto_power_cycle_host: Callable[[Callable, str], Awaitable[Optional[bool]]]
     emit_all_off_bus_power_cycle_required: Callable[[Callable, int, int, str], None]
     host_escalation_kwargs: Callable[[], dict]
     # Probe primitives that already live in the health package (health.monitors.heartbeat) but
     # that server.py re-exports by import and tests monkeypatch on ``server.<name>`` to drive the
     # moved bodies' behavior deterministically — see the class docstring. Real server-side callers
     # of these three remain (the gate, the startup probe, the exec/reset tools), which is what
-    # distinguishes them from e.g. ``reset_chip_via_bridge`` or ``_fire_ubb_reset``, which have
+    # distinguishes them from e.g. ``reset_chip_via_bridge``, which has
     # none and so are imported directly where the moved bodies need them instead.
     read_heartbeats: Callable[[], dict]
     heartbeat_supported: Callable[[], bool]
@@ -260,7 +299,7 @@ class RecoveryDeps:
     # deps fixture — may supply its own bindings, which boot leaves untouched).
     board_types_provider: Optional[Callable[[], Optional[list]]] = None
     glx_board_types_provider: Optional[Callable[[], tuple]] = None
-    # {chip index: PCI address}, the map the tray rung derives its trays from (spec 04 I16). Same
+    # {chip index: PCI address}, the map tray placement is derived from (spec 04 I16). Same
     # injection reason as the two above: the cache lives on the HealthMonitor singleton.
     chip_buses_provider: Optional[Callable[[], Optional[dict]]] = None
     journal_skip_once: Optional[Callable[[str, str], None]] = None
@@ -269,12 +308,29 @@ class RecoveryDeps:
     # monkeypatched fake still takes effect. Default None only because the conftest deps fixture
     # predates the sampler and never constructs one; ServerFsm.boot always receives real values.
     chip_sample: Optional[Callable[[], dict]] = None
+    # The sampler's early off-bus watch (spec 03 I79): kernel-held AER counters and the node list.
+    link_signals: Optional[Callable[[], dict]] = None
     append_trace: Optional[Callable[[dict], None]] = None
     capture_incident: Optional[Callable[..., object]] = None
     isolate_chip: Optional[Callable[[str], bool]] = None
     chip_pci_bdf: Optional[Callable[[str], Optional[str]]] = None
     health_event: Optional[Callable[..., None]] = None
     kill_device_holders: Optional[Callable[[str], Awaitable[list]]] = None
+    # Marks the pollers the dead-chip valve stopped as owed a restart (server._owe_device_pollers):
+    # that stop has no paired restore, and an idle relift can close the episode with no reset.
+    owe_device_pollers: Optional[Callable[[str], None]] = None
+    # Spec 03 I83: one heartbeat read of only the given chips, after a mesh reset whose POST_RESET
+    # failed on them (monitors.heartbeat.read_heartbeats with only). None: the in-flight cut is off.
+    read_inflight_heartbeats: Optional[Callable[[frozenset], dict]] = None
+    # Spec 03 I83: (pids, scan complete) of the device holders that are not the broker's own or the
+    # reset's (server._find_inflight_readers). Read-only.
+    find_inflight_readers: Optional[Callable[[], tuple]] = None
+    # Spec 03 I83: SIGTERM, then SIGKILL PREEMPT_KILL_GRACE_SEC later, to those holders
+    # (server._cut_inflight_readers). The cut calls it only once every confirmed chip is detached.
+    cut_inflight_readers: Optional[Callable[[str], Awaitable[list]]] = None
+    # Records the holders the dead-chip valve refused to kill (server._note_dead_kill_refused, spec 03
+    # I84), so the 10-min bound sends them to the host rung instead of reading them as tenants.
+    note_kill_refused: Optional[Callable[[str, list], list]] = None
     mark_device_dirty: Optional[Callable[..., None]] = None
     # Places a not-dirty fabric-unverified hold (server._hold_device_fabric_unverified): a reset whose
     # fabric stayed a 77 settles there, never as a failed reset.
@@ -283,9 +339,14 @@ class RecoveryDeps:
     # (server._note_fabric_77_reset_passes), so the next relift falls back at once instead of
     # re-running the passes the reset just spent.
     note_fabric_77_reset_passes: Optional[Callable[[int], None]] = None
+    # The open hold's fabric link-short cause (server._fabric_link_short_hold; "" when none): a lost
+    # link, a latched topology mismatch or missing descriptor ports. Spec 04 I79/I83 send those holds
+    # to the power cycle after one ladder pass, so the sweep never waits to space its mesh reset (I93).
+    fabric_link_short_hold: Optional[Callable[[], str]] = None
     # Whether the open hold's fabric 77 has a cause no reset or reboot fixes — a known cable fault (a 78),
-    # a topology mismatch or fault, hugepages not yet allocated, the validator missing
-    # (server._fabric_77_no_reset_cause). Such a 77 never climbs to a host rung (spec 04 I29).
+    # a topology mismatch, hugepages not yet allocated, the validator missing
+    # (server._fabric_77_no_reset_cause; never the I42 latch, which takes the ladder). Such a 77
+    # never climbs to a host rung (spec 04 I29).
     fabric_77_no_reset_cause: Optional[Callable[[], bool]] = None
     refresh_idle_hold_ledger: Optional[Callable[[], None]] = None
     spawn_idle_relift: Optional[Callable[[], None]] = None
@@ -302,6 +363,10 @@ class RecoveryDeps:
     # short count IS that fault, and re-dirtying it would disable the hold's idle relift.
     episode_open: Optional[Callable[[], bool]] = None
     episode_job: Optional[Callable[[], dict]] = None
+    # Re-runs a failed eth self-test at the head of a full health pass (server._rearm_eth_before_check,
+    # spec 03 I28). Returns a FROZEN detail when the self-test hung during an open fault episode,
+    # else "". None (the conftest deps fixture) skips the retry.
+    eth_rearm: Optional[Callable[[], Awaitable[str]]] = None
 
 
 class Recovery(ABC):
@@ -428,16 +493,34 @@ class Recovery(ABC):
         """
         # ladder-v2: the per-chip SBR window this rung reads, chip id -> {"reason": "no_bridge"} for
         # every chip whose reset could not fire because the endpoint left the bus. Reset FRESH every
-        # call (before the empty-set early return), so a later gate never classifies a hold on a
-        # stale prior pass; the server threads it onto Evidence.bridge_reset_failed after this fires.
+        # call (before the empty-set early return), so a later reader never sees a stale prior pass.
         self.last_bridge_reset_reasons: dict = {}
         isolated_chips = self.deps.isolated_chips()
+        # Spec 04 I69: every chip the broker removed is off the bus and un-reset, so it is a target
+        # whether or not this pass was asked for it (a record reloaded after a restart, say). Left out,
+        # the rescan any other chip's reset ends with would re-enumerate it un-reset.
+        adopted = [i for i in pci.removed_chip_ids() if i not in isolated_chips]
+        if adopted:
+            isolated_chips.update(adopted)
+            health_event("removed_chips_isolated", chips=adopted, context="bridge_reset")
         if not isolated_chips:
             return True
         targets = sorted(isolated_chips, key=int)
+        # Spec 04 I76: a PCI sysfs write is blocked in the kernel (PCI-wedged). Every bridge reset ends in
+        # a rescan on that same lock, so none can run: the rung fails at once, its chips stay withheld,
+        # and the power cycle is already requested.
+        if pci_wedged_refusal(f"bridge reset of chip(s) {','.join(targets)}", log):
+            for idx in targets:
+                self.last_bridge_reset_reasons[idx] = {"reason": "pci_wedged"}
+                metrics.stage_fired("bridge_reset", "blocked")
+            health_event("chip_recovery", recovered=[], still_dead=targets, inapplicable=[], pci_wedged=True)
+            return False
         _t0 = datetime.now()
         self.deps.begin_action_row("[broker]bridge-reset", f"bridge-reset chip(s) {','.join(targets)}")
-        self.deps.set_device_op_detail(f"recovering chip(s) {','.join(targets)} " f"via bridge reset (~10s)")
+        # Spec 04 I90: a device reset like glx_reset, so /status shows it as one from its first second.
+        self.deps.set_device_op_detail(
+            f"{constants.DEVICE_RESET_DETAIL_PREFIX} bridge reset of chip(s) {','.join(targets)} (~10s)"
+        )
         device_pci_map = self.deps.device_pci_map()
         recovered, lost, inapplicable = [], [], []
         # The SBR write needs root and setpci (spec 04 I17). Decided once, ahead of the loop,
@@ -447,7 +530,10 @@ class Recovery(ABC):
         # needs no setpci.
         sbr = bridge_reset_enabled()
         if not sbr:
-            log(f"per-chip bridge reset unavailable ({bridge_reset_unavailable_reason()}) — trying a PCI rescan")
+            log(
+                f"per-chip bridge reset unavailable ({bridge_reset_unavailable_reason()}) — a PCI rescan follows "
+                "unless a chip the broker removed is still un-reset"
+            )
         # An SBR takes its chip off the bus like any reset, so the per-host gate (spec 04 I24) holds it
         # too: the isolated chips are off the bus by definition.
         gated, why = False, ""
@@ -455,20 +541,106 @@ class Recovery(ABC):
             allowed, why = pcie_guard.host_reset_gate(len(targets))
             gated = not allowed
         if gated:
-            log(f"per-chip bridge reset NOT fired: {why} — trying a PCI rescan")
+            log(
+                f"per-chip bridge reset NOT fired: {why} — a PCI rescan follows unless a chip the broker "
+                "removed is still un-reset"
+            )
             health_event("host_reset_gated", context="bridge_reset", chips=targets, reason=why, host_at_risk=True)
+        # Spec 04 I92: every reset journals its pre-reset holder scan. This one needs none: each target
+        # was cut out of the kernel (detached), so no process can map it and closing a holder's fd
+        # makes the driver send it nothing. Killing readers here would only stop the device pollers'
+        # reads of the chips that stay on the bus.
+        if sbr and not gated:
+            health_event(
+                "pre_reset_holder_scan",
+                argv=["bridge-reset", *targets],
+                owner="[broker]bridge-reset",
+                outcome="targets_detached",
+                chips=targets,
+                seconds=0.0,
+            )
+        # Spec 04 I69: a chip the broker removed is still hung, and any rescan this pass would
+        # re-enumerate it for the driver to probe. So reset every one of them through its recorded
+        # bridge first, then rescan once. If any cannot be reset, no rescan runs this pass at all
+        # (each per-chip reset below rescans too): the chips stay isolated and the hold escalates.
+        reset_this_pass: set = set()
+        withheld: list = []
+        # Spec 04 I76: set by the first bridge reset that times out or is refused. The pass stops there:
+        # no further bridge call, no rescan; every chip not yet tried is withheld.
+        wedged = False
+        removed = [t for t in targets if pci.removed_chip(t)]
+        unreset: list = []
+        if sbr and not gated and removed:
+            for idx in removed:
+                for attempt in range(BRIDGE_RESET_MAX_TRIES):
+                    FABRIC_DEBT.note_reset(f"bridge reset of chip {idx}")
+                    # An SBR clears the chip's firmware clock cap like any reset (spec 03 I35).
+                    CEILING.mark_owed(f"bridge reset of chip {idx}")
+                    try:
+                        fired = await PCI_WRITER.write(
+                            f"bridge reset of removed chip {idx}",
+                            reset_removed_chip,
+                            idx,
+                            timeout=bridge_reset_call_timeout(),
+                        )
+                    except PciWedged as e:
+                        health_event("bridge_reset_failed", chip=idx, reason="pci_wedged", error=str(e))
+                        log(f"bridge reset of removed chip {idx} failed: {e}")
+                        wedged = True
+                        break
+                    if fired:
+                        reset_this_pass.add(idx)
+                        break
+                    if fired is None:
+                        # Same no-window signal as reset_chip_via_bridge's no_bridge (see below).
+                        self.last_bridge_reset_reasons[idx] = {"reason": "no_bridge"}
+                        break
+                    if attempt + 1 < BRIDGE_RESET_MAX_TRIES:
+                        await asyncio.sleep(BRIDGE_RESET_SETTLE_SEC)
+                if idx not in reset_this_pass:
+                    unreset.append(idx)
+                if wedged:
+                    unreset.extend(i for i in removed if i not in reset_this_pass and i not in unreset)
+                    break
+            if not unreset:
+                log(f"chip(s) {removed} reset through their recorded bridges — rescanning once")
+                # One link-retrain settle for the batch, after the last SBR release, as
+                # reset_chip_via_bridge waits before its own rescan.
+                await asyncio.sleep(SBR_RETRAIN_SETTLE_SEC)
+                try:
+                    await pci_rescan("bridge reset batch rescan", _sysfs_rescan)
+                except (OSError, asyncio.TimeoutError) as e:
+                    log(f"PCI rescan after the bridge reset could not run ({e})")
+                for _ in range(20):
+                    await asyncio.sleep(0.5)
+                    if all((pci.SYSFS_CLASS_DIR / f"tenstorrent!{i}").exists() for i in removed):
+                        break
         for idx in targets:
+            if wedged and idx not in lost:
+                withheld.append(idx)
+                self.last_bridge_reset_reasons[idx] = {"reason": "pci_wedged"}
+                metrics.stage_fired("bridge_reset", "blocked")
+                continue
             if gated:
                 inapplicable.append(idx)
                 self.last_bridge_reset_reasons[idx] = {"reason": "gated"}
                 metrics.stage_fired("bridge_reset", "blocked")
                 continue
+            if sbr and unreset:
+                withheld.append(idx)
+                if idx not in unreset:
+                    self.last_bridge_reset_reasons[idx] = {"reason": "rescan_withheld"}
+                metrics.stage_fired("bridge_reset", "blocked")
+                continue
+            if idx in reset_this_pass and (pci.SYSFS_CLASS_DIR / f"tenstorrent!{idx}").exists():
+                # Reset above and back on the bus from the pass's rescan (or a later chip's).
+                pci.forget_removed_chip(idx)
+                recovered.append(idx)
+                continue
             if not sbr:
                 inapplicable.append(idx)
-                # NOT no_bridge: that means the endpoint left the bus, which is the drop measured
-                # never to return and the one _classify_hold escalates straight to a power cycle
-                # on. Nothing was written here, so the window is unproven — a distinct reason
-                # keeps it out of that class rather than licensing the sweep on an untested chip.
+                # NOT no_bridge: that means the endpoint left the bus. Nothing was written here,
+                # so the window is unproven, and a distinct reason says so.
                 self.last_bridge_reset_reasons[idx] = {"reason": "no_privilege"}
                 # blocked, not not_applicable: metrics.STAGE_OUTCOMES reserves not_applicable for
                 # a platform fact that will never change. A missing euid or package is the most
@@ -493,14 +665,41 @@ class Recovery(ABC):
             # the identical no-op. Firing a rung that cannot work here only delays the next one, so
             # record the chip inapplicable and fall through now (the incident burnt ~64s spinning
             # a no_bridge reset 3x per gone chip, then again on the stuck-hold escalation).
-            for attempt in range(BRIDGE_RESET_MAX_TRIES):
+            # A removed chip already spent one try on the reset above.
+            tries = BRIDGE_RESET_MAX_TRIES - 1 if idx in reset_this_pass else BRIDGE_RESET_MAX_TRIES
+            for attempt in range(tries):
+                if idx in reset_this_pass and attempt == 0:
+                    await asyncio.sleep(BRIDGE_RESET_SETTLE_SEC)
                 FABRIC_DEBT.note_reset(f"bridge reset of chip {idx}")
                 # A bridge reset clears the chip's firmware clock cap like any reset (spec 03 I35).
                 CEILING.mark_owed(f"bridge reset of chip {idx}")
-                result = await asyncio.to_thread(reset_chip_via_bridge, idx, bdf)
+                try:
+                    # The one in-flight PCI write (spec 04 I76): its rescan waits on the kernel's PCI
+                    # rescan/remove lock, which a write blocked in the kernel holds for good. A timeout
+                    # latches PCI-wedged and ends the whole pass here, not just this chip.
+                    result = await PCI_WRITER.write(
+                        f"bridge reset of chip {idx}",
+                        reset_chip_via_bridge,
+                        idx,
+                        bdf,
+                        timeout=bridge_reset_call_timeout(),
+                    )
+                except PciWedged as e:
+                    health_event(
+                        "bridge_reset_failed",
+                        chip=idx,
+                        bdf=bdf,
+                        reason="timeout",
+                        timeout_s=bridge_reset_call_timeout(),
+                        error=str(e),
+                    )
+                    log(f"bridge reset of chip {idx} failed: {e}; the pass stops, the power cycle is requested")
+                    lost.append(idx)
+                    metrics.stage_fired("bridge_reset", "failed")
+                    wedged = True
+                    break
                 if result:
                     recovered.append(idx)
-                    metrics.stage_fired("bridge_reset", "ok")
                     break
                 if result is None:
                     inapplicable.append(idx)
@@ -512,17 +711,31 @@ class Recovery(ABC):
                     self.last_bridge_reset_reasons[idx] = {"reason": "no_bridge"}
                     metrics.stage_fired("bridge_reset", "not_applicable")
                     break
-                if attempt + 1 < BRIDGE_RESET_MAX_TRIES:
+                if attempt + 1 < tries:
                     await asyncio.sleep(BRIDGE_RESET_SETTLE_SEC)
             else:
                 lost.append(idx)
+                if idx in reset_this_pass:
+                    # A chip the broker removed, reset through its recorded bridge on every try and
+                    # still off the bus: no SBR brings it back, the same no-window fact as no_bridge
+                    # (spec 04 I69).
+                    self.last_bridge_reset_reasons[idx] = {"reason": NO_WINDOW_REMOVED_REASON}
                 metrics.stage_fired("bridge_reset", "failed")
 
+        # Spec 04 I94: back on the bus is not recovered. A chip re-enumerated with its ARC dead stays
+        # isolated and still dead, so the rung fails and the off-bus one-shot escalates past it. A
+        # PCI-wedged pass already failed and requested the power cycle: it reads nothing more.
+        arc_dead = [] if wedged else await self._arc_dead_after_bridge_reset(recovered, log)
+        recovered = [i for i in recovered if i not in arc_dead]
+        lost.extend(arc_dead)
+        for idx in arc_dead:
+            metrics.stage_fired("bridge_reset", "failed")
         for idx in recovered:
+            metrics.stage_fired("bridge_reset", "ok")
             isolated_chips.discard(idx)
         # An inapplicable chip is NOT recovered — it stays isolated and forces the not-recovered
         # branch, so an all-gone mesh (every chip no_bridge) can never read as healed and release.
-        still_dead = sorted(set(lost) | set(inapplicable), key=int)
+        still_dead = sorted(set(lost) | set(inapplicable) | set(withheld), key=int)
         health_event(
             "chip_recovery", recovered=recovered, still_dead=still_dead, inapplicable=sorted(inapplicable, key=int)
         )
@@ -537,7 +750,21 @@ class Recovery(ABC):
             len(still_dead),
         )
 
-        if still_dead:
+        # Spec 04 I69: never re-enumerate a removed chip that was not reset this pass — the rescan
+        # lets the driver probe a hung chip. Every record counts, not only this pass's targets: the
+        # rescan is global. A refused host reset gate withholds it only then (the removed chips were
+        # not reset because of it); chips the broker never removed keep the bare rescan, as before.
+        unreset_dead = [i for i in pci.removed_chip_ids() if i not in reset_this_pass]
+        withhold = ("host_reset_gated" if gated else "removed_chip_not_reset") if unreset_dead else ""
+        if wedged or PCI_WRITER.latched:
+            withhold = "pci_wedged"
+        if still_dead and withhold:
+            health_event("pci_rescan_withheld", chips=still_dead, unreset=unreset_dead, reason=withhold)
+            log(
+                f"PCI rescan withheld ({withhold}) for chip(s) {still_dead}: re-enumerating a hung chip "
+                f"that was not reset can take the host down; they stay isolated, escalating to a heavier rung"
+            )
+        if still_dead and not withhold and set(still_dead) - set(arc_dead):
             # Cheapest rung there is, and the one that was missing: a bare PCI rescan. A chip with no
             # parent bridge is not necessarily a departed ASIC — measured twice on this host, the
             # endpoint was still in lspci AND still bound to the driver, and only its /dev node was
@@ -546,14 +773,20 @@ class Recovery(ABC):
             # reboot or a chassis power cycle. A rescan re-enumerates it in about a second with no
             # downtime; both times it restored 8/8. Try it before anything that costs a tenant.
             try:
-                await asyncio.to_thread(Path("/sys/bus/pci/rescan").write_text, "1")
+                await pci_rescan("bare rescan of dead chips", _sysfs_rescan)
                 await asyncio.sleep(3)
-            except OSError as e:
+            except (OSError, asyncio.TimeoutError) as e:
                 log(f"PCI rescan could not run ({e}); falling through to the heavier rungs")
             else:
-                back = [i for i in still_dead if Path(f"/sys/class/tenstorrent/tenstorrent!{i}").exists()]
+                # A rescan cannot revive a chip already on the bus with its ARC dead (I94).
+                back = [
+                    i
+                    for i in still_dead
+                    if i not in arc_dead and Path(f"{pci.SYSFS_CLASS_DIR}/tenstorrent!{i}").exists()
+                ]
                 # The rescan may bring back more than the chips this pass targeted.
-                back = sorted(set(back) | set(drop_returned_isolated(isolated_chips, "PCI rescan", log)), key=int)
+                others = isolated_chips - set(arc_dead)
+                back = sorted(set(back) | set(drop_returned_isolated(others, "PCI rescan", log)), key=int)
                 if back:
                     for idx in back:
                         isolated_chips.discard(idx)
@@ -565,14 +798,20 @@ class Recovery(ABC):
                     )
                 if not still_dead:
                     return True
+        if still_dead:
             if inapplicable:
                 log(
                     f"chip(s) {sorted(inapplicable, key=int)} have no bridge to reset — they left "
                     f"the bus, so the per-chip rung cannot reach them; escalating to a heavier rung."
                 )
-            if lost:
+            if arc_dead:
                 log(
-                    f"chip(s) {lost} did NOT come back from a bridge reset after "
+                    f"chip(s) {arc_dead} came back on the bus with no live ARC heartbeat after "
+                    f"{BRIDGE_RESET_ARC_WAIT_SEC:g}s: not recovered, they stay isolated; escalating to a heavier rung."
+                )
+            if set(lost) - set(arc_dead):
+                log(
+                    f"chip(s) {[i for i in lost if i not in arc_dead]} did NOT come back from a bridge reset after "
                     f"{BRIDGE_RESET_MAX_TRIES} tries; they stay out of the kernel so they cannot take "
                     f"the host down. Escalating to a galaxy reset — they re-enumerate on the next PCI "
                     f"rescan, no power-cycle required."
@@ -580,6 +819,34 @@ class Recovery(ABC):
             return False
         log(f"chip(s) {recovered} are back on the bus and bound to the driver")
         return True
+
+    async def _arc_dead_after_bridge_reset(self, chips: list, log) -> list:
+        """Spec 04 I94: of the chips the bridge rung brought back on the bus, those whose ARC heartbeat
+        still does not read as a counter after BRIDGE_RESET_ARC_WAIT_SEC. Reads only; a live chip costs
+        one heartbeat read and no wait. On a host whose KMD has no heartbeat attr it marks no chip:
+        the rung's other checks and the full post-reset check, fabric included, still gate the lift."""
+        global _arc_check_skip_logged
+        pending = sorted(chips, key=int)
+        if (
+            pending
+            and not await asyncio.to_thread(heartbeat_attr_present, pending)
+            and not await asyncio.to_thread(self.deps.heartbeat_supported)
+        ):
+            if not _arc_check_skip_logged:
+                _arc_check_skip_logged = True
+                log("post-bridge ARC check skipped: this driver exposes no tt_heartbeat attr")
+                health_event("bridge_reset_arc_check_skipped", reason="attr_absent", chips=pending)
+            return []
+        for attempt in range(BRIDGE_RESET_ARC_POLLS + 1):
+            if not pending:
+                break
+            if attempt:
+                await asyncio.sleep(BRIDGE_RESET_ARC_POLL_SEC)
+            live = set(await asyncio.to_thread(arc_live_chips, pending))
+            pending = [i for i in pending if i not in live]
+        if pending:
+            health_event("bridge_reset_arc_dead", chips=pending, wait_sec=BRIDGE_RESET_ARC_WAIT_SEC)
+        return pending
 
     def _fabric_ran_but_unverified(self, evidence: dict) -> bool:
         """A 77: the fabric traffic pass RAN but tested no trained link — the ``fabric`` key is present
@@ -598,26 +865,50 @@ class Recovery(ABC):
         ``healthy`` is None: never a recovery (no hold is cleared onto a fabric no pass proved, the box D
         shape: enum+ARC read OK while every full-mesh job died on a down link), and never a failed reset
         either (a 77 measured nothing, so it must not arm the host rungs). Falsy, so a caller that only
-        asks "recovered?" still reads no. Returns ``(healthy, evidence, fabric_retries)``."""
+        asks "recovered?" still reads no. A 77 from a validator that is not built yet (spec 03 I81) gets no
+        retry and no eth-training wait: it is the same UNKNOWN at once. Returns ``(healthy, evidence,
+        fabric_retries)``."""
         healthy, evidence = await self._verify_device(expected, log)
         retries = 0
+        not_built = None
         while (
             self._fabric_ran_but_unverified(evidence)
             and healthy
             and expected > 1
             and retries < POST_RESET_FABRIC_RETRIES
         ):
+            not_built = fabric.validator_not_built()
+            if not_built is not None:
+                # I81: the 77 is a validator that is not on disk; no wait for eth training makes it run.
+                log(
+                    f"post-reset fabric could not run: fabric validator not built ({not_built}) — no "
+                    "eth-training wait; the fabric stays unverified until the build lands"
+                )
+                break
             retries += 1
-            log(
-                f"post-reset fabric found no trained link (77) — waiting {POST_RESET_FABRIC_RETRY_SLEEP_SEC:.0f}s "
-                f"for eth training, then re-checking (retry {retries}/{POST_RESET_FABRIC_RETRIES})"
-            )
-            await asyncio.sleep(POST_RESET_FABRIC_RETRY_SLEEP_SEC)
+            if fabric.names_dispatch_cap(evidence["fabric"].get("detail", "")):
+                # I84: the validator already moved traffic across every link, so they were trained;
+                # only the dispatch probe ran out its cap. The eth-training wait buys nothing here.
+                log(
+                    f"post-reset fabric passed its links but the dispatch probe hit its cap (77) — "
+                    f"re-checking now, no eth-training wait (retry {retries}/{POST_RESET_FABRIC_RETRIES})"
+                )
+            else:
+                log(
+                    f"post-reset fabric found no trained link (77) — waiting {POST_RESET_FABRIC_RETRY_SLEEP_SEC:.0f}s "
+                    f"for eth training, then re-checking (retry {retries}/{POST_RESET_FABRIC_RETRIES})"
+                )
+                await asyncio.sleep(POST_RESET_FABRIC_RETRY_SLEEP_SEC)
             healthy, evidence = await self._verify_device(expected, log)
         if healthy and expected > 1 and self._fabric_ran_but_unverified(evidence):
             log(
-                "post-reset fabric still could not verify after eth-training retries — the fabric is UNKNOWN "
-                "(enum+ARC healthy, no pass got a verdict): not recovered, and not a failed reset"
+                (
+                    "post-reset fabric could not verify (fabric validator not built)"
+                    if not_built
+                    else "post-reset fabric still could not verify after eth-training retries"
+                )
+                + " — the fabric is UNKNOWN (enum+ARC healthy, no pass got a verdict): not recovered, and not "
+                "a failed reset"
             )
             healthy = None
         FABRIC_DEBT.note_evidence(evidence)
@@ -636,17 +927,62 @@ class Recovery(ABC):
         will not revive it on an immediate retry, and every extra reset is another pass
         of MMIO at a dead endpoint — the exact traffic that promotes a PCIe error to
         fatal and takes the host down with it. One attempt, then back off and let the
-        caller report honestly. Returns True if the device verified healthy, None when the reset ran,
+        caller report honestly. The one exception is a reset that brought every chip back on the bus
+        but left ARC not ready: that is not a dead endpoint, and one more reset clears it
+        (:meth:`_arc_not_ready_retry_due`). Returns True if the device verified healthy, None when the reset ran,
         enum+ARC verify and only the fabric stayed unverifiable (a persistent 77: held fabric-unverified,
         the caller must not climb on it), False otherwise.
         """
+        started = time.monotonic()
         try:
             return await self._reset_and_verify_device_once(indices, log)
         finally:
             # The reset and its verify are over and the host is still up: an off-bus intent is spent.
             pcie_guard.end_offbus_reset()
+            if self.mechanism.last_reset_monotonic >= started and "-glx_reset" in self.reset_argv(indices):
+                # A launched Galaxy mesh reset: the sweep spaces the episode's second from it (I93).
+                self.mechanism.last_mesh_reset_run = {
+                    "episode": self.deps.device_hold_episode_since() or "",
+                    "started": started,
+                    # The reset command's end, not its check's: the sweep's gap counts from here.
+                    "ended": max(started, self.mechanism.last_reset_ended_monotonic),
+                }
 
-    async def _reset_and_verify_device_once(self, indices: list, log) -> Optional[bool]:
+    async def _arc_not_ready_retry_due(self, argv: list, expected: int, log) -> bool:
+        """After a mesh reset that EXITED non-zero: is this the one shape a second reset clears, on a box
+        it may fire on? All of: a Galaxy ``-glx_reset`` on a multi-chip mesh; every expected chip on the
+        bus (none missing, none reading all-ones); at least one chip ARC-not-ready, still so after
+        ``ARC_NOT_READY_RETRY_SETTLE_SEC``; no running broker job and a complete holder scan with no
+        tenant. A chip still off the bus is the dead-endpoint case the no-repeat rule is for: never."""
+        if expected <= 1 or "-glx_reset" not in argv:
+            return False
+
+        def bus_back_arc_not_ready() -> list:
+            beats = self.deps.read_heartbeats()
+            not_ready = arc_not_ready_chips(beats)
+            if not not_ready or offbus_count(beats, expected, not_ready) or pcie_guard.chips_off_bus(expected):
+                return []
+            return sorted(not_ready, key=int)
+
+        if not await asyncio.to_thread(bus_back_arc_not_ready):
+            return False
+        await asyncio.sleep(ARC_NOT_READY_RETRY_SETTLE_SEC)
+        not_ready = await asyncio.to_thread(bus_back_arc_not_ready)
+        if not not_ready:
+            return False
+        if self.deps.job_running():
+            return False
+        scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
+        if not scan.complete or any(is_tenant(h) for h in scan.holders):
+            return False
+        log(
+            f"all {expected} chips back on the bus but chip(s) {not_ready} ARC not ready after the reset — "
+            "one more reset on the idle device (not a dead endpoint)"
+        )
+        health_event("reset_arc_not_ready_retry", argv=argv, arc_not_ready=not_ready, expected_chips=expected)
+        return True
+
+    async def _reset_and_verify_device_once(self, indices: list, log, arc_retry: bool = True) -> Optional[bool]:
         # Reset per call: only a reset that actually EXITS non-zero this pass sets it below. An adopted
         # foreign scope or a clean-exit-but-unverified reset must not leave a stale hard-fail flag that
         # steers the next gate's escalation to the cold rung over a reset that never hard-failed.
@@ -696,14 +1032,26 @@ class Recovery(ABC):
 
         log(f"resetting device: {' '.join(argv)}  ({expected} device(s); ~30-60s, restart-safe)")
         health_event("reset_begin", argv=argv, expected_chips=expected)
+        prior_reset_monotonic = self.mechanism.last_reset_monotonic
         self.mechanism.last_reset_monotonic = time.monotonic()
         pcie_guard.begin_offbus_reset("mesh reset", off_bus)
         aer_mask = pcie_guard.mask_for_mesh_reset(log)
         try:
             rc, out = await self.mechanism.reset_with_quiesce(argv, log)
         finally:
+            self.mechanism.last_reset_ended_monotonic = time.monotonic()
             if aer_mask is not None:
                 await asyncio.to_thread(aer_mask.restore)
+        if rc is None and (out or "").startswith("reset refused:"):
+            # Spec 04 I92: the pre-reset scan refused (a tenant, a reader that would not die, an off-bus
+            # chip it could not detach, a reset already in flight). No reset ran, so nothing that a
+            # reset settles is settled: the cooldown clock goes back, a kill-reset debt or a spent
+            # dispatch reset stays owed, and the hold stays for the 10-min ladder (I76).
+            self.mechanism.last_reset_monotonic = prior_reset_monotonic
+            log(out)
+            health_event("reset_refused", argv=argv, detail=out)
+            metrics.stage_fired("smi_reset", "blocked")
+            return False
         self.mechanism.last_reset_rc = rc
         if _journal_cpld_too_old(argv, out, log):
             # Latched on the mechanism both platforms share, so the NEXT rung and every later pass
@@ -723,8 +1071,12 @@ class Recovery(ABC):
             if rc is not None:
                 self.mechanism.last_reset_failed = True
                 self.mechanism.last_reset_exit_nonzero = True
-                self.mechanism.mesh_reset_failed_since_release = True
+                self.mechanism.mark_mesh_reset_failed()
             metrics.stage_fired("smi_reset", "timeout" if rc is None else "failed")
+            if rc is not None and arc_retry and await self._arc_not_ready_retry_due(argv, expected, log):
+                # The retry is this same gated path (host gate, outage hold, cooldown clock, full verify
+                # with the fabric), only once: a second failure returns False and the ladder climbs on.
+                return await self._reset_and_verify_device_once(indices, log, arc_retry=False)
             return False
 
         # rc == 0: the reset command itself completed, independent of whatever the verify below
@@ -743,7 +1095,9 @@ class Recovery(ABC):
             # strikes, and drove the idle ladder toward a host rung on no evidence. Hold fabric-unverified
             # (not dirty) instead: the reset was the remedy a reported fault was pending, so retire that,
             # and the hold is 77-only — the idle relift re-runs the pass, bounded by spec 03 I40.
-            health_event("reset_unverified", rc=rc, evidence=evidence, fabric_retries=retries)
+            health_event(
+                "reset_unverified", rc=rc, evidence=evidence, fabric_retries=retries, fabric=_fabric_of(self.monitor)
+            )
             self.mechanism.last_reset_failed = False
             self.deps.clear_device_reported_fault("reset ran and enum+ARC verify; the fabric is unknown")
             if self.deps.hold_device_fabric_unverified is not None:
@@ -761,10 +1115,11 @@ class Recovery(ABC):
             healthy=healthy,
             evidence=evidence,
             fabric_retries=retries,
+            fabric=_fabric_of(self.monitor),
         )
         self.mechanism.last_reset_failed = not healthy
         if not healthy:
-            self.mechanism.mesh_reset_failed_since_release = True
+            self.mechanism.mark_mesh_reset_failed()
         if healthy:
             log("reset complete + health verified")
             return True

@@ -22,7 +22,6 @@ from tests.test_ladder_v2 import _wire_failed_tray_down_sweep
 from tests.test_offbus_power_cycle import _gated, _ladder_ran, _pass
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.recovery import base as recovery_base
-from tt_device_mcp.health.recovery import galaxy
 from tt_device_mcp.health.recovery import offbus_power_cycle as opc
 
 DAY = 1_760_486_400.0  # a fixed midnight; only differences matter
@@ -119,8 +118,7 @@ async def test_g8_the_ladder_takes_the_power_cycle_instead_of_holding_for_the_in
     if verified:
         _verify_g7()
     offbus = {str(i) for i in range(32)}
-    out = await g._fire_tray_down_no_window(offbus, 32, lambda m: None, gate_phase="post-job", ev=None)
-    assert out == galaxy.OUTCOME_WAITING
+    await g._climb_or_hand_off(32, len(offbus), "2026-10-14T18:04:51", lambda m: None)
     assert cycles["n"] == (1 if verified else 0)
 
 

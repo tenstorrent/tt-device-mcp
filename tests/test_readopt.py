@@ -87,7 +87,13 @@ async def test_readopted_job_recovers_its_real_exit_code(monkeypatch, tmp_path, 
     monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
 
     srv.jobs["134"] = srv.Job(
-        id="134", owner="[agent]jsmith", workspace="/w", command="pytest", queued_at="", status=srv.JobStatus.RUNNING
+        id="134",
+        owner="[agent]jsmith",
+        workspace="/w",
+        command="pytest",
+        queued_at="",
+        status=srv.JobStatus.RUNNING,
+        started_at=srv.datetime.now().isoformat(),
     )
     # What the job itself recorded on its way out.
     (tmp_path / "134.exit").write_text("1")
@@ -106,7 +112,13 @@ async def test_readopted_job_that_passed_is_reported_as_passed(monkeypatch, tmp_
     monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
 
     srv.jobs["135"] = srv.Job(
-        id="135", owner="[agent]jsmith", workspace="/w", command="pytest", queued_at="", status=srv.JobStatus.RUNNING
+        id="135",
+        owner="[agent]jsmith",
+        workspace="/w",
+        command="pytest",
+        queued_at="",
+        status=srv.JobStatus.RUNNING,
+        started_at=srv.datetime.now().isoformat(),
     )
     (tmp_path / "135.exit").write_text("0")
 
@@ -148,7 +160,13 @@ async def test_a_readopted_job_that_wedged_the_mesh_flags_the_device(monkeypatch
     log = tmp_path / "run_137.log"
     log.write_text("... op start ...\nwaiting for active ethernet core\n... teardown ...\n")
     job = srv.Job(
-        id="137", owner="[agent]jsmith", workspace="/w", command="pytest", queued_at="", status=srv.JobStatus.RUNNING
+        id="137",
+        owner="[agent]jsmith",
+        workspace="/w",
+        command="pytest",
+        queued_at="",
+        status=srv.JobStatus.RUNNING,
+        started_at=srv.datetime.now().isoformat(),
     )
     job.log_file = str(log)
     srv.jobs["137"] = job

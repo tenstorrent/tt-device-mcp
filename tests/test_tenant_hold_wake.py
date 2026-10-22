@@ -58,6 +58,7 @@ async def test_startup_release_dispatches_a_held_job_within_a_second(monkeypatch
     passes = _held(monkeypatch, reasons)
     srv.fsm.on_fault("startup_unverified", detail="startup verify pending", dirty=False)
 
+    monkeypatch.setattr(srv, "TENANT_HOLD_WAKE_MIN_GAP_SEC", 0.1)
     job = _job("668")
     hold = asyncio.create_task(srv._hold_job_until_device_fit(job, None, reasons[0]))
     await asyncio.sleep(0.05)
@@ -71,6 +72,9 @@ async def test_startup_release_dispatches_a_held_job_within_a_second(monkeypatch
 
     assert result == "", result
     assert job.status is srv.JobStatus.QUEUED, "a woken hold must hand the job on, never cancel it"
+    # The wake keeps TENANT_HOLD_WAKE_MIN_GAP_SEC (0.1 s here) between gate passes; a loaded suite
+    # run adds to that. The poll is 60 s and wait_for caps the hold at 5 s, so 2 s tells a wake from
+    # a poll.
     assert time.monotonic() - released < 2.0, "the held job waited for the poll, not the release"
     assert len(passes) == 1, "the wake must re-run the gate once, and only the gate releases the job"
     assert "device_released" in events

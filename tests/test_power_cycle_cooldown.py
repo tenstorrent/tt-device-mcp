@@ -23,10 +23,14 @@ from tt_device_mcp import server as srv
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy
-from tt_device_mcp.health.recovery.base import AUTO_RECOVERY_LEDGER, POWER_CYCLE_MIN_INTERVAL_SEC
+from tt_device_mcp.health.recovery.base import (
+    AUTO_RECOVERY_LEDGER,
+    CLASS_A_LADDER_AFTER_SEC,
+    POWER_CYCLE_MIN_INTERVAL_SEC,
+)
 
 T0 = 1_800_000_000.0
-LADDER = {"glx_reset", "ubb_tray", "sweep"}
+LADDER = {"glx_reset", "sweep"}
 
 
 @pytest.fixture
@@ -89,13 +93,15 @@ def _watchdog(r, monkeypatch, at):
 async def test_a_boot_3_min_before_startup_holds_to_a_deadline_then_cycles_once(cool, monkeypatch):
     """The box came up 3 min ago from a cycle the broker did not fire (manual, BMC, datacenter): a
     whole tray is off at startup. The hold stays with its deadline on /health; no ladder rung runs
-    meanwhile; at the deadline the watchdog asks once and exactly one cycle fires."""
+    before the 10-min mark, where the watchdog starts the full ladder once (spec 04 I73); at the
+    deadline it asks once more and exactly one cycle fires."""
     cool["boot"]["btime"] = T0 - 180
     _tray_off(cool)
     assert await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup") == galaxy.OUTCOME_WAITING
     until = T0 - 180 + POWER_CYCLE_MIN_INTERVAL_SEC
     assert _cycles(cool) == 0 and not LADDER & set(cool["order"])
     assert cool["g"].mechanism.power_cycle_retry[0] == until
+    assert cool["g"].mechanism.power_cycle_retry_cooldown, "a boot cooldown defers the 10-min ladder (I76)"
     state = cool["g"].mechanism.power_cycle_cooldown_state
     assert state["cause"] == "host boot" and "power cycle in cooldown until" in state["why"]
     monkeypatch.setattr(srv, "_device_hold_state", lambda now=None: ("tray off", srv.device_hold_episode_since))
@@ -106,6 +112,10 @@ async def test_a_boot_3_min_before_startup_holds_to_a_deadline_then_cycles_once(
     cool["clk"][0] = T0 + 600
     await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
     assert _cycles(cool) == 0 and not LADDER & set(cool["order"])
+    mark = cool["g"].mechanism._class_a_ladder_anchor_now(T0 + 600) + CLASS_A_LADDER_AFTER_SEC
+    assert T0 < mark < until
+    assert _watchdog(cool, monkeypatch, mark - 1) == []
+    assert _watchdog(cool, monkeypatch, mark) == [mark], "the full ladder at the 10-min mark"
     assert _watchdog(cool, monkeypatch, until - 1) == []
     assert _watchdog(cool, monkeypatch, until) == [until], "asked the moment the cooldown ends"
     assert _watchdog(cool, monkeypatch, until + 30) == [], "once per denial"
@@ -246,6 +256,7 @@ def test_the_per_boot_cap_denial_shows_on_health(cool, monkeypatch):
     until = T0 - 60 + POWER_CYCLE_MIN_INTERVAL_SEC
     assert not allowed and m.power_cycle_cooldown_state["until"] == until == m.power_cycle_retry[0]
     assert m.power_cycle_cooldown_state["last"] == T0 - 60
+    assert not m.power_cycle_retry_cooldown, "a cap wait is not a cooldown: the 10-min ladder still runs (I76)"
 
 
 # ---- (c) backoff ---------------------------------------------------------------------------------
@@ -343,18 +354,25 @@ def test_only_a_verified_release_with_no_fabric_debt_ends_the_streak(monkeypatch
     monkeypatch.setattr(srv, "health_dir", lambda: tmp_path)
     monkeypatch.setattr(recovery_base, "health_dir", lambda: tmp_path)
     m = srv.recovery_mechanism
+    # Each cycle took the host down: recorded on an earlier boot (spec 04 I72).
+    monkeypatch.setattr(m, "_current_boot_id", lambda: "boot-earlier")
     for i in range(3):
         m.record_auto_recovery("power-cycle", "tray off", now_epoch=time.time() - 3000 + i)
+    monkeypatch.setattr(m, "_current_boot_id", lambda: "boot-now")
     assert m.power_cycle_interval() == 7200
+    deadline = tmp_path / recovery_base.POWER_CYCLE_DEADLINE_FILE  # this hold's fixed deadline (I65)
+    deadline.write_text(json.dumps({"until": time.time() + 600, "set_at": time.time() - 60}))
     held = []
     monkeypatch.setattr(srv, "_hold_device_fabric_unverified", lambda why: held.append(why))
     monkeypatch.setattr(srv, "_post_reset_debt", lambda: FABRIC_DEBT.owed)  # a multi-chip mesh with a fabric check
     FABRIC_DEBT.owed = "power-cycle"
     assert srv._clear_device_dirty(verified=True, why="post-cycle check") is False
     assert held and m.power_cycle_interval() == 7200, "no release, the streak stands"
+    assert deadline.exists(), "no release, the hold episode and its deadline stand"
     FABRIC_DEBT.owed = ""
     assert srv._clear_device_dirty(verified=True, why="post-cycle check") is True
     assert m.power_cycle_interval() == POWER_CYCLE_MIN_INTERVAL_SEC
+    assert not deadline.exists(), "only the verified release ends the episode"
 
 
 # ---- (g) class C at startup ----------------------------------------------------------------------
@@ -475,3 +493,162 @@ def test_an_unmatched_failure_line_is_ignored(state_hist):
 def test_an_attempt_without_a_failure_line_still_counts(state_hist):
     _hist_recs(state_hist, (T0 - 500, "old"), (T0 - 100, "BMC"))
     assert recovery_base._last_external_power_cycle(T0) == (T0 - 100, "BMC")
+
+
+# ---- (i) one hold episode's deadline never moves later ------------------------------------------
+
+
+def _deadline_file():
+    return recovery_base.health_dir() / recovery_base.POWER_CYCLE_DEADLINE_FILE
+
+
+def _ask(m, at):
+    return m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=at)
+
+
+def test_reboots_inside_one_hold_never_move_its_power_cycle_deadline_later(cool, monkeypatch):
+    """The broker's power cycle at T healed nothing and the hold stands. Boots at T+20, T+40 and
+    T+60 min (an operator shutdown, an external cycle, a warm reboot: none heals a whole tray) each
+    restarted the full interval, so the cycle never came. Now the deadline the first denial fixed
+    holds; only a boot right at it adds the stated post-boot settle."""
+    monkeypatch.setattr(recovery_base, "POWER_CYCLE_MIN_INTERVAL_SEC", 3600)
+    settle = recovery_base.POWER_CYCLE_POST_BOOT_SETTLE_SEC
+    m = cool["g"].mechanism
+    _ledger({"action": "power-cycle", "boot_id": "boot-A", "at_epoch": T0, "at": "x"})
+    allowed, why = _ask(m, T0 + 60)
+    assert not allowed and m.power_cycle_retry[0] == T0 + 3600
+    assert json.loads(_deadline_file().read_text())["until"] == T0 + 3600
+    untils = []
+    for n, boot_at in enumerate((T0 + 1200, T0 + 2400, T0 + 3600)):
+        cool["boot"].update(id=f"boot-{n}", btime=boot_at)
+        m.power_cycle_cooldown_state = m.power_cycle_retry = None  # a broker restart with the boot
+        allowed, why = _ask(m, boot_at + 60)
+        assert not allowed and "fixed for this hold" in why
+        untils.append(m.power_cycle_retry[0])
+    assert untils == [T0 + 3600, T0 + 3600, T0 + 3600 + settle], "never later than the deadline or boot + settle"
+    assert _ask(m, T0 + 3600 + settle - 1)[0] is False
+    allowed, why = _ask(m, T0 + 3600 + settle)
+    assert allowed, why
+
+
+@pytest.mark.asyncio
+async def test_an_operator_shutdown_inside_the_hold_keeps_the_deadline_and_the_cycle_fires_at_it(cool, monkeypatch):
+    """Gate level: a whole tray off after the broker's cycle at T; the first pass fixes the deadline.
+    A shutdown brings a new boot 20 min in: the startup gate still holds (no reset, no release),
+    /health shows the same deadline, and the cycle fires at it, not a full interval after the boot."""
+    _ledger({"action": "power-cycle", "boot_id": "boot-A", "at_epoch": T0, "at": "x"})
+    _tray_off(cool)
+    cool["clk"][0] = T0 + 60
+    await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
+    until = T0 + POWER_CYCLE_MIN_INTERVAL_SEC
+    m = cool["g"].mechanism
+    assert _cycles(cool) == 0 and m.power_cycle_cooldown_state["until"] == until
+    cool["boot"].update(id="boot-B", btime=T0 + 1200)
+    m.power_cycle_cooldown_state = m.power_cycle_retry = None
+    cool["clk"][0] = T0 + 1260
+    assert await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup") == galaxy.OUTCOME_WAITING
+    assert _cycles(cool) == 0 and not LADDER & set(cool["order"])
+    assert m.power_cycle_retry[0] == until
+    monkeypatch.setattr(srv, "_device_hold_state", lambda now=None: ("tray off", srv.device_hold_episode_since))
+    cd = srv._health_payload(now=datetime.fromtimestamp(T0 + 1260))["power_cycle_cooldown"]
+    assert cd["next_deadline"] == datetime.fromtimestamp(until).isoformat(timespec="seconds")
+    assert cd["fixed_at"] == datetime.fromtimestamp(T0 + 60).isoformat(timespec="seconds")
+    cool["clk"][0] = until
+    await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
+    assert _cycles(cool) == 1 and not LADDER & set(cool["order"])
+
+
+def test_the_brokers_next_cycle_spends_the_deadline_and_the_boot_loop_guard_holds(cool):
+    """The boot-loop guard (I65): once the broker cycles at the fixed deadline, the next cycle waits a full
+    interval from that cycle's boot, never the old deadline plus the settle."""
+    m = cool["g"].mechanism
+    _ledger({"action": "power-cycle", "boot_id": "boot-A", "at_epoch": T0, "at": "x"})
+    assert _ask(m, T0 + 60)[0] is False
+    at = T0 + POWER_CYCLE_MIN_INTERVAL_SEC
+    assert _ask(m, at)[0] is True
+    m.record_auto_recovery("power-cycle", "tray off", now_epoch=at)
+    cool["boot"].update(id="boot-B", btime=at + 120)
+    allowed, why = _ask(m, at + 180)
+    assert not allowed and "fixed for this hold" not in why
+    assert m.power_cycle_retry[0] == at + 120 + m.power_cycle_interval(now_epoch=at + 180)
+
+
+def test_a_verified_release_ends_the_episode_deadline(cool):
+    m = cool["g"].mechanism
+    _ledger({"action": "power-cycle", "boot_id": "boot-A", "at_epoch": T0, "at": "x"})
+    assert _ask(m, T0 + 60)[0] is False and _deadline_file().exists()
+    m.note_mesh_verified(now_epoch=T0 + 120)
+    assert not _deadline_file().exists()
+    cool["boot"].update(id="boot-B", btime=T0 + 1200)  # a new fault on a later boot: the plain cooldown
+    assert _ask(m, T0 + 1260)[0] is False and m.power_cycle_retry[0] == T0 + 1200 + POWER_CYCLE_MIN_INTERVAL_SEC
+
+
+@pytest.mark.parametrize(
+    "rec",
+    [
+        "not json",
+        {"until": T0 + 60, "set_at": T0 + 9999, "last": T0, "cause": "x", "interval_sec": 1800},  # fixed in the future
+        {"until": T0 - 5 * 3600, "set_at": T0 - 6 * 3600, "last": T0, "cause": "x", "interval_sec": 1800},  # stale
+        {"until": "NaN", "set_at": T0 - 60, "last": T0, "cause": "x", "interval_sec": 1800},
+        {"until": T0 + 60, "set_at": T0 - 60, "cause": "x"},  # incomplete
+    ],
+)
+def test_an_unusable_deadline_record_leaves_the_plain_cooldown(cool, rec):
+    m = cool["g"].mechanism
+    cool["boot"].update(id="boot-B", btime=T0 - 600)
+    _deadline_file().write_text(rec if isinstance(rec, str) else json.dumps(rec))
+    assert _ask(m, T0)[0] is False and m.power_cycle_retry[0] == T0 - 600 + POWER_CYCLE_MIN_INTERVAL_SEC
+
+
+@pytest.mark.parametrize("stamp", ["garbage", None])
+def test_a_broker_cycle_with_an_unreadable_stamp_spends_the_deadline(cool, stamp):
+    """Fail toward the longer wait: a cycle the ledger cannot date may be one after the deadline."""
+    m = cool["g"].mechanism
+    _deadline_file().write_text(
+        json.dumps({"until": T0 + 60, "set_at": T0 - 1200, "last": T0 - 1740, "cause": "x", "interval_sec": 1800})
+    )
+    _ledger({"action": "power-cycle", "boot_id": "boot-0", "at_epoch": stamp, "at": "x"})
+    cool["boot"].update(id="boot-B", btime=T0 - 300)
+    assert m._episode_power_cycle_deadline(m.read_auto_recovery_ledger(), T0) is None
+
+
+def test_an_old_unreadable_stamp_does_not_void_a_later_deadline(cool):
+    """A cycle row the ledger could never date, there before the deadline was fixed, does not spend
+    it: only one more such row than at fixing time does (each denial would otherwise fall back to the
+    plain cooldown, re-armed per boot)."""
+    m = cool["g"].mechanism
+    rec = {"until": T0 + 60, "set_at": T0 - 1200, "last": T0 - 1740, "cause": "x", "interval_sec": 1800}
+    old = {"action": "power-cycle", "boot_id": "boot-0", "at_epoch": "garbage", "at": "x"}
+    _deadline_file().write_text(json.dumps(dict(rec, unstamped_cycles=1)))
+    _ledger(old)
+    cool["boot"].update(id="boot-B", btime=T0 - 300)
+    assert m._episode_power_cycle_deadline(m.read_auto_recovery_ledger(), T0)["until"] == T0 + 60
+    _ledger(old, dict(old, boot_id="boot-1"))
+    assert m._episode_power_cycle_deadline(m.read_auto_recovery_ledger(), T0) is None
+
+
+def test_the_first_denial_records_how_many_cycles_had_no_stamp(cool):
+    m = cool["g"].mechanism
+    _ledger({"action": "power-cycle", "boot_id": "boot-0", "at_epoch": None, "at": "x"})
+    cool["boot"].update(id="boot-B", btime=T0 - 600)
+    assert _ask(m, T0)[0] is False
+    assert json.loads(_deadline_file().read_text())["unstamped_cycles"] == 1
+
+
+def test_a_deadline_fixed_later_than_now_is_kept_not_rewritten(cool):
+    """The clock went back after a boot: the record reads as fixed in the future, so it is ignored for
+    now, but it is not overwritten with a fresh (later) deadline that would re-arm the interval."""
+    m = cool["g"].mechanism
+    rec = {"until": T0 + 900, "set_at": T0 + 600, "last": T0 - 900, "cause": "x", "interval_sec": 1800}
+    _deadline_file().write_text(json.dumps(rec))
+    cool["boot"].update(id="boot-B", btime=T0 - 600)
+    assert _ask(m, T0)[0] is False
+    assert json.loads(_deadline_file().read_text()) == rec
+
+
+def test_the_post_boot_settle_is_within_the_startup_gates_own_bound():
+    from tt_device_mcp.constants import FABRIC_CHECK_TIMEOUT_SEC
+
+    assert (
+        0 < recovery_base.POWER_CYCLE_POST_BOOT_SETTLE_SEC <= srv.STARTUP_HUGEPAGES_WAIT_SEC + FABRIC_CHECK_TIMEOUT_SEC
+    )

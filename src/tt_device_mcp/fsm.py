@@ -30,11 +30,12 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Iterable, Optional
 
 from tt_device_mcp import metrics, privileges
 from tt_device_mcp.health import (
@@ -61,7 +62,9 @@ if TYPE_CHECKING:
 # A boot-attribution clause names how THIS boot came up; it must not ride forward on a long episode's
 # carried detail (an 18h-old reboot then reads as this boot's cause). Stripped on carry so only the
 # current boot's adjacency-guarded attribution, if any, is present. action may be hyphenated (power-cycle).
-_BOOT_ATTRIBUTION_RE = re.compile(r"\s*boot attributed to a broker-fired [\w-]+ recorded at \S+")
+_BOOT_ATTRIBUTION_RE = re.compile(
+    r"\s*boot attributed to a (?:broker-fired [\w-]+|warm reboot \([^)]*\)) recorded at \S+"
+)
 
 
 def _strip_boot_attribution(detail: str) -> str:
@@ -76,6 +79,10 @@ class ServerState(str, Enum):
     HEALTHY = "healthy"
     RECOVERING = "recovering"
     DOWN = "down"
+
+
+# The states in which fsm.json's readopted_jobs may be non-empty (spec 03 I76).
+_READOPT_STATES = (ServerState.BOOT, ServerState.RECOVERING)
 
 
 # The closed vocabulary `why` may hold — every distinct reason a gate pass or a job's exit has
@@ -188,9 +195,22 @@ class ServerFsm:
         # unknown boot id must never be trusted to mean "the same boot" on either side.
         self._boot_id = current_boot_id
         self._record = FsmRecord(ServerState.BOOT)
+        # When on_fault last placed or refreshed a hold (time.monotonic(), 0.0 for never in this
+        # process): a passing check older than this proves nothing about the fault (spec 03 I78).
+        self.fault_monotonic: float = 0.0
         # Per-episode latches: reset every time a new episode opens (see _open_episode), so a
         # once-per-episode rung re-arms once the device has actually recovered and gone bad again.
         self._latches: dict[str, bool] = {}
+        # Spec 03 I76: the re-adopted job ids the startup hold waits on, as /health's
+        # startup_verify.readopted_job_ids reports them (server.py syncs it). Report-only: nothing in
+        # the broker reads it back, so it never lifts a hold or skips a check. [] outside BOOT/RECOVERING.
+        self._readopted_jobs: list[str] = []
+        # Spec 03 I76, report-only: while the startup gate owns the startup hold, when the gate began
+        # and the latest its check may end (ISO strings, deadline None while a re-adopted job runs),
+        # as /health's startup_verify reports them; None otherwise. fsm.json carries it as
+        # startup_check_in_progress / startup_check_started_at / startup_check_deadline. Nothing in
+        # the broker reads it back. Not loaded from the file: each broker start syncs it afresh.
+        self._startup_check: Optional[dict] = None
         # Whether _load restored an episode a previous boot wrote — see reopen_after_boot. One-shot.
         self._crossed_boot = False
         # Whether _load read a file this same boot wrote: an earlier broker of this boot already
@@ -366,6 +386,9 @@ class ServerFsm:
                 dirty=bool(raw.get("dirty", False)),
             )
             latches = {k: bool(v) for k, v in (raw.get("latches") or {}).items()}
+            # Absent in a file written before spec 03 I76: loads as [].
+            raw_readopted = raw.get("readopted_jobs") or []
+            readopted = [str(j) for j in raw_readopted] if isinstance(raw_readopted, list) else []
         except (ValueError, TypeError, AttributeError):
             # A field is present but the wrong type (latches not a mapping, an unknown state
             # string) — same fail-safe as above: BOOT, not a crash at import time. Explicit,
@@ -405,13 +428,20 @@ class ServerFsm:
         self._crossed_boot = bool(file_boot_id) and bool(self._boot_id) and not same_boot
         self._loaded_same_boot = same_boot
         self._record = record
+        # A latch an older broker wrote for the removed BMC tray re-power rung means nothing now.
+        latches.pop("ubb_reset_fired", None)
         self._latches = latches
+        # No job survives a reboot; within one boot the startup sync re-derives it from the live scopes.
+        self._readopted_jobs = readopted if same_boot and record.state in _READOPT_STATES else []
 
     def _persist(self) -> None:
         """Write the whole record as one atomic replace: a temp file in the same directory,
         fsync'd, then ``os.replace`` — so a reader (or a crash) never observes a half-written
         file, and the record on disk after any crash is always the last one that fully landed.
         Never raises: a durable record we could not write must not take the gate down with it."""
+        if self._record.state not in _READOPT_STATES:
+            self._readopted_jobs = []  # a release (HEALTHY) or DOWN ends the startup verify it reported
+            self._startup_check = None
         payload = {
             "state": self._record.state.value,
             "why": self._record.why,
@@ -420,6 +450,10 @@ class ServerFsm:
             "job": self._record.job,
             "dirty": self._record.dirty,
             "latches": self._latches,
+            "readopted_jobs": list(self._readopted_jobs),
+            "startup_check_in_progress": self._startup_check is not None,
+            "startup_check_started_at": (self._startup_check or {}).get("started_at"),
+            "startup_check_deadline": (self._startup_check or {}).get("deadline"),
             "boot_id": self._boot_id,
             # Not read back by anything in this class — purely so an operator staring at the raw
             # file can tell how stale it is without cross-referencing a log timestamp.
@@ -460,6 +494,37 @@ class ServerFsm:
         the boot's arrival — the ledger escalation that caused it — is judged on the first start
         only; see boot_merge and the startup probe's post-reboot verify."""
         return self._loaded_same_boot
+
+    @property
+    def readopted_jobs(self) -> list[str]:
+        """Spec 03 I76: the re-adopted job ids the startup hold waits on; [] when none. Report-only."""
+        return list(self._readopted_jobs) if self._record.state in _READOPT_STATES else []
+
+    def set_readopted_jobs(self, job_ids: Iterable[str]) -> None:
+        """Record which re-adopted jobs the startup hold waits on (spec 03 I76), [] once none does.
+        Persists only on a change. Ignored (kept []) outside BOOT/RECOVERING. Report-only: no gate,
+        hold, bound or escalation reads it."""
+        ids = [str(j) for j in job_ids] if self._record.state in _READOPT_STATES else []
+        if ids != self._readopted_jobs:
+            self._readopted_jobs = ids
+            self._persist()
+
+    @property
+    def startup_check_in_progress(self) -> bool:
+        """Spec 03 I76: whether the startup gate owns the startup hold right now. Report-only."""
+        return self._startup_check is not None and self._record.state in _READOPT_STATES
+
+    def set_startup_check(self, started_at: Optional[str], deadline: Optional[str], *, in_progress: bool) -> None:
+        """Record that the startup check is in progress, when it began and the latest it may end (spec
+        03 I76), or that it no longer is. Persists only on a change. Ignored outside BOOT/RECOVERING;
+        a release, DOWN or a fault hold (on_fault with any other why) clears it. Report-only: no gate,
+        hold, bound or escalation reads it."""
+        value = {"started_at": started_at, "deadline": deadline} if in_progress else None
+        if self._record.state not in _READOPT_STATES:
+            value = None
+        if value != self._startup_check:
+            self._startup_check = value
+            self._persist()
 
     @property
     def healthy(self) -> bool:
@@ -573,6 +638,9 @@ class ServerFsm:
         hold call (dirty=False) or another dirty mark landing on an already-dirty record may
         replace it."""
         why = _validate_why(why) or "gate_error"
+        self.fault_monotonic = time.monotonic()
+        if why != "startup_unverified":
+            self._startup_check = None  # spec 03 I76: a fault hold ends the startup check it reported
         if self._record.state in (ServerState.HEALTHY, ServerState.BOOT):
             self._open_episode(ServerState.RECOVERING, why, detail=detail, job=job, dirty=dirty)
         else:
@@ -618,7 +686,7 @@ class ServerFsm:
         back, spec 03 I52). That is right within one boot, where
         the ladder that took it there ran on this silicon; a reboot since is itself the biggest reset
         the ladder has, so a carried DOWN is a verdict about a boot that is gone. Only when the record
-        was loaded from another boot and is still DOWN: ``why`` and ``ubb_reset_fired`` stay, ``since``
+        was loaded from another boot and is still DOWN: ``why`` stays, ``since``
         starts over (the bound counts from this boot), ``dirty`` clears (the caller has just placed a
         no-reset hold) and the ``escalated`` latch drops so this boot's ladder is not pre-spent.
         Returns whether it reopened."""
@@ -671,8 +739,15 @@ class ServerFsm:
         if attributed_boot and not self.restarted_this_boot:
             action = attributed_boot.get("action", "?")
             at = attributed_boot.get("at", "?")
+            refuted = attributed_boot.get("cycle_refuted")
+            # Spec 04 I88: the BMC refuted the cycle, so this boot is a warm reboot, not a power cycle.
+            cause = (
+                f"warm reboot (the broker-fired {action} did not happen: BMC restart cause {refuted})"
+                if refuted
+                else f"broker-fired {action}"
+            )
             self._record.detail = (f"{self._record.detail} " if self._record.detail else "") + (
-                f"boot attributed to a broker-fired {action} recorded at {at}"
+                f"boot attributed to a {cause} recorded at {at}"
             )
         self._persist()
         return self._record.state

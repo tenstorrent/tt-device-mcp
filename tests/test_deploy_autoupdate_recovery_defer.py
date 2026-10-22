@@ -331,14 +331,14 @@ def test_a_hold_that_began_during_the_install_does_not_stop_the_restart(tmp_path
 
 def test_no_recovery_deferral_comes_after_the_install_starts():
     """Every recovery deferral is decided before pip runs. The only stop after it is the device-op
-    bar (I7, I24), which a restart may never cross."""
+    bar (I7, I24) and a broker job still running at the job cap, which a restart may never cross."""
     text = _SCRIPT.read_text()
     install = text.index('"$VENV/bin/pip" install')
     assert text.rindex("if recovery_gate; then") < text.index('git -C "$clone" reset --hard') < install
     after = text[install:]
     assert "if recovery_gate" not in after
     deferrals = re.findall(r'au_log deferred "([^"]*)"', after)
-    assert deferrals == ["device op still in flight at restart time (job cap ${JOB_CAP}s)"], deferrals
+    assert deferrals == ["broker job or device op still running at restart time (job cap ${JOB_CAP}s)"], deferrals
 
 
 def test_a_device_op_at_restart_time_is_waited_out(tmp_path):
@@ -364,7 +364,7 @@ def test_a_device_op_that_outlives_the_wait_is_never_restarted_over(tmp_path):
     assert done.returncode == 0, done.stderr
     assert "restart" not in trace
     assert (tmp_path / "root" / "installed.sha").read_text().strip() == _OLD
-    assert "decision=deferred" in log[-1] and "device op still in flight at restart time" in log[-1]
+    assert "decision=deferred" in log[-1] and "broker job or device op still running at restart time" in log[-1]
     assert "job cap 1560s" in log[-1], log
 
 

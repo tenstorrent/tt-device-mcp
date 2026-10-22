@@ -25,9 +25,10 @@ import time
 from typing import Optional
 
 from tt_device_mcp import metrics
+from tt_device_mcp.health import chip_state
 from tt_device_mcp.health.core import Verdict
 from tt_device_mcp.health.evidence import health_event
-from tt_device_mcp.health.monitors import pci
+from tt_device_mcp.health.monitors import hostpci, pci
 from tt_device_mcp.health.monitors.pci import chip_pci_bdf
 
 # The ARC counter ticks ~10Hz. This is the dwell between the two samples whose
@@ -36,8 +37,15 @@ from tt_device_mcp.health.monitors.pci import chip_pci_bdf
 HEARTBEAT_SETTLE_SEC = 0.5
 
 
-def read_heartbeats() -> dict[str, int]:
-    """Per-chip ARC heartbeat counters, keyed by device index. Zero device touches.
+def read_heartbeats(*, probe_lost: bool = False, only: Optional[frozenset] = None) -> dict[str, int]:
+    """Per-chip ARC heartbeat counters, keyed by device index.
+
+    Each attribute read is a PCIe read of the chip (the KMD reads the counter from the chip's
+    BAR), so a chip the broker has confirmed lost is not read again until :func:`chip_state.may_read`
+    allows it (spec 03 I66); it reports ALL_ONES, what its last real read said. ``probe_lost`` is for
+    a health check's decision read: each lost chip is read for real once, so a chip that answers
+    again is judged on its answer, not on the mark. ``only``, when given, limits the read to those
+    chips (spec 03 I83: the chips that just failed POST_RESET, and no other).
 
     A chip whose attribute is missing or unreadable is omitted rather than zeroed,
     so the caller sees it as an absent chip (a real fault) and not as a chip whose
@@ -51,12 +59,16 @@ def read_heartbeats() -> dict[str, int]:
     for ent in entries:
         # KMD names these `tenstorrent!N`; the index is what tt-smi and /dev agree on.
         idx = ent.name.rsplit("!", 1)[-1]
-        if not idx.isdigit():
+        if not idx.isdigit() or (only is not None and idx not in only):
+            continue
+        if not chip_state.may_read(idx, ent, probe=probe_lost):
+            beats[idx] = ALL_ONES
             continue
         try:
             beats[idx] = int(_read_beat(ent))
         except (OSError, ValueError):
             continue
+        chip_state.observe(idx, beats[idx])
     return beats
 
 
@@ -120,6 +132,36 @@ def arc_not_ready_chips(beats: dict[str, int]) -> set[str]:
     return out
 
 
+def unreadable_on_bus_chips(ids) -> set[str]:
+    """Of ``ids``, the chips whose KMD node is there with its PCI endpoint bound to the driver but
+    whose heartbeat read fails with an error other than ENODATA (EIO, or the attribute missing on
+    that node), and whose link does not read as down. :func:`offbus_chip_ids` counts such a chip off
+    the bus; it is enumerated and bound, so it is on the bus but unhealthy. Only the class A read uses
+    this (spec 04 I37): survivors of a whole-tray drop that read like this must not hide the drop's
+    shape. A chip that reads now (a counter or all-ones) or reads ENODATA is not in it; those have
+    their own handling. Nor is a lingering node whose link is down (speed ``Unknown`` or width 63,
+    :func:`hostpci.link_down`): spec 03 I9 never counts it back on the bus."""
+    out: set[str] = set()
+    for idx in sorted({str(i) for i in ids}, key=int):
+        node = pci.SYSFS_CLASS_DIR / f"tenstorrent!{idx}"
+        try:
+            _read_beat(node)
+            continue
+        except OSError as e:
+            if e.errno == errno.ENODATA:
+                continue
+        except ValueError:
+            continue
+        bdf = chip_pci_bdf(idx)
+        try:
+            bound = bool(bdf) and node.is_dir() and (pci.PCI_DEVICES_DIR / bdf / "driver").exists()
+        except OSError:
+            bound = False
+        if bound and not hostpci.link_down(bdf):
+            out.add(idx)
+    return out
+
+
 def offbus_chip_ids(beats: dict[str, int], expected: int, not_ready: Optional[set] = None) -> set[str]:
     """The chips off the PCIe bus by this heartbeat read: every expected index missing from
     ``beats``, other than an ARC-not-ready chip (:func:`arc_not_ready_chips`), plus every chip
@@ -143,7 +185,7 @@ def offbus_count(
 def returned_chips(ids) -> list[str]:
     """Of ``ids``, the chips back on the bus by a fresh sysfs read: the KMD node is there and its
     heartbeat is a counter that is not all-ones, or it is ARC-not-ready on a bound endpoint. Read
-    after every tray re-power, mesh reset and PCI rescan so a chip that came back leaves
+    after every mesh reset and PCI rescan so a chip that came back leaves
     ``isolated_chips`` at once, whatever the verify that follows says."""
     want = {str(i) for i in ids}
     if not want:
@@ -153,6 +195,24 @@ def returned_chips(ids) -> list[str]:
     if want - back:
         back |= want & arc_not_ready_chips(beats)
     return sorted(back, key=int)
+
+
+def arc_live_chips(ids) -> list[str]:
+    """Of ``ids``, the chips whose ARC heartbeat reads as a counter now: not all-ones, not an
+    ENODATA (ARC not ready) or other failed read. Stricter than :func:`returned_chips`: a chip a
+    bridge reset re-enumerated with its ARC dead is back on the bus but not recovered (spec 04 I94)."""
+    want = {str(i) for i in ids}
+    if not want:
+        return []
+    # Only these chips, and a lost-marked one too: a decision read, so it is judged on its answer.
+    beats = read_heartbeats(probe_lost=True, only=frozenset(want))
+    return sorted((i for i in want if i in beats and beats[i] != ALL_ONES), key=int)
+
+
+def heartbeat_attr_present(ids) -> bool:
+    """Does any of ``ids``' sysfs nodes expose ``tt_heartbeat``? A stat, no chip read. False on a
+    host whose KMD predates the counter."""
+    return any((pci.SYSFS_CLASS_DIR / f"tenstorrent!{i}" / "tt_heartbeat").exists() for i in ids)
 
 
 def heartbeat_absence_reason() -> Optional[str]:
@@ -251,7 +311,9 @@ def heartbeat_verdict(expected_count: int, settle_sec: float = HEARTBEAT_SETTLE_
 
 
 def _heartbeat_verdict_body(expected_count: int, settle_sec: float) -> tuple[Verdict, str, dict]:
-    first = read_heartbeats()
+    # A check, not a poll: a chip marked lost is read for real here (once; the second sample is
+    # gated again), so a chip that came back passes and one that did not is judged on a real read.
+    first = read_heartbeats(probe_lost=True)
     # read_heartbeats() leaves out a chip whose read fails, so a short (or empty) read is not a
     # short sysfs: count the class nodes too, so chips that are listed but unreadable are named as
     # such and never reported as "no chips exposed".

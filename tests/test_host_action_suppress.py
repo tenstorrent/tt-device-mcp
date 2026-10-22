@@ -42,7 +42,6 @@ def held(monkeypatch, tmp_path):
     monkeypatch.delenv("TT_DEVICE_MCP_FORCE_ESCALATE", raising=False)
     fired = []
     monkeypatch.setattr(srv, "_fire_power_cycle", lambda: fired.append("power-cycle"))
-    monkeypatch.setattr(galaxy, "_fire_host_reboot", lambda: fired.append("reboot"))
     spawned = []
 
     async def _escalation():
@@ -101,16 +100,6 @@ async def test_power_cycle_request_suppresses_every_deadline_tick(held):
     assert len(suppressed) == 1, "one line per request, not one per tick"
     assert suppressed[0]["action"] == "power-cycle"
     assert suppressed[0]["trigger"] == "offbus_one_shot"
-
-
-@pytest.mark.asyncio
-async def test_reboot_request_suppresses_the_deadline_tick(held):
-    await srv.galaxy_recovery._auto_reboot_host(lambda m: None, "reset could not recover the device")
-    assert held["fired"] == ["reboot"]
-    _offbus_tick()
-    assert srv._forced_escalation_task is None
-    assert "hold_escalation_suppressed_host_action" in _kinds(held["events"])
-    assert srv.recovery_mechanism.host_action_pending() is not None
 
 
 @pytest.mark.asyncio
@@ -317,14 +306,12 @@ def test_an_operator_reset_is_refused_while_a_host_action_is_pending(monkeypatch
 @pytest.mark.asyncio
 async def test_a_power_cycle_command_that_timed_out_stays_pending(held, monkeypatch):
     """A cycler that timed out may already have started its detached cycle: the mark stays, with
-    its normal bound, so no reset starts under it. A non-zero exit still clears it."""
-    from tt_device_mcp.health.recovery import offbus_power_cycle as opc
+    its normal bound, so no reset starts under it. A cycle that never launched (spec 04 I88) is no
+    timeout: it never runs the command under a live OS."""
+    from tt_device_mcp.health.recovery.stages import power_cycle as pc
 
-    monkeypatch.setattr(opc, "_run", lambda *a, **k: (None, "timed out after 30s"))
-    with pytest.raises(recovery_base.HostActionTimedOut):
-        _real_fire_command(["cycler"], REASON)
-    monkeypatch.setattr(opc, "_run", lambda *a, **k: (1, "nope"))
-    with pytest.raises(RuntimeError) as err:
+    monkeypatch.setattr(pc, "os_first_unavailable", lambda: "no hook")
+    with pytest.raises(pc.PowerCycleNotLaunched) as err:
         _real_fire_command(["cycler"], REASON)
     assert not isinstance(err.value, recovery_base.HostActionTimedOut)
 
@@ -345,17 +332,18 @@ async def test_a_power_cycle_command_that_timed_out_stays_pending(held, monkeypa
     assert held["spawned"] == [True], "the bound still holds after a timeout"
 
 
-# --- no latch stops resets when the cold rung is refused or not opted in (spec 04 I36 governs) ----
+# --- a cold rung that cannot fire does not buy a second mesh reset (spec 04 I87 governs) ---------
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cold_rung", ["refused", "not-opted-in"])
-async def test_a_shrinking_offbus_set_resets_again_when_the_power_cycle_cannot_fire(
+async def test_a_shrinking_offbus_set_gets_no_second_reset_when_the_power_cycle_cannot_fire(
     monkeypatch, clear_job_state, cold_rung
 ):
     """A reset ran, failed and left chips off the bus; the power cycle is denied by its rate limit or
-    not opted in. A chip came back by the next forced window, so the reset runs again: nothing stops
-    resets for the rest of the hold while the cold rung cannot fire: no unbounded hold."""
+    not opted in. A chip came back by the next forced window, but the episode's one mesh reset is spent
+    (spec 04 I87): no later window resets again, and the device stays held for the power cycle or an
+    operator."""
     from tests import test_no_repeat_failed_rung as nr
 
     counters, events, _ = nr._episode(monkeypatch, power_cycle=cold_rung == "refused")
@@ -369,23 +357,24 @@ async def test_a_shrinking_offbus_set_resets_again_when_the_power_cycle_cannot_f
     for still_off in (nr.OFF_BUS - 1, nr.OFF_BUS - 2):
         monkeypatch.setattr(srv, "read_heartbeats", lambda n=still_off: {str(i): 100 for i in range(nr.EXPECTED - n)})
         assert await nr._window() is True
-    assert counters["resets"] == 3, "each shrunk set earns its reset"
-    assert "device_reset_skipped_power_cycle_required" not in events and nr.SKIP not in events
+    assert counters["resets"] == 1, "a shrunk set gets no second mesh reset in the episode"
+    assert nr._skipped(events) >= 2
     assert counters["power_cycles"] == 0 and counters["dirty_cleared"] == 0, "the device stays held"
 
 
 @pytest.mark.asyncio
-async def test_the_gate_keeps_resetting_a_drop_whose_power_cycle_is_not_opted_in(
+async def test_the_gate_runs_one_reset_per_episode_when_the_power_cycle_is_not_opted_in(
     monkeypatch, tmp_path, clear_job_state
 ):
     """The gate's reset ran, hard-failed and left the drop needing the cold rung, with none opted in.
-    The next gate pass, once the reset cooldown ran out, still runs the reset: the gate's cooldown
-    bounds the retry rate, no latch ends the retries."""
+    The next gate pass, once the reset cooldown ran out, does not run the mesh reset again: the hold's
+    one reset is spent (spec 04 I87), so the gate reports the spent rung and keeps the hold for the
+    power cycle or the operator. No host rung fires in its place."""
     from tests.test_device_safety import _reach_reboot_rung_with_regressing_reset
 
     monkeypatch.setattr(srv, "device_hold_episode_since", datetime.now().isoformat(timespec="seconds"))
     srv.device_hold_logged = True
-    reboots = _reach_reboot_rung_with_regressing_reset(monkeypatch, tmp_path, off_before=20, off_after=20)
+    host_rungs = _reach_reboot_rung_with_regressing_reset(monkeypatch, tmp_path, off_before=20, off_after=20)
     events, resets = [], {"n": 0}
     patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
@@ -394,14 +383,20 @@ async def test_the_gate_keeps_resetting_a_drop_whose_power_cycle_is_not_opted_in
         resets["n"] += 1
         srv.recovery_mechanism.last_reset_monotonic = time.monotonic()
         srv.recovery_mechanism.last_reset_exit_nonzero = True
+        srv.recovery_mechanism.mark_mesh_reset_failed()  # what the real reset records on failure
         return False
 
     patch_recovery(monkeypatch, "_reset_and_verify_device", hard_failing_reset)
-    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
-    assert resets["n"] == 1 and "reset_unrecoverable_power_cycle_required" in events
-    monkeypatch.setattr(srv.recovery_mechanism, "cooling", lambda: False)  # the reset cooldown ran out
-    events.clear()
-    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
-    assert resets["n"] == 2, "the gate retries the reset; no latch stops it"
-    assert "device_reset_skipped_power_cycle_required" not in events
-    assert reboots["n"] == 0
+    try:
+        await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+        assert resets["n"] == 1 and "reset_unrecoverable_power_cycle_required" in events
+        monkeypatch.setattr(srv.recovery_mechanism, "cooling", lambda: False)  # the reset cooldown ran out
+        events.clear()
+        await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+        assert resets["n"] == 1, "the hold's one mesh reset is spent; the gate never runs a second one"
+        assert "reset_rung_skipped_spent" in events
+        assert host_rungs["n"] == 0
+        assert srv.device_hold_episode_since, "the device stays held"
+    finally:
+        srv.recovery_mechanism.mesh_reset_failed_since_release = False
+        srv.recovery_mechanism.mesh_reset_failed_episode = None
