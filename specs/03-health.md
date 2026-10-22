@@ -1375,7 +1375,8 @@ cooldown (spec 04 I65) holds longer.
   | foreign holder gone, hugepages ready | ~2 s | one full check (~45-100 s) |
 - **I80 — A hold stays held through its own recovery.** A broker op that runs while a hold episode
   is open (a forced ladder rung such as a glx_reset, any reset, the check after it) keeps `/health`
-  `held: true` and `status: degraded`, with the hold's own `held_since` and `held_reason`, until
+  `held: true` and `status: degraded`, with the hold's own `held_since` and `held_reason` (its
+  opening reason, plus I85's escalation line), until
   the full gate, fabric included, passes and closes the episode. Neither the op starting nor the op
   ending lifts it, and `held_since` stays one clock for the whole episode: a hold opened inside the
   op keeps the start `/health` reported during it after the op ends. A closed episode's clock never
@@ -1537,6 +1538,23 @@ cooldown (spec 04 I65) holds longer.
   fail) lifts the hold and clears it. Time to recover, refused kill: 10 min plus the power cycle.
   The poller stop that follows a failed remove runs after the hold is marked, so it moves no rung.
 
+- **I85 — A held device says where its escalation stands.** While the device is held, `/health`
+  `held_reason` is the reason the hold opened with plus one bracketed line, and `hold_escalation`
+  carries the same as fields: `stage` (the last step of this episode's forced escalation: each rung
+  line the forced pass logs, and the outcome it ended with; after a broker restart, "power cycle
+  requested" or the hold bound's ladder age when those are on record; else "held, no forced
+  escalation yet") with `stage_at`; `next_step` with `next_deadline` and `next_in_sec`; and
+  `power_cycle_requested` with `power_cycle_requested_at`. The next step is the hold watchdog's own
+  next rung, the one `/health` `next_rung` reads (`_hold_next_rung`: the spec 04 I76 10-min full
+  ladder, then the power cycle, and the boot/post-cycle cooldown end it waits on), else the I76
+  bound's deadline (`hold_bound_deadline`); while the forced ladder runs, or a tenant blocks the
+  bound, it says so with no deadline. No second clock. The power-cycle request is read from disk,
+  so it survives the cycle: this episode's off-bus attempt record, or a power-cycle row of the
+  auto-recovery ledger written since the episode began. Reporting only: it opens, lifts, resets,
+  power-cycles and releases nothing, moves no escalation clock, and leaves time to recover as it
+  was; only a just-passed full check with fabric lifts the hold. The stage clears with the episode
+  (a new episode or the release). The jobs-list hold row keeps the name it opened with.
+
 ## Interfaces
 
 **What the main loop consumes.** `server.py` owns the job runner and the gate; it drives the
@@ -1570,7 +1588,8 @@ subsystem through the root:
   open hold, I80), `startup_verify` (non-null while that hold is only a startup hold behind a live
   re-adopted job or its startup gate, I76), `fsm_state`, `fsm_why`,
   `held`/`held_since`/`held_reason`/`held_age_sec`, `device_degraded`, queue counts, version.
-  `held_reason` and `fsm_why` keep the reason the hold opened with; the live fields say where it
+  `held_reason` and `fsm_why` keep the reason the hold opened with (`held_reason` plus I85's
+  bracketed escalation line, which `hold_escalation` gives as fields); the live fields say where it
   stands now, read fresh from sysfs on every call with no device touch: `isolated_chips` (always),
   and where the heartbeat detector and a chip baseline exist, `off_bus` (chips off the PCIe bus now,
   the count the rungs use), `arc_not_ready` (on the bus, heartbeat ENODATA on a bound endpoint, 04
@@ -2230,6 +2249,7 @@ refuses.
 | I83 (cut after tt-smi exits, before the bounded closing rescan, which re-adds a removed chip that answers; the broker and the reset are never cut) | `tests/test_inflight_reader_cut.py::test_the_mechanism_is_wired_to_the_samplers_cut`, `tests/test_inflight_reader_cut.py::test_a_post_reset_failure_is_cut_after_tt_smi_exits_and_before_the_closing_rescan`, `tests/test_inflight_reader_cut.py::test_a_chip_the_cut_removes_is_readded_by_the_closing_rescan_when_it_answers`, `tests/test_inflight_reader_cut.py::test_a_closing_rescan_that_blocks_is_bounded`, `tests/test_inflight_reader_cut.py::test_the_cut_never_selects_the_broker_the_reset_or_their_children`, `tests/test_inflight_reader_cut.py::test_reclaim_select_replaces_the_tenant_rule`, `tests/test_inflight_reader_cut.py::test_a_cancel_during_the_cut_still_settles_the_pollers` |
 | I84 | `tests/test_deadchip_detach_before_kill.py::test_every_kill_and_poller_stop_comes_after_the_detach`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_detach_kills_nobody_and_keeps_the_hold`, `tests/test_deadchip_detach_before_kill.py::test_one_failed_detach_of_two_kills_nobody`, `tests/test_deadchip_detach_before_kill.py::test_with_no_detach_wired_nobody_is_killed`, `tests/test_deadchip_detach_before_kill.py::test_a_hung_detach_is_bounded_and_the_loop_stays_responsive`, `tests/test_deadchip_detach_before_kill.py::test_a_reset_that_started_before_the_kill_keeps_every_holder`, `tests/test_deadchip_detach_before_kill.py::test_another_all_ones_chip_not_yet_detached_defers_the_kill_to_its_own_valve`, `tests/test_deadchip_detach_before_kill.py::test_a_chip_whose_earlier_detach_failed_blocks_every_later_kill`, `tests/test_deadchip_detach_before_kill.py::test_the_broker_never_signals_itself`, `tests/test_deadchip_detach_before_kill.py::test_the_first_all_ones_sample_leaves_the_poller_stop_to_the_detach`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_or_timed_out_detach_stops_the_pollers_once_and_kills_nobody`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_remove_beside_an_untried_chip_stops_the_pollers_on_the_next_sample`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_remove_under_a_live_reset_leaves_the_poller_stop_to_the_reset` |
 | I84 a refusal's holders reach the power cycle at the I76 bound; the record lifts nothing and only a passing full check with fabric clears it | `tests/test_deadchip_refused_bound.py::test_a_refused_holder_gets_the_power_cycle_at_the_bound`, `tests/test_deadchip_refused_bound.py::test_the_refusal_record_lifts_nothing_and_only_a_passing_full_check_clears_it` |
+| I85 | `tests/test_hold_escalation_status.py::test_a_fresh_hold_names_the_watchdogs_own_next_rung`, `tests/test_hold_escalation_status.py::test_the_ten_minute_mark_and_the_cooldown_come_from_the_broker_clocks`, `tests/test_hold_escalation_status.py::test_each_logged_step_moves_the_stage`, `tests/test_hold_escalation_status.py::test_a_power_cycle_request_is_read_from_disk_and_survives_a_restart`, `tests/test_hold_escalation_status.py::test_another_episodes_power_cycle_is_not_this_ones`, `tests/test_hold_escalation_status.py::test_the_bound_ladder_ran_before_a_restart`, `tests/test_hold_escalation_status.py::test_a_running_ladder_and_a_tenant_say_so`, `tests/test_hold_escalation_status.py::test_reading_it_moves_no_clock`, `tests/test_hold_escalation_status.py::test_the_hold_row_keeps_its_name`, `tests/test_hold_escalation_status.py::test_a_new_episode_and_the_release_clear_the_stage`, `tests/test_hold_escalation_status.py::test_not_held_reports_no_escalation`, `tests/test_hold_escalation_status.py::test_a_forced_pass_updates_the_stage_and_keeps_the_hold` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
