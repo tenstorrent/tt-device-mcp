@@ -196,6 +196,8 @@ class TelemetrySampler:
         # few seconds costs effectively nothing and is the only way to see the run-up.
         self.ring: deque = deque(maxlen=SAMPLE_RING_SIZE)
         self.task: Optional[asyncio.Task] = None
+        # The dead-chip release waits and endpoint removals running off the loop (spec 03 I19).
+        self.isolations: set = set()
         # All-ones on EVERY chip at once is not 32 independent failures. It is the driver, the
         # bus, or a reset — a global event — and removing every device in response leaves a box
         # with nothing to run on and no way back except a rescan. Treat it as a fault to
@@ -878,7 +880,10 @@ class TelemetrySampler:
                 f"the PCIe bus. Isolating NOW; every further access risks a core stall "
                 f"that reboots the host."
             )
-        self._deps.health_event("chip_dead", chips=fresh, pci={i: self._deps.chip_pci_bdf(i) for i in fresh})
+        # Read the PCI addresses now: once removed, a chip's sysfs link is gone and resolves to none,
+        # and the stuck-holder check after the kill matches BAR mappings by them (spec 04 I77).
+        pci = {i: self._deps.chip_pci_bdf(i) for i in fresh}
+        self._deps.health_event("chip_dead", chips=fresh, pci=pci)
 
         # Detach first, then kill (spec 03 I84). The PCI remove is the only step that marks the
         # driver's device detached, and tt-kmd's fd-close path sends the chip a power-state message
@@ -914,6 +919,7 @@ class TelemetrySampler:
         others = [i for i in (self.sample_all_ones or dead) if i not in removed]
         untried = [i for i in others if i not in isolated_chips]
         refused = await self._kill_refusal(stuck, others, untried)
+        killed: list = []
         if refused:
             if log:
                 log.error(
@@ -929,7 +935,7 @@ class TelemetrySampler:
                 host_at_risk=refused in ("detach_failed", "detach_unavailable"),
             )
         else:
-            await self._deps.kill_device_holders(reason)
+            killed = await self._deps.kill_device_holders(reason) or []
             await self._deps.set_device_pollers(False, lambda m: log.info(f"DEAD-CHIP {m}") if log else None)
             # No reset pairs this stop with a restore, and an idle relift may close the episode
             # without one: owe the restart, so the next close to HEALTHY (a passing full check)
@@ -937,6 +943,8 @@ class TelemetrySampler:
             if self._deps.owe_device_pollers is not None:
                 self._deps.owe_device_pollers(reason)
 
+        # Held from here, before any wait (spec 03 I19): the release wait below must not leave the
+        # device admissible while a killed holder still sits in the driver.
         self._deps.mark_device_dirty(f"chip(s) {','.join(fresh)} fell off the PCIe bus", why="heartbeat")
         if refused and self._deps.note_kill_refused is not None:
             # After the hold opened: the holders left alive are recorded against it, so the 10-min bound
@@ -955,3 +963,58 @@ class TelemetrySampler:
             trace=list(self.ring),
             evidence={"dead": fresh, "removed": removed},
         )
+
+        # A SIGKILLed holder can sit in the driver's release for seconds after the signal, its
+        # device fds still open. Wait for the killed pids to let go, or the bound to pass (spec 03
+        # I19, 01 I67), before any rung re-enumerates PCI under them: the pending wait fences every
+        # reset. The wait runs off this loop: the sampler keeps checking the other chips and keeps
+        # driving the hold deadline (the 10-min ladder) meanwhile. One already gone costs one scan.
+        pids = [k["pid"] for k in killed if isinstance(k.get("pid"), int)]
+        if self._deps.wait_device_released is not None and pids:
+            task = asyncio.create_task(self._detached_holder_release(fresh, removed, killed, pids, pci))
+            self.isolations.add(task)
+            task.add_done_callback(self.isolations.discard)
+            return
+        await self._finish_holder_release(fresh, removed, killed, [], pci)
+
+    async def settle_isolations(self) -> None:
+        """Wait for every detached holder release wait to finish."""
+        while self.isolations:
+            await asyncio.gather(*list(self.isolations), return_exceptions=True)
+
+    async def _detached_holder_release(self, fresh: list, removed: list, killed: list, pids: list, pci: dict) -> None:
+        try:
+            await self._finish_holder_release(fresh, removed, killed, pids, pci)
+        except Exception as e:  # noqa: BLE001 - off the loop, nothing else would log it
+            log = self._deps.logger()
+            if log:
+                log.error(f"DEAD-CHIP holder release wait for chip(s) {fresh} failed: {e}")
+
+    async def _finish_holder_release(self, fresh: list, removed: list, killed: list, pids: list, pci: dict) -> None:
+        """The release wait for ``pids`` (none: no wait), then the stuck-holder record (spec 04 I77)
+        with the chips' PCI addresses ``pci``, read before the removal.
+        The device is already dirty, so it stays held until recovery's reset and full post-reset
+        check, fabric included, pass."""
+        log = self._deps.logger()
+        if pids:
+            lingering = sorted(await self._deps.wait_device_released(pids))
+            if lingering:
+                if log:
+                    log.error(f"DEAD-CHIP killed holder(s) {lingering} still hold the device at the release bound")
+                self._deps.health_event("dead_chip_holders_lingering", chips=fresh, pids=lingering)
+
+        # A killed holder that is still alive past the bound is stuck in the kernel, most often
+        # reading the dead BAR (state D) — it never acts on its SIGKILL. Name it, page, and fence
+        # every rung that would re-enumerate PCI under it (spec 04 I77); the broker's bounded
+        # escalation takes the host rung if it outlives its budget.
+        note = self._deps.note_stuck_holders
+        if note is None or not killed:
+            return
+        bdfs = tuple(b for b in (pci.get(i) for i in fresh) if isinstance(b, str) and ":" in b)
+        stuck_holders = await asyncio.to_thread(note, list(fresh), list(killed), bdfs)
+        if stuck_holders and log:
+            log.error(
+                f"DEAD CHIP(S) {removed} removed from the kernel, but killed holder(s) "
+                f"{stuck_holders} are stuck on them in the kernel — the host is STILL at "
+                f"risk; no rung re-enumerates PCI until they are gone (spec 04 I77)"
+            )

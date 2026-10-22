@@ -46,6 +46,7 @@ from tt_device_mcp.health.recovery.base import (
     drop_returned_isolated,
     pci_rescan,
     pci_wedged_refusal,
+    reenumerate_withheld,
     refuse_mesh_reset,
 )
 from tt_device_mcp.health.recovery.stages.bridge_reset import (
@@ -316,6 +317,21 @@ class RecoveryDeps:
     chip_pci_bdf: Optional[Callable[[str], Optional[str]]] = None
     health_event: Optional[Callable[..., None]] = None
     kill_device_holders: Optional[Callable[[str], Awaitable[list]]] = None
+    # Bounded wait for the pids it killed to drop out of the holder scan; returns those still
+    # listed (spec 03 I19, the shared spec 01 I67 helper).
+    wait_device_released: Optional[Callable[[list], Awaitable[set]]] = None
+    # Spec 04 I77: names each killed pid that is stuck in the kernel still referencing the dead
+    # chip(s), journals host_at_risk, pages, and fences every re-enumerating rung while it lives.
+    # Returns the stuck pids. Its third argument: the chips' PCI addresses, read before the removal.
+    note_stuck_holders: Optional[Callable[[list, list, tuple], list]] = None
+    # Spec 04 I77: the registered dead-chip stuck holders still stuck, by pid, on a fresh /proc read.
+    # The I70 rung's 'gone' check counts them as still holding: one with only a removed chip's BAR
+    # or deleted node mapped is not in the /dev/tenstorrent holder scan.
+    stuck_holder_pids: Optional[Callable[[], set]] = None
+    # Spec 04 I77: a RUNNING job the broker has not itself killed for recovery. The I70 host rung's
+    # guard asks this instead of job_running: a job the dead-chip path SIGKILLed stays RUNNING while
+    # its process is stuck in the kernel, and counting it would hold the rung forever. None: job_running.
+    live_job_running: Optional[Callable[[], bool]] = None
     # Marks the pollers the dead-chip valve stopped as owed a restart (server._owe_device_pollers):
     # that stop has no paired restore, and an idle relift can close the episode with no reset.
     owe_device_pollers: Optional[Callable[[str], None]] = None
@@ -514,6 +530,15 @@ class Recovery(ABC):
                 self.last_bridge_reset_reasons[idx] = {"reason": "pci_wedged"}
                 metrics.stage_fired("bridge_reset", "blocked")
             health_event("chip_recovery", recovered=[], still_dead=targets, inapplicable=[], pci_wedged=True)
+            return False
+
+        # A killed holder stuck in the kernel with a removed chip's BAR mapped (spec 04 I77): the
+        # bridge reset and the rescan both re-enumerate under it, so neither runs. The chips stay
+        # out and the hold stands; the broker's I70 escalation owns the bound.
+        if reenumerate_withheld(self.mechanism, f"bridge reset of chip(s) {','.join(targets)}", log):
+            for idx in targets:
+                self.last_bridge_reset_reasons[idx] = {"reason": "stuck_holder"}
+            metrics.stage_fired("bridge_reset", "blocked")
             return False
         _t0 = datetime.now()
         self.deps.begin_action_row("[broker]bridge-reset", f"bridge-reset chip(s) {','.join(targets)}")

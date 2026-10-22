@@ -337,6 +337,10 @@ def _seal_real_hardware(monkeypatch, tmp_dirs):
     monkeypatch.setattr(srv, "_leftover_rung_stage", "")
     monkeypatch.setattr(srv, "_leftover_rung_detail", "")
     monkeypatch.setattr(srv, "_leftover_rung_task", None)
+    monkeypatch.setattr(srv, "_dead_chip_stuck", {})
+    monkeypatch.setattr(srv, "_dead_chip_page_pending", None)
+    monkeypatch.setattr(srv, "_leftover_dead_chip", False)
+    monkeypatch.setattr(recovery_base, "_reenumerate_withheld_journaled", {})
     # The pollers a quiesce stopped and owes a restore. None: read again from the per-test health dir.
     monkeypatch.setattr(srv, "_pollers_to_restore", None)
     # The reset argv/mode env vars are read live (never cached), so an operator's own shell/CI

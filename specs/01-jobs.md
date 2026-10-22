@@ -349,10 +349,10 @@ the queue and a running job outlive the broker process.
   job with nothing left costs nothing, and a slow exit adds at most 28 s to the job's teardown,
   in which the queue waits as it already waits for the sweep. The poll is one shared helper,
   `device_holders.wait_device_released`, for every path that SIGKILLs device holders and must
-  know they let go before it acts on the device. Time to recover (class J, a job that timed out
-  or was killed and exits slowly): a holder that lets go within the window no longer turns a
-  ~1 min post-job check into a hold that waited for the next job or the 600 s ceiling (spec 03
-  I23).
+  know they let go before it acts on the device; the dead-chip isolation is the other such path
+  (spec 03 I19). Time to recover (class J, a job that timed out or was killed and exits slowly): a
+  holder that lets go within the window no longer turns a ~1 min post-job check into a hold that
+  waited for the next job or the 600 s ceiling (spec 03 I23).
 
 - **I68** — A job whose tt-metal output dirs its user cannot write is refused at the door,
   before the cooldown, the gate or any hold, and never spawned. tt-metal writes under
