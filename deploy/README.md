@@ -56,8 +56,9 @@ record (`TTPC`) before the cycle and after a cycle that failed. The broker never
 the OS up: for an `ipmitool ... chassis power cycle` command it first checks the BMC read-only
 (`mc info`, 10 s), and if that, the hook, `systemd-run` or the reboot request is missing or fails,
 nothing fires, the device stays held and the broker pages `power_cycle_not_launched`. On the next
-boot it reads `ipmitool chassis restart_cause` to confirm the cycle; a BMC that reports no cause
-cannot confirm it, and then a warm reboot in its place still counts as a cycle.
+boot it reads the raw restart cause (`ipmitool raw 0x00 0x07`) to confirm the cycle; for a BMC that
+reports no cause it looks for a power-off in the BMC's SEL instead, and the record names why the
+cause was unavailable. With neither, a warm reboot in its place still counts as a cycle.
 
 ## What is verified vs. what needs on-box validation
 

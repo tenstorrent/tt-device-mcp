@@ -553,6 +553,8 @@ def test_restart_cause_names_the_raw_code(os_first, out, want, cycle):
     if want is not None:
         assert pc.restart_cause_is_cycle(want) is cycle
         assert pc.restart_cause_is_mapped(want) is not want.startswith("unmapped code")
+    cause, why = pc.read_restart_cause_why(CYCLE)
+    assert cause == want and (why == "") is (want is not None)
 
 
 def test_rtc_wakeup_confirms_the_cycle(booted):
@@ -712,6 +714,46 @@ def test_a_bmc_that_never_reports_a_cause_leaves_the_cycle_unconfirmed_and_count
     assert any(n == "power_cycle_unconfirmed" for n, _ in booted["hevents"])
 
 
+UNSPECIFIED = "Unable to send RAW command (channel=0x0 netfn=0x0 lun=0x0 cmd=0x7 rsp=0xff): Unspecified error"
+
+
+@pytest.mark.parametrize(
+    "rc,out,argv,exe,why",
+    [
+        (1, UNSPECIFIED, None, True, "the BMC refused the query (rc 1): " + UNSPECIFIED),
+        (1, "", None, True, "the BMC refused the query (rc 1): no output"),
+        (None, "TimeoutExpired(...)", None, True, "the BMC query did not finish in 10s: TimeoutExpired(...)"),
+        (0, "invalid\n", None, True, "the BMC answer does not parse: invalid"),
+        (0, "", ["/opt/site/cycle-host"], True, "no BMC query to derive"),
+        (0, "", None, False, "ipmitool not found"),
+    ],
+)
+def test_a_cause_the_bmc_cannot_give_says_why_in_the_row_and_the_event(booted, monkeypatch, rc, out, argv, exe, why):
+    """A null restart cause never stands alone: the row and the event name why there is none (measured
+    on a Galaxy BMC: the raw query answers rsp=0xff "Unspecified error")."""
+    booted["rc"]["restart_cause"] = rc
+    booted["out"]["restart_cause"] = out
+    if argv is not None:
+        monkeypatch.setattr(opc, "power_cycle_argv", lambda: argv)
+    if not exe:
+        monkeypatch.setattr(pc, "_resolve_command", lambda c: None)
+    assert booted["mech"].confirm_power_cycle_on_boot(now_epoch=BOOT_NOW) == "unconfirmed"
+    row = _row(booted)
+    assert row["restart_cause"] is None and why in row["restart_cause_unavailable"]
+    assert len(row["restart_cause_unavailable"]) <= 160
+    (event,) = [k for n, k in booted["hevents"] if n == "power_cycle_unconfirmed"]
+    assert event["restart_cause"] is None and event["restart_cause_unavailable"] == row["restart_cause_unavailable"]
+
+
+@pytest.mark.parametrize("out", [" 01 0f", " 00 0f", " 0c 0f"])
+def test_a_cause_the_bmc_gives_carries_no_unavailable_reason(booted, out):
+    booted["out"]["restart_cause"] = out
+    booted["mech"].confirm_power_cycle_on_boot(now_epoch=BOOT_NOW)
+    row = _row(booted)
+    assert row["restart_cause"] is not None and "restart_cause_unavailable" not in row
+    assert all("restart_cause_unavailable" not in k for _, k in booted["hevents"])
+
+
 def test_unknown_from_a_bmc_never_seen_to_report_a_cause_is_unconfirmed(booted):
     booted["out"]["restart_cause"] = " 00 0f"
     assert booted["mech"].confirm_power_cycle_on_boot(now_epoch=BOOT_NOW) == "unconfirmed"
@@ -775,6 +817,7 @@ def test_a_bmc_with_no_restart_cause_confirms_the_cycle_from_its_sel(sel_booted)
     assert sel_booted["mech"].confirm_power_cycle_on_boot(now_epoch=SEL_CHECK) == "confirmed"
     row = _row(sel_booted)
     assert row["cycle_checked"] == "confirmed" and row["restart_cause"] is None
+    assert row["restart_cause_unavailable"].endswith("rsp=0xff): Unspecified error")
     assert row["host_rebooted"] is True and row["power_cycled"] is True and "took_host_down" not in row
     # 03:03:14 on the BMC clock, 1.98 s behind the host's.
     assert row["sel_power_off"] == recovery_base._local_time(1792638194 + 1.98)
@@ -786,6 +829,8 @@ def test_a_bmc_with_no_restart_cause_confirms_the_cycle_from_its_sel(sel_booted)
     assert all(c[3] <= pc.SEL_TIMEOUT_SEC for c in sel_booted["calls"][-2:])
     names = [n for n, _ in sel_booted["hevents"]]
     assert "power_cycle_confirmed" in names and "power_cycle_unconfirmed" not in names
+    (event,) = [k for n, k in sel_booted["hevents"] if n == "power_cycle_confirmed"]
+    assert event["restart_cause_unavailable"] == row["restart_cause_unavailable"]
     assert not (sel_booted["tmp"] / recovery_base.POWER_CYCLE_CAUSE_CAPABLE_FILE).exists()
 
 
