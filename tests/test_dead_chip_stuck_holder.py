@@ -772,3 +772,137 @@ async def test_the_dead_chip_path_notes_stuck_holders_and_says_the_host_is_still
     # The removal comes first (spec 03 I84) and is logged as such; the stuck holder found after the
     # kill has the last word: the host is still at risk.
     assert "STILL at risk" in lines[-1]
+
+
+# --- bounded reads, one scan per tick, every killed group member ----------------------------------
+
+
+def _blocking_maps(monkeypatch):
+    """Every maps read blocks until the returned event is set; ``calls`` counts the reads started."""
+    release = threading.Event()
+    calls = []
+    real = job_reap._read_leftover
+
+    def read(pid, name):
+        if name != "maps":
+            return real(pid, name)
+        calls.append(pid)
+        release.wait(5)
+        return real(pid, name)
+
+    monkeypatch.setattr(job_reap, "_read_leftover", read)
+    return release, calls
+
+
+def test_one_outstanding_maps_reader_per_pid(tmp_path, monkeypatch):
+    """A maps read stuck behind a D-state task's mmap lock leaks its thread: while one is out for a pid,
+    the next read of that pid counts as unanswered at once and starts no other thread."""
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    _stage_holder(proc, maps=(BAR,))
+    monkeypatch.setattr(job_reap, "LEFTOVER_PROC_DIR", str(proc))
+    release, calls = _blocking_maps(monkeypatch)
+    try:
+        assert job_reap._bounded_read(PID, "maps", 0.1) is None
+        t0 = time.monotonic()
+        for _ in range(5):
+            assert job_reap._bounded_read(PID, "maps", 0.5) is None
+        assert time.monotonic() - t0 < 0.5, "an outstanding read is not waited on again"
+        assert calls == [PID], "one reader thread per pid, not one per scan"
+    finally:
+        release.set()
+    deadline = time.monotonic() + 5
+    while PID in job_reap._outstanding_reads and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert PID not in job_reap._outstanding_reads, "a reader that answered frees its slot"
+    assert BAR in job_reap._bounded_read(PID, "maps", 2.0)
+    assert calls == [PID, PID]
+
+
+def test_an_unanswered_maps_read_fails_closed_when_the_fds_name_nothing(tmp_path, monkeypatch):
+    """A D-state holder with only the dead BAR mapped (no device fd) whose maps read does not answer is
+    kept as stuck: the BAR mapping behind the read cannot be ruled out."""
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    _stage_holder(proc, fds=("/tmp/log",), maps=(BAR,))
+    monkeypatch.setattr(job_reap, "LEFTOVER_PROC_DIR", str(proc))
+    release, _ = _blocking_maps(monkeypatch)
+    try:
+        assert job_reap.device_refs(PID, [BDF], maps_timeout=0.1) is None
+        assert job_reap.stuck_device_holder(PID, "dead-chip:3", 1234, [BDF]) is not None
+    finally:
+        release.set()
+
+
+def test_the_reenumeration_fence_scans_once_per_tick(stuck, monkeypatch):
+    """Every rung that asks the fence within one sampler tick reuses its scan; a holder that exits or
+    leaves the kernel lifts it at once, and a new tick or a registry change scans again."""
+    _note(stuck)
+    scans = []
+    real = srv._reaped_leftovers
+    monkeypatch.setattr(srv, "_reaped_leftovers", lambda scan=None: (scans.append(1), real(scan))[1])
+    now = [1000.0]
+    monkeypatch.setattr(srv.time, "monotonic", lambda: now[0])
+
+    first = srv._dead_chip_stuck_reason()
+    assert first and srv._dead_chip_stuck_reason() == first and srv.recovery_mechanism.reenumerate_fence() == first
+    assert len(scans) == 1, "one scan per tick, not one per rung"
+
+    now[0] += srv.SAMPLE_INTERVAL_SEC
+    assert srv._dead_chip_stuck_reason() == first and len(scans) == 2, "a new tick scans again"
+
+    _stage_holder(stuck["proc"], PID + 1)
+    srv._note_dead_chip_stuck_holders([CHIP], [{"pid": PID + 1}])
+    scans.clear()  # the registration's own scan
+    assert f"pid {PID + 1}" in srv._dead_chip_stuck_reason() and len(scans) == 1, "a new registration scans again"
+
+    _gone(stuck)
+    still = srv._dead_chip_stuck_reason()
+    assert f"pid {PID + 1}" in still and f"pid {PID} " not in still, "a holder that exited is dropped within the tick"
+    _gone(stuck, PID + 1)
+    assert srv._dead_chip_stuck_reason() == "", "the last holder that exited lifts the fence within the tick"
+
+
+def test_a_holder_that_leaves_the_kernel_lifts_the_fence_within_the_tick(stuck, monkeypatch):
+    _note(stuck)
+    now = [1000.0]
+    monkeypatch.setattr(srv.time, "monotonic", lambda: now[0])
+    assert srv._dead_chip_stuck_reason()
+    (stuck["proc"] / str(PID) / "stat").write_text(
+        (stuck["proc"] / str(PID) / "stat").read_text().replace(") D ", ") S ")
+    )
+    assert srv._dead_chip_stuck_reason() == ""
+
+
+@pytest.mark.asyncio
+async def test_every_member_of_a_killed_process_group_is_checked(stuck, monkeypatch):
+    """The dead-chip kill signals a broker process group with killpg: each member it reached is named in
+    ``killed``, so a child that maps the dead BAR without a device fd is checked and registered."""
+    import types
+
+    from tt_device_mcp.job_reap import ProcInfo
+
+    leader, child, other = PID + 10, PID, PID + 20  # the child: stuck in D, its BAR mapped, no fd
+    _stage_holder(stuck["proc"], leader, state="S")
+    (stuck["proc"] / str(PID)).rename(stuck["proc"] / "staged")
+    _stage_holder(stuck["proc"], child, fds=(), maps=(BAR,))
+    sent = []
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    monkeypatch.setattr(srv.os, "kill", lambda pid, sig: sent.append(("kill", pid)))
+    monkeypatch.setattr(srv.os, "killpg", lambda pid, sig: sent.append(("killpg", pid)))
+    monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", None)
+    monkeypatch.setattr(srv, "current_process", types.SimpleNamespace(pid=leader))
+    monkeypatch.setattr(
+        srv,
+        "job_processes",
+        lambda pid, **k: {
+            p: ProcInfo(pid=p, ppid=1, pgid=g, sid=leader, state="D", starttime="424242")
+            for p, g in ((leader, leader), (child, leader), (other, other))
+        },
+    )
+
+    killed = await srv._kill_device_holders("chip(s) 3 left the PCIe bus")
+    assert sent == [("killpg", leader)]
+    assert [k["pid"] for k in killed] == [leader, child], "the group's members, not another group's"
+    assert srv._note_dead_chip_stuck_holders([CHIP], killed, (BDF,)) == [child]
+    assert srv._dead_chip_stuck_reason()

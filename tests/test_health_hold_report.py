@@ -530,33 +530,17 @@ def test_cooldown_candidate_and_next_rung():
 # ---- rungs rollout-3 added beside the watchdog chain (spec 04 I73, I70) ---------------------------
 
 
-def test_the_class_a_10_min_ladder_is_named_and_fires_when_reported(held, monkeypatch):
-    """Spec 04 I73: a whole tray whose cycle the cooldown refuses gets the full ladder 10 min after its
-    last cycle or boot. With the first ceiling window spent, that mark comes before the next window
-    and before the cooldown's own retry, and the report names it at the time the watchdog asks it."""
+def test_a_class_a_hold_in_the_cooldown_has_no_second_10_min_trigger(held, monkeypatch):
+    """Spec 04 I73/I76: a whole tray whose cycle the cooldown refuses gets its full ladder only in the
+    10-min hold bound's run. No separate class-A start exists: with the first ceiling window spent, the
+    report names the next window, and no class-A kind fires 10 min after the last cycle or boot."""
     held["off"] = set(TRAY_CHIPS[0x40])
     monkeypatch.setattr(held["m"], "whole_tray_off", list(TRAY_CHIPS[0x40]))
     monkeypatch.setattr(held["m"], "_class_a_ladder_anchor", None)
-    monkeypatch.setattr(held["m"], "_class_a_ladder_spawned", None)
     monkeypatch.setattr(srv, "device_hold_escalate_bucket", 1)
     _deny(held["m"], START + 400 + 1800, last=START + 400)
-    p = _payload()
-    assert (p["next_rung"], p["next_rung_source"]) == ("forced ladder", "class A 10-min ladder")
-    assert p["next_rung_at"] == _iso(START + 1000) and p["next_rung_due"] is False
-    assert "class_a_ladder" not in _fires(START + 999, monkeypatch)
-    assert "class_a_ladder" in _fires(START + 1000, monkeypatch)
-    held["m"]._class_a_ladder_spawned = START + 400  # its pass started: the next window is next
     assert _payload()["next_rung_source"] == "hold ceiling window 2"
-
-
-def test_the_class_a_ladder_is_not_named_when_the_cooldown_ends_first(held, monkeypatch):
-    held["off"] = set(TRAY_CHIPS[0x40])
-    monkeypatch.setattr(held["m"], "whole_tray_off", list(TRAY_CHIPS[0x40]))
-    monkeypatch.setattr(held["m"], "_class_a_ladder_anchor", None)
-    monkeypatch.setattr(held["m"], "_class_a_ladder_spawned", None)
-    _deny(held["m"], START + 300, last=START - 1500)
-    assert held["m"].class_a_ladder_watch_at(T0) is None
-    assert _payload()["next_rung_source"] == "power_cycle_cooldown"
+    assert "class_a_ladder" not in _fires(START + 1000, monkeypatch)
 
 
 def test_the_unkillable_leftover_host_rung_is_named(held, monkeypatch):
@@ -641,20 +625,18 @@ def test_the_report_names_the_rung_the_forced_run_routes_to(held, monkeypatch, r
     assert _first_act(read_at, START + 1900, monkeypatch) == (START + at, "power cycle")
 
 
-def test_a_class_a_ladder_mark_inside_the_check_window_is_not_reported(held, monkeypatch):
-    """The class A 10-min ladder falls due at 1000 s while the bound ladder's check (900 s + 300 s)
-    is pending: the run returns there, so the report skips it and names the host rung at 1200 s."""
+def test_a_class_a_hold_inside_the_check_window_reports_the_host_rung(held, monkeypatch):
+    """A whole tray off while the bound ladder's check (900 s + 300 s) is pending: no class-A start
+    fires 10 min after the last cycle (1000 s), and the report names the act that comes first."""
     held["off"] = set(TRAY_CHIPS[0x40])
     monkeypatch.setattr(held["m"], "whole_tray_off", list(TRAY_CHIPS[0x40]))
     monkeypatch.setattr(held["m"], "_class_a_ladder_anchor", None)
-    monkeypatch.setattr(held["m"], "_class_a_ladder_spawned", None)
     monkeypatch.setattr(srv, "device_hold_escalate_bucket", 1)
     _deny(held["m"], START + 400 + 1800, last=START + 400)
     _bound_ladder_ran(monkeypatch, 900.0, True)
     read_at = START + 950
-    assert "class_a_ladder" in _fires(START + 1000, monkeypatch), "the mark is due inside the window"
+    assert "class_a_ladder" not in _fires(START + 1000, monkeypatch)
     rung, source, at = _report(read_at)
-    assert source != "class A 10-min ladder"
     assert _first_act(read_at, START + 2400, monkeypatch) == (datetime.fromisoformat(at).timestamp(), rung)
 
 

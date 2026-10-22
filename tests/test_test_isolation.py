@@ -24,8 +24,8 @@ LEAKING_PAIRS = [
     "tests/test_hold_bound.py::test_a_stuck_hold_event_past_the_bound_never_reads_escalated_false",
     "tests/test_hold_bound.py::test_a_latched_i42_hold_still_escalates_and_its_latch_stands",
     # The shared recovery mechanism's class-A 10-min ladder anchor.
-    "tests/test_power_cycle_ac_needed.py::test_the_watchdog_starts_the_class_a_ladder_at_the_10_min_mark",
-    "tests/test_power_cycle_ac_needed.py::test_the_full_ladder_runs_10_min_after_the_last_cycle_or_boot_then_the_cycle",
+    "tests/test_power_cycle_ac_needed.py::test_the_hold_bound_is_the_one_trigger_of_the_class_a_ladder",
+    "tests/test_power_cycle_ac_needed.py::test_the_full_ladder_runs_at_the_10_min_hold_bound_then_the_cycle",
     # chip_state's configured present/expected chip sources.
     "tests/test_chip_state.py::test_the_published_state_is_atomic_and_names_every_expected_chip",
     "tests/test_chip_state.py::test_a_re_created_node_is_read_at_once_and_a_valid_read_clears_lost",
@@ -78,7 +78,6 @@ def test_the_per_test_reset_clears_every_hold_bound_and_escalation_global(monkey
     srv.reset_killed_causes["job-1"] = "left over"
     m = srv.recovery_mechanism
     monkeypatch.setattr(m, "_class_a_ladder_anchor", 1.0)
-    monkeypatch.setattr(m, "_class_a_ladder_spawned", 1.0)
     chip_state.configure(present=lambda: ["0"], expected=lambda: 4)
 
     _reset_server_state()
@@ -87,7 +86,7 @@ def test_the_per_test_reset_clears_every_hold_bound_and_escalation_global(monkey
     assert {name: getattr(srv, name) for name in FRESH_SETS} == {name: set() for name in FRESH_SETS}
     assert srv._idle_holders == {}
     assert srv.reset_killed_causes == {}, "spec 01 I70: a recycled job id never reads another's cause"
-    assert (m._class_a_ladder_anchor, m._class_a_ladder_spawned) == (None, None)
+    assert m._class_a_ladder_anchor is None
     chip_state.reset()
     assert (chip_state._present, chip_state._expected) == (chip_state._sysfs_indices, chip_state._no_baseline)
 

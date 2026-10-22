@@ -27,6 +27,7 @@ import asyncio
 import logging
 import os
 import signal
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
@@ -438,15 +439,32 @@ def find_reaped_leftovers(
 # hold its mmap lock, and a maps read waits on that lock, so the read runs on its own thread and an
 # unanswered read counts as unreadable (fail closed: the holder is kept as stuck).
 STUCK_MAPS_READ_SEC = 2.0
+# The bounded reads still out, per pid. One stuck behind the mmap lock never returns, nor does its
+# thread: while it is out, a further read of that pid starts no thread and counts as unanswered at
+# once, so a long hold does not leave one thread behind per scan.
+_outstanding_reads: dict[int, threading.Thread] = {}
+_outstanding_lock = threading.Lock()
 
 
 def _bounded_read(pid: int, name: str, timeout: float) -> Optional[str]:
-    """``_read_leftover`` on a daemon thread, or None when it has not answered in ``timeout``."""
-    import threading
-
+    """``_read_leftover`` on a daemon thread, or None when it has not answered in ``timeout``, or at
+    once while an earlier read of ``pid`` is still out (at most one reader thread per pid)."""
     box: list = []
-    t = threading.Thread(target=lambda: box.append(_read_leftover(pid, name)), daemon=True)
-    t.start()
+
+    def read() -> None:
+        try:
+            box.append(_read_leftover(pid, name))
+        finally:
+            with _outstanding_lock:
+                if _outstanding_reads.get(pid) is threading.current_thread():
+                    del _outstanding_reads[pid]
+
+    with _outstanding_lock:
+        if pid in _outstanding_reads:
+            return None
+        t = threading.Thread(target=read, daemon=True, name=f"bounded-read-{pid}")
+        _outstanding_reads[pid] = t
+        t.start()
     t.join(timeout)
     return box[0] if box else None
 
@@ -454,15 +472,14 @@ def _bounded_read(pid: int, name: str, timeout: float) -> Optional[str]:
 def device_refs(pid: int, bdfs: Iterable[str], *, maps_timeout: float = STUCK_MAPS_READ_SEC) -> Optional[list[str]]:
     """What of the device ``pid`` still references (spec 04 I77): open fds on a /dev/tenstorrent node
     and mappings of a device node or of one of ``bdfs``' PCI BARs (``.../<bdf>/resource<n>``),
-    deleted ones included. [] when both fds and maps were read and name nothing; None when neither
-    could be read (the caller fails closed)."""
+    deleted ones included. [] when both fds and maps were read and name nothing; None when the fds
+    name nothing and the maps could not be read or did not answer in time (a BAR mapping behind it
+    cannot be ruled out: the caller fails closed)."""
     bars = [f"/{b}/resource" for b in bdfs if b]
     node = device_holders.DEVICE_DIR + "/"
     refs: list[str] = []
-    readable = False
     try:
         fds = os.listdir(f"{LEFTOVER_PROC_DIR}/{pid}/fd")
-        readable = True
     except OSError:
         fds = []
     for fd in fds:
@@ -473,16 +490,23 @@ def device_refs(pid: int, bdfs: Iterable[str], *, maps_timeout: float = STUCK_MA
         if target.startswith(node) or any(b in target for b in bars):
             refs.append(f"fd {fd} -> {target}")
     maps = _bounded_read(pid, "maps", maps_timeout)
-    if maps is not None:
-        readable = True
-        for line in maps.splitlines():
-            parts = line.split(None, 5)
-            path = parts[5].strip() if len(parts) == 6 else ""
-            if path and (path.startswith(node) or any(b in path for b in bars)) and f"map {path}" not in refs:
-                refs.append(f"map {path}")
-    if refs or readable:
-        return refs
-    return None
+    if maps is None:
+        return refs or None
+    for line in maps.splitlines():
+        parts = line.split(None, 5)
+        path = parts[5].strip() if len(parts) == 6 else ""
+        if path and (path.startswith(node) or any(b in path for b in bars)) and f"map {path}" not in refs:
+            refs.append(f"map {path}")
+    return refs
+
+
+def still_stuck(pid: int, starttime: str) -> bool:
+    """Whether ``pid`` (the process with ``starttime``, when given) is still stuck in the kernel: state
+    D or SIGKILL pending. /proc stat and status only: no maps read, so it never waits on a lock."""
+    state, now = _leftover_state(pid)
+    if state in ("?", "Z", "X") or (starttime and now != starttime):
+        return False
+    return state == "D" or bool(_sigkill_pending(pid))
 
 
 def stuck_device_holder(pid: int, label: str, uid: int, bdfs: Iterable[str]) -> Optional[ReapedLeftover]:
