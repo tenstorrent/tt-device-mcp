@@ -106,6 +106,13 @@ def _note(s):
     return stuck
 
 
+def _pin_restored():
+    """A restored t0 comes from the wall clock, so it is fractional; t0 + 120 then rounds across a
+    binade and ``now - t0`` can fall just under the budget. Whole seconds make the sums exact."""
+    srv._leftover_unkillable_mono = float(int(srv._leftover_unkillable_mono))
+    return srv._leftover_unkillable_mono
+
+
 def _gone(s, pid=PID):
     import shutil
 
@@ -529,7 +536,12 @@ def test_the_registry_is_recorded_and_removed_once_the_holder_is_gone(stuck):
     assert not path.exists()
 
 
-async def test_a_restart_keeps_the_fence_and_resumes_the_120s_clock(stuck, monkeypatch):
+@pytest.mark.parametrize("mono", [None, 8172.0137, 8172.0274, 8172.1233], ids=["live", "a", "b", "c"])
+async def test_a_restart_keeps_the_fence_and_resumes_the_120s_clock(stuck, monkeypatch, mono):
+    if mono is not None:  # host uptimes where t0 + 120 used to round below the budget
+        # frozen clocks make the restored t0 exactly mono - 100, a value where (t0 + 120) - t0 < 120
+        monkeypatch.setattr(time, "monotonic", lambda: mono)
+        monkeypatch.setattr(time, "time", lambda: 1.8e9)
     stuck["rig"]["beats"] = {str(i): 100 for i in range(EXPECTED) if i != int(CHIP)}
     _note(stuck)
     _restart(monkeypatch, elapsed=100)
@@ -541,7 +553,7 @@ async def test_a_restart_keeps_the_fence_and_resumes_the_120s_clock(stuck, monke
     assert srv._leftover_fault_class() == "J-dead-chip-stuck-holder"
     (restored,) = _events(stuck, "dead_chip_holder_stuck_restored")
     assert restored["pids"] == [PID]
-    t0 = srv._leftover_unkillable_mono
+    t0 = _pin_restored()
     assert abs((time.monotonic() - t0) - 100) < 5  # the clock resumed, not restarted
     assert not await _tick(t0 + BUDGET - 1)
     assert await _tick(t0 + BUDGET)
@@ -681,7 +693,7 @@ async def test_a_second_restart_readopts_the_victim_and_the_rung_still_fires(
     assert srv.jobs[VICTIM].status is srv.JobStatus.RUNNING
     assert srv._dead_chip_stuck_reason()
 
-    t0 = srv._leftover_unkillable_mono
+    t0 = _pin_restored()
     start = int(time.monotonic() - t0)
     requested_at = None
     for s in range(start, max(start, BUDGET) + RETRY + 2):

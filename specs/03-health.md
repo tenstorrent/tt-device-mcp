@@ -159,7 +159,9 @@ cooldown (spec 04 I65) holds longer.
   has never shown a chip skips with no hold — nothing there will ever verify.
 - **I15 — Only proof releases.** A clear that verified (full pass) closes the episode; an
   unverified clear drops only the dirty bit (ends the RESETTING, never the doubt) and leaves the
-  door held, with a durable `device_dirty_cleared` event naming whether it was verified.
+  door held, with a durable event naming whether it was verified: `device_dirty_cleared` when the
+  device leaves the hold, `device_dirty_dropped_held` when only the dirty bit drops and the hold
+  stays, so no log line claims a clear the hold did not have.
 - **I16 — A frozen active-eth-core verdict is held, not reset below the 10-min bound (spec 04 I76)**, dirty or not: it is the
   self-healing (~15–89 min) single-chip wedge, and the galaxy reset is the measured all-chip drop.
   Falling through to the reset needs both kill switches off: the hold's

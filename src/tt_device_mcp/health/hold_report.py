@@ -132,6 +132,25 @@ def cooldown_candidate(cooldown: Optional[Mapping], at: float) -> RungCandidate:
     return RungCandidate(at, "power cycle", "power_cycle_cooldown")
 
 
+def gate_power_cycle(candidates, gates) -> list:
+    """``candidates`` with each power-cycle step moved to the end of the latest governor wait in
+    ``gates`` (``(until, name)``: the backstop, the boot / post-cycle cooldown), whose source then
+    names every wait it clears: the governor refuses the cycle before that, so it is not the time
+    the rung fires (spec 04 I65/I75). Other steps (a ladder, a check) keep their time."""
+    if not gates:
+        return list(candidates)
+    until = max(u for u, _ in gates)
+    waits = ", then ".join(
+        f"the {name} until {datetime.fromtimestamp(u).isoformat(timespec='seconds')}" for u, name in sorted(gates)
+    )
+    out = []
+    for c in candidates:
+        if c is not None and c.rung.startswith("power cycle") and c.at < until:
+            c = RungCandidate(until, c.rung, f"{c.source}, held by {waits}")
+        out.append(c)
+    return out
+
+
 def next_rung(candidates) -> Optional[RungCandidate]:
     """The earliest armed candidate; ties keep the first given."""
     best = None

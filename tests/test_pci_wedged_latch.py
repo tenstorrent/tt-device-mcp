@@ -212,3 +212,37 @@ async def test_e_no_hold_lifts_while_pci_wedged_without_a_just_passed_full_check
         await asyncio.sleep(0.01)
     assert srv._clear_device_dirty(verified=True, why="test") is True
     assert not writer.latched, "the latch clears on the verified lift"
+
+
+@pytest.mark.asyncio
+async def test_the_wedged_power_cycle_request_names_the_wedge_not_a_failed_ladder(monkeypatch):
+    """A PCI-wedged hold asks for the power cycle seconds in, with no ladder run: every rung needs the
+    PCI lock the blocked write holds. The request's reason must say the ladder was skipped and why,
+    never that the full ladder ran and did not heal the hold."""
+    writer = _writer(monkeypatch)
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
+    monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_retry", None)
+    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", lambda action, **k: (True, ""))
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    monkeypatch.setattr(srv, "_bound_tenant_blocker", lambda *a: None)
+    causes = []
+
+    async def cycle(log, cause):
+        causes.append(cause)
+        return True
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", cycle)
+    writer._latch("test: a bridge reset blocked in the kernel")
+    await srv._hold_bound_host_rung(9.0, lambda *a: None)
+    assert len(causes) == 1, causes
+    assert "PCI-wedged" in causes[0] and "skipped" in causes[0], causes[0]
+    assert "a bridge reset blocked in the kernel" in causes[0], causes[0]
+    assert "did not heal it" not in causes[0], causes[0]
+
+
+def test_a_skipped_ladder_is_named_in_the_power_cycle_reason():
+    """A host rung asked with no ladder first (the leftover chips, a refused kill) names that skip;
+    only the plain bound case says the full ladder did not heal the hold."""
+    assert srv._hold_bound_cause(612.0) == "10-min hold bound: held 612s and the full ladder did not heal it"
+    skipped = srv._hold_bound_cause(612.0, "2 chips stay off after the ladder")
+    assert skipped == "10-min hold bound: held 612s and the ladder was skipped: 2 chips stay off after the ladder"
