@@ -15651,8 +15651,8 @@ async def test_replay_a_20_min_readopted_job_then_the_startup_check(monkeypatch,
     pages nor names the broker's own job as a tenant, and /health shows no hold yet. At its end the hold
     opens, and the startup gate's full check runs first. A pass releases the device with no ladder. A
     failure gets the bound's ladder 600 s after the job's end, once; when the full check after it fails
-    too, one power-cycle request. Fails on base, which paged hold_bound_tenant_blocked over the broker's
-    own re-adopted job at the 10-min mark."""
+    too, one power-cycle request. Before the I75/I76 ordering, the bound paged hold_bound_tenant_blocked
+    over the broker's own re-adopted job at the 10-min mark."""
     _, job, climbs, gate_calls, gate_heals, release_job, _, events = _setup_startup_hold_behind_readopted_job(
         monkeypatch, tmp_path
     )
@@ -15868,14 +15868,18 @@ async def test_a_hung_startup_check_gets_the_ladder_by_its_bound_after_the_reado
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("gate", ["fails", "never_runs"])
+@pytest.mark.parametrize("gate", ["fails", "never_runs", "never_runs_job_cleaned_up", "never_runs_job_unknown"])
 async def test_replay_a_1_min_readopted_job_whose_startup_check_fails_or_never_runs(monkeypatch, tmp_path, gate):
     """The 10-17 06:27-06:41 PDT episode: a broker restart re-adopted a live job that ended after 1 min.
     The startup hold then stood 12m50s with no ladder at the 10-min mark. Now: the startup check runs as
     soon as the job ends; when it fails, or never runs because the job's scope outlives the job (a killed
     job still exiting), the bound's ladder runs no later than 10 min after the job's end, and a full
     check that still fails after it asks for one power cycle. Fails on base for ``never_runs``: the I75
-    stand-down had no clock until the gate stopped waiting on the scope, so it kept the ladder off."""
+    stand-down had no clock until the gate stopped waiting on the scope, so it kept the ladder off.
+    ``never_runs_job_cleaned_up``: the finished-job cleanup (which any queued job's hold loop runs) passes
+    over the job past its retention, before the bound runs out. Fails on base, which dropped the job, so
+    the stand-down lost its clock and kept the ladder off for good. ``never_runs_job_unknown``: a scope
+    whose job the broker no longer knows counts from the startup gate's start, so the bound still holds."""
     since, job, climbs, gate_calls, gate_heals, release_job, tick, events = _setup_startup_hold_behind_readopted_job(
         monkeypatch, tmp_path
     )
@@ -15892,15 +15896,23 @@ async def test_replay_a_1_min_readopted_job_whose_startup_check_fails_or_never_r
     await tick(job_end + 300)
     assert climbs == [] and cycles == []
 
-    if gate == "never_runs":
+    if gate != "fails":
         _ended_ago(job, ceiling - job_end + 1)
+        job.status = srv.JobStatus.KILLED
+    if gate == "never_runs_job_cleaned_up":
+        assert ceiling - job_end + 1 > srv.JOB_RETENTION_SEC
+        await srv.cleanup_finished_jobs()
+        assert srv.jobs.get(job.id) is job, "a job whose scope still lingers keeps its end time"
+    if gate == "never_runs_job_unknown":
+        del srv.jobs[job.id]
+        monkeypatch.setattr(srv, "_startup_verify_started_wall", time.time() - (ceiling - job_end + 1))
     await tick(ceiling + 1)  # 9 min after the job's end
     assert climbs == ["present-forced"], "no ladder by 10 min after the re-adopted job's end"
     assert len(cycles) == 1, "the full check after the ladder failed: one power-cycle request"
     await tick(ceiling + 21)
     await tick(2 * ceiling - 1)
     assert climbs == ["present-forced"] and len(cycles) == 1, "the hold was driven twice"
-    if gate == "never_runs":
+    if gate != "fails":
         assert gate_calls == []
         srv.readopted_scopes.clear()
         await srv._startup_verify_task

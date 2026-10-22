@@ -1206,7 +1206,9 @@ cooldown (spec 04 I65) holds longer.
   Bounded: `STARTUP_VERIFY_DEFER_MAX_SEC` (hugepage wait + fabric timeout + 120 s, 420 s) after the
   re-adopted jobs end, the escalations act as before. That clock starts when the gate stops
   waiting on their scopes or, while a scope outlives its job (a killed job's scope still exiting),
-  at the job's `finished_at`: a scope that lingers never holds the ladder off past it. A dirty or
+  at the job's `finished_at`: a scope that lingers never holds the ladder off past it. The finished-job
+  cleanup keeps such a job while its scope lingers, and a scope whose job the broker no longer knows
+  counts from the gate's start, so the clock is never lost. A dirty or
   faulted job end keeps the gate's own reset + full check. Time to recover (class S, restart over a
   re-adopted job longer than the ceiling): from the job's end, one scope poll plus the startup gate
   (about 1-2 min), against a galaxy reset, its settle and verify, then the gate (about 4-6 min)

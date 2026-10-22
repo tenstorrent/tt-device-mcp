@@ -11488,12 +11488,17 @@ async def cleanup_finished_jobs():
     completed jobs in memory indefinitely.
 
     Uses lock to prevent race conditions with concurrent job state access.
+
+    A re-adopted job stays while its scope does (`readopted_scopes`): its ``finished_at`` bounds the
+    spec 03 I75 stand-down, and without it the stand-down kept the hold's ladder off for good.
     """
     now = datetime.now()
     to_remove = []
 
     async with get_lock():
         for job_id, job in jobs.items():
+            if job_id in readopted_scopes:
+                continue
             if job.status in (
                 JobStatus.COMPLETED,
                 JobStatus.FAILED,
@@ -13893,11 +13898,19 @@ def _readopted_jobs_end() -> Optional[datetime]:
 
 def _readopted_jobs_ended_at() -> Optional[datetime]:
     """When the last job re-adopted by this broker start whose scope has not been reaped yet ended
-    (its ``finished_at``), or None when none is known to have ended or one still runs."""
+    (its ``finished_at``), or None when none is known to have ended or one still runs. A job no longer
+    in ``jobs`` has ended at an unknown time: it counts from the startup gate's start, so the I75
+    stand-down keeps its bound."""
     ended: Optional[datetime] = None
     for jid in readopted_scopes:
         job = jobs.get(jid)
-        if job is None or job.status == JobStatus.RUNNING or not job.finished_at:
+        if job is None:
+            if _startup_verify_started_wall is None:
+                return None
+            at = datetime.fromtimestamp(_startup_verify_started_wall)
+            ended = at if ended is None or at > ended else ended
+            continue
+        if job.status == JobStatus.RUNNING or not job.finished_at:
             return None
         try:
             at = datetime.fromisoformat(job.finished_at)
