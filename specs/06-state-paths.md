@@ -359,6 +359,8 @@ Behavior).
 | `TTDEV_DISPATCH_BIN` | validator `distributed_program_dispatch` | Fabric-check dispatch stage binary |
 | `TTDEV_DISPATCH_TIMEOUT` | 90 | Fabric-check dispatch stage timeout |
 | `TTDEV_DISPATCH_OP_TIMEOUT` | 25 | `TT_METAL_OPERATION_TIMEOUT_SECONDS` for the dispatch stage |
+| `TTDEV_FABRIC_STAGGER` | unset (off) | Fabric-check wrapper: `tray` runs the dispatch stage once per PCI host bridge with only that bridge's chips in `TT_VISIBLE_DEVICES`, one bridge after another; every chip must still pass, and the link stage (every cabled link, whole mesh open) is the same in both modes. A split that is not >= 2 bridges of `TTDEV_FABRIC_STAGGER_CHIPS` each dispatches to the whole mesh (`tests/test_fabric_stagger.py`) |
+| `TTDEV_FABRIC_STAGGER_CHIPS` | 8 | Chips per bridge the staggered dispatch needs (the probe's 2x4 mesh) |
 | `TTDEV_DISPATCH_RUNTIME_ROOT`, `TTDEV_DISPATCH_CACHE` | validator `current/`, broker cache | Runtime root/cache for the pre-job dispatch probe (src, server.py) |
 | `TTDEV_ETH_CHECK_PYTHON` | unset (validator env, then fallbacks) | Interpreter for the eth probe (src) |
 | `TTDEV_ETH_CHECK_PROBE` | built-in staged probe | Eth probe script override (src) |

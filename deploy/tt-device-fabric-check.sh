@@ -48,6 +48,12 @@
 #                             describes THIS machine. Unset (the default) = traffic-only, which is
 #                             what makes the check work on every machine config.
 #   TTDEV_FABRIC_ITERS        traffic iterations (default 1)
+#   TTDEV_FABRIC_STAGGER      unset/0/off (default) = one dispatch to the whole mesh; tray = the
+#                             dispatch stage runs once per PCI host bridge (a tray on a galaxy),
+#                             one after another, so fewer chips start a program at once. The link
+#                             stage is the same in both modes. See the dispatch section.
+#   TTDEV_FABRIC_STAGGER_CHIPS  chips per tray the staggered dispatch needs (default 8: the probe's
+#                             2x4 mesh); any other split dispatches to the whole mesh instead
 set -u
 
 EXIT_CANNOT_CHECK=77
@@ -300,23 +306,84 @@ DTMO="${TTDEV_DISPATCH_TIMEOUT:-90}"
 DOUT="$(mktemp)" || cannot_check "cannot create a temp file for the dispatch probe"
 trap 'rm -f "$RUNLOG" "$DOUT"' EXIT
 
-log "fabric healthy; dispatching a program to every chip via the mesh (typ 14s, cap ${DTMO}s)"
 # The operation timeout is what turns a hang into a verdict. Without it a wedged core sits in
 # metal's own 180s-per-device wait, outlasts the cap, and all we learn is that we timed out; with
 # it metal throws by name and the probe exits non-zero having actually measured something.
-TT_METAL_OPERATION_TIMEOUT_SECONDS="${TTDEV_DISPATCH_OP_TIMEOUT:-25}" \
-    timeout --signal=KILL "$DTMO" "$DBIN" >"$DOUT" 2>&1
-drc=$?
+# $1: the TT_VISIBLE_DEVICES list for a staggered group; none = the whole mesh, env as it was.
+dispatch() {
+    if [ "$#" -gt 0 ]; then
+        TT_VISIBLE_DEVICES="$1" TT_METAL_OPERATION_TIMEOUT_SECONDS="${TTDEV_DISPATCH_OP_TIMEOUT:-25}" \
+            timeout --signal=KILL "$DTMO" "$DBIN" >"$DOUT" 2>&1
+    else
+        TT_METAL_OPERATION_TIMEOUT_SECONDS="${TTDEV_DISPATCH_OP_TIMEOUT:-25}" \
+            timeout --signal=KILL "$DTMO" "$DBIN" >"$DOUT" 2>&1
+    fi
+    drc=$?
+}
+
+# Staggered mode (TTDEV_FABRIC_STAGGER=tray): the same probe, once per PCI host bridge with only that
+# bridge's chips visible, one bridge after another. Every chip still runs a program and must pass;
+# the links were all measured above with the whole mesh open, since a link between two trays needs
+# both ends. A split that does not give every bridge exactly the probe's mesh size (a chip missing,
+# another machine) cannot be staggered, so it dispatches to the whole mesh as before.
+# One line per bridge: "<pciDDDD:BB> <bdf>,<bdf>,...", sorted.
+tray_groups() {
+    local fn real root
+    local -A grp=()
+    for fn in "$PCI_DEVICES"/*; do
+        [ "$(cat "$fn/vendor" 2>/dev/null)" = "0x1e52" ] || continue
+        real="$(readlink -f "$fn")"
+        root="$(sed -n 's#.*/\(pci[0-9a-f]\{4\}:[0-9a-f]\{2\}\)/.*#\1#p' <<<"$real")"
+        [ -n "$root" ] || return 0
+        grp[$root]="${grp[$root]:+${grp[$root]},}${fn##*/}"
+    done
+    for root in "${!grp[@]}"; do echo "$root ${grp[$root]}"; done | sort
+}
+groups=()
+STAGGER="${TTDEV_FABRIC_STAGGER:-}"
+case "$STAGGER" in
+    ""|0|off) ;;
+    tray)
+        per="${TTDEV_FABRIC_STAGGER_CHIPS:-8}"
+        mapfile -t groups < <(tray_groups)
+        split=""
+        for g in "${groups[@]}"; do
+            n="$(tr ',' '\n' <<<"${g#* }" | grep -c .)"
+            split="${split:+$split, }${g%% *}:$n"
+            [ "$n" = "$per" ] || bad=1
+        done
+        if [ "${#groups[@]}" -lt 2 ] || [ -n "${bad:-}" ]; then
+            log "staggered dispatch needs >= 2 PCI host bridges of $per chips each, found ${split:-none}; dispatching to the whole mesh"
+            groups=()
+        fi ;;
+    *)  log "TTDEV_FABRIC_STAGGER='$STAGGER' is not 'tray' or off; dispatching to the whole mesh" ;;
+esac
+
+where=""
+if [ "${#groups[@]}" -eq 0 ]; then
+    log "fabric healthy; dispatching a program to every chip via the mesh (typ 14s, cap ${DTMO}s)"
+    dispatch
+else
+    log "fabric healthy; dispatching a program to every chip, ${#groups[@]} trays one at a time (typ 14s each, cap ${DTMO}s each)"
+    for g in "${groups[@]}"; do
+        where=" on tray ${g%% *}"
+        log "dispatch${where}: ${g#* }"
+        dispatch "${g#* }"
+        [ "$drc" -eq 0 ] || break
+        log "dispatch OK${where}"
+    done
+    [ "$drc" -eq 0 ] && where=" (${#groups[@]} trays one at a time)"
+fi
 
 case "$drc" in
-    0)   log "dispatch OK: every chip ran a program"; topo_ok; exit 0 ;;
+    0)   log "dispatch OK: every chip ran a program${where}"; topo_ok; exit 0 ;;
     # Killed at the cap. We did NOT measure a wedge — we failed to measure at all, and this is the
     # exact verdict that reset this host in a loop when the probe itself was the slow thing. A real
     # dispatch hang comes back through the operation timeout as a non-zero exit above, so nothing
     # is lost by refusing to guess here.
     137) save_to_last "$DOUT"
          log "dispatch probe last output: $(grep -vE '^\s*$' "$DOUT" | sed -n '$p' | cut -c1-160)"
-         cannot_check "dispatch probe hit its ${DTMO}s cap without a verdict (typical is 14s)" ;;
+         cannot_check "dispatch probe hit its ${DTMO}s cap without a verdict${where} (typical is 14s)" ;;
     *)   # what() carries the cause; "terminate called" sits above it and names only the type.
          reason=""
          for pat in 'what\(\):.*' 'TT_THROW.*' 'Timed out.*' 'terminate called.*'; do
@@ -328,6 +395,6 @@ case "$drc" in
          grep -vE '^\s*$' "$DOUT" | tail -n 20 | sed 's/^/fabric-check|  /' >&2
          save_to_last "$DOUT"
          log "the bus and the links are fine and the mesh still cannot run a program -> UNHEALTHY, the broker will reset"
-         log "dispatch FAILED on a green fabric (rc=$drc)${reason:+: $reason}"
+         log "dispatch FAILED on a green fabric${where} (rc=$drc)${reason:+: $reason}"
          exit 1 ;;
 esac
