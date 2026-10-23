@@ -86,6 +86,8 @@ systemctl() {{
     esac
 }}
 op_in_flight() {{ return 1; }}
+# The live-pid part of the op probe: every op the stand-ins report is the broker's own.
+op_lock_live() {{ op_in_flight; }}
 hold_write() {{ :; }}
 count_busy() {{ kids=0; holders=0; scopes=0; queued=0; busy=0; }}
 {stand_ins}
@@ -273,7 +275,7 @@ def _waits():
     text = _SCRIPT.read_text()
     age = text[text.index("youngest_job_age() {") : text.index("# The device-op bar above, asked again")]
     wait = text[text.index("wait_job_boundary() {") : text.index("\ncount_busy\nif")]
-    return "JOB_CAP=1560\nUPTIME=/proc/uptime\n" + age + wait + "\n"
+    return "JOB_CAP=1560\nOP_CAP=660\nUPTIME=/proc/uptime\n" + age + wait + "\n"
 
 
 def _pre_install():

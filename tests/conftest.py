@@ -4,6 +4,7 @@
 """Pytest fixtures for tt-device-mcp tests."""
 
 import asyncio
+import errno
 import fnmatch
 import os
 import shutil
@@ -141,6 +142,109 @@ def isolate_process_globals():
     os.environ.clear()
     os.environ.update(env)
     sys.argv[:] = argv
+
+
+# Spec 09 I9: a test may signal only processes this pytest process spawned. The broker's kill
+# paths (the dead-chip valve's holder kill, the survivor reap's pgid backstop, foreign-holder
+# reclaim) act on whatever the host's /proc shows, and a test that reached one unstubbed on a
+# device host SIGKILLed real jobs holding the real device. Every child inherits this token, so a
+# child that left the session or was re-parented still reads as ours; each process (an xdist
+# worker included) gets its own value.
+_SPAWN_TOKEN_ENV = "TT_DEVICE_MCP_TEST_SPAWN_TOKEN"
+_SPAWN_TOKEN = f"{os.getpid()}-{time.time_ns()}"
+os.environ[_SPAWN_TOKEN_ENV] = _SPAWN_TOKEN
+_real_kill, _real_killpg = os.kill, os.killpg
+
+
+def _proc_stat_fields(pid: int) -> "list[str] | None":
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            data = f.read()
+    except OSError:
+        return None
+    return data[data.rindex(")") + 2 :].split()
+
+
+def _carries_spawn_token(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            return f"{_SPAWN_TOKEN_ENV}={_SPAWN_TOKEN}".encode() in f.read().split(b"\0")
+    except OSError:
+        return False
+
+
+def _spawned_by_this_run(pid: int) -> bool:
+    """pid is this process, one of its descendants, or a process that inherited its token."""
+    me, cur = os.getpid(), pid
+    for _ in range(4096):
+        if cur == me:
+            return True
+        fields = _proc_stat_fields(cur) if cur and cur > 1 else None
+        if fields is None:
+            break
+        cur = int(fields[1])
+    return _carries_spawn_token(pid)
+
+
+def _group_members(pgid: int) -> list:
+    members = []
+    for name in os.listdir("/proc"):
+        if name.isdigit():
+            fields = _proc_stat_fields(int(name))
+            if fields is not None and int(fields[2]) == pgid:
+                members.append(int(name))
+    return members
+
+
+class _SignalGuard:
+    """Refuses (EPERM, nothing delivered) a signal aimed at a process this run did not spawn, and
+    records it so the test fails. Signal 0 delivers nothing and passes; so does a pid that does not
+    exist (the call raises ESRCH as it would anyway)."""
+
+    def __init__(self):
+        self.refused: list = []
+        self.owned = _spawned_by_this_run
+
+    def _foreign(self, pids: list) -> list:
+        """The pids that exist and are not this run's. A process (or an ancestor) that exits during
+        the ppid walk breaks it, so a miss is read again; one that is gone by then is skipped."""
+        return [p for p in pids if not self.owned(p) and os.path.exists(f"/proc/{p}") and not self.owned(p)]
+
+    def _refuse(self, what: str, sig: int, members: list):
+        self.refused.append(f"{what}(signal {int(sig)}) reaches pid(s) {members[:8]} this test did not spawn")
+        raise PermissionError(errno.EPERM, f"spec 09 I9: refused {what}: not spawned by this test run")
+
+    def kill(self, pid: int, sig: int):
+        if sig == 0:
+            return _real_kill(pid, sig)
+        if pid == -1:
+            return self._refuse(f"os.kill({pid})", sig, ["every process"])
+        if pid <= 0:
+            return self.killpg(os.getpgid(0) if pid == 0 else -pid, sig, what=f"os.kill({pid})")
+        if self._foreign([pid]):
+            return self._refuse(f"os.kill({pid})", sig, [pid])
+        return _real_kill(pid, sig)
+
+    def killpg(self, pgid: int, sig: int, what: str = ""):
+        what = what or f"os.killpg({pgid})"
+        if sig == 0:
+            return _real_killpg(pgid, sig)
+        members = _group_members(os.getpgid(0) if pgid == 0 else pgid)
+        foreign = self._foreign(members)
+        if foreign:
+            return self._refuse(what, sig, foreign)
+        return _real_killpg(pgid, sig)
+
+
+@pytest.fixture(autouse=True)
+def signal_guard(monkeypatch):
+    """Spec 09 I9: no test signals a process it did not spawn. A refused signal fails the test."""
+    guard = _SignalGuard()
+    monkeypatch.setattr(os, "kill", guard.kill)
+    monkeypatch.setattr(os, "killpg", guard.killpg)
+    yield guard
+    if guard.refused:
+        pytest.fail("spec 09 I9: this test signalled processes it did not spawn: " + "; ".join(guard.refused))
 
 
 def pytest_addoption(parser):

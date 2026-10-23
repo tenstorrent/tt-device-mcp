@@ -61,7 +61,10 @@ from tt_device_mcp.constants import (
     FABRIC_CHECK_TIMEOUT_SEC,
     GRACEFUL_KILL_GRACE_SEC,
     HOLDER_RELEASE_WAIT_SEC,
+    HUNG_IO_CAP_SEC,
     HUNG_SIGINT_GRACE_SEC,
+    HUNG_SILENCE_MAX_SEC,
+    HUNG_SILENCE_MIN_SEC,
     JOB_RETENTION_SEC,
     POST_STEP_DEADLINE_DEFAULT_SEC,
     POST_STEP_DEADLINE_ENV,
@@ -198,6 +201,8 @@ from tt_device_mcp.job_reap import (
     ReapedLeftover,
     _leftover_state,
     find_reaped_leftovers,
+    io_advanced,
+    job_io_bytes,
     job_processes,
     reap_job_survivors,
     still_stuck,
@@ -384,6 +389,18 @@ class JobSubmitInput(BaseModel):
             f"{PREEMPT_GRACE_SEC}s. The job ends 'preempted'. Its status reads 'PREEMPTABLE <x>min' "
             "while it runs and 'PREEMPTING <s>s' (seconds left) during that time. Anyone using "
             "this MUST watch the broker (queue status or this job's status). Default: false."
+        ),
+    )
+    hung_silence_sec: Optional[int] = Field(
+        None,
+        ge=HUNG_SILENCE_MIN_SEC,
+        le=HUNG_SILENCE_MAX_SEC,
+        description=(
+            "This job's own hung limit: it is reaped as hung (and the device reset and fully checked) "
+            "after this many seconds with neither output nor storage IO. Storage IO keeps a silent job "
+            f"alive for at most {HUNG_IO_CAP_SEC}s (or this limit, if longer); CPU use never does. "
+            f"Between {HUNG_SILENCE_MIN_SEC} and {HUNG_SILENCE_MAX_SEC}. Default: the host's limit "
+            "(300s unless the operator changed it)."
         ),
     )
 
@@ -812,6 +829,7 @@ class Job:
     last_output_monotonic: float = 0.0  # set on every line; the hung watchdog's clock
     doomed_monotonic: Optional[float] = None  # first sight of an unrecoverable-device line, if any
     preemptable: bool = False  # no timeout except on contention: timeout_sec is enforced only while another job waits
+    hung_silence_sec: Optional[int] = None  # the job's own silence limit; None = HUNG_SILENCE_SEC
     # Preemption state, all on time.monotonic() and in memory only (a restart re-derives it):
     queued_monotonic: Optional[float] = None  # time.monotonic() at queueing: the preemption clock's arrival
     contention_since_monotonic: Optional[float] = None  # start of the running job's current grace minute
@@ -9889,6 +9907,22 @@ def _refresh_idle_hold_ledger() -> None:
 # mid-CCL wedges the mesh, which is the exact failure this is meant to clear.
 HUNG_SILENCE_SEC = int(os.environ.get("TT_DEVICE_MCP_HUNG_SILENCE_SEC", "300"))
 HUNG_POLL_SEC = 15.0
+# Bound on one storage-IO sample of the hung watchdog. The sample reads /proc/<pid>/environ of
+# every host process, and that read can block for good on a process stuck in D state (a hung
+# device driver). A sample that does not return in time is no signal, so silence decides.
+HUNG_IO_SAMPLE_SEC = 10.0
+
+
+def _bounded_hung_silence(value) -> Optional[int]:
+    """A submitted per-job silence limit, clamped to [HUNG_SILENCE_MIN_SEC, HUNG_SILENCE_MAX_SEC];
+    None (or 0) keeps the host's HUNG_SILENCE_SEC. Applied on every submit path, like the timeout."""
+    if value is None or value == "":
+        return None
+    value = int(value)
+    if value <= 0:
+        return None
+    return max(HUNG_SILENCE_MIN_SEC, min(value, HUNG_SILENCE_MAX_SEC))
+
 
 # How often a preemptable job past its time limit looks for a waiting job. The grace minute is
 # anchored on the waiter's own queue time, so this only bounds how late a gap between waiters is
@@ -13093,6 +13127,7 @@ async def _job_runner_loop():
         spool_tails: list = []  # the job's output files, when it writes to a spool (spec 01 I17)
         spool_offsets = None
         reaping = False  # the watchdog has started the termination ladder
+        hung_reason = ""  # what the hung reaper saw, for the job's terminal note
         preempting = False  # the preempt watchdog's grace minute ran out and the kill began
         # Unique to this run (ids recycle): what still finds a child that left the job's
         # session after its parent exited, for the survivor sweep in the finally below.
@@ -13266,9 +13301,56 @@ export {JOB_TAG_ENV}={job_tag}
                 # Kills the process rather than raising: the streams then hit EOF and the gather
                 # below returns on its own, so the normal completion path runs and the job keeps
                 # whatever output it managed to produce before it went quiet.
+                #
+                # Storage IO by the job's processes also counts as liveness (HUNG_IO_CAP_SEC), up
+                # to the cap; CPU time never does. A job with neither output nor IO is reaped at
+                # its limit exactly as before.
+                nonlocal hung_reason
                 announced = 0.0
+                limit = job.hung_silence_sec or HUNG_SILENCE_SEC
+                io_cap = max(HUNG_IO_CAP_SEC, limit)
+                io_scope = job_scope_unit(job_id) if privsep_prefix else None
+                io_prev = None
+                last_io = None  # monotonic time IO was last seen advancing
+                # At most one sample thread in flight: a sample stuck on a blocked /proc read is
+                # never joined by another, so stuck threads cannot fill the executor that
+                # _terminate_job's own to_thread calls need.
+                io_task = None
+                io_timed_out = False
                 while True:
-                    silent = time.monotonic() - job.last_output_monotonic
+                    poll_start = time.monotonic()
+                    io_now = None
+                    if limit > 0:
+                        if io_task is None:
+                            io_task = asyncio.ensure_future(asyncio.to_thread(job_io_bytes, job.pid, io_scope, job_tag))
+                            # Retrieves the outcome of a sample nobody awaits any more.
+                            io_task.add_done_callback(lambda t: t.cancelled() or t.exception())
+                            await asyncio.wait({io_task}, timeout=min(HUNG_POLL_SEC, HUNG_IO_SAMPLE_SEC))
+                            if io_task.done():
+                                try:
+                                    io_now = io_task.result()
+                                except Exception:  # noqa: BLE001 - no IO signal is the safe side: silence decides
+                                    io_now = None
+                                io_task = None
+                            elif not io_timed_out:
+                                io_timed_out = True
+                                if logger:
+                                    logger.warning(
+                                        f"JOB_RUNNER job_id={job_id} storage IO sample did not return "
+                                        f"within {min(HUNG_POLL_SEC, HUNG_IO_SAMPLE_SEC)}s; "
+                                        "no IO signal until it does, silence decides"
+                                    )
+                        elif io_task.done():
+                            # A late sample is stale: drop it, and sample afresh on the next poll.
+                            io_task = None
+                    now = time.monotonic()
+                    silent = now - job.last_output_monotonic
+                    if limit > 0:
+                        if io_advanced(io_prev, io_now):
+                            last_io = now
+                        io_prev = io_now
+                    io_live = last_io is not None and last_io > job.last_output_monotonic
+                    quiet = now - last_io if io_live else silent
 
                     # Checked before silence: this job is still talking, so the silence clock will
                     # never reach it, and every second spent waiting is a second the device is held
@@ -13313,27 +13395,48 @@ export {JOB_TAG_ENV}={job_tag}
 
                     if HUNG_NOTICE_SEC > 0 and silent - announced >= HUNG_NOTICE_SEC:
                         announced = silent
-                        left = f"; reaping as hung at {HUNG_SILENCE_SEC}s" if HUNG_SILENCE_SEC > 0 else ""
-                        if left and job.preemptable:
-                            left += " once another job is queued"
-                        note(f"no output for {int(silent)}s{left}")
+                        # Says which signal is keeping the job alive, so a reader can tell a job
+                        # still writing its cache from one that has gone quiet everywhere.
+                        if limit <= 0:
+                            text = f"no output for {int(silent)}s"
+                        elif io_live:
+                            text = (
+                                f"no output for {int(silent)}s, but storage IO {int(now - last_io)}s ago "
+                                f"keeps it alive; reaping as hung after {limit}s with neither, "
+                                f"or at {io_cap}s without output"
+                            )
+                        else:
+                            io_word = "no storage IO" if io_now is not None else "storage IO unreadable"
+                            text = f"no output for {int(silent)}s, {io_word}; reaping as hung at {limit}s"
+                        if limit > 0 and job.preemptable:
+                            text += " once another job is queued"
+                        note(text)
 
-                    if HUNG_SILENCE_SEC > 0 and silent >= HUNG_SILENCE_SEC and not spared and not preempt_owns_stop:
+                    if limit > 0:
+                        if quiet >= limit:
+                            if io_live or io_now is not None:
+                                io_part = f"no storage IO for {int(quiet)}s"
+                            else:
+                                io_part = "storage IO unreadable"
+                            hung_reason = f"no output for {int(silent)}s and {io_part}"
+                            reap_why = f"{hung_reason} (limit {limit}s)"
+                        elif silent >= io_cap:
+                            hung_reason = f"no output for {int(silent)}s, only storage IO"
+                            reap_why = f"{hung_reason} (cap {io_cap}s)"
+                        else:
+                            reap_why = ""
+                    else:
+                        reap_why = ""
+                    if reap_why and not spared and not preempt_owns_stop:
                         async with get_lock():
                             # A user kill that already landed owns the verdict; do not relabel it.
                             # Nor a preemption that started since the check above.
                             if job.status != JobStatus.RUNNING or job.preempt_killed_monotonic is not None:
                                 return
                             job.status = JobStatus.HUNG
-                        note(
-                            f"no output for {int(silent)}s (limit {HUNG_SILENCE_SEC}s) — "
-                            f"terminating this job as hung"
-                        )
+                        note(f"{reap_why} — terminating this job as hung")
                         if logger:
-                            logger.warning(
-                                f"JOB_RUNNER job_id={job_id} HUNG: no output for {int(silent)}s "
-                                f"(limit {HUNG_SILENCE_SEC}s) -> terminating"
-                            )
+                            logger.warning(f"JOB_RUNNER job_id={job_id} HUNG: {reap_why} -> terminating")
                         # Kill the whole scope for a privsep job — killpg on the wrapper pid leaves the
                         # scoped payload running and wedges the eth. See _terminate_job.
                         # A silent job does not unwind on SIGINT and owes the reset anyway: a
@@ -13341,12 +13444,14 @@ export {JOB_TAG_ENV}={job_tag}
                         reaping = True
                         _log_job_tree_killed(
                             job_id,
-                            f"hung (no output for {int(silent)}s)",
+                            f"hung ({hung_reason})",
                             await _terminate_job(job_id, job.pid, grace_sec=HUNG_SIGINT_GRACE_SEC),
                         )
                         return
 
-                    await asyncio.sleep(HUNG_POLL_SEC)
+                    # The sample's own wait counts toward the poll, so a blocked sample never
+                    # stretches the period past HUNG_POLL_SEC.
+                    await asyncio.sleep(max(0.0, HUNG_POLL_SEC - (time.monotonic() - poll_start)))
 
             async def preempt_watchdog():
                 # No timeout except on contention: past its limit the job runs on for as long as
@@ -13551,7 +13656,7 @@ export {JOB_TAG_ENV}={job_tag}
                     terminal_note = (
                         "\n[HUNG: runtime reported the device unrecoverable]"
                         if job.doomed_monotonic is not None
-                        else f"\n[HUNG: no output for {HUNG_SILENCE_SEC}s]"
+                        else f"\n[HUNG: {hung_reason or 'no output'}]"
                     )
                 job.output = "".join(job.out_buf)
                 job.error = "".join(job.err_buf) + terminal_note
@@ -13864,6 +13969,7 @@ def _persist_queued_job(job: "Job") -> None:
                     "env_vars": job.env_vars,
                     "timeout_sec": job.timeout_sec,
                     "preemptable": job.preemptable,
+                    "hung_silence_sec": job.hung_silence_sec,
                     "log_file": job.log_file,
                 }
             )
@@ -14038,6 +14144,7 @@ async def _restore_queued_jobs() -> None:
                 env_vars=spec.get("env_vars") or {},
                 timeout_sec=int(spec.get("timeout_sec", DEFAULT_TIMEOUT_SEC)),
                 preemptable=bool(spec.get("preemptable", False)),
+                hung_silence_sec=_bounded_hung_silence(spec.get("hung_silence_sec")),
                 log_file=spec.get("log_file"),
             )
         except (OSError, ValueError, TypeError, KeyError) as e:
@@ -15053,6 +15160,7 @@ def create_mcp_server() -> MCPServer:
             inherited_env=data.get("inherited_env"),
             timeout_sec=data.get("timeout_sec", DEFAULT_TIMEOUT_SEC),
             preemptable=bool(data.get("no_timeout_except_on_contention", data.get("preemptable", False))),
+            hung_silence_sec=data.get("hung_silence_sec"),
         )
         return JSONResponse(result)
 
@@ -15440,6 +15548,8 @@ def create_mcp_server() -> MCPServer:
             result.update(job_activity_view(job_id) or {})  # DEVICE IDLE (spec 03 I54)
         elif job.idle_total_sec is not None:
             result["idle_total_sec"] = job.idle_total_sec
+        if job.hung_silence_sec:
+            result["hung_silence_sec"] = job.hung_silence_sec
         if job_id in readopted_scopes:
             result["readopted"] = True
             # Spec 03 I76: the broker's startup hold waits on this job; it is not a fault.
@@ -15566,6 +15676,7 @@ def create_mcp_server() -> MCPServer:
         inherited_env: dict[str, str] = None,
         timeout_sec: int = DEFAULT_TIMEOUT_SEC,
         preemptable: bool = False,
+        hung_silence_sec: Optional[int] = None,
     ) -> dict:
         """Internal helper to queue a job."""
         global job_counter
@@ -15579,6 +15690,11 @@ def create_mcp_server() -> MCPServer:
         # and the REST route passes timeout_sec through raw. Clamping only at the tool layer
         # left the ceiling unenforced for the paths people actually submit through.
         timeout_sec = max(1, min(int(timeout_sec), MAX_TIMEOUT_SEC))
+        # Same funnel, same reason: the REST route passes the per-job hung limit through raw.
+        try:
+            hung_silence_sec = _bounded_hung_silence(hung_silence_sec)
+        except (TypeError, ValueError):
+            return {"error": f"hung_silence_sec must be an integer number of seconds, got {hung_silence_sec!r}"}
 
         # Always derived, never taken from the caller. Over the socket the peer uid names the
         # submitter and the request surface decides the tag; off it there is no identity to read
@@ -15667,6 +15783,8 @@ def create_mcp_server() -> MCPServer:
                 f.write(f"TIMEOUT:     {timeout_sec}s\n")
                 if preemptable:
                     f.write("PREEMPTABLE: yes\n")
+                if hung_silence_sec:
+                    f.write(f"HUNG LIMIT:  {hung_silence_sec}s\n")
                 f.write(f"QUEUED:      {queued_at}\n")
                 f.write("-" * 70 + "\n")
                 f.write("ENVIRONMENT VARIABLES:\n")
@@ -15686,6 +15804,7 @@ def create_mcp_server() -> MCPServer:
             env_vars=resolved_env_vars,
             timeout_sec=timeout_sec,
             preemptable=bool(preemptable),
+            hung_silence_sec=hung_silence_sec,
             log_file=job_log_file,
             queued_monotonic=time.monotonic(),
         )
@@ -15780,6 +15899,7 @@ def create_mcp_server() -> MCPServer:
             params.inherited_env,
             params.timeout_sec,
             params.no_timeout_except_on_contention,
+            params.hung_silence_sec,
         )
 
     @mcp.tool(
@@ -15824,6 +15944,7 @@ def create_mcp_server() -> MCPServer:
             params.inherited_env,
             params.timeout_sec,
             params.no_timeout_except_on_contention,
+            params.hung_silence_sec,
         )
         if "error" in result:
             return result
