@@ -481,6 +481,26 @@ def test_an_all_ones_chip_is_in_no_tray_row(held):
     assert sum(len(r["chips_present"]) for r in rows.values()) == EXPECTED - 1
 
 
+
+def test_a_dead_enumerated_tray_with_no_map_is_a_whole_tray(held, monkeypatch):
+    """Spec 03 I72: with no tray map banked, a tray whose chips read all-ones still has its KMD nodes;
+    hold_class reads the ladder's presence, so it is a whole tray off (A), not part of one (B2)."""
+    monkeypatch.setattr(srv.galaxy_recovery, "_tray_map_now", lambda: None)
+    held["dead"] = set(TRAY_CHIPS[0x40])
+    assert set(TRAY_CHIPS[0x40]) <= set(srv.chip_pci_bdfs())
+    assert _payload()["hold_class"] == "A"
+
+
+def test_a_link_down_tray_with_no_map_is_a_whole_tray(held, monkeypatch):
+    """A tray whose nodes linger with their links down and no heartbeat read is a whole tray off too."""
+    tray = set(TRAY_CHIPS[0x40])
+    monkeypatch.setattr(srv.galaxy_recovery, "_tray_map_now", lambda: None)
+    monkeypatch.setattr(srv, "chip_pci_bdfs", lambda: dict(enumerate(GALAXY_BUS_IDS)))
+    monkeypatch.setattr(srv, "link_down", lambda bdf: GALAXY_BUS_IDS.index(bdf) in tray)
+    held["off"] = tray
+    assert _payload()["hold_class"] == "A"
+
+
 # ---- the pure helpers ----------------------------------------------------------------------------
 
 
