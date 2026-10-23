@@ -481,7 +481,6 @@ def test_an_all_ones_chip_is_in_no_tray_row(held):
     assert sum(len(r["chips_present"]) for r in rows.values()) == EXPECTED - 1
 
 
-
 def test_a_dead_enumerated_tray_with_no_map_is_a_whole_tray(held, monkeypatch):
     """Spec 03 I72: with no tray map banked, a tray whose chips read all-ones still has its KMD nodes;
     hold_class reads the ladder's presence, so it is a whole tray off (A), not part of one (B2)."""

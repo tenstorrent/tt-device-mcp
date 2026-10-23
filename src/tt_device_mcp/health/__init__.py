@@ -77,7 +77,12 @@ from tt_device_mcp.health.monitors.heartbeat import (
 
 # The host-software version floors the startup preflight reports. Sysfs reads only, so the
 # preflight can assert them without spawning anything or touching a device.
-from tt_device_mcp.health.monitors.hostpci import CONFIG_UNREADABLE, hugepages_shortfall, link_down, version_floor_warnings
+from tt_device_mcp.health.monitors.hostpci import (
+    CONFIG_UNREADABLE,
+    hugepages_shortfall,
+    link_down,
+    version_floor_warnings,
+)
 
 # The tt-smi/sysfs telemetry-sampler primitives server.py's own polling loop runs directly.
 from tt_device_mcp.health.monitors.pci import (

@@ -663,7 +663,6 @@ async def test_a_tray_of_link_down_nodes_with_one_eio_survivor_is_class_a(rig, m
     assert ev["unreadable"] == [str(survivor)] and ev["off_bus"] == sorted(map(str, tray), key=int)
 
 
-
 @pytest.mark.asyncio
 async def test_an_enodata_tray_reading_ffff_is_class_a(rig, monkeypatch, tmp_path):
     """Spec 04 I24: a tray that lost power right after a reset reads ENODATA on bound endpoints with

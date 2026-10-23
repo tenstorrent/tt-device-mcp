@@ -282,7 +282,6 @@ def test_eio_chips_still_count_off_the_bus_for_the_rungs(monkeypatch, tmp_path):
     assert heartbeat.offbus_count(beats, EXPECTED) == 2
 
 
-
 # ---------------------------------------------------------------- ENODATA needs a live config read
 
 
