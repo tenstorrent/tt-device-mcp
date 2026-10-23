@@ -1960,7 +1960,8 @@ each rung fires only when the gentler one failed or cannot apply.
   Before the bound the SBR defaults do not change. A chip reading all-ones (isolated) is SBR'd. A
   chip gone from the bus (absent from two heartbeat reads, its PCIe node gone) is SBR'd only when
   `TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET` is set; by default it is left to the hold. A stalled chip
-  that still enumerates is on the bus and is never SBR'd: its bridge hosts live silicon.
+  that still enumerates is on the bus and is never SBR'd: its bridge hosts live silicon. It still arms
+  the off-bus one-shot (I96).
 
   At the 10-min bound (`escalate(..., bound=True)` from the I76 watchdog) every kept rung runs: PCI
   rescan, then SBR of the bridged off-bus chips. A chip is bridged when the rung has a bridge to write
@@ -2233,6 +2234,22 @@ each rung fires only when the gentler one failed or cannot apply.
   sit below their ports. A host with no recorded topology that starts with its chips off the bus
   has no port to rescan, so it loses the rescan rung (there is no global fallback) and goes on to
   the next rung.
+
+- **I96 — A below-floor off-bus hold arms the off-bus one-shot for every chip the gate counted off the
+  bus, isolated or not.** The one-shot (spec 03 I23) and the hold report's next-rung candidate key on
+  `isolated_chips | _offbus_hold_chips`. When the gate holds `BELOW_FLOOR` with chips off the bus, it
+  adds the chips it counted (`offbus_chip_ids`) to `_offbus_hold_chips`. Two holds that used to wait
+  for the 600 s bound now get the one-shot on its short clock: a chip that enumerates but whose
+  heartbeat read fails (not ENODATA), which is counted off the bus but never isolated, and any
+  off-bus chip of a hold a broker restart carried, whose new process starts with both sets empty (its
+  startup gate fills the set again). The set only arms the one-shot. It routes nothing: these chips are
+  not added to `isolated_chips`, so the bridge rung never SBRs an enumerated chip (I89). The set is
+  cleared when the hold episode closes. The one-shot's reset lifts the hold only through the full
+  post-reset check, fabric included (all cabled links); a failed check keeps the hold for the 10-min
+  ladder and then the power cycle (I76).
+
+  Time to recover (TTR): such a hold reaches its first reset one sampler tick after it opened (on a
+  tenant-free box), not at the 600 s bound. No other class changes.
 
 - **I77 — A killed holder stuck on a dead chip withholds every PCI re-enumeration and escalates in
   120 s (fault class `J-dead-chip-stuck-holder`).** The class: the dead-chip path (03 I19) killed a
@@ -2884,3 +2901,4 @@ sees a silent fabric pass.
 | I95 every rescan rung (reset path, bridge batch, bare rescan of dead chips, tray-down and below-floor), the bridge reset and the health probe write only the Tenstorrent root port; with none, each fails, writes nothing and does not latch | `tests/test_scoped_pci_rescan.py::test_every_rescan_rung_reaches_only_the_tenstorrent_root_port`, `::test_with_no_tenstorrent_root_port_every_rescan_rung_fails_without_a_global_write`, `::test_the_bridge_reset_rescans_only_the_tenstorrent_root_port`, `::test_a_bridge_reset_with_no_tenstorrent_root_port_fails_without_a_global_write`, `::test_the_health_probe_rescans_only_the_tenstorrent_root_port`, `::test_the_health_probe_with_no_tenstorrent_root_port_writes_nothing` |
 | I95 a remembered port is trusted only while no other device sits below it: one whose slot now holds a non-Tenstorrent function is skipped and journaled, alone or beside a Tenstorrent port; one with an empty subtree or only a bridge below is still rescanned | `tests/test_scoped_pci_rescan.py::test_a_remembered_port_whose_slot_now_holds_another_device_is_not_rescanned`, `::test_a_stale_remembered_port_is_skipped_while_the_tenstorrent_port_is_rescanned`, `::test_a_remembered_port_with_no_other_device_below_it_is_still_rescanned` |
 | I95 the 10-min ladder with the real rescan: scoped, and a failed rescan still climbs to the mesh reset, the full check and the power cycle without lifting the hold | `tests/test_scoped_pci_rescan.py::test_the_10_min_ladders_rescan_is_scoped_and_a_failed_one_still_reaches_the_power_cycle` |
+| I96 a below-floor hold on an enumerated chip with an unreadable heartbeat and nothing isolated runs the off-bus one-shot on the next sampler tick, also for a hold carried across a broker restart; the chip is never isolated or SBR'd, and the hold lifts only through the full post-reset check, fabric included | `tests/test_offbus_one_shot_unisolated.py::test_an_enumerated_dead_arc_chip_arms_the_one_shot_on_its_short_clock`, `::test_a_hold_carried_across_a_restart_arms_the_one_shot_for_its_dead_arc_chip` |
