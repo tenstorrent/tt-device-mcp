@@ -1194,6 +1194,7 @@ _recovery_deps = RecoveryDeps(
     chip_pci_bdf=lambda idx: chip_pci_bdf(idx),
     health_event=lambda kind, **f: health_event(kind, **f),
     kill_device_holders=lambda reason: _kill_device_holders(reason),
+    freeze_device_readers=lambda reason: _freeze_device_readers(reason),
     wait_device_released=lambda pids: wait_device_released(pids, HOLDER_RELEASE_WAIT_SEC),
     note_stuck_holders=lambda chips, killed, bdfs: _note_dead_chip_stuck_holders(chips, killed, bdfs),
     stuck_holder_pids=lambda: {f.pid for f in _dead_chip_stuck_leftovers()},
@@ -5841,6 +5842,34 @@ def _maybe_spawn_idle_holder_watch() -> None:
         return
     _idle_holder_last_scan = now
     _idle_holder_task = asyncio.create_task(_idle_holder_watch_pass())
+
+
+def _freeze_device_readers(reason: str) -> list:
+    """SIGSTOP the broker's own device readers (spec 03 I86): the fabric check's and the aiclk
+    ceiling's process groups. The dead-chip valve calls it the moment it confirms a chip off the
+    bus, before the PCI remove, so no further read of the mesh is issued while the remove runs.
+    A stop closes no fd, so the driver never reaches the still-attached chip, which a kill would
+    (spec 03 I84); the SIGKILL after the remove still ends them. A user job is not stopped here:
+    its fate is the valve's kill, unchanged. Returns the pids stopped. Never raises."""
+    stopped = []
+    for proc, who in (
+        (health_monitor.fabric_check_proc, "[broker]fabric-check"),
+        (CEILING.proc, "[broker]aiclk-ceiling"),
+    ):
+        if proc is None or getattr(proc, "returncode", None) is not None:
+            continue
+        try:
+            os.killpg(proc.pid, signal.SIGSTOP)
+            stopped.append({"pid": proc.pid, "user": who})
+        except (ProcessLookupError, OSError):
+            continue
+        if who == "[broker]fabric-check":
+            # A stopped run measures nothing either: no verdict, a full pass owed (spec 03 I82), even
+            # if the valve then refuses the kill and the probe's own timeout ends it.
+            health_monitor.note_fabric_check_killed(reason)
+    if stopped and logger:
+        logger.error(f"DEAD-CHIP stopped the broker's own device readers before the remove — {reason}: {stopped}")
+    return stopped
 
 
 async def _kill_device_holders(reason: str) -> list:

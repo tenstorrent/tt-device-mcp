@@ -250,9 +250,21 @@ _BDF = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$")
 def _uncorrectable_aer(dev: Path) -> Optional[int]:
     """Uncorrectable (non-fatal + fatal) AER errors the kernel has counted on one PCI function: its
     own ``aer_dev_nonfatal``/``aer_dev_fatal`` and, on a root port, the ``aer_rootport_total_err_*``
-    messages it received from below. None when no counter could be read. Correctable errors are
-    left out on purpose: they are routine on a healthy link and would arm the watch all day."""
+    messages it received from below, plus the one correctable row that is not link noise
+    (``NonFatalErr`` in ``aer_dev_correctable``: an Advisory Non-Fatal error, i.e. an uncorrectable
+    error the device downgraded, such as a completion timeout or an unsupported request). None when
+    no counter could be read. The other correctable rows (RxErr, BadTLP, Timeout, ...) are left
+    out on purpose: they are routine on a healthy link and would arm the watch all day. A chip that
+    stops answering with its reads in flight shows first as an Advisory Non-Fatal storm on the port
+    above it, often reported firmware-first, so this row is the earliest kernel signal of it."""
     total, seen = 0, False
+    try:
+        for line in (dev / "aer_dev_correctable").read_text().splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "NonFatalErr" and parts[1].isdigit():
+                total, seen = total + int(parts[1]), True
+    except OSError:
+        pass
     for name in ("aer_dev_nonfatal", "aer_dev_fatal"):
         p = dev / name
         if p.exists():
@@ -274,16 +286,19 @@ def link_signals() -> dict:
 
     ``chips`` is the KMD node list; ``aer`` covers each chip's endpoint and every port above it up
     to the root port, keyed by PCI address, so a link drop the port above a chip counted shows
-    even when the chip's own counters did not move (a vanished node is its own signal). Every value here is a counter the kernel keeps in memory:
+    even when the chip's own counters did not move (a vanished node is its own signal). ``paths``
+    maps each chip index to the addresses on its own path, endpoint first, so a rise can be pinned
+    to the chips below the port that counted it. Every value here is a counter the kernel keeps in memory:
     no read reaches a chip, a switch or a config space, which is what makes it safe to take every
     second while a chip may be dying (an access at a dead endpoint is what stalls a CPU core). The
     link-state attributes (``current_link_speed``/``width``) are config reads and stay out."""
     chips: list = []
     aer: dict = {}
+    paths: dict = {}
     try:
         entries = sorted(SYSFS_CLASS_DIR.iterdir())
     except OSError:
-        return {"chips": chips, "aer": aer}
+        return {"chips": chips, "aer": aer, "paths": paths}
     for ent in entries:
         idx = ent.name.rsplit("!", 1)[-1]
         if not idx.isdigit():
@@ -293,10 +308,13 @@ def link_signals() -> dict:
             dev = (ent / "device").resolve()
         except OSError:
             continue
-        while _BDF.match(dev.name) and dev.name not in aer:
-            aer[dev.name] = _uncorrectable_aer(dev)
+        path = paths.setdefault(idx, [])
+        while _BDF.match(dev.name):
+            path.append(dev.name)
+            if dev.name not in aer:
+                aer[dev.name] = _uncorrectable_aer(dev)
             dev = dev.parent
-    return {"chips": chips, "aer": aer}
+    return {"chips": chips, "aer": aer, "paths": paths}
 
 
 def chip_pci_bdf(idx: str) -> Optional[str]:
