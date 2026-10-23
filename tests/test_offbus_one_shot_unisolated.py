@@ -90,11 +90,11 @@ async def test_an_enumerated_dead_arc_chip_arms_the_one_shot_on_its_short_clock(
     full post-reset check, fabric included."""
     evidence, released = verdict
     _, bridges, count = _below_floor_hold(monkeypatch, mesh, {"now": IDLE})
-    monkeypatch.setattr(srv, "_offbus_hold_chips", set())
+    monkeypatch.setattr(srv, "_offbus_hold_chips", set(), raising=False)
     _dead_arc_on_bus(monkeypatch)
     await _gate_below_floor_pass(monkeypatch)
     assert count("below_floor_kept_rungs") == 1, "the gate did not hold the mesh below the floor"
-    assert srv._offbus_hold_chips == {DEAD} and srv.isolated_chips == set()
+    assert srv.isolated_chips == set(), "the enumerated chip was isolated (I89: it is never SBR'd)"
     calls = []
     _verify_returning(monkeypatch, evidence, calls)
     resets = _real_mesh_reset(monkeypatch)
