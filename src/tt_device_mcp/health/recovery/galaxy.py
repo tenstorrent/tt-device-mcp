@@ -13,6 +13,7 @@ import dataclasses
 import logging
 import math
 import os
+import signal
 import time
 from collections.abc import Mapping
 from datetime import datetime
@@ -1792,6 +1793,8 @@ class GalaxyRecovery(Recovery):
         heartbeat reads all-ones, so the SBR rung can reset them through their recorded bridge (spec 04
         I69, I89). The broker's own device readers are stopped first (spec 03 I86), and every remove is
         the one in-flight PCI write, all inside one DETACH budget. A remove that wedges stops the loop.
+        Once every remove worked the stopped readers are SIGKILLed, as after the valve's remove; after a
+        failed one they stay stopped until their own timeouts end them (spec 03 I86).
         Returns the chips removed; the rest are not reset, and the hold stands."""
         why = f"chip(s) {','.join(sorted(chips, key=int))} off the bus with their PCIe node present"
         if self.deps.isolate_chip is None:
@@ -1799,6 +1802,7 @@ class GalaxyRecovery(Recovery):
             health_event("below_floor_linkdown_isolated", context=context, chips=[], failed=sorted(chips, key=int))
             return []
         freeze = self.deps.freeze_device_readers
+        stopped: list = []
         if freeze is not None:
             try:
                 stopped = freeze(why)
@@ -1820,6 +1824,12 @@ class GalaxyRecovery(Recovery):
             if ok:
                 removed.append(c)
         failed = [c for c in sorted(chips, key=int) if c not in removed]
+        if not failed:
+            for reader in stopped or ():
+                try:
+                    os.killpg(reader["pid"], signal.SIGKILL)
+                except (ProcessLookupError, OSError, KeyError, TypeError):
+                    continue
         log(
             f"below-floor rungs ({context}): {why} — removed {removed or 'none'} for the SBR"
             + (f"; could not remove {failed}, not reset" if failed else "")

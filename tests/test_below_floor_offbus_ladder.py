@@ -18,6 +18,7 @@ Below the bound a forced run keeps its own path (the mesh reset, no rescan or SB
 once). No test reaches a real reset, setpci or power cycle."""
 
 import asyncio
+import signal
 import threading
 import time
 from datetime import datetime, timedelta
@@ -498,7 +499,8 @@ async def test_a_fabric_check_short_of_the_cabled_links_keeps_the_hold(
 def _dead_link(monkeypatch, tmp_path, order, how):
     """Chip 31's node is present (``_rig(enumerated=True)``) but its link reads down (``how`` "link")
     or its heartbeat reads all-ones (``how`` "all-ones"); ``how`` None arms only the hooks. Its remove is recorded in ``order`` after the
-    broker's readers are stopped, and makes it an isolated chip, as the real hook does."""
+    broker's readers are stopped, and makes it an isolated chip, as the real hook does. Returns the
+    reader process groups SIGKILLed."""
     if how == "link":
         (tmp_path / "pci" / "0000:5f:00.0" / "current_link_speed").write_text("Unknown\n")
     elif how == "all-ones":
@@ -509,7 +511,7 @@ def _dead_link(monkeypatch, tmp_path, order, how):
 
     def freeze(reason):
         order.append("readers stopped")
-        return [4242]
+        return [{"pid": 4242, "user": "[broker]fabric-check"}]
 
     def isolate(idx):
         assert order[-1] == "readers stopped", "no broker-owned reader may touch the chip at its remove"
@@ -519,6 +521,9 @@ def _dead_link(monkeypatch, tmp_path, order, how):
 
     monkeypatch.setattr(deps, "freeze_device_readers", freeze)
     monkeypatch.setattr(deps, "isolate_chip", isolate)
+    killed = []
+    monkeypatch.setattr(galaxy.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
+    return killed
 
 
 @pytest.mark.asyncio
@@ -527,8 +532,9 @@ async def test_a_dead_link_chip_with_its_node_present_is_isolated_then_sbrd_at_t
     monkeypatch, tmp_path, clear_job_state, how
 ):
     order, events, counters = _rig(monkeypatch, tmp_path, enumerated=True)
-    _dead_link(monkeypatch, tmp_path, order, how)
+    killed = _dead_link(monkeypatch, tmp_path, order, how)
     assert await _bound_ladder() == OUTCOME_TERMINAL
+    assert killed == [(4242, signal.SIGKILL)], "a reader stopped for the remove is ended once it worked"
     i = order.index("readers stopped")
     assert order[i : i + 3] == ["readers stopped", f"isolate {GONE}", f"sbr ['{GONE}']"]
     assert not any(o.startswith("sbr") for o in order[:i]), "never an SBR before the chip is removed"
@@ -540,9 +546,10 @@ async def test_a_dead_link_chip_with_its_node_present_is_isolated_then_sbrd_at_t
 @pytest.mark.asyncio
 async def test_a_dead_link_chip_whose_remove_fails_is_not_reset(monkeypatch, tmp_path, clear_job_state):
     order, _events, counters = _rig(monkeypatch, tmp_path, enumerated=True)
-    _dead_link(monkeypatch, tmp_path, order, "link")
+    killed = _dead_link(monkeypatch, tmp_path, order, "link")
     monkeypatch.setattr(srv.galaxy_recovery.deps, "isolate_chip", lambda idx: order.append("remove failed") and False)
     await _bound_ladder()
+    assert not killed, "a reader of a chip still attached stays stopped: its kill would reach the chip"
     assert not any(o.startswith("sbr") for o in order), "an SBR under a chip still bound would hit a live node"
     assert order[-1] == "power cycle" and counters["dirty_cleared"] == 0
 
