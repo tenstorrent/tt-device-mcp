@@ -1856,7 +1856,9 @@ class GalaxyRecovery(Recovery):
         """The gate's below-floor kept rungs (spec 04 I89), once per hold episode and off-bus set, then
         the full check with fabric. RECOVERED only on that check's pass; otherwise the hold stands and
         the I76 bound runs the full ladder at 10 min. Like the bridge rung, a runtime-reported fault is
-        kept: a rescan and an SBR re-init no eth core on the other chips."""
+        kept: a rescan and an SBR re-init no eth core on the other chips. An enumerated chip in
+        ``offbus_set`` (its heartbeat unreadable) is only rescanned, never SBR'd; the gate arms the
+        off-bus one-shot for it all the same (spec 04 I96), so its hold does not wait for the bound."""
         key = (hold_since, frozenset(offbus_set))
         prev = self._below_floor_rungs_key
         if prev == key:  # the same episode and off-bus set

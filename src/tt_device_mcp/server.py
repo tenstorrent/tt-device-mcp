@@ -1815,6 +1815,12 @@ exec_scope_seq: int = 0
 # to reset it through. Resolve the map up front or lose the chip for good.
 isolated_chips: set = set()
 device_pci_map: dict = {}
+# Spec 04 I96: the chips the gate's below-floor pass counted off the bus for the open hold. It arms
+# the off-bus one-shot like isolated_chips does, but routes nothing: an enumerated chip with a dead
+# ARC (its heartbeat read fails, not ENODATA) or a gone chip is never isolated, and adding it there
+# would SBR a chip I89 never SBRs. Filled again by the startup gate after a restart, which empties
+# both sets; cleared when the episode closes.
+_offbus_hold_chips: set = set()
 
 # Daemons that continuously poll every chip. They are stopped for the duration of
 # a reset: MMIO aimed at a chip that is mid-reset (or already dead) is what pushes
@@ -2812,6 +2818,7 @@ def _reset_for_testing():
     device_hold_offbus_tenant_wait = False
     device_hold_offbus_idle_early = False
     device_hold_offbus_prior_bucket = None
+    _offbus_hold_chips.clear()
     device_hold_tenant_deferred = False
     device_hold_job_bound_escalated = False
     device_hold_escalation_trigger = ""
@@ -4412,10 +4419,10 @@ def _hold_escalation_note(off_bus: int = 0) -> str:
             )
         if off_bus <= 0 and _disproven_lift_hold():
             return _DISPROVEN_LIFT_NOTE
-        if off_bus > 0 and isolated_chips:
+        if off_bus > 0 and _offbus_one_shot_chips():
             first = int(_offbus_one_shot_sec())
             return (
-                f"The off-bus ladder escalates in ~{first} s (isolated chips; "
+                f"The off-bus ladder escalates in ~{first} s (chips off the bus; "
                 f"{int(_offbus_hold_ceiling_sec())} s while a tenant holds the device) and again at each "
                 f"{ceiling_min}-min hold ceiling — do not plan around waiting the wedge out."
             )
@@ -5444,6 +5451,8 @@ async def _attempt_down_offbus_recheck() -> None:
                 beats = await asyncio.to_thread(_decision_heartbeats)
                 not_ready = await asyncio.to_thread(arc_not_ready_chips, beats)
                 off_bus = _offbus_count(beats, expected, not_ready)
+                # Spec 04 I96: a chip back on the bus no longer arms the off-bus one-shot.
+                _offbus_hold_chips.intersection_update(offbus_chip_ids(beats, expected, not_ready))
                 if off_bus > 0:
                     _log(f"DOWN off-bus hold: {off_bus}/{expected} chip(s) still off the bus — holding")
                     return
@@ -7536,6 +7545,14 @@ async def device_health_gate(
             # full ladder (spec 04 I76). There is no BMC tray re-power rung.
             if await _fire(BELOW_FLOOR):
                 return
+            if ev.off_bus > 0:
+                # Spec 04 I96: these chips arm the off-bus one-shot even when none is isolated (an
+                # enumerated chip with an unreadable heartbeat, or any chip after a broker restart).
+                # Read after the rungs: their rescan can bring a chip back, and a chip counted from the
+                # read before them would arm a reset for a chip that is on the bus again.
+                fresh = await asyncio.to_thread(_decision_heartbeats)
+                _offbus_hold_chips.clear()
+                _offbus_hold_chips.update(await asyncio.to_thread(offbus_chip_ids, fresh, expected))
             reset_floor = _galaxy_reset_min_dead_chips(expected)
             outage_held = mesh_reset_hold_reason() if dispatch_failed and ev.off_bus == 0 else ""
             # Under the outage hold no rung may reset this mesh, so name the held reset rather than
@@ -8180,7 +8197,7 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
         at_start = hold_report.RungCandidate(now_epoch, "forced ladder", "fabric link-short at-start ladder")
         if add(candidates, at_start, "fabric_link_short"):
             return done(candidates)  # due: the watchdog's chain stops at it
-    if isolated_chips and not device_hold_offbus_escalated:
+    if _offbus_one_shot_chips() and not device_hold_offbus_escalated:
         one_shot = started + _offbus_one_shot_sec()
         acts = add(
             candidates, hold_report.RungCandidate(one_shot, "forced ladder", "off-bus one-shot"), "offbus_one_shot"
@@ -8653,10 +8670,11 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         # ...and its own forced-escalation windows, and where the last one stood.
         device_hold_escalate_bucket = 0
         _note_escalation_stage("")
-        # ...and its own early off-bus attempt.
+        # ...and its own early off-bus attempt, and the chips that armed it (spec 04 I96).
         device_hold_offbus_escalated = False
         device_hold_offbus_prior_bucket = None
         device_hold_offbus_tenant_wait = False
+        _offbus_hold_chips.clear()
         device_hold_tenant_deferred = False
         # ...and its held-job bound's attempt.
         device_hold_job_bound_escalated = False
@@ -8760,6 +8778,12 @@ async def _force_escalate_stuck_hold() -> None:
             # Spec 03 I75, re-read under the lock after this run's reads: the re-adopted job can have
             # ended since the check before the lock. The ladder re-reads it at its tenant check too.
             _defer_to_startup_verify(kind, log)
+            return
+        if kind == "offbus_one_shot" and not bound and _offbus_one_shot_returned(beats, expected):
+            # Spec 04 I96: every chip that armed it is back on the bus. No reset for a chip that came
+            # back; the hold stands until the full check passes, and the 10-min bound's ladder still runs.
+            health_event("offbus_one_shot_dropped", reason="chips_returned", held_since=device_hold_episode_since)
+            log("off-bus one-shot dropped: the chips that armed it are back on the bus — no reset; the hold stays")
             return
         off_bus = _offbus_count(beats, expected)
         no_reset = "" if off_bus or isolated_chips or climb_77 else _fabric_no_reset_hold()
@@ -9479,20 +9503,36 @@ def _defer_to_startup_verify(kind: str, log, *, journaled: bool = False) -> None
     health_event("stuck_hold_deferred", mesh="present", forced=True, blocker="startup_verify")
 
 
+def _give_back_offbus_one_shot() -> None:
+    """Un-claim the off-bus one-shot: it may arm again, and the ceiling window it claimed as its own
+    run goes back with it. Kept, a hold whose chips came back before it ran (so no one-shot is retried)
+    waited out one more whole ceiling window."""
+    global device_hold_offbus_escalated, device_hold_escalate_bucket, device_hold_offbus_prior_bucket
+    device_hold_offbus_escalated = False
+    if device_hold_offbus_prior_bucket is not None:
+        device_hold_escalate_bucket = device_hold_offbus_prior_bucket
+        device_hold_offbus_prior_bucket = None
+
+
+def _offbus_one_shot_returned(beats: dict, expected: int) -> bool:
+    """Drop from ``_offbus_hold_chips`` every chip back on the bus by ``beats`` (spec 04 I96). True, with
+    the one-shot given back, when no chip is left to arm it: it then runs no reset. The hold itself is
+    untouched; only a passing full check lifts it."""
+    _offbus_hold_chips.intersection_update(offbus_chip_ids(beats, expected))
+    if _offbus_one_shot_chips():
+        return False
+    _give_back_offbus_one_shot()
+    return True
+
+
 def _rearm_tenant_deferred_window(kind: str) -> bool:
     """Give back the watchdog window a forced run claimed when it stood down on a live tenant and ran
     no rung (spec 03 I23): the next idle sampler tick retries it. Spending it left an off-bus hold
     waiting out the whole general ceiling once the tenant had gone. Only the one-shot and the ceiling
     windows are given back; the other kinds keep their own once-per-episode bookkeeping."""
-    global device_hold_offbus_escalated, device_hold_escalate_bucket, device_hold_tenant_deferred
-    global device_hold_offbus_prior_bucket
+    global device_hold_escalate_bucket, device_hold_tenant_deferred
     if kind == "offbus_one_shot":
-        device_hold_offbus_escalated = False
-        # The window the one-shot claimed as its own run goes back with it: kept, a hold whose chips
-        # came back meanwhile (no one-shot to retry) waited out one more whole ceiling window.
-        if device_hold_offbus_prior_bucket is not None:
-            device_hold_escalate_bucket = device_hold_offbus_prior_bucket
-            device_hold_offbus_prior_bucket = None
+        _give_back_offbus_one_shot()
     elif kind == "ceiling_window":
         device_hold_escalate_bucket = max(0, device_hold_escalate_bucket - 1)
     elif kind != "fabric_link_short":  # spec 04 I83: no ladder ran, so it is still due on the next tick
@@ -9605,6 +9645,12 @@ def _maybe_spawn_forced_escalation() -> bool:
         return False  # no event loop (the sampler always has one; a sync unit test may not) — nothing to spawn
     _forced_escalation_task = loop.create_task(_force_escalate_stuck_hold())
     return True
+
+
+def _offbus_one_shot_chips() -> set:
+    """The chips that arm the off-bus one-shot: the isolated ones and those the gate's below-floor pass
+    counted off the bus for this hold (spec 04 I96). Empty means no one-shot."""
+    return isolated_chips | _offbus_hold_chips
 
 
 def _offbus_one_shot_sec() -> float:
@@ -9771,7 +9817,7 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         _maybe_spawn_forced_escalation()
     elif only_77:
         pass
-    elif isolated_chips and not device_hold_offbus_escalated and age >= _offbus_one_shot_sec():
+    elif _offbus_one_shot_chips() and not device_hold_offbus_escalated and age >= _offbus_one_shot_sec():
         device_hold_escalation_kind = "offbus_one_shot"
         device_hold_escalation_trigger = f"the {int(_offbus_one_shot_sec())}s off-bus one-shot"
         device_hold_offbus_idle_early = not device_hold_offbus_tenant_wait and age < _offbus_hold_ceiling_sec()
