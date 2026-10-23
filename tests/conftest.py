@@ -591,6 +591,7 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     monkeypatch.setattr(srv, "device_fault_reported", "", raising=False)
     # Many tests assign srv.isolated_chips directly; a leaked chip makes a later hold not 77-only.
     monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.setattr(srv, "_offbus_hold_chips", set())
     # Spec 03 I66: the lost/recovering registry is process-wide; each test starts with none, and
     # publishes into its own tmp file, never /run.
     monkeypatch.setenv("TT_DEVICE_MCP_CHIP_STATE_FILE", str(tmp_dirs.mktemp("chipstate") / "chip-state.json"))
