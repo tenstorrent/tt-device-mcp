@@ -60,6 +60,9 @@ def valve(monkeypatch):
         srv, "enumerate_device_holders", lambda: HolderScan(holders=[DeviceHolder(pid=TENANT, uid=1000)], complete=True)
     )
     monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", _FakeProc())
+    # The other broker readers (spec 03 I86) start idle; a test of one sets it.
+    monkeypatch.setattr(srv.health_monitor, "snapshot_proc", None, raising=False)
+    monkeypatch.setattr(srv, "eth_selftest_proc", None, raising=False)
     monkeypatch.setattr(srv, "current_process", None)
     log = []
     detach_ok = {}

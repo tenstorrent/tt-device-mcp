@@ -10,18 +10,25 @@ the valve SIGSTOPs the fabric check and the aiclk ceiling before the PCI remove.
 the stopped fabric run is no verdict, so only a later full pass can lift it. No device is touched.
 """
 
+import json
 import signal
+import subprocess
+import sys
 
 import pytest
 
 import tests.test_deadchip_detach_before_kill as _detach
 import tests.test_offbus_early_watch as _early
+from tests.conftest import REAL_RUN_SNAPSHOT
 from tests.test_deadchip_detach_before_kill import FABRIC, TENANT
 from tests.test_offbus_early_watch import DEAD, LIVE
+from tests.test_reset import _snapshot
 from tt_device_mcp import server as srv
 from tt_device_mcp import telemetry
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import FABRIC_DEBT
+from tt_device_mcp.health import monitor as monitor_mod
+from tt_device_mcp.health.monitor import HealthMonitor
 from tt_device_mcp.health.monitors import pci
 
 valve = _detach.valve  # shared fixtures
@@ -148,3 +155,126 @@ async def test_after_the_abort_only_a_fresh_full_fabric_pass_lets_the_hold_lift(
     assert srv._hold_lift_unproven(), "the earlier pass no longer vouches for a lift"
     FABRIC_DEBT.note_fabric(True)  # a full pass with every cabled link, after recovery
     assert not FABRIC_DEBT.owed and srv._hold_lift_unproven() == ""
+
+
+@pytest.mark.asyncio
+async def test_an_aer_rise_just_after_a_reset_corroborates_no_first_sample(watch, monkeypatch):
+    """The reset's own errors can post a poll after it ends: such a rise leaves the I79 proof in place."""
+    s, clock, isolated, _ = watch
+    reads = iter([_sig(0), _sig(14), _sig(30)])
+    monkeypatch.setattr(srv, "link_signals", lambda: next(reads))
+    monkeypatch.setattr(srv.recovery_mechanism, "reset_in_flight", True)
+    await s.poll_link()
+    monkeypatch.setattr(srv.recovery_mechanism, "reset_in_flight", False)
+    clock.t += 2
+    await s.poll_link()
+    await s.check_for_dead_chips({"13": DEAD, "14": LIVE})
+    assert isolated == [] and s.aer_at == {}, "a rise inside POST_STEP_AER_QUIET_SEC isolates nothing at once"
+    clock.t += telemetry.POST_STEP_AER_QUIET_SEC
+    s.dead_chip_strikes.clear()
+    s.bad_since.clear()
+    await s.poll_link()
+    await s.check_for_dead_chips({"13": DEAD, "14": LIVE})
+    assert isolated == ["13"], "past the quiet window a real drop still isolates on the first sample"
+
+
+class _Reader:
+    def __init__(self, pid, returncode=None):
+        self.pid, self.returncode = pid, returncode
+
+
+SNAPSHOT, ETH = 7001, 7002
+
+
+@pytest.mark.asyncio
+async def test_drop_during_the_snapshot_stops_it_before_the_remove_and_kills_it_after(valve, monkeypatch):
+    log, _ = valve
+    monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", None)
+    monkeypatch.setattr(srv.health_monitor, "snapshot_proc", _Reader(SNAPSHOT), raising=False)
+    monkeypatch.setattr(FABRIC_DEBT, "owed", "")
+    await srv.sampler.isolate_dead_chips(["13"])
+    assert log.index(("stop", SNAPSHOT)) < log.index(("detach", "13")) < log.index(("kill", SNAPSHOT)), log
+    assert FABRIC_DEBT.owed, "the full check it belonged to is no verdict: a full pass is owed"
+
+
+@pytest.mark.asyncio
+async def test_drop_during_the_eth_selftest_stops_it_before_the_remove_and_kills_it_after(valve, monkeypatch):
+    log, _ = valve
+    monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", None)
+    monkeypatch.setattr(srv, "eth_selftest_proc", _Reader(ETH), raising=False)
+    await srv.sampler.isolate_dead_chips(["13"])
+    assert log.index(("stop", ETH)) < log.index(("detach", "13")) < log.index(("kill", ETH)), log
+
+
+@pytest.mark.asyncio
+async def test_finished_snapshot_and_eth_selftest_are_not_signalled(valve, monkeypatch):
+    log, _ = valve
+    monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", None)
+    monkeypatch.setattr(srv.health_monitor, "snapshot_proc", _Reader(SNAPSHOT, 0), raising=False)
+    monkeypatch.setattr(srv, "eth_selftest_proc", _Reader(ETH, 0), raising=False)
+    monkeypatch.setattr(FABRIC_DEBT, "owed", "")
+    await srv.sampler.isolate_dead_chips(["13"])
+    assert not [e for e in log if e[1] in (SNAPSHOT, ETH)], log
+    assert not FABRIC_DEBT.owed
+
+
+def test_a_snapshot_the_valve_stopped_mid_run_gives_no_pass(valve, monkeypatch):
+    """Its later exit 0 with every chip listed measured nothing: no pass, the hold's debt stays."""
+    monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", None)
+    monkeypatch.setattr(FABRIC_DEBT, "owed", "")
+
+    def run(self, argv, timeout_sec):
+        self.snapshot_proc = _Reader(SNAPSHOT)
+        srv._freeze_device_readers("chip(s) 13 fell off the PCIe bus")
+        self.snapshot_proc = None
+        return subprocess.CompletedProcess(argv, 0, json.dumps(_snapshot(2)), "")
+
+    monkeypatch.setattr(HealthMonitor, "_run_snapshot", run, raising=False)
+    ok, detail = srv.health_monitor._verify_device_health_body(2)
+    assert ok is False and "no verdict" in detail, detail
+    assert FABRIC_DEBT.owed
+
+
+def test_the_snapshot_runs_tracked_in_its_own_session_and_a_timeout_ends_it(monkeypatch):
+    m = srv.health_monitor
+    seen = {}
+
+    real_popen = subprocess.Popen
+
+    def popen(argv, **k):
+        p = real_popen(argv, **k)
+        seen["session"] = k.get("start_new_session")
+        return p
+
+    monkeypatch.setattr(monitor_mod.subprocess, "Popen", popen)
+    done = REAL_RUN_SNAPSHOT(m, [sys.executable, "-c", "print('ok')"], 30)
+    assert done.returncode == 0 and done.stdout.strip() == "ok"
+    assert seen["session"] is True and m.snapshot_proc is None
+    with pytest.raises(subprocess.TimeoutExpired):
+        REAL_RUN_SNAPSHOT(m, [sys.executable, "-c", "import time; time.sleep(30)"], 0.2)
+    assert m.snapshot_proc is None
+
+
+@pytest.mark.asyncio
+async def test_an_eth_selftest_the_valve_stopped_mid_run_arms_nothing(valve, monkeypatch):
+    """Its exit 0 measured nothing: the rung stays off and retryable, and no frozen core is claimed."""
+    monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", None)
+    monkeypatch.delenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", raising=False)
+    monkeypatch.setenv("TTDEV_ETH_CHECK_ARMED", "")
+    monkeypatch.delenv("TTDEV_ETH_CHECK_ARMED")
+    monkeypatch.setattr(srv, "eth_check_armed", False)
+    monkeypatch.setattr(srv.eth, "build", lambda: (["eth-read"], {}))
+
+    class _Proc(_Reader):
+        async def communicate(self):
+            srv._freeze_device_readers("chip(s) 13 fell off the PCIe bus")
+            self.returncode = 0
+            return b"all eth cores advancing\n", None
+
+    async def spawn(*argv, **k):
+        return _Proc(ETH)
+
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", spawn)
+    assert await srv.selftest_eth_heartbeat() == ""
+    assert srv.eth_check_armed is False and "dead-chip isolation" in srv.eth_check_disarm_reason
+    assert srv.eth_rearm_retryable and srv.eth_selftest_proc is None

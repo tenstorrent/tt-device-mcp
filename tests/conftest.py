@@ -31,6 +31,7 @@ from tt_device_mcp.health import bmc_capture, post_reset
 from tt_device_mcp.health import evidence as health
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.core import HealthState
+from tt_device_mcp.health.monitor import HealthMonitor
 from tt_device_mcp.health.monitors import eth, heartbeat, pci
 from tt_device_mcp.health.recovery import RecoveryDeps, offbus_power_cycle, pcie_guard
 from tt_device_mcp.health.recovery import base as recovery_base
@@ -798,7 +799,21 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     if getattr(srv, "galaxy_recovery", None) is not None:
         srv.galaxy_recovery.tray_down_episode_end()
 
+    # The full check's tt-smi snapshot runs tracked, in its own session (spec 03 I86). The suite's
+    # snapshot fakes stand in for `subprocess.run`, so here the runner delegates to it; the I86 tests
+    # of the tracked runner itself restore the real one (REAL_RUN_SNAPSHOT).
+    monkeypatch.setattr(
+        HealthMonitor,
+        "_run_snapshot",
+        lambda self, argv, timeout_sec: subprocess.run(argv, capture_output=True, text=True, timeout=timeout_sec),
+        raising=False,
+    )
+
     _install_spawn_tripwire(monkeypatch, allow_device_spawns=device_marked)
+
+
+# The tracked snapshot runner the fixture above swaps out (spec 03 I86).
+REAL_RUN_SNAPSHOT = getattr(HealthMonitor, "_run_snapshot", None)
 
 
 # Programs no test may ever hand to the kernel, marker or not: they power-cycle the box, reboot

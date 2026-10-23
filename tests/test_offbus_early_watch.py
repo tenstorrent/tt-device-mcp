@@ -49,6 +49,7 @@ def watch(monkeypatch):
     monkeypatch.setattr(s, "dead_chip_strikes", {})
     monkeypatch.setattr(s, "aer_at", {})
     monkeypatch.setattr(s, "_aer_rose_chips", [])
+    monkeypatch.setattr(s, "_step_seen_at", None, raising=False)
     monkeypatch.setattr(s, "all_chips_gone_strikes", 0)
     monkeypatch.setattr(s, "short_count_strikes", 0)
     monkeypatch.setattr(srv.recovery_mechanism, "reset_in_flight", False)

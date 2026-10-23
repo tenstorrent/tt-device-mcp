@@ -43,6 +43,11 @@ FAST_SAMPLE_SEC = 2.0
 FAST_WINDOW_SEC = 30.0
 FAST_MAX_SEC = 60.0
 FAST_CONFIRM_SEC = 4.0
+# Spec 03 I86: an AER rise read this soon after a reset or recovery step last owned the chips
+# corroborates no all-ones read. The firmware-first (GHES) path can post the step's own errors a
+# poll or two after it ends; such a rise still arms the fast cadence, and a real drop in the window
+# is proved by I79's FAST_CONFIRM_SEC instead of the first sample.
+POST_STEP_AER_QUIET_SEC = 5.0
 
 # Spec 03 I83's cut after a failed POST_RESET: all PCI removes together get at most this long (a
 # remove behind a hung endpoint can block in the kernel for good; nobody is killed then), and the
@@ -245,6 +250,7 @@ class TelemetrySampler:
         # outside any reset, and the chips the latest link_signals read pinned a rise to.
         self.aer_at: dict = {}
         self._aer_rose_chips: list = []
+        self._step_seen_at: Optional[float] = None
 
     def tick(self) -> None:
         self.last_tick = time.monotonic()
@@ -385,12 +391,14 @@ class TelemetrySampler:
         if self._mechanism.reset_in_flight or self.scope_seen or chip_state.recovering():
             # A rise from before or during the step corroborates nothing after it (I86).
             self.aer_at.clear()
+            self._step_seen_at = self._clock()
             return False
         if reason is None:
             return False
         now = self._clock()
-        for idx in self._aer_rose_chips:
-            self.aer_at[idx] = now
+        if self._step_seen_at is None or now - self._step_seen_at > POST_STEP_AER_QUIET_SEC:
+            for idx in self._aer_rose_chips:
+                self.aer_at[idx] = now
         return self.arm_fast(reason)
 
     async def wait_for_next_sample(self) -> None:
