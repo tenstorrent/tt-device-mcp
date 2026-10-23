@@ -10,9 +10,9 @@ the bound they are no tenants: the broker skips the ladder (whose reset would ki
 power cycle, still killing nobody. A tenant the valve never refused still blocks, and no lift happens
 without a just-passed full check with fabric. No process is spawned and no device touched."""
 
+import signal
 from datetime import datetime
 
-import signal
 import pytest
 
 from tests.conftest import fsm_dirty

@@ -1343,9 +1343,11 @@ cooldown (spec 04 I65) holds longer.
 - **I79 The sampler watches the kernel's PCIe error record between samples and samples sooner
   when it moves.** Every `LINK_WATCH_SEC` (1 s) between samples the sampler reads
   `link_signals()`: the KMD chip node list and the uncorrectable AER counters (`aer_dev_nonfatal`,
-  `aer_dev_fatal`, `aer_rootport_total_err_nonfatal`/`_fatal`) of every chip's endpoint and every
-  port above it up to the root port. These are kernel memory: no read reaches a chip, switch or
-  config space. Correctable counters are left out (routine on a healthy link). A rise in any
+  `aer_dev_fatal`, `aer_rootport_total_err_nonfatal`/`_fatal`, plus the `NonFatalErr` row of
+  `aer_dev_correctable`, an Advisory Non-Fatal error: an uncorrectable error the device downgraded,
+  such as a completion timeout, I86) of every chip's endpoint and every port above it up to the
+  root port. These are kernel memory: no read reaches a chip, switch or config space. The other
+  correctable rows are left out (routine on a healthy link). A rise in any
   counter, or a chip node that left sysfs, arms a fast cadence: the next sample comes
   `FAST_SAMPLE_SEC` (2 s) after the last one began (at once if that is already past), and samples
   stay `FAST_SAMPLE_SEC` apart until `FAST_WINDOW_SEC` (30 s) after the last signal. Only the
@@ -1604,6 +1606,29 @@ cooldown (spec 04 I65) holds longer.
   power-cycles and releases nothing, moves no escalation clock, and leaves time to recover as it
   was; only a just-passed full check with fabric lifts the hold. The stage clears with the episode
   (a new episode or the release). The jobs-list hold row keeps the name it opened with.
+
+- **I86 — A chip that leaves the bus with reads in flight stops the broker's own readers at once.**
+  `link_signals()` also returns each chip's own path (endpoint first, up to the root port), so a
+  counter rise is pinned to the chips below the port that counted it; a rise while a reset or
+  recovery step owns the chips (I66) records nothing. When a chip reads all-ones on a sample within
+  `FAST_WINDOW_SEC` of a rise on its own path, that one sample confirms it (journal
+  `offbus_aer_confirmed`): the AER rise is the corroboration the second sample would give, and the
+  second sample is up to `SAMPLE_INTERVAL_SEC` more of reads at an endpoint that no longer answers,
+  which is what stalls a core. A rise on another chip's path, a rise older than `FAST_WINDOW_SEC`,
+  or a rise with every chip answering confirms nothing; without a rise I79's confirm bound and the
+  two-sample proof are unchanged. The valve (I84), before the first PCI remove, SIGSTOPs the
+  process groups of the broker's own device readers that are still running, the fabric check and
+  the aiclk ceiling helper (journal `device_readers_stopped`): a stop issues no further read and
+  closes no fd, so it is safe while the chip is still attached; the kill after a successful remove
+  ends them as before, and a refused kill leaves them stopped until the hold's recovery. The
+  pollers stop as in I84. A stopped fabric run is no verdict (I82): it is marked killed, owes a full
+  pass and drops the last pass's vouching, so the hold never lifts on it; only a just-passed full
+  check with fabric on all cabled links lifts it (I78). A user job is not stopped here: its
+  handling is I84's kill, unchanged. Recovery class is unchanged: a partial drop keeps the hold's
+  ladder (full ladder at 10 min, then the power cycle, spec 04 I76); a whole-tray or all-chips-off
+  drop keeps its path straight to the power cycle after the cooldown (I19, I65). Time to detach,
+  first all-ones read with a rise on the chip's path: that sample (was one more sample, 10 s, or
+  `FAST_CONFIRM_SEC` under the fast cadence); the stop precedes the remove.
 
 ## Interfaces
 
@@ -2306,6 +2331,7 @@ refuses.
 | I84 | `tests/test_deadchip_detach_before_kill.py::test_every_kill_and_poller_stop_comes_after_the_detach`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_detach_kills_nobody_and_keeps_the_hold`, `tests/test_deadchip_detach_before_kill.py::test_one_failed_detach_of_two_kills_nobody`, `tests/test_deadchip_detach_before_kill.py::test_with_no_detach_wired_nobody_is_killed`, `tests/test_deadchip_detach_before_kill.py::test_a_hung_detach_is_bounded_and_the_loop_stays_responsive`, `tests/test_deadchip_detach_before_kill.py::test_a_reset_that_started_before_the_kill_keeps_every_holder`, `tests/test_deadchip_detach_before_kill.py::test_another_all_ones_chip_not_yet_detached_defers_the_kill_to_its_own_valve`, `tests/test_deadchip_detach_before_kill.py::test_a_chip_whose_earlier_detach_failed_blocks_every_later_kill`, `tests/test_deadchip_detach_before_kill.py::test_the_broker_never_signals_itself`, `tests/test_deadchip_detach_before_kill.py::test_the_first_all_ones_sample_leaves_the_poller_stop_to_the_detach`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_or_timed_out_detach_stops_the_pollers_once_and_kills_nobody`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_remove_beside_an_untried_chip_stops_the_pollers_on_the_next_sample`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_remove_under_a_live_reset_leaves_the_poller_stop_to_the_reset` |
 | I84 a refusal's holders reach the power cycle at the I76 bound; the record lifts nothing and only a passing full check with fabric clears it | `tests/test_deadchip_refused_bound.py::test_a_refused_holder_gets_the_power_cycle_at_the_bound`, `tests/test_deadchip_refused_bound.py::test_the_refusal_record_lifts_nothing_and_only_a_passing_full_check_clears_it` |
 | I85 | `tests/test_hold_escalation_status.py::test_a_fresh_hold_names_the_watchdogs_own_next_rung`, `tests/test_hold_escalation_status.py::test_the_ten_minute_mark_and_the_cooldown_come_from_the_broker_clocks`, `tests/test_hold_escalation_status.py::test_each_logged_step_moves_the_stage`, `tests/test_hold_escalation_status.py::test_a_power_cycle_request_is_read_from_disk_and_survives_a_restart`, `tests/test_hold_escalation_status.py::test_another_episodes_power_cycle_is_not_this_ones`, `tests/test_hold_escalation_status.py::test_the_bound_ladder_ran_before_a_restart`, `tests/test_hold_escalation_status.py::test_a_running_ladder_and_a_tenant_say_so`, `tests/test_hold_escalation_status.py::test_reading_it_moves_no_clock`, `tests/test_hold_escalation_status.py::test_the_hold_row_keeps_its_name`, `tests/test_hold_escalation_status.py::test_a_new_episode_and_the_release_clear_the_stage`, `tests/test_hold_escalation_status.py::test_not_held_reports_no_escalation`, `tests/test_hold_escalation_status.py::test_a_forced_pass_updates_the_stage_and_keeps_the_hold` |
+| I86 | `tests/test_offbus_abort_readers.py::test_link_signals_counts_advisory_nonfatal_and_names_each_chip_path`, `tests/test_offbus_abort_readers.py::test_an_aer_rise_on_the_chips_path_confirms_on_the_first_all_ones_sample`, `tests/test_offbus_abort_readers.py::test_no_false_trigger_from_another_path_a_stale_rise_aer_alone_or_a_reset`, `tests/test_offbus_abort_readers.py::test_drop_during_the_fabric_check_stops_it_before_the_remove_and_keeps_the_hold`, `tests/test_offbus_abort_readers.py::test_drop_during_a_hold_escalation_check_stops_it_and_the_hold_stays`, `tests/test_offbus_abort_readers.py::test_drop_during_the_aiclk_ceiling_stops_it_before_the_remove`, `tests/test_offbus_abort_readers.py::test_a_finished_reader_is_not_signalled`, `tests/test_offbus_abort_readers.py::test_after_the_abort_only_a_fresh_full_fabric_pass_lets_the_hold_lift` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

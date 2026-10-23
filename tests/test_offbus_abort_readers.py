@@ -14,13 +14,18 @@ import signal
 
 import pytest
 
-from tests.test_deadchip_detach_before_kill import FABRIC, TENANT, valve  # noqa: F401 - fixture
-from tests.test_offbus_early_watch import DEAD, LIVE, watch  # noqa: F401 - fixture
+import tests.test_deadchip_detach_before_kill as _detach
+import tests.test_offbus_early_watch as _early
+from tests.test_deadchip_detach_before_kill import FABRIC, TENANT
+from tests.test_offbus_early_watch import DEAD, LIVE
 from tt_device_mcp import server as srv
 from tt_device_mcp import telemetry
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import FABRIC_DEBT
 from tt_device_mcp.health.monitors import pci
+
+valve = _detach.valve  # shared fixtures
+watch = _early.watch
 
 PATHS = {"13": ["0000:02:00.0", "0000:00:01.1"], "14": ["0000:03:00.0", "0000:00:01.2"]}
 
@@ -93,7 +98,7 @@ async def test_drop_during_the_fabric_check_stops_it_before_the_remove_and_keeps
 async def test_drop_during_a_hold_escalation_check_stops_it_and_the_hold_stays(valve, monkeypatch):
     log, detach_ok = valve
     monkeypatch.setattr(FABRIC_DEBT, "owed", "")
-    srv.mark_device_dirty("an open hold under escalation", why="heartbeat")
+    srv._mark_device_dirty("an open hold under escalation", why="heartbeat")
     detach_ok["13"] = False  # the remove fails: nobody is killed, the readers stay stopped
     sent = []
     monkeypatch.setattr(srv.os, "killpg", lambda pid, sig: sent.append((pid, sig)))
@@ -101,3 +106,45 @@ async def test_drop_during_a_hold_escalation_check_stops_it_and_the_hold_stays(v
     assert sent[0] == (FABRIC, signal.SIGSTOP) and (FABRIC, signal.SIGKILL) not in sent
     assert srv.fsm.state is not ServerState.HEALTHY
     assert FABRIC_DEBT.owed
+
+
+class _Ceiling:
+    pid = 4242
+    returncode = None
+
+
+@pytest.mark.asyncio
+async def test_drop_during_the_aiclk_ceiling_stops_it_before_the_remove(valve, monkeypatch):
+    log, _ = valve
+    monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", None)
+    monkeypatch.setattr(srv.CEILING, "proc", _Ceiling())
+    await srv.sampler.isolate_dead_chips(["13"])
+    assert log.index(("stop", _Ceiling.pid)) < log.index(("detach", "13")), log
+    assert ("pollers", False) in log, "telemetry and health probes stop reading too"
+
+
+@pytest.mark.asyncio
+async def test_a_finished_reader_is_not_signalled(valve, monkeypatch):
+    log, _ = valve
+    done = _Ceiling()
+    done.returncode = 0
+    monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", None)
+    monkeypatch.setattr(srv.CEILING, "proc", done)
+    monkeypatch.setattr(FABRIC_DEBT, "owed", "")
+    await srv.sampler.isolate_dead_chips(["13"])
+    assert ("stop", _Ceiling.pid) not in log
+    assert not FABRIC_DEBT.owed, "no fabric run was stopped, so none is marked killed"
+
+
+@pytest.mark.asyncio
+async def test_after_the_abort_only_a_fresh_full_fabric_pass_lets_the_hold_lift(valve, monkeypatch):
+    """Goal 11: the stopped run is no verdict; the hold lifts only on a full pass that came after it."""
+    monkeypatch.setattr(FABRIC_DEBT, "owed", "")
+    monkeypatch.setattr(FABRIC_DEBT, "runs_here", lambda expected: True)
+    FABRIC_DEBT.note_fabric(True)  # a pass from before the drop
+    srv._mark_device_dirty("chip(s) 13 fell off the PCIe bus", why="heartbeat")
+    await srv.sampler.isolate_dead_chips(["13"])
+    assert srv.fsm.state is not ServerState.HEALTHY
+    assert srv._hold_lift_unproven(), "the earlier pass no longer vouches for a lift"
+    FABRIC_DEBT.note_fabric(True)  # a full pass with every cabled link, after recovery
+    assert not FABRIC_DEBT.owed and srv._hold_lift_unproven() == ""

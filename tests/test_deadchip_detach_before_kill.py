@@ -65,7 +65,9 @@ def valve(monkeypatch):
     detach_ok = {}
     monkeypatch.setattr(srv, "isolate_chip", lambda idx: log.append(("detach", idx)) or detach_ok.get(idx, True))
     monkeypatch.setattr(srv.os, "kill", lambda pid, sig: log.append(("kill", pid)))
-    monkeypatch.setattr(srv.os, "killpg", lambda pid, sig: log.append(("stop" if sig == signal.SIGSTOP else "kill", pid)))
+    monkeypatch.setattr(
+        srv.os, "killpg", lambda pid, sig: log.append(("stop" if sig == signal.SIGSTOP else "kill", pid))
+    )
 
     async def pollers(active, _log):
         log.append(("pollers", active))
@@ -113,7 +115,10 @@ async def test_a_failed_detach_kills_nobody_and_keeps_the_hold(valve):
     detach_ok["13"] = False
     await srv.sampler.isolate_dead_chips(["13"])
 
-    assert _acts(log) == [("detach", "13"), ("pollers", False)], f"a kill, or no poller stop after the failed remove: {log}"
+    assert _acts(log) == [
+        ("detach", "13"),
+        ("pollers", False),
+    ], f"a kill, or no poller stop after the failed remove: {log}"
     refused = _refusals()
     assert refused and refused[-1]["reason"] == "detach_failed"
     assert refused[-1]["chips"] == ["13"] and refused[-1]["host_at_risk"] is True
