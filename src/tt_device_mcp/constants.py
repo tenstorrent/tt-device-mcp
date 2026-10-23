@@ -68,6 +68,18 @@ HOLDER_RELEASE_WAIT_SEC = 30
 # is expected to see the waiter in the queue and end itself. No signal is sent inside it.
 PREEMPT_GRACE_SEC = 60
 
+# A job may ask for its own silence limit at submit (hung_silence_sec), within these bounds. The
+# upper one keeps a wedged job that asked for a long limit from holding the device for more than
+# an hour; the lower one keeps a job from being reaped (and the device reset) on a normal pause.
+HUNG_SILENCE_MIN_SEC = 60
+HUNG_SILENCE_MAX_SEC = 3600
+# Storage IO by the job's processes (read_bytes/write_bytes in /proc/<pid>/io) counts as liveness:
+# a silent job still reading a model or writing a cache is working. CPU time does not count: a
+# tt-metal host process busy-polls a hung device, and counting it would keep exactly the jobs
+# this reaper exists for. IO without output is believed only this long (or the job's own limit,
+# if longer): a job that loops on IO without ever printing is still reaped.
+HUNG_IO_CAP_SEC = 1800
+
 # Once the grace minute is spent, the job's whole process tree gets SIGTERM and, at most this
 # much later, SIGKILL: 10 s for its handlers to release the device. The job already had its
 # minute to end itself. A tree that all exits through its own code on SIGTERM inside it gets the

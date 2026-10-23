@@ -38,6 +38,9 @@ from tt_device_mcp import __version__
 from tt_device_mcp.constants import (
     DEFAULT_PORT,
     DEFAULT_SOCKET,
+    HUNG_IO_CAP_SEC,
+    HUNG_SILENCE_MAX_SEC,
+    HUNG_SILENCE_MIN_SEC,
     POST_STEP_DEADLINE_DEFAULT_SEC,
     POST_STEP_DEADLINE_ENV,
     PRE_STEP_DEADLINE_DEFAULT_SEC,
@@ -334,6 +337,7 @@ def cmd_run(args) -> int:
             "inherited_env": inherited_env,
             "timeout_sec": timeout,
             "no_timeout_except_on_contention": bool(getattr(args, "preemptable", False)),
+            "hung_silence_sec": getattr(args, "hung_silence", None),
         },
     )
 
@@ -420,6 +424,7 @@ def cmd_run_bg(args) -> int:
             "inherited_env": inherited_env,
             "timeout_sec": timeout,
             "no_timeout_except_on_contention": bool(getattr(args, "preemptable", False)),
+            "hung_silence_sec": getattr(args, "hung_silence", None),
         },
     )
 
@@ -1746,6 +1751,12 @@ _NO_TIMEOUT_HELP = (
     f"PREEMPTABLE <x>min, then PREEMPTING <s>s. You MUST watch the broker (tt-device-mcp status)."
 )
 
+_HUNG_SILENCE_HELP = (
+    f"This job's hung limit in seconds ({HUNG_SILENCE_MIN_SEC}-{HUNG_SILENCE_MAX_SEC}; default: the "
+    f"host's, 300 unless changed): reaped as hung after this long with neither output nor storage IO. "
+    f"Storage IO keeps a silent job for at most {HUNG_IO_CAP_SEC}s (or this limit, if longer); CPU use never does."
+)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(
@@ -1791,6 +1802,7 @@ Examples:
         action="store_true",
         help=_NO_TIMEOUT_HELP,
     )
+    run_parser.add_argument("--hung-silence", type=int, default=None, metavar="SEC", help=_HUNG_SILENCE_HELP)
     run_parser.add_argument(
         "-o", "--output-lines", type=int, default=0, help="Show last N lines summary at end (default: 0 = no summary)"
     )
@@ -1822,6 +1834,7 @@ Examples:
         action="store_true",
         help=_NO_TIMEOUT_HELP,
     )
+    run_bg_parser.add_argument("--hung-silence", type=int, default=None, metavar="SEC", help=_HUNG_SILENCE_HELP)
 
     status_parser = subparsers.add_parser(
         "status", help="[N] [-j ID]  — queue + last N recent (all users, default 15); -j for one job's detail"
