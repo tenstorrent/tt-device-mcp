@@ -4177,6 +4177,7 @@ async def selftest_eth_heartbeat() -> str:
                 env=env,
                 preexec_fn=os.setsid,
             )
+            note_broker_internal(proc.pid)  # its own session: never read as a tenant (spec 04 I59)
             eth_selftest_proc = proc
             out, _ = await aio.wait_for(proc.communicate(), timeout=ETH_CHECK_SELFTEST_BUDGET_SEC)
             rc = proc.returncode

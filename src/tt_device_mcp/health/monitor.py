@@ -31,6 +31,7 @@ from tt_device_mcp.constants import (
     FABRIC_CHECK_HARDWARE_FAULT_RC,
     FABRIC_CHECK_TIMEOUT_SEC,
 )
+from tt_device_mcp.device_holders import note_broker_internal
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.core import HealthState, Observation, Verdict
 from tt_device_mcp.health.evidence import capture_incident, health_dir, health_event
@@ -987,6 +988,9 @@ class HealthMonitor:
         remove and SIGKILL it after (spec 03 I86). Raises TimeoutExpired as run does, after killing
         the group."""
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        # Its own session takes it out of the broker's process group: register it, or a holder scan
+        # reads the broker's own snapshot as a tenant (spec 04 I59).
+        note_broker_internal(proc.pid)
         self.snapshot_proc = proc
         try:
             try:

@@ -11,6 +11,7 @@ the stopped fabric run is no verdict, so only a later full pass can lift it. No 
 """
 
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -23,8 +24,9 @@ from tests.conftest import REAL_RUN_SNAPSHOT
 from tests.test_deadchip_detach_before_kill import FABRIC, TENANT
 from tests.test_offbus_early_watch import DEAD, LIVE
 from tests.test_reset import _snapshot
+from tt_device_mcp import device_holders, telemetry
 from tt_device_mcp import server as srv
-from tt_device_mcp import telemetry
+from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import FABRIC_DEBT
 from tt_device_mcp.health import monitor as monitor_mod
@@ -255,6 +257,68 @@ def test_the_snapshot_runs_tracked_in_its_own_session_and_a_timeout_ends_it(monk
     assert m.snapshot_proc is None
 
 
+def _live_snapshot(monkeypatch, during):
+    """Run the real full-check body on a real child in its own session; ``during(proc)`` runs mid-run,
+    while the child is alive and the body waits on it."""
+    m = srv.health_monitor
+    monkeypatch.setattr(HealthMonitor, "_run_snapshot", REAL_RUN_SNAPSHOT, raising=False)
+    monkeypatch.setattr(m, "fabric_check_proc", None)
+    monkeypatch.setattr(m, "snapshot_proc", None, raising=False)
+    monkeypatch.setattr(srv, "eth_selftest_proc", None, raising=False)
+    monkeypatch.setattr(srv.CEILING, "proc", None)
+    monkeypatch.setattr(FABRIC_DEBT, "owed", "")
+    real_popen = subprocess.Popen
+
+    def popen(argv, **k):
+        p = real_popen([sys.executable, "-c", "import time; time.sleep(30)"], **k)
+        real_communicate = p.communicate
+
+        def communicate(timeout=None):
+            if not getattr(p, "_seen", False):
+                p._seen = True
+                during(p)
+            return real_communicate(timeout=timeout)
+
+        p.communicate = communicate
+        return p
+
+    monkeypatch.setattr(monitor_mod.subprocess, "Popen", popen)
+    return m._verify_device_health_body(2, timeout_sec=20)
+
+
+def test_a_live_snapshot_is_tracked_so_the_valve_stops_and_kills_it(monkeypatch):
+    """While it runs, snapshot_proc is the live Popen: the valve's stop reaches its group before the
+    remove, the kill after ends it, and the check is no verdict with a full pass owed."""
+    seen = {}
+
+    def during(p):
+        seen["tracked"] = srv.health_monitor.snapshot_proc is p and p.poll() is None
+        seen["stopped"] = [r["pid"] for r in srv._freeze_device_readers("chip(s) 13 fell off the PCIe bus")]
+        os.killpg(p.pid, signal.SIGKILL)  # the valve's kill after a successful remove
+        seen["pid"] = p.pid
+
+    ok, detail = _live_snapshot(monkeypatch, during)
+    assert seen["tracked"], "the running snapshot must be on snapshot_proc, or the valve never sees it"
+    assert seen["stopped"] == [seen["pid"]], seen
+    assert ok is False and "no verdict" in detail, detail
+    assert FABRIC_DEBT.owed and srv.health_monitor.snapshot_proc is None
+
+
+def test_a_running_snapshot_is_broker_internal_not_a_tenant(monkeypatch):
+    """Its own session takes it out of the broker's group: only the I59 registration keeps a holder
+    scan taken while it runs from reading the broker's own snapshot as a tenant."""
+    seen = {}
+
+    def during(p):
+        scan = HolderScan(holders=[DeviceHolder(pid=p.pid, uid=0)], complete=True)
+        seen["internal"] = device_holders.is_broker_internal(p.pid)
+        seen["holders"] = device_holders.discount_broker_internal(scan).holders
+        os.killpg(p.pid, signal.SIGKILL)  # end it now rather than at its timeout
+
+    _live_snapshot(monkeypatch, during)
+    assert seen["internal"] and seen["holders"] == [], seen
+
+
 @pytest.mark.asyncio
 async def test_an_eth_selftest_the_valve_stopped_mid_run_arms_nothing(valve, monkeypatch):
     """Its exit 0 measured nothing: the rung stays off and retryable, and no frozen core is claimed."""
@@ -275,6 +339,9 @@ async def test_an_eth_selftest_the_valve_stopped_mid_run_arms_nothing(valve, mon
         return _Proc(ETH)
 
     monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", spawn)
+    internal = []
+    monkeypatch.setattr(srv, "note_broker_internal", internal.append)
     assert await srv.selftest_eth_heartbeat() == ""
+    assert internal == [ETH], "its own session: registered broker-internal, never a tenant (04 I59)"
     assert srv.eth_check_armed is False and "dead-chip isolation" in srv.eth_check_disarm_reason
     assert srv.eth_rearm_retryable and srv.eth_selftest_proc is None
