@@ -234,9 +234,15 @@ def test_floor_message_promises_escalation_only_when_armed(monkeypatch):
     note = srv._hold_escalation_note(off_bus=8)
     assert "goes to the power cycle" not in note and "not armed" in note and "climbs at the 10-min" in note
     monkeypatch.setattr(srv, "isolated_chips", {7})
-    assert "escalates in ~10 s (isolated chips; 120 s while a tenant holds the device)" in srv._hold_escalation_note(
+    assert "escalates in ~10 s (chips off the bus; 120 s while a tenant holds the device)" in srv._hold_escalation_note(
         off_bus=1
     )
+    # Spec 04 I96: a chip the gate counted off the bus but never isolated arms the same early rung.
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.setattr(srv, "_offbus_hold_chips", {8})
+    assert "escalates in ~10 s (chips off the bus;" in srv._hold_escalation_note(off_bus=1)
+    monkeypatch.setattr(srv, "_offbus_hold_chips", set())
+    monkeypatch.setattr(srv, "isolated_chips", {7})
     monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
     for off_bus in (0, 1):
         note = srv._hold_escalation_note(off_bus)
