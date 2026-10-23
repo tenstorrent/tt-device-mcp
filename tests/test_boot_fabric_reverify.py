@@ -128,7 +128,7 @@ async def test_a_carried_down_fabric_hold_reopens_on_a_startup_77(monkeypatch, t
     assert srv.fsm.record.since != _OLD_SINCE, "the bound counts from this boot"
     assert not srv.fsm.record.dirty
     assert not srv.fsm.latch("escalated"), "this boot's ladder is not pre-spent"
-    assert srv.fsm.latch("ubb_reset_fired"), "the tray rung's latch is kept"
+    assert not srv.fsm.latch("ubb_reset_fired"), "the removed tray rung's stale latch is dropped"
     assert srv.device_hold_escalated_monotonic == 0.0
     assert srv._startup_fabric_owed(), "one startup pass is owed even with the relift off"
     assert srv._idle_relift_armed() == (False, True, False)

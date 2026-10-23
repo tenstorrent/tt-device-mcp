@@ -24,9 +24,8 @@ FABRIC_OUT = (
     f"{DISPATCH_LINE}\n"
 )
 OUTAGE_HOLD = {
-    "TT_DEVICE_MCP_AUTO_REBOOT": "0",
+    "TT_DEVICE_MCP_AUTO_MESH_RESET": "0",
     "TT_DEVICE_MCP_AUTO_POWER_CYCLE": "0",
-    "TT_DEVICE_MCP_AUTO_UBB_RESET": "0",
 }
 
 
@@ -52,7 +51,7 @@ def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
     """A 32-chip Galaxy, every chip on the bus, whose fabric pass moves traffic but cannot dispatch.
     ``bad`` keeps the dispatch failing; the reset records its argv and the verify records whether
     it ran the fabric pass."""
-    st = {"bad": True, "resets": [], "verifies": [], "reboots": 0, "events": [], "alerts": []}
+    st = {"bad": True, "resets": [], "verifies": [], "events": [], "alerts": []}
     for i in range(CHIPS):
         (tmp_path / str(i)).write_text("")
     monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
@@ -60,8 +59,7 @@ def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
     srv.device_op_lock = None
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")  # not the outage hold; the reboot rung opted in
-    monkeypatch.delenv("TT_DEVICE_MCP_AUTO_MESH_RESET", raising=False)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "1")  # not the outage hold; OUTAGE_HOLD sets it to 0
     monkeypatch.setattr(base, "_mesh_hold_paged", {})
     g = srv.galaxy_recovery
     monkeypatch.setattr(srv.health_monitor, "expected", lambda present: CHIPS)
@@ -97,14 +95,10 @@ def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
         st["bad"] = not st.get("reset_heals", True)
         return 0, ""
 
-    async def reboot(log, reason):
-        st["reboots"] += 1
-
     for r in (g, srv.per_target_recovery):
         monkeypatch.setattr(r, "_verify_device", verify)
     monkeypatch.setattr(g.mechanism, "await_foreign_scope", no_scope)
     monkeypatch.setattr(g.mechanism, "reset_with_quiesce", reset)
-    monkeypatch.setattr(g, "_auto_reboot_host", reboot)
     patch_health_event(monkeypatch, lambda name, *a, **k: st["events"].append(name))
     monkeypatch.setattr(alert, "send_alert", lambda event, log=None: st["alerts"].append(event) or object())
     monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: {})
@@ -150,19 +144,21 @@ async def test_a_second_dispatch_failure_in_the_episode_holds_instead_of_resetti
 
 
 @pytest.mark.asyncio
-async def test_a_failed_post_reset_check_stays_held_and_climbs(mesh):
+async def test_a_failed_post_reset_check_stays_held_and_climbs(mesh, armed_power_cycle):
     """A prior cycle already failed (was_failing): the dispatch reset fires, its post-reset check
-    fails, the device stays held and the ladder climbs to the opted-in host rung."""
+    fails, the device stays held and the ladder climbs: the last-chance sweep once (its mesh reset is
+    the one repeat the episode allows, spec 04 I87), then the power cycle."""
     mesh["reset_heals"] = False
     srv.recovery_mechanism.last_reset_failed = True
     await _gate()
-    # The dispatch reset, then the ladder's own last-chance sweep before the host rung (04 I22).
     assert mesh["events"].count("dispatch_failure_mesh_reset") == 1
-    assert "last_chance_reset_sweep" in mesh["events"]
-    assert mesh["resets"][0] == ["tt-smi", "-glx_reset"]
+    assert mesh["events"].count("last_chance_reset_sweep") == 1
+    assert mesh["resets"] == [["tt-smi", "-glx_reset"]] * 2, "the dispatch reset, then the sweep's"
     assert mesh["verifies"][-1] is True, "the post-reset check ran the fabric pass"
     assert srv.fsm.state is ServerState.RECOVERING, "a failed post-reset check never releases"
-    assert mesh["reboots"] == 1, "it climbs to the opted-in host rung"
+    assert armed_power_cycle == ["power-cycle"], "it climbs to the power cycle"
+    # Spec 04 I93: the sweep's mesh reset first waited out the gap after the dispatch reset.
+    assert "mesh_reset_spaced" in mesh["events"]
 
 
 @pytest.mark.asyncio
@@ -170,7 +166,7 @@ async def test_outage_hold_holds_and_pages_without_a_reset(monkeypatch, mesh):
     for var, value in OUTAGE_HOLD.items():
         monkeypatch.setenv(var, value)
     await _gate()
-    assert mesh["resets"] == [] and mesh["reboots"] == 0, "the outage hold forbids the reset"
+    assert mesh["resets"] == [], "the outage hold forbids the reset"
     assert srv.fsm.state is ServerState.RECOVERING
     assert "mesh_reset_held" in mesh["events"] and "dispatch_failure_mesh_reset" not in mesh["events"]
     assert [a["kind"] for a in mesh["alerts"]] == ["mesh_reset_held"]

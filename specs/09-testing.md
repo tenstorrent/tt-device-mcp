@@ -64,10 +64,10 @@ gets through anyway.
     `last_fabric_check_monotonic`, `last_job_end_monotonic`, `owner_submit_times`, the hold
     and skip-journal latches, the sampler's blackout strike counter, board-type caches — is
     reset per test so one test's outcome never steers the next test's gate.
-  - **Host rungs**: `TT_DEVICE_MCP_AUTO_REBOOT=0`, `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0`
-    (both default ON, so they are pinned off, never merely deleted),
-    `TT_DEVICE_MCP_AUTO_UBB_RESET` and `TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK` cleared; `_fire_host_reboot` and `_fire_ubb_reset` are
-    replaced with functions that raise `AssertionError` — loud tripwires, so a test that
+  - **Host rung**: `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0` (default ON, so it is pinned off, never
+    merely deleted), the off-bus power cycle's `fire_command` is replaced with a function that
+    raises `AssertionError`, and the spawn tripwire refuses `ipmitool`, `reboot`, `shutdown` and
+    `poweroff` — loud tripwires, so a test that
     reaches a real fire fails instead of taking the box down. `shutil.which("tt-smi")` answers
     None: it is a device tool, so an unmarked test must not find one, and preflight verdicts keyed
     on it otherwise differ between a developer box and CI. A test whose subject needs it present
@@ -78,6 +78,14 @@ gets through anyway.
     pinned True (the default-armed shape the ladder tests assert) and
     `recovery_mechanism.scope_active` pinned False (unstubbed it asks the real host's
     systemd, which failed three sampler tests on a box mid-incident and nowhere else).
+  - **Holder scan**: `device_holders.DRIVER_PROC_DIR` (tt-kmd's holder record) and
+    `device_holders.DEVICE_DIR` (the real `/dev/tenstorrent` that the `/proc` fd walk matches
+    each fd against) point at paths that cannot exist; the cgroup reads (`SCOPE_PROC_DIR`,
+    `job_reap.LEFTOVER_PROC_DIR`) at empty dirs. Without the `DEVICE_DIR` seal, any real process
+    of uid >= 1000 holding the device on the host running the suite read as a live tenant: the
+    runner's holder wait kept a test's job queued and the hold bound's host rung was blocked, so
+    tests failed only while the host ran device work. A test about holders stages its own dir and
+    points these at it.
 - **I2** — A spawn tripwire hard-fails any test that would hand a device-touching command
   to the kernel. The seam is the process-spawn layer — `subprocess.Popen.__init__` and
   `asyncio.create_subprocess_exec` are both wrapped — rather than each caller, so a caller
@@ -103,13 +111,12 @@ gets through anyway.
   broker's own constant rather than a literal, so it cannot drift wider than the set the broker
   actually manages; notably it excludes `tt-device-broker.service`, which a test stopping would
   pull the host out from under itself. Read-only queries (scope liveness) pass either way,
-  because gate paths genuinely need them.
+  because gate paths genuinely need them, except on the broker's own job and exec units (I10).
 - **I3** — A test that needs a forbidden command MUST stub the function that composes the
   argv and assert on the argv itself — never on a mocked spawn. The established seams:
-  `Recovery.reset_argv` (`health/recovery/__init__.py`), `_ubb_reset_argv`
-  (`health/recovery/stages/ubb_tray.py`), `systemd_run_prefix` (`privsep.py`), and the
+  `Recovery.reset_argv` (`health/recovery/__init__.py`), `systemd_run_prefix` (`privsep.py`), and the
   stage fire fns (`_fire_host_reboot` in `stages/host_reboot.py`, `_fire_power_cycle` in
-  `stages/power_cycle.py`, `_fire_ubb_reset` in `stages/ubb_tray.py` — a test exercising a
+  `stages/power_cycle.py` — a test exercising a
   fire path re-patches the fire itself).
 - **I4** — The suite MUST pass device-free, with every `device`-marked test skipped and no
   other test skipped. Passing on a device box proves nothing about CI; the docker check under
@@ -160,11 +167,21 @@ gets through anyway.
     probe *caches* are the exception to the exception — they are build artifacts a real probe
     needs to run at usable speed, so they point at one session-scoped temp dir shared by all
     device tests rather than a fresh per-test one.
-  - **Never lifted — the destructive rungs.** `TT_DEVICE_MCP_AUTO_REBOOT=0` and
-    `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0` stay pinned off, `TT_DEVICE_MCP_AUTO_UBB_RESET` stays
-    cleared, and `_fire_host_reboot` / `_fire_ubb_reset` stay `AssertionError` tripwires. The
-    ladder above the warm rung takes the whole host or a whole tray down; nothing in a pytest
+  - **Never lifted — the destructive rungs.** `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0`
+    stays pinned off, and the power cycle's `fire_command` and the `ipmitool` spawn stay tripwires. The
+    power cycle takes the whole host down; nothing in a pytest
     run may reboot or power-cycle the machine it is running on. `tt-smi -r` is the ceiling.
+- **I10** — No test reaches the host's own broker job and exec units (`ttdev-job-*`,
+  `ttdev-exec-*`), marker or not. On a broker host the live broker runs each job in a
+  `ttdev-job-<id>.scope`, and a test's job can share its id: a kill test read that live scope as
+  its own and asked systemd to SIGINT a real job. The spawn tripwire (I2) applies to any
+  `systemctl`/`systemd-run` argv that names such a unit, a glob that matches one included:
+  - **A query fails closed.** A read-only `systemctl` verb (`is-active`, `is-failed`,
+    `is-enabled`, `status`, `show`, `list-units`, `cat`) runs a stand-in that prints nothing and
+    exits 3, so every caller reads no such unit live. A test that needs a live scope stubs the
+    query (`srv._scope_active`, `srv.list_active_job_scopes`) or `subprocess.run` itself.
+  - **An action is refused.** Any other `systemctl` verb on such a unit, and any `systemd-run`
+    that names one, fails the test. The `device` marker lifts neither.
 
 ## What the suite guarantees
 
@@ -173,9 +190,9 @@ carry which spec's anchors. Approximate collected counts in parentheses.
 
 | File(s) | Pins | Spec |
 |---|---|---|
-| `test_device_safety.py` (450) | The safety corpus: gate hold/dirty/verify semantics, idle and fabric relift, stuck-hold escalation, galaxy floor, ledger/governor, bridge and tray rungs, dead-chip sampler, burst cap, cooldown, exec gating, preflight | 01, 03, 04, 05, 06 |
+| `test_device_safety.py` (450) | The safety corpus: gate hold/dirty/verify semantics, idle and fabric relift, stuck-hold escalation, galaxy floor, ledger/governor, bridge rung, dead-chip sampler, burst cap, cooldown, exec gating, preflight | 01, 03, 04, 05, 06 |
 | `test_server.py` (70) | Job lifecycle, ids and wraparound, activation script / env resolution, clean-device gate ladder, MCP progress streaming, synthetic socket host | 01, 02 |
-| `test_readopt.py` (25) | Restart survival: scope re-adoption, recovered deadlines and exit codes, jobexit dir redirection and perms | 01, 05, 06 |
+| `test_readopt.py` (25), `test_job_exit_file.py` (24) | Restart survival: scope re-adoption, recovered deadlines and exit codes, jobexit dir redirection and perms, fresh per-job exit files and the startup sweep, the submitter's uid from the log header | 01, 05, 06 |
 | `test_recent_jobs.py` (37) | Job-log footer format, recent-history parsing, id reservation, kill audit | 01, 05 |
 | `test_socket_transport.py` (8), `test_stdio_shim.py` (3), `test_cli.py` (34) | Unix-socket JSON-RPC, peer-uid scope, shim socket resolution, CLI entry behavior; `test_cli.py` also carries the lock and smi-wrapper anchors | 02, 05 |
 | `test_authz.py` (7), `test_peercred.py` (8), `test_privsep.py` (14), `test_privsep_guard.py` (3) | SO_PEERCRED parse, identity over self-report, run-as-submitter prefix, refuse-never-root-fallback | 05 |
@@ -183,7 +200,7 @@ carry which spec's anchors. Approximate collected counts in parentheses.
 | `test_boot_platform.py` (7), `test_rung_arming.py` (9) | Boot-time platform commit (and import purity), eth-rung arming rules | 03, 04 |
 | `test_eth_probe.py` (40), `test_fabric_probe.py` (8), `test_eth_heartbeat_probe.py` (21) | Exit-code laundering contracts (ok/frozen/cannot-check), hung reads are skips, the eth-heartbeat probe script's own verdicts | 03 |
 | `test_broker_telemetry.py` (8) | Sampler snapshot/exposition: tri-state fabric verdict, last-pass-not-running-total, crash-tolerant snapshot | 03 |
-| `test_reset.py` (56), `test_reset_gate.py` (18), `test_device_holders.py` (18), `test_recovery_select.py` (3), `test_ubb_reset_launch.py` (3) | Reset argv per platform, scoped execution and quiesce, holder scan and reset gate (foreign deny, fail-closed, force), platform selection, tray-fire tt-smi compat, reclaim pid+starttime identity | 04, 05 |
+| `test_reset.py` (56), `test_reset_gate.py` (18), `test_device_holders.py` (18), `test_recovery_select.py` (3) | Reset argv per platform, scoped execution and quiesce, holder scan and reset gate (foreign deny, fail-closed, force), platform selection, reclaim pid+starttime identity | 04, 05 |
 | `test_metrics.py` (37) | Stage-metrics classification (inapplicable ≠ blocked) and textfile writer behavior | 04, 06 |
 | `test_state_paths.py` (10), `test_install_modes.py` (34) | euid-split defaults, env overrides beat both defaults, install/state base split, per-user daemon gate-on default | 06 |
 | `test_deploy_*.py` (9 files, 42), `test_apply_host_config_render.py` (16) | Deployment-script fail-closed statements (via `deploy_helpers`) and host-config rendering | 08 |
@@ -454,6 +471,7 @@ own claims that are pinned:
 | I5 (state dir overridable so tests never touch the live one) | `tests/test_install_modes.py::test_the_state_dir_is_overridable_so_tests_never_touch_the_live_one` |
 | I6 (import purity — boot off import) | `tests/test_boot_platform.py::test_importing_the_server_never_touches_the_device` |
 | I1 (probe reads sealed sysfs, not silicon) | `tests/test_device_safety.py::test_heartbeat_probe_touches_no_device` |
+| I1 (holder scan sealed: a real holder of the host's `/dev/tenstorrent` is no holder in a test) | `tests/test_test_isolation.py::test_a_real_device_holder_on_the_host_is_not_a_holder_in_a_test` |
 | I1 (env seal: armed flag never inherited from a stale environment) | `tests/test_rung_arming.py::test_the_armed_flag_is_not_inherited_from_a_stale_environment` |
 | I2 (never-list refused even under the marker) | `tests/test_device_marker.py::test_the_never_spawn_list_is_refused_even_under_the_device_marker` |
 | I2 (`tt-smi`/`systemd-run` refused unmarked, permitted marked) | `tests/test_device_marker.py::test_the_device_only_list_is_refused_unmarked_and_permitted_marked` |
@@ -462,10 +480,13 @@ own claims that are pinned:
 | I2 (the poller exception cannot launder another unit) | `tests/test_device_marker.py::test_the_poller_exception_does_not_extend_to_other_units` |
 | I2 (`systemd-run` cannot launder a never-list payload) | `tests/test_device_marker.py::test_systemd_run_is_permitted_under_the_marker_only_for_what_it_wraps` |
 | I7 (the per-test reset clears every job, hold, hold-bound and escalation global) | `tests/test_test_isolation.py::test_the_per_test_reset_clears_every_hold_bound_and_escalation_global` |
-| I7 (the pairs that leaked state pass with the leaking test first: `tests/test_hold_bound.py::test_a_stuck_hold_event_past_the_bound_never_reads_escalated_false` then `::test_a_latched_i42_hold_still_escalates_and_its_latch_is_lifted`; `tests/test_power_cycle_ac_needed.py::test_the_watchdog_starts_the_class_a_ladder_at_the_10_min_mark` then `::test_the_full_ladder_runs_10_min_after_the_last_cycle_or_boot_then_the_cycle`; `tests/test_chip_state.py::test_the_published_state_is_atomic_and_names_every_expected_chip` then `::test_a_re_created_node_is_read_at_once_and_a_valid_read_clears_lost`) | `tests/test_test_isolation.py::test_the_leaking_pairs_pass_with_the_leaking_test_first` |
+| I7 (the pairs that leaked state pass with the leaking test first: `tests/test_hold_bound.py::test_a_stuck_hold_event_past_the_bound_never_reads_escalated_false` then `::test_a_latched_i42_hold_still_escalates_and_its_latch_is_lifted`; `tests/test_power_cycle_ac_needed.py::test_the_hold_bound_is_the_one_trigger_of_the_class_a_ladder` then `::test_the_full_ladder_runs_at_the_10_min_hold_bound_then_the_cycle`; `tests/test_chip_state.py::test_the_published_state_is_atomic_and_names_every_expected_chip` then `::test_a_re_created_node_is_read_at_once_and_a_valid_read_clears_lost`) | `tests/test_test_isolation.py::test_the_leaking_pairs_pass_with_the_leaking_test_first` |
 | I8 (the gate reads real `/dev`, never the sandboxed attribute) | `tests/test_device_marker.py::test_the_device_gate_reads_the_real_dev_dir_not_the_sandboxed_one` |
 | I8 (no chips, or no dir, means no device) | `tests/test_device_marker.py::test_no_chips_means_no_device`, `::test_an_absent_dev_dir_means_no_device` |
 | I8 (the marker is registered, so `-m device` selects it) | `tests/test_device_marker.py::test_the_device_marker_is_registered` |
+| I10 (a live host job scope reads as none through the real queries, sync and asyncio) | `tests/test_host_job_units.py::test_a_live_host_job_scope_reads_as_none_through_the_real_queries`, `::test_a_live_host_job_scope_reads_as_none_through_asyncio`, `::test_a_glob_over_job_scopes_counts_as_naming_them` |
+| I10 (a test's kill never takes the host scope path) | `tests/test_host_job_units.py::test_killing_a_tests_job_never_takes_the_host_scope_path` |
+| I10 (an action on a broker unit is refused, marker or not) | `tests/test_host_job_units.py::test_an_action_on_a_broker_unit_is_refused_marker_or_not` |
 | I8 (an unmarked test keeps its seals) | `tests/test_device_marker.py::test_this_test_is_not_device_marked` |
 | I8 (real silicon: topology, probes, `/proc` identity, reclaim, warm reset) | every test in `tests/test_device_hardware.py` |
 | Spec anchors resolve (a renamed or deleted test cannot leave a table asserting coverage) | `tests/test_spec_anchors.py::test_every_spec_anchor_names_a_test_that_exists`, `tests/test_spec_anchors.py::test_every_anchor_points_at_a_test_file_that_exists` |

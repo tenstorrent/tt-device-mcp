@@ -27,6 +27,8 @@ import asyncio
 import logging
 import os
 import signal
+import threading
+import time
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
@@ -38,6 +40,13 @@ logger = logging.getLogger("tt-device-mcp")
 PROC_DIR = "/proc"
 # Exported into every job's shell with a value unique to that run; children inherit it.
 JOB_TAG_ENV = "TT_DEVICE_MCP_JOB_TAG"
+# An empty /proc/<pid>/environ does not prove the tag absent: a process inside execve reads empty
+# until the new image's environment is mapped, and one past exit_mm reads empty for good. Such a
+# process (not a kernel thread or zombie, which never have one) is re-read, bounded for the whole
+# scan, before it is ruled out.
+TAG_REREAD_SEC = 0.1
+_TAG_REREAD_POLL_SEC = 0.002
+_PF_KTHREAD = 0x00200000
 _POLL_SEC = 0.1
 
 
@@ -100,13 +109,52 @@ def _in_scope(pid: int, scope: str) -> bool:
     return False
 
 
-def _has_tag(pid: int, tag: str) -> bool:
+def _read_tag(pid: int, tag: str) -> Optional[bool]:
+    """Whether ``pid`` carries ``tag``; None when its environ reads empty but it is a live user
+    process, so the read cannot tell (mid-execve, or exiting)."""
     try:
         with open(f"{PROC_DIR}/{pid}/environ", "rb") as f:
-            entries = f.read().split(b"\0")
+            raw = f.read()
     except OSError:
         return False
-    return f"{JOB_TAG_ENV}={tag}".encode() in entries
+    if raw:
+        return f"{JOB_TAG_ENV}={tag}".encode() in raw.split(b"\0")
+    try:
+        with open(f"{PROC_DIR}/{pid}/stat") as f:
+            rest = f.read().rsplit(")", 1)[1].split()
+        if rest[0] in ("Z", "X") or int(rest[6]) & _PF_KTHREAD:
+            return False
+    except (OSError, IndexError, ValueError):
+        return False
+    return None
+
+
+def _tagged(pids: Iterable[int], tag: str) -> set[int]:
+    """The pids that carry ``tag``. One whose read cannot tell is re-read until it can, for at
+    most ``TAG_REREAD_SEC`` across all of them; still undecided then, it is ruled out."""
+    found, unsure = set(), []
+    for p in pids:
+        has = _read_tag(p, tag)
+        if has:
+            found.add(p)
+        elif has is None:
+            unsure.append(p)
+    deadline = time.monotonic() + TAG_REREAD_SEC
+    while unsure and time.monotonic() < deadline:
+        time.sleep(_TAG_REREAD_POLL_SEC)
+        still = []
+        for p in unsure:
+            has = _read_tag(p, tag)
+            if has:
+                found.add(p)
+            elif has is None:
+                still.append(p)
+        unsure = still
+    return found
+
+
+def _has_tag(pid: int, tag: str) -> bool:
+    return pid in _tagged((pid,), tag)
 
 
 def _cmdline(pid: int) -> str:
@@ -157,10 +205,10 @@ def job_processes(pid: Optional[int], scope: Optional[str] = None, tag: Optional
     members = {
         p
         for p, info in procs.items()
-        if (pid and (info.pgid == pid or info.sid == pid or p == pid))
-        or (scope and _in_scope(p, scope))
-        or (tag and p not in exclude and _has_tag(p, tag))
+        if (pid and (info.pgid == pid or info.sid == pid or p == pid)) or (scope and _in_scope(p, scope))
     }
+    if tag:
+        members |= _tagged((p for p in procs if p not in exclude and p not in members), tag)
     # Descendants of any member: a child that left the group or session but whose parent
     # chain is still intact.
     children: dict[int, list[int]] = {}
@@ -283,6 +331,10 @@ async def reap_job_survivors(
                 await device_holders.wait_device_released(holding, release_wait_sec - kill_wait_sec)
         # Re-scan: anything the job forked during the sweep is a survivor too.
         rescan = await asyncio.to_thread(job_processes, pid, scope, tag)
+        # A process the first scan found stays the job's while it lives (_alive checks the
+        # starttime): past exit_mm, stuck in the driver's release, its tag no longer reads.
+        for p, i in found.items():
+            rescan.setdefault(p, i)
         survivors = [
             Survivor(pid=p, state=i.state, cmdline=_cmdline(p), holds_device=_holds_device(p), starttime=i.starttime)
             for p, i in sorted(rescan.items())
@@ -301,6 +353,8 @@ async def reap_job_survivors(
 # Read through their own root, not PROC_DIR: the sweep above is exercised against real
 # processes, while the fence below is tested against staged /proc trees.
 LEFTOVER_PROC_DIR = "/proc"
+# The job_id of a leftover the dead-chip path killed (spec 04 I77): "dead-chip:<chip,...>".
+DEAD_CHIP_LABEL_PREFIX = "dead-chip:"
 JOB_SCOPE_PREFIX = "ttdev-job-"
 _SIGKILL_BIT = 1 << (signal.SIGKILL - 1)
 
@@ -318,8 +372,13 @@ class ReapedLeftover:
 
     def describe(self) -> str:
         kill = {True: "SIGKILL pending", False: "no SIGKILL pending", None: "signals unreadable"}
+        owner = (
+            f"killed holder of chip(s) {self.job_id[len(DEAD_CHIP_LABEL_PREFIX) :]}"
+            if self.job_id.startswith(DEAD_CHIP_LABEL_PREFIX)
+            else f"job {self.job_id}"
+        )
         return (
-            f"job {self.job_id} pid {self.pid} ({device_holders.username_for_uid(self.uid)}) "
+            f"{owner} pid {self.pid} ({device_holders.username_for_uid(self.uid)}) "
             f"state {self.state} wchan {self.wchan}, {kill[self.sigkill_pending]}"
         )
 
@@ -407,3 +466,94 @@ def find_reaped_leftovers(
             )
         )
     return found
+
+
+# Spec 04 I77: how long one read of /proc/<pid>/maps may take. A process stuck in the kernel can
+# hold its mmap lock, and a maps read waits on that lock, so the read runs on its own thread and an
+# unanswered read counts as unreadable (fail closed: the holder is kept as stuck).
+STUCK_MAPS_READ_SEC = 2.0
+# The bounded reads still out, per pid. One stuck behind the mmap lock never returns, nor does its
+# thread: while it is out, a further read of that pid starts no thread and counts as unanswered at
+# once, so a long hold does not leave one thread behind per scan.
+_outstanding_reads: dict[int, threading.Thread] = {}
+_outstanding_lock = threading.Lock()
+
+
+def _bounded_read(pid: int, name: str, timeout: float) -> Optional[str]:
+    """``_read_leftover`` on a daemon thread, or None when it has not answered in ``timeout``, or at
+    once while an earlier read of ``pid`` is still out (at most one reader thread per pid)."""
+    box: list = []
+
+    def read() -> None:
+        try:
+            box.append(_read_leftover(pid, name))
+        finally:
+            with _outstanding_lock:
+                if _outstanding_reads.get(pid) is threading.current_thread():
+                    del _outstanding_reads[pid]
+
+    with _outstanding_lock:
+        if pid in _outstanding_reads:
+            return None
+        t = threading.Thread(target=read, daemon=True, name=f"bounded-read-{pid}")
+        _outstanding_reads[pid] = t
+        t.start()
+    t.join(timeout)
+    return box[0] if box else None
+
+
+def device_refs(pid: int, bdfs: Iterable[str], *, maps_timeout: float = STUCK_MAPS_READ_SEC) -> Optional[list[str]]:
+    """What of the device ``pid`` still references (spec 04 I77): open fds on a /dev/tenstorrent node
+    and mappings of a device node or of one of ``bdfs``' PCI BARs (``.../<bdf>/resource<n>``),
+    deleted ones included. [] when both fds and maps were read and name nothing; None when the fds
+    name nothing and the maps could not be read or did not answer in time (a BAR mapping behind it
+    cannot be ruled out: the caller fails closed)."""
+    bars = [f"/{b}/resource" for b in bdfs if b]
+    node = device_holders.DEVICE_DIR + "/"
+    refs: list[str] = []
+    try:
+        fds = os.listdir(f"{LEFTOVER_PROC_DIR}/{pid}/fd")
+    except OSError:
+        fds = []
+    for fd in fds:
+        try:
+            target = os.readlink(f"{LEFTOVER_PROC_DIR}/{pid}/fd/{fd}")
+        except OSError:
+            continue
+        if target.startswith(node) or any(b in target for b in bars):
+            refs.append(f"fd {fd} -> {target}")
+    maps = _bounded_read(pid, "maps", maps_timeout)
+    if maps is None:
+        return refs or None
+    for line in maps.splitlines():
+        parts = line.split(None, 5)
+        path = parts[5].strip() if len(parts) == 6 else ""
+        if path and (path.startswith(node) or any(b in path for b in bars)) and f"map {path}" not in refs:
+            refs.append(f"map {path}")
+    return refs
+
+
+def still_stuck(pid: int, starttime: str) -> bool:
+    """Whether ``pid`` (the process with ``starttime``, when given) is still stuck in the kernel: state
+    D or SIGKILL pending. /proc stat and status only: no maps read, so it never waits on a lock."""
+    state, now = _leftover_state(pid)
+    if state in ("?", "Z", "X") or (starttime and now != starttime):
+        return False
+    return state == "D" or bool(_sigkill_pending(pid))
+
+
+def stuck_device_holder(pid: int, label: str, uid: int, bdfs: Iterable[str]) -> Optional[ReapedLeftover]:
+    """``pid`` as a leftover named ``label`` when it survived its SIGKILL stuck in the kernel with a
+    reference on the device (spec 04 I77), else None. Stuck: state D, or SIGKILL queued and not yet
+    acted on. A zombie or a gone process holds nothing. Refs that cannot be read count as held."""
+    state, _ = _leftover_state(pid)
+    if state in ("?", "Z", "X"):
+        return None
+    pending = _sigkill_pending(pid)
+    if state != "D" and not pending:
+        return None
+    refs = device_refs(pid, bdfs)
+    if refs == []:
+        return None
+    wchan = (_read_leftover(pid, "wchan") or "").strip() or "?"
+    return ReapedLeftover(job_id=label, pid=pid, uid=uid, state=state, wchan=wchan, sigkill_pending=pending)

@@ -34,6 +34,7 @@ from tt_device_mcp.health.monitors import eth, heartbeat, pci
 from tt_device_mcp.health.monitors.heartbeat import heartbeat_verdict, read_heartbeats
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (
+    BELOW_FLOOR,
     BLOCKED,
     BRIDGE_RESET_MAX_TRIES,
     DEFER,
@@ -43,10 +44,8 @@ from tt_device_mcp.health.recovery import (
     OUTCOME_WAITING,
     RELEASE,
     STAGE_BRIDGE_RESET,
-    STAGE_HOST_REBOOT,
     STAGE_POWER_CYCLE,
     STAGE_SMI_RESET,
-    STAGE_UBB_TRAY,
     WAIT,
     Evidence,
     galaxy,
@@ -1424,7 +1423,7 @@ async def test_a_reset_that_outlives_our_wait_still_shields_its_chips(monkeypatc
     await srv.sampler.check_for_dead_chips(half)  # two samples: would be "confirmed" without the guard
     assert isolated == [], "amputated a chip out of a live reset scope"
     assert marks == [], "dirtied the device on a reset's own all-ones"
-    assert pollers == [False], "the pollers stay off the all-ones tray (03 I66), stopped once"
+    assert pollers == [], "no poller fd is closed on an attached all-ones tray (03 I66, I84); the reset quiesced them"
     assert srv.sampler.scope_seen and chip_state.recovering(), "the live scope is published as recovering"
 
     blackout = {str(i): (heartbeat.ALL_ONES,) for i in range(32)}
@@ -2125,7 +2124,7 @@ async def test_a_transient_all_ones_does_not_amputate_a_chip(monkeypatch):
     blip = {"0": live, "13": [heartbeat.ALL_ONES, 0, 0, 0, 0, 0], "31": live}
     await srv.sampler.check_for_dead_chips(blip)
     assert isolated == [], "isolated on a single sample"
-    assert pollers == [False], "the pollers stop at the first all-ones sample (03 I66); isolation waits"
+    assert pollers == [], "an all-ones chip is not detached yet: the poller stop waits for the valve (03 I66, I84)"
     assert chip_state.lost_chips() == [], "one sample is not lost"
 
     healthy = {"0": live, "13": live, "31": live}
@@ -2136,15 +2135,16 @@ async def test_a_transient_all_ones_does_not_amputate_a_chip(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_chip_dead_on_two_consecutive_samples_is_isolated(monkeypatch):
-    """The case that matters: a real chip drop still gets cut out, fast. The pollers stop on the
-    first all-ones sample already (spec 03 I66), before the second confirms it."""
+    """The case that matters: a real chip drop still gets cut out, fast. The pollers are not stopped
+    on the first all-ones sample (spec 03 I66): the chip is not detached yet, so the valve stops them
+    after its remove (I84)."""
     isolated = _no_isolation(monkeypatch)
     pollers = stub_device_pollers(monkeypatch)
 
     live = [100, 800, 800, 0, 0, 0]
     dead = {"0": live, "13": [heartbeat.ALL_ONES, 0, 0, 0, 0, 0], "31": live}
     await srv.sampler.check_for_dead_chips(dead)
-    assert pollers == [False] and isolated == []
+    assert pollers == [] and isolated == []
     await srv.sampler.check_for_dead_chips(dead)
 
     assert isolated == ["13"], "a genuinely dead chip was not isolated"
@@ -2772,7 +2772,10 @@ async def test_reset_runs_in_its_own_systemd_scope(monkeypatch):
     assert argv[0] == "systemd-run" and "--scope" in argv
     assert any(a.startswith("--unit=" + recovery_base.RESET_SCOPE_PREFIX) for a in argv)
     # The reset command must survive as the scope's payload, after the `--`.
-    assert list(argv[argv.index("--") + 1 :]) == ["tt-smi", "-glx_reset"]
+    # A mesh reset runs under the spec 04 I91 ipmitool guard, which then execs the reset itself.
+    payload = list(argv[argv.index("--") + 1 :])
+    assert payload == recovery_base.ipmi_guard.guarded_argv(["tt-smi", "-glx_reset"])
+    assert payload[-2:] == ["tt-smi", "-glx_reset"]
 
 
 @pytest.mark.asyncio
@@ -2837,7 +2840,7 @@ async def test_pollers_are_stopped_before_the_reset_and_restarted_after(monkeypa
         order.append("start" if active else "stop")
         return ["tt-telemetry.service"]
 
-    async def reset(argv, log, owner="[broker]health-gate"):
+    async def reset(argv, log, owner="[broker]health-gate", on_output=None):
         order.append("reset")
         return 0, ""
 
@@ -2856,7 +2859,7 @@ async def test_pollers_are_restarted_even_if_the_reset_raises(monkeypatch):
         order.append("start" if active else "stop")
         return ["tt-telemetry.service"]
 
-    async def reset(argv, log, owner="[broker]health-gate"):
+    async def reset(argv, log, owner="[broker]health-gate", on_output=None):
         raise OSError("boom")
 
     monkeypatch.setattr(srv, "_set_device_pollers", pollers)
@@ -3013,7 +3016,7 @@ def _reset_that_fails(monkeypatch, rc=1):
     """reset_with_quiesce's backend stubbed: the reset exits ``rc``, no scope is left cycling, and
     the PCI rescan and settle sleep are no-ops."""
 
-    async def run_scoped(argv, log, owner="[broker]health-gate"):
+    async def run_scoped(argv, log, owner="[broker]health-gate", on_output=None):
         return rc, "reset exited 1; device not recovered"
 
     async def to_thread(fn, *a, **k):
@@ -3207,11 +3210,9 @@ async def test_the_startup_quiesce_keeps_the_pollers_stopped_when_the_gate_holds
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("step", ["reset", "tray re-power"])
-async def test_a_step_that_did_not_complete_owes_the_pollers_even_on_a_healthy_fsm(monkeypatch, step):
-    """Spec 03 I66 with 04 I12: a reset that exited non-zero, or a tray re-power that never fired,
-    starts no poller even while the FSM still reads HEALTHY (its chips may be off the bus or hung),
-    and hands them to the owed restart, so the next close to HEALTHY (a passing full check, fabric
+async def test_a_step_that_did_not_complete_owes_the_pollers_even_on_a_healthy_fsm(monkeypatch):
+    """Spec 03 I66 with 04 I12: a reset that exited non-zero starts no poller even while the FSM still
+    reads HEALTHY (its chips may be off the bus or hung), and hands them to the owed restart, so the next close to HEALTHY (a passing full check, fabric
     included) starts them once, as for a restore deferred on a held device."""
     monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", DEFAULT_POLLERS)
     calls = []
@@ -3219,18 +3220,9 @@ async def test_a_step_that_did_not_complete_owes_the_pollers_even_on_a_healthy_f
     fsm_healthy(srv)
     assert srv._pollers_unfit_reason() is None
 
-    if step == "reset":
-        _reset_that_fails(monkeypatch)
-        rc, _ = await srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-r"], lambda m: None)
-        assert rc == 1
-    else:
-
-        def refuse(*a, **k):
-            raise pcie_guard.TrayRepowerRefused("tray map disagrees")
-
-        monkeypatch.setattr(galaxy_mod, "_fire_ubb_reset", refuse)
-        with pytest.raises(pcie_guard.TrayRepowerRefused):
-            await srv.galaxy_recovery._fire_tray_repower(0b1000, [3], lambda m: None)
+    _reset_that_fails(monkeypatch)
+    rc, _ = await srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-r"], lambda m: None)
+    assert rc == 1
 
     assert [c for c in calls if c[0] == "stop"], "the step still lands on a quiet bus"
     assert not [c for c in calls if c[0] == "start"], calls
@@ -3637,7 +3629,8 @@ async def test_a_dirty_flag_dropped_without_a_check_leaves_a_durable_trace(monke
     assert (
         srv.fsm.record.why == "foreign_holder"
     ), "the gate did not reword the hold once a foreign tenant blocked the verify"
-    cleared = [f for k, f in events if k == "device_dirty_cleared"]
+    assert not [f for k, f in events if k == "device_dirty_cleared"], "the hold stays: nothing was cleared"
+    cleared = [f for k, f in events if k == "device_dirty_dropped_held"]
     assert cleared, "the dirty flag was dropped with no durable trace on the health timeline"
     assert cleared[0]["prior_reason"] == "job 511 ended killed (exit -9)"
     assert "foreign holder" in cleared[0]["why"]
@@ -4206,6 +4199,34 @@ async def test_the_owner_comes_from_the_peer_uid_and_the_surface(monkeypatch, cl
     finally:
         current_via_mcp.reset(mcp_tok)
         current_peer_uid.reset(tok)
+
+
+def test_rest_job_logs_clamps_tail_to_the_tool_cap(monkeypatch, tmp_path, clear_job_state):
+    """The MCP tool's schema caps `tail` at 10,000 lines, but the REST route the CLI uses passed it
+    through raw: tail=10001 returned 10,001 lines and tail=0 the whole log. The cap holds in the
+    shared helper, on every path (spec 02 I2)."""
+    from starlette.testclient import TestClient
+
+    log = tmp_path / "j.log"
+    log.write_text("".join(f"l{i}\n" for i in range(12000)))
+    monkeypatch.setattr(srv, "jobs", {})
+    srv.jobs["050"] = srv.Job(
+        id="050", owner="t", workspace="/tmp", command="echo hi", queued_at="t", log_file=str(log)
+    )
+    app = srv.build_asgi_app(srv.create_mcp_server())
+    with TestClient(app) as client:
+
+        def lines(tail):
+            body = {"job_id": "050"} if tail is None else {"job_id": "050", "tail": tail}
+            return client.post("/api/tt_device_job_logs", json=body).json()["content"].splitlines()
+
+        assert len(lines(10001)) == srv.MAX_LOG_TAIL_LINES == 10000
+        assert lines(10001)[-1] == "l11999"
+        assert lines(0) == ["l11999"]
+        assert lines(-5) == ["l11999"]
+        assert len(lines("x")) == len(lines(None)) == 100
+        assert len(lines(250)) == 250
+    assert srv.JobLogsInput.model_fields["tail"].metadata[-1].le == srv.MAX_LOG_TAIL_LINES
 
 
 @pytest.mark.asyncio
@@ -5639,17 +5660,6 @@ def _ledger_dir(monkeypatch, tmp_path):
     return tmp_path
 
 
-def test_auto_reboot_is_off_by_default(monkeypatch):
-    """The one action that takes every tenant down with the box must never fire on a host that
-    did not ask for it. Only TT_DEVICE_MCP_AUTO_REBOOT=1 enables it."""
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
-    assert srv._auto_reboot_enabled() is False
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
-    assert srv._auto_reboot_enabled() is False
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
-    assert srv._auto_reboot_enabled() is True
-
-
 def test_governor_never_reboots_over_a_tenant(monkeypatch, tmp_path):
     """Absolute rule: a tenant on the device outranks every other signal. A reboot would abort
     their run — the exact interference this loop must never cause."""
@@ -5705,46 +5715,6 @@ def test_governor_fails_closed_when_the_ledger_is_unreadable(monkeypatch, tmp_pa
     allowed, why = srv.recovery_mechanism.auto_recovery_allowed("reboot", tenant_active=False)
     assert allowed is False
     assert "unreadable" in why
-
-
-@pytest.mark.asyncio
-async def test_auto_reboot_records_durably_before_it_fires(monkeypatch, tmp_path):
-    """The ledger write is the rate limiter, so it must land on disk BEFORE the reboot request
-    takes the process down — else the next boot cannot see this reboot already happened. The
-    action also leaves a visible jobs-list row so the reboot is not a blank in the audit trail."""
-    _ledger_dir(monkeypatch, tmp_path)
-    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-
-    order = []
-    monkeypatch.setattr(srv.recovery_mechanism, "record_auto_recovery", lambda *a, **k: order.append("record") or True)
-    monkeypatch.setattr(galaxy, "_fire_host_reboot", lambda: order.append("fire"))
-
-    await srv.galaxy_recovery._auto_reboot_host(lambda _m: None, "reset failed twice")
-
-    assert order == ["record", "fire"], "recorded the escalation before firing the reboot"
-    rows = [r for r in srv._recent_jobs(20) if r["owner"] == "[broker]reboot-request"]
-    assert len(rows) == 1, rows
-    assert rows[0]["status"] == "reboot"
-
-
-@pytest.mark.asyncio
-async def test_auto_reboot_aborts_when_the_ledger_cannot_be_written(monkeypatch, tmp_path):
-    """The durable record IS the rate limiter. If it cannot be persisted (full disk, read-only
-    rootfs), the reboot must be ABORTED — an unrecorded reboot is one the next boot repeats, a
-    loop. Firing anyway is the fail-open bug this guards against."""
-    _ledger_dir(monkeypatch, tmp_path)
-    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-    monkeypatch.setattr(srv.recovery_mechanism, "record_auto_recovery", lambda *a, **k: False)
-
-    fired = []
-    monkeypatch.setattr(galaxy, "_fire_host_reboot", lambda: fired.append(True))
-
-    await srv.galaxy_recovery._auto_reboot_host(lambda _m: None, "reset failed twice")
-
-    assert fired == [], "must NOT reboot when the escalation could not be recorded"
-    assert [r for r in srv._recent_jobs(20) if r["owner"] == "[broker]reboot-request"] == []
 
 
 def test_governor_fails_closed_on_a_record_with_no_timestamp(monkeypatch, tmp_path):
@@ -5892,128 +5862,36 @@ def test_reboot_does_not_de_escalate_past_a_recent_power_cycle(monkeypatch, tmp_
     assert "boot-loop guard" in why
 
 
-def test_choose_escalation_prefers_reboot_then_power_cycle(monkeypatch, tmp_path):
-    """With both rungs opted in and no reboot yet tried, the least-drastic one is chosen. Once a
-    reboot has been tried under a previous boot and the box is back still wedged, the chooser
-    escalates to the power cycle."""
+def test_choose_escalation_power_cycle_is_the_only_host_rung(monkeypatch, tmp_path):
+    """The power cycle is the one host rung: armed, it is the escalation, with nothing to satisfy
+    first. A leftover reboot setting from an older install arms nothing."""
     _ledger_dir(monkeypatch, tmp_path)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
-    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-B")
-    monkeypatch.setattr(recovery_base, "AUTO_RECOVERY_MIN_INTERVAL_SEC", 3600)
-    # No reboot on record yet: reboot is the rung.
-    assert galaxy._choose_recovery_escalation(**srv._host_escalation_kwargs()) == "reboot"
-    # A reboot from the previous boot within the interval: escalate to the power cycle.
-    monkeypatch.setattr(srv.recovery_mechanism, "_reboot_already_attempted", lambda **k: True)
     assert galaxy._choose_recovery_escalation(**srv._host_escalation_kwargs()) == "power-cycle"
 
 
-def test_choose_escalation_power_cycle_alone_goes_straight_to_it(monkeypatch, tmp_path):
-    """A host may opt into the power cycle without the reboot — e.g. it only ever sees whole-bus
-    wedges a reboot cannot clear. With reboot off, the power cycle is the rung directly, with no
-    reboot-first requirement to satisfy."""
+def test_choose_escalation_none_when_the_power_cycle_is_not_armed(monkeypatch, tmp_path):
+    """The power cycle not armed: no host-level escalation is offered, and a stale reboot setting
+    does not bring one back."""
     _ledger_dir(monkeypatch, tmp_path)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
-    assert galaxy._choose_recovery_escalation(**srv._host_escalation_kwargs()) == "power-cycle"
-
-
-def test_choose_escalation_none_when_neither_opted_in(monkeypatch, tmp_path):
-    """Both rungs off (the default): no host-level escalation is offered, and the ladder leaves the
-    device flagged exactly as it did before either rung existed."""
-    _ledger_dir(monkeypatch, tmp_path)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
     assert galaxy._choose_recovery_escalation(**srv._host_escalation_kwargs()) is None
 
 
-def test_host_escalation_for_drop_sends_all_off_bus_to_the_cold_rung(monkeypatch, tmp_path):
-    """A whole-bus drop (present==0) is the one wedge a warm reboot cannot clear: it does not
-    power-cycle the Galaxy UBBs, so dropped ASICs stay off across it. So an all-off-bus mesh never
-    takes the reboot rung — power-cycle when opted in, else no rung + reboot_blocked so the caller
-    holds loudly. A partial drop (a chip still on the bus) keeps the ordinary reboot-first ladder."""
-    _ledger_dir(monkeypatch, tmp_path)
-    # Reboot opted in, power cycle NOT: an all-off-bus drop BLOCKS the reboot (it cannot re-enumerate).
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    assert galaxy._host_escalation_for_drop(off_bus=32, expected=32, **srv._host_escalation_kwargs()) == (None, True)
-    # A partial drop keeps the reboot rung — some chips are on the bus, a reboot may re-enumerate them.
-    assert galaxy._host_escalation_for_drop(off_bus=31, expected=32, **srv._host_escalation_kwargs()) == (
-        "reboot",
-        False,
-    )
-    # Power cycle opted in: an all-off-bus drop skips straight to the cold rung, no useless reboot first.
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
-    assert galaxy._host_escalation_for_drop(off_bus=32, expected=32, **srv._host_escalation_kwargs()) == (
-        "power-cycle",
-        False,
-    )
-    # A single-chip host has no UBB re-enumeration failure mode: the ordinary ladder applies.
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    assert galaxy._host_escalation_for_drop(off_bus=1, expected=1, **srv._host_escalation_kwargs()) == ("reboot", False)
-
-
-def test_host_escalation_for_drop_routes_a_futile_reboot_to_the_cold_rung(monkeypatch, tmp_path):
-    """A PARTIAL drop the caller has proven a warm reboot cannot recover — a reset that regressed
-    the mesh off the bus, or hard-exited leaving chips off it — is routed like a whole-bus drop:
-    the reboot is skipped for the cold rung when opted in, else no rung + reboot_blocked to hold
-    loudly. Without the flag the same partial drop keeps the ordinary reboot-first ladder."""
+@pytest.mark.parametrize("off_bus,expected", [(32, 32), (31, 32), (8, 32), (0, 32), (1, 1)])
+def test_host_escalation_for_drop_is_the_power_cycle_or_a_loud_hold(monkeypatch, tmp_path, off_bus, expected):
+    """Every drop, whole-tray, partial or a present mesh, gets the power cycle when it is armed. Not
+    armed, no rung and the caller holds loudly: no warm reboot stands in for it, whatever the env
+    says."""
     _ledger_dir(monkeypatch, tmp_path)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    # 20/32 off-bus is a partial drop: the ordinary ladder warm-reboots it.
-    assert galaxy._host_escalation_for_drop(off_bus=20, expected=32, **srv._host_escalation_kwargs()) == (
-        "reboot",
-        False,
-    )
-    # warm_reboot_futile blocks that useless reboot; with no cold rung opted in the caller must hold.
-    assert galaxy._host_escalation_for_drop(
-        off_bus=20, expected=32, warm_reboot_futile=True, **srv._host_escalation_kwargs()
-    ) == (None, True)
-    # Cold rung opted in: skip straight to it, never the reboot that cannot re-enumerate the drop.
+    kw = srv._host_escalation_kwargs()
+    assert galaxy._host_escalation_for_drop(off_bus=off_bus, expected=expected, **kw) == (None, True)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
-    assert galaxy._host_escalation_for_drop(
-        off_bus=20, expected=32, warm_reboot_futile=True, **srv._host_escalation_kwargs()
-    ) == ("power-cycle", False)
-    # A single-chip host has no UBB re-enumeration failure mode: the flag does not apply.
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    assert galaxy._host_escalation_for_drop(
-        off_bus=1, expected=1, warm_reboot_futile=True, **srv._host_escalation_kwargs()
-    ) == ("reboot", False)
-
-
-def test_an_unconfigured_host_still_has_a_terminating_ladder(monkeypatch, tmp_path):
-    """The rungs are ON unless switched off, so a host nobody configured still climbs to something
-    that can actually recover a dropped ASIC. This is the regression guard for the failure the
-    defaults exist to prevent: with both rungs off, a partial drop a warm reboot cannot clear finds
-    no rung at all and the device is HELD forever — every gentler rung is already spent (the
-    per-chip bridge rung cannot reach a chip whose bridge left with it, and the tray rung exists
-    only on a Galaxy), so 'hold' means 'hold until a human notices'.
-
-    Deletes the vars rather than setting them: the suite-wide fixture pins both OFF so no test
-    fires a real reboot, and this is the one test whose subject IS the unset default. It only
-    calls the pure chooser, so nothing can fire."""
-    _ledger_dir(monkeypatch, tmp_path)
-    monkeypatch.delenv("TT_DEVICE_MCP_AUTO_REBOOT", raising=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", raising=False)
-
-    assert srv._auto_reboot_enabled(), "the warm-reboot rung must be armed on an unconfigured host"
-    assert srv._auto_power_cycle_enabled(), "the cold rung must be armed on an unconfigured host"
-    # Spec 04 I71: on a multi-chip host the cold rung goes first, a partial drop included; a warm
-    # reboot does not re-power the trays. A single-chip host keeps the reboot first.
-    assert galaxy._host_escalation_for_drop(off_bus=1, expected=8, **srv._host_escalation_kwargs()) == (
-        "power-cycle",
-        False,
-    )
-    assert galaxy._host_escalation_for_drop(off_bus=1, expected=1, **srv._host_escalation_kwargs()) == ("reboot", False)
-    # The drop that used to strand the queue: reboot proven futile, so climb — never (None, True).
-    assert galaxy._host_escalation_for_drop(
-        off_bus=3, expected=8, warm_reboot_futile=True, **srv._host_escalation_kwargs()
-    ) == ("power-cycle", False)
-    assert galaxy._host_escalation_for_drop(off_bus=8, expected=8, **srv._host_escalation_kwargs()) == (
-        "power-cycle",
-        False,
-    )
+    assert galaxy._host_escalation_for_drop(off_bus=off_bus, expected=expected, **kw) == ("power-cycle", False)
 
 
 @pytest.mark.asyncio
@@ -6054,46 +5932,6 @@ async def test_auto_power_cycle_aborts_when_the_ledger_cannot_be_written(monkeyp
 
     assert fired == [], "must NOT power-cycle when the escalation could not be recorded"
     assert [r for r in srv._recent_jobs(20) if r["owner"] == "[broker]power-cycle-request"] == []
-
-
-def test_reboot_already_attempted_ignores_this_boot_and_stale_records(monkeypatch, tmp_path):
-    """The escalation trigger is a reboot from a PREVIOUS boot in this episode (spec 04 I10). A reboot
-    record stamped with the current boot has not taken the box down yet; a reboot a verified release
-    followed is a different, already-recovered wedge. Neither is the 'reboot did not clear it' signal."""
-    d = _ledger_dir(monkeypatch, tmp_path)
-    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-B")
-    monkeypatch.setattr(recovery_base, "AUTO_RECOVERY_MIN_INTERVAL_SEC", 3600)
-    d_ledger = d / recovery_base.AUTO_RECOVERY_LEDGER
-    # This-boot reboot: box has not gone down for it yet.
-    d_ledger.write_text('{"action": "reboot", "boot_id": "boot-B", "at_epoch": 1000.0}\n')
-    assert srv.recovery_mechanism._reboot_already_attempted(now_epoch=1060.0) is False
-    # Previous-boot reboot: the escalation signal, past the interval too while no release verified.
-    d_ledger.write_text('{"action": "reboot", "boot_id": "boot-A", "at_epoch": 1000.0}\n')
-    assert srv.recovery_mechanism._reboot_already_attempted(now_epoch=1060.0) is True
-    assert srv.recovery_mechanism._reboot_already_attempted(now_epoch=1000.0 + 4000) is True
-    # A verified release after it: a separate, recovered wedge.
-    (d / recovery_base.AUTO_RECOVERY_VERIFIED).write_text('{"boot_id": "boot-B", "at_epoch": 1300.0}')
-    assert srv.recovery_mechanism._reboot_already_attempted(now_epoch=1000.0 + 4000) is False
-
-
-def test_unreadable_boot_id_never_escalates_to_power_cycle(monkeypatch, tmp_path):
-    """Fail-closed guard for a host whose /proc boot id cannot be read. Without a boot id we cannot
-    prove a reboot crossed a boot, and the interval (weaker-rank record) and the per-boot cap (no
-    boot id) both no-op — so if the chooser offered the power cycle here it would fire in the SAME
-    boot as the reboot with NO loop guard at all. It must stay on the reboot instead."""
-    d = _ledger_dir(monkeypatch, tmp_path)
-    monkeypatch.setattr(srv, "_current_boot_id", lambda: "")  # unreadable
-    monkeypatch.setattr(recovery_base, "AUTO_RECOVERY_MIN_INTERVAL_SEC", 3600)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
-    # A reboot recorded 60s ago; with no boot id this could be THIS boot's, not a crossed one.
-    (d / recovery_base.AUTO_RECOVERY_LEDGER).write_text('{"action": "reboot", "boot_id": "", "at_epoch": 1000.0}\n')
-    assert srv.recovery_mechanism._reboot_already_attempted(now_epoch=1060.0) is False
-    assert galaxy._choose_recovery_escalation(**srv._host_escalation_kwargs()) == "reboot"
-    # And the reboot's own interval guard still blocks a repeat, so nothing loops.
-    allowed, why = srv.recovery_mechanism.auto_recovery_allowed("reboot", tenant_active=False, now_epoch=1060.0)
-    assert allowed is False
-    assert "boot-loop guard" in why
 
 
 def _no_workspace_activation(monkeypatch):
@@ -6492,9 +6330,13 @@ def test_aiclk_left_busy_names_only_chips_above_the_idle_clock(monkeypatch):
         "2": {"tt_aiclk": None},
         "3": {},
         "4": {"tt_aiclk": 500},
+        "5": {"tt_aiclk": 0xFFFFFFFF},
+        "6": {"tt_aiclk": srv.AICLK_READ_MAX_MHZ + 1},
+        "7": {"tt_aiclk": srv.AICLK_READ_MAX_MHZ},
     }
     monkeypatch.setattr(srv, "chip_snapshot", lambda: snap)
-    assert srv._aiclk_left_busy(800) == {"0": 1350}
+    # 5: an off-bus chip's all-ones read; 6: no real clock reads that high. Neither is busy.
+    assert srv._aiclk_left_busy(800) == {"0": 1350, "7": srv.AICLK_READ_MAX_MHZ}
 
     def _boom():
         raise OSError("sysfs gone")
@@ -7466,23 +7308,10 @@ def _reach_reboot_rung(monkeypatch, tmp_path, n_present):
     async def fake_reboot(log, reason):
         reboots["n"] += 1
 
-    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", fake_reboot)
     patch_health_event(monkeypatch, lambda *a, **k: None)
     monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: {})
     monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
     return reboots
-
-
-@pytest.mark.asyncio
-async def test_a_mass_drop_still_reboots(monkeypatch, tmp_path, clear_job_state):
-    """The other half: a mass drop self-heal does NOT clear, so the reboot must still fire."""
-    reboots = _reach_reboot_rung(monkeypatch, tmp_path, n_present=1)
-    # Only 1 of 32 chips answers — the mesh is gone.
-    monkeypatch.setattr(srv, "read_heartbeats", lambda: {"0": 100})
-
-    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
-
-    assert reboots["n"] == 1, "a mass drop must still escalate to a reboot"
 
 
 @pytest.mark.asyncio
@@ -7532,25 +7361,6 @@ async def test_gate_all_off_bus_power_cycles_when_opted_in(monkeypatch, tmp_path
     assert (
         power_cycles["n"] == 1 and reboots["n"] == 0
     ), "an all-off-bus mesh with the cold rung opted in must power-cycle, not reboot"
-
-
-@pytest.mark.asyncio
-async def test_a_present_mesh_wedge_climbs_to_reboot_at_the_gate(monkeypatch, tmp_path, clear_job_state):
-    """The GATE path must progress like the idle-relift path already does: a PRESENT mesh (every chip
-    on the bus, off_bus==0) that stays unhealthy after a failed reset is an eth/fabric wedge the reset
-    could not clear and self-heal will not either — it must climb to the host reboot, not sit below
-    the mass floor forever. Fails on base, whose gate suppresses any off_bus < floor
-    (reboot_suppressed_below_mass_threshold), present mesh included — the indefinite hold seen on box B."""
-    reboots = _reach_reboot_rung(monkeypatch, tmp_path, n_present=32)
-    # Model box B: a reset ran and the chips came back ON the bus (off_bus==0) but STILL unhealthy —
-    # a fabric wedge. Disable the galaxy-reset floor so the reset runs and the flow reaches the reboot
-    # block (the floor's present-mesh hold is a separate rung, exercised elsewhere).
-    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0")
-    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 + i for i in range(32)})
-
-    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
-
-    assert reboots["n"] == 1, "a present-mesh wedge that survived the reset must climb to reboot, not hold"
 
 
 @pytest.mark.asyncio
@@ -7668,78 +7478,6 @@ async def test_gate_hard_failed_reset_holds_loudly_never_reboots(monkeypatch, tm
     assert reboots["n"] == 0, "a hard-failed reset leaving chips off the bus must never warm-reboot"
     assert "reset_unrecoverable_power_cycle_required" in events, "the cold rung must be named for the held drop"
     assert "reset_regressed_offbus" not in events, "an unchanged off-bus count is not a regression"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "tenant",
-    [DeviceHolder(pid=4242, uid=1000), DeviceHolder(pid=4242, uid=996, scoped=True)],
-    ids=["uid-floor", "scoped-service-account"],
-)
-async def test_a_tenant_arriving_before_the_reboot_decision_blocks_it(monkeypatch, tmp_path, clear_job_state, tenant):
-    """The gate scans for foreign holders TWICE: once before it touches anything, and again right
-    before the host rung — and the window between them is a whole galaxy reset wide. A tenant that
-    arrived inside it must reach the governor as active and block the reboot: the highest-risk
-    action in the repo does not get to take the box down over a run it merely started too late to
-    see. Only the idle path's equivalent re-scan was covered."""
-    reboots = _reach_reboot_rung(monkeypatch, tmp_path, n_present=1)
-    monkeypatch.setattr(srv, "read_heartbeats", lambda: {"0": 100})  # 31 of 32 off the bus
-    _ledger_dir(monkeypatch, tmp_path)
-
-    scans = {"n": 0}
-
-    def holders():
-        scans["n"] += 1
-        if scans["n"] == 1:
-            return HolderScan(holders=[], complete=True)  # nobody, at the top of the gate
-        # A tenant opened the device while the reset ran (a scoped service-account job is one too).
-        return HolderScan(holders=[tenant], complete=True)
-
-    monkeypatch.setattr(srv, "enumerate_device_holders", holders)
-    # The REAL governor, so the re-scan's tenant verdict is what decides — _reach_reboot_rung's
-    # blanket allow-everything stub would hide exactly the check under test.
-    real_governor = type(srv.recovery_mechanism).auto_recovery_allowed
-    seen = []
-
-    def governor(action, *, tenant_active):
-        seen.append(tenant_active)
-        return real_governor(srv.recovery_mechanism, action, tenant_active=tenant_active)
-
-    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", governor)
-
-    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
-
-    assert scans["n"] >= 2, "the gate must re-scan for holders before the host rung"
-    assert seen == [True], "the tenant that arrived mid-pass must reach the governor as active"
-    assert reboots["n"] == 0, "rebooted the box out from under a tenant that arrived mid-pass"
-
-
-@pytest.mark.asyncio
-async def test_the_gate_aborts_the_host_reboot_when_the_ledger_cannot_be_written(
-    monkeypatch, tmp_path, clear_job_state
-):
-    """The durable ledger write IS the rate limiter, and it must land BEFORE the rung fires: a
-    reboot no record survives is one the next boot repeats, which is a loop across boots. Driven
-    through the GATE, because the gate's host rung fires inside escalate() now and nothing pinned
-    that this ordering survived the move."""
-    _reach_reboot_rung(monkeypatch, tmp_path, n_present=1)  # reboot opted in, mass drop
-    monkeypatch.setattr(srv, "read_heartbeats", lambda: {"0": 100})
-    _ledger_dir(monkeypatch, tmp_path)
-    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
-    # Drop the harness's counting stub so the real _auto_reboot_host — the ledger-then-fire
-    # ordering under test — is what the gate reaches.
-    monkeypatch.delattr(srv.galaxy_recovery, "_auto_reboot_host")
-
-    recorded, fired = [], []
-    monkeypatch.setattr(
-        srv.recovery_mechanism, "record_auto_recovery", lambda *a, **k: recorded.append(a) or False
-    )  # unwritable ledger
-    monkeypatch.setattr(galaxy, "_fire_host_reboot", lambda: fired.append(True))
-
-    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
-
-    assert recorded, "the gate never reached the host rung, so this proves nothing"
-    assert fired == [], "fired a reboot the ledger could not record — the next boot repeats it"
 
 
 @pytest.mark.asyncio
@@ -8157,16 +7895,13 @@ def _rung(monkeypatch, deps, **kw):
 
     ``host_escalation``/``reset_recovered`` are legacy test-only shorthands, not ``Evidence``
     fields (``Evidence`` deliberately has neither — see its own docstring): ``host_escalation``
-    sets the auto-reboot/auto-power-cycle env opt-ins ``next_stage``'s own fold reads (mirroring
-    ``_choose_recovery_escalation``, so "reboot" needs only TT_DEVICE_MCP_AUTO_REBOOT and
-    "power-cycle" only TT_DEVICE_MCP_AUTO_POWER_CYCLE — the ledger read the fold also touches,
-    ``reboot_already_attempted``, reads an empty per-test ledger by default); ``reset_recovered``
+    sets the env ``next_stage``'s own fold reads: "power-cycle" arms TT_DEVICE_MCP_AUTO_POWER_CYCLE,
+    anything else leaves it off; ``reset_recovered``
     maps onto ``last_action=STAGE_SMI_RESET`` with ``last_action_recovered`` set to the same
     bool, ``None`` staying the pre-action ladder."""
     host_escalation = kw.pop("host_escalation", "unset")
     if host_escalation != "unset":
-        # Both rungs are armed by DEFAULT, so selecting one means explicitly disarming the other:
-        # clearing the var would leave it on and the router would name the gentler rung instead.
+        # "reboot" sets only the stale reboot setting, which arms no rung: the power cycle stays off.
         monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1" if host_escalation == "reboot" else "0")
         monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1" if host_escalation == "power-cycle" else "0")
     reset_recovered = kw.pop("reset_recovered", "unset")
@@ -8230,8 +7965,8 @@ def test_cascade_router_climbs_gentlest_first(monkeypatch, health_deps):
     # Below the galaxy floor with nothing to surgically reset: the per-tray BMC reset is the
     # next-gentlest rung the gate always attempts before holding (B5) — never a jump straight to
     # a mesh-wide reset over a single-chip wedge, whether or not a prior reset has failed.
-    assert _rung(monkeypatch, health_deps, off_bus=1) == STAGE_UBB_TRAY
-    assert _rung(monkeypatch, health_deps, off_bus=1, was_failing=True, host_escalation="reboot") == STAGE_UBB_TRAY
+    assert _rung(monkeypatch, health_deps, off_bus=1) == BELOW_FLOOR
+    assert _rung(monkeypatch, health_deps, off_bus=1, was_failing=True, host_escalation="reboot") == BELOW_FLOOR
     # At or above the floor, before this pass's reset: the mesh-wide galaxy reset — whether or not a
     # prior cycle failed. The gate runs the reset again on a fresh pass; a failed prior reset plus an
     # elapsed cooldown earns another attempt, NOT a jump to the host rung.
@@ -8250,43 +7985,49 @@ def test_cascade_router_keys_the_galaxy_floor_on_frozen_chips_too(monkeypatch, h
     assert _rung(monkeypatch, health_deps, off_bus=0, frozen_chips=32) == STAGE_SMI_RESET
     # Below the floor even combined: a few frozen chips still self-heal, so the per-tray rung (the
     # gate always attempts it below the floor) still stands, never the mesh-wide reset.
-    assert _rung(monkeypatch, health_deps, off_bus=0, frozen_chips=3) == STAGE_UBB_TRAY
+    assert _rung(monkeypatch, health_deps, off_bus=0, frozen_chips=3) == BELOW_FLOOR
 
 
 def test_cascade_router_escalates_to_the_host_rung_only_once_reset_is_exhausted(monkeypatch, health_deps):
-    """The host rungs (warm reboot, then BMC power cycle) are the highest-risk — each takes the whole
+    """The host rung (the BMC power cycle, the only one) is the highest-risk — it takes the whole
     box down. The gate reaches one only AFTER the galaxy reset it just ran also failed to recover
     (last_action is the galaxy reset, last_action_recovered is False), so the router names a host
     rung only in that post-reset phase, and only when a prior cycle failed too (was_failing), the
     drop is at/above the reboot floor, no reset is still cycling, AND that rung is opted in.
     Anything short holds the mesh degraded."""
     # Reset just ran and did not recover, a prior cycle failed too, mass drop, opted in: climb to the
-    # chosen host rung, gentlest of the two.
-    assert (
-        _rung(monkeypatch, health_deps, reset_recovered=False, off_bus=16, was_failing=True, host_escalation="reboot")
-        == STAGE_HOST_REBOOT
-    )
+    # power cycle, the only host rung.
     assert (
         _rung(
             monkeypatch, health_deps, reset_recovered=False, off_bus=16, was_failing=True, host_escalation="power-cycle"
         )
         == STAGE_POWER_CYCLE
     )
-    # Post-reset, mass drop, but neither host rung opted in (the default): hold, never reboot.
+    # Post-reset, mass drop, but the power cycle not armed: no rung can recover it, so BLOCKED (the
+    # loud fail-closed hold), never a warm reboot in its place.
     assert (
         _rung(monkeypatch, health_deps, reset_recovered=False, off_bus=16, was_failing=True, host_escalation=None)
-        == WAIT
+        == BLOCKED
     )
     # Post-reset but only THIS pass's reset failed (was_failing False — no prior cycle): one failed
     # reset is not "clearly won't recover", so hold, do not reboot.
     assert (
-        _rung(monkeypatch, health_deps, reset_recovered=False, off_bus=16, was_failing=False, host_escalation="reboot")
+        _rung(
+            monkeypatch,
+            health_deps,
+            reset_recovered=False,
+            off_bus=16,
+            was_failing=False,
+            host_escalation="power-cycle",
+        )
         == WAIT
     )
     # Post-reset below the reboot floor: a single/few-chip wedge self-heals and the holder-kill covers
     # the MCE path, so hold rather than reboot in-flight work away.
     assert (
-        _rung(monkeypatch, health_deps, reset_recovered=False, off_bus=1, was_failing=True, host_escalation="reboot")
+        _rung(
+            monkeypatch, health_deps, reset_recovered=False, off_bus=1, was_failing=True, host_escalation="power-cycle"
+        )
         == WAIT
     )
     # Post-reset but a reset re-opened its scope (a chip dropped mid-reset reads all-ones like a mass
@@ -8298,7 +8039,7 @@ def test_cascade_router_escalates_to_the_host_rung_only_once_reset_is_exhausted(
             reset_recovered=False,
             off_bus=16,
             was_failing=True,
-            host_escalation="reboot",
+            host_escalation="power-cycle",
             scope_active=True,
         )
         == WAIT
@@ -8306,12 +8047,14 @@ def test_cascade_router_escalates_to_the_host_rung_only_once_reset_is_exhausted(
     # Reset NOT yet run this pass (pre-reset) at a mass drop: run the galaxy reset first, not the host
     # rung — even with a prior cycle failed.
     assert (
-        _rung(monkeypatch, health_deps, reset_recovered=None, off_bus=16, was_failing=True, host_escalation="reboot")
+        _rung(
+            monkeypatch, health_deps, reset_recovered=None, off_bus=16, was_failing=True, host_escalation="power-cycle"
+        )
         == STAGE_SMI_RESET
     )
-    # A whole-bus drop after the failed reset, with only the reboot opted in and no power cycle to
-    # fall back to: BLOCKED (B7), never WAIT — no opted-in rung can recover it, so the loud
-    # fail-closed alert owns this, not the ordinary self-heal hold.
+    # A whole-bus drop after the failed reset with the power cycle not armed (a stale reboot setting
+    # arms nothing): BLOCKED (B7), never WAIT — no rung can recover it, so the loud fail-closed
+    # alert owns this, not the ordinary self-heal hold.
     assert (
         _rung(
             monkeypatch,
@@ -8395,10 +8138,12 @@ def test_cascade_router_climbs_the_present_mesh_post_reset_wedge_too(monkeypatch
     unhealthy after the reset it just ran — an eth/fabric wedge the reset could not clear, which
     self-heal will not either since it already survived the deepest reset (server.py:3148). A
     router that requires off_bus >= reboot_floor can never be satisfied by off_bus==0 (the reboot
-    floor is floored at 2) and names WAIT while the gate reboots."""
+    floor is floored at 2) and names WAIT while the gate climbs."""
     assert (
-        _rung(monkeypatch, health_deps, reset_recovered=False, off_bus=0, was_failing=True, host_escalation="reboot")
-        == STAGE_HOST_REBOOT
+        _rung(
+            monkeypatch, health_deps, reset_recovered=False, off_bus=0, was_failing=True, host_escalation="power-cycle"
+        )
+        == STAGE_POWER_CYCLE
     )
 
 
@@ -8456,42 +8201,6 @@ async def test_a_recovered_bridge_reset_releases_without_the_mesh_wide_reset(mon
     await srv._device_health_gate(None, phase="post-job", run_fabric=False)
 
     assert resets["n"] == 0, "the bridge reset pre-empts the mesh-wide galaxy reset"
-    assert srv.fsm.state is ServerState.HEALTHY
-
-
-@pytest.mark.asyncio
-async def test_a_recovered_ubb_tray_reset_releases_without_the_mesh_wide_reset(
-    monkeypatch, tmp_path, clear_job_state, galaxy_trays
-):
-    """A clean below-floor whole-tray drop, opted in, fires the per-tray BMC reset instead of
-    holding, and a walk that verifies healthy reopens the door — the mesh-wide reset (which inverts
-    a below-floor drop) never runs."""
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
-    _reach_reboot_rung(monkeypatch, tmp_path, n_present=24)
-    srv.isolated_chips = set()
-    srv.device_pci_map = {}
-    srv.device_fault_reported = ""
-    fsm_dirty(srv, "", why="gate_error")
-    # chips 24-31 (tray 3) off the bus; 0-23 tick -> off_bus 8, below the floor of 16.
-    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 + i for i in range(24)})
-    resets = _count_galaxy_resets(monkeypatch)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
-    monkeypatch.delenv("TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET", raising=False)
-
-    verify_calls = {"n": 0}
-
-    async def verify(expected, log, run_fabric=True, **_):
-        verify_calls["n"] += 1
-        ok = verify_calls["n"] > 1
-        return ok, {"snapshot": {"ok": ok, "detail": "" if ok else "chips 24-31 off the bus"}}
-
-    patch_recovery(monkeypatch, "_verify_device", verify)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda *a, **k: None, raising=False)
-
-    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
-
-    assert resets["n"] == 0, "the tray reset pre-empts the mesh-wide galaxy reset"
     assert srv.fsm.state is ServerState.HEALTHY
 
 
@@ -9521,7 +9230,6 @@ def _gate_offbus_hold_with_reported_fault(monkeypatch, tmp_path):
     monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 + i for i in range(30)})
     monkeypatch.setattr(srv, "isolated_chips", set())
     monkeypatch.setattr(srv, "device_pci_map", {})
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")
     monkeypatch.setattr(srv, "device_fault_reported", "job 031 waiting for active ethernet core")
     monkeypatch.setattr(FABRIC_DEBT, "owed", "")
@@ -10221,9 +9929,9 @@ def _arm_stuck_hold(
     """Arm the idle escalation: present-mesh hold past the ceiling, no tenant, no cooldown, reset
     mocked. ``beats_after_reset`` (if given) is what ``read_heartbeats`` returns AFTER the mocked
     reset runs — how a galaxy reset that dropped the mesh off the bus is expressed to the failed-
-    reset climb. The host rung (reboot/power-cycle) is mocked to count and its rate-limit ledger +
+    reset climb. The host rung (the power cycle) is mocked to count and its rate-limit ledger +
     boot id are stubbed open. Returns a counters dict recording reset / fault-clear / dirty-clear /
-    reboot / power-cycle calls."""
+    power-cycle calls; "reboots" stays 0, as no path reboots the host."""
     beats = beats if beats is not None else {str(i): 100 for i in range(32)}
     scan = scan if scan is not None else HolderScan(holders=[], complete=True)
     counters = {"resets": 0, "fault_cleared": 0, "dirty_cleared": 0, "reboots": 0, "power_cycles": 0}
@@ -10249,14 +9957,10 @@ def _arm_stuck_hold(
             monkeypatch.setattr(srv, "read_heartbeats", lambda: beats_after_reset)
         return reset_result
 
-    async def reboot(log, reason):
-        counters["reboots"] += 1
-
     async def power_cycle(log, reason):
         counters["power_cycles"] += 1
 
     patch_recovery(monkeypatch, "_reset_and_verify_device", reset)
-    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", reboot)
     monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
     monkeypatch.setattr(
         srv,
@@ -10423,26 +10127,36 @@ async def test_stuck_hold_escalation_is_inert_when_kill_switched(monkeypatch, cl
 
 
 @pytest.mark.asyncio
-async def test_stuck_hold_escalation_retries_on_the_grace_cadence(monkeypatch, clear_job_state):
-    """A present-mesh reset that does not clear the wedge RETRIES — an eth wedge does not self-heal
-    by waiting and the box is idle, so the only cure keeps getting its shot until recovery or the
-    ceiling. Retries are paced, not capped: a pass inside the grace window since the last reset
-    defers; one past it fires again, episode latch notwithstanding."""
-    counters = _arm_stuck_hold(monkeypatch, reset_result=False)  # the reset ran but did not recover
+@pytest.mark.parametrize("power_cycle", [False, True], ids=["no-host-rung", "power-cycle"])
+async def test_stuck_hold_escalation_never_repeats_a_failed_mesh_reset_in_the_episode(
+    monkeypatch, clear_job_state, power_cycle
+):
+    """Spec 04 I87: a present-mesh reset that ran and did not clear the wedge is spent for the hold
+    episode. A later idle pass past the grace, or a forced window, never runs it again: the climb
+    goes on to the power cycle (or hands off when there is none). Repeated resets ten minutes apart
+    measured nothing new and only pushed the power cycle later."""
+    counters = _arm_stuck_hold(monkeypatch, reset_result=False)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1" if power_cycle else "0")
+    real_reset = srv.galaxy_recovery._reset_and_verify_device
+
+    async def launched_reset(indices, log):
+        srv.recovery_mechanism.last_reset_rc = 1  # the reset launched and exited non-zero
+        return await real_reset(indices, log)
+
+    patch_recovery(monkeypatch, "_reset_and_verify_device", launched_reset)
     first = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
     assert first is True and counters["resets"] == 1
 
-    srv.galaxy_recovery.mechanism.last_reset_monotonic = time.monotonic()
-    second = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
-    assert (
-        second is False and counters["resets"] == 1
-    ), "inside the grace window since the last reset the retry must defer, not stack"
+    assert counters["power_cycles"] == (1 if power_cycle else 0), "the climb asks for the power cycle, if armed"
 
     srv.galaxy_recovery.mechanism.last_reset_monotonic = time.monotonic() - galaxy._present_mesh_reset_grace_sec() - 1
-    third = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
-    assert (
-        third is True and counters["resets"] == 2
-    ), "past the grace window the escalation retries — the episode latch is not a cap here"
+    again = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
+    assert again is False and counters["resets"] == 1, "an idle pass past the grace never repeats the reset"
+    assert counters["power_cycles"] == (1 if power_cycle else 0), "unforced, the climb runs once per episode"
+    # The watchdog's forced window (the I76 bound) climbs again, still without a second reset.
+    await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
+    assert counters["resets"] == 1, "the episode's one mesh reset is spent: no forced window repeats it"
+    assert counters["reboots"] == 0
 
 
 @pytest.mark.asyncio
@@ -10493,14 +10207,17 @@ async def test_stuck_hold_failed_reset_on_a_present_mesh_climbs_to_the_host_rung
     """A galaxy reset that did NOT recover but left the mesh PRESENT (every chip on the bus, ARC-
     healthy) is an eth/fabric wedge the reset could not clear — reaching here means the galaxy reset,
     which normally re-inits every eth core, failed, so it is NOT self-healing and the cascade must
-    climb to the host rung rather than hold indefinitely (measured on box D: hours of ceiling ->
-    galaxy-reset -> hold with the eth core wedged the whole time). Only a FEW chips off the bus below
-    the floor still holds (they re-enumerate) — see the below-floor test. Opt-in + rate-limited."""
+    climb to the host rung, the power cycle, rather than hold indefinitely (measured on one Galaxy:
+    hours of ceiling -> galaxy-reset -> hold with the eth core wedged the whole time). A stale reboot
+    setting changes nothing: the power cycle is the only host rung."""
     counters = _arm_stuck_hold(monkeypatch, reset_result=False, beats_after_reset={str(i): 100 for i in range(32)})
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     ran = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
     assert ran is True and counters["resets"] == 1
-    assert counters["reboots"] == 1, "a present-mesh wedge that survived the galaxy reset must climb to the host rung"
+    assert (
+        counters["power_cycles"] == 1
+    ), "a present-mesh wedge that survived the galaxy reset must climb to the power cycle"
 
 
 @pytest.mark.asyncio
@@ -10952,28 +10669,6 @@ async def test_escalate_does_not_report_recovered_when_the_mesh_was_never_degrad
 
 
 @pytest.mark.asyncio
-async def test_escalate_recovers_via_a_ubb_tray_reset(monkeypatch, clear_job_state, galaxy_trays):
-    """Closes the UBB-tray-recovered branch's escalate()-level coverage gap: the per-tray BMC
-    reset (neither the surgical bridge reset nor the mesh-wide reset) is what clears the hold, and
-    escalate() must report RECOVERED for it exactly as for the other two recovering rungs."""
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
-    counters = _arm_offbus_stuck_hold(monkeypatch, off_bus=8, isolated=set())  # chips 24-31 = tray 3
-    _make_clear_fns_real(monkeypatch, counters)
-    fsm_dirty(srv, "test")
-    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16, 8 is below it
-    monkeypatch.delenv("TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET", raising=False)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, chip_ids: None)
-
-    async def verified_after_reset(expected, log):
-        return True, {"snapshot": {"ok": True}}, 0
-
-    patch_recovery(monkeypatch, "_verify_device_after_reset", verified_after_reset)
-    outcome = await srv.galaxy_recovery.escalate("offbus", ["0", "1"], 32, lambda m: None)
-    assert outcome == OUTCOME_RECOVERED
-    assert counters["sbr"] == 0 and counters["resets"] == 0 and srv.fsm.state is ServerState.HEALTHY
-
-
-@pytest.mark.asyncio
 async def test_escalate_reports_terminal_when_a_below_floor_tray_down_fails_the_mesh_reset(
     monkeypatch, clear_job_state
 ):
@@ -10982,7 +10677,6 @@ async def test_escalate_reports_terminal_when_a_below_floor_tray_down_fails_the_
     ceiling, nothing opted in) only names the host rung — nothing recovered, so escalate() must
     report TERMINAL even though something ran."""
     counters = _arm_offbus_stuck_hold(monkeypatch, off_bus=8, isolated=set(), reset_result=False)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")
     monkeypatch.delenv("TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET", raising=False)
     fsm_dirty(srv, "test")
@@ -11083,7 +10777,6 @@ async def test_stuck_offbus_hold_below_floor_fires_the_power_cycle_when_opted_in
     )
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")  # cold rung opted in
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "0")  # tray reset named, not fired
     monkeypatch.delenv("TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET", raising=False)
 
     ran = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
@@ -11178,7 +10871,7 @@ async def test_present_mesh_failed_reset_sweeps_then_climbs_without_the_ceiling_
     swept = []
     counters = _arm_stuck_hold(monkeypatch, held_minutes_ago=6, reset_result=False)
     patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
 
     async def sweep(*a, **k):
         swept.append(k.get("context"))
@@ -11189,7 +10882,7 @@ async def test_present_mesh_failed_reset_sweeps_then_climbs_without_the_ceiling_
     assert ran is True
     assert counters["resets"] == 1, "the grace-time galaxy reset still fires"
     assert len(swept) == 1, "the last-chance sweep still runs before the host rung (I22)"
-    assert counters["reboots"] == 1 and counters["power_cycles"] == 0
+    assert counters["power_cycles"] == 1 and counters["reboots"] == 0
     assert "host_rung_not_deferred" in events and "host_rung_deferred_until_ladder_end" not in events
     assert counters["dirty_cleared"] == 0, "nothing releases the device without a passing full check"
 
@@ -11255,7 +10948,6 @@ async def test_forced_offbus_escalation_bypasses_the_once_per_episode_latch(monk
         monkeypatch, off_bus=8, isolated=set(), reset_result=False, sbr_verify_healthy=False
     )
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "0")  # name the tray rung, do not fire it
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     # Latch through the writer, not fsm.set_latch directly: the predicate the escalator reads
     # (_hold_escalation_latched) also checks the expiry clock, and a raw latch with a zero stamp
@@ -11548,15 +11240,10 @@ def _arm_regressed_offbus_hold(monkeypatch, *, held_minutes_ago=21):
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
     counters["trays"] = counters["sweeps"] = 0
 
-    async def tray(*a, **k):
-        counters["trays"] += 1
-        return None
-
     async def sweep(*a, **k):
         counters["sweeps"] += 1
         return False
 
-    monkeypatch.setattr(srv.galaxy_recovery, "_attempt_ubb_tray_reset", tray)
     monkeypatch.setattr(srv.galaxy_recovery, "_settle_and_verify_before_host_rung", sweep)
     return counters, events
 
@@ -11742,33 +11429,6 @@ async def test_gate_latches_a_regression_seen_before_any_hold(monkeypatch, tmp_p
 # --- F13: the per-UBB tray rung (a tray-down named as the lightest sufficient recovery) ---
 
 
-def test_ubb_reset_plan_maps_a_clean_whole_tray_drop_to_its_bitmap(galaxy_trays):
-    """A drop confined to whole trays maps to those trays and a bitmap. Tray numbers and bits come
-    from the chips' bus groups (I16): chips 0-7 are tray 1, 24-31 are tray 3, and 16-23 are tray 4
-    — so a 0-7 + 16-23 drop is trays 1 and 4, bits 0 and 3."""
-    assert galaxy._ubb_reset_plan({str(i) for i in range(8)}, 32, galaxy_trays) == ([1], 0x01)
-    assert galaxy._ubb_reset_plan({str(i) for i in range(24, 32)}, 32, galaxy_trays) == ([3], 0x04)
-    drop = {str(i) for i in list(range(8)) + list(range(16, 24))}
-    assert galaxy._ubb_reset_plan(drop, 32, galaxy_trays) == ([1, 4], 0x09)
-
-
-def test_ubb_reset_plan_rejects_a_partial_or_scattered_drop(galaxy_trays):
-    """The tray rung fits only a clean tray-down. A partial tray (half of tray 3 still up) or a chip
-    off-bus outside an otherwise-down tray would have the reset either miss it or take out live
-    silicon, so the plan is None and the drop falls through to the per-chip rung / hold."""
-    assert galaxy._ubb_reset_plan({"28", "29", "30", "31"}, 32, galaxy_trays) is None  # half of tray 3 up
-    assert galaxy._ubb_reset_plan({str(i) for i in range(8)} | {"20"}, 32, galaxy_trays) is None  # tray 1 + a stray
-    assert galaxy._ubb_reset_plan(set(), 32, galaxy_trays) is None  # nothing off-bus
-
-
-def test_ubb_reset_plan_needs_multi_tray_topology(galaxy_trays):
-    """Only a host with at least two full trays has the tray-reset failure mode; a single-tray or
-    non-tray-aligned chip count (an n300, a 20-chip host) gets None so the rung never fires there."""
-    assert galaxy._ubb_reset_plan({"0", "1"}, 2, galaxy_trays) is None  # not multi-tray
-    assert galaxy._ubb_reset_plan({str(i) for i in range(8)}, 8, galaxy_trays) is None  # one tray only
-    assert galaxy._ubb_reset_plan({str(i) for i in range(8)}, 20, galaxy_trays) is None  # 20 not a multiple of 8
-
-
 # --- F18: the tray rung broadened — walk ANY affected tray one at a time, not clean-tray-down only ---
 
 
@@ -11791,413 +11451,8 @@ def test_affected_trays_rejects_a_non_tray_topology_or_bad_drop(galaxy_trays):
     assert galaxy._affected_trays({"x"}, 32, galaxy_trays) is None  # malformed id
 
 
-def test_ubb_tray_walk_plan_walks_only_the_affected_trays(galaxy_trays):
-    """F18 / spec 04 I25: the walk re-powers only the trays holding an off-bus chip, one tray at a time,
-    ascending by real tray number. A tray whose chips are all on the bus is never in the plan."""
-    assert galaxy._ubb_tray_walk_plan({str(i) for i in range(8)}, 32, galaxy_trays) == [1]
-    assert galaxy._ubb_tray_walk_plan({str(i) for i in range(24, 32)}, 32, galaxy_trays) == [3]
-    assert galaxy._ubb_tray_walk_plan({"20"}, 32, galaxy_trays) == [4]  # a lone chip -> its tray only
-    assert galaxy._ubb_tray_walk_plan({"0", "31"}, 32, galaxy_trays) == [1, 3]  # never a healthy tray
-    assert galaxy._ubb_tray_walk_plan(set(), 32, galaxy_trays) is None  # no tray to re-power
-    assert galaxy._ubb_tray_walk_plan({str(i) for i in range(8)}, 8, galaxy_trays) is None  # single-tray host
-
-
-def test_maybe_emit_ubb_reset_required_names_the_exact_bmc_command_on_a_tray_down(monkeypatch, galaxy_trays):
-    """A tray-down emits the loud actionable event carrying the exact ipmitool command an operator
-    must run — the one the opted-in fire (F13b) would issue — and leaves the hold to the caller.
-    Chips 24-31 are tray 3, which is bit 2, so the named command must carry 0x04."""
-    calls = []
-    patch_health_event(monkeypatch, lambda name, *a, **k: calls.append((name, k)))
-    beats = {str(i): 100 for i in range(24)}  # chips 24-31 (tray 3) off the bus
-    trays = galaxy._maybe_emit_ubb_reset_required(beats, 8, 32, lambda m: None, galaxy_trays)
-    assert trays == [3]
-    names = [c[0] for c in calls]
-    assert "ubb_reset_required" in names
-    kw = dict(calls[names.index("ubb_reset_required")][1])
-    assert kw["command"] == "ipmitool raw 0x30 0x8b 0x04 0xff 0x00 0x0f"
-    assert kw["host_at_risk"] is True and kw["trays"] == [3]
-
-
-def test_maybe_emit_ubb_reset_required_names_the_affected_tray_even_for_a_lone_chip(monkeypatch, galaxy_trays):
-    """F18 broadening: a single off-bus chip is enough to name its tray — every off-bus chip belongs to
-    a tray, and re-powering that tray is the lightest recovery. The misfire guard fires only where
-    there is no tray to re-power at all: a host with no multi-tray topology."""
-    calls = []
-    patch_health_event(monkeypatch, lambda name, *a, **k: calls.append(name))
-    beats = {str(i): 100 for i in range(31)}  # only chip 31 off — a lone chip in tray 3
-    assert galaxy._maybe_emit_ubb_reset_required(beats, 1, 32, lambda m: None, galaxy_trays) == [3]
-    assert "ubb_reset_required" in calls
-    # A host with no multi-tray topology (a single n300) still gets nothing — no tray to re-power.
-    calls.clear()
-    assert galaxy._maybe_emit_ubb_reset_required({"0": 100}, 1, 2, lambda m: None, galaxy_trays) is None
-    assert "ubb_reset_required" not in calls
-
-
-@pytest.mark.asyncio
-async def test_stuck_offbus_hold_names_the_ubb_tray_rung_then_climbs_on_a_clean_tray_drop(
-    monkeypatch, clear_job_state, galaxy_trays
-):
-    """A whole tray (8 chips) off the bus is below the galaxy-reset floor: the mesh reset must not fire
-    (it inverts the drop), and with the per-tray BMC reset forced off (=0; the default is now ON) it is
-    only NAMED — the lightest sufficient recovery an operator can run. But naming a rung must never
-    become a silent indefinite hold: past the grace the escalation climbs to the host rung, loudly when
-    none is opted in. Fails on base, which holds silently."""
-    events = []
-    counters = _arm_offbus_stuck_hold(
-        monkeypatch, off_bus=8, isolated=set(), reset_result=False
-    )  # chips 24-31 = tray 3
-    patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "0")  # force off -> name it, then climb
-    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
-    monkeypatch.delenv("TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET", raising=False)
-    ran = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
-    assert ran is True, "a below-floor tray-down past the grace must climb, never hold indefinitely"
-    assert (
-        counters["sbr"] == 0 and counters["resets"] == 1
-    ), "the named-but-unfired tray rung falls to the mesh reset's below-floor attempt"
-    assert "ubb_reset_required" in events, "a clean tray-down must name the lightest sufficient recovery"
-    assert (
-        "stuck_hold_galaxy_reset_below_floor_attempt" in events
-    ), "the below-floor mesh reset is attempted, not suppressed, on the stuck-hold ladder"
-    assert (
-        "reset_unrecoverable_power_cycle_required" in events
-    ), "with no host rung opted in the climb must be loud, never a silent hold"
-    assert counters["fault_cleared"] == 0 and counters["dirty_cleared"] == 0
-
-
-@pytest.mark.asyncio
-async def test_gate_below_floor_hold_names_the_ubb_tray_rung_on_a_clean_tray_drop(
-    monkeypatch, tmp_path, clear_job_state, galaxy_trays
-):
-    """The gate side of the tray-down, made actionable, with the fire forced off. A whole tray (8 chips
-    = tray 3) off the bus at a job boundary is below the galaxy-reset floor, so the gate holds it (the mesh
-    reset would invert it, the reboot cannot re-enumerate it) — but base holds SILENTLY until the box
-    goes idle. It must name the per-tray BMC reset while still holding (no reset, no release). With the
-    rung forced off (=0; the default is now ON) this is the name-and-hold path. Fails on base, which
-    emits no ubb_reset_required at the gate's below-floor hold."""
-    events = []
-    _reach_reboot_rung(monkeypatch, tmp_path, n_present=24)  # 24 /dev nodes: past the empty-dir check
-    srv.isolated_chips = set()
-    srv.device_pci_map = {}
-    srv.device_fault_reported = ""
-    fsm_dirty(srv, "", why="gate_error")
-    # chips 24-31 (tray 3) off the bus; 0-23 tick -> off_bus 8, below the floor of 16.
-    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 + i for i in range(24)})
-    resets = _count_galaxy_resets(monkeypatch)
-    patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "0")  # force off -> name it and hold
-    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
-    monkeypatch.delenv("TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET", raising=False)
-
-    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
-
-    assert resets["n"] == 0, "a below-floor tray-down must hold at the gate, never fire the mesh-inverting galaxy reset"
-    assert (
-        "ubb_reset_required" in events
-    ), "the gate must name the lightest sufficient recovery for a clean tray-down, not hold silently"
-    assert (
-        "galaxy_reset_suppressed_below_mass_threshold" in events
-    ), "the below-floor suppression still holds — the tray event only adds actionability"
-    assert srv.fsm.state is not ServerState.HEALTHY, "the tray-down must keep the tenant door shut"
-
-
-@pytest.mark.asyncio
-async def test_ubb_tray_reset_fires_and_recovers_a_clean_tray_down_when_opted_in(
-    monkeypatch, clear_job_state, galaxy_trays
-):
-    """Opted in, a clean below-floor tray-down FIRES the per-tray BMC reset — the lightest sufficient
-    recovery — instead of holding. A reset that verifies healthy retires the fault and clears the hold,
-    and the mesh-wide galaxy reset (which would invert the below-floor drop) never runs. Fails on base,
-    which has no tray-reset rung: the tray-down holds and no fire is issued."""
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
-    fired = {"n": 0}
-    counters = _arm_offbus_stuck_hold(
-        monkeypatch, off_bus=8, isolated=set(), sbr_verify_healthy=True  # chips 24-31 = tray 3
-    )
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
-    monkeypatch.delenv("TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET", raising=False)
-    monkeypatch.setattr(
-        galaxy, "_fire_ubb_reset", lambda *a, **k: fired.__setitem__("n", fired["n"] + 1), raising=False
-    )
-    ran = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
-    assert ran is True
-    assert fired["n"] == 1, "a clean tray-down opted in must fire the per-tray BMC reset"
-    assert counters["resets"] == 0, "the tray reset must pre-empt the mesh-wide galaxy reset"
-    assert (
-        counters["fault_cleared"] == 1 and counters["dirty_cleared"] == 1
-    ), "a tray reset that verified healthy retires the fault and clears the hold"
-
-
-@pytest.mark.asyncio
-async def test_ubb_tray_reset_fires_on_a_partial_tray_below_floor_drop(monkeypatch, clear_job_state, galaxy_trays):
-    """F18 broadening: opted in, a below-floor drop that is NOT a clean whole-tray-down — half of a
-    tray, the rest of that tray still up — now FIRES the per-tray reset on the AFFECTED tray instead of
-    holding. Re-powering the tray bounces its live chips too, but that is strictly lighter than the
-    32-chip mesh reset (which inverts a partial drop off the bus). chips 28-31 off is half of tray 3.
-    Fails on base, whose clean-tray-down-only rung returns None here and holds silently."""
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
-    fired = {"n": 0}
-    counters = _arm_offbus_stuck_hold(
-        monkeypatch, off_bus=4, isolated=set(), sbr_verify_healthy=True  # 28-31 off = half tray 3
-    )
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
-    monkeypatch.delenv("TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET", raising=False)
-    monkeypatch.setattr(
-        galaxy, "_fire_ubb_reset", lambda *a, **k: fired.__setitem__("n", fired["n"] + 1), raising=False
-    )
-    ran = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
-    assert ran is True
-    assert fired["n"] == 1, "the affected tray (tray 3) is re-powered even though only half of it dropped"
-    assert counters["resets"] == 0, "the tray reset pre-empts the mesh-wide galaxy reset"
-    assert counters["fault_cleared"] == 1 and counters["dirty_cleared"] == 1
-
-
-@pytest.mark.asyncio
-async def test_ubb_tray_reset_walk_falls_through_to_the_hold_when_the_affected_tray_stays_off(
-    monkeypatch, clear_job_state, galaxy_trays
-):
-    """A per-tray reset walk that re-powered the affected tray (spec 04 I25: only trays holding an
-    off-bus chip) and still did not recover must not sit: with no bounded power cycle to hand off to
-    (spec 04 I27) it climbs straight to the host rung (a warm reboot cannot re-enumerate a still-off-bus
-    tray, so the cold power cycle is the only rung left), loudly when none is opted in, and the
-    episode's one walk is spent so it does not loop. No below-floor mesh reset follows a failed walk:
-    on one Galaxy it overran its 180 s and failed with 8 chips off. Fails on base, which falls to a
-    silent below-floor hold."""
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
-    fired = {"n": 0}
-    counters = _arm_offbus_stuck_hold(
-        monkeypatch, off_bus=8, isolated=set(), sbr_verify_healthy=False, reset_result=False
-    )  # no tray reset recovers the mesh
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")
-    monkeypatch.delenv("TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET", raising=False)
-    events = []
-    patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
-    monkeypatch.setattr(
-        galaxy, "_fire_ubb_reset", lambda *a, **k: fired.__setitem__("n", fired["n"] + 1), raising=False
-    )
-    ran = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
-    assert ran is True, "a walk that did not recover must climb, never sit"
-    assert fired["n"] == 1, "the walk re-powered the affected tray only, never a healthy one"
-    assert counters["resets"] == 0, "no below-floor mesh reset after a failed walk"
-    assert counters["dirty_cleared"] == 0, "a walk that did not verify healthy must not clear the hold"
-    assert "ubb_reset_did_not_recover" in events
-    assert "galaxy_reset_skipped_after_tray_walk" in events
-    assert "stuck_hold_galaxy_reset_below_floor_attempt" not in events
-    assert (
-        "reset_unrecoverable_power_cycle_required" in events
-    ), "the failed walk climbs loudly to the host rung, never a silent hold"
-    assert srv.fsm.latch("ubb_reset_fired") is True, "the episode's one walk is spent"
-
-
-@pytest.mark.asyncio
-async def test_ubb_tray_reset_fires_at_most_once_per_hold_episode(monkeypatch, clear_job_state, galaxy_trays):
-    """The per-tray reset carries its own once-per-episode latch — the gate, unlike the idle
-    escalation, never sets the general one — so a second attempt in the same episode names the command
-    and holds rather than re-powering the tray again."""
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
-    fired = {"n": 0}
-    srv.fsm.set_latch("ubb_reset_fired", False)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-
-    async def healthy(expected, log, run_fabric=True, **_):
-        return True, {"snapshot": {"ok": True}}
-
-    patch_recovery(monkeypatch, "_verify_device", healthy)
-    monkeypatch.setattr(
-        galaxy, "_fire_ubb_reset", lambda *a, **k: fired.__setitem__("n", fired["n"] + 1), raising=False
-    )
-    beats = {str(i): 100 for i in range(24)}  # chips 24-31 = tray 3 off the bus
-    first = await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 8, 32, lambda m: None)
-    second = await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 8, 32, lambda m: None)
-    assert (
-        first is True and second is None
-    ), "the first attempt fires and recovers; the second is latched off and only names the command"
-    assert fired["n"] == 1, "at most one per-tray reset per hold episode"
-
-
-@pytest.mark.asyncio
-async def test_ubb_tray_reset_walk_stops_as_soon_as_the_mesh_is_healthy(monkeypatch, clear_job_state, galaxy_trays):
-    """F18: the affected tray leads and the walk STOPS the moment the mesh verifies healthy — it does
-    not go on to bounce the healthy trays. One affected tray (tray 3), verify healthy after its reset ->
-    exactly one fire, of that tray's bitmap."""
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
-    fired = []
-    srv.fsm.set_latch("ubb_reset_fired", False)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-
-    async def healthy(expected, log, run_fabric=True, **_):
-        return True, {"snapshot": {"ok": True}}
-
-    patch_recovery(monkeypatch, "_verify_device", healthy)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: fired.append(bitmap), raising=False)
-    beats = {str(i): 100 for i in range(24)}  # chips 24-31 = tray 3 off the bus
-    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 8, 32, lambda m: None)
-    assert out is True
-    assert fired == [0x04], "only the affected tray (tray 3 = bit 2) was re-powered; the walk stopped healthy"
-
-
-@pytest.mark.asyncio
-async def test_ubb_tray_reset_declines_a_fully_off_bus_mesh_it_is_the_cold_rung(monkeypatch, clear_job_state):
-    """A fully-off-bus mesh (every chip gone from the bus) is the cold-power-cycle case, never the tray
-    rung: a BMC tray reset cannot verify a tray with no chip on the bus, and re-powering it does not
-    re-enumerate a dropped ASIC. _attempt_ubb_tray_reset must DECLINE — return None, fire nothing, and
-    not spend the episode's one walk — so the caller's all-off-bus cold rung owns it. Fails on base,
-    whose walk maps all 32 off-bus chips onto all four trays and re-powers every one."""
-    fired = []
-    srv.fsm.set_latch("ubb_reset_fired", False)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-
-    async def never_healthy(expected, log, run_fabric=True, **_):
-        return False, {"snapshot": {}}
-
-    patch_recovery(monkeypatch, "_verify_device", never_healthy)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: fired.append(bitmap), raising=False)
-    beats = {}  # no chip on the bus — the whole 32-chip mesh is off
-    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 32, 32, lambda m: None)
-    assert out is None, "a fully-off-bus mesh is declined to the cold rung, not walked"
-    assert fired == [], "no tray is re-powered on an all-off-bus mesh"
-    assert srv.fsm.latch("ubb_reset_fired") is False, "declining must not spend the episode's one per-tray walk"
-
-
-@pytest.mark.asyncio
-async def test_ubb_tray_reset_walk_never_sweeps_healthy_trays_when_the_affected_tray_does_not_recover(
-    monkeypatch, clear_job_state, galaxy_trays
-):
-    """Spec 04 I25: when re-powering the affected tray does not clear the drop, the walk does NOT go on
-    to re-power the trays whose chips are all on the bus (fleet: sweeping healthy trays took 16+ chips
-    off in a third of single-chip walks). It returns False and the next rung (the mesh reset) owns the
-    rest, so no rung before the power cycle is skipped."""
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
-    fired = []
-    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(32)})
-    srv.fsm.set_latch("ubb_reset_fired", False)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-
-    async def unhealthy(expected, log, run_fabric=True, **_):
-        return False, {"snapshot": {"ok": False}}
-
-    patch_recovery(monkeypatch, "_verify_device", unhealthy)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: fired.append(bitmap), raising=False)
-    beats = {str(i): 100 for i in range(24)}  # tray 3 off; 0-23 up
-    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 8, 32, lambda m: None)
-    assert out is False, "not recovered -> the caller climbs to the next rung"
-    assert fired == [0x04], "affected tray 3 only — a tray whose chips are all present is never re-powered"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("tray", [1, 2, 3, 4])
-async def test_ubb_tray_reset_walk_recovers_chips_off_on_any_tray_by_re_powering_that_tray_alone(
-    monkeypatch, clear_job_state, galaxy_trays, tray
-):
-    """Recovery equivalence (spec 04 I25): for chips off on tray X, re-powering tray X alone recovers
-    them, exactly as the old walk did when it fired X first. No other tray is touched."""
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
-    fired = []
-    srv.fsm.set_latch("ubb_reset_fired", False)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-
-    async def healthy_after_x(expected, log, run_fabric=True, **_):
-        return (len(fired) == 1, {"snapshot": {"ok": len(fired) == 1}})
-
-    patch_recovery(monkeypatch, "_verify_device", healthy_after_x)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: fired.append(bitmap), raising=False)
-    off = set(galaxy_trays[tray])
-    beats = {str(i): 100 for i in range(32) if i not in off}
-    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, len(off), 32, lambda m: None)
-    assert out is True, f"re-powering tray {tray} alone recovers its chips"
-    assert fired == [1 << (tray - 1)], f"only tray {tray} was re-powered"
-
-
-@pytest.mark.asyncio
-async def test_ubb_tray_reset_walk_does_not_clear_a_hold_on_an_unverified_fabric(
-    monkeypatch, clear_job_state, galaxy_trays
-):
-    """A per-tray reset whose post-reset fabric never verifies (a persistent 77 — the pass found no
-    trained link, a training-window verdict, not proof the mesh moves data) is NOT a recovery. The walk
-    must not STOP and clear the hold onto an unproven fabric — the box D shape, where enum+ARC read OK
-    while every full-mesh job died on a down eth link. It gives the 77 training time, then, still
-    unverified, treats that tray as not-recovered; a walk that never verifies returns False and holds. Fails on base, where a 77 reads healthy=True so the first tray's reset stops the
-    walk and clears the hold."""
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
-    fired = []
-    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(32)})  # all back on the bus
-    srv.fsm.set_latch("ubb_reset_fired", False)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
-    monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRIES", 1)  # bound the training retry
-    monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRY_SLEEP_SEC", 0)  # no real sleep in a unit test
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-
-    async def verify_77(expected, log, run_fabric=True, **_):
-        return True, {"fabric": {"ok": None, "detail": "no link tested (77)"}}  # persistent 77
-
-    patch_recovery(monkeypatch, "_verify_device", verify_77)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: fired.append(bitmap), raising=False)
-    beats = {str(i): 100 for i in range(24)}  # chips 24-31 = tray 3 off the bus
-    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 8, 32, lambda m: None)
-    assert out is False, "a persistent post-reset 77 is NOT a verified recovery — the walk must not clear the hold"
-    assert fired == [0x04], "an unverified fabric never stops-and-clears on the 77, and no healthy tray is swept"
-
-
-def _arm_ubb_walk(monkeypatch, heartbeat_reads, verify_healthy=None):
-    """Arm a direct per-tray walk: guards open, opted in, every fire recorded. ``heartbeat_reads`` are
-    the bus reads the walk makes after each failed verify, in order (the last one repeats);
-    ``verify_healthy`` the verify verdict per step (default: never healthy). Returns (fired, events)."""
-    fired, events = [], []
-    srv.fsm.set_latch("ubb_reset_fired", False)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
-    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
-    # A fresh host: no record of an earlier walk's regression on this boot (it survives a restart).
-    (pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE).unlink(missing_ok=True)
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
-    patch_health_event(monkeypatch, lambda name, *a, **k: events.append((name, k)))
-    reads = list(heartbeat_reads)
-    monkeypatch.setattr(srv, "read_heartbeats", lambda: dict(reads.pop(0) if len(reads) > 1 else reads[0]))
-    verdicts = list(verify_healthy or [])
-
-    async def verify(expected, log, run_fabric=True, **_):
-        ok = verdicts.pop(0) if verdicts else False
-        return ok, {"snapshot": {"ok": ok}}
-
-    patch_recovery(monkeypatch, "_verify_device", verify)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: fired.append(bitmap), raising=False)
-    return fired, events
-
-
 def _beats_without(off):
     return {str(i): 100 for i in range(32) if i not in off}
-
-
-@pytest.mark.asyncio
-async def test_ubb_tray_reset_walk_re_powers_every_affected_tray(monkeypatch, clear_job_state, galaxy_trays):
-    """With two affected trays, one chip that stays off on the first must not stop the walk before the
-    second is re-powered; then the walk ends without touching a healthy tray (spec 04 I25)."""
-    off = {3, 24}  # one chip on tray 1, one on tray 3
-    fired, events = _arm_ubb_walk(monkeypatch, [_beats_without(off)])
-    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(off), 2, 32, lambda m: None)
-    assert out is False
-    assert fired == [0x01, 0x04], "both affected trays, never a healthy one"
-    assert "ubb_reset_did_not_recover" in [n for n, _ in events]
 
 
 def _tray_of(tray_map, chip):
@@ -12205,63 +11460,11 @@ def _tray_of(tray_map, chip):
 
 
 @pytest.mark.asyncio
-async def test_a_one_chip_drop_on_a_full_galaxy_never_re_powers_its_tray(monkeypatch, clear_job_state, galaxy_trays):
-    """The 1 -> 24 case: chip 18 off the bus on a 32/32 Galaxy, below the reset floor and on one tray.
-    Re-powering that tray took the other trays off the bus with it (24 chips off 40 s later), so by
-    default the walk declines: no fire, no once-per-episode latch spent, the hold stands. Opted back in
-    (TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK=1) the same drop fires the tray and the walk sees the 1 -> 24
-    regression. Fails on base, which fires the tray re-power by default."""
-    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
-    tray = _tray_of(galaxy_trays, 18)
-    others = {c for t, chips in galaxy_trays.items() if t != tray for c in map(int, chips)}
-    after_fire = _beats_without(others)  # what the box read after the tray re-power: 24 off
-    lines = []
-    fired, events = _arm_ubb_walk(monkeypatch, [after_fire])
-    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without({18}), 1, 32, lines.append)
-    names = [n for n, _ in events]
-    assert out is None and fired == [], "a one-chip drop on one tray must not re-power the tray"
-    assert "ubb_reset_begin" not in names
-    declined = dict(events)["ubb_reset_declined_single_tray"]
-    assert declined["tray"] == tray and declined["off_bus"] == ["18"] and declined["floor"] == 16
-    assert srv.fsm.latch("ubb_reset_fired") is False, "a declined walk must not spend the episode's one walk"
-    assert any("holding" in m for m in lines)
-
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")
-    fired, events = _arm_ubb_walk(monkeypatch, [after_fire])
-    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without({18}), 1, 32, lambda m: None)
-    assert out is False and fired == [1 << (tray - 1)]
-    regressed = dict(events)["ubb_reset_regressed_offbus"]
-    assert regressed["off_bus_before"] == 1 and regressed["off_bus_after"] == 24
-
-
-@pytest.mark.asyncio
-async def test_a_whole_tray_below_the_floor_is_not_re_powered_alone_but_two_trays_still_walk(
-    monkeypatch, clear_job_state, galaxy_trays
-):
-    """The guard is keyed on one affected tray below the floor, whatever the count on it: a whole tray
-    (8 off) is declined too, as a whole-tray drop that goes to the power cycle. A below-floor partial
-    drop across two trays still walks both (spec 04 I25)."""
-    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
-    tray3 = set(range(24, 32))
-    fired, events = _arm_ubb_walk(monkeypatch, [_beats_without(tray3)])
-    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(tray3), 8, 32, lambda m: None)
-    assert out is False and fired == []
-    assert "ubb_reset_declined_whole_tray" in [n for n, _ in events]
-
-    fired, events = _arm_ubb_walk(monkeypatch, [_beats_without({3, 24})])
-    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without({3, 24}), 2, 32, lambda m: None)
-    assert out is False and fired == [0x01, 0x04]
-    assert "ubb_reset_declined_single_tray" not in [n for n, _ in events]
-
-
-@pytest.mark.asyncio
-async def test_gate_holds_a_one_chip_drop_without_a_tray_re_power(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
-    """At a job boundary a one-chip drop (chip 18) on a 32/32 Galaxy reaches the below-floor tray rung.
-    With the rung armed (the default) the gate must still not fire the tray, must not run the mesh
-    reset, and must keep the device held: nothing was reset, so nothing was verified, so nothing is
-    released. Fails on base, which fires the tray re-power at the gate."""
+async def test_gate_holds_a_one_chip_drop_below_the_floor(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
+    """At a job boundary a one-chip drop (chip 18) on a 32/32 Galaxy is below the reset floor. The
+    gate must not run the mesh reset and must keep the device held: nothing was reset, so nothing was
+    verified, so nothing is released. No tray re-power exists to fire."""
     events = []
-    fired = {"n": 0}
     cleared = {"n": 0}
     _reach_reboot_rung(monkeypatch, tmp_path, n_present=31)
     srv.isolated_chips = set()
@@ -12271,317 +11474,26 @@ async def test_gate_holds_a_one_chip_drop_without_a_tray_re_power(monkeypatch, t
     monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 + i for i in range(32) if i != 18})
     resets = _count_galaxy_resets(monkeypatch)
     patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
     monkeypatch.delenv("TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET", raising=False)
     monkeypatch.setattr(srv, "_clear_device_dirty", lambda **kw: cleared.__setitem__("n", cleared["n"] + 1))
-    monkeypatch.setattr(
-        galaxy, "_fire_ubb_reset", lambda *a, **k: fired.__setitem__("n", fired["n"] + 1), raising=False
-    )
 
     await srv._device_health_gate(None, phase="post-job", run_fabric=False)
 
-    assert fired["n"] == 0, "the gate must not re-power a tray for a one-chip drop"
-    assert resets["n"] == 0, "nor run the mesh reset below the floor"
-    assert "ubb_reset_declined_single_tray" in events
+    assert resets["n"] == 0, "the gate must not run the mesh reset below the floor"
     assert cleared["n"] == 0 and srv.fsm.state is not ServerState.HEALTHY, "the device stays held"
 
 
 @pytest.mark.asyncio
-async def test_a_declined_tray_walk_hands_the_stuck_hold_to_the_next_rung(monkeypatch, clear_job_state, galaxy_trays):
-    """On the stuck-hold ladder the declined walk is not a dead end: the climb goes on to the next rung
-    (the mesh reset, then the host rungs), and a reset that does not verify never clears the hold."""
-    fired = {"n": 0}
+async def test_a_below_floor_stuck_hold_climbs_to_the_next_rung(monkeypatch, clear_job_state, galaxy_trays):
+    """On the stuck-hold ladder a one-chip drop is not a dead end: the climb goes to the mesh reset,
+    then the host rungs, and a reset that does not verify never clears the hold."""
     counters = _arm_offbus_stuck_hold(monkeypatch, off_bus=1, isolated=set(), reset_result=False)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
     monkeypatch.delenv("TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET", raising=False)
-    monkeypatch.setattr(
-        galaxy, "_fire_ubb_reset", lambda *a, **k: fired.__setitem__("n", fired["n"] + 1), raising=False
-    )
     await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
-    assert fired["n"] == 0, "no single-tray re-power on the stuck-hold ladder either"
     assert counters["resets"] == 1, "the climb goes on to the next rung"
     assert counters["fault_cleared"] == 0 and counters["dirty_cleared"] == 0
-
-
-@pytest.mark.asyncio
-async def test_an_opted_in_single_tray_walk_releases_only_after_the_full_check(
-    monkeypatch, clear_job_state, galaxy_trays
-):
-    """Goal: health check after every reset. Opted back in, a single-tray re-power is a reset like any
-    other: the walk recovers only on the full post-reset check (fabric included), and a check that fails
-    leaves the device held."""
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")
-    calls = []
-
-    for healthy in (False, True):
-        calls.clear()
-        fired, _events = _arm_ubb_walk(monkeypatch, [_beats_without({18})])
-
-        async def verify(expected, log, run_fabric=True, healthy=healthy, **_):
-            calls.append(run_fabric)
-            return healthy, {"snapshot": {"ok": healthy}}
-
-        patch_recovery(monkeypatch, "_verify_device", verify)
-        out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without({18}), 1, 32, lambda m: None)
-        assert len(fired) == 1 and calls and all(calls), "the post-reset check ran, fabric included"
-        assert out is healthy, "the walk recovers only when that check passed"
-
-
-@pytest.mark.asyncio
-async def test_ubb_tray_reset_walk_stops_when_a_step_takes_a_healthy_chip_off_the_bus(
-    monkeypatch, clear_job_state, galaxy_trays
-):
-    """A step that takes a chip off the bus that was on it before the walk makes things worse: the
-    walk stops at once with ubb_reset_regressed_offbus and returns False, rather than re-power more
-    trays. Covered on a one-tray walk and on the first of two affected trays. Fails on base, which
-    walked on and took 17 chips off the bus on a real host."""
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
-    start = set(range(24, 32))
-    # Affected step: tray 3 stays off and chip 5 (tray 1) dropped with it.
-    fired, events = _arm_ubb_walk(monkeypatch, [_beats_without(start | {5})])
-    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(start), 8, 32, lambda m: None)
-    assert out is False and fired == [0x04]
-    regressed = dict(events)["ubb_reset_regressed_offbus"]
-    assert regressed["new_off"] == ["5"] and regressed["off_bus_before"] == 8 and regressed["off_bus_after"] == 9
-
-    # Two affected trays (chip 3 on tray 1, chips 24-31 on tray 3): tray 1's re-power leaves chips 16-23
-    # off, so the walk stops before tray 3.
-    start = start | {3}
-    fired, events = _arm_ubb_walk(monkeypatch, [_beats_without(start | set(range(16, 24)))])
-    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(start), 9, 32, lambda m: None)
-    assert out is False
-    assert fired == [0x01], "the walk stops at the step that regressed, no further tray"
-    assert dict(events)["ubb_reset_regressed_offbus"]["new_off"] == [str(c) for c in range(16, 24)]
-
-
-@pytest.mark.asyncio
-async def test_ubb_tray_reset_walk_rescans_after_each_tray_before_the_verify(
-    monkeypatch, clear_job_state, galaxy_trays
-):
-    """A tray re-power does not undo the dead-chip sampler's `remove`, so each step rescans the PCI bus
-    (and settles) before its verify, and the pollers stay stopped across the walk and come back at the
-    end of a walk that recovered (an unrecovered one leaves them stopped, spec 03 I66). A failed rescan still verifies. A walk that recovers takes its chips out of isolated_chips,
-    so the next gate does not bridge-reset them. Fails on base, which never rescanned."""
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
-    order = []
-    fired, _events = _arm_ubb_walk(monkeypatch, [_beats_without(set())])
-    monkeypatch.setattr(galaxy, "UBB_WALK_RESCAN_SETTLE_SEC", 0)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", lambda bitmap, ids: order.append(("fire", bitmap)), raising=False)
-    monkeypatch.setattr(galaxy, "_pci_rescan", lambda: order.append(("rescan",)))
-    pollers = stub_device_pollers(monkeypatch, stopped=["tt-poller.service"])
-
-    async def verify(expected, log, run_fabric=True, **_):
-        order.append(("verify",))
-        return False, {"snapshot": {"ok": False}}
-
-    patch_recovery(monkeypatch, "_verify_device", verify)
-    off = set(range(24, 32)) | {3}  # trays 1 and 3
-    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(off), 9, 32, lambda m: None)
-    assert out is False
-    assert order == [
-        step for bitmap in (0x01, 0x04) for step in (("fire", bitmap), ("rescan",), ("verify",))
-    ], "fire, rescan, verify for every tray"
-    assert pollers == [False], "pollers stopped once across the walk; an unrecovered walk leaves them down (03 I66)"
-
-    # A failed rescan is logged and the verify still runs; a recovered walk un-isolates its chips.
-    _arm_ubb_walk(monkeypatch, [_beats_without(set())], verify_healthy=[True])
-
-    def rescan_fails():
-        raise OSError("read-only sysfs")
-
-    monkeypatch.setattr(galaxy, "_pci_rescan", rescan_fails)
-    srv.isolated_chips = {"24", "3"}
-    lines = []
-    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(set(range(24, 32))), 8, 32, lines.append)
-    assert out is True
-    assert any("PCI rescan after the tray 3 re-power failed" in m for m in lines)
-    assert srv.isolated_chips == {"3"}, "the walk's chips are back on the bus, so no longer isolated"
-    assert pollers == [False, False, True], "a recovered walk restarts the pollers at the end"
-
-
-@pytest.mark.asyncio
-async def test_the_walk_rescans_only_the_re_powered_trays_root_ports(monkeypatch, clear_job_state, galaxy_trays):
-    """A global rescan after a tray's re-power also walks the other trays' ports; on a Galaxy each
-    per-tray re-power then left the slot-6 chip of every other tray reading all-ones. Each step rescans
-    only its own tray's root ports, and the whole bus never while one is known."""
-    order = []
-    _arm_ubb_walk(monkeypatch, [_beats_without(set())])
-    monkeypatch.setattr(galaxy, "UBB_WALK_RESCAN_SETTLE_SEC", 0)
-    monkeypatch.setattr(pcie_guard, "rescan_trays", lambda trays, log: order.append(("tray", trays)) or ["rp"])
-    monkeypatch.setattr(galaxy, "_pci_rescan", lambda: order.append(("global",)))
-    off = set(range(24, 28)) | {3}  # trays 1 and 3, neither wholly off (a whole tray is never walked)
-    await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(off), 5, 32, lambda m: None)
-    assert order == [("tray", [1]), ("tray", [3])], "each tray's own ports, never the whole bus"
-
-
-@pytest.mark.asyncio
-async def test_a_regressed_walk_disables_the_tray_rung_for_the_process(monkeypatch, clear_job_state, galaxy_trays):
-    """After one walk that took a chip on another tray off the bus, the rung is declined for the rest of
-    the boot (ubb_tray_rung_disabled, once): the next drop is named and held as when opted out, and
-    nothing is re-powered. The opt-in switch itself stays on (the sweep reads the record instead).
-    A broker restart on the same boot keeps it declined; only a new boot arms the walk again."""
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
-    start = set(range(24, 32))
-    fired, events = _arm_ubb_walk(monkeypatch, [_beats_without(start | {5})])
-    assert await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(start), 8, 32, lambda m: None) is False
-    assert fired == [0x04]
-    assert pcie_guard.tray_rung_disabled() == {"tray": 3, "new_off": ["5"]}
-    assert [n for n, _ in events].count("ubb_tray_rung_disabled") == 1
-    assert galaxy._ubb_reset_enabled() is True, "the sweep's tray re-power stays armed"
-
-    srv.fsm.set_latch("ubb_reset_fired", False)  # a new hold episode
-    fired.clear()
-    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(start), 8, 32, lambda m: None)
-    assert out is None and fired == [], "declined, as when opted out"
-
-    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)  # a broker restart on the same boot
-    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(start), 8, 32, lambda m: None)
-    assert out is None and fired == [], "still declined after a restart: the record is on disk"
-
-
-@pytest.mark.asyncio
-async def test_a_tray_pulse_that_drops_position_5_on_other_trays_disables_the_rung(
-    monkeypatch, clear_job_state, galaxy_trays
-):
-    """The cross-tray signature: a tray re-power, and a minute later chip 5 of every tray it did not
-    re-power reads off (5/13/21 after tray 4). The walk's own verify found no new chip off, so it did not
-    latch; the next pass sees the drop and disables the rung before it re-powers anything. A drop at
-    other positions too (a mesh reset after the pulse) is not the signature."""
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
-    start = set(range(24, 32))  # tray 3 off the bus
-    fired, events = _arm_ubb_walk(monkeypatch, [_beats_without(start)])
-    assert await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(start), 8, 32, lambda m: None) is False
-    assert fired == [0x04] and pcie_guard.tray_rung_disabled() is None, "no new chip off at the walk's own read"
-
-    srv.fsm.set_latch("ubb_reset_fired", False)  # the next hold episode
-    fired.clear()
-    later = start | {5, 13}  # trays 1 and 2 lost their position-5 chip after the pulse
-    out = await srv.galaxy_recovery._attempt_ubb_tray_reset(_beats_without(later), 10, 32, lambda m: None)
-    assert out is None and fired == [], "the signature disables the rung before another re-power"
-    assert pcie_guard.tray_rung_disabled() == {"tray": [3], "new_off": ["5", "13"], "signature": "position5"}
-    assert (pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE).exists()
-
-    # Not the signature: chips at other positions dropped too.
-    pcie_guard.note_tray_pulse([3], galaxy_trays, start)
-    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
-    (pcie_guard.health_dir() / pcie_guard.TRAY_RUNG_FILE).unlink()
-    assert pcie_guard.latch_tray_pulse_drop(start | {5, 6}) is None
-    assert pcie_guard.tray_rung_disabled() is None
-
-
-@pytest.mark.asyncio
-async def test_ubb_tray_reset_walk_defers_the_dead_chip_sampler_during_the_transient_drop(
-    monkeypatch, clear_job_state, galaxy_trays
-):
-    """F18 constraint: a tray reset takes its 8 chips transiently off the bus; without reset_in_flight
-    held across the walk the dead-chip sampler would isolate a tray mid-reset and tear it out of the
-    kernel (mistaking the expected transient drop for a new fault). The flag must be set while
-    _fire_ubb_reset runs, and cleared once the walk returns. Fails on base, whose rung never sets it."""
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
-    srv.fsm.set_latch("ubb_reset_fired", False)
-    srv.recovery_mechanism.reset_in_flight = False
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-    seen = {"in_flight_during_fire": None}
-
-    def fire(bitmap, ids):
-        seen["in_flight_during_fire"] = srv.recovery_mechanism.reset_in_flight
-
-    async def healthy(expected, log, run_fabric=True, **_):
-        return True, {"snapshot": {"ok": True}}
-
-    patch_recovery(monkeypatch, "_verify_device", healthy)
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", fire, raising=False)
-    beats = {str(i): 100 for i in range(24)}  # tray 3 off
-    await srv.galaxy_recovery._attempt_ubb_tray_reset(beats, 8, 32, lambda m: None)
-    assert seen["in_flight_during_fire"] is True, "reset_in_flight must be set while the tray reset fires"
-    assert srv.recovery_mechanism.reset_in_flight is False, "and cleared once the walk returns"
-
-
-@pytest.mark.asyncio
-async def test_gate_fires_the_ubb_tray_reset_on_a_clean_tray_down_when_opted_in(
-    monkeypatch, tmp_path, clear_job_state, galaxy_trays
-):
-    """The gate side of the fire: a clean below-floor tray-down at a job boundary, opted in, fires the
-    per-tray BMC reset instead of holding, and a reset that verifies healthy clears the tenant door.
-    The mesh-wide galaxy reset never runs. Fails on base, which holds and issues no fire."""
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
-    fired = {"n": 0}
-    cleared = {"n": 0}
-    _reach_reboot_rung(monkeypatch, tmp_path, n_present=24)
-    srv.isolated_chips = set()
-    srv.device_pci_map = {}
-    srv.device_fault_reported = ""
-    fsm_dirty(srv, "", why="gate_error")
-    # chips 24-31 (tray 3) off the bus; 0-23 tick -> off_bus 8, below the floor of 16.
-    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 + i for i in range(24)})
-    resets = _count_galaxy_resets(monkeypatch)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
-    monkeypatch.delenv("TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET", raising=False)
-
-    # The gate's own health decision must see the tray-down (unhealthy) to reach the reset path; the
-    # per-tray reset's post-fire verify must then see a recovered mesh. First call unhealthy, rest OK.
-    verify_calls = {"n": 0}
-
-    async def verify(expected, log, run_fabric=True, **_):
-        verify_calls["n"] += 1
-        ok = verify_calls["n"] > 1
-        return ok, {"snapshot": {"ok": ok, "detail": "" if ok else "chips 24-31 off the bus"}}
-
-    patch_recovery(monkeypatch, "_verify_device", verify)
-    monkeypatch.setattr(srv, "_clear_device_dirty", lambda **kw: cleared.__setitem__("n", cleared["n"] + 1))
-    monkeypatch.setattr(
-        galaxy, "_fire_ubb_reset", lambda *a, **k: fired.__setitem__("n", fired["n"] + 1), raising=False
-    )
-
-    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
-
-    assert fired["n"] == 1, "the gate must fire the per-tray reset on a clean tray-down when opted in"
-    assert resets["n"] == 0, "the tray reset pre-empts the mesh-wide galaxy reset"
-    assert cleared["n"] >= 1, "a tray reset that verified healthy clears the hold at the gate"
-
-
-def test_the_tray_reset_rung_is_armed_by_default():
-    """A below-floor tray-down that holds forever IS the reported bug, and the per-tray BMC reset is the
-    lightest hardware-verified way out of it — only the target tray's ARC restarts, the other 24 chips
-    keep running, ~30s, and it does not risk the 8->32 inversion the mesh-wide reset does — so the rung
-    is ON by default. Fails on base, which shipped it default-OFF."""
-    assert galaxy._ubb_reset_enabled() is True
-
-
-def test_an_operator_can_still_force_the_tray_reset_rung_off(monkeypatch):
-    """The knob survives the default flip: a host whose BMC/ipmitool bit-order an operator has not
-    confirmed forces the rung off with =0, back to naming the command and holding."""
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "0")
-    assert galaxy._ubb_reset_enabled() is False
-
-
-@pytest.mark.asyncio
-async def test_ubb_tray_reset_fires_by_default_on_a_clean_tray_down(monkeypatch, clear_job_state, galaxy_trays):
-    """The default flip, end to end: with nothing set (the shipped default), a clean below-floor
-    tray-down FIRES the per-tray reset instead of naming it and holding — no opt-in required. Mirrors
-    the opted-in fire test but leaves the env at its default. Fails on base, whose default-OFF rung only
-    named the command and held here."""
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")  # the single-tray walk under test is opt-in
-    fired = {"n": 0}
-    counters = _arm_offbus_stuck_hold(
-        monkeypatch, off_bus=8, isolated=set(), sbr_verify_healthy=True  # chips 24-31 = tray 3
-    )
-    # Deliberately leave TT_DEVICE_MCP_AUTO_UBB_RESET unset — this IS the shipped default now.
-    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
-    monkeypatch.delenv("TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET", raising=False)
-    monkeypatch.setattr(
-        galaxy, "_fire_ubb_reset", lambda *a, **k: fired.__setitem__("n", fired["n"] + 1), raising=False
-    )
-    ran = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
-    assert ran is True
-    assert fired["n"] == 1, "the shipped default now fires the per-tray BMC reset without an opt-in"
-    assert counters["resets"] == 0, "the tray reset pre-empts the mesh-wide galaxy reset"
 
 
 @pytest.mark.asyncio
@@ -13357,27 +12269,27 @@ async def test_a_present_mesh_wedge_that_survived_the_galaxy_reset_climbs_to_the
 ):
     """The cascade must PROGRESS. A present mesh (every chip on the bus) whose galaxy reset still did
     not verify is an eth/fabric wedge the reset could not clear — it survived the deepest reset, so it
-    is not self-healing and must climb to the host reboot/power-cycle, not hold indefinitely (measured
-    on box D: hours of ceiling->galaxy-reset->hold with the eth core wedged). Fails on base, which
-    holds any off_bus < reboot_floor, present mesh included."""
+    is not self-healing and must climb to the power cycle, not hold indefinitely (measured on one
+    Galaxy: hours of ceiling->galaxy-reset->hold with the eth core wedged)."""
     _ledger_dir(monkeypatch, tmp_path)
     monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-A")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(32)})  # all 32 present
     _no_holders(monkeypatch)
     monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", lambda esc, *, tenant_active: (True, "ok"))
     patch_health_event(monkeypatch, lambda *a, **k: None)
-    reboots = {"n": 0}
+    cycles = {"n": 0}
 
-    async def fake_reboot(log, reason):
-        reboots["n"] += 1
+    async def fake_power_cycle(log, reason):
+        cycles["n"] += 1
 
-    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", fake_reboot)
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_power_cycle)
+
     await srv.galaxy_recovery._climb_to_host_recovery_after_failed_reset(
         32, 0, lambda _m: None
     )  # present before the reset
-    assert reboots["n"] == 1, "a present-mesh wedge that survived the galaxy reset must climb to the host rung"
+    assert cycles["n"] == 1, "a present-mesh wedge that survived the galaxy reset must climb to the power cycle"
 
 
 @pytest.mark.asyncio
@@ -13395,7 +12307,6 @@ async def test_a_few_chip_off_bus_drop_still_holds_below_the_reboot_floor(monkey
     async def fake_reboot(log, reason):
         reboots["n"] += 1
 
-    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", fake_reboot)
     await srv.galaxy_recovery._climb_to_host_recovery_after_failed_reset(
         32, 2, lambda _m: None
     )  # 2 off-bus, no regression
@@ -13440,267 +12351,6 @@ def test_boot_attribution_accepts_a_recent_escalation(monkeypatch, tmp_path):
     assert (
         rec is not None and rec.get("action") == "reboot"
     ), "a recent, previous-boot escalation must be attributed to this boot"
-
-
-@pytest.mark.asyncio
-async def test_post_reboot_all_off_bus_climbs_to_the_power_cycle(monkeypatch, tmp_path):
-    """The box B incident: the broker's warm reboot came back 0/32 (a 6U-Galaxy reboot cannot re-
-    enumerate dropped UBBs), and base re-held the box dead ~18h. With the cold rung opted in, the boot
-    that verifies the reboot climbs straight to the power cycle instead. Fails on base (no verify)."""
-    _ledger_dir(monkeypatch, tmp_path)
-    _seed_reboot_ledger(tmp_path)
-    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-now")
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    _no_holders(monkeypatch)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-    cycles = {"n": 0}
-
-    async def fake_power_cycle(log, reason):
-        cycles["n"] += 1
-
-    monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_power_cycle)
-    await srv.galaxy_recovery._verify_post_reboot_recovery(off_bus=32, expected=32, log=lambda _m: None)
-    assert cycles["n"] == 1, "a warm reboot that came back all-off-bus must climb to the cold rung"
-
-
-@pytest.mark.asyncio
-async def test_post_reboot_all_off_bus_holds_loudly_with_no_cold_rung_opted_in(monkeypatch, tmp_path):
-    """No power cycle opted in: the reboot is the rung that just failed and must NOT repeat, so the
-    verify emits the loud actionable event and keeps holding — never a second warm reboot, never a
-    release. Fails on base, which re-holds silently with no event and no next rung."""
-    _ledger_dir(monkeypatch, tmp_path)
-    _seed_reboot_ledger(tmp_path)
-    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-now")
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    events = []
-    patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
-    reboots, cycles = {"n": 0}, {"n": 0}
-
-    async def fake_reboot(log, reason):
-        reboots["n"] += 1
-
-    async def fake_power_cycle(log, reason):
-        cycles["n"] += 1
-
-    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", fake_reboot)
-    monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_power_cycle)
-    await srv.galaxy_recovery._verify_post_reboot_recovery(off_bus=32, expected=32, log=lambda _m: None)
-    assert reboots["n"] == 0 and cycles["n"] == 0, "no rung may fire with none opted in — hold loudly"
-    assert "all_chips_off_bus_power_cycle_required" in events, "the whole-bus wedge must be loud, not swallowed"
-
-
-@pytest.mark.asyncio
-async def test_post_reboot_verify_never_repeats_the_warm_reboot(monkeypatch, tmp_path):
-    """A mass drop the reboot did not clear, still short of all-off-bus, with only the warm reboot
-    opted in: _host_escalation_for_drop re-offers the reboot — the rung that just failed. The verify
-    must NOT repeat it; it holds loudly. Fails on base, which has no post-reboot verify at all."""
-    _ledger_dir(monkeypatch, tmp_path)
-    _seed_reboot_ledger(tmp_path)
-    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-now")
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    events = []
-    patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
-    reboots = {"n": 0}
-
-    async def fake_reboot(log, reason):
-        reboots["n"] += 1
-
-    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", fake_reboot)
-    # 20 of 32 off the bus: a mass drop (>= floor) but not all-off-bus.
-    await srv.galaxy_recovery._verify_post_reboot_recovery(off_bus=20, expected=32, log=lambda _m: None)
-    assert reboots["n"] == 0, "the warm reboot already failed on this drop — it must never be repeated"
-    assert "post_reboot_recovery_stuck_no_cold_rung" in events, "the stuck box must be loud about needing the cold rung"
-
-
-@pytest.mark.asyncio
-async def test_post_reboot_verify_never_cold_cycles_a_single_chip_host_without_power_cycle_consent(
-    monkeypatch, tmp_path
-):
-    """_host_escalation_for_drop's reboot_futile short-circuits on expected > 1 (a single-chip host
-    has no UBB-re-enumeration failure mode), so on a single-chip host it hands back escalation=
-    "reboot" instead of the None/"power-cycle" pair a multi-chip drop always resolves to. With
-    AUTO_REBOOT=1 and AUTO_POWER_CYCLE=0, that must still hold — never fire the chassis power cycle
-    the operator explicitly did not opt into, and never repeat the warm reboot that just failed."""
-    _ledger_dir(monkeypatch, tmp_path)
-    _seed_reboot_ledger(tmp_path)
-    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-now")
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    _no_holders(monkeypatch)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
-    # Withheld consent is =0, not an absent var: the cold rung defaults ARMED, so deleting this
-    # grants the very consent the assertions below require to be absent.
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    events = []
-    patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
-    reboots, cycles = {"n": 0}, {"n": 0}
-
-    async def fake_reboot(log, reason):
-        reboots["n"] += 1
-
-    async def fake_power_cycle(log, reason):
-        cycles["n"] += 1
-
-    monkeypatch.setattr(srv.galaxy_recovery, "_auto_reboot_host", fake_reboot)
-    monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_power_cycle)
-    await srv.galaxy_recovery._verify_post_reboot_recovery(off_bus=1, expected=1, log=lambda _m: None)
-    assert cycles["n"] == 0, "AUTO_POWER_CYCLE=0 must never cold-cycle the chassis regardless of chip count"
-    assert reboots["n"] == 0, "the warm reboot already ran and failed — this method must never repeat it"
-    assert "all_chips_off_bus_power_cycle_required" in events
-
-
-@pytest.mark.asyncio
-async def test_post_reboot_few_chip_drop_below_floor_climbs_to_the_power_cycle(monkeypatch, tmp_path):
-    """A warm reboot that brought the mesh back with chips STILL off the bus did not fully recover it,
-    and a dropped ASIC does not re-enumerate on another warm reboot (a 6U-Galaxy reboot does not
-    power-cycle the UBBs). Below the mass floor or not, a still-off-bus mesh here is not self-healing —
-    the cold power cycle is the only rung above the reboot that just ran, so with it opted in the verify
-    climbs to it rather than holding a degraded box. Fails on base, which holds below the floor."""
-    _ledger_dir(monkeypatch, tmp_path)
-    _seed_reboot_ledger(tmp_path)
-    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-now")
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    _no_holders(monkeypatch)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
-    events = []
-    patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
-    cycles = {"n": 0}
-
-    async def fake_power_cycle(log, reason):
-        cycles["n"] += 1
-
-    monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_power_cycle)
-    await srv.galaxy_recovery._verify_post_reboot_recovery(off_bus=2, expected=32, log=lambda _m: None)
-    assert cycles["n"] == 1, "a still-off-bus mesh after a reboot climbs to the cold rung, never holds"
-    assert "post_reboot_host_escalation" in events
-
-
-@pytest.mark.asyncio
-async def test_post_reboot_verify_is_inert_when_this_boot_is_not_a_broker_reboot(monkeypatch, tmp_path):
-    """An external/manual reboot or a firmware crash leaves no broker reboot record attributing this
-    boot, so there is nothing to verify — the verify must not climb over a boot it did not cause."""
-    _ledger_dir(monkeypatch, tmp_path)  # empty ledger dir: no auto-recovery record at all
-    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-now")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-    cycles = {"n": 0}
-
-    async def fake_power_cycle(log, reason):
-        cycles["n"] += 1
-
-    monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_power_cycle)
-    await srv.galaxy_recovery._verify_post_reboot_recovery(off_bus=32, expected=32, log=lambda _m: None)
-    assert cycles["n"] == 0, "no broker reboot attributes this boot — nothing to climb past"
-
-
-def test_post_reboot_verify_is_on_by_default(monkeypatch):
-    """The verify closes the incident's dead-box hold, so it is on unless an operator opts out."""
-    monkeypatch.delenv("TT_DEVICE_MCP_POST_REBOOT_VERIFY", raising=False)
-    assert galaxy._post_reboot_verify_enabled() is True
-    monkeypatch.setenv("TT_DEVICE_MCP_POST_REBOOT_VERIFY", "0")
-    assert galaxy._post_reboot_verify_enabled() is False
-
-
-@pytest.mark.asyncio
-async def test_startup_health_climbs_after_a_reboot_that_did_not_bring_the_mesh_back(
-    monkeypatch, tmp_path, clear_job_state
-):
-    """End-to-end through the startup probe: a broker warm reboot came back 0/32, the sysfs probe
-    marks the box dirty (held) — and now, with the cold rung opted in, the same startup climbs to the
-    power cycle instead of re-holding it dead. The device stays dirty throughout: it never releases.
-    Fails on base, where startup only re-holds and no rung ever fires."""
-    _ledger_dir(monkeypatch, tmp_path)
-    _seed_reboot_ledger(tmp_path)
-    monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
-    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-now")
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    _no_holders(monkeypatch)
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-    monkeypatch.setattr(srv, "write_action_log", lambda *a, **k: None)
-    monkeypatch.setattr(srv, "read_heartbeats", lambda: {})  # 0/32: nothing came back
-    monkeypatch.setattr(srv, "heartbeat_verdict", lambda expected, **k: (Verdict.UNHEALTHY, "0 chip(s) in sysfs", {}))
-    cycles = {"n": 0}
-
-    async def fake_power_cycle(log, reason):
-        cycles["n"] += 1
-
-    monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_power_cycle)
-    await srv._record_startup_health()
-    assert cycles["n"] == 1, "a reboot that came back 0/32 must climb to the power cycle from startup"
-    assert srv.fsm.state is not ServerState.HEALTHY, "the box must stay HELD across the verify — it never releases"
-
-
-def _arm_degraded_startup_after_reboot(monkeypatch, tmp_path):
-    """A broker start on a boot the ledger attributes to the broker's own warm reboot, with the sysfs
-    probe reading 0/32 and the cold rung opted in: the post-reboot verify, if it runs, climbs to the
-    power cycle. Returns the power-cycle counter and the verify-call counter."""
-    _ledger_dir(monkeypatch, tmp_path)
-    _seed_reboot_ledger(tmp_path)
-    monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
-    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-now")
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    _no_holders(monkeypatch)
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-    monkeypatch.setattr(srv, "write_action_log", lambda *a, **k: None)
-    monkeypatch.setattr(srv, "read_heartbeats", lambda: {})
-    monkeypatch.setattr(srv, "heartbeat_verdict", lambda expected, **k: (Verdict.UNHEALTHY, "0 chip(s) in sysfs", {}))
-    counts = {"cycles": 0, "verifies": 0}
-
-    async def fake_power_cycle(log, reason):
-        counts["cycles"] += 1
-
-    real_verify = srv.galaxy_recovery._verify_post_reboot_recovery
-
-    async def counting_verify(*a, **k):
-        counts["verifies"] += 1
-        return await real_verify(*a, **k)
-
-    monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_power_cycle)
-    monkeypatch.setattr(srv.galaxy_recovery, "_verify_post_reboot_recovery", counting_verify)
-    return counts
-
-
-@pytest.mark.asyncio
-async def test_post_reboot_verify_runs_on_the_boots_first_broker_start(monkeypatch, tmp_path, clear_job_state):
-    """The boot's first broker start is the reboot's only verification point: fsm.json was last
-    written by the boot before (or not at all), so the verify runs and climbs a still-dead mesh to
-    the power cycle. The pair to the same-boot restart test below."""
-    counts = _arm_degraded_startup_after_reboot(monkeypatch, tmp_path)
-    fsm_path = tmp_path / "fsmdir" / "fsm.json"
-    fsm_path.parent.mkdir()
-    ServerFsm(fsm_path, current_boot_id="prev-boot").on_fault("off_bus", dirty=False)  # the boot that rebooted
-    first = ServerFsm(fsm_path, current_boot_id="boot-now")
-    assert first.restarted_this_boot is False
-    monkeypatch.setattr(srv, "fsm", first)
-    await srv._record_startup_health()
-    assert counts == {"cycles": 1, "verifies": 1}
-    assert first.state is not ServerState.HEALTHY
-
-
-@pytest.mark.asyncio
-async def test_a_restart_later_in_the_boot_does_not_rerun_the_post_reboot_verify(
-    monkeypatch, tmp_path, clear_job_state
-):
-    """The ledger's warm reboot stays adjacent to the boot for its whole life, so without a gate a
-    broker restarted days later in the same boot (an autoupdate, a crash) that finds a fresh
-    degradation would read it as the reboot's failure and climb straight to the chassis power
-    cycle. Only the first start verifies the reboot; the restart marks the device dirty and leaves
-    it held for the forced startup gate. Fails on base, where every start of the boot re-verifies."""
-    counts = _arm_degraded_startup_after_reboot(monkeypatch, tmp_path)
-    fsm_path = tmp_path / "fsmdir" / "fsm.json"
-    fsm_path.parent.mkdir()
-    ServerFsm(fsm_path, current_boot_id="boot-now").boot_merge(open_episode=None, attributed_boot=None)
-    restarted = ServerFsm(fsm_path, current_boot_id="boot-now")  # an earlier broker of this boot wrote it
-    assert restarted.restarted_this_boot is True
-    monkeypatch.setattr(srv, "fsm", restarted)
-    await srv._record_startup_health()
-    assert counts == {"cycles": 0, "verifies": 0}, "a same-boot restart must not re-verify the boot's reboot"
-    assert restarted.state is not ServerState.HEALTHY, "the degraded device stays HELD for the startup gate"
 
 
 # --- a carried episode is still an ordinary episode to the gate that clears it ----------------
@@ -14270,63 +12920,6 @@ async def test_a_restart_later_in_the_boot_does_not_blame_the_boots_power_cycle(
 
 
 @pytest.mark.asyncio
-async def test_post_reboot_climb_keeps_the_escalated_marker_and_the_reset_retries(monkeypatch, tmp_path):
-    """The exact loop the durable record exists to prevent: the idle escalation already spent this
-    episode's one present-mesh reset before the box's OWN reboot fired (the next rung up), the
-    ledger attributes this boot to that reboot, and the mesh comes back still off the bus. Two
-    things must both hold: the ledger-driven startup climb still reaches the power cycle with the
-    carried episode in place (already proven fsm-agnostic by
-    test_startup_health_climbs_after_a_reboot_that_did_not_bring_the_mesh_back; repeated here to
-    show the carried episode does not interfere), and the episode's escalated latch survives that
-    whole climb untouched — it is the watchdog's durable marker that an escalation ran. The latch
-    is NOT a cap on the present-mesh reset though: a mesh back PRESENT but still wedged is again
-    in the exact state the galaxy reset cures, so the idle escalation retries it on the grace
-    cadence — the reset is paced by the last-reset clock, never barred by episode memory."""
-    fsm_path = tmp_path / "fsmdir" / "fsm.json"
-    fsm_path.parent.mkdir()
-    before = ServerFsm(fsm_path, current_boot_id="boot-before")
-    before.on_fault("off_bus", dirty=False)
-    before.set_latch("escalated", True)  # this episode's one present-mesh reset already ran
-
-    after = ServerFsm(fsm_path, current_boot_id="boot-after")
-    open_episode = after.record if after.record.state in (ServerState.RECOVERING, ServerState.DOWN) else None
-    after.boot_merge(open_episode=open_episode, attributed_boot=None)
-    assert after.record.state is ServerState.RECOVERING and after.latch("escalated") is True
-    monkeypatch.setattr(srv, "fsm", after)
-
-    _ledger_dir(monkeypatch, tmp_path)
-    _seed_reboot_ledger(tmp_path)  # this boot IS the result of the broker's own reboot escalation
-    monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
-    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-after")
-    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
-    _no_holders(monkeypatch)
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-    monkeypatch.setattr(srv, "write_action_log", lambda *a, **k: None)
-    monkeypatch.setattr(srv, "read_heartbeats", lambda: {})  # 0/32: the reboot did not bring it back
-    monkeypatch.setattr(srv, "heartbeat_verdict", lambda expected, **k: (Verdict.UNHEALTHY, "0 chip(s) in sysfs", {}))
-    cycles = {"n": 0}
-
-    async def fake_power_cycle(log, reason):
-        cycles["n"] += 1
-
-    monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_power_cycle)
-    await srv._record_startup_health()
-    assert cycles["n"] == 1, "a reboot that came back 0/32 must climb straight to the power cycle"
-    assert (
-        after.latch("escalated") is True
-    ), "the climb to the power cycle must not touch the episode's own escalation memory"
-
-    # Later: the mesh is back present (self-healed, or the power cycle above ran) but still wedged —
-    # exactly the state the galaxy reset cures, so the idle relift retries it on the grace cadence
-    # despite the episode's escalated memory.
-    counters = _arm_stuck_hold(monkeypatch)
-    ran = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
-    assert ran is True, "a present-but-wedged mesh gets the reset again — the latch is not a cap"
-    assert counters["resets"] == 1
-
-
-@pytest.mark.asyncio
 async def test_a_reset_that_leaves_the_fabric_unverified_is_unknown(monkeypatch, tmp_path, clear_job_state):
     """H2: on a multi-chip host, a galaxy reset whose fabric still cannot verify after eth-training
     retries (persistent 77) is NOT a recovery — enum+ARC came back but the fabric proved nothing — and
@@ -14334,6 +12927,7 @@ async def test_a_reset_that_leaves_the_fabric_unverified_is_unknown(monkeypatch,
     neither cleared onto an unverified fabric nor counted a failed reset (cooldown, two strikes, host
     rungs): it becomes a not-dirty 77-only fabric-unverified hold the idle relift re-checks (spec 03 I40)."""
     monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)  # built: a 77 is a link verdict
     srv._mark_device_dirty("job 007 ended: eth link down")
     monkeypatch.setattr(srv, "device_fault_reported", "ethernet link timeout")
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", True)
@@ -14390,6 +12984,7 @@ async def test_a_reset_that_leaves_the_fabric_unverified_counts_toward_the_relif
     """Spec 04 I29: the UNKNOWN reset records its episode and counts its post-reset 77 passes toward the
     I40 bound, so the next relift's 77 falls back to the startup checks at once."""
     monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)  # built: a 77 is a link verdict
     srv._mark_device_dirty("job 007 ended: eth link down")
     monkeypatch.setattr(srv, "device_hold_episode_since", "2026-10-14T05:38:40")  # the idle ledger's episode
     monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRIES", 1)
@@ -14552,7 +13147,7 @@ async def test_a_sweep_still_reading_77_with_no_known_cause_climbs_to_the_host_r
     counters, climbs, alerts = _arm_sweep_still_77(monkeypatch)
     g = srv.galaxy_recovery
     assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
-    assert climbs == [{"swept": True, "cause": galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE, "ladder_ran": True, "cold": False}]
+    assert climbs == [{"swept": True, "cause": galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE, "ladder_ran": True}]
     assert alerts == [], "the host rung is the automatic end; no operator page yet"
     assert srv.recovery_mechanism.unverified_77_host_rung_since == srv.device_hold_episode_since
 
@@ -14593,9 +13188,7 @@ async def test_a_latched_hold_whose_sweep_still_reads_a_mismatch_77_climbs_to_th
     g = srv.galaxy_recovery
     assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
     if latched:
-        assert climbs == [
-            {"swept": True, "cause": galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE, "ladder_ran": True, "cold": False}
-        ]
+        assert climbs == [{"swept": True, "cause": galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE, "ladder_ran": True}]
         assert [a["kind"] for a in alerts] == []
     else:
         assert climbs == []
@@ -14643,48 +13236,6 @@ async def test_a_boot_the_77_host_rung_brought_up_hands_off_instead_of_climbing_
     assert [a["kind"] for a in alerts] == ([] if climbs_again else ["fabric_unverified_operator_handoff"])
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "action,cold_climb",
-    [("reboot", True), ("power-cycle", False)],
-)
-async def test_a_boot_the_77_reboot_brought_up_climbs_cold_once_and_a_power_cycle_boot_hands_off(
-    monkeypatch, clear_job_state, action, cold_climb
-):
-    """Spec 04 I79: with a power cycle opted in, the boot the 77 climb's warm reboot brought up (no
-    fabric pass since the start) owes the climb at once and takes the cold rung, never a second
-    reboot and never an operator page first. The boot that power cycle brought up is spent and goes
-    to an operator, still held. Once means once: the next escalation of the episode fires no second
-    cold rung; the spent rung goes to an operator with one page."""
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
-    counters, climbs, alerts = _arm_sweep_still_77(monkeypatch)
-    monkeypatch.setattr(srv.FABRIC_DEBT, "passed_since_start", False)
-    monkeypatch.setattr(
-        srv.recovery_mechanism,
-        "boot_from_broker_escalation",
-        lambda boot: {"action": action, "reason": galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE},
-    )
-    g = srv.galaxy_recovery
-    assert g._fabric_77_cold_rung_due() is cold_climb
-    assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
-    if cold_climb:
-        assert [c.get("cold") for c in climbs] == [True]
-        assert alerts == []
-        assert srv.recovery_mechanism.unverified_77_host_rung_since == srv.device_hold_episode_since
-    else:
-        assert climbs == []
-        assert [a["kind"] for a in alerts] == ["fabric_unverified_operator_handoff"]
-
-    for _ in range(2):
-        assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
-    assert len(climbs) == (1 if cold_climb else 0), "the cold rung fires once per episode, never again"
-    assert [a["kind"] for a in alerts] == ["fabric_unverified_operator_handoff"], "one page per episode"
-    assert g.fabric_77_handoff_status(srv.device_hold_episode_since)["owner"] == "operator"
-    if cold_climb:
-        assert g.fabric_77_climb_owed(srv.device_hold_episode_since) is False, "the fired cold rung is spent"
-    assert counters["dirty_cleared"] == 0, "held: only a passing full check releases it"
-
-
 def test_an_owed_77_hold_skips_the_i40_retries_and_the_i48_backoff_and_a_first_time_77_keeps_them(
     monkeypatch, clear_job_state
 ):
@@ -14719,44 +13270,6 @@ def test_an_owed_77_hold_skips_the_i40_retries_and_the_i48_backoff_and_a_first_t
     assert srv._fabric_77_climb_owed() is False, "once its host rung fired, the episode owes no climb"
 
 
-@pytest.mark.asyncio
-async def test_the_77_host_rung_fires_the_reboot_through_the_climbs_guards(monkeypatch, clear_job_state):
-    """Spec 04 I29: end to end, the 77 climb on a present mesh past the ceiling fires the opted-in warm
-    reboot once, recorded under the 77 cause the next boot reads; with no host rung opted in it fires
-    nothing and pages the operator."""
-    counters = _arm_stuck_hold(monkeypatch, reset_result=None)
-    g = srv.galaxy_recovery
-    monkeypatch.setattr(srv.recovery_mechanism, "unverified_reset_since", srv.device_hold_episode_since)
-    monkeypatch.setattr(srv.recovery_mechanism, "unverified_sweep_since", None)
-    monkeypatch.setattr(srv.recovery_mechanism, "unverified_sweep_77_since", None)
-    monkeypatch.setattr(srv.recovery_mechanism, "unverified_77_host_rung_since", None)
-    monkeypatch.setattr(srv, "_fabric_77_no_reset_cause", lambda: False)
-    monkeypatch.setattr(srv.FABRIC_DEBT, "passed_since_start", False)
-    monkeypatch.setattr(g, "_fabric_77_handoff", None)
-    alerts = []
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: alerts.append(event["kind"]))
-    reasons = []
-
-    async def reboot(log, reason):
-        reasons.append(reason)
-
-    async def sweep(expected, log, gate_phase, **k):
-        g._sweep_read_77 = True
-        return False
-
-    monkeypatch.setattr(g, "_auto_reboot_host", reboot)
-    monkeypatch.setattr(g, "_settle_and_verify_before_host_rung", sweep)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
-    assert reasons == [] and alerts == ["fabric_unverified_operator_handoff"]
-
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
-    assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
-    assert reasons == [galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE]
-    assert counters["resets"] == 0 and counters["dirty_cleared"] == 0
-
-
 def _arm_77_host_rung_end_to_end(monkeypatch):
     """The I29 77 climb through the real climb and its guards: reset UNKNOWN, the sweep still reads 77,
     no known no-reset cause, every chip present. Returns (counters, g, alerts, reasons, events, age):
@@ -14773,18 +13286,19 @@ def _arm_77_host_rung_end_to_end(monkeypatch):
     alerts, reasons, events = [], [], []
     monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: alerts.append(event))
 
-    async def reboot(log, reason):
+    async def power_cycle(log, reason):
+        counters["power_cycles"] += 1
         reasons.append(reason)
 
     async def sweep(expected, log, gate_phase, **k):
         g._sweep_read_77 = True
         return False
 
-    monkeypatch.setattr(g, "_auto_reboot_host", reboot)
     monkeypatch.setattr(g, "_settle_and_verify_before_host_rung", sweep)
     monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", lambda esc, *, tenant_active: (True, "ok"))
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
+    monkeypatch.setattr(privileges, "can_ipmi", lambda: True)
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
     age = {"v": 700}
     monkeypatch.setattr(galaxy_mod, "_hold_age_sec", lambda since: age["v"])
     patch_health_event(monkeypatch, lambda kind, **kw: events.append(kind))
@@ -14794,7 +13308,7 @@ def _arm_77_host_rung_end_to_end(monkeypatch):
 @pytest.mark.asyncio
 async def test_an_owed_pass_77_reaches_the_host_rung_after_the_sweep_not_at_the_ceiling(monkeypatch, clear_job_state):
     """Spec 04 I79: a 77 hold whose reset came back UNKNOWN and whose sweep still reads 77 climbs at
-    the sweep's end, on a 250 s-old hold, not at the 600 s ceiling: the reboot fires under the 77 cause,
+    the sweep's end, on a 250 s-old hold, not at the 600 s ceiling: the power cycle fires under the 77 cause,
     no page, no hand-off. Held throughout: never released unverified. Fails on 4485fb8, which deferred
     it to the ceiling and so fired the rung about 18.5 min into the hold."""
     counters, g, alerts, reasons, events, age = _arm_77_host_rung_end_to_end(monkeypatch)
@@ -14817,10 +13331,10 @@ async def test_a_77_host_rung_that_cannot_run_pages_once_and_a_later_rung_clears
 ):
     """Spec 04 I29: a 77 climb past the ceiling that cannot run (no host rung opted in, or
     auto_recovery_allowed denies it) pages the operator exactly once per episode and logs no host rung.
-    Once the rung can run, it fires and its reboot ends the hand-off on /health."""
+    Once the rung can run, it fires and its power cycle ends the hand-off on /health."""
     counters, g, alerts, reasons, events, age = _arm_77_host_rung_end_to_end(monkeypatch)
     if cannot_run == "not_opted_in":
-        monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
+        monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
     else:
         monkeypatch.setattr(
             srv.recovery_mechanism, "auto_recovery_allowed", lambda esc, *, tenant_active: (False, "rate-limited")
@@ -14835,7 +13349,7 @@ async def test_a_77_host_rung_that_cannot_run_pages_once_and_a_later_rung_clears
     assert alerts[0]["broker_retries"] is (cannot_run == "denied")
     assert reasons == [] and "fabric_unverified_host_rung" not in events
 
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", lambda esc, *, tenant_active: (True, "ok"))
     assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
     assert reasons == [galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE] and len(alerts) == 1
@@ -14843,17 +13357,11 @@ async def test_a_77_host_rung_that_cannot_run_pages_once_and_a_later_rung_clears
     assert counters["dirty_cleared"] == 0
 
 
-def _arm_77_reboot_boot_cold_rung(monkeypatch):
-    """The I79 boot a 77 climb's warm reboot brought up, with a power cycle opted in and no fabric pass
-    since the broker started, through the real climb and its guards. Returns the end-to-end tuple of
+def _arm_77_power_cycle_rung(monkeypatch):
+    """The I79 77 climb with the power cycle (the only host rung) opted in and no fabric pass since the
+    broker started, through the real climb and its guards. Returns the end-to-end tuple of
     _arm_77_host_rung_end_to_end plus ``asked``, the host actions auto_recovery_allowed was asked for."""
     armed = _arm_77_host_rung_end_to_end(monkeypatch)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
-    monkeypatch.setattr(
-        srv.recovery_mechanism,
-        "boot_from_broker_escalation",
-        lambda boot: {"action": "reboot", "reason": galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE},
-    )
     asked = []
     return (*armed, asked)
 
@@ -14862,13 +13370,13 @@ def _arm_77_reboot_boot_cold_rung(monkeypatch):
 async def test_a_cooldown_denied_cold_rung_is_retried_on_each_re_check_and_fires_one_power_cycle(
     monkeypatch, clear_job_state
 ):
-    """Spec 04 I79: on the 77 reboot's boot, a cold rung the I65 cooldown holds off is not spent. The
+    """Spec 04 I79: a 77 climb's power cycle the I65 cooldown holds off is not spent. The
     escalations inside the cooldown fire nothing and page no one (the broker fires the cycle itself
     once the cooldown ends), journal the wait once and show its deadline on /health. Each later
-    re-check climbs again; the first one the cooldown no longer denies fires exactly one power cycle,
-    never a reboot. A further escalation fires nothing more. Held throughout: only a passing full
+    re-check climbs again; the first one the cooldown no longer denies fires exactly one power cycle;
+    no path reboots the host. A further escalation fires nothing more. Held throughout: only a passing full
     check releases it. Fails on 2fdd088, which paged an operator for the cooldown."""
-    counters, g, alerts, reasons, events, age, asked = _arm_77_reboot_boot_cold_rung(monkeypatch)
+    counters, g, alerts, reasons, events, age, asked = _arm_77_power_cycle_rung(monkeypatch)
     age["v"] = 250
     mech = srv.recovery_mechanism
     monkeypatch.setattr(mech, "power_cycle_cooldown_state", None)
@@ -14894,7 +13402,7 @@ async def test_a_cooldown_denied_cold_rung_is_retried_on_each_re_check_and_fires
     monkeypatch.setattr(mech, "auto_recovery_allowed", allowed)
     for _ in range(2):
         assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
-    assert asked == ["power-cycle"] * 2, "the cold rung, never a second reboot, asked on every re-check"
+    assert asked == ["power-cycle"] * 2, "the power cycle, the only host rung, asked on every re-check"
     assert counters["power_cycles"] == 0 and reasons == []
     assert alerts == [], "a bounded cooldown pages no one"
     assert g.fabric_77_handoff_status(srv.device_hold_episode_since) is None
@@ -14911,13 +13419,15 @@ async def test_a_cooldown_denied_cold_rung_is_retried_on_each_re_check_and_fires
 
     cooldown["on"] = False
     assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
-    assert counters["power_cycles"] == 1 and reasons == [], "one power cycle once the cooldown ends"
+    assert counters["power_cycles"] == 1 and reasons == [
+        galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE
+    ], "one power cycle once the cooldown ends"
     assert g.fabric_77_handoff_status(srv.device_hold_episode_since) is None, "the fired rung ends the hand-off"
     assert srv.recovery_mechanism.unverified_77_host_rung_since == srv.device_hold_episode_since
 
     for _ in range(2):
         assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
-    assert counters["power_cycles"] == 1 and reasons == [], "at most one power cycle per episode"
+    assert counters["power_cycles"] == 1 and len(reasons) == 1, "at most one power cycle per episode"
     assert len(asked) == 3
     assert counters["resets"] == 0 and counters["dirty_cleared"] == 0, "held, never released unverified"
     assert [a["why"] for a in alerts] == ["the host rung already ran on this hold"], "paged only once spent"
@@ -14926,18 +13436,18 @@ async def test_a_cooldown_denied_cold_rung_is_retried_on_each_re_check_and_fires
 @pytest.mark.asyncio
 @pytest.mark.parametrize("denial", ["tenant", "stale_cooldown"])
 async def test_a_cold_rung_denied_for_a_reason_other_than_the_cooldown_pages_once(monkeypatch, clear_job_state, denial):
-    """Spec 04 I79: on the 77 reboot's boot, a cold rung held off by anything but a bounded I65
+    """Spec 04 I79: a 77 climb's power cycle held off by anything but a bounded I65
     cooldown (a tenant; or a rate limit while an older cooldown record still lingers) is not spent and
     still pages once per episode, naming the broker as the owner while it retries. No cooldown wait is
     journaled for it. Held throughout."""
-    counters, g, alerts, reasons, events, age, asked = _arm_77_reboot_boot_cold_rung(monkeypatch)
+    counters, g, alerts, reasons, events, age, asked = _arm_77_power_cycle_rung(monkeypatch)
     age["v"] = 250
     mech = srv.recovery_mechanism
     monkeypatch.setattr(mech, "power_cycle_retry", None)
     stale = {"until": time.time() + 900, "last": time.time(), "cause": "host boot", "interval_sec": 900}
     monkeypatch.setattr(mech, "power_cycle_cooldown_state", {**stale, "why": "an earlier cooldown"})
     if denial == "tenant":
-        why = "a tenant holds the device; a reboot would destroy a running job"
+        why = "a tenant holds the device; a power cycle would destroy a running job"
     else:
         why = "already auto-escalated 1x this boot (cap 1)"
 
@@ -14957,61 +13467,12 @@ async def test_a_cold_rung_denied_for_a_reason_other_than_the_cooldown_pages_onc
 
 
 @pytest.mark.asyncio
-async def test_the_77_bound_fallback_on_the_77_reboots_boot_marks_the_episode_and_takes_the_cold_rung(
-    monkeypatch, clear_job_state
-):
-    """Spec 04 I79: on the boot a 77 climb's warm reboot brought up, the I40 fallback that the startup
-    checks cannot clear marks the episode's reset as already spent before it escalates, so the
-    ladder runs its sweep (not a fresh reset) and climbs straight to the cold rung: one power cycle,
-    no reboot. A first-time 77 (not that boot) is not marked. Fails without the marking: the
-    escalation would run a fresh grace reset instead."""
-    counters, g, alerts, reasons, events, age, asked = _arm_77_reboot_boot_cold_rung(monkeypatch)
-    age["v"] = 250
-    monkeypatch.setattr(srv.recovery_mechanism, "unverified_reset_since", None)
-    monkeypatch.setattr(srv, "_post_reset_debt", lambda: "broker start")
-
-    async def eth_ok():
-        return True, "all active-eth cores advancing"
-
-    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_ok)
-    marked = []
-
-    async def escalate(rung):
-        marked.append(srv.recovery_mechanism.unverified_reset_since)
-        return await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
-
-    evidence = {"fabric": {"ok": None, "detail": "rc 77"}}
-    assert await srv._fabric_77_fallback(evidence, lambda m: None, escalate) is True
-    assert marked == [srv.device_hold_episode_since], "the episode is marked before the ladder runs"
-    assert counters["resets"] == 0, "no fresh reset: the reboot already ran the episode's reset"
-    assert counters["power_cycles"] == 1 and reasons == [], "the cold rung, never a second reboot"
-    assert counters["dirty_cleared"] == 0, "held: only a passing full check releases it"
-
-    assert await srv._fabric_77_fallback(evidence, lambda m: None, escalate) is True
-    assert counters["power_cycles"] == 1, "the spent cold rung fires no second power cycle"
-
-    # A first-time 77 on a boot no 77 climb brought up is not marked: it keeps its reset.
-    monkeypatch.setattr(srv.recovery_mechanism, "boot_from_broker_escalation", lambda boot: None)
-    monkeypatch.setattr(srv.recovery_mechanism, "unverified_reset_since", None)
-    monkeypatch.setattr(srv.recovery_mechanism, "unverified_77_host_rung_since", None)
-    marked.clear()
-
-    async def record_only(rung):
-        marked.append(srv.recovery_mechanism.unverified_reset_since)
-        return True
-
-    assert await srv._fabric_77_fallback(evidence, lambda m: None, record_only) is True
-    assert marked == [None]
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "case, expect",
     [
         ("scope_active", galaxy_mod.HOST_RUNG_DEFERRED),
         ("young_hold", galaxy_mod.HOST_RUNG_DEFERRED),
         ("not_opted_in", galaxy_mod.NO_HOST_RUNG),
-        ("reboot_blocked", galaxy_mod.NO_HOST_RUNG),
         ("denied", galaxy_mod.HOST_RUNG_DENIED),
         ("fires", galaxy_mod.HOST_RUNG_FIRED),
     ],
@@ -15026,9 +13487,7 @@ async def test_the_host_rung_climb_reports_fired_deferred_or_cannot_run(monkeypa
     elif case == "young_hold":
         age["v"] = 250
     elif case == "not_opted_in":
-        monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
-    elif case == "reboot_blocked":
-        monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 0xFFFFFFFF for i in range(32)})
+        monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
     elif case == "denied":
         monkeypatch.setattr(
             srv.recovery_mechanism, "auto_recovery_allowed", lambda esc, *, tenant_active: (False, "rate-limited")
@@ -15038,7 +13497,7 @@ async def test_the_host_rung_climb_reports_fired_deferred_or_cannot_run(monkeypa
         32, 0, lambda m: None, swept=True, cause=galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE, on_fire=lambda: fired.append(1)
     )
     assert outcome == expect
-    assert (outcome in galaxy_mod.HOST_RUNG_CANNOT_RUN) is (case in ("not_opted_in", "reboot_blocked", "denied"))
+    assert (outcome in galaxy_mod.HOST_RUNG_CANNOT_RUN) is (case in ("not_opted_in", "denied"))
     assert bool(fired) is (expect == galaxy_mod.HOST_RUNG_FIRED)
     assert bool(reasons) is (expect == galaxy_mod.HOST_RUNG_FIRED)
 
@@ -15054,7 +13513,7 @@ async def test_a_sweep_verify_that_reads_77_is_not_a_release(
     g = srv.galaxy_recovery
     cleared = []
 
-    async def fire_all(bitmap, ids, trays_, expected, log, do_sbr):
+    async def fire_all(trays_, expected, log, do_sbr=True):
         return True
 
     async def verify_77(expected, log, run_fabric=True, **k):
@@ -15574,18 +14033,64 @@ async def test_a_bridge_less_chip_is_rescanned_before_anything_destructive(monke
             self.p = str(p)
 
         def write_text(self, v):
-            rescans.append(self.p)
+            raise AssertionError(f"no bare sysfs write expected here: {self.p}")
 
         def exists(self):
             # The node reappears only AFTER a rescan has run — exactly the real behaviour.
             return "tenstorrent!0" in self.p and bool(rescans)
 
     monkeypatch.setattr(recovery_pkg, "Path", FakePath)
+    # The rescan is scoped to the Tenstorrent root ports (spec 04 I95), never /sys/bus/pci/rescan.
+    monkeypatch.setattr(pcie_guard, "rescan_tt_root_ports", lambda: rescans.append("tt root ports") or ["p"])
 
     ok = await srv.galaxy_recovery._recover_isolated_chips(lambda *a, **k: None)
 
-    assert "/sys/bus/pci/rescan" in rescans, "the rescan rung never ran — the cheap recovery was skipped"
+    assert rescans, "the rescan rung never ran — the cheap recovery was skipped"
     assert ok, "the chip came back on the rescan, so recovery must succeed and not escalate further"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked", ["bridge reset", "bare rescan"])
+async def test_an_isolated_chip_rung_blocked_in_the_kernel_fails_in_bounded_time(monkeypatch, blocked):
+    """A PCI remove blocked in the kernel holds the rescan/remove lock, so a bridge reset (its own
+    rescan) or a bare rescan behind it never returns. Each must give up at its bound, be journaled
+    and count as the rung failing, so the hold goes on to its next rung and the power cycle."""
+    import threading
+
+    events = []
+    kernel_lock = threading.Event()
+    monkeypatch.setattr(srv, "isolated_chips", {"0"})
+    monkeypatch.setattr(srv, "device_pci_map", {"0": "0000:61:00.0"})
+    monkeypatch.setattr(srv, "write_action_log", lambda *a, **k: None)
+    patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
+    monkeypatch.setattr(recovery_base, "PCI_SYSFS_WRITE_TIMEOUT_SEC", 0.2)
+    monkeypatch.setattr(recovery_pkg, "bridge_reset_call_timeout", lambda: 0.2)
+
+    def bridge(idx, bdf):
+        if blocked == "bridge reset":
+            kernel_lock.wait(30)
+        return None  # no bridge: the bare rescan rung follows
+
+    class BlockedPath:
+        def __init__(self, p):
+            self.p = str(p)
+
+        def write_text(self, v):
+            kernel_lock.wait(30)
+
+        def exists(self):
+            return False
+
+    monkeypatch.setattr(recovery_pkg, "reset_chip_via_bridge", bridge)
+    monkeypatch.setattr(recovery_pkg, "Path", BlockedPath)
+    monkeypatch.setattr(pcie_guard, "rescan_tt_root_ports", lambda: kernel_lock.wait(30))
+    t0 = time.monotonic()
+    try:
+        ok = await asyncio.wait_for(srv.galaxy_recovery._recover_isolated_chips(lambda *a, **k: None), 10)
+    finally:
+        kernel_lock.set()  # free the worker threads
+    assert not ok and time.monotonic() - t0 < 5
+    assert ("bridge_reset_failed" if blocked == "bridge reset" else "pci_rescan_timeout") in events
 
 
 @pytest.mark.asyncio
@@ -16848,6 +15353,8 @@ def _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path):
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     job = srv.Job(id="428", owner="u", workspace="/", command="(re-adopted)", queued_at="")
     job.status = srv.JobStatus.RUNNING
+    # A 1500 s job that started just now: inside its stated end (spec 03 I75) for the whole test.
+    job.started_at, job.timeout_sec = datetime.now().isoformat(), srv.MAX_TIMEOUT_SEC
     monkeypatch.setattr(srv, "jobs", {"428": job})
     monkeypatch.setattr(srv.galaxy_recovery, "tenant_holds", srv.galaxy_recovery.deps.job_running)
     climbs = []
@@ -17052,6 +15559,445 @@ async def test_a_failed_startup_gate_behind_a_readopted_job_gets_the_bound_ladde
     await tick(ceiling + 21)
     await tick(2 * ceiling - 1)
     assert climbs == ["present-forced"] and len(cycles) == 1, "the hold was driven twice"
+
+
+def _arm_unhealed_power_cycle(monkeypatch, healed=False):
+    """The power-cycle rung as the existing I75/I76 tests stub it, with the bound ladder's full check
+    after its reset failing unless ``healed``. Returns the power-cycle requests."""
+    cycles = []
+
+    async def power_cycle(log, reason):
+        cycles.append(reason)
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", lambda action, tenant_active: (True, ""))
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    ladder = srv.galaxy_recovery.escalate
+
+    async def ladder_then_check(phase, indices, expected, log, **kw):
+        outcome = await ladder(phase, indices, expected, log, **kw)
+        if outcome == OUTCOME_RECOVERED and healed:
+            fsm_healthy(srv)  # the full check after the ladder's reset passed
+            return outcome
+        return OUTCOME_WAITING if outcome == OUTCOME_RECOVERED else outcome  # its full check failed
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", ladder_then_check)
+    return cycles
+
+
+def _ended_ago(job, sec):
+    job.status = srv.JobStatus.COMPLETED
+    job.finished_at = (datetime.now() - timedelta(seconds=sec)).isoformat()
+
+
+_STARTUP_VERDICT = "device unverified: gate/startup: awaiting the startup check"
+
+
+def _deferred_behind_the_job(monkeypatch, job, release_job):
+    """Spec 03 I75: the startup hold over a live re-adopted job names no fault, so the sampler's verdict
+    opens no hold episode until the job ends or runs past its stated end. Turns the setup's hand-opened
+    episode back into that deferral, on one clock the broker's own reads share from the restart (t0).
+    Returns (t0, at, job_ends): ``at(sec)`` is one sampler verdict and one deadline tick at t0 + sec;
+    ``job_ends()`` ends the job now and lets the startup gate run its check."""
+    monkeypatch.setattr(srv.fsm, "_record", dataclasses.replace(srv.fsm.record, dirty=False))
+    for name, value in (
+        ("device_fault_reported", ""),
+        ("_kill_reset_owed", ""),
+        ("device_hold_episode_since", ""),
+        ("device_hold_logged", False),
+        ("_hold_startup_deferred", False),
+        ("_hold_episode_restorable", False),
+    ):
+        monkeypatch.setattr(srv, name, value)
+    monkeypatch.setattr(srv, "_device_liveness_reason", lambda: "")
+    t0 = datetime.now().replace(microsecond=0)
+    clock = {"now": t0}
+
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["now"]
+
+    class _WallClock:  # the startup gate stamps the jobs' end with time.time()
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+        def time(self):
+            return clock["now"].timestamp()
+
+    monkeypatch.setattr(srv, "datetime", _Clock)
+    monkeypatch.setattr(srv, "time", _WallClock())
+    monkeypatch.setattr(srv, "_startup_verify_started_wall", t0.timestamp())
+
+    async def at(sec):
+        clock["now"] = t0 + timedelta(seconds=sec)
+        srv._note_tenant_gate_verdict(_STARTUP_VERDICT)
+        srv._check_hold_deadline(now=clock["now"])
+        if srv._forced_escalation_task is not None:
+            await srv._forced_escalation_task
+
+    async def job_ends():
+        job.status = srv.JobStatus.COMPLETED
+        job.finished_at = clock["now"].isoformat()
+        await release_job()
+
+    return t0, at, job_ends
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("check", ["passes", "fails", "fails_after_the_ladder_too"])
+async def test_replay_a_20_min_readopted_job_then_the_startup_check(monkeypatch, tmp_path, check):
+    """Spec 03 I75 with spec 04 I76 (ordering of 10-17): a broker restart re-adopted a job that runs
+    20 min. Its run time is service, not hold: no hold episode opens while it runs, so the bound neither
+    pages nor names the broker's own job as a tenant, and /health shows no hold yet. At its end the hold
+    opens, and the startup gate's full check runs first. A pass releases the device with no ladder. A
+    failure gets the bound's ladder 600 s after the job's end, once; when the full check after it fails
+    too, one power-cycle request. Before the I75/I76 ordering, the bound paged hold_bound_tenant_blocked
+    over the broker's own re-adopted job at the 10-min mark."""
+    _, job, climbs, gate_calls, gate_heals, release_job, _, events = _setup_startup_hold_behind_readopted_job(
+        monkeypatch, tmp_path
+    )
+    gate_heals["on"] = check == "passes"
+    cycles = _arm_unhealed_power_cycle(monkeypatch, healed=check == "fails")
+    t0, at, job_ends = _deferred_behind_the_job(monkeypatch, job, release_job)
+    ceiling = srv._stuck_hold_ceiling_sec()
+
+    for sec in (ceiling + 1, ceiling + 300, 2 * ceiling - 1):  # the job runs for 20 min
+        await at(sec)
+    assert climbs == [] and cycles == []
+    assert "hold_bound_tenant_blocked" not in [k for k, _ in events], "the job's run time paged as hold"
+    assert not srv.device_hold_episode_since and srv._hold_bound_health() is None, "no hold while it serves"
+
+    job_end = 2 * ceiling
+    await at(job_end)
+    await job_ends()
+    assert gate_calls == [("startup", True, True, [])], "the full check, fabric included, runs first"
+    await at(job_end + 11)
+    if check != "passes":
+        health = srv._hold_bound_health()
+        assert health["deadline"] == (t0 + timedelta(seconds=job_end + ceiling)).isoformat(timespec="seconds")
+    await at(job_end + ceiling - 1)
+    assert climbs == [] and cycles == [], "no ladder before the job's end + the 10-min bound"
+    for sec in (job_end + ceiling + 1, job_end + ceiling + 11, job_end + ceiling + 21):
+        await at(sec)
+    if check == "passes":
+        assert srv.fsm.state is ServerState.HEALTHY and climbs == [] and cycles == []
+    elif check == "fails":
+        assert climbs == ["present-forced"] and cycles == [], "one ladder; its passing check asks for no cycle"
+        assert srv.fsm.state is ServerState.HEALTHY
+    else:
+        assert climbs == ["present-forced"] and len(cycles) == 1, "one ladder, then one power-cycle request"
+
+
+def _capture_alerts(monkeypatch):
+    """The operator's alert hook, armed; returns the events it was handed."""
+    sent = []
+    monkeypatch.setattr(srv.alert, "alert_argv", lambda: ["alert-cmd"])
+    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log: sent.append(event) or 0)
+    monkeypatch.setattr(srv, "_persist_hold_alert_backoff", lambda *a: None)
+    monkeypatch.setattr(srv, "device_hold_alert_next_bucket", 1)
+    monkeypatch.setattr(srv, "device_hold_alert_gap", 0)
+    return sent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("job_kind", ["placeholder", "preemptable_past_soft_limit"])
+async def test_a_readopted_job_serves_the_startup_hold_only_up_to_its_stated_end(monkeypatch, tmp_path, job_kind):
+    """Spec 03 I75 / 04 I76 (review of 10-19, F1): the re-adopted job's run time is service only up to its
+    stated end, its start + timeout + the stop's grace, or the restart + its timeout for a job with no
+    known start. A placeholder rebuilt without its log, or a preemptable job past its soft limit with
+    nothing queued, which the broker never stops, kept the startup hold deferred without end. Now past
+    its stated end the hold opens, counted from the restart, and the bound acts as on any hold: it pages
+    the job as the blocking tenant, the stuck-hold watchdog flags the hold, and once the job leaves, a
+    failed full check gets one ladder, then one power-cycle request."""
+    _, job, climbs, gate_calls, gate_heals, release_job, _, events = _setup_startup_hold_behind_readopted_job(
+        monkeypatch, tmp_path
+    )
+    t0, at, job_ends = _deferred_behind_the_job(monkeypatch, job, release_job)
+    if job_kind == "placeholder":
+        job.started_at, job.timeout_sec = None, srv.DEFAULT_TIMEOUT_SEC  # Job(...) rebuilt in reconcile
+    else:
+        job.preemptable, job.started_at = True, (t0 - timedelta(seconds=60)).isoformat()
+        job.timeout_sec = srv.DEFAULT_TIMEOUT_SEC
+    gate_heals["on"] = False
+    cycles = _arm_unhealed_power_cycle(monkeypatch)
+    sent = _capture_alerts(monkeypatch)
+    pages = []
+    patch_health_event(
+        monkeypatch, lambda kind, **f: (events.append((kind, f.get("blocker"))), pages.append((kind, f)))
+    )
+    ceiling, stuck = srv._stuck_hold_ceiling_sec(), srv._hold_deadline_sec()
+    end = srv._readopted_job_service_end(job)
+    assert t0 < end <= t0 + timedelta(seconds=ceiling + srv.READOPTED_SERVICE_GRACE_SEC)
+
+    await at(300)
+    assert srv._hold_bound_health() is None, "no hold while the job serves"
+    past = int((end - t0).total_seconds()) + 1
+    for sec in (past, past + 30, past + 60):
+        await at(sec)
+    assert srv.device_hold_episode_since == t0.isoformat(), "past its stated end the hold counts from the restart"
+    assert climbs == [] and cycles == [], "no reset under the running job"
+    blocked = [f for k, f in pages if k == "hold_bound_tenant_blocked"]
+    assert len(blocked) == 1 and blocked[0]["job_id"] == "428", "past its stated end the job is paged, named"
+    health = srv._hold_bound_health()
+    assert health["deadline"] is not None and health["next_step"] == "tenant_blocked"
+    assert "re-adopted job 428" in health["blocked_by"]
+    await at(stuck + 1)
+    assert "hold_stuck_past_deadline" in [k for k, _ in events], "a hold past the stated end is flagged"
+    assert [e for e in sent if e["kind"] == "hold_stuck_past_deadline"], "and alerted"
+
+    await job_ends()
+    assert gate_calls == [("startup", True, True, [])], "the full check, fabric included, runs first"
+    for sec in (stuck + 11, stuck + 21, stuck + 60):
+        await at(sec)
+    assert climbs == ["present-forced"] and len(cycles) == 1, "one ladder, then one power-cycle request"
+    assert srv.fsm.state is not ServerState.HEALTHY, "a failed full check never lifts the hold"
+
+
+@pytest.mark.asyncio
+async def test_the_stuck_hold_watchdog_counts_a_readopted_job_from_its_end(monkeypatch, tmp_path):
+    """Spec 03 I75 (review of 10-19, F2): 2x the ceiling into a healthy re-adopted job on the startup hold,
+    the stuck-hold watchdog wrote hold_stuck_past_deadline ('Manual recovery is likely required') and fired
+    the operator's alert hook over the broker's own job. The job's run inside its stated end is service:
+    no hold, so no event or alert while it runs; the hold opens at its end, so one deadline after the
+    job's end a hold that still stands is flagged and alerted."""
+    _, job, climbs, _, gate_heals, release_job, _, events = _setup_startup_hold_behind_readopted_job(
+        monkeypatch, tmp_path
+    )
+    gate_heals["on"] = False
+    cycles = _arm_unhealed_power_cycle(monkeypatch)
+    sent = _capture_alerts(monkeypatch)
+    _, at, job_ends = _deferred_behind_the_job(monkeypatch, job, release_job)
+    ceiling, stuck = srv._stuck_hold_ceiling_sec(), srv._hold_deadline_sec()
+    assert stuck == 2 * ceiling
+    job_end = stuck + 300  # the job runs past 2x the ceiling
+    for sec in (ceiling + 1, stuck + 1, job_end):
+        await at(sec)
+    assert "hold_stuck_past_deadline" not in [k for k, _ in events], "the job's run time flagged as stuck"
+    assert sent == [], "the operator was alerted over the broker's own job"
+
+    await job_ends()  # the full check fails, the ladder's too: the hold stands
+    await at(job_end + ceiling + 1)
+    await at(job_end + ceiling + 11)
+    assert climbs == ["present-forced"] and len(cycles) == 1
+    await at(job_end + stuck - 1)
+    assert "hold_stuck_past_deadline" not in [k for k, _ in events]
+    await at(job_end + stuck + 1)
+    assert "hold_stuck_past_deadline" in [k for k, _ in events], "the hold went silent after the job's end"
+    assert [e["kind"] for e in sent] == ["hold_stuck_past_deadline"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop", ["timeout", "preempt"])
+async def test_a_readopted_job_the_broker_is_stopping_serves_until_the_stop_s_bound(monkeypatch, tmp_path, stop):
+    """Spec 03 I75 (review of 10-20, F3): the stated end's grace was 60 s, shorter than the broker's own
+    stop of a re-adopted job past its timeout: the monitor's poll, SIGINT and its 60 s grace, then a
+    blocking `systemctl stop` (up to systemd's 90 s stop timeout). A job that ignored SIGINT read as
+    overrun while the broker was still reaping it: hold_bound_tenant_blocked named it,
+    hold_stuck_past_deadline fired and both reached the operator's alert hook. Now the grace covers
+    the whole stop (READOPTED_SERVICE_GRACE_SEC): inside it, nothing pages; past it, a job still
+    running is paged, flagged and alerted as before. The preempt path (its window, then SIGKILL) fits
+    inside the same grace."""
+    _, job, climbs, _, gate_heals, release_job, _, events = _setup_startup_hold_behind_readopted_job(
+        monkeypatch, tmp_path
+    )
+    t0, at, _ = _deferred_behind_the_job(monkeypatch, job, release_job)
+    job.started_at, job.timeout_sec = t0.isoformat(), 1200
+    if stop == "preempt":
+        job.preemptable = True
+        job.preempt_deadline_monotonic = time.monotonic() + srv.PREEMPT_GRACE_SEC
+    gate_heals["on"] = False
+    cycles = _arm_unhealed_power_cycle(monkeypatch)
+    sent = _capture_alerts(monkeypatch)
+
+    # The broker's stop: the monitor's 5 s poll (twice), then SIGINT + its grace + the reap's `systemctl
+    # stop` (systemd's default 90 s), or the preempt window and its SIGKILL.
+    stop_bound = 2 * 5 + max(srv.GRACEFUL_KILL_GRACE_SEC + 90, srv.PREEMPT_GRACE_SEC)
+
+    # The broker is still stopping the job (SIGINT, its grace, the reap): it is still RUNNING.
+    for sec in (1250, 1300, 1330, 1200 + stop_bound):
+        await at(sec)
+    assert "hold_bound_tenant_blocked" not in [k for k, _ in events], "the broker's own stop paged as a tenant"
+    assert "hold_stuck_past_deadline" not in [k for k, _ in events], "the broker's own stop flagged as stuck"
+    assert sent == [], "the operator was alerted over the broker's own stop"
+    assert climbs == [] and cycles == []
+    grace = srv.READOPTED_SERVICE_GRACE_SEC
+    assert stop_bound < grace <= 300, "the grace covers the broker's whole stop, and stays bounded"
+
+    # Past the grace the job still runs: a stuck tenant, paged by name, flagged and alerted.
+    await at(1200 + grace + 1)
+    blocked = [b for k, b in events if k == "hold_bound_tenant_blocked"]
+    assert blocked, "a job past the stop's bound is paged"
+    assert "hold_stuck_past_deadline" in [k for k, _ in events], "and flagged"
+    assert [e for e in sent if e["kind"] == "hold_stuck_past_deadline"], "and alerted"
+    health = srv._hold_bound_health(t0 + timedelta(seconds=1200 + grace + 1))
+    assert health["next_step"] == "tenant_blocked" and "re-adopted job 428" in health["blocked_by"]
+    assert climbs == [] and cycles == [], "no reset under the running job"
+
+    _ended_ago(job, 0)
+    await release_job()
+
+
+@pytest.mark.asyncio
+async def test_a_hung_startup_check_gets_the_ladder_by_its_bound_after_the_readopted_jobs_end(monkeypatch, tmp_path):
+    """Spec 03 I75 / 04 I76: a startup check that hangs after a 20 min re-adopted job holds the ladder
+    off only until STARTUP_VERIFY_DEFER_MAX_SEC (420 s) after the job's end, inside 10 min of it."""
+    since, job, climbs, _, _, _, tick, _ = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    cycles = _arm_unhealed_power_cycle(monkeypatch)
+    ceiling = srv._stuck_hold_ceiling_sec()
+    await tick(2 * ceiling - 1)
+    started, stuck = asyncio.Event(), asyncio.Event()
+
+    async def hung_gate(*a, **kw):
+        started.set()
+        await stuck.wait()
+
+    monkeypatch.setattr(srv, "_device_health_gate", hung_gate)
+    _ended_ago(job, 0)
+    srv.readopted_scopes.clear()
+    await started.wait()
+    try:
+        await tick(2 * ceiling + 1)
+        assert climbs == [], "the startup check runs first"
+        assert srv.STARTUP_VERIFY_DEFER_MAX_SEC < 600
+        monkeypatch.setattr(srv, "_startup_verify_ready_at", time.monotonic() - srv.STARTUP_VERIFY_DEFER_MAX_SEC - 1)
+        await tick(2 * ceiling + srv.STARTUP_VERIFY_DEFER_MAX_SEC + 1)
+        assert climbs == ["present-forced"] and len(cycles) == 1
+    finally:
+        stuck.set()
+        await srv._startup_verify_task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate", ["fails", "never_runs", "never_runs_job_cleaned_up", "never_runs_job_unknown"])
+async def test_replay_a_1_min_readopted_job_whose_startup_check_fails_or_never_runs(monkeypatch, tmp_path, gate):
+    """The 10-17 06:27-06:41 PDT episode: a broker restart re-adopted a live job that ended after 1 min.
+    The startup hold then stood 12m50s with no ladder at the 10-min mark. Now: the startup check runs as
+    soon as the job ends; when it fails, or never runs because the job's scope outlives the job (a killed
+    job still exiting), the bound's ladder runs no later than 10 min after the job's end, and a full
+    check that still fails after it asks for one power cycle. Fails on base for ``never_runs``: the I75
+    stand-down had no clock until the gate stopped waiting on the scope, so it kept the ladder off.
+    ``never_runs_job_cleaned_up``: the finished-job cleanup (which any queued job's hold loop runs) passes
+    over the job past its retention, before the bound runs out. Fails on base, which dropped the job, so
+    the stand-down lost its clock and kept the ladder off for good. ``never_runs_job_unknown``: a scope
+    whose job the broker no longer knows counts from the startup gate's start, so the bound still holds."""
+    since, job, climbs, gate_calls, gate_heals, release_job, tick, events = _setup_startup_hold_behind_readopted_job(
+        monkeypatch, tmp_path
+    )
+    gate_heals["on"] = False
+    cycles = _arm_unhealed_power_cycle(monkeypatch)
+    ceiling = srv._stuck_hold_ceiling_sec()
+    job_end = 60
+    if gate == "fails":
+        _ended_ago(job, 0)
+        await release_job()
+        assert gate_calls == [("startup", True, True, [])]
+    else:
+        job.status = srv.JobStatus.KILLED  # its scope is still exiting: the gate keeps waiting on it
+    await tick(job_end + 300)
+    assert climbs == [] and cycles == []
+
+    if gate != "fails":
+        _ended_ago(job, ceiling - job_end + 1)
+        job.status = srv.JobStatus.KILLED
+    if gate == "never_runs_job_cleaned_up":
+        assert ceiling - job_end + 1 > srv.JOB_RETENTION_SEC
+        await srv.cleanup_finished_jobs()
+        assert srv.jobs.get(job.id) is job, "a job whose scope still lingers keeps its end time"
+    if gate == "never_runs_job_unknown":
+        del srv.jobs[job.id]
+        monkeypatch.setattr(srv, "_startup_verify_started_wall", time.time() - (ceiling - job_end + 1))
+    await tick(ceiling + 1)  # 9 min after the job's end
+    assert climbs == ["present-forced"], "no ladder by 10 min after the re-adopted job's end"
+    assert len(cycles) == 1, "the full check after the ladder failed: one power-cycle request"
+    await tick(ceiling + 21)
+    await tick(2 * ceiling - 1)
+    assert climbs == ["present-forced"] and len(cycles) == 1, "the hold was driven twice"
+    if gate != "fails":
+        assert gate_calls == []
+        srv.readopted_scopes.clear()
+        await srv._startup_verify_task
+
+
+@pytest.mark.asyncio
+async def test_a_fault_hold_from_before_the_restart_keeps_its_clock_behind_a_readopted_job(monkeypatch, tmp_path):
+    """Spec 04 I76 (ordering of 10-17): a fault hold open before the restart keeps its original start.
+    A re-adopted job that ended does not restart its clock or hand it to the startup gate: the ladder
+    runs at 10 min from the original start, then one power cycle; /health shows that deadline."""
+    since, job, climbs, _, _, _, tick, events = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    fsm_dirty(srv, "gate: eth/fabric fault before the restart", why="gate_error")
+    cycles = _arm_unhealed_power_cycle(monkeypatch)
+    ceiling = srv._stuck_hold_ceiling_sec()
+    _ended_ago(job, 0)  # the restart re-adopted a job; its scope is still exiting
+    assert srv._hold_bound_health(since)["deadline"] == (since + timedelta(seconds=ceiling)).isoformat()
+    await tick(ceiling - 1)
+    assert climbs == []
+    await tick(ceiling + 1)
+    assert climbs == ["present-forced"] and len(cycles) == 1
+    assert ("stuck_hold_deferred", "startup_verify") not in events
+    srv.readopted_scopes.clear()
+    await srv._startup_verify_task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("report", ["on", "off"])
+async def test_the_startup_verify_report_never_hides_or_delays_the_10min_hold_bound(monkeypatch, tmp_path, report):
+    """Spec 03 I76 with spec 04 I76: the startup_verify report is reporting only.
+    With the report on, /health still carries hold_bound (deadline, age, next step) beside it, and the
+    bound's ladder and then its one power cycle fire on the same ticks as with the report forced off."""
+    since, job, climbs, gate_calls, gate_heals, release_job, tick, _ = _setup_startup_hold_behind_readopted_job(
+        monkeypatch, tmp_path
+    )
+    if report == "off":
+        monkeypatch.setattr(srv, "_startup_verify_view", lambda: None)
+    gate_heals["on"] = False
+    cycles = []
+
+    async def power_cycle(log, reason):
+        cycles.append(reason)
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", lambda action, tenant_active: (True, ""))
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    ladder = srv.galaxy_recovery.escalate
+
+    async def unhealed_ladder(phase, indices, expected, log, **kw):
+        outcome = await ladder(phase, indices, expected, log, **kw)
+        return OUTCOME_WAITING if outcome == OUTCOME_RECOVERED else outcome
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", unhealed_ladder)
+    ceiling = srv._stuck_hold_ceiling_sec()
+
+    def health(sec, phase):
+        now = since + timedelta(seconds=sec)
+        body = srv._health_payload(now=now)
+        bound = body["hold_bound"]
+        assert bound is not None and bound["bound_sec"] == int(ceiling), "startup_verify hid the hold bound"
+        assert bound["deadline"] == srv._hold_bound_deadline_iso(now) is not None
+        assert body["held_age_sec"] is not None
+        if report == "on":
+            assert body["startup_verify"]["phase"] == phase and body["startup_verify"]["fault"] is False
+        else:
+            assert body["startup_verify"] is None
+        return bound
+
+    await tick(ceiling - 60)
+    assert health(ceiling - 60, "readopted_job_running")["next_step"] == "ladder"
+    await tick(ceiling + 1)  # past the bound while the job runs: only the live tenant blocks it
+    health(ceiling + 1, "readopted_job_running")
+    assert climbs == [] and cycles == []
+    job.status = srv.JobStatus.COMPLETED
+    srv.readopted_scopes.pop(job.id, None)  # its scope ended: only the startup gate is left to run
+    await tick(ceiling + 6)
+    health(ceiling + 6, "verifying")
+    assert climbs == [] and cycles == []
+    await release_job()
+    assert len(gate_calls) == 1 and srv.fsm.state is ServerState.RECOVERING
+
+    await tick(ceiling + 11)
+    assert climbs == ["present-forced"], "the bound's ladder runs on the first tick after the failed gate"
+    assert len(cycles) == 1, "then the power cycle, on the same tick, report or not"
+    assert srv._health_payload(now=since + timedelta(seconds=ceiling + 11))["startup_verify"] is None
 
 
 @pytest.mark.asyncio
@@ -17262,3 +16208,367 @@ async def test_idle_relift_leaves_a_startup_hold_to_the_pending_startup_gate(mon
     srv.last_relift_monotonic = 0.0
     await srv._attempt_idle_relift()
     assert counters["resets"] == 1, "once the startup gate is done, a hold still standing escalates as before"
+
+
+def _readopted_running_job(job_id="428"):
+    job = srv.Job(id=job_id, owner="o", workspace="/w", command="c", queued_at="", status=srv.JobStatus.RUNNING)
+    srv.jobs[job_id] = job
+    return job
+
+
+@pytest.mark.asyncio
+async def test_health_names_a_startup_hold_behind_a_live_readopted_job_as_no_fault(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 03 I76: a restart re-adopted a healthy job and its startup hold
+    read as a device in recovery; a client yielded by killing the job, which then owed the mesh a reset
+    plus the full check. /health, the queue status and the job's own status now name the state and the
+    job, and say it is no fault. The hold itself stays visible: held, its start and its age, and the
+    FSM's own record. Fails on base, which has no startup_verify field."""
+    since, *_ = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    _readopted_running_job()
+    srv._hold_episode_restorable = False
+
+    body = srv._health_payload(now=since + timedelta(seconds=700))
+    assert body["status"] == "degraded", "status keeps its two values: a client reads any other as broker down"
+    assert body["startup_verify"] == {
+        "phase": "readopted_job_running",
+        "readopted_job_ids": ["428"],
+        "fault": False,
+        "since": since.isoformat(),
+        "check_started_at": None,
+        "deadline": None,
+        "bound_sec": srv.STARTUP_VERIFY_DEFER_MAX_SEC,
+    }
+    assert body["fsm_state"] == "recovering" and body["fsm_why"] == "startup_unverified", "the FSM contract stands"
+    assert body["held"] is True and body["held_age_sec"] is not None, "the hold and its clock are not hidden"
+    assert body["device_degraded"], "a new tenant job is still refused until the startup check passes"
+
+    queue = srv._get_queue_status()
+    assert queue["startup_verify"]["readopted_job_ids"] == ["428"]
+    hold_row = next(r for r in queue["running"] if r.get("op") == "hold")
+    assert "not a fault" in hold_row["command"] and "428" in hold_row["command"]
+
+    from tt_device_mcp.socket_transport import current_peer_uid, current_via_mcp
+
+    mcp = srv.create_mcp_server()
+    tok, mtok = current_peer_uid.set(4242), current_via_mcp.set(False)
+    try:
+        out = json.loads((await mcp.call_tool("tt_device_job_status", {"params": {"job_id": "428"}})).content[0].text)
+    finally:
+        current_peer_uid.reset(tok)
+        current_via_mcp.reset(mtok)
+    assert out["readopted"] is True and out["startup_verify"]["phase"] == "readopted_job_running"
+    srv._startup_verify_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_the_startup_check_still_runs_and_gates_the_queue_after_the_readopted_job_ends(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 03 I76 (goal: a full check after every reset or start): the new state is reporting only.
+    While it shows, tenants stay refused; the startup gate still runs the full check, fabric included,
+    once the re-adopted job ends, and only its pass releases the queue. A gate that fails leaves an
+    ordinary fault hold: the state is gone."""
+    since, _, climbs, gate_calls, gate_heals, release_job, _, _ = _setup_startup_hold_behind_readopted_job(
+        monkeypatch, tmp_path
+    )
+    job = _readopted_running_job()
+    assert srv._startup_verify_view()["phase"] == "readopted_job_running"
+    assert srv._device_unavailable_for_tenant(), "the queue opened before the startup check"
+
+    gate_heals["on"] = False
+    job.status = srv.JobStatus.COMPLETED
+    await release_job()
+    assert gate_calls == [("startup", True, True, [])], "the startup gate runs the full check, fabric included"
+    assert srv._startup_verify_view() is None, "a hold the startup gate left standing is a fault hold"
+    assert srv._health_payload()["startup_verify"] is None
+    assert srv._device_unavailable_for_tenant()
+
+
+@pytest.mark.asyncio
+async def test_the_startup_check_reports_when_it_began_and_its_deadline(monkeypatch, tmp_path, clear_job_state):
+    """Spec 03 I76: while the startup check runs, the hold's episode start can still be unset, and
+    the view showed 'verifying' with since null, so a client with a queued job guessed how long the
+    check would take and withdrew it. The view now names the gate's start (since), the check's own
+    start (check_started_at) and its bound (deadline: hugepage wait plus the check's bound), and a
+    queued job's status says it waits on the check. All of it goes with the view once the gate passes.
+    Fails on base, which reports since null and no deadline."""
+    *_, release_job, _, _ = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv, "device_hold_episode_since", "")
+    gate_started = time.time() - 30
+    monkeypatch.setattr(srv, "_startup_verify_started_wall", gate_started)
+    monkeypatch.setattr(srv, "_startup_verify_ready_wall", None)
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def gate(job_log_file, *, phase, run_fabric, force_fabric=False):
+        entered.set()
+        await finish.wait()
+        fsm_healthy(srv)
+
+    monkeypatch.setattr(srv, "_device_health_gate", gate)
+    queued = srv.Job(id="501", owner="o", workspace="/w", command="c", queued_at="")
+    srv.jobs["501"] = queued
+    _readopted_running_job()
+
+    view = srv._startup_verify_view()
+    assert (
+        view["phase"] == "readopted_job_running" and view["since"] == datetime.fromtimestamp(gate_started).isoformat()
+    )
+    assert view["check_started_at"] is None and view["deadline"] is None, "the check has not begun"
+
+    before = time.time()
+    srv.readopted_scopes.pop("428")
+    srv.jobs["428"].status = srv.JobStatus.COMPLETED
+    await asyncio.wait_for(entered.wait(), 5)
+    view = srv._startup_verify_view()
+    assert view["phase"] == "verifying"
+    assert view["since"] == datetime.fromtimestamp(gate_started).isoformat(), "since was null during the check"
+    began = datetime.fromisoformat(view["check_started_at"])
+    assert datetime.fromtimestamp(before - 1) <= began <= datetime.now()
+    deadline = datetime.fromisoformat(view["deadline"])
+    assert deadline == began + timedelta(seconds=srv.STARTUP_VERIFY_DEFER_MAX_SEC)
+    assert srv.STARTUP_VERIFY_DEFER_MAX_SEC >= srv.STARTUP_HUGEPAGES_WAIT_SEC + srv.FABRIC_CHECK_TIMEOUT_SEC
+    assert srv._health_payload()["startup_verify"]["deadline"] == view["deadline"]
+    raw = json.loads(srv.fsm._path.read_text())
+    assert raw["startup_check_in_progress"] is True, "fsm.json does not say the startup check is running"
+    assert (raw["startup_check_started_at"], raw["startup_check_deadline"]) == (view["since"], view["deadline"])
+    assert (raw["state"], raw["why"]) == ("recovering", "startup_unverified")
+
+    from tt_device_mcp.socket_transport import current_peer_uid, current_via_mcp
+
+    mcp = srv.create_mcp_server()
+
+    async def status(job_id):
+        tok, mtok = current_peer_uid.set(4242), current_via_mcp.set(False)
+        try:
+            res = await mcp.call_tool("tt_device_job_status", {"params": {"job_id": job_id}})
+            return json.loads(res.content[0].text)
+        finally:
+            current_peer_uid.reset(tok)
+            current_via_mcp.reset(mtok)
+
+    out = await status("501")
+    assert out["status"] == "queued" and out["hold_reason"].startswith("held: startup check")
+    assert out["startup_verify"]["deadline"] == view["deadline"]
+
+    finish.set()
+    await release_job()
+    assert srv.fsm.state is ServerState.HEALTHY
+    assert srv._startup_verify_view() is None and srv._health_payload()["startup_verify"] is None
+    raw = json.loads(srv.fsm._path.read_text())
+    assert (raw["startup_check_in_progress"], raw["startup_check_deadline"]) == (False, None)
+    out = await status("501")
+    assert "hold_reason" not in out and "startup_verify" not in out, "the hold reason outlived the check"
+
+
+@pytest.mark.asyncio
+async def test_a_startup_check_that_passes_after_the_readopted_job_releases_the_queue(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 03 I76: the 'verifying' phase covers the gate's own run; its pass opens the queue and
+    clears the state."""
+    *_, release_job, _, _ = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    job = _readopted_running_job()
+    srv.readopted_scopes.pop("428")
+    job.status = srv.JobStatus.COMPLETED
+    assert srv._startup_verify_view()["phase"] == "verifying"
+    await release_job()
+    assert srv.fsm.state is ServerState.HEALTHY
+    assert srv._startup_verify_view() is None
+    body = srv._health_payload()
+    assert body["status"] == "ok" and body["startup_verify"] is None
+
+
+@pytest.mark.asyncio
+async def test_killing_the_readopted_job_drops_the_startup_verify_state_and_still_owes_the_reset(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 03 I76 with I69: the state never covers a kill. Once a kill of the re-adopted job is
+    requested the hold reads as a fault again, and the job's end owes the mesh one reset plus the
+    full check, as before."""
+    *_, release_job, _, _ = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
+    job = _readopted_running_job()
+    assert srv._startup_verify_view() is not None
+    srv._sync_fsm_readopted_jobs()
+    assert json.loads(srv.fsm._path.read_text())["readopted_jobs"] == ["428"]
+    job.status = srv.JobStatus.KILLED  # what _kill_job stamps before it stops the scope
+    srv.request_killed_job_ids.add("428")
+    assert srv._startup_verify_view() is None, "a requested kill is not 'no fault'"
+    assert srv._health_payload()["startup_verify"] is None
+    await asyncio.wait_for(srv._monitor_readopted_scope("428", "ttdev-job-428.scope"), timeout=5)
+    assert srv._kill_reset_debt().startswith("re-adopted job 428"), "the kill still owes one reset + full check"
+    assert srv._startup_verify_view() is None
+    assert json.loads(srv.fsm._path.read_text())["readopted_jobs"] == [], "fsm.json still names the killed job"
+    srv._startup_verify_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_fault_during_the_startup_verify_state_reads_as_a_fault(monkeypatch, tmp_path, clear_job_state):
+    """Spec 03 I76: anything that says fault ends the state at once, so the fault's class keeps its own
+    shortest path and its clients see it: a chip the live probe finds off the bus, a runtime fault
+    report, an isolated chip, or the hold turning into a fault class."""
+    _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    _readopted_running_job()
+    assert srv._startup_verify_view() is not None
+
+    monkeypatch.setattr(srv, "_device_liveness_reason", lambda: "chip 3 off the PCIe bus")
+    assert srv._startup_verify_view() is None
+    monkeypatch.setattr(srv, "_device_liveness_reason", lambda: "")
+    assert srv._startup_verify_view() is not None
+
+    monkeypatch.setattr(srv, "device_fault_reported", "ttnn: ethernet core timeout")
+    assert srv._startup_verify_view() is None
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+
+    monkeypatch.setattr(srv, "isolated_chips", {5})
+    assert srv._startup_verify_view() is None
+    monkeypatch.setattr(srv, "isolated_chips", set())
+
+    fsm_dirty(srv, "chip 3 dropped", why="job_killed")
+    assert srv._startup_verify_view() is None
+    assert srv._health_payload()["startup_verify"] is None
+    srv._startup_verify_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_the_startup_verify_state_hides_no_hold_bound(monkeypatch, tmp_path, clear_job_state):
+    """Spec 03 I76 with I23/I75: the state is reporting only. While the re-adopted job runs past the
+    ceiling the hold stands down on that tenant exactly as before (and its age keeps counting on
+    /health); once the job has ended and the startup gate is stuck past STARTUP_VERIFY_DEFER_MAX_SEC
+    the state is gone and the ceiling ladder climbs on the next tick."""
+    since, _, climbs, _, _, _, tick, _ = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    job = _readopted_running_job()
+    srv._hold_episode_restorable = False
+    ceiling = srv._stuck_hold_ceiling_sec()
+
+    await tick(ceiling + 1)
+    assert climbs == [] and srv.device_hold_tenant_deferred is True, "stood down on the live tenant, as before"
+    body = srv._health_payload(now=since + timedelta(seconds=ceiling + 1))
+    assert body["startup_verify"]["phase"] == "readopted_job_running" and body["held_age_sec"] is not None
+
+    job.status = srv.JobStatus.COMPLETED
+    srv.readopted_scopes.clear()
+    await asyncio.sleep(0)
+    gate_started = asyncio.Event()
+    stuck = asyncio.Event()
+
+    async def hung_gate():
+        gate_started.set()
+        await stuck.wait()
+
+    srv._startup_verify_task.cancel()
+    srv._startup_verify_task = asyncio.create_task(hung_gate())
+    await gate_started.wait()
+    monkeypatch.setattr(srv, "_startup_verify_ready_at", time.monotonic() - srv.STARTUP_VERIFY_DEFER_MAX_SEC - 1)
+    try:
+        assert srv._startup_verify_view() is None, "past its bound the startup gate no longer owns the hold"
+        await tick(ceiling + 11)
+        assert climbs == ["present-forced"]
+    finally:
+        stuck.set()
+        await srv._startup_verify_task
+
+
+def _fsm_file_readopted_jobs():
+    return json.loads(srv.fsm._path.read_text())["readopted_jobs"]
+
+
+@pytest.mark.asyncio
+async def test_fsm_json_names_the_readopted_job_while_it_runs_and_clears_when_it_ends(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 03 I76: fsm.json's readopted_jobs mirrors /health startup_verify.readopted_job_ids, so a
+    client reading the file tells the startup hold behind a live re-adopted job from a fault. Set when
+    the startup gate takes the hold over the re-adopted job and on each scope poll; [] once the job
+    ends. Report-only: the hold and the startup gate are unchanged."""
+    *_, release_job, _, _ = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    job = _readopted_running_job()
+    srv._sync_fsm_readopted_jobs()  # what run_startup_tasks does once the startup gate owns the hold
+    assert _fsm_file_readopted_jobs() == ["428"]
+
+    seen = []
+
+    def scope_active(scope):
+        seen.append(_fsm_file_readopted_jobs())
+        if len(seen) < 3:
+            return True
+        job.status = srv.JobStatus.COMPLETED
+        return False
+
+    monkeypatch.setattr(srv, "_scope_active", scope_active)
+    srv.fsm.set_readopted_jobs([])  # the poll alone must set it again
+    await asyncio.wait_for(srv._monitor_readopted_scope("428", "ttdev-job-428.scope"), timeout=5)
+    assert seen[1:] == [["428"], ["428"]], "each scope poll writes the live re-adopted job"
+    assert _fsm_file_readopted_jobs() == [], "the job ended: nothing re-adopted holds the hold"
+    assert srv.fsm.state is ServerState.RECOVERING and srv.fsm.record.why == "startup_unverified"
+    await release_job()
+    assert srv.fsm.state is ServerState.HEALTHY and _fsm_file_readopted_jobs() == []
+
+
+@pytest.mark.asyncio
+async def test_a_same_boot_restart_that_readopts_no_job_empties_a_stale_fsm_json_list(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 03 I76: a previous broker of this boot wrote readopted_jobs ['428'] and died; job 428 died
+    with it. The same-boot load keeps the list, and only run_startup_tasks' sync, once the startup gate
+    owns the hold, empties it. Without that sync the file names a dead job until HEALTHY or DOWN, and a
+    client reading it waits on a job that no longer exists. The hold itself stands: report-only."""
+    fsm_path = tmp_path / "fsmdir" / "fsm.json"
+    fsm_path.parent.mkdir()
+    before = ServerFsm(fsm_path, current_boot_id="boot-same")
+    before.on_fault("startup_unverified", dirty=False)
+    before.set_readopted_jobs(["428"])
+    assert json.loads(fsm_path.read_text())["readopted_jobs"] == ["428"]
+
+    after = ServerFsm(fsm_path, current_boot_id="boot-same")
+    assert after.readopted_jobs == ["428"], "the same-boot load keeps the list until the startup sync"
+    monkeypatch.setattr(srv, "fsm", after)
+    monkeypatch.setattr(srv, "readopted_scopes", {})  # this restart re-adopts no live scope
+    _gate_with_verdict(monkeypatch, tmp_path, _HEALTHY_VERDICT)
+    await _start_broker_holding(monkeypatch, [])
+
+    assert srv._startup_verify_task is not None
+    assert json.loads(fsm_path.read_text())["readopted_jobs"] == [] and srv.fsm.readopted_jobs == []
+    assert srv.fsm.state is ServerState.RECOVERING and srv.fsm.record.why == "startup_unverified"
+
+
+@pytest.mark.asyncio
+async def test_fsm_json_readopted_jobs_clear_on_release(monkeypatch, tmp_path, clear_job_state):
+    """Spec 03 I76: the startup gate's pass releases the queue and empties the field."""
+    *_, release_job, _, _ = _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    job = _readopted_running_job()
+    srv._sync_fsm_readopted_jobs()
+    assert _fsm_file_readopted_jobs() == ["428"]
+    job.status = srv.JobStatus.COMPLETED
+    await release_job()  # drops the scope without a monitor sync; the release itself must clear it
+    assert srv.fsm.state is ServerState.HEALTHY
+    assert _fsm_file_readopted_jobs() == [] and srv.fsm.readopted_jobs == []
+
+
+@pytest.mark.asyncio
+async def test_fsm_json_readopted_jobs_empty_when_the_job_is_gone_or_a_fault_shows(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 03 I76: the field is never wider than startup_verify: a re-adopted job that disappeared, or
+    any fault sign, leaves it []. It hides no hold and no fault."""
+    _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path)
+    _readopted_running_job()
+    srv._sync_fsm_readopted_jobs()
+    assert _fsm_file_readopted_jobs() == ["428"]
+
+    monkeypatch.setattr(srv, "_device_liveness_reason", lambda: "chip 3 off the PCIe bus")
+    srv._sync_fsm_readopted_jobs()
+    assert _fsm_file_readopted_jobs() == [], "a fault sign is not 'wait'"
+    monkeypatch.setattr(srv, "_device_liveness_reason", lambda: "")
+    srv._sync_fsm_readopted_jobs()
+    assert _fsm_file_readopted_jobs() == ["428"]
+
+    del srv.jobs["428"]
+    srv._sync_fsm_readopted_jobs()
+    assert _fsm_file_readopted_jobs() == [], "a re-adopted job that disappeared holds nothing"
+    assert srv._device_unavailable_for_tenant(), "the hold itself stands"
+    srv._startup_verify_task.cancel()

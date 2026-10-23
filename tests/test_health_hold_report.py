@@ -59,7 +59,6 @@ def held(monkeypatch, galaxy_trays):
     monkeypatch.setattr(srv, "_ubb_bus_id_tables", lambda: TABLES)
     monkeypatch.setattr(m, "power_cycle_cooldown_state", None)
     monkeypatch.setattr(m, "power_cycle_retry", None)
-    monkeypatch.setattr(m, "progress_retry", None)
     monkeypatch.setattr(m, "host_action_requested", None)
     monkeypatch.setattr(opc, "_pending", {})
     monkeypatch.delenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", raising=False)
@@ -330,8 +329,6 @@ def _gated(monkeypatch, **pending) -> None:
     "pending, cmd, at, source",
     [
         ({"gated": True}, True, START + 300, "gated off-bus grace"),
-        ({"ipmi_at": datetime.fromtimestamp(START + 30)}, True, START + 330, "BMC IPMI hand-off bound"),
-        ({"tray_walk_at": datetime.fromtimestamp(START + 20)}, True, START + 320, "failed tray walk hand-off bound"),
         (
             {"handoff": {"deadline": START + 1200, "why": "w", "latched": "", "operator_seen": "none"}},
             False,
@@ -366,21 +363,6 @@ def test_the_off_bus_pass_waits_for_the_ladder_to_have_run(held, monkeypatch):
     assert opc.watchdog_due_at(_episode()) is None and opc.watchdog_due_at("other") is None
 
 
-def test_the_i39_progress_retry_is_named(held, monkeypatch):
-    """F1: a failed mesh reset that brought chips back retries early, not at the ceiling."""
-    held["off"] = {3, 4, 5, 6}
-    held["m"].progress_retry = (_episode(), srv.time.monotonic() + 45)
-    p = _payload()
-    assert p["next_rung_source"] == "progress retry"
-    assert abs(datetime.fromisoformat(p["next_rung_at"]).timestamp() - (T0 + 45)) <= 2
-    held["m"].progress_retry = (_episode(), srv.time.monotonic() - 1)
-    p = _payload()
-    assert p["next_rung_at"] == _iso(T0) and p["next_rung_due"] is True
-    assert _fires(T0, monkeypatch) == ["progress_retry"]
-    held["m"].progress_retry = ("another episode", srv.time.monotonic() - 1)
-    assert _payload()["next_rung_source"] == "hold bound (600s)"
-
-
 def test_a_declined_window_stays_reported_as_due(held, monkeypatch):
     """F2a: window 1 is due at 600 s; its spawn was declined, so at 700 s it is still window 1 (the
     watchdog retries it every tick), never window 2 at 1200 s."""
@@ -393,41 +375,6 @@ def test_a_declined_window_stays_reported_as_due(held, monkeypatch):
     )
     assert _fires(START + 700, monkeypatch) == ["ceiling_window"]
     assert _fires(START + 599, monkeypatch) == [] and _fires(START + 600, monkeypatch) == ["ceiling_window"]
-
-
-def test_an_armed_progress_retry_does_not_hide_a_due_ceiling_window(held, monkeypatch):
-    """Review #1304 F2a: an I39 retry armed but not yet due leaves the watchdog's ceiling branch live.
-    At 610 s window 1 (due at 600 s) fires, not the retry due at 640 s; before 600 s the retry is next."""
-    held["off"] = {3, 4, 5, 6}
-    now = START + 610
-    held["m"].progress_retry = (_episode(), srv.time.monotonic() + 30)
-    p = srv._health_payload(now=datetime.fromtimestamp(now))
-    assert (p["next_rung_source"], p["next_rung_at"], p["next_rung_due"]) == (
-        "hold ceiling window 1",
-        _iso(START + 600),
-        True,
-    )
-    assert _fires(now, monkeypatch) == ["ceiling_window"]
-    p = srv._health_payload(now=datetime.fromtimestamp(START + 560))
-    assert p["next_rung_source"] == "progress retry" and p["next_rung_due"] is False
-    held["m"].progress_retry = (_episode(), srv.time.monotonic() - 1)  # due: the chain stops at it
-    p = srv._health_payload(now=datetime.fromtimestamp(now))
-    assert (p["next_rung_source"], p["next_rung_at"]) == ("progress retry", _iso(now))
-    assert _fires(now, monkeypatch) == ["progress_retry"]
-
-
-def test_an_off_bus_one_shot_not_yet_due_does_not_hide_an_earlier_retry(held, monkeypatch):
-    """The one-shot branch needs its age; before it, a due progress retry still fires and is named."""
-    held["off"] = {3, 4}
-    monkeypatch.setattr(srv, "isolated_chips", {"3", "4"})
-    monkeypatch.setattr(srv, "device_hold_offbus_tenant_wait", True)  # one-shot at the 120 s tenant bound
-    held["m"].progress_retry = (_episode(), srv.time.monotonic() - 1)
-    p = _payload()
-    assert (p["next_rung_source"], p["next_rung_at"], p["next_rung_due"]) == ("progress retry", _iso(T0), True)
-    assert _fires(T0, monkeypatch) == ["progress_retry"]
-    assert _fires(START + 120, monkeypatch) == ["offbus_one_shot"]
-    p = srv._health_payload(now=datetime.fromtimestamp(START + 130))
-    assert p["next_rung_source"] == "off-bus one-shot", "due: the watchdog's chain stops at it"
 
 
 @pytest.mark.parametrize("failed", [False, True])
@@ -534,6 +481,25 @@ def test_an_all_ones_chip_is_in_no_tray_row(held):
     assert sum(len(r["chips_present"]) for r in rows.values()) == EXPECTED - 1
 
 
+def test_a_dead_enumerated_tray_with_no_map_is_a_whole_tray(held, monkeypatch):
+    """Spec 03 I72: with no tray map banked, a tray whose chips read all-ones still has its KMD nodes;
+    hold_class reads the ladder's presence, so it is a whole tray off (A), not part of one (B2)."""
+    monkeypatch.setattr(srv.galaxy_recovery, "_tray_map_now", lambda: None)
+    held["dead"] = set(TRAY_CHIPS[0x40])
+    assert set(TRAY_CHIPS[0x40]) <= set(srv.chip_pci_bdfs())
+    assert _payload()["hold_class"] == "A"
+
+
+def test_a_link_down_tray_with_no_map_is_a_whole_tray(held, monkeypatch):
+    """A tray whose nodes linger with their links down and no heartbeat read is a whole tray off too."""
+    tray = set(TRAY_CHIPS[0x40])
+    monkeypatch.setattr(srv.galaxy_recovery, "_tray_map_now", lambda: None)
+    monkeypatch.setattr(srv, "chip_pci_bdfs", lambda: dict(enumerate(GALAXY_BUS_IDS)))
+    monkeypatch.setattr(srv, "link_down", lambda bdf: GALAXY_BUS_IDS.index(bdf) in tray)
+    held["off"] = tray
+    assert _payload()["hold_class"] == "A"
+
+
 # ---- the pure helpers ----------------------------------------------------------------------------
 
 
@@ -583,33 +549,17 @@ def test_cooldown_candidate_and_next_rung():
 # ---- rungs rollout-3 added beside the watchdog chain (spec 04 I73, I70) ---------------------------
 
 
-def test_the_class_a_10_min_ladder_is_named_and_fires_when_reported(held, monkeypatch):
-    """Spec 04 I73: a whole tray whose cycle the cooldown refuses gets the full ladder 10 min after its
-    last cycle or boot. With the first ceiling window spent, that mark comes before the next window
-    and before the cooldown's own retry, and the report names it at the time the watchdog asks it."""
+def test_a_class_a_hold_in_the_cooldown_has_no_second_10_min_trigger(held, monkeypatch):
+    """Spec 04 I73/I76: a whole tray whose cycle the cooldown refuses gets its full ladder only in the
+    10-min hold bound's run. No separate class-A start exists: with the first ceiling window spent, the
+    report names the next window, and no class-A kind fires 10 min after the last cycle or boot."""
     held["off"] = set(TRAY_CHIPS[0x40])
     monkeypatch.setattr(held["m"], "whole_tray_off", list(TRAY_CHIPS[0x40]))
     monkeypatch.setattr(held["m"], "_class_a_ladder_anchor", None)
-    monkeypatch.setattr(held["m"], "_class_a_ladder_spawned", None)
     monkeypatch.setattr(srv, "device_hold_escalate_bucket", 1)
     _deny(held["m"], START + 400 + 1800, last=START + 400)
-    p = _payload()
-    assert (p["next_rung"], p["next_rung_source"]) == ("forced ladder", "class A 10-min ladder")
-    assert p["next_rung_at"] == _iso(START + 1000) and p["next_rung_due"] is False
-    assert "class_a_ladder" not in _fires(START + 999, monkeypatch)
-    assert "class_a_ladder" in _fires(START + 1000, monkeypatch)
-    held["m"]._class_a_ladder_spawned = START + 400  # its pass started: the next window is next
     assert _payload()["next_rung_source"] == "hold ceiling window 2"
-
-
-def test_the_class_a_ladder_is_not_named_when_the_cooldown_ends_first(held, monkeypatch):
-    held["off"] = set(TRAY_CHIPS[0x40])
-    monkeypatch.setattr(held["m"], "whole_tray_off", list(TRAY_CHIPS[0x40]))
-    monkeypatch.setattr(held["m"], "_class_a_ladder_anchor", None)
-    monkeypatch.setattr(held["m"], "_class_a_ladder_spawned", None)
-    _deny(held["m"], START + 300, last=START - 1500)
-    assert held["m"].class_a_ladder_watch_at(T0) is None
-    assert _payload()["next_rung_source"] == "power_cycle_cooldown"
+    assert "class_a_ladder" not in _fires(START + 1000, monkeypatch)
 
 
 def test_the_unkillable_leftover_host_rung_is_named(held, monkeypatch):
@@ -622,7 +572,7 @@ def test_the_unkillable_leftover_host_rung_is_named(held, monkeypatch):
     monkeypatch.setattr(srv, "_leftover_rung_last_try", 0.0)
     monkeypatch.setattr(srv, "_leftover_rung_stage", "")
     p = _payload()
-    assert (p["next_rung"], p["next_rung_source"]) == ("host reboot or power cycle", "unkillable leftover budget")
+    assert (p["next_rung"], p["next_rung_source"]) == ("power cycle", "unkillable leftover budget")
     assert abs(datetime.fromisoformat(p["next_rung_at"]).timestamp() - (T0 + 500)) <= 2
     monkeypatch.setattr(srv, "_leftover_unkillable_mono", mono - 700)
     monkeypatch.setattr(srv, "_leftover_rung_last_try", mono - 20)
@@ -694,20 +644,18 @@ def test_the_report_names_the_rung_the_forced_run_routes_to(held, monkeypatch, r
     assert _first_act(read_at, START + 1900, monkeypatch) == (START + at, "power cycle")
 
 
-def test_a_class_a_ladder_mark_inside_the_check_window_is_not_reported(held, monkeypatch):
-    """The class A 10-min ladder falls due at 1000 s while the bound ladder's check (900 s + 300 s)
-    is pending: the run returns there, so the report skips it and names the host rung at 1200 s."""
+def test_a_class_a_hold_inside_the_check_window_reports_the_host_rung(held, monkeypatch):
+    """A whole tray off while the bound ladder's check (900 s + 300 s) is pending: no class-A start
+    fires 10 min after the last cycle (1000 s), and the report names the act that comes first."""
     held["off"] = set(TRAY_CHIPS[0x40])
     monkeypatch.setattr(held["m"], "whole_tray_off", list(TRAY_CHIPS[0x40]))
     monkeypatch.setattr(held["m"], "_class_a_ladder_anchor", None)
-    monkeypatch.setattr(held["m"], "_class_a_ladder_spawned", None)
     monkeypatch.setattr(srv, "device_hold_escalate_bucket", 1)
     _deny(held["m"], START + 400 + 1800, last=START + 400)
     _bound_ladder_ran(monkeypatch, 900.0, True)
     read_at = START + 950
-    assert "class_a_ladder" in _fires(START + 1000, monkeypatch), "the mark is due inside the window"
+    assert "class_a_ladder" not in _fires(START + 1000, monkeypatch)
     rung, source, at = _report(read_at)
-    assert source != "class A 10-min ladder"
     assert _first_act(read_at, START + 2400, monkeypatch) == (datetime.fromisoformat(at).timestamp(), rung)
 
 
@@ -830,9 +778,6 @@ def test_the_bound_feed_is_silent_when_its_mark_is_not_next(held, monkeypatch, c
 def test_the_bound_feed_names_the_host_rung_the_box_opts_into(held, monkeypatch):
     held["off"] = {3, 4, 5, 6}
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: False)
-    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: True)
-    assert srv._hold_bound_feed(START, T0, None).rung == "full ladder, then warm reboot"
-    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
     assert srv._hold_bound_feed(START, T0, None).rung == "full ladder"
 
 
@@ -862,3 +807,65 @@ def test_the_bound_feed_moves_no_clock(held, monkeypatch):
     _payload()
     srv._hold_bound_feed(START, T0, None)
     assert {n: getattr(srv, n) for n in names} == before
+
+
+def test_a_power_cycle_the_governor_still_gates_is_reported_at_the_latest_gate(held, monkeypatch):
+    """Spec 04 I75: window 2 routes to the host rung at 1200 s, but the governor's backstop and then
+    its post-boot cooldown refuse a power cycle until later. next_rung_at and hold_escalation's
+    next_deadline give the later gate's end and the source names both waits, not the window alone."""
+    held["off"] = {3, 4, 5, 6}
+    monkeypatch.setattr(srv, "device_hold_escalate_bucket", 1)
+    _bound_ladder_ran(monkeypatch, 1000.0, False)
+    backstop, cooldown = START + 1578, START + 1665
+    monkeypatch.setattr(
+        held["m"],
+        "power_cycle_gates",
+        lambda now_epoch=None: [(cooldown, "power-cycle cooldown (host boot)"), (backstop, "power-cycle backstop")],
+        raising=False,
+    )
+    p = srv._health_payload(now=datetime.fromtimestamp(START + 1100))
+    assert p["next_rung"] == "power cycle"
+    assert p["next_rung_at"] == _iso(cooldown)
+    assert p["next_rung_source"].startswith("hold bound host rung")
+    assert p["next_rung_source"].endswith(
+        f", held by the power-cycle backstop until {_iso(backstop)}, "
+        f"then the power-cycle cooldown (host boot) until {_iso(cooldown)}"
+    )
+    assert p["hold_escalation"]["next_deadline"] == _iso(cooldown)
+
+
+def test_the_governor_gates_move_only_a_power_cycle_step():
+    """A ladder or a check keeps its time; a power cycle already past every gate keeps its own."""
+    from tt_device_mcp.health import hold_report
+
+    gates = [(500.0, "power-cycle backstop")]
+    out = hold_report.gate_power_cycle(
+        [
+            hold_report.RungCandidate(100.0, "reset ladder", "class A 10-min ladder"),
+            hold_report.RungCandidate(200.0, "power cycle", "w"),
+            hold_report.RungCandidate(900.0, "power cycle (retry of a missed request)", "r"),
+        ],
+        gates,
+    )
+    assert [(c.at, c.rung) for c in out] == [
+        (100.0, "reset ladder"),
+        (500.0, "power cycle"),
+        (900.0, "power cycle (retry of a missed request)"),
+    ]
+    assert out[1].source.startswith("w, held by the power-cycle backstop until ")
+    assert hold_report.gate_power_cycle(out, []) == out
+
+
+def test_the_power_cycle_gates_read_marks_nothing(held, monkeypatch):
+    """The /health read of the governor's waits is read-only: it sets no refusal record or retry,
+    and a failed ledger read gives no gates rather than raising."""
+    m = held["m"]
+    state, retry = m.power_cycle_cooldown_state, m.power_cycle_retry
+    m.power_cycle_gates(START + 100)
+    assert (m.power_cycle_cooldown_state, m.power_cycle_retry) == (state, retry)
+
+    def _boom():
+        raise OSError("ledger unreadable")
+
+    monkeypatch.setattr(m, "read_auto_recovery_ledger", _boom)
+    assert m.power_cycle_gates(START + 100) == []

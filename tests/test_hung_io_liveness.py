@@ -13,7 +13,14 @@ import time
 import pytest
 
 import tt_device_mcp.cli as cli
-from tests.test_job_kill_reset import _runner_done, _start, _stop, _until, runner_env  # noqa: F401 (fixture)
+from tests.test_job_kill_reset import (  # noqa: F401 (fixture)
+    _recording_ladder,
+    _runner_done,
+    _start,
+    _stop,
+    _until,
+    runner_env,
+)
 from tt_device_mcp import job_reap
 from tt_device_mcp import server as srv
 
@@ -59,6 +66,7 @@ async def test_a_silent_job_with_storage_io_advancing_is_not_reaped(fast, monkey
     assert job.status is srv.JobStatus.COMPLETED, f"a job still doing IO was reaped as {job.status.value}"
     assert "done" in job.output
     assert io.calls > 5, "the reaper sampled the job's IO every poll"
+    assert srv._kill_reset_debt() == "", "a job that IO kept alive and that exited 0 owes no reset"
 
 
 @pytest.mark.asyncio
@@ -124,6 +132,23 @@ async def test_the_hard_cap_reaps_a_job_with_io_but_no_output(fast, monkeypatch)
     assert 1.5 < elapsed < 10, f"reaped at {elapsed:.1f}s, not at the 2 s cap"
     assert "only storage IO" in job.error, job.error
     assert srv._kill_reset_debt().startswith("job 966"), "a cap reap owes the reset and full check too"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("advancing,why", [(False, "no storage IO"), (True, "only storage IO")])
+async def test_both_hung_reaps_give_sigint_the_short_window(fast, monkeypatch, advancing, why):
+    """The silence-limit reap and the IO-cap reap are both I10's hung reap: each gets the short
+    HUNG_SIGINT_GRACE_SEC window, and each keeps the reset and full check it owes."""
+    monkeypatch.setattr(srv, "HUNG_IO_CAP_SEC", 2)
+    monkeypatch.setattr(srv, "job_io_bytes", _Io(advancing=advancing))
+    graces = []
+    _recording_ladder(monkeypatch, graces)
+    job, runner = await _start("958", "echo start; sleep 600")
+    await _run(job, runner)
+    assert job.status is srv.JobStatus.HUNG
+    assert why in job.error, job.error
+    assert graces == [srv.HUNG_SIGINT_GRACE_SEC], f"hung reap SIGINT window {graces}, want the short one"
+    assert srv._kill_reset_debt().startswith("job 958"), "the short window must not drop the reset"
 
 
 @pytest.mark.asyncio

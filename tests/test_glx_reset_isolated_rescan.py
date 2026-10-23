@@ -13,7 +13,6 @@ retry's second reset finished the job: a one-chip drop (class B1) took ~8.5 min 
 
 import asyncio
 import time
-from pathlib import Path
 
 import pytest
 
@@ -23,7 +22,6 @@ from tests.test_no_repeat_failed_rung import (
     ONE_SHOT,
     RESET_SEC,
     _beats_with_off,
-    _drive_progress_retry_watchdog,
     _episode,
     _false,
     _window,
@@ -31,9 +29,8 @@ from tests.test_no_repeat_failed_rung import (
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.recovery import base
 
-RESCAN = Path("/sys/bus/pci/rescan")
+RESCAN = base._scoped_rescan  # the reset path's rescan: the Tenstorrent root ports only
 GLX_OK_SEC = 62  # a mesh reset whose driver wait finds every chip
-PROGRESS_RETRY_SEC = 60  # spec 04 I39: the retry comes due 60 s after the failed reset
 B1_BUDGET_SEC = 6 * 60
 SETTLE = "\x1b[93mWaiting for 30 seconds: 0\x1b[0m" + "".join(
     f"\r\x1b[93mWaiting for 30 seconds: {i}\x1b[0m" for i in range(1, 31)
@@ -71,7 +68,7 @@ def _real_reset_path(monkeypatch, hw, clock, *, chunks=None):
     real_sleep = asyncio.sleep
 
     async def to_thread(fn, *a, **k):
-        if getattr(fn, "__self__", None) == RESCAN:  # the real sysfs write never runs here
+        if fn is RESCAN:  # the real sysfs write never runs here
             hw["rescans"].append("during" if hw["in_reset"] else "after")
             if hw["repowered"]:
                 hw["off"].clear()
@@ -104,6 +101,17 @@ def _real_reset_path(monkeypatch, hw, clock, *, chunks=None):
     monkeypatch.setattr(base.CEILING, "apply", no_ceiling)
 
 
+@pytest.fixture
+def instant_reader_scan(monkeypatch):
+    """The pre-reset holder scan (spec 04 I92, its own tests) found no reader, without its executor
+    hop: the cancel tests below count event-loop ticks to the driver-wait rescan."""
+
+    async def no_readers(argv, owner, log):
+        return ""
+
+    monkeypatch.setattr(srv.recovery_mechanism, "pre_reset_scan", no_readers)
+
+
 def _hw():
     return {"off": {"31"}, "repowered": False, "in_reset": False, "resets": [], "rescans": []}
 
@@ -117,8 +125,6 @@ async def test_b1_replay_one_mesh_reset_heals_an_isolated_chip_inside_the_budget
     ONE_SHOT + 263 + 60 + 62 = 505 s against a 360 s budget."""
     clock = [ONE_SHOT]
     counters, events, _ = _episode(monkeypatch, power_cycle=True, clock=clock, off_bus=1)
-    monkeypatch.setattr(srv.recovery_mechanism, "progress_retry", None)
-    monkeypatch.setattr(srv.recovery_mechanism, "progress_retry_spent_since", "")
     hw = _hw()
     monkeypatch.setattr(srv, "read_heartbeats", lambda: _beats_with_off(hw["off"]))
     srv.isolated_chips = {"31"}
@@ -141,10 +147,6 @@ async def test_b1_replay_one_mesh_reset_heals_an_isolated_chip_inside_the_budget
     _real_reset_path(monkeypatch, hw, clock)
 
     assert await _window() is True
-    if srv.recovery_mechanism.progress_retry is not None:  # the old path: the first reset failed
-        assert _drive_progress_retry_watchdog(monkeypatch) == ["progress_retry"]
-        clock[0] += PROGRESS_RETRY_SEC
-        assert await _window() is True
 
     assert clock[0] <= B1_BUDGET_SEC, f"B1 time to recover {clock[0]:.0f}s is over its {B1_BUDGET_SEC}s budget"
     assert [r for r in hw["resets"] if "-glx_reset" in r] == hw["resets"]
@@ -216,7 +218,7 @@ async def test_a_failed_driver_wait_rescan_is_journaled_and_the_reset_runs_on(mo
     calls = []
 
     async def to_thread(fn, *a, **k):
-        if getattr(fn, "__self__", None) == RESCAN and not calls:
+        if fn is RESCAN and not calls:
             calls.append(fn)
             raise PermissionError("read-only sysfs")
         return await fake(fn, *a, **k)
@@ -231,7 +233,9 @@ async def test_a_failed_driver_wait_rescan_is_journaled_and_the_reset_runs_on(mo
 
 
 @pytest.mark.asyncio
-async def test_a_cancelled_reset_cancels_a_pending_driver_wait_rescan(monkeypatch, clear_job_state):
+async def test_a_cancelled_reset_cancels_a_pending_driver_wait_rescan(
+    monkeypatch, clear_job_state, instant_reader_scan
+):
     """An abandoned reset leaves no orphaned rescan task behind."""
     srv.isolated_chips = {"31"}
     monkeypatch.setattr(base, "health_event", lambda *a, **k: None)
@@ -239,7 +243,7 @@ async def test_a_cancelled_reset_cancels_a_pending_driver_wait_rescan(monkeypatc
     started = []
 
     async def to_thread(fn, *a, **k):
-        if getattr(fn, "__self__", None) == RESCAN:
+        if fn is RESCAN:
             started.append(time.monotonic())
             await gate.wait()
         return None
@@ -264,13 +268,21 @@ async def test_a_cancelled_reset_cancels_a_pending_driver_wait_rescan(monkeypatc
     pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
     for _ in range(5):
         await asyncio.sleep(0)
-    assert all(t.done() for t in pending), "no rescan task left running"
+    # The sysfs write itself is not cancellable (its thread runs on in the kernel): the one in-flight
+    # PCI writer keeps tracking it so no second write starts behind it (spec 04 I76). Nothing else is left.
+    write = srv.PCI_WRITER._task
+    assert srv.PCI_WRITER.pending(), "the write is still tracked"
+    assert all(t.done() for t in pending if t is not write), "no rescan task left running"
+    gate.set()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert write.done() and not srv.PCI_WRITER.pending()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("rc", [0, 1])
 async def test_a_cancel_while_the_driver_wait_rescan_finishes_still_runs_the_reset_cleanup(
-    monkeypatch, clear_job_state, rc
+    monkeypatch, clear_job_state, instant_reader_scan, rc
 ):
     """tt-smi has exited but the driver-wait sysfs write is still running when the caller is cancelled
     (an operator's reset call dropped). The cancel still reaches the caller, but only after the cleanup
@@ -285,7 +297,7 @@ async def test_a_cancel_while_the_driver_wait_rescan_finishes_still_runs_the_res
     real_sleep = asyncio.sleep
 
     async def to_thread(fn, *a, **k):
-        if getattr(fn, "__self__", None) == RESCAN:
+        if fn is RESCAN:
             rescans.append("driver wait" if not rescans else "after")
             if len(rescans) == 1:
                 await gate.wait()  # a slow sysfs write, still running when tt-smi exits
@@ -315,6 +327,8 @@ async def test_a_cancel_while_the_driver_wait_rescan_finishes_still_runs_the_res
     assert rescans == ["driver wait"] and srv.recovery_mechanism.reset_in_flight is True
     monkeypatch.setattr(srv.asyncio, "sleep", no_sleep)
     task.cancel()
+    await real_sleep(0)
+    gate.set()  # the write ends inside its bound; the rescan after the reset waits for it (spec 04 I76)
     with pytest.raises(asyncio.CancelledError):
         await task
 
@@ -331,7 +345,9 @@ async def test_a_cancel_while_the_driver_wait_rescan_finishes_still_runs_the_res
 
 
 @pytest.mark.asyncio
-async def test_output_after_a_cancelled_reset_starts_no_driver_wait_rescan(monkeypatch, clear_job_state):
+async def test_output_after_a_cancelled_reset_starts_no_driver_wait_rescan(
+    monkeypatch, clear_job_state, instant_reader_scan
+):
     """After a mid-reset cancel the backend's shielded output reader keeps feeding the callback. A driver
     wait marker that arrives then starts no rescan (it would be nobody's to cancel); the caller's own
     callback still sees the output."""
@@ -340,7 +356,7 @@ async def test_output_after_a_cancelled_reset_starts_no_driver_wait_rescan(monke
     rescans, seen, feed = [], [], []
 
     async def to_thread(fn, *a, **k):
-        if getattr(fn, "__self__", None) == RESCAN:
+        if fn is RESCAN:
             rescans.append(fn)
         return None
 

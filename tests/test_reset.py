@@ -352,6 +352,31 @@ def test_reset_failure_surfaces_returncode_and_output(monkeypatch, tmp_path):
     assert "reset failed" in d["stdout"]
 
 
+def test_an_operator_reset_refuses_while_another_reset_is_in_flight(monkeypatch, tmp_path):
+    """Spec 04 I92: a second reset into a mesh still cycling (a scope from before a restart, another
+    broker's, or a local-backend reset) is refused, and the in-flight reset is never signalled."""
+    (tmp_path / "0").write_text("")
+    calls = _fake_scoped_reset(monkeypatch, 0, "Resetting...\n")
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: "ttdev-reset-7-1")
+    d = _client(monkeypatch, tmp_path).post("/api/tt_device_reset", json={"force": True}).json()
+
+    assert d["status"] == "refused" and d["reason"] == "reset_in_flight"
+    assert "ttdev-reset-7-1" in d["detail"]
+    assert calls == [], "a second reset ran into one already in flight"
+
+
+def test_a_streaming_operator_reset_refuses_while_another_reset_is_in_flight(monkeypatch, tmp_path):
+    (tmp_path / "0").write_text("")
+    calls = _fake_scoped_reset(monkeypatch, 0, "Resetting...\n")
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: "ttdev-reset-7-1")
+    resp = _client(monkeypatch, tmp_path).post("/api/tt_device_reset_stream", json={"force": True})
+
+    assert resp.status_code == 200
+    assert "REFUSED: a reset is already in flight (ttdev-reset-7-1)" in resp.text
+    assert resp.text.rstrip().endswith("::status::refused")
+    assert calls == [], "a second reset ran into one already in flight"
+
+
 def _intercept_scoped_subprocess(monkeypatch, rc=0, output="Resetting...\n"):
     """Intercept the reset at the systemd-run/create_subprocess_exec seam, NOT at
     _run_reset_scoped — so the real scoped runner runs, including the action-log row it
@@ -825,6 +850,7 @@ def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
 
 def test_an_operator_reset_whose_fabric_cannot_verify_holds_fabric_unverified(monkeypatch, tmp_path):
     _mesh_with_fabric_check(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)  # built: a 77 is a link verdict
     calls = _verify_seam(monkeypatch, fabric_ok=None)
     monkeypatch.setattr(srv, "device_fault_reported", "job 7 waiting for active ethernet core")
 
@@ -905,6 +931,103 @@ def test_the_stream_settles_an_operator_reset_like_the_tool(monkeypatch, tmp_pat
     assert (srv.device_fault_reported == "") is fabric_ok
     if not fabric_ok:
         assert srv.fsm.record.why == "operator_reset_unhealthy"
+
+
+# --- a failed operator reset arms the failed-reset cooldown (spec 04 I3) ---------------------
+#
+# The operator's reset used to leave the cooldown and the gate's two strikes untouched, so a failed
+# one was followed by a back-to-back broker reset and never counted toward the host rung.
+
+
+@pytest.mark.parametrize("route", ["tool", "stream"])
+@pytest.mark.parametrize(
+    "rc,fabric_ok,status,failed",
+    [
+        (1, None, "reset_failed", True),
+        (0, False, "reset_unhealthy", True),
+        (0, None, "reset_unverified", False),  # a persistent 77 is unknown, not a failed reset
+        (0, True, "reset_complete", False),
+    ],
+)
+def test_a_failed_operator_reset_arms_the_cooldown_and_the_two_strikes(
+    monkeypatch, tmp_path, route, rc, fabric_ok, status, failed
+):
+    _mesh_with_fabric_check(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)  # built: a 77 is a link verdict
+    _fake_scoped_reset(monkeypatch, rc, "Re-initialized boards\n" if rc == 0 else "tt-smi: reset failed")
+    _verify_seam(monkeypatch, fabric_ok=fabric_ok)
+    # A broker reset failed long ago: a verified operator reset must clear its strike, a failed one keep it.
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", True)
+    before = srv.time.monotonic()
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", before - 2 * recovery_base.RESET_COOLDOWN_SEC)
+
+    if route == "tool":
+        assert _reset_tool(monkeypatch, tmp_path)["status"] == status
+    else:
+        assert f"::status::{status}" in _reset_stream(monkeypatch, tmp_path)
+
+    assert srv.recovery_mechanism.last_reset_monotonic >= before, "the reset's start is the cooldown clock"
+    assert srv.recovery_mechanism.last_reset_failed is failed, "the gate reads this as was_failing"
+    assert srv.recovery_mechanism.cooling() is failed
+    if failed and rc == 0:
+        assert srv.fsm.state is not srv.ServerState.HEALTHY, "a failed verify never releases"
+
+
+@pytest.mark.parametrize("route", ["tool", "stream"])
+@pytest.mark.parametrize(
+    "rc,fabric_ok,spent",
+    [(1, None, True), (0, False, True), (0, None, False), (0, True, False), (None, None, False)],
+)
+def test_a_failed_operator_mesh_reset_spends_the_episodes_mesh_reset(
+    monkeypatch, tmp_path, route, rc, fabric_ok, spent
+):
+    """A failed operator -glx_reset is marked as the broker marks its own failed mesh reset, so an
+    all-off mesh after it is class C and no path fires a second mesh reset in the episode (spec 04
+    I37, I87). A persistent 77, a verified reset or one that never finished marks nothing."""
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
+    _mesh_with_fabric_check(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)
+    calls = _fake_scoped_reset(monkeypatch, rc, "tt-smi: reset failed" if rc else "Re-initialized boards\n")
+    _verify_seam(monkeypatch, fabric_ok=fabric_ok)
+    monkeypatch.setattr(srv.recovery_mechanism, "mesh_reset_failed_since_release", False)
+    monkeypatch.setattr(srv.recovery_mechanism, "mesh_reset_failed_episode", None)
+
+    if route == "tool":
+        _reset_tool(monkeypatch, tmp_path)
+    else:
+        _reset_stream(monkeypatch, tmp_path)
+
+    assert calls and "-glx_reset" in calls[-1], calls
+    assert srv.recovery_mechanism.mesh_reset_failed_since_release is spent
+    assert srv.recovery_mechanism.mesh_reset_spent("") is spent
+
+
+def test_a_failed_operator_chip_reset_does_not_spend_the_mesh_reset(monkeypatch):
+    """Only a mesh reset (-glx_reset) is the episode's one mesh reset; a failed chip reset is not."""
+    monkeypatch.setattr(srv.recovery_mechanism, "mesh_reset_failed_since_release", False)
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 0.0)
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", False)
+
+    srv._note_operator_reset_outcome(1, None, srv.time.monotonic(), ["tt-smi", "-r", "0"])
+
+    assert srv.recovery_mechanism.last_reset_failed is True
+    assert srv.recovery_mechanism.mesh_reset_failed_since_release is False
+
+
+@pytest.mark.parametrize("route", ["tool", "stream"])
+def test_an_operator_reset_that_did_not_finish_leaves_the_cooldown_alone(monkeypatch, tmp_path, route):
+    """A timed-out reset may still be cycling (the next caller adopts it), and a refused one never ran."""
+    _mesh_with_fabric_check(monkeypatch, tmp_path)
+    _fake_scoped_reset(monkeypatch, None, "reset timed out")
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 5.0)
+
+    if route == "tool":
+        _reset_tool(monkeypatch, tmp_path)
+    else:
+        _reset_stream(monkeypatch, tmp_path)
+
+    assert srv.recovery_mechanism.last_reset_monotonic == 5.0
+    assert srv.recovery_mechanism.last_reset_failed is False and not srv.recovery_mechanism.cooling()
 
 
 # --- the streaming reset is a reset like any other ----------------------------
@@ -1062,7 +1185,9 @@ def test_a_streaming_local_reset_is_visible_to_a_restarted_daemon(monkeypatch, t
     (tmp_path / "0").touch()
     release = tmp_path / "release"
     started = tmp_path / "started"
-    reset_script = tmp_path / "reset"
+    # Named as tt-smi's module file: spec 04 I91 never runs an override that names neither tt-smi nor
+    # the Galaxy flag, and the spawn tripwire refuses a program named tt-smi.
+    reset_script = tmp_path / "tt_smi.py"
     reset_script.write_text(
         "#!/usr/bin/env python3\n"
         "import pathlib, time\n"
@@ -1704,6 +1829,37 @@ async def test_a_readopted_job_killed_by_a_forced_reset_does_not_flag_the_device
     assert not srv._device_unavailable_for_tenant(), "a reset-killed job must not flag the device"
     assert "907-1" not in srv.reset_killed_job_ids and "907-1" not in srv.readopted_scopes
     assert "[KILLED by device reset]" in log.read_text()
+
+
+@pytest.mark.asyncio
+async def test_a_readopted_job_recovery_killed_ends_killed_with_its_cause(monkeypatch, tmp_path, clear_job_state):
+    """Spec 01 I70: a dead-chip holder-kill of a re-adopted job leaves no exit status. The monitor
+    must still say KILLED with recovery's cause, never FAILED with "the broker restarted"."""
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    log = tmp_path / "run_909.log"
+    log.write_text("... running ...\nown-stderr\n")
+    job = srv.Job(
+        id="909-1", owner="carol", workspace="/w", command="pytest", queued_at="", status=srv.JobStatus.RUNNING
+    )
+    job.log_file = str(log)
+    srv.jobs["909-1"] = job
+    scope = srv.job_scope_unit("909-1")
+    monkeypatch.setattr(srv, "readopted_scopes", {"909-1": scope})
+    srv._mark_job_device_fault_failed("909-1", "device recovery kill: chip 5 left the PCIe bus")
+
+    await srv._monitor_readopted_scope("909-1", scope)
+
+    assert job.status == srv.JobStatus.KILLED and "chip 5 left the PCIe bus" in job.error
+    assert "restarted" not in job.error
+    assert not srv._device_unavailable_for_tenant(), "a recovery-killed job must not flag the device"
+    text = log.read_text()
+    assert f"{srv.RECOVERY_KILL_MARKER} killed by device recovery (chip 5 left the PCIe bus)" in text
+    assert srv.RESET_KILL_MARKER not in text, "one kill line, not two"
+    assert "909-1" not in srv.reset_killed_job_ids and "909-1" not in srv.reset_killed_causes
 
 
 def test_killing_a_readopted_job_holds_the_device_until_its_scope_ends(monkeypatch, tmp_path):

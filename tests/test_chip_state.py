@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import fsm_healthy, patch_health_event, patch_recovery, stub_device_pollers
+from tests.conftest import fsm_healthy, patch_health_event, stub_device_pollers
 from tt_device_mcp import server as srv
 from tt_device_mcp.health import chip_state
 from tt_device_mcp.health import monitor as monitor_mod
@@ -245,8 +245,9 @@ def test_the_sampler_reads_no_chip_while_a_reset_owns_them(monkeypatch, sysfs, o
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["all-ones", "stalled heartbeat"])
 async def test_the_first_hung_sample_stops_the_pollers(monkeypatch, kind):
-    """A present chip that reads all-ones, or whose heartbeat did not move since the last sample, stops
-    the pollers on that first sample (isolation still waits for its second); once per episode."""
+    """A present chip whose heartbeat did not move since the last sample stops the pollers on that first
+    sample (isolation still waits for its second); once per episode. A chip reading all-ones may be off
+    the bus and is not detached yet, so its stop is deferred to the dead-chip valve (I84), journalled once."""
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv.sampler, "isolate_dead_chips", lambda d: asyncio.sleep(0))
     events = []
@@ -259,12 +260,17 @@ async def test_the_first_hung_sample_stops_the_pollers(monkeypatch, kind):
     bad = ALL_ONES if kind == "all-ones" else 101
     hung = {"0": row(200), "1": row(bad), "2": row(202), "3": row(203)}
     await srv.sampler.check_for_dead_chips(hung)
-    assert pollers == [False], "the pollers did not stop at the first hung sample"
-    stops = [f for k, f in events if k == "pollers_quiesced_hung_chip"]
-    assert stops and (stops[0]["all_ones"] if kind == "all-ones" else stops[0]["stalled"]) == ["1"]
     hung2 = {"0": row(300), "1": row(bad), "2": row(302), "3": row(303)}
     await srv.sampler.check_for_dead_chips(hung2)
-    assert pollers == [False], "one episode stops them once"
+    if kind == "all-ones":
+        assert pollers == [], "the pollers stopped on a chip that is not detached"
+        deferred = [f for k, f in events if k == "pollers_quiesce_deferred"]
+        assert len(deferred) == 1 and deferred[0]["all_ones"] == ["1"]
+        assert deferred[0]["reason"] == "chip_not_detached"
+        return
+    assert pollers == [False], "the pollers did not stop at the first hung sample, or stopped twice"
+    stops = [f for k, f in events if k == "pollers_quiesced_hung_chip"]
+    assert stops and stops[0]["stalled"] == ["1"]
 
 
 @pytest.mark.asyncio
@@ -681,56 +687,10 @@ async def test_the_galaxy_reset_sweep_clears_recovering_on_every_exit(sysfs, clo
     clock.now += 1.0
     if how == "cancelled":
         with pytest.raises(asyncio.CancelledError):
-            await g._issue_all_resets_back_to_back(0, [], [], N, lambda m: None, do_sbr=False)
+            await g._issue_all_resets_back_to_back([], N, lambda m: None, do_sbr=False)
     else:
-        assert await g._issue_all_resets_back_to_back(0, [], [], N, lambda m: None, do_sbr=False) is True
+        assert await g._issue_all_resets_back_to_back([], N, lambda m: None, do_sbr=False) is True
     assert seen == [True], "the sweep's mesh reset did not run under recovering"
-    assert not chip_state.recovering()
-    assert _lost_chip_read_on_next_poll(sysfs)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("how", ["fails", "raises", "cancelled"])
-async def test_the_tray_walk_clears_recovering_on_every_exit(sysfs, clock, monkeypatch, how):
-    """The per-tray walk holds recovering across the walk; a fire that fails, a verify that raises and a
-    cancel mid-fire all clear it and open the grace."""
-    from tt_device_mcp.device_holders import HolderScan
-    from tt_device_mcp.health.recovery import galaxy, pcie_guard
-
-    g = srv.galaxy_recovery
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", "1")
-    srv.fsm.set_latch("ubb_reset_fired", False)
-    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
-    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
-    monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off: (True, ""))
-    monkeypatch.setattr(g, "_tray_map_now", lambda: {t: list(range((t - 1) * 8, t * 8)) for t in range(1, 5)})
-    patch_health_event(monkeypatch, lambda *a, **k: None)
-    stub_device_pollers(monkeypatch)
-    seen = []
-
-    def fire(bitmap, ids):
-        seen.append(chip_state.recovering())
-        if how == "fails":
-            raise RuntimeError("bmc unreachable")
-        if how == "cancelled":
-            raise asyncio.CancelledError()
-
-    async def verify(*a, **k):
-        raise RuntimeError("verify blew up")
-
-    monkeypatch.setattr(galaxy, "_fire_ubb_reset", fire, raising=False)
-    patch_recovery(monkeypatch, "_verify_device", verify)
-    sysfs["node"](2, ALL_ONES)
-    chip_state.mark_lost(["2"], "test", chip_state.chip_nodes(["2"]))
-    clock.now += 1.0
-    beats = {str(i): 100 for i in range(32) if i != 2}
-    if how == "fails":
-        assert await g._attempt_ubb_tray_reset(beats, 1, 32, lambda m: None) is False
-    else:
-        with pytest.raises((RuntimeError, asyncio.CancelledError)):
-            await g._attempt_ubb_tray_reset(beats, 1, 32, lambda m: None)
-    assert seen == [True], "the walk did not fire under recovering"
     assert not chip_state.recovering()
     assert _lost_chip_read_on_next_poll(sysfs)
 

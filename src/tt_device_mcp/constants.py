@@ -38,6 +38,14 @@ GRACEFUL_KILL_GRACE_SEC = 60
 # to the reap, and reaching SIGKILL means the device was NOT released.
 SIGTERM_GRACE_SEC = 15
 
+# SIGINT window for a job the hung reaper stops for silence (spec 01 I10), in place of
+# GRACEFUL_KILL_GRACE_SEC. A job that printed nothing for HUNG_SILENCE_SEC is blocked, most
+# often inside a device op, and does not unwind on SIGINT: on a Galaxy host every silence reap
+# observed ran the full 60 s and ended at SIGTERM. A HUNG job owes the mesh the reset and the
+# full check either way (spec 03 I69), so the long window only delayed recovery. The SIGINT
+# still goes first, and SIGTERM (SIGTERM_GRACE_SEC) and SIGKILL follow as on every ladder.
+HUNG_SIGINT_GRACE_SEC = 10
+
 # After a job is finalized, any of its processes still alive (a child that left the process
 # group, or one the ladder never reached) gets SIGTERM, then SIGKILL after this window. The
 # job itself is already gone, so this is a sweep of leftovers, not a teardown: it is kept
@@ -55,9 +63,9 @@ SURVIVOR_KILL_WAIT_SEC = 2
 # the device held until the next job or the hold ceiling.
 HOLDER_RELEASE_WAIT_SEC = 30
 
-# A preemptable job's whole stop window, from the first signal to SIGKILL. Its owner has
-# agreed to watch the queue and get off the device within this once another job is waiting
-# past its time limit, so it is shorter than the ordinary ladder (SIGINT 60 s + SIGTERM 15 s).
+# A preemptable job's grace minute. Contention (the job past its time limit AND another job
+# waiting) must last this long, unbroken, before the broker does anything to the job: the job
+# is expected to see the waiter in the queue and end itself. No signal is sent inside it.
 PREEMPT_GRACE_SEC = 60
 
 # A job may ask for its own silence limit at submit (hung_silence_sec), within these bounds. The
@@ -71,6 +79,27 @@ HUNG_SILENCE_MAX_SEC = 3600
 # this reaper exists for. IO without output is believed only this long (or the job's own limit,
 # if longer): a job that loops on IO without ever printing is still reaped.
 HUNG_IO_CAP_SEC = 1800
+
+# Once the grace minute is spent, the job's whole process tree gets SIGTERM and, at most this
+# much later, SIGKILL: 10 s for its handlers to release the device. The job already had its
+# minute to end itself. A tree that all exits through its own code on SIGTERM inside it gets the
+# fast post-job check; a SIGKILL, any signal death or an unwitnessed exit gets a reset and the
+# full check.
+PREEMPT_KILL_GRACE_SEC = 10
+
+# Before any reset, a process other than a tenant that still maps the device gets SIGTERM and
+# this long to let go before SIGKILL (spec 04 I92): the same 10 s a preempted job's handlers get.
+# A reader that keeps its mapping through a reset reads chips that are off the bus.
+PRE_RESET_TERM_GRACE_SEC = PREEMPT_KILL_GRACE_SEC
+
+# The longest the pre-reset scan waits for the off-bus chips' detach (a sysfs PCI remove, spec 04
+# I92) before it gives up: a remove that does not return in this time counts as not detached, the
+# reset is refused and the hold stays for the bounded recovery. One deadline for all the chips.
+PRE_RESET_DETACH_TIMEOUT_SEC = 30
+
+# A pre-reset scan that cannot see a holder it knows of (the driver names a pid it could not read,
+# often one mid-exit) scans once more after this long before it refuses the reset (spec 04 I92).
+PRE_RESET_RESCAN_SETTLE_SEC = 1.0
 
 # When a device reset has run long enough to be worth saying so (a 6U Galaxy reset is
 # ~30-60s). This is a WARNING line, not a verdict: the reset owns its own systemd scope and
@@ -126,7 +155,7 @@ FABRIC_CHECK_CANNOT_CHECK_RC = 77
 # cable, so the broker holds as a known fabric fault and pages once (spec 03 I47).
 FABRIC_CHECK_HARDWARE_FAULT_RC = 78
 
-# The recovery ladder's five named rungs, in severity order (0..4) — the one place that names
+# The recovery ladder's three named rungs, in severity order (0..2) — the one place that names
 # them. Lives here, not in health/recovery/stages/ (the package these actually name), so
 # metrics.py can import it directly: importing a package submodule always runs that package's
 # __init__.py first, and health/recovery/__init__.py imports metrics — a cycle metrics.py's own
@@ -134,10 +163,11 @@ FABRIC_CHECK_HARDWARE_FAULT_RC = 78
 # anything under tt_device_mcp, so it carries no such risk for any importer.
 STAGE_BRIDGE_RESET = "bridge_reset"
 STAGE_SMI_RESET = "smi_reset"
-STAGE_UBB_TRAY = "ubb_tray"
-STAGE_HOST_REBOOT = "host_reboot"
 STAGE_POWER_CYCLE = "power_cycle"
-STAGE_NAMES = (STAGE_BRIDGE_RESET, STAGE_SMI_RESET, STAGE_UBB_TRAY, STAGE_HOST_REBOOT, STAGE_POWER_CYCLE)
+STAGE_NAMES = (STAGE_BRIDGE_RESET, STAGE_SMI_RESET, STAGE_POWER_CYCLE)
+# Spec 04 I90: every reset step (bridge, glx_reset, the AICLK re-apply) narrates its device-op
+# detail with this prefix, and /status reads it as a reset in progress.
+DEVICE_RESET_DETAIL_PREFIX = "device reset:"
 
 # A Slurm prologue/epilogue must always return a verdict rather than hang until the site's
 # PrologEpilogTimeout kills the script — a kill drains the node with nothing said about what was

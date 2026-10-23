@@ -2,10 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Keep a host alive across the resets that re-power Tenstorrent silicon.
 
-A per-tray BMC re-power or a mesh-wide reset takes chips off the bus. Each root port above them then
+A mesh-wide reset takes chips off the bus. Each root port above them then
 reports Surprise Down, completion timeouts and Advisory Non-Fatal errors. On a 6U Galaxy that error
-stream has turned into an AER interrupt flood, on the re-powered tray's ports and on a SIBLING tray's
-port, followed by NMI/RCU stalls and a dead host. This module holds the pieces that keep a reset from
+stream has turned into an AER interrupt flood on their root ports, followed by NMI/RCU stalls and a dead host. This module holds the pieces that keep a reset from
 getting there:
 
 * :func:`tt_endpoints` — every Tenstorrent PCI function, its bus, its root port and its /dev id, read
@@ -15,7 +14,6 @@ getting there:
   and is reported, so a flood cannot take the host down.
 * :func:`host_reset_gate` — the per-host switch (``TT_DEVICE_MCP_HOST_RESET_GATE``) that refuses an
   automatic reset while chips are off the bus or AER errors are flooding.
-* :func:`safe_tray_repower` — the full envelope around one per-tray BMC re-power, with a dry run.
 * The host-hang latch — :func:`begin_offbus_reset` writes an intent before an automatic reset with
   chips off the bus, and :func:`check_offbus_reset_latch` reads one left by an earlier boot as a
   reset that hung the host, and holds every later off-bus reset on this boot until every chip is
@@ -41,7 +39,7 @@ from typing import Callable, Optional
 
 from tt_device_mcp import alert
 from tt_device_mcp.health.evidence import health_dir, health_event
-from tt_device_mcp.health.monitors.heartbeat import ALL_ONES, dead_chips, read_heartbeats
+from tt_device_mcp.health.monitors.heartbeat import dead_chips, read_heartbeats
 from tt_device_mcp.health.monitors.hostpci import link_down
 
 _logger = logging.getLogger("tt-device-mcp")
@@ -245,6 +243,79 @@ def tt_root_ports(endpoints: Optional[dict] = None) -> list:
     present = {e.root_port for e in (eps or {}).values() if e.root_port}
     remembered = {p for p in _seen()["root_ports"] if (_pci_dir() / p).exists()}
     return sorted(present | remembered)
+
+
+class NoTtRootPort(OSError):
+    """No Tenstorrent root port could be rescanned: the scoped rescan wrote nothing."""
+
+
+_PCI_CLASS_BRIDGE = 0x0604
+
+
+def _non_tt_function_below(port: str) -> Optional[str]:
+    """The first function below ``port`` now that is neither a Tenstorrent function nor a PCI bridge
+    (class 0x0604), or None. A function whose vendor cannot be read is not counted; one whose class
+    cannot be read counts as no bridge."""
+    stack = [Path(os.path.realpath(_pci_dir() / port))]
+    while stack:
+        try:
+            children = sorted(c for c in stack.pop().iterdir() if _BDF.match(c.name) and not c.is_symlink())
+        except OSError:
+            continue
+        for dev in children:
+            stack.append(dev)
+            try:
+                vendor = int((dev / "vendor").read_text().strip(), 16)
+            except (OSError, ValueError):
+                continue
+            if vendor == TT_VENDOR:
+                continue
+            try:
+                if int((dev / "class").read_text().strip(), 16) >> 8 == _PCI_CLASS_BRIDGE:
+                    continue
+            except (OSError, ValueError):
+                pass
+            return dev.name
+    return None
+
+
+def rescan_tt_root_ports() -> list:
+    """The PCI rescan every tt-device-mcp path makes: only the bus below each Tenstorrent root port
+    (:func:`tt_root_ports`), through the kernel's ``<port>/pci_bus/<bus>/rescan``, never the global
+    ``/sys/bus/pci/rescan``. A global rescan walks every root bus, and has reassigned the resources of
+    unrelated root ports (a host's NVMe drives). Blocking: callers run it through the one in-flight
+    PCI writer. Returns the ports rescanned. Raises :class:`NoTtRootPort` (an OSError, so the calling
+    rung fails and recovery goes on to its next step) when no port is known or none could be
+    rescanned; there is no global fallback. A port that is only remembered (no Tenstorrent function
+    below it now) is trusted only while no other device sits below it: its slot may since hold
+    another card, whose bus a rescan would resize, so it is skipped."""
+    eps = tt_endpoints()
+    present = {e.root_port for e in (eps or {}).values() if e.root_port}
+    ports = tt_root_ports(eps)
+    done: list = []
+    for port in ports:
+        if port not in present:
+            other = _non_tt_function_below(port)
+            if other:
+                health_event("pci_rescan_port_skipped", port=port, function=other, reason="non_tt_function_below")
+                continue
+        try:
+            buses = sorted((_pci_dir() / port / "pci_bus").iterdir())
+        except OSError as exc:
+            health_event("pci_rescan_port_skipped", port=port, reason=str(exc))
+            continue
+        for bus in buses:
+            try:
+                (bus / "rescan").write_text("1")
+            except OSError as exc:
+                health_event("pci_rescan_port_skipped", port=port, bus=bus.name, reason=str(exc))
+                continue
+            if port not in done:
+                done.append(port)
+    if not done:
+        health_event("pci_rescan_no_tt_root_port", ports=ports)
+        raise NoTtRootPort(f"no Tenstorrent root port to rescan (known: {ports or 'none'})")
+    return done
 
 
 def tray_bus_groups(endpoints: Optional[dict] = None) -> Optional[dict]:
@@ -513,7 +584,7 @@ def hold_lifted(why: str):
 
 
 def host_reset_gate(off_bus: int) -> tuple:
-    """``(allowed, why)`` for an automatic host-affecting reset (mesh reset, per-tray re-power) with
+    """``(allowed, why)`` for an automatic host-affecting reset (the mesh reset) with
     ``off_bus`` chips already off the bus. A refused reset is a rung that did not fire, so the ladder
     above it holds rather than climbing to a reboot or power cycle."""
     if off_bus <= 0:
@@ -909,538 +980,11 @@ def mask_for_mesh_reset(log) -> Optional[AerMask]:
         return None
 
 
-# ---- the per-tray re-power envelope -----------------------------------------------------------------
-
-
-class TrayRepowerRefused(RuntimeError):
-    """The envelope refused to cut tray power; nothing was re-powered."""
-
-
-class TrayRepowerDryRun(TrayRepowerRefused):
-    """``TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN=1``: the plan was logged, nothing was touched."""
-
-
-@dataclass
-class TrayPlan:
-    bitmap: int
-    trays: list
-    functions: list  # Tenstorrent functions on the re-powered trays, removed before the pulse
-    chips: list  # their /dev ids
-    root_ports: list  # every Tenstorrent root port, masked for the window (siblings too)
-    mismatch: str = ""
-    kept_masked: list = field(default_factory=list)  # ports still erroring after the re-power
-    tray_ports: list = field(default_factory=list)  # the re-powered trays' root ports, the only ones rescanned
-    siblings_dropped: list = field(default_factory=list)  # chips on other trays that read all-ones after it
-    siblings_still_off: list = field(default_factory=list)  # ... and still did after their remove + rescan
-    box_chips: list = field(default_factory=list)  # every chip on the box: a pulse can drop the other trays too
-
-
-def plan_tray_repower(bitmap: int, tray_chip_ids: list) -> TrayPlan:
-    """What re-powering ``bitmap`` touches, from sysfs. ``mismatch`` is set when the caller's chip ids
-    and the trays' buses disagree (a mis-mapped tray, issue #27): firing then would re-power a
-    healthy tray. It is also set when sysfs cannot be read: that is no answer, not every chip off the
-    bus, and the cross-check cannot run. Chips with no /dev node are off the bus and cannot be checked."""
-    trays = [i + 1 for i in range(8) if bitmap >> i & 1]
-    try:
-        eps = _scan_endpoints()
-    except SysfsUnreadable as exc:
-        return TrayPlan(
-            bitmap=bitmap,
-            trays=trays,
-            functions=[],
-            chips=[],
-            root_ports=[],
-            mismatch=f"{exc}; refusing the re-power of trays {trays}: the tray map cannot be checked",
-        )
-    _remember(eps)
-    groups = tray_bus_groups(eps)
-    plan = TrayPlan(bitmap=bitmap, trays=trays, functions=[], chips=[], root_ports=tt_root_ports(eps))
-    plan.tray_ports = tray_root_ports(trays, eps, groups)
-    plan.box_chips = sorted({e.chip for e in eps.values() if e.chip is not None} | _published_chips())
-    if not eps:
-        # Every chip is off the bus: no healthy tray can be cut, and there is nothing to cross-check.
-        # Refusing here would leave an all-off mesh with no tray re-power before the power cycle.
-        return plan
-    if not groups or any(t not in groups for t in trays):
-        plan.mismatch = f"no tt-smi tray table covers trays {trays} on this host"
-        return plan
-    wanted = {groups[t] for t in trays}
-    on_trays = [e for e in eps.values() if e.bus & 0xF0 in wanted]
-    plan.functions = sorted(e.bdf for e in on_trays)
-    plan.chips = sorted(e.chip for e in on_trays if e.chip is not None)
-    given = {int(c) for c in tray_chip_ids}
-    elsewhere = sorted(e.chip for e in eps.values() if e.chip in given and e.bus & 0xF0 not in wanted)
-    missing = sorted(set(plan.chips) - given)
-    if elsewhere or missing:
-        plan.mismatch = (
-            f"tray map disagrees with sysfs for trays {trays}: chip(s) {elsewhere} sit on other trays, "
-            f"chip(s) {missing} on these trays were not named"
-        )
-    return plan
-
-
-def _secondary_buses(port: str) -> list:
-    """The buses below a root port, from its ``pci_bus`` children (there with or without a chip on them)."""
-    try:
-        return sorted(int(b.name.split(":")[-1], 16) for b in (_pci_dir() / port / "pci_bus").iterdir())
-    except (OSError, ValueError):
-        return []
-
-
-def tray_root_ports(trays: list, endpoints: Optional[dict] = None, groups: Optional[dict] = None) -> list:
-    """The root ports of ``trays``: those above a Tenstorrent function on them now, and every Tenstorrent
-    root port (present or remembered) whose bus below falls in their tt-smi bus group, which still finds
-    the port of a chip that is off the bus. ``[]`` when no tray table is known."""
-    eps = (tt_endpoints() or {}) if endpoints is None else endpoints
-    groups = tray_bus_groups(eps) if groups is None else groups
-    if not groups:
-        return []
-    wanted = {groups[t] for t in trays if t in groups}
-    ports = {e.root_port for e in eps.values() if e.root_port and e.bus & 0xF0 in wanted}
-    ports |= {p for p in tt_root_ports(eps) if any(b & 0xF0 in wanted for b in _secondary_buses(p))}
-    return sorted(ports)
-
-
-def rescan_root_ports(ports: list, log: Callable[[str], None]) -> list:
-    """Rescan only the bus below each of ``ports`` (the kernel's ``pci_bus/<bus>/rescan``), never the
-    whole host: a global rescan also walks every other tray's ports, and after each per-tray re-power
-    on a 6U Galaxy the slot-6 chip of every other tray was left reading all-ones. Returns the ports
-    rescanned; one that cannot be is logged and skipped."""
-    done = []
-    for port in ports:
-        try:
-            buses = sorted((_pci_dir() / port / "pci_bus").iterdir())
-        except OSError as exc:
-            log(f"no scoped rescan for root port {port}: {exc!r}")
-            continue
-        for bus in buses:
-            try:
-                _write(bus / "rescan", "1")
-            except OSError as exc:
-                log(f"rescan of bus {bus.name} below {port} failed: {exc!r}")
-                continue
-            if port not in done:
-                done.append(port)
-    return done
-
-
-def rescan_trays(trays: list, log: Callable[[str], None]) -> list:
-    """:func:`rescan_root_ports` for the root ports of ``trays``. ``[]`` when none could be rescanned."""
-    return rescan_root_ports(tray_root_ports(trays), log)
-
-
-def _heartbeats() -> dict:
-    """``{chip: ARC heartbeat}`` from the tenstorrent class: a sysfs read, the driver answers it. A chip
-    whose value cannot be read is left out."""
-    out: dict = {}
-    try:
-        entries = list((SYS_ROOT / "sys/class/tenstorrent").iterdir())
-    except OSError:
-        return out
-    for entry in entries:
-        m = re.search(r"(\d+)$", entry.name)
-        if not m:
-            continue
-        try:
-            out[int(m.group(1))] = int((entry / "tt_heartbeat").read_text().strip())
-        except (OSError, ValueError):
-            continue
-    return out
-
-
-def _live_siblings(plan: TrayPlan) -> dict:
-    """``{chip: Endpoint}`` for the chips NOT on the re-powered trays whose heartbeat reads live now: the
-    ones a re-power must not take off the bus. Empty when sysfs cannot be read."""
-    eps = tt_endpoints() or {}
-    beats = _heartbeats()
-    return {
-        e.chip: e
-        for e in eps.values()
-        if e.chip is not None and e.bdf not in plan.functions and beats.get(e.chip, ALL_ONES) != ALL_ONES
-    }
-
-
-def _recover_siblings(plan: TrayPlan, live: dict, log: Callable[[str], None], sleep: Callable[[float], None]) -> None:
-    """After the pulse: a chip on another tray that read live before it and all-ones now gets ONE remove
-    and a rescan of its own root port. One still all-ones after that is left to the caller (the walk's
-    regression check hands it to the mesh reset)."""
-    if not live:
-        return
-    beats = _heartbeats()
-    dropped = sorted(c for c in live if beats.get(c) == ALL_ONES)
-    if not dropped:
-        return
-    plan.siblings_dropped = dropped
-    log(f"tray re-power of trays {plan.trays} left chip(s) {dropped} on other trays reading all-ones; remove + rescan")
-    for c in dropped:
-        try:
-            _write(_pci_dir() / live[c].bdf / "remove", "1")
-        except OSError as exc:
-            log(f"could not remove {live[c].bdf} (chip {c}): {exc!r}")
-    rescan_root_ports(sorted({live[c].root_port for c in dropped if live[c].root_port}), log)
-    sleep(3)
-    beats = _heartbeats()
-    by_bdf = {e.bdf: e.chip for e in (tt_endpoints() or {}).values()}
-    plan.siblings_still_off = [
-        c for c in dropped if beats.get(by_bdf.get(live[c].bdf), ALL_ONES) == ALL_ONES  # type: ignore[arg-type]
-    ]
-    health_event(
-        "tray_repower_sibling_offbus",
-        trays=plan.trays,
-        chips=dropped,
-        functions=[live[c].bdf for c in dropped],
-        still_off=plan.siblings_still_off,
-        host_at_risk=True,
-    )
-
-
-# Set by :func:`disable_tray_rung` once a per-tray re-power took chips on other trays off the bus
-# (``ubb_reset_regressed_offbus``): the per-tray rung (the verify-between walk and the sweep's tray
-# re-power) is declined on this host for ``TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS`` (default 7). Written to
-# ``TRAY_RUNG_FILE`` in the health dir with the host name and time, so a broker restart and a reboot or
-# power cycle both keep it: the UBB that regressed is still the same one after a cycle (measured: the
-# rung re-armed on each new boot and the same re-power took 20 more chips off three times in an hour).
-# A record from another host or older than the window is dropped. An operator clears it after a repair
-# with :func:`clear_tray_rung_cmd`; a running broker sees the file gone and re-arms the rung.
-TRAY_RUNG_FILE = "ubb_tray_rung_disabled.json"
-TRAY_RUNG_LATCH_DEFAULT_DAYS = 7.0
-_TRAY_RUNG_DISABLED: Optional[dict] = None
-_TRAY_RUNG_AT = 0.0  # when the in-memory record was latched (epoch s)
-_TRAY_RUNG_PERSISTED = False  # the in-memory record is backed by TRAY_RUNG_FILE
-
-
-def clear_tray_rung_cmd() -> str:
-    """The exact command that re-arms the per-tray rung on THIS broker after a hardware repair (its
-    interpreter and health dir, as root), as :func:`clear_latch_cmd` does for the host-hang latch."""
-    return (
-        f"sudo {sys.executable} -m tt_device_mcp.health.recovery.pcie_guard --clear-tray-rung-latch "
-        f"--health-dir {health_dir()}"
-    )
-
-
-def clear_tray_rung_latch(dirs: Optional[list] = None) -> list:
-    """Operator step: re-arm the per-tray rung in each of ``dirs`` (default :func:`latch_dirs`), e.g.
-    after the UBB whose re-power regressed was repaired. Returns the files removed. Raises OSError when
-    one exists but cannot be removed (not root)."""
-    global _TRAY_RUNG_DISABLED, _TRAY_RUNG_PERSISTED
-    cleared = []
-    for d in latch_dirs() if dirs is None else dirs:
-        path = Path(d) / TRAY_RUNG_FILE
-        if path.exists():
-            path.unlink()
-            cleared.append(path)
-            health_event("ubb_tray_rung_cleared", path=str(path), by="operator")
-    if cleared:
-        _TRAY_RUNG_DISABLED, _TRAY_RUNG_PERSISTED = None, False
-    return cleared
-
-
-def tray_rung_latch_sec() -> float:
-    """How long a recorded tray re-power regression declines the per-tray rung on this host. A malformed
-    or non-positive ``TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS`` reads as the default."""
-    try:
-        days = float(os.environ.get("TT_DEVICE_MCP_TRAY_RUNG_LATCH_DAYS", "") or TRAY_RUNG_LATCH_DEFAULT_DAYS)
-    except ValueError:
-        days = TRAY_RUNG_LATCH_DEFAULT_DAYS
-    return (days if days > 0 else TRAY_RUNG_LATCH_DEFAULT_DAYS) * 86400.0
-
-
-def disable_tray_rung(**why) -> None:
-    """Decline the per-tray rung on this host for :func:`tray_rung_latch_sec` (``ubb_tray_rung_disabled``,
-    once). The record goes to the health dir with the host name and time, so it survives a broker
-    restart, a reboot and a power cycle."""
-    global _TRAY_RUNG_DISABLED, _TRAY_RUNG_AT, _TRAY_RUNG_PERSISTED
-    if tray_rung_disabled() is not None:
-        return
-    rec = {"why": dict(why), "boot_id": _boot_id(), "host": socket.gethostname(), "at_epoch": time.time()}
-    _TRAY_RUNG_DISABLED, _TRAY_RUNG_AT, _TRAY_RUNG_PERSISTED = dict(why), rec["at_epoch"], False
-    try:
-        path = health_dir() / TRAY_RUNG_FILE
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(json.dumps(rec))
-            f.flush()
-            os.fsync(f.fileno())
-        _TRAY_RUNG_PERSISTED = True
-    except OSError as exc:
-        health_event("ubb_tray_rung_disabled_unwritable", error=repr(exc), host_at_risk=True)
-    health_event(
-        "ubb_tray_rung_disabled",
-        **why,
-        boot_id=rec["boot_id"],
-        latch_days=tray_rung_latch_sec() / 86400.0,
-        clear_with=clear_tray_rung_cmd(),
-        host_at_risk=True,
-    )
-
-
-def tray_rung_disabled() -> Optional[dict]:
-    """Why the per-tray rung is disabled on this host, or None while it is armed. Reads the record an
-    earlier broker process wrote, on this boot or an earlier one: a power cycle does not repair the UBB
-    whose re-power regressed. A record from another host, or older than :func:`tray_rung_latch_sec`, is
-    removed and never counts. One with no time of its own is aged by the file's mtime; one whose age cannot
-    be read at all cannot be shown stale, so it counts: the hold it routes to is the bounded I27 hand-off."""
-    global _TRAY_RUNG_DISABLED, _TRAY_RUNG_AT, _TRAY_RUNG_PERSISTED
-    path = health_dir() / TRAY_RUNG_FILE
-    if _TRAY_RUNG_DISABLED is not None:
-        if _TRAY_RUNG_PERSISTED and not path.exists():
-            # An operator cleared it (:func:`clear_tray_rung_cmd`) while this broker ran: re-arm now.
-            health_event("ubb_tray_rung_cleared", path=str(path), by="file_removed", latch=_TRAY_RUNG_DISABLED)
-            _TRAY_RUNG_DISABLED, _TRAY_RUNG_PERSISTED = None, False
-            return None
-        if time.time() - _TRAY_RUNG_AT < tray_rung_latch_sec():
-            return _TRAY_RUNG_DISABLED
-        _TRAY_RUNG_DISABLED = None
-    try:
-        rec = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return None
-    current = _boot_id()
-    at = rec.get("at_epoch") if isinstance(rec, dict) else None
-    if not isinstance(at, (int, float)):  # a record from before the time was kept: the file's own
-        try:
-            at = path.stat().st_mtime
-        except OSError:
-            at = None
-    age = time.time() - at if isinstance(at, (int, float)) else None
-    host = rec.get("host") if isinstance(rec, dict) else None
-    stale = (host and host != socket.gethostname()) or (age is not None and age >= tray_rung_latch_sec())
-    if not isinstance(rec, dict) or stale:
-        path.unlink(missing_ok=True)
-        health_event("ubb_tray_rung_rearmed", latch=rec, boot_id=current, age_sec=age)
-        return None
-    why = rec.get("why")
-    _TRAY_RUNG_DISABLED = dict(why) if isinstance(why, dict) else {}
-    _TRAY_RUNG_AT = at if age is not None else time.time()
-    _TRAY_RUNG_PERSISTED = True
-    health_event(
-        "ubb_tray_rung_disabled_restored",
-        **_TRAY_RUNG_DISABLED,
-        boot_id=current,
-        latched_boot_id=rec.get("boot_id"),
-        age_sec=age,
-        clear_with=clear_tray_rung_cmd(),
-        host_at_risk=True,
-    )
-    return _TRAY_RUNG_DISABLED
-
-
-# The last per-tray re-power of this process, for :func:`latch_tray_pulse_drop`: chips on the trays it
-# did NOT re-power that leave the bus within ``TRAY_PULSE_WINDOW_SEC`` of it, all at in-tray position 5
-# (chips 5/13/21/29 on a Galaxy), are the cross-tray signature some UBBs show a minute after a pulse.
-# The drop often lands after the pulse's own hold was released, in a new hold episode, so the match spans
-# episodes inside the window. The record names the pulse's episode and trays, so an operator who finds
-# the drop was someone else's (e.g. an outside load test) re-arms the rung with clear_tray_rung_cmd().
-TRAY_PULSE_WINDOW_SEC = 900.0
-TRAY_PULSE_POSITION = 5
-_LAST_TRAY_PULSE: Optional[dict] = None
-
-
-def note_tray_pulse(trays, tray_map: Optional[dict], off_before, episode: str = "") -> None:
-    """A per-tray re-power of ``trays`` was fired with ``off_before`` (chip ids) off the bus, in the hold
-    episode ``episode`` (its onset; empty when unknown)."""
-    global _LAST_TRAY_PULSE
-    if not tray_map:
-        return
-    _LAST_TRAY_PULSE = {
-        "trays": sorted(int(t) for t in trays),
-        "tray_map": {int(t): sorted(int(c) for c in chips) for t, chips in tray_map.items()},
-        "off_before": {str(c) for c in off_before},
-        "at": time.monotonic(),
-        "episode": episode or "",
-    }
-
-
-def latch_tray_pulse_drop(off_now, episode: str = "") -> Optional[dict]:
-    """Disable the per-tray rung (:func:`disable_tray_rung`) when chips that were on the bus before the
-    last tray re-power, on trays it did not re-power, are now off and every one of them sits at in-tray
-    position 5. Only that signature counts: a mesh reset fired after the pulse drops other chips too.
-    The record names the pulse's hold episode, and ``episode`` (the hold the drop was seen in) when it
-    is another one. Returns why it latched, or None."""
-    pulse = _LAST_TRAY_PULSE
-    if pulse is None or time.monotonic() - pulse["at"] > TRAY_PULSE_WINDOW_SEC:
-        return None
-    new_off = {str(c) for c in off_now} - pulse["off_before"]
-    elsewhere = {
-        c: pos
-        for tray, chips in pulse["tray_map"].items()
-        if tray not in pulse["trays"]
-        for pos, c in enumerate(chips)
-        if str(c) in new_off
-    }
-    if not elsewhere or set(elsewhere.values()) != {TRAY_PULSE_POSITION}:
-        return None
-    why = {"tray": pulse["trays"], "new_off": [str(c) for c in sorted(elsewhere)], "signature": "position5"}
-    if pulse.get("episode"):
-        why["episode"] = pulse["episode"]
-    if episode and episode != pulse.get("episode"):
-        why["seen_in"] = episode
-    health_event("ubb_reset_regressed_offbus", **why, host_at_risk=True)
-    disable_tray_rung(**why)
-    return why
-
-
-def _published_chips() -> set:
-    """Every chip id tt-kmd publishes under /proc, on the bus or not."""
-    try:
-        return {int(d.name) for d in (SYS_ROOT / "proc/driver/tenstorrent").iterdir() if d.name.isdigit()}
-    except OSError:
-        return set()
-
-
-def _tray_holders(chips: list) -> dict:
-    """``{chip: [pid, ...]}`` for the given chips that a process still holds open (tt-kmd's own
-    record). A chip the driver does not publish has no entry."""
-    out = {}
-    for c in chips:
-        try:
-            pids = [int(p) for p in (SYS_ROOT / f"proc/driver/tenstorrent/{c}/pids").read_text().split()]
-        except (OSError, ValueError):
-            continue
-        pids = [p for p in pids if p != os.getpid()]
-        if pids:
-            out[c] = pids
-    return out
-
-
-def _write(path: Path, text: str) -> None:
-    path.write_text(text)
-
-
-def safe_tray_repower(
-    bitmap: int,
-    tray_chip_ids: list,
-    fire: Callable[[], None],
-    log: Callable[[str], None],
-    *,
-    quiesce: Callable[[list], None] = lambda chips: None,
-    reinit: Callable[[list], None] = lambda chips: None,
-    sleep: Callable[[float], None] = time.sleep,
-) -> TrayPlan:
-    """Re-power the trays in ``bitmap`` without letting the host see the fallout:
-
-    1. refuse if the tray map disagrees with sysfs (a wrong tray would be cut) or sysfs cannot be
-       read; with every chip off the bus there is no healthy tray to cut and nothing to
-       cross-check, so it goes ahead;
-    2. wait up to ``TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC`` (default 10) for every process to
-       let go of EVERY chip on the box, else refuse: one tray's pulse has dropped the other trays
-       within seconds, so the box must be idle as for a whole-box cycle;
-    3. mask AER and DPC on EVERY Tenstorrent root port, the sibling trays' and the off-bus chips'
-       included; a port that cannot be masked refuses the fire before any chip is touched;
-    4. ``quiesce`` the chips (tt-smi's USER_RESET ioctl);
-    5. remove the tray's PCI functions so nothing in the kernel touches them while unpowered;
-    6. ``fire`` the BMC pulse (it also waits out the settle);
-    7. rescan only the tray's root ports (a global rescan only when none is known), ``reinit`` the
-       chips (POST_RESET ioctl);
-    8. heartbeat-check the other trays' chips: one that read live before the pulse and all-ones now
-       gets one remove and a rescan of its own root port;
-    9. restore AER on every port that stayed quiet; one that keeps erroring stays masked.
-
-    Steps 7-9 run even when the quiesce or the pulse raised. ``TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN=1`` logs the plan
-    and raises :class:`TrayRepowerDryRun` before step 2."""
-    plan = plan_tray_repower(bitmap, tray_chip_ids)
-    log(
-        f"tray re-power plan: trays {plan.trays} (bitmap {bitmap:#04x}); functions {plan.functions}; "
-        f"chips {plan.chips}; AER/DPC masked on {plan.root_ports}"
-    )
-    if os.environ.get("TT_DEVICE_MCP_TRAY_REPOWER_DRY_RUN", "").strip() == "1":
-        steps = [
-            f"wait for holders on every chip {plan.box_chips or plan.chips}",
-            f"mask AER/DPC on {plan.root_ports}",
-            f"quiesce chips {plan.chips}",
-            f"remove {plan.functions}",
-            f"fire BMC re-power {bitmap:#04x}",
-            f"rescan {plan.tray_ports or 'the bus'}",
-            f"re-init chips {plan.chips}",
-            "heartbeat-check the other trays",
-            "restore AER on quiet ports",
-        ]
-        log("tray re-power DRY RUN, nothing touched: " + " -> ".join(steps))
-        health_event("tray_repower_dry_run", trays=plan.trays, functions=plan.functions, mismatch=plan.mismatch)
-        raise TrayRepowerDryRun(plan.mismatch or "dry run")
-    if plan.mismatch:
-        health_event("tray_repower_refused", trays=plan.trays, reason=plan.mismatch, host_at_risk=True)
-        raise TrayRepowerRefused(plan.mismatch)
-    wait = _env_float("TT_DEVICE_MCP_TRAY_REPOWER_HOLDER_WAIT_SEC", 10)
-    deadline = time.monotonic() + wait
-    box = sorted(set(plan.box_chips) | set(plan.chips))
-    holders = _tray_holders(box)
-    while holders and time.monotonic() < deadline:
-        sleep(0.5)
-        holders = _tray_holders(box)
-    if holders:
-        why = f"chip(s) still held open after {wait:.0f}s: {holders}"
-        health_event("tray_repower_refused", trays=plan.trays, reason=why, holders=holders)
-        raise TrayRepowerRefused(why)
-    live = _live_siblings(plan)
-    try:
-        mask = AerMask(plan.root_ports).apply()
-    except OSError as exc:
-        why = f"could not mask AER on the Tenstorrent root ports: {exc!r}"
-        health_event("tray_repower_refused", trays=plan.trays, reason=why, host_at_risk=True)
-        raise TrayRepowerRefused(why) from exc
-    try:
-        quiesce(plan.chips)
-        for bdf in plan.functions:
-            try:
-                _write(_pci_dir() / bdf / "remove", "1")
-            except OSError as exc:
-                log(f"could not remove {bdf} before the re-power: {exc!r}")
-        fire()
-    finally:
-        try:
-            if not rescan_root_ports(plan.tray_ports, log):
-                log(f"no root port of trays {plan.trays} could be rescanned on its own; rescanning the whole bus")
-                _write(SYS_ROOT / "sys/bus/pci/rescan", "1")
-            sleep(3)
-        except OSError as exc:
-            log(f"PCI rescan after the re-power failed: {exc!r}")
-        try:
-            reinit(plan.chips)
-        finally:
-            try:
-                _recover_siblings(plan, live, log, sleep)
-            except Exception as exc:  # noqa: BLE001 - the AER restore below must still run
-                log(f"checking the other trays after the re-power failed: {exc!r}")
-            kept = plan.kept_masked = mask.restore(sleep=sleep)
-            back = sorted(b for b in plan.functions if (_pci_dir() / b).exists())
-            log(
-                f"tray re-power done: {len(back)}/{len(plan.functions)} function(s) back"
-                + (f"; AER kept masked on erroring port(s) {kept}" if kept else "; AER restored")
-                + (f"; other trays' chip(s) {plan.siblings_dropped} dropped" if plan.siblings_dropped else "")
-            )
-            health_event(
-                "tray_repower_envelope",
-                trays=plan.trays,
-                back=len(back),
-                of=len(plan.functions),
-                kept_masked=kept,
-                siblings_dropped=plan.siblings_dropped,
-                siblings_still_off=plan.siblings_still_off,
-            )
-    return plan
-
-
 def main(argv: Optional[list] = None) -> int:
-    """``python -m tt_device_mcp.health.recovery.pcie_guard <bitmap> [chip ...]``: print the plan a
-    per-tray re-power would follow. Reads sysfs only; never touches a device."""
+    """``python -m tt_device_mcp.health.recovery.pcie_guard [--clear-hang-latch [--health-dir DIR]]``:
+    with no argument, print the reset gate's mode and any host-hang hold; ``--clear-hang-latch`` clears
+    that hold. Reads sysfs only; never touches a device."""
     args = sys.argv[1:] if argv is None else argv
-    if args[:1] == ["--clear-tray-rung-latch"]:
-        rest = args[1:]
-        if rest and (len(rest) != 2 or rest[0] != "--health-dir"):
-            print("usage: pcie_guard --clear-tray-rung-latch [--health-dir DIR]")
-            return 2
-        dirs = latch_dirs(rest[1] if rest else None)
-        try:
-            cleared = clear_tray_rung_latch(dirs)
-        except OSError as exc:
-            print(f"the per-tray rung is latched off but could not be re-armed ({exc}); run it as root (sudo)")
-            return 1
-        if cleared:
-            print("per-tray rung re-armed: " + ", ".join(str(p) for p in cleared))
-        else:
-            print("the per-tray rung was not latched off in " + ", ".join(str(d) for d in dirs))
-        return 0
     if args[:1] == ["--clear-hang-latch"]:
         rest = args[1:]
         if rest and (len(rest) != 2 or rest[0] != "--health-dir"):
@@ -1457,23 +1001,14 @@ def main(argv: Optional[list] = None) -> int:
         else:
             print("no host-hang hold was latched in " + ", ".join(str(d) for d in dirs))
         return 0
-    if not args:
-        print(
-            "usage: pcie_guard <bitmap> [chip ...] | --clear-hang-latch [--health-dir DIR] "
-            "| --clear-tray-rung-latch [--health-dir DIR]"
-        )
+    if args:
+        print("usage: pcie_guard [--clear-hang-latch [--health-dir DIR]]")
         return 2
-    plan = plan_tray_repower(int(args[0], 0), [int(a) for a in args[1:]])
-    print(f"trays {plan.trays}\nfunctions {plan.functions}\nchips {plan.chips}\nroot ports {plan.root_ports}")
-    print(f"mismatch: {plan.mismatch or 'none'}")
     print(f"gate: {gate_mode()}")
     latch = offbus_reset_latched()
     if latch is not None:
         print(f"host-hang hold LATCHED: {_latch_boots(latch)} ({latch}); clear with `{clear_latch_cmd()}`")
-    rung = tray_rung_disabled()
-    if rung is not None:
-        print(f"per-tray rung LATCHED OFF ({rung}); re-arm after a repair with `{clear_tray_rung_cmd()}`")
-    return 1 if plan.mismatch else 0
+    return 0
 
 
 if __name__ == "__main__":

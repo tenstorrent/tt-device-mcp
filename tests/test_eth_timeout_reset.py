@@ -21,9 +21,8 @@ CHIPS = 32
 TIMED_OUT = (None, f"{ETH_COULD_NOT_CHECK}: {eth.READ_TIMED_OUT}")
 ADVANCING = (True, "all active-eth cores advancing (1s)")
 OUTAGE_HOLD = {
-    "TT_DEVICE_MCP_AUTO_REBOOT": "0",
+    "TT_DEVICE_MCP_AUTO_MESH_RESET": "0",
     "TT_DEVICE_MCP_AUTO_POWER_CYCLE": "0",
-    "TT_DEVICE_MCP_AUTO_UBB_RESET": "0",
 }
 
 
@@ -54,7 +53,6 @@ def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
         "resets": [],
         "fabric": [],
         "eth_reads": 0,
-        "reboots": 0,
         "events": [],
     }
     for i in range(CHIPS):
@@ -64,8 +62,7 @@ def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
     srv.device_op_lock = None
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
-    monkeypatch.delenv("TT_DEVICE_MCP_AUTO_MESH_RESET", raising=False)
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "1")  # not the outage hold; OUTAGE_HOLD sets it to 0
     monkeypatch.delenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", raising=False)
     monkeypatch.setattr(base, "_mesh_hold_paged", {})
     monkeypatch.setattr(srv, "eth_check_armed", True)
@@ -117,13 +114,9 @@ def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
         st["fabric_bad"] = not st.get("reset_heals", True)
         return 0, ""
 
-    async def reboot(log, reason):
-        st["reboots"] += 1
-
     g = srv.galaxy_recovery
     monkeypatch.setattr(g.mechanism, "await_foreign_scope", no_scope)
     monkeypatch.setattr(g.mechanism, "reset_with_quiesce", reset)
-    monkeypatch.setattr(g, "_auto_reboot_host", reboot)
     patch_health_event(monkeypatch, lambda name, *a, **k: st["events"].append(name))
     monkeypatch.setattr(alert, "send_alert", lambda event, log=None: object())
     monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: {})
@@ -172,15 +165,15 @@ async def test_the_full_check_after_the_reset_gates_the_release(mesh):
 
 
 @pytest.mark.asyncio
-async def test_a_failed_post_reset_check_stays_held_and_climbs(mesh):
+async def test_a_failed_post_reset_check_stays_held_and_climbs(mesh, armed_power_cycle):
     mesh["reset_heals"] = False
-    srv.recovery_mechanism.last_reset_failed = True  # a prior cycle failed: the host rung is armed
+    srv.recovery_mechanism.last_reset_failed = True  # a prior cycle failed: the host rung is due
     await _gate()
     assert mesh["resets"][0] == ["tt-smi", "-glx_reset"]
     assert mesh["events"].count("eth_timeout_mesh_reset") == 1
     assert mesh["fabric"] and min(mesh["fabric"]) >= 1, "every fabric pass ran after the reset"
     assert srv.fsm.state is ServerState.RECOVERING, "a failed post-reset check never releases"
-    assert mesh["reboots"] == 1, "it climbs to the opted-in host rung"
+    assert armed_power_cycle == ["power-cycle"], "it climbs to the power cycle"
 
 
 @pytest.mark.asyncio
@@ -285,6 +278,17 @@ async def test_host_pci_not_ok_keeps_todays_fabric_pass(mesh):
     await _gate()
     assert mesh["resets"] == [] and "eth_timeout_mesh_reset" not in mesh["events"]
     assert mesh["fabric"] == [0]
+
+
+@pytest.mark.asyncio
+async def test_a_degraded_pcie_link_holds_and_never_releases(mesh):
+    """Spec 03 I9: a link trained below its expected width fails host-pci like any other host-pci
+    fault. The gate holds and recovers; the device is never released while the check fails."""
+    mesh["eth"] = ADVANCING
+    mesh["hostpci"] = (False, "PCIe link degraded on 1/32: 0000:01:00.0 x1 (expected x8)")
+    await _gate()
+    assert srv.fsm.state is not ServerState.HEALTHY, "a failed host-pci check never releases"
+    assert "PCIe link degraded" in mesh["log"].text()
 
 
 @pytest.mark.asyncio

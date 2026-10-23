@@ -136,7 +136,6 @@ class Probe:
     def __init__(self, root: Path = Path("/")):
         self.dev_dir = root / "dev/tenstorrent"
         self.pci_dir = root / "sys/bus/pci/devices"
-        self.rescan_path = root / "sys/bus/pci/rescan"
         self.boot_id_path = root / "proc/sys/kernel/random/boot_id"
         self.proc_dir = root / "proc"
         self.sleep: Callable[[float], None] = time.sleep
@@ -157,12 +156,15 @@ class Probe:
         return r.stdout.strip()
 
     def rescan(self) -> bool:
-        """One write to the bus rescan file under the broker's device-op flock (spec 06 I8
-        external-tool contract). False, nothing written, while a broker device op holds it."""
+        """One rescan of the Tenstorrent root ports' buses (never /sys/bus/pci/rescan) under the broker's
+        device-op flock (spec 06 I8 external-tool contract). False, nothing written, while a broker
+        device op holds it. Raises OSError when no Tenstorrent root port could be rescanned."""
+        from tt_device_mcp.health.recovery import pcie_guard
+
         with device_op_flock() as free:
             if not free:
                 return False
-            self.rescan_path.write_text("1")
+            pcie_guard.rescan_tt_root_ports()
         return True
 
     def present(self) -> int:

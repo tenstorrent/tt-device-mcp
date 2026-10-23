@@ -280,6 +280,11 @@ def _normalized_board(raw) -> str:
     return board.lower()
 
 
+# The detail every fabric pass the dead-chip isolation killed starts with (spec 03 I82): the gate reads
+# it off its own evidence to keep the off-bus hold dirty rather than hold it as a plain 77.
+FABRIC_KILLED_BY_ISOLATION = "fabric check KILLED by dead-chip isolation"
+
+
 class HealthMonitor:
     """Runs the probe pass and holds its state: the board-type snapshot cache, the fabric probe's
     last-real-verdict latch, the in-flight fabric-check process handle, and the last ``readings``
@@ -316,8 +321,8 @@ class HealthMonitor:
         # that has left the bus is absent from every later snapshot AND from sysfs, so the tray
         # rung that needs its bus (spec 04 I16) can only ever read one taken before the drop.
         self._bus_ids: Optional[list] = None
-        # {chip index: PCI address} read from sysfs while every chip was on the bus — the map the
-        # tray rung actually keys on (spec 04 I16). tt-smi lists chips in PCI order and the kernel
+        # {chip index: PCI address} read from sysfs while every chip was on the bus — the map
+        # tray placement actually keys on (spec 04 I16). tt-smi lists chips in PCI order and the kernel
         # numbers them in its own order, so ``_bus_ids`` read by position names the wrong chip.
         # Re-banked by any later trusted full read that differs: the kernel can re-number chips.
         self._chip_buses: Optional[dict] = None
@@ -374,6 +379,9 @@ class HealthMonitor:
         # bus it is the likeliest thing still reading a dead address — and `pci remove` does not
         # revoke its mapping. Tracked so a dead chip can kill it (see server._kill_device_holders).
         self.fabric_check_proc: asyncio.subprocess.Process | None = None
+        # Why the broker's dead-chip isolation killed the in-flight fabric pass ("" when it did not):
+        # that run's exit is no verdict (spec 03 I82). Set by note_fabric_check_killed, read once.
+        self._fabric_killed: str = ""
 
         # The last pass's readings blackboard. None until update() runs once.
         self._readings: Optional[HealthState] = None
@@ -1105,7 +1113,15 @@ class HealthMonitor:
         v["age_s"] = round(time.monotonic() - v.pop("_at"), 1)
         return v
 
+    def note_fabric_check_killed(self, reason: str) -> None:
+        """The broker's dead-chip isolation SIGKILLed the in-flight fabric pass (spec 03 I82). Its exit
+        (-9) then says nothing about the links: the run is no verdict, the fabric unknown, and a full
+        pass is owed before any release (04 I32)."""
+        self._fabric_killed = reason or "dead-chip isolation"
+        FABRIC_DEBT.note_fabric_killed(f"fabric check killed ({self._fabric_killed})")
+
     async def _verify_fabric_health_body(self, timeout_sec: float) -> tuple[Optional[bool], str]:
+        self._fabric_killed = ""
         override = self._fabric_check_cmd()
         built = fabric.build_command()
         if built is None:
@@ -1156,6 +1172,8 @@ class HealthMonitor:
         # the journal carries truncates exactly the part naming them.
         self.last_fabric_output = text
         self.last_fabric_output_at = _t0
+        if self._fabric_killed:
+            return self._fabric_killed_no_verdict(cmd, rc, text, dt)
         last = text.splitlines()[-1][:200] if text else "(no output)"
         if override:
             # An operator's own wrapper has already done its own interpretation and reports it
@@ -1175,6 +1193,10 @@ class HealthMonitor:
                 )
                 self.last_fabric_output = text
                 self.last_fabric_output_at = _t0
+        if self._fabric_killed:
+            # Read again after the traffic-only rerun (I45): a kill there is no verdict either (I82),
+            # never a link fault or a missing-cable verdict (I47) from whatever the killed run printed.
+            return self._fabric_killed_no_verdict(cmd, rc, text, (datetime.now() - _t0).total_seconds())
         # Traffic crossed every discovered link but ports of the descriptor are missing: a FAILED
         # check, never a lift (I71). The cached mismatch goes, so the next pass runs the descriptor
         # again and a reset that brought the link back reads clean.
@@ -1260,6 +1282,24 @@ class HealthMonitor:
         if rc is None:
             return False, f"fabric check timed out after {timeout_sec:.0f}s; last line: {last}"
         return False, f"fabric check exited {rc} ({dt:.0f}s): {reason[:400]}"
+
+    def _fabric_killed_no_verdict(self, cmd: str, rc: Optional[int], text: str, dt: float) -> tuple[None, str]:
+        """A pass the dead-chip isolation killed (spec 03 I82): neither a pass nor a link fault, nor a
+        77. No failed verdict, no 77 streak (I46) and no cover from an earlier pass: the fabric is
+        unknown until a later pass measures it."""
+        why, self._fabric_killed = self._fabric_killed, ""
+        self._write_action_log("[broker]fabric-check", cmd, dt, "killed", rc, output=_action_log_output(text))
+        self.last_fabric_ok = None
+        self.last_fabric_skipped = False
+        detail = (
+            f"{FABRIC_KILLED_BY_ISOLATION} ({dt:.0f}s, exit {rc}): {why}; no verdict, "
+            "fabric unknown, a full pass is owed after recovery"
+        )
+        health_event("fabric_check_no_verdict", cause="killed_by_dead_chip_isolation", reason=why[:400], rc=rc)
+        log = self._logger()
+        if log:
+            log.warning(f"FABRIC-CHECK {detail}")
+        return None, detail
 
     async def _keep_skip_output(self, rc: int, text: str, reason: str, cmd: str) -> Optional[str]:
         """Freeze a no-verdict fabric run's exit code and output tail (``FABRIC_SKIP_OUTPUT_TAIL_BYTES``)
