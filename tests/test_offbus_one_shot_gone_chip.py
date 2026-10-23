@@ -100,4 +100,6 @@ async def test_a_whole_gone_tray_goes_to_the_power_cycle_with_no_reset(rig, phas
         await rig["g"].escalate(phase, [], 32, lambda m: None)
     assert rig["order"] == ["rescan", "capture", "power_cycle"], "a reset ran before the whole-tray power cycle"
     assert "released" not in rig["order"]
-    assert galaxy.FAULT_CLASS_WHOLE_TRAY in [f.get("fault_class") for k, f in rig["events"] if k == "power_cycle_direct"]
+    assert galaxy.FAULT_CLASS_WHOLE_TRAY in [
+        f.get("fault_class") for k, f in rig["events"] if k == "power_cycle_direct"
+    ]
