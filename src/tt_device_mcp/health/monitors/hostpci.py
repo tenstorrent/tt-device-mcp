@@ -10,27 +10,32 @@ the kernel could not place, is unusable no matter what its ARC heartbeat says, a
 are invisible to every probe we had: the heartbeat reads a chip's own counter, and the snapshot
 asks tt-smi, which needs the very mapping an unplaced BAR denies it.
 
-Three questions get a verdict, because any answer makes the device unusable and that is the
+Four questions get a verdict, because any answer makes the device unusable and that is the
 only question a verdict answers (see health.core.Verdict — there is no third state):
 
   * every Tenstorrent function on the bus is bound to tt-kmd,
-  * no implemented BAR is left unassigned, and
-  * no function's link reads as down (speed ``Unknown`` or width 63: :func:`link_down`).
+  * no implemented BAR is left unassigned,
+  * no function's link reads as down (speed ``Unknown`` or width 63: :func:`link_down`), and
+  * no live link trained below the link it should have: narrower or slower than the lower of the
+    two ends' caps, or than it showed on an earlier passing check (:func:`_judge_link`).
 
-Everything else this reads — IOMMU grouping, a live link's speed and width, AER totals on the endpoints
-*and* their upstream bridges — is recorded as evidence and never alerts. A correctable-error
-count is a trend, not a state: non-zero is ordinary on a healthy link, and a probe that held the
-device over one would be wrong far more often than right. The counters are here because the
-documented path from a wedged chip to an ungraceful host reboot runs through the root complex
-escalating accumulated errors, and the bridge half of that path was not being recorded at all.
+Everything else this reads — IOMMU grouping, the speed of a device whose speed is not judged,
+AER totals on the endpoints *and* their upstream bridges — is recorded as evidence and never
+alerts. A correctable-error count is a trend, not a state: non-zero is ordinary on a healthy
+link, and a probe that held the device over one would be wrong far more often than right. The
+counters are here because the documented path from a wedged chip to an ungraceful host reboot
+runs through the root complex escalating accumulated errors, and the bridge half of that path
+was not being recorded at all.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Optional
 
+from tt_device_mcp.health import evidence
 from tt_device_mcp.health.monitors import pci
 
 # Tenstorrent's PCI vendor id, as sysfs renders it.
@@ -117,6 +122,107 @@ def link_down(bdf: str, devices_dir: Optional[Path] = None) -> bool:
     return (speed is not None and speed.startswith("Unknown")) or _read(dev / "current_link_width") == LINK_DOWN_WIDTH
 
 
+# A live read of a function's config-space vendor id (spec 04 I24). The kernel keeps the cached
+# ``vendor`` attribute from enumeration, so a chip that lost power still shows 0x1e52 there; the
+# ``config`` file is read from the device on every open. A function that is gone answers all-ones.
+CONFIG_PRESENT = "present"
+CONFIG_MISSING = "missing"
+CONFIG_UNREADABLE = "unreadable"
+_TT_VENDOR = 0x1E52
+_NO_DEVICE_VENDOR = 0xFFFF
+
+
+def config_vendor_state(bdf: str, devices_dir: Optional[Path] = None) -> str:
+    """:data:`CONFIG_PRESENT` when the first two bytes of ``<bdf>/config`` read 0x1e52 now,
+    :data:`CONFIG_MISSING` when they read 0xffff (nothing answers at that address), else
+    :data:`CONFIG_UNREADABLE` (an OSError, a short read, any other value): no evidence either way,
+    never taken as present or missing. Read-only: no ``/dev/tenstorrent`` open, no config write.
+    One small read; call it only for a chip already suspect, never for every chip between jobs."""
+    try:
+        with open((devices_dir or pci.PCI_DEVICES_DIR) / bdf / "config", "rb", buffering=0) as f:
+            raw = f.read(2)
+    except OSError:
+        return CONFIG_UNREADABLE
+    if len(raw) < 2:
+        return CONFIG_UNREADABLE
+    vendor = int.from_bytes(raw, "little")
+    if vendor == _TT_VENDOR:
+        return CONFIG_PRESENT
+    if vendor == _NO_DEVICE_VENDOR:
+        return CONFIG_MISSING
+    return CONFIG_UNREADABLE
+
+
+# A live link that trained narrower or slower than it can (spec 03 I9). The link it should have is
+# the lower of the two ends' capabilities: on a Galaxy most chips are x8 endpoints behind x1 root
+# ports, so they train x1 by design and the endpoint's own cap alone would hold every one of them.
+# Each link is also judged against the best it has shown on a passing check, banked here.
+PCIE_LINK_BASELINE_FILE = "pcie_link_baseline.json"
+# Device ids whose trained speed is judged as well as their width. ASPM (L0s/L1) changes a link's
+# power state, never the speed it trained at, but a device may still retrain slower on its own while
+# idle (autonomous speed change), and that is a power state, not a fault. Blackhole (0xb140) is
+# listed on evidence: every link on a 32-chip Galaxy read its capped 32 GT/s on every recorded
+# pass, idle or not. Any other device is judged on width only, with its speed kept as evidence,
+# until its links show the same.
+SPEED_JUDGED_DEVICE_IDS = frozenset({"0xb140"})
+
+
+def _link_width(raw: Optional[str]) -> Optional[int]:
+    try:
+        return int(raw) if raw is not None else None
+    except ValueError:
+        return None
+
+
+def _link_speed(raw: Optional[str]) -> Optional[float]:
+    """GT/s from a sysfs speed like ``32.0 GT/s PCIe``; None for ``Unknown`` or anything unparsable."""
+    try:
+        return float(raw.split()[0]) if raw else None
+    except (ValueError, IndexError):
+        return None
+
+
+def _cap(*values: Optional[float]) -> Optional[float]:
+    known = [v for v in values if v is not None]
+    return min(known) if known else None
+
+
+def _load_link_baseline() -> dict:
+    """The banked links, ``{bdf: {...}}``. Missing or unreadable is an empty bank: the caps still
+    judge every link, and the next passing check rewrites the file."""
+    try:
+        data = json.loads((evidence.health_dir() / PCIE_LINK_BASELINE_FILE).read_text())
+        links = data.get("links")
+        return links if isinstance(links, dict) else {}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+
+
+def _bank_link_baseline(banked: dict, current: dict) -> None:
+    """Ratchet each link's mark up to what this passing check read. A mark belongs to the link it
+    was taken on (the upstream port and both caps): when those differ, the old mark is replaced,
+    since it no longer describes this link. Written only when something changed."""
+    out = dict(banked)
+    for bdf, cur in current.items():
+        old = banked.get(bdf)
+        if isinstance(old, dict) and all(old.get(k) == cur[k] for k in ("port", "width_cap", "speed_cap")):
+            cur = dict(cur)
+            for k in ("width", "speed"):
+                if old.get(k) is not None and (cur[k] is None or old[k] > cur[k]):
+                    cur[k] = old[k]
+        out[bdf] = cur
+    if out == banked:
+        return
+    try:
+        p = evidence.health_dir() / PCIE_LINK_BASELINE_FILE
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps({"links": out}))
+        os.replace(tmp, p)
+    except OSError:
+        pass  # a mark we cannot persist must not break the gate; the caps still judge every link
+
+
 def tt_functions() -> list[str]:
     """Every Tenstorrent function on the PCI bus, by BDF.
 
@@ -143,9 +249,12 @@ def host_pci_verdict() -> tuple[Optional[bool], str, dict]:
 
     unbound: list[str] = []
     downlinks: list[str] = []
+    degraded: list[str] = []
     badbars: dict[str, list[int]] = {}
     devices: dict[str, dict] = {}
     bridges: dict[str, dict] = {}
+    banked = _load_link_baseline()
+    links: dict[str, dict] = {}
 
     for bdf in bdfs:
         dev = pci.PCI_DEVICES_DIR / bdf
@@ -155,7 +264,8 @@ def host_pci_verdict() -> tuple[Optional[bool], str, dict]:
         bars = _unassigned_bars(dev)
         if bars:
             badbars[bdf] = bars
-        if link_down(bdf):
+        down = link_down(bdf)
+        if down:
             downlinks.append(bdf)
 
         rec: dict = {"driver": driver}
@@ -181,17 +291,23 @@ def host_pci_verdict() -> tuple[Optional[bool], str, dict]:
             rec["unassigned_bars"] = bars
         devices[bdf] = rec
 
-        # The upstream bridge is the other end of the link, and errors logged there never appear
-        # on the endpoint. Recorded per bridge rather than per chip: several chips share one.
+        # The upstream bridge is the other end of the link: its cap bounds what the link can train
+        # to, and errors logged there never appear on the endpoint.
         try:
-            parent = Path(os.path.realpath(dev / ".."))
+            parent: Optional[Path] = Path(os.path.realpath(dev / ".."))
         except OSError:
+            parent = None
+        port = parent if parent is not None and (parent / "vendor").exists() else None
+        reason = _judge_link(dev, port, rec, banked, links)
+        if reason and not down:
+            degraded.append(f"{bdf} {reason}")
+
+        # Recorded per bridge rather than per chip: several chips share one.
+        if port is None or port.name in bridges:
             continue
-        if parent.name in bridges or not (parent / "vendor").exists():
-            continue
-        baer = _aer_totals(parent)
+        baer = _aer_totals(port)
         if baer:
-            bridges[parent.name] = {"aer": baer}
+            bridges[port.name] = {"aer": baer}
 
     evidence: dict = {"devices": devices, "iommu": _iommu_mode()}
     if bridges:
@@ -202,13 +318,62 @@ def host_pci_verdict() -> tuple[Optional[bool], str, dict]:
         problems.append(f"tt-kmd not bound to {len(unbound)}/{len(bdfs)}: {', '.join(unbound)}")
     if downlinks:
         problems.append(f"PCIe link down on {len(downlinks)}/{len(bdfs)}: {', '.join(downlinks)}")
+    if degraded:
+        problems.append(f"PCIe link degraded on {len(degraded)}/{len(bdfs)}: {', '.join(degraded)}")
     if badbars:
         listed = ", ".join(f"{bdf} BAR{'/'.join(str(b) for b in bars)}" for bdf, bars in badbars.items())
         problems.append(f"unassigned BARs on {len(badbars)}/{len(bdfs)}: {listed}")
     if problems:
         return False, "; ".join(problems), evidence
 
-    return True, f"{len(bdfs)}/{len(bdfs)} functions bound to tt-kmd with every BAR assigned", evidence
+    _bank_link_baseline(banked, links)
+    return (
+        True,
+        f"{len(bdfs)}/{len(bdfs)} functions bound to tt-kmd with every BAR assigned and no link below its expected width or speed",
+        evidence,
+    )
+
+
+def _judge_link(dev: Path, port: Optional[Path], rec: dict, banked: dict, links: dict) -> str:
+    """Why this function's live link is below the link it should have, or "" when it is not.
+
+    Expected is the lower of the endpoint's and the upstream port's cap, and also no lower than the
+    best this same link showed on a passing check. Records the expected link in ``rec`` and this
+    link's reading in ``links`` (banked by the caller only when the whole check passes). An
+    unreadable attribute is no evidence: a link with no readable width is not judged on width."""
+    width, speed = _link_width(rec.get("link_width")), _link_speed(rec.get("link_speed"))
+    port_width = _read(port / "max_link_width") if port is not None else None
+    port_speed = _read(port / "max_link_speed") if port is not None else None
+    if port_width is not None:
+        rec["link_width_port_max"] = port_width
+    if port_speed is not None:
+        rec["link_speed_port_max"] = port_speed
+    width_cap = _cap(_link_width(rec.get("link_width_max")), _link_width(port_width))
+    speed_cap = _cap(_link_speed(rec.get("link_speed_max")), _link_speed(port_speed))
+    judge_speed = _read(dev / "device") in SPEED_JUDGED_DEVICE_IDS
+    if width_cap is not None:
+        rec["link_width_expected"] = width_cap
+    if speed_cap is not None and judge_speed:
+        rec["link_speed_expected"] = speed_cap
+
+    here = {"port": port.name if port is not None else None, "width_cap": width_cap, "speed_cap": speed_cap}
+    links[dev.name] = {**here, "width": width, "speed": speed}
+    mark = banked.get(dev.name)
+    if not isinstance(mark, dict) or any(mark.get(k) != v for k, v in here.items()):
+        mark = {}
+
+    reasons = []
+    if width is not None:
+        if width_cap is not None and width < width_cap:
+            reasons.append(f"x{width} (expected x{width_cap})")
+        elif isinstance(mark.get("width"), int) and width < mark["width"]:
+            reasons.append(f"x{width} (x{mark['width']} on an earlier passing check)")
+    if speed is not None and judge_speed:
+        if speed_cap is not None and speed < speed_cap:
+            reasons.append(f"{speed:g} GT/s (expected {speed_cap:g} GT/s)")
+        elif isinstance(mark.get("speed"), (int, float)) and speed < mark["speed"]:
+            reasons.append(f"{speed:g} GT/s ({mark['speed']:g} GT/s on an earlier passing check)")
+    return ", ".join(reasons)
 
 
 def _iommu_mode() -> str:

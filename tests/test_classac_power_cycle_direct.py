@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.conftest import patch_health_event
+from tests.conftest import fsm_dirty, patch_health_event, patch_recovery
 from tests.test_arc_not_ready import _fake_sysfs
 from tests.test_startup_fabric_hugepages import _shortfalls, _startup, _systemctl  # noqa: F401 - the fixtures
 from tt_device_mcp import server as srv
@@ -65,7 +65,6 @@ def rig(monkeypatch, tmp_path, galaxy_trays):
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: state["scan"])
     monkeypatch.setattr(srv, "read_heartbeats", lambda: dict(state["beats"]))
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
-    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
     monkeypatch.setattr(g.mechanism, "auto_recovery_allowed", lambda action, tenant_active=False, **k: state["allowed"])
     monkeypatch.setattr(g.mechanism, "_journal_auto_recovery_denied", lambda *a, **k: order.append("denied"))
     monkeypatch.setattr(g.mechanism, "mesh_reset_failed_since_release", False)
@@ -104,7 +103,7 @@ def rig(monkeypatch, tmp_path, galaxy_trays):
         g.mechanism.last_reset_rc = 1
         return False
 
-    async def sweep(bitmap, ids, trays, expected, log, do_sbr=True):
+    async def sweep(trays, expected, log, do_sbr=True):
         order.append("sweep")
         state["clock"][0] += SWEEP_SEC
         return True
@@ -115,7 +114,6 @@ def rig(monkeypatch, tmp_path, galaxy_trays):
     monkeypatch.setattr(g, "_reset_and_verify_device", mesh_reset)
     monkeypatch.setattr(g, "_issue_all_resets_back_to_back", sweep)
     monkeypatch.setattr(g, "_verify_device", verify)
-    monkeypatch.setattr(g, "_attempt_ubb_tray_reset", lambda *a, **k: _record(order, "ubb_tray"))
     g.tray_down_episode_end()
     yield state
     g.tray_down_episode_end()
@@ -517,7 +515,7 @@ async def test_a_whole_tray_drop_with_no_map_cycles_at_the_first_gate_pass(short
     class is read from the buses on the bus, so the cycle is requested now, not after the 600 s
     ceiling and a mesh reset that has never healed a whole tray."""
     rig = short_boot
-    assert await _gate(rig, galaxy.STAGE_UBB_TRAY, phase=phase) == galaxy.OUTCOME_WAITING
+    assert await _gate(rig, galaxy.BELOW_FLOOR, phase=phase) == galaxy.OUTCOME_WAITING
     assert "glx_reset" not in rig["order"] and "ubb_tray" not in rig["order"] and "sweep" not in rig["order"]
     assert rig["order"][-1] == "power_cycle"
     ((_, fired),) = [(k, f) for k, f in rig["events"] if k == "power_cycle_direct"]
@@ -536,7 +534,7 @@ async def test_the_hold_deadline_climb_with_no_map_cycles_with_no_reset(short_bo
 async def test_a_partial_drop_with_no_map_keeps_the_ladder(short_boot):
     rig = short_boot
     rig["present"] = _present({0x00: 8, 0x40: 8, 0x80: 7, 0xC0: 1})
-    await _gate(rig, galaxy.STAGE_UBB_TRAY, phase="startup")
+    await _gate(rig, galaxy.BELOW_FLOOR, phase="startup")
     assert "power_cycle" not in rig["order"] and "power_cycle_direct" not in _kinds(rig)
 
 
@@ -555,7 +553,7 @@ async def test_inside_the_cooldown_the_deadline_shows_at_once_and_no_reset_runs(
     monkeypatch.setattr(
         g.mechanism, "auto_recovery_allowed", lambda action, **k: g.mechanism._deny_power_cycle(dict(cooldown))
     )
-    assert await _gate(rig, galaxy.STAGE_UBB_TRAY, phase="startup") == galaxy.OUTCOME_WAITING
+    assert await _gate(rig, galaxy.BELOW_FLOOR, phase="startup") == galaxy.OUTCOME_WAITING
     assert rig["order"][-1] == "denied"
     assert not {"glx_reset", "ubb_tray", "sweep", "power_cycle"} & set(rig["order"]), "no reset meanwhile"
     assert g.mechanism.power_cycle_retry[0] == until
@@ -594,7 +592,7 @@ async def test_a_whole_tray_with_eio_survivors_cycles_with_no_map(short_boot, mo
     rig = short_boot
     rig["beats"] = _beats_without(set(range(24, 32)) | {0})  # chip 0's node is there, its read fails
     _unreadable(monkeypatch, {0})
-    assert await _gate(rig, galaxy.STAGE_UBB_TRAY, phase="startup") == galaxy.OUTCOME_WAITING
+    assert await _gate(rig, galaxy.BELOW_FLOOR, phase="startup") == galaxy.OUTCOME_WAITING
     assert not {"glx_reset", "ubb_tray", "sweep"} & set(rig["order"]) and rig["order"][-1] == "power_cycle"
 
 
@@ -604,7 +602,7 @@ async def test_a_no_map_tray_of_lingering_nodes_is_class_a(short_boot):
     cannot fill the tray they left."""
     rig = short_boot
     rig["present"] = _present({0x00: 8, 0x40: 8, 0x80: 8, 0xC0: 8})
-    assert await _gate(rig, galaxy.STAGE_UBB_TRAY, phase="startup") == galaxy.OUTCOME_WAITING
+    assert await _gate(rig, galaxy.BELOW_FLOOR, phase="startup") == galaxy.OUTCOME_WAITING
     assert "glx_reset" not in rig["order"] and rig["order"][-1] == "power_cycle"
 
 
@@ -665,7 +663,39 @@ async def test_a_tray_of_link_down_nodes_with_one_eio_survivor_is_class_a(rig, m
     assert ev["unreadable"] == [str(survivor)] and ev["off_bus"] == sorted(map(str, tray), key=int)
 
 
-# ---- the tray rung with no map (Part 2 of spec 04 I37) ------------------------------------------
+@pytest.mark.asyncio
+async def test_an_enodata_tray_reading_ffff_is_class_a(rig, monkeypatch, tmp_path):
+    """Spec 04 I24: a tray that lost power right after a reset reads ENODATA on bound endpoints with
+    their links up. Its config space reads 0xffff, so it is off the bus, not ARC-not-ready: class A,
+    straight to the power cycle with no mesh reset."""
+    tray = set(rig["map"][3])
+    _fake_sysfs(monkeypatch, tmp_path, enodata=tray, vendor_ffff=tray)
+    monkeypatch.setattr(galaxy, "unreadable_on_bus_chips", heartbeat.unreadable_on_bus_chips)
+    monkeypatch.setattr(heartbeat.time, "sleep", lambda s: None)
+    rig["beats"] = heartbeat.read_heartbeats()
+    assert heartbeat.arc_not_ready_chips(rig["beats"]) == set()
+    assert await _gate(rig, galaxy.STAGE_SMI_RESET) == galaxy.OUTCOME_WAITING
+    assert "glx_reset" not in rig["order"] and rig["order"][-1] == "power_cycle"
+    assert "released" not in rig["order"]
+
+
+@pytest.mark.asyncio
+async def test_an_enodata_tray_with_unreadable_config_never_lifts(rig, monkeypatch, tmp_path):
+    """The same tray with config space that cannot be read: no evidence it is gone, none that it is
+    there. It is never ARC-not-ready, every rung counts it off the bus, and the hold never lifts."""
+    tray = set(rig["map"][3])
+    _fake_sysfs(monkeypatch, tmp_path, enodata=tray, config_unreadable=tray)
+    monkeypatch.setattr(galaxy, "unreadable_on_bus_chips", heartbeat.unreadable_on_bus_chips)
+    monkeypatch.setattr(heartbeat.time, "sleep", lambda s: None)
+    rig["beats"] = heartbeat.read_heartbeats()
+    assert heartbeat.arc_not_ready_chips(rig["beats"]) == set()
+    assert galaxy._offbus_chip_ids(rig["beats"], EXPECTED) == {str(c) for c in tray}
+    await _gate(rig, galaxy.STAGE_SMI_RESET)
+    assert "released" not in rig["order"]
+    assert galaxy.offbus_count(rig["beats"], EXPECTED) == len(tray)
+
+
+# ---- the whole-tray check with no map (Part 2 of spec 04 I37) ------------------------------------------
 
 
 @pytest.fixture
@@ -675,39 +705,38 @@ def real_tray_rung(short_boot, monkeypatch):
     g = short_boot["g"]
     monkeypatch.setattr(offbus_power_cycle, "_pending", {})
     monkeypatch.setattr(g.deps, "device_hold_episode_since", lambda: "2026-10-16T12:39:00")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
 
-    async def rung(beats, off_bus):
-        return await type(g)._attempt_ubb_tray_reset(g, beats, off_bus, EXPECTED, lambda m: None)
+    def rung(beats, off_bus):
+        return type(g)._note_whole_tray_drop(g, beats, off_bus, EXPECTED, lambda m: None)
 
     return short_boot, rung, offbus_power_cycle
 
 
 @pytest.mark.asyncio
-async def test_the_tray_rung_with_no_map_hands_a_whole_tray_to_the_power_cycle(real_tray_rung):
+async def test_the_whole_tray_check_with_no_map_hands_a_whole_tray_to_the_power_cycle(real_tray_rung):
     rig, rung, opc = real_tray_rung
-    assert await rung(rig["beats"], 8) is False
+    assert rung(rig["beats"], 8) is True
     assert opc.whole_tray_down_age_sec("2026-10-16T12:39:00") is not None
-    ((_, ev),) = [(k, f) for k, f in rig["events"] if k == "ubb_reset_declined_whole_tray"]
+    ((_, ev),) = [(k, f) for k, f in rig["events"] if k == "whole_tray_down_power_cycle"]
     assert ev["trays"] == ["bus group 0xc0"]
 
 
 @pytest.mark.asyncio
-async def test_the_tray_rung_with_no_map_and_eio_survivors_hands_off_too(real_tray_rung, monkeypatch):
+async def test_the_whole_tray_check_with_no_map_and_eio_survivors_hands_off_too(real_tray_rung, monkeypatch):
     rig, rung, opc = real_tray_rung
     rig["beats"] = _beats_without(set(range(24, 32)) | {0})
     _unreadable(monkeypatch, {0})
-    assert await rung(rig["beats"], 9) is False
+    assert rung(rig["beats"], 9) is True
     assert opc.whole_tray_down_age_sec("2026-10-16T12:39:00") is not None
 
 
 @pytest.mark.asyncio
-async def test_the_tray_rung_with_no_map_keeps_a_partial_drop_on_the_ladder(real_tray_rung):
+async def test_the_whole_tray_check_with_no_map_keeps_a_partial_drop_on_the_ladder(real_tray_rung):
     rig, rung, opc = real_tray_rung
     rig["present"] = _present({0x00: 8, 0x40: 8, 0x80: 7, 0xC0: 1})
-    assert await rung(rig["beats"], 8) is None
+    assert rung(rig["beats"], 8) is False
     assert opc.whole_tray_down_age_sec("2026-10-16T12:39:00") is None
-    assert "ubb_reset_declined_whole_tray" not in _kinds(rig)
+    assert "whole_tray_down_power_cycle" not in _kinds(rig)
 
 
 @pytest.mark.asyncio
@@ -718,5 +747,116 @@ async def test_a_listed_node_whose_link_is_down_does_not_fill_a_tray(short_boot)
     rig["link_down"] = {f"0000:{rig['present'][0]:02x}:00.0"}
     present_buses, _ = rig["g"]._presence_read(set(range(24, 32)), EXPECTED)
     assert 0 not in present_buses and 1 in present_buses
-    await _gate(rig, galaxy.STAGE_UBB_TRAY, phase="startup")
+    await _gate(rig, galaxy.BELOW_FLOOR, phase="startup")
     assert "power_cycle" not in rig["order"], "the read does not add up to whole trays: the ladder decides"
+
+
+# ---- a failed reset's cooldown never delays the class A/C power cycle (spec 04 I3) ---------------
+#
+# The cooldown WAIT returned before the off-bus class was read, so a whole tray off the bus after a
+# failed operator reset waited for the forced ladder at the hold bound instead of its power cycle.
+
+
+async def _gate_in_cooldown(rig, monkeypatch, tmp_path, off: set, argv=("tt-smi", "-glx_reset")):
+    """A failed operator reset arms the cooldown, then a post-job gate runs end to end on ``off``.
+    An all-off set keeps its device nodes (lingering): with none at all the gate holds and leaves the
+    climb to the idle off-bus escalation."""
+    (tmp_path / "dev").mkdir()
+    for i in range(EXPECTED):
+        if i not in off or len(off) == EXPECTED:
+            (tmp_path / "dev" / str(i)).write_text("")
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path / "dev"))
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
+    srv.device_op_lock = None
+    monkeypatch.setattr(srv.health_monitor, "expected", lambda present: EXPECTED)
+    monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: {})
+    monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.setattr(srv, "device_pci_map", {})
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+    monkeypatch.setattr(rig["g"].mechanism, "last_reset_failed", False)
+    monkeypatch.setattr(rig["g"].mechanism, "last_reset_monotonic", 0.0)
+    fsm_dirty(srv, "", why="gate_error")
+
+    async def unhealthy(expected, log, run_fabric=True, **_):
+        return False, {"snapshot": {"ok": False, "detail": "chips off the bus"}}
+
+    patch_recovery(monkeypatch, "_verify_device", unhealthy)
+    rungs = []
+    monkeypatch.setattr(
+        galaxy.GalaxyRecovery, "_fire_gate_rung", lambda self, gate_phase, stage, *a, **k: _record(rungs, stage)
+    )
+    rig["beats"] = _beats_without(off)
+    rig["g"]._td_reset_seen = True  # the off set follows a reset: no tray-down onset
+    srv._note_operator_reset_outcome(1, None, srv.time.monotonic(), list(argv))
+    assert rig["g"].mechanism.cooling(), "the failed operator reset armed the cooldown"
+
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+    return rungs
+
+
+def _no_release(rig):
+    """Goal 11: nothing here passed a full check, fabric included, so nothing is released."""
+    assert "released" not in rig["order"]
+    assert srv.fsm.state is not srv.ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec", [{3: 8}, {1: 8, 4: 8}])
+async def test_a_whole_tray_in_a_failed_resets_cooldown_cycles_on_the_next_gate_pass(
+    rig, monkeypatch, tmp_path, clear_job_state, spec
+):
+    rungs = await _gate_in_cooldown(rig, monkeypatch, tmp_path, _off(rig["map"], spec))
+    assert rig["order"] == ["power_cycle"], "no reset, no sweep, no wait for the forced ladder"
+    assert rungs == []
+    ((_, fired),) = [(k, f) for k, f in rig["events"] if k == "power_cycle_direct"]
+    assert fired["fault_class"] == galaxy.FAULT_CLASS_WHOLE_TRAY
+    assert "reset_suppressed_cooldown" not in _kinds(rig)
+    _no_release(rig)
+
+
+@pytest.mark.asyncio
+async def test_all_off_after_a_failed_operator_mesh_reset_cycles_in_its_cooldown(
+    rig, monkeypatch, tmp_path, clear_job_state
+):
+    """The failed operator -glx_reset was the episode's one mesh reset: class C, no second one."""
+    rungs = await _gate_in_cooldown(rig, monkeypatch, tmp_path, set(range(EXPECTED)))
+    assert rig["order"] == ["power_cycle"] and rungs == []
+    ((_, fired),) = [(k, f) for k, f in rig["events"] if k == "power_cycle_direct"]
+    assert fired["fault_class"] == galaxy.FAULT_CLASS_ALL_OFF
+    _no_release(rig)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "off, argv",
+    [
+        (lambda m: _off(m, {3: 4}), ("tt-smi", "-glx_reset")),  # part of a tray: the ladder
+        (lambda m: set(), ("tt-smi", "-glx_reset")),  # a present mesh: the 120 s grace
+        (lambda m: set(range(EXPECTED)), ("tt-smi", "-r", "0")),  # all off, no mesh reset spent yet
+    ],
+    ids=["partial", "present", "all-off-no-mesh-reset"],
+)
+async def test_any_other_set_still_waits_out_the_cooldown(rig, monkeypatch, tmp_path, clear_job_state, off, argv):
+    rungs = await _gate_in_cooldown(rig, monkeypatch, tmp_path, off(rig["map"]), argv=argv)
+    assert rig["order"] == [] and rungs == [], "no reset, no power cycle inside the cooldown"
+    assert "reset_suppressed_cooldown" in _kinds(rig)
+    assert "power_cycle_direct" not in _kinds(rig)
+    _no_release(rig)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec", [{2: 8}, None], ids=["whole-tray", "all-off"])
+async def test_an_idle_off_bus_hold_in_a_failed_resets_cooldown_cycles(rig, monkeypatch, spec):
+    """The idle off-bus escalation reads the class before its own cooldown check: a whole tray is
+    class A, and every chip off after the failed operator mesh reset is class C."""
+    ladders = []
+    monkeypatch.setattr(rig["g"], "_escalate_offbus_stuck_hold", lambda *a, **k: _record(ladders, "offbus"))
+    monkeypatch.setattr(rig["g"].mechanism, "last_reset_monotonic", 0.0)
+    srv._note_operator_reset_outcome(1, None, srv.time.monotonic(), ["tt-smi", "-glx_reset"])
+    assert rig["g"].mechanism.cooling()
+    rig["beats"] = _beats_without(_off(rig["map"], spec)) if spec else {}
+    rig["g"]._td_reset_seen = True
+    assert await rig["g"].escalate("offbus", [], EXPECTED, lambda m: None) == galaxy.OUTCOME_TERMINAL
+    assert rig["order"] == ["power_cycle"] and ladders == []
+    assert "released" not in rig["order"]

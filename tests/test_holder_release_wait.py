@@ -6,7 +6,9 @@
 The survivor sweep waits, bounded, for a SIGKILLed process to let go of the device before it names
 it a leftover, and a dirty job_killed / foreign_holder hold with nothing queued gets the post-job
 gate, fabric forced, from the idle tick instead of waiting for the next job or the hold ceiling.
-No device is touched: the holder scan, the gate and the liveness read are stubbed.
+The dead-chip isolation waits the same way for the holders it killed before it removes the
+endpoint (spec 03 I19). No device is touched: the holder scan, the gate and the liveness read are
+stubbed.
 """
 
 import asyncio
@@ -15,7 +17,7 @@ import time
 import pytest
 
 from tests.conftest import fsm_dirty, fsm_healthy, patch_health_event
-from tests.test_job_reap import _escaped_child, _kill_quietly
+from tests.test_job_reap import _escaped_child, _kill_quietly, _unique_tag
 from tt_device_mcp import device_holders, job_reap
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
@@ -32,7 +34,8 @@ def _swallow_signals(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_holder_that_releases_within_the_window_is_not_a_leftover(monkeypatch):
-    job_pid, child = _escaped_child("t-release")
+    tag = _unique_tag("t-release")
+    job_pid, child = _escaped_child(tag)
     _swallow_signals(monkeypatch)
     state = {"holding": True, "scans": 0}
 
@@ -51,7 +54,7 @@ async def test_a_holder_that_releases_within_the_window_is_not_a_leftover(monkey
             "t1",
             job_pid,
             None,
-            "t-release",
+            tag,
             term_grace_sec=0.2,
             kill_wait_sec=0.2,
             release_wait_sec=10,
@@ -68,7 +71,8 @@ async def test_a_holder_that_releases_within_the_window_is_not_a_leftover(monkey
 
 @pytest.mark.asyncio
 async def test_a_holder_still_holding_after_the_window_is_named(monkeypatch):
-    job_pid, child = _escaped_child("t-hold")
+    tag = _unique_tag("t-hold")
+    job_pid, child = _escaped_child(tag)
     _swallow_signals(monkeypatch)
     monkeypatch.setattr(
         device_holders, "enumerate_device_holders", lambda: HolderScan(holders=[DeviceHolder(pid=child, uid=0)])
@@ -80,7 +84,7 @@ async def test_a_holder_still_holding_after_the_window_is_named(monkeypatch):
             "t2",
             job_pid,
             None,
-            "t-hold",
+            tag,
             term_grace_sec=0.2,
             kill_wait_sec=0.2,
             release_wait_sec=0.8,
@@ -93,6 +97,27 @@ async def test_a_holder_still_holding_after_the_window_is_named(monkeypatch):
     finally:
         monkeypatch.undo()
         _kill_quietly(child)
+
+
+@pytest.mark.asyncio
+async def test_another_runs_child_of_the_same_test_is_not_a_survivor(monkeypatch):
+    """Two runs of the suite on one host (two checkouts checked at once) spawn the same test's
+    child together. The sweep matches the job tag host-wide, so each run's tag must be its own,
+    or one run names the other's child as its survivor."""
+    _, other = _escaped_child(_unique_tag("t-hold"))  # the other run's child
+    tag = _unique_tag("t-hold")
+    job_pid, child = _escaped_child(tag)
+    _swallow_signals(monkeypatch)
+    monkeypatch.setattr(job_reap, "_holds_device", lambda pid: False)
+    try:
+        survivors = await job_reap.reap_job_survivors(
+            "t3", job_pid, None, tag, term_grace_sec=0.1, kill_wait_sec=0.1, log=lambda _m: None
+        )
+        assert [s.pid for s in survivors] == [child], "only this run's child is its survivor"
+    finally:
+        monkeypatch.undo()
+        _kill_quietly(child)
+        _kill_quietly(other)
 
 
 @pytest.mark.asyncio
@@ -280,3 +305,170 @@ async def test_no_idle_gate_while_anything_else_owns_the_device(dirty_idle, monk
 
 async def _noop():
     await asyncio.sleep(0)
+
+
+# --- spec 03 I19: the dead-chip path removes the endpoint once its killed holders let go --------
+
+
+def _dead_chip_harness(monkeypatch, holding_scans):
+    """A dead chip with one tenant (pid 4242) mapping it. The tenant stays in the holder scan for
+    ``holding_scans`` scans after the kill (None: for ever). Records the order of kill, scans and
+    endpoint removal, and the journal."""
+    srv.device_op_lock = None
+    srv.isolated_chips = set()
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
+    order, events = [], []
+    state = {"scans": 0, "killed": False}
+
+    def scan():
+        if state["killed"]:
+            state["scans"] += 1
+        held = not state["killed"] or holding_scans is None or state["scans"] <= holding_scans
+        order.append(("scan", held))
+        return HolderScan(holders=[DeviceHolder(pid=4242, uid=1000)] if held else [], complete=True)
+
+    def kill(pid, sig):
+        state["killed"] = True
+        order.append(("kill", pid))
+
+    async def pollers(active, log):
+        return []
+
+    monkeypatch.setattr(srv, "enumerate_device_holders", scan)
+    monkeypatch.setattr(device_holders, "enumerate_device_holders", scan)
+    monkeypatch.setattr(srv.os, "kill", kill)
+    monkeypatch.setattr(srv.os, "killpg", lambda pid, sig: None)
+    monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", None, raising=False)
+    monkeypatch.setattr(srv, "current_process", None, raising=False)
+    monkeypatch.setattr(srv, "isolate_chip", lambda idx: order.append(("remove", idx)) or True)
+    monkeypatch.setattr(srv, "chip_pci_bdf", lambda idx: "0000:46:00.0")
+    monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
+    monkeypatch.setattr(srv, "_set_device_pollers", pollers)
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    return order, events
+
+
+@pytest.mark.asyncio
+async def test_the_release_wait_follows_the_remove_and_kill_and_ends_when_the_holder_lets_go(monkeypatch):
+    order, events = _dead_chip_harness(monkeypatch, holding_scans=2)
+    start = time.monotonic()
+    await srv.sampler.isolate_dead_chips(["13"])
+    await srv.sampler.settle_isolations()
+    elapsed = time.monotonic() - start
+
+    kill = order.index(("kill", 4242))
+    assert order.index(("remove", "13")) < kill, "detach first, then kill (spec 03 I84)"
+    assert ("scan", True) in order[kill + 1 :], "the killed holder was waited for"
+    assert order[-1] == ("scan", False), "the wait ends once the holder let go"
+    assert elapsed < 5, "the wait ends at the release, not the 30 s bound"
+    assert not [k for k, _ in events if k == "dead_chip_holders_lingering"]
+    assert ("chip_isolated", {"chips": ["13"]}) in events
+
+
+@pytest.mark.asyncio
+async def test_a_dead_chip_whose_killed_holders_are_gone_costs_one_scan(monkeypatch):
+    order, _events = _dead_chip_harness(monkeypatch, holding_scans=0)
+    await srv.sampler.isolate_dead_chips(["13"])
+    await srv.sampler.settle_isolations()
+    after_kill = order[order.index(("kill", 4242)) + 1 :]
+    assert after_kill == [("scan", False)], "a holder already gone adds one scan and no wait"
+
+
+@pytest.mark.asyncio
+async def test_a_killed_holder_still_holding_at_the_bound_goes_on_to_removal_and_a_dirty_hold(monkeypatch):
+    monkeypatch.setattr(srv, "HOLDER_RELEASE_WAIT_SEC", 0.6)
+    order, events = _dead_chip_harness(monkeypatch, holding_scans=None)
+    start = time.monotonic()
+    await srv.sampler.isolate_dead_chips(["13"])
+    await srv.sampler.settle_isolations()
+    elapsed = time.monotonic() - start
+
+    assert 0.6 <= elapsed < 5, "the wait runs to its bound and no longer: never open-ended"
+    assert ("remove", "13") in order, "a lingering holder never stops the endpoint removal"
+    lingering = [f for k, f in events if k == "dead_chip_holders_lingering"]
+    assert lingering and lingering[-1]["pids"] == [4242], "the holder still holding is named"
+    # The existing escalation: the device stays dirty and held, so only recovery's reset and its
+    # full post-reset check (fabric included) can release it.
+    assert srv.fsm.state is not ServerState.HEALTHY
+    assert srv.fsm.record.dirty
+
+
+def _spy_scans(monkeypatch, order, seen):
+    """Wrap the harness's holder scan: each scan after the kill records the fsm state, the dirty
+    flag and the reset fence as they stand during the release wait."""
+    inner = srv.enumerate_device_holders
+
+    def spy():
+        out = inner()
+        if ("kill", 4242) in order:
+            seen.append((srv.fsm.state, srv.fsm.record.dirty, srv._dead_chip_isolation_pending_reason()))
+        return out
+
+    monkeypatch.setattr(srv, "enumerate_device_holders", spy)
+    monkeypatch.setattr(device_holders, "enumerate_device_holders", spy)
+
+
+@pytest.mark.asyncio
+async def test_the_device_is_held_before_the_release_wait_starts(monkeypatch):
+    """Review fix: while a killed holder lingers the fsm is already out of HEALTHY and dirty, so no
+    gate admits the next job, and every reset is fenced until the wait and the stuck-holder check
+    ran (spec 03 I19)."""
+    monkeypatch.setattr(srv, "HOLDER_RELEASE_WAIT_SEC", 0.4)
+    order, _events = _dead_chip_harness(monkeypatch, holding_scans=None)
+    fsm_healthy(srv)
+    seen = []
+    _spy_scans(monkeypatch, order, seen)
+
+    await srv.sampler.isolate_dead_chips(["13"])
+    await srv.sampler.settle_isolations()
+
+    assert seen, "the wait polled the holder scan"
+    for state, dirty, fence in seen:
+        assert state is not ServerState.HEALTHY, "held for the whole release wait"
+        assert dirty, "dirty for the whole release wait: only a reset and the full check release it"
+        assert "killed holders are still being waited for" in fence, "no reset runs under the pending wait"
+    assert ("remove", "13") in order
+    assert srv._dead_chip_isolation_pending_reason() == "", "the fence lifts once the wait ended"
+    assert srv.fsm.record.dirty
+
+
+@pytest.mark.asyncio
+async def test_the_release_wait_runs_off_the_sampler_loop(monkeypatch):
+    """Review fix: the bounded wait does not stall the sampler. The loop keeps ticking and keeps
+    driving the hold deadline (the 10-min ladder, spec 04 I76) and the other chips' dead-chip check
+    while the release wait runs; the wait still runs to its bound."""
+    from tt_device_mcp import telemetry
+
+    monkeypatch.setattr(srv, "HOLDER_RELEASE_WAIT_SEC", 1.5)
+    monkeypatch.setattr(telemetry, "SAMPLE_INTERVAL_SEC", 0.02)
+    order, events = _dead_chip_harness(monkeypatch, holding_scans=None)
+    sample = {"0": [1], "13": [telemetry.ALL_ONES]}
+    monkeypatch.setattr(srv, "chip_sample", lambda: sample)
+    monkeypatch.setattr(srv, "append_trace", lambda s: None)
+    monkeypatch.setattr(srv, "_maybe_spawn_idle_relift", lambda: None)
+    monkeypatch.setattr(srv.sampler._deps, "watch_idle_holders", None)
+    monkeypatch.setattr(srv.sampler, "recovering_now", lambda: asyncio.sleep(0, result=False))
+    deadline_checks = []
+    monkeypatch.setattr(srv, "_refresh_idle_hold_ledger", lambda: deadline_checks.append(time.monotonic()))
+    srv.sampler.dead_chip_strikes = {}
+
+    loop_task = asyncio.create_task(srv.sampler.run())
+    try:
+        start = time.monotonic()
+        while ("kill", 4242) not in order and time.monotonic() - start < 3:
+            await asyncio.sleep(0.01)
+        assert ("kill", 4242) in order, "the dead chip was confirmed and its holder killed"
+        killed_at = time.monotonic()
+        ticks, checks = srv.sampler.last_tick, len(deadline_checks)
+        await asyncio.sleep(0.5)
+        assert srv._dead_chip_isolation_pending_reason(), "the wait for the killed holder is still pending"
+        assert srv.sampler.last_tick > ticks, "the sampler kept ticking during the wait"
+        assert len(deadline_checks) > checks, "the hold-deadline check kept running during the wait"
+        await srv.sampler.settle_isolations()
+        assert [f for k, f in events if k == "dead_chip_holders_lingering"], "the wait ran to its bound"
+        assert time.monotonic() - killed_at >= 1.0, "the wait ended at the bound"
+        assert order.count(("kill", 4242)) == 1, "the chip is isolated once, not once per pass"
+    finally:
+        loop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await loop_task
