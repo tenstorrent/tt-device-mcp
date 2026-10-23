@@ -31,11 +31,23 @@ def _bdf(i: int) -> str:
 
 
 def _fake_sysfs(
-    monkeypatch, tmp_path, *, missing=(), unbound=(), enodata=(), eio=(), speed_unknown=(), width_63=()
+    monkeypatch,
+    tmp_path,
+    *,
+    missing=(),
+    unbound=(),
+    enodata=(),
+    eio=(),
+    speed_unknown=(),
+    width_63=(),
+    vendor_ffff=(),
+    config_unreadable=(),
 ) -> dict:
     """32 chips; ``missing`` have no class node, ``unbound`` an endpoint with no driver, ``enodata``
     (``eio``) a heartbeat read that fails with ENODATA (EIO), ``speed_unknown`` (``width_63``) an
-    endpoint whose link reads down by its speed (width). Returns a handle to bring a chip back."""
+    endpoint whose link reads down by its speed (width), ``vendor_ffff`` an endpoint whose config
+    space reads all-ones and ``config_unreadable`` one with no readable config (every other endpoint's
+    config starts with the Tenstorrent vendor id). Returns a handle to bring a chip back."""
     cls_dir = tmp_path / "sys/class/tenstorrent"
     devs = tmp_path / "sys/bus/pci/devices"
     cls_dir.mkdir(parents=True)
@@ -52,6 +64,8 @@ def _fake_sysfs(
             (ep / "driver").mkdir(exist_ok=True)
         (ep / "current_link_speed").write_text("Unknown\n" if i in speed_unknown else "32.0 GT/s PCIe\n")
         (ep / "current_link_width").write_text("63\n" if i in width_63 else "16\n")
+        if i not in config_unreadable:
+            (ep / "config").write_bytes(b"\xff\xff\xff\xff" if i in vendor_ffff else b"\x52\x1e\x40\xb1")
         node = cls_dir / f"tenstorrent!{i}"
         node.mkdir()
         (node / "device").symlink_to(ep)
@@ -235,9 +249,20 @@ def test_dropping_a_returned_chip_never_clears_the_hold(monkeypatch, tmp_path, c
 
 def test_unreadable_on_bus_chips_names_bound_eio_chips_only(monkeypatch, tmp_path):
     """A bound, enumerated chip whose heartbeat read fails with EIO is on the bus (unhealthy) for the
-    class A read; ENODATA has its own path, and a missing or unbound chip stays off the bus."""
-    _fake_sysfs(monkeypatch, tmp_path, missing={8}, unbound={9}, enodata={10}, eio={9, 11, 12})
-    assert heartbeat.unreadable_on_bus_chips({8, 9, 10, 11, "12", 13}) == {"11", "12"}
+    class A read; ENODATA has its own path (vendor 0x1e52: ARC not ready; 0xffff: off), and a missing
+    or unbound chip stays off the bus. An ENODATA chip whose config read fails is the one ENODATA
+    shape that joins them (spec 04 I24)."""
+    _fake_sysfs(
+        monkeypatch,
+        tmp_path,
+        missing={8},
+        unbound={9},
+        enodata={10, 14, 15},
+        eio={9, 11, 12},
+        vendor_ffff={14},
+        config_unreadable={15},
+    )
+    assert heartbeat.unreadable_on_bus_chips({8, 9, 10, 11, "12", 13, 14, 15}) == {"11", "12", "15"}
     assert heartbeat.unreadable_on_bus_chips(set()) == set()
 
 

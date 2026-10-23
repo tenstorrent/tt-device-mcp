@@ -97,19 +97,20 @@ def dead_chips(beats: dict[str, int]) -> list[str]:
     return sorted((i for i, v in beats.items() if v == ALL_ONES), key=int)
 
 
-def arc_not_ready_chips(beats: dict[str, int]) -> set[str]:
-    """Chips :func:`read_heartbeats` left out of ``beats`` that are still ON the bus: the KMD node is
-    there, its PCI endpoint is bound to the driver, and the heartbeat read fails with ENODATA (the
-    KMD has no ARC telemetry for it yet: ARC not ready, e.g. mid-boot after a reset or re-power).
-    Such a chip is present but not usable. It is unhealthy for the gate, but it is not off the bus,
-    so it never arms an off-bus rung (bridge, tray, gone-chip) nor counts toward a floor (spec 04
-    I24). Only the chips missing from ``beats`` are re-read; any other error, or an endpoint that is
-    gone or unbound, leaves the chip counted off the bus."""
+def enodata_presence(beats: dict[str, int]) -> dict[str, str]:
+    """The chips :func:`read_heartbeats` left out of ``beats`` whose heartbeat read fails with ENODATA
+    on an endpoint bound to the driver, each with where it stands by a live read (spec 04 I24):
+    :data:`hostpci.CONFIG_PRESENT` (its link does not read down and its config-space vendor id reads
+    0x1e52 now: on the bus, ARC not ready), :data:`hostpci.CONFIG_MISSING` (link down, or the vendor
+    id reads 0xffff: off the bus) or :data:`hostpci.CONFIG_UNREADABLE` (the config read failed: no
+    evidence either way). tt-kmd answers ENODATA while a chip needs hardware init, after a reset
+    whether it still has power or not, so ENODATA alone proves nothing. Only chips missing from
+    ``beats`` are read: a full read makes no read at all."""
     try:
         entries = sorted(pci.SYSFS_CLASS_DIR.iterdir())
     except OSError:
-        return set()
-    out: set[str] = set()
+        return {}
+    out: dict[str, str] = {}
     for ent in entries:
         idx = ent.name.rsplit("!", 1)[-1]
         if not idx.isdigit() or idx in beats:
@@ -122,24 +123,57 @@ def arc_not_ready_chips(beats: dict[str, int]) -> set[str]:
                 continue
         except ValueError:
             continue
-        bdf = chip_pci_bdf(idx)
-        try:
-            bound = bool(bdf) and (pci.PCI_DEVICES_DIR / bdf / "driver").exists()
-        except OSError:
-            bound = False
-        if bound:
-            out.add(idx)
+        state = _enodata_state(idx)
+        if state is not None:
+            out[idx] = state
     return out
+
+
+def _enodata_state(idx: str) -> Optional[str]:
+    """Where a chip whose heartbeat read gives ENODATA stands (see :func:`enodata_presence`); None when
+    its endpoint is gone or unbound (off the bus, as before)."""
+    bdf = chip_pci_bdf(idx)
+    try:
+        bound = bool(bdf) and (pci.PCI_DEVICES_DIR / bdf / "driver").exists()
+    except OSError:
+        bound = False
+    if not bound:
+        return None
+    if hostpci.link_down(bdf):
+        return hostpci.CONFIG_MISSING
+    return hostpci.config_vendor_state(bdf)
+
+
+def arc_not_ready_chips(beats: dict[str, int]) -> set[str]:
+    """Chips :func:`read_heartbeats` left out of ``beats`` that are still ON the bus: the KMD node is
+    there, its PCI endpoint is bound to the driver, its link does not read down, a live read of its
+    config-space vendor id gives 0x1e52, and the heartbeat read fails with ENODATA (the KMD has no ARC
+    telemetry for it yet: ARC not ready, e.g. mid-boot after a reset or re-power). Such a chip is
+    present but not usable. It is unhealthy for the gate, but it is not off the bus, so it never arms
+    an off-bus rung (bridge, tray, gone-chip) nor counts toward a floor (spec 04 I24). Only the chips
+    missing from ``beats`` are re-read; any other error, an endpoint that is gone, unbound or whose
+    link is down, a vendor id of 0xffff, or a config read that fails leaves the chip counted off the
+    bus (the last one is named by :func:`config_unreadable_chips`)."""
+    return {i for i, s in enodata_presence(beats).items() if s == hostpci.CONFIG_PRESENT}
+
+
+def config_unreadable_chips(beats: dict[str, int]) -> set[str]:
+    """Chips whose heartbeat read gives ENODATA on a bound endpoint with its link up but whose live
+    config read fails (:data:`hostpci.CONFIG_UNREADABLE`): neither ARC-not-ready nor proven gone. The
+    rungs count them off the bus, so the hold stays; only the class A read takes them as on the bus
+    (:func:`unreadable_on_bus_chips`, spec 04 I37)."""
+    return {i for i, s in enodata_presence(beats).items() if s == hostpci.CONFIG_UNREADABLE}
 
 
 def unreadable_on_bus_chips(ids) -> set[str]:
     """Of ``ids``, the chips whose KMD node is there with its PCI endpoint bound to the driver but
     whose heartbeat read fails with an error other than ENODATA (EIO, or the attribute missing on
-    that node), and whose link does not read as down. :func:`offbus_chip_ids` counts such a chip off
+    that node), or with ENODATA while its live config read fails (:func:`config_unreadable_chips`),
+    and whose link does not read as down. :func:`offbus_chip_ids` counts such a chip off
     the bus; it is enumerated and bound, so it is on the bus but unhealthy. Only the class A read uses
     this (spec 04 I37): survivors of a whole-tray drop that read like this must not hide the drop's
-    shape. A chip that reads now (a counter or all-ones) or reads ENODATA is not in it; those have
-    their own handling. Nor is a lingering node whose link is down (speed ``Unknown`` or width 63,
+    shape. A chip that reads now (a counter or all-ones), or reads ENODATA with its vendor id 0x1e52
+    or 0xffff, is not in it; those have their own handling. Nor is a lingering node whose link is down (speed ``Unknown`` or width 63,
     :func:`hostpci.link_down`): spec 03 I9 never counts it back on the bus."""
     out: set[str] = set()
     for idx in sorted({str(i) for i in ids}, key=int):
@@ -149,6 +183,8 @@ def unreadable_on_bus_chips(ids) -> set[str]:
             continue
         except OSError as e:
             if e.errno == errno.ENODATA:
+                if node.is_dir() and _enodata_state(idx) == hostpci.CONFIG_UNREADABLE:
+                    out.add(idx)
                 continue
         except ValueError:
             continue
@@ -346,32 +382,43 @@ def _heartbeat_verdict_body(expected_count: int, settle_sec: float) -> tuple[Ver
     if len(first) < expected_count or not first:
         # A chip whose heartbeat read gives ENODATA on a bound endpoint is on the bus with its ARC not
         # ready: still unhealthy, but named as such, so nobody reads it as a drop (spec 04 I24).
-        not_ready = sorted(arc_not_ready_chips(first), key=int)
+        # The config-space read decides ENODATA chips only: a chip whose config read fails is named as
+        # such, counted off the bus, and never taken as present.
+        presence = enodata_presence(first)
+        not_ready = sorted((i for i, s in presence.items() if s == hostpci.CONFIG_PRESENT), key=int)
+        cfg_unreadable = sorted((i for i, s in presence.items() if s == hostpci.CONFIG_UNREADABLE), key=int)
+        cfg_note = f"; config space unreadable on [{','.join(cfg_unreadable)}]" if cfg_unreadable else ""
         off = offbus_count(first, expected_count, set(not_ready))
         if not_ready:
+            ev = {
+                "present": sorted(first),
+                "in_sysfs": len(in_sysfs),
+                "arc_not_ready": not_ready,
+                "off_bus": off,
+                "expected_count": expected_count,
+            }
+            if cfg_unreadable:
+                ev["config_unreadable"] = cfg_unreadable
             return (
                 Verdict.UNHEALTHY,
                 f"chip(s) [{','.join(not_ready)}] on the bus but ARC not ready (heartbeat read ENODATA), "
-                f"{off} off the bus",
-                {
-                    "present": sorted(first),
-                    "in_sysfs": len(in_sysfs),
-                    "arc_not_ready": not_ready,
-                    "off_bus": off,
-                    "expected_count": expected_count,
-                },
+                f"{off} off the bus{cfg_note}",
+                ev,
             )
         if unreadable:
+            ev = {
+                "present": sorted(first),
+                "in_sysfs": len(in_sysfs),
+                "heartbeat_unreadable": unreadable,
+                "expected_count": expected_count,
+            }
+            if cfg_unreadable:
+                ev["config_unreadable"] = cfg_unreadable
             return (
                 Verdict.UNHEALTHY,
                 f"{len(in_sysfs)} chip(s) in sysfs, heartbeat unreadable on {len(unreadable)} "
-                f"[{','.join(unreadable)}], expected {expected_count}",
-                {
-                    "present": sorted(first),
-                    "in_sysfs": len(in_sysfs),
-                    "heartbeat_unreadable": unreadable,
-                    "expected_count": expected_count,
-                },
+                f"[{','.join(unreadable)}], expected {expected_count}{cfg_note}",
+                ev,
             )
         return (
             Verdict.UNHEALTHY,

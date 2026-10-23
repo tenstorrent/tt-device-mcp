@@ -122,6 +122,37 @@ def link_down(bdf: str, devices_dir: Optional[Path] = None) -> bool:
     return (speed is not None and speed.startswith("Unknown")) or _read(dev / "current_link_width") == LINK_DOWN_WIDTH
 
 
+# A live read of a function's config-space vendor id (spec 04 I24). The kernel keeps the cached
+# ``vendor`` attribute from enumeration, so a chip that lost power still shows 0x1e52 there; the
+# ``config`` file is read from the device on every open. A function that is gone answers all-ones.
+CONFIG_PRESENT = "present"
+CONFIG_MISSING = "missing"
+CONFIG_UNREADABLE = "unreadable"
+_TT_VENDOR = 0x1E52
+_NO_DEVICE_VENDOR = 0xFFFF
+
+
+def config_vendor_state(bdf: str, devices_dir: Optional[Path] = None) -> str:
+    """:data:`CONFIG_PRESENT` when the first two bytes of ``<bdf>/config`` read 0x1e52 now,
+    :data:`CONFIG_MISSING` when they read 0xffff (nothing answers at that address), else
+    :data:`CONFIG_UNREADABLE` (an OSError, a short read, any other value): no evidence either way,
+    never taken as present or missing. Read-only: no ``/dev/tenstorrent`` open, no config write.
+    One small read; call it only for a chip already suspect, never for every chip between jobs."""
+    try:
+        with open((devices_dir or pci.PCI_DEVICES_DIR) / bdf / "config", "rb", buffering=0) as f:
+            raw = f.read(2)
+    except OSError:
+        return CONFIG_UNREADABLE
+    if len(raw) < 2:
+        return CONFIG_UNREADABLE
+    vendor = int.from_bytes(raw, "little")
+    if vendor == _TT_VENDOR:
+        return CONFIG_PRESENT
+    if vendor == _NO_DEVICE_VENDOR:
+        return CONFIG_MISSING
+    return CONFIG_UNREADABLE
+
+
 # A live link that trained narrower or slower than it can (spec 03 I9). The link it should have is
 # the lower of the two ends' capabilities: on a Galaxy most chips are x8 endpoints behind x1 root
 # ports, so they train x1 by design and the endpoint's own cap alone would hold every one of them.

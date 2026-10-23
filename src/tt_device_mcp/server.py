@@ -143,6 +143,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     _ubb_bus_id_tables,
     aer_totals,
     append_trace,
+    CONFIG_UNREADABLE,
     arc_not_ready_chips,
     bridge_reset_enabled,
     bridge_reset_unavailable_reason,
@@ -155,6 +156,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     chip_snapshot_event,
     chip_state,
     dead_chips,
+    enodata_presence,
     eth,
     eth_read_timed_out,
     fabric,
@@ -167,6 +169,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     host_action_pending_sec,
     isolate_chip,
     journal_interrupted_fabric_check,
+    link_down,
     link_signals,
     load_removed_chips,
     mark_boot,
@@ -7899,6 +7902,7 @@ def _live_offbus_state() -> dict:
         out["expected_chips"] = expected
         return out
     beats = read_heartbeats()
+    presence = enodata_presence(beats)
     not_ready = arc_not_ready_chips(beats)
     off = offbus_chip_ids(beats, expected, not_ready)
     present = set(chip_state._sysfs_indices())
@@ -7906,6 +7910,8 @@ def _live_offbus_state() -> dict:
         "off_bus": _offbus_count(beats, expected, not_ready),
         "off_bus_chips": sorted(off, key=int),
         "arc_not_ready": sorted(not_ready, key=int),
+        # ENODATA on a bound, link-up endpoint whose config read fails: counted off the bus, held.
+        "config_unreadable": sorted((i for i, s in presence.items() if s == CONFIG_UNREADABLE), key=int),
         # Node present, reads all-ones: on the bus, not answering.
         "hung_chips": sorted((i for i in dead_chips(beats) if i in present), key=int),
     }
@@ -8222,7 +8228,12 @@ def _hold_report(now: Optional[datetime] = None) -> dict:
         beats = read_heartbeats()
         not_ready = arc_not_ready_chips(beats)
         off_ids = {int(i) for i in offbus_chip_ids(beats, expected, not_ready)}
-        present = {i: pci_bus_number(a) for i, a in chip_pci_bdfs().items()}
+        # The ladder's own presence read (galaxy _presence_read): a chip off the bus by the heartbeat,
+        # or whose link reads down, is not present even if its node lingers, so a dead but still
+        # enumerated tray reads as the whole-tray drop the ladder sees.
+        present = {
+            i: pci_bus_number(a) for i, a in chip_pci_bdfs().items() if int(i) not in off_ids and not link_down(a)
+        }
         whole = False
         if off_ids and len(off_ids) < expected:
             tray_map = galaxy_recovery._tray_map_now() if galaxy_recovery is not None else None
@@ -8237,12 +8248,8 @@ def _hold_report(now: Optional[datetime] = None) -> dict:
         )
         alive = {i for i in beats if i not in set(dead_chips(beats))}
         if groups:
-            # A chip reading all-ones still has its KMD node, so chip_pci_bdfs lists it; it is off the
-            # bus all the same (hold_class counts it so), so the tray rows leave it out. The
-            # classifier above keeps the ladder's own present_buses input.
-            on_bus = {i: b for i, b in present.items() if int(i) not in off_ids}
             read_at = now.isoformat(timespec="seconds")
-            trays = hold_report.trays_present(on_bus, alive, groups, read_at, UBB_CHIP_COUNT)
+            trays = hold_report.trays_present(present, alive, groups, read_at, UBB_CHIP_COUNT)
     out["hold_class"] = hold_class
     rung = _hold_next_rung(now_epoch)
     out["next_rung"] = rung.rung if rung else None
