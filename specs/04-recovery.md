@@ -505,13 +505,24 @@ each rung fires only when the gentler one failed or cannot apply.
   flood), or within `TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC` of one (the first look after a recent boot
   counts from zero at boot). `hold` also refuses while any chip has no PCI function, or keeps its
   function but its ARC heartbeat reads all-ones (its BAR reads return nothing: it has left the bus
-  too), so a reset that dropped a chip is not re-issued over it. A chip whose heartbeat read fails
-  with ENODATA while its KMD node is there and its PCI endpoint is bound to the driver is on the bus
-  with its ARC not ready (mid-boot after a reset), not off it: the heartbeat verdict
-  reads it UNHEALTHY and names it `arc_not_ready`, but no off-bus count includes it (this gate, the
+  too), so a reset that dropped a chip is not re-issued over it. ENODATA alone proves nothing:
+  the driver returns it while the chip still needs its post-reset init, whether or not the chip
+  has power. A chip whose heartbeat read fails with ENODATA is on the bus with its ARC not ready
+  (mid-boot after a reset), not off it, only while its KMD node is there, its PCI endpoint is
+  bound to the driver, its link does not read down (`hostpci.link_down`) and a live read of its
+  PCI config space (`hostpci.config_vendor_state`: the first two bytes of
+  `/sys/bus/pci/devices/<bdf>/config`, read-only, never through the device node) returns the
+  Tenstorrent vendor id 0x1e52: the heartbeat
+  verdict reads it UNHEALTHY and names it `arc_not_ready`, but no off-bus count includes it (this gate, the
   reset and reboot floors, the bridge and gone-chip rungs, the hold-deadline
-  climbs, `/health` `off_bus`). An unbound endpoint, a missing node or any other read error still
-  counts the chip off the bus. Under every mode, `off` included, an automatic reset is refused while
+  climbs, `/health` `off_bus`). A config read of 0xffff or a link that reads down means the chip
+  is off the bus, so a whole tray of such chips is class A (I37) and goes straight to the power
+  cycle, with no ARC-not-ready wait. An unbound endpoint, a missing node or any other read error
+  still counts the chip off the bus. A config read that fails or returns anything else is a third
+  state, `config_unreadable`: like an EIO chip it counts off the bus for every rung and floor, so
+  its hold stays and never lifts on it, and it is on the bus only for the class A read (I37); the
+  heartbeat verdict and `/health` name it. The config read is made only for a chip missing from
+  the heartbeat read with ENODATA, so a healthy pass reads no config space. Under every mode, `off` included, an automatic reset is refused while
   the flood window a port that errored again after its mask opened is still open: with the gate `off` that
   holds every automatic mesh reset and last-chance sweep (and so the host rung above
   them, I22) for `TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC`. The one exception is inside a last-chance
@@ -2580,7 +2591,7 @@ sees a silent fabric pass.
 | I27 with a power cycle configured, a whole tray down goes straight to it; a partial drop gets one lifted ladder pass (the mesh reset) past the grace, spent only when its climb reaches the rungs (a pass declined by scope, tenant or the ceiling stays due), then the power cycle on the next forced pass only if the hold stands; each reset releases only after the full check, fabric included, and the cycle releases nothing | `tests/test_gated_hold_handoff.py::test_a_whole_tray_down_goes_straight_to_the_power_cycle`, `::test_a_partial_drop_gets_the_mesh_reset_first_and_the_power_cycle_only_if_it_fails`, `::test_a_partial_drop_the_mesh_reset_heals_never_gets_the_power_cycle`, `::test_a_partial_drop_with_no_tray_map_gets_the_mesh_reset_first`, `::test_before_the_grace_a_partial_drop_gets_no_lifted_reset`, `::test_a_declined_lifted_pass_is_not_spent_and_the_mesh_reset_still_runs_first`, `::test_the_partial_drops_mesh_reset_releases_only_after_a_passing_fabric_check`, `::test_the_power_cycle_releases_nothing`, `tests/test_startup_fabric_hugepages.py::test_startup_fabric_pass_waits_for_hugepages_then_runs` |
 | I84 a dispatch-cap 77 after a reset re-checks at once (the full check, fabric included); any other 77 waits for eth training; a persisting one stays held | `tests/test_post_reset_gate.py::test_a_dispatch_cap_77_after_a_reset_rechecks_at_once_and_class_j_fits_its_budget`, `::test_a_no_trained_link_77_after_a_reset_still_waits_for_eth_training`, `::test_a_dispatch_cap_77_that_persists_never_releases`, `::test_the_wrapper_reason_names_the_dispatch_cap_over_a_validator_error_line` |
 | I24 `hold` counts an all-ones chip still in sysfs as off the bus; the mesh reset and the sweep refuse over it | `tests/test_pcie_guard.py::test_chips_off_bus_counts_an_all_ones_chip_still_in_sysfs`, `::test_a_hold_gate_refuses_the_mesh_reset_and_the_sweep_over_an_all_ones_chip` |
-| I24 ENODATA on a bound endpoint is ARC-not-ready, not off the bus; an unbound endpoint, a missing node or another errno is off | `tests/test_arc_not_ready.py::test_enodata_on_31_bound_chips_is_not_off_the_bus`, `tests/test_arc_not_ready.py::test_an_unbound_or_missing_chip_still_counts_off_the_bus` |
+| I24 ENODATA on a bound endpoint is ARC-not-ready, not off the bus, only with a live link and a config vendor read of 0x1e52; 0xffff or a down link is off the bus and a whole tray of it is class A; an unreadable config is held, never ARC-not-ready, never lifts; healthy chips get no config read; an unbound endpoint, a missing node or another errno is off | `tests/test_arc_not_ready.py::test_enodata_on_31_bound_chips_is_not_off_the_bus`, `tests/test_arc_not_ready.py::test_an_unbound_or_missing_chip_still_counts_off_the_bus`, `::test_enodata_with_vendor_ffff_is_off_the_bus`, `::test_enodata_with_the_link_down_is_off_the_bus`, `::test_enodata_with_config_unreadable_is_held_and_named`, `::test_a_healthy_read_makes_no_config_read`, `tests/test_hostpci.py::test_config_vendor_state_reads_the_first_two_bytes`, `tests/test_classac_power_cycle_direct.py::test_an_enodata_tray_reading_ffff_is_class_a`, `::test_an_enodata_tray_with_unreadable_config_never_lifts` |
 | I24 the per-chip bridge SBR obeys the hold gate and the latch | `tests/test_pcie_guard.py::test_the_per_chip_bridge_reset_obeys_the_hold_gate_and_the_latch` |
 | I25 the last-chance sweep names each off-bus chip, its PCI address and tray, read fresh from the heartbeats | `tests/test_ubb_tray_map.py::test_the_off_bus_placement_marks_what_the_map_cannot_place` |
 | I25 the host-hang latch: intent, latch on a new boot, not on the same boot, clear, opt-out | `tests/test_pcie_guard.py::test_an_off_bus_reset_writes_an_intent_and_removes_it_when_done`, `::test_an_intent_from_a_boot_that_died_latches_hold_until_cleared`, `::test_an_intent_from_this_boot_does_not_latch`, `::test_the_latch_can_be_switched_off` |

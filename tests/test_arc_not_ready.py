@@ -282,6 +282,95 @@ def test_eio_chips_still_count_off_the_bus_for_the_rungs(monkeypatch, tmp_path):
     assert heartbeat.offbus_count(beats, EXPECTED) == 2
 
 
+
+# ---------------------------------------------------------------- ENODATA needs a live config read
+
+
+TRAY = range(24, 32)  # a whole UBB tray's worth of chips
+
+
+def test_enodata_with_vendor_ffff_is_off_the_bus(monkeypatch, tmp_path):
+    """Spec 04 I24: the driver returns ENODATA for a chip that lost power as well as for one mid-boot.
+    A tray whose config space reads 0xffff is off the bus, never ARC-not-ready."""
+    _fake_sysfs(monkeypatch, tmp_path, enodata=TRAY, vendor_ffff=TRAY)
+    monkeypatch.setattr(heartbeat.time, "sleep", lambda s: None)
+    beats = heartbeat.read_heartbeats()
+
+    assert heartbeat.arc_not_ready_chips(beats) == set()
+    assert heartbeat.offbus_chip_ids(beats, EXPECTED) == {str(i) for i in TRAY}
+    assert galaxy._offbus_chip_ids(beats, EXPECTED) == {str(i) for i in TRAY}
+    assert heartbeat.unreadable_on_bus_chips(set(TRAY)) == set()
+    verdict, detail, evidence = heartbeat.heartbeat_verdict(expected_count=EXPECTED)
+    assert verdict is Verdict.UNHEALTHY, detail
+    assert not evidence.get("arc_not_ready") and "ARC not ready" not in detail
+
+
+@pytest.mark.parametrize("link", ["speed_unknown", "width_63"])
+def test_enodata_with_the_link_down_is_off_the_bus(monkeypatch, tmp_path, link):
+    """A link that reads down is off the bus whatever the config read says (its cached 0x1e52 included)."""
+    _fake_sysfs(monkeypatch, tmp_path, enodata={6}, **{link: {6}})
+    beats = heartbeat.read_heartbeats()
+
+    assert heartbeat.arc_not_ready_chips(beats) == set()
+    assert heartbeat.offbus_chip_ids(beats, EXPECTED) == {"6"}
+    assert heartbeat.config_unreadable_chips(beats) == set()
+
+
+def test_enodata_with_config_unreadable_is_held_and_named(monkeypatch, tmp_path, clear_job_state):
+    """Config space that cannot be read is a third state: never ARC-not-ready, counted off the bus for
+    the rungs (so the hold stands), and named in the verdict and on /health."""
+    _fake_sysfs(monkeypatch, tmp_path, enodata={6, 7}, config_unreadable={6})
+    monkeypatch.setattr(heartbeat.time, "sleep", lambda s: None)
+    beats = heartbeat.read_heartbeats()
+
+    assert heartbeat.arc_not_ready_chips(beats) == {"7"}
+    assert heartbeat.config_unreadable_chips(beats) == {"6"}
+    assert heartbeat.offbus_chip_ids(beats, EXPECTED) == {"6"}
+    verdict, detail, evidence = heartbeat.heartbeat_verdict(expected_count=EXPECTED)
+    assert verdict is Verdict.UNHEALTHY, detail
+    assert evidence["config_unreadable"] == ["6"]
+    assert "config space unreadable" in detail
+
+    _live_health(monkeypatch)
+    fsm_healthy(srv)
+    monkeypatch.setattr(srv, "device_op_active", "")
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    payload = srv._health_payload()
+    assert payload["config_unreadable"] == ["6"]
+    assert payload["arc_not_ready"] == ["7"]
+    assert payload["off_bus"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_down_offbus_recheck_never_lifts_on_an_unreadable_config(monkeypatch, tmp_path, clear_job_state):
+    """Every node is back but chip 6's config cannot be read: the hold stays DOWN and nothing releases."""
+    _setup_down_offbus(monkeypatch, tmp_path)
+    _fake_sysfs(monkeypatch, tmp_path / "fake", enodata=[6], config_unreadable=[6])
+    monkeypatch.setattr(srv, "heartbeat_supported", lambda *a: True)
+    monkeypatch.setattr(srv, "_clear_device_dirty", lambda *a, **k: pytest.fail("released"))
+
+    await srv._attempt_down_offbus_recheck()
+
+    assert srv.fsm.state is ServerState.DOWN and srv.fsm.record.why == "off_bus"
+
+
+def test_a_healthy_read_makes_no_config_read(monkeypatch, tmp_path):
+    """The config read is only for a chip missing from the heartbeat read with ENODATA: a full read, an
+    EIO chip and a missing chip add no config read to the between-jobs pass."""
+    _fake_sysfs(monkeypatch, tmp_path, eio={3}, missing={4})
+    monkeypatch.setattr(
+        heartbeat.hostpci, "config_vendor_state", lambda *a, **k: pytest.fail("config read for a healthy chip")
+    )
+    monkeypatch.setattr(heartbeat.time, "sleep", lambda s: None)
+    beats = heartbeat.read_heartbeats()
+
+    assert heartbeat.arc_not_ready_chips(beats) == set()
+    assert heartbeat.config_unreadable_chips(beats) == set()
+    assert heartbeat.offbus_chip_ids(beats, EXPECTED) == {"3", "4"}
+    assert heartbeat.unreadable_on_bus_chips({3, 4}) == {"3"}
+    heartbeat.heartbeat_verdict(expected_count=EXPECTED)
+
+
 # ---------------------------------------------------------------- one more reset when ARC lags the bus
 
 ALL_BUT_0 = range(1, EXPECTED)
