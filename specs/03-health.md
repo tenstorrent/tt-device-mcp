@@ -85,7 +85,11 @@ cooldown (spec 04 I65) holds longer.
   from config space while the kernel still lists the node with its driver bound, so it looks
   present to every other sysfs read. An attribute that cannot be read is no evidence of anything. The same read
   keeps such a node out of spec 04's class A presence read (I37) and out of the I25 latch's
-  all-back count, so a chip whose link is down never counts as back on the bus.
+  all-back count, so a chip whose link is down never counts as back on the bus. For a chip whose
+  heartbeat read fails with ENODATA, the same link read and a live read of the first two bytes of
+  its PCI config space decide whether it is on the bus with its ARC not ready (0x1e52, link up)
+  or off it (0xffff, or the link down); spec 04 I24 owns that rule and its third, unreadable
+  state.
 
   A fourth verdict: no live link trained below the link it should have (`hostpci._judge_link`).
   Expected is the lower of the two ends' caps, `max_link_width`/`max_link_speed` of the endpoint
@@ -1189,7 +1193,9 @@ cooldown (spec 04 I65) holds longer.
   yet. `trays_present` groups the chips on the bus by UBB bus group (spec 04 I16, never by index),
   with the chips that answer their ARC heartbeat and the time of the one read they come from; a chip
   the hold counts off the bus (missing from the read, or reading all-ones though its KMD node is
-  still there) is in no tray's `chips_present`; it is `null` where tt-smi's tray tables are missing.
+  still there, or whose link reads down) is in no tray's `chips_present`; it is `null` where tt-smi's tray tables are missing.
+  `hold_class` reads the same presence the ladder's class A read does (spec 04 I37): with no tray
+  map, a dead tray whose nodes are still enumerated is a whole tray off (`A`), as the ladder sees it.
   It is labelled `verified: false` with the text `not verified: sysfs presence and ARC heartbeat
   only; no health check has passed`. The report uses only the sysfs enumeration and heartbeat reads
   `/health` already makes: it never touches a chip, never calls a chip healthy, never admits a job,
@@ -1635,8 +1641,9 @@ subsystem through the root:
   bracketed escalation line, which `hold_escalation` gives as fields); the live fields say where it
   stands now, read fresh from sysfs on every call with no device touch: `isolated_chips` (always),
   and where the heartbeat detector and a chip baseline exist, `off_bus` (chips off the PCIe bus now,
-  the count the rungs use), `arc_not_ready` (on the bus, heartbeat ENODATA on a bound endpoint, 04
-  I24) and `expected_chips`. A chip that is back on the bus leaves `isolated_chips` right after the
+  the count the rungs use), `arc_not_ready` (on the bus, heartbeat ENODATA on a bound endpoint
+  with a live link and config vendor 0x1e52, 04 I24), `config_unreadable` (heartbeat ENODATA and
+  config space unreadable: held, counted off the bus, 04 I24) and `expected_chips`. A chip that is back on the bus leaves `isolated_chips` right after the
   reset, external tray re-power or PCI rescan that brought it back (the reset mechanism's rescan,
   the tray-down prelude rescan, the isolated-chip rescan), whatever the verify after it
   says. Dropping it never releases the device or clears a hold: only the full gate does (I52).
@@ -2256,6 +2263,7 @@ refuses.
 | I68 (a dirty job_killed/foreign_holder hold with nothing queued gets the post-job gate, fabric forced, once per episode; a dirty I42-latched hold gets the present-mesh rung with no grace instead, an unlatched one does not; a failure keeps the hold; anything else owning the device defers it) | `tests/test_holder_release_wait.py::test_a_dirty_killed_hold_with_an_empty_queue_runs_the_full_post_job_gate_once`, `tests/test_holder_release_wait.py::test_a_failed_idle_gate_keeps_the_hold_and_runs_once_per_episode`, `tests/test_holder_release_wait.py::test_an_idle_gate_that_raises_keeps_the_device_held`, `tests/test_holder_release_wait.py::test_the_idle_gate_is_rate_limited`, `tests/test_holder_release_wait.py::test_no_idle_gate_while_anything_else_owns_the_device`, `tests/test_fabric_links_missing.py::test_a_dirty_latched_hold_with_an_empty_queue_takes_the_idle_gate_at_once`, `tests/test_fabric_links_missing.py::test_a_paced_present_rung_does_not_spend_the_dirty_latched_idle_gate`, `tests/test_fabric_links_missing.py::test_an_unlatched_dirty_fabric_hold_does_not_take_the_idle_gate` |
 | I72 (each fault class is named, with its start and per-tray presence by bus group) | `tests/test_health_hold_report.py::test_class_a_whole_tray_reports_its_tray_by_bus_and_the_ceiling_window`, `tests/test_health_hold_report.py::test_class_b1_isolated_chips_report_the_off_bus_one_shot`, `tests/test_health_hold_report.py::test_class_b2_part_of_one_tray`, `tests/test_health_hold_report.py::test_class_c_all_off_lists_every_tray_empty`, `tests/test_health_hold_report.py::test_class_d_present_mesh_with_a_dead_arc`, `tests/test_health_hold_report.py::test_class_d_arc_not_ready_chip_is_present_but_not_alive`, `tests/test_health_hold_report.py::test_ac_needed_reports_the_recheck`, `tests/test_health_hold_report.py::test_classify_hold`, `tests/test_health_hold_report.py::test_classify_hold_with_no_baseline`, `tests/test_health_hold_report.py::test_trays_group_by_bus_never_by_index` |
 | I72 (a chip off the bus, missing or all-ones with its node present, is in no tray's `chips_present`) | `tests/test_health_hold_report.py::test_an_all_ones_chip_is_in_no_tray_row`, `tests/test_health_hold_report.py::test_class_d_present_mesh_with_a_dead_arc` |
+| I72 (`hold_class` reads the ladder's presence: with no tray map a dead but enumerated tray, all-ones or link down, is `A`) | `tests/test_health_hold_report.py::test_a_dead_enumerated_tray_with_no_map_is_a_whole_tray`, `tests/test_health_hold_report.py::test_a_link_down_tray_with_no_map_is_a_whole_tray` |
 | I72 (the 10-min hold bound's mark, per class and latch, and its cooldown end) | `tests/test_health_hold_report.py::test_the_bound_mark_is_reported_for_each_fault_class`, `tests/test_health_hold_report.py::test_a_latched_hold_reports_the_same_mark`, `tests/test_health_hold_report.py::test_a_cooldown_hold_reports_the_ladder_at_the_mark_and_the_host_rung_at_its_end`, `tests/test_health_hold_report.py::test_a_healthy_device_reports_no_bound` |
 | I72 (only while RECOVERING or DOWN; unknown baseline or tables report null) | `tests/test_health_hold_report.py::test_recovering_reports_too_and_healthy_does_not`, `tests/test_health_hold_report.py::test_no_baseline_and_no_tables_report_unknown` |
 | I72 (read-only: no rung clock moves, the hold and FSM state stay, no job admitted, never called healthy) | `tests/test_health_hold_report.py::test_the_report_is_read_only` |

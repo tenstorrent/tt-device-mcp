@@ -600,3 +600,23 @@ def test_the_bank_is_not_rewritten_when_nothing_changed(tmp_path, monkeypatch):
     os.utime(path, ns=(1, 1))
     hostpci.host_pci_verdict()
     assert path.stat().st_mtime_ns == 1 != before
+
+
+@pytest.mark.parametrize(
+    "config, want",
+    [
+        (b"\x52\x1e\x40\xb1", hostpci.CONFIG_PRESENT),
+        (b"\xff\xff\xff\xff", hostpci.CONFIG_MISSING),
+        (None, hostpci.CONFIG_UNREADABLE),  # no config file: the read fails
+        (b"\x52", hostpci.CONFIG_UNREADABLE),  # a short read
+        (b"\x86\x80\x00\x00", hostpci.CONFIG_UNREADABLE),  # another vendor: no evidence either way
+    ],
+)
+def test_config_vendor_state_reads_the_first_two_bytes(tmp_path, config, want):
+    """Spec 04 I24: the live vendor read gives present (0x1e52), missing (0xffff) or unreadable, a
+    third state never folded into either."""
+    dev = tmp_path / "0000:41:00.0"
+    dev.mkdir()
+    if config is not None:
+        (dev / "config").write_bytes(config)
+    assert hostpci.config_vendor_state("0000:41:00.0", devices_dir=tmp_path) == want

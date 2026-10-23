@@ -663,6 +663,38 @@ async def test_a_tray_of_link_down_nodes_with_one_eio_survivor_is_class_a(rig, m
     assert ev["unreadable"] == [str(survivor)] and ev["off_bus"] == sorted(map(str, tray), key=int)
 
 
+@pytest.mark.asyncio
+async def test_an_enodata_tray_reading_ffff_is_class_a(rig, monkeypatch, tmp_path):
+    """Spec 04 I24: a tray that lost power right after a reset reads ENODATA on bound endpoints with
+    their links up. Its config space reads 0xffff, so it is off the bus, not ARC-not-ready: class A,
+    straight to the power cycle with no mesh reset."""
+    tray = set(rig["map"][3])
+    _fake_sysfs(monkeypatch, tmp_path, enodata=tray, vendor_ffff=tray)
+    monkeypatch.setattr(galaxy, "unreadable_on_bus_chips", heartbeat.unreadable_on_bus_chips)
+    monkeypatch.setattr(heartbeat.time, "sleep", lambda s: None)
+    rig["beats"] = heartbeat.read_heartbeats()
+    assert heartbeat.arc_not_ready_chips(rig["beats"]) == set()
+    assert await _gate(rig, galaxy.STAGE_SMI_RESET) == galaxy.OUTCOME_WAITING
+    assert "glx_reset" not in rig["order"] and rig["order"][-1] == "power_cycle"
+    assert "released" not in rig["order"]
+
+
+@pytest.mark.asyncio
+async def test_an_enodata_tray_with_unreadable_config_never_lifts(rig, monkeypatch, tmp_path):
+    """The same tray with config space that cannot be read: no evidence it is gone, none that it is
+    there. It is never ARC-not-ready, every rung counts it off the bus, and the hold never lifts."""
+    tray = set(rig["map"][3])
+    _fake_sysfs(monkeypatch, tmp_path, enodata=tray, config_unreadable=tray)
+    monkeypatch.setattr(galaxy, "unreadable_on_bus_chips", heartbeat.unreadable_on_bus_chips)
+    monkeypatch.setattr(heartbeat.time, "sleep", lambda s: None)
+    rig["beats"] = heartbeat.read_heartbeats()
+    assert heartbeat.arc_not_ready_chips(rig["beats"]) == set()
+    assert galaxy._offbus_chip_ids(rig["beats"], EXPECTED) == {str(c) for c in tray}
+    await _gate(rig, galaxy.STAGE_SMI_RESET)
+    assert "released" not in rig["order"]
+    assert galaxy.offbus_count(rig["beats"], EXPECTED) == len(tray)
+
+
 # ---- the whole-tray check with no map (Part 2 of spec 04 I37) ------------------------------------------
 
 
