@@ -3182,7 +3182,12 @@ class GalaxyRecovery(Recovery):
         return True
 
     async def _below_floor_bound_rungs(
-        self, offbus_chips: set, expected: int, log, sbr_tried: frozenset = frozenset(), context: str = "I76 bound ladder"
+        self,
+        offbus_chips: set,
+        expected: int,
+        log,
+        sbr_tried: frozenset = frozenset(),
+        context: str = "I76 bound ladder",
     ) -> bool:
         """The I76 bound's kept rungs ahead of its one mesh reset (spec 04 I89): PCI rescan, then SBR of
         the bridged off-bus chips (a gone chip only with the opt-in: see _below_floor_kept_rungs). True only when every chip is back and the full
