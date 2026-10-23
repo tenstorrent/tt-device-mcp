@@ -1765,10 +1765,11 @@ class GalaxyRecovery(Recovery):
             self._sbr_hold = (since, prev | frozenset(fired))
         return ok
 
-    def _sbr_owed(self, hold_since: Optional[str], off_ids: Optional[set]) -> list:
+    def _sbr_owed(self, hold_since: Optional[str], off_ids: Optional[set], beats: Optional[dict] = None) -> list:
         """The off-bus chips the kept SBR rung could reset that this hold has not SBR'd yet (spec 04
         I87): isolated or broker-removed chips, and chips whose node is present but whose PCIe link
-        reads down. A chip gone from the bus counts only with the gone-chip opt-in, as in the rung."""
+        reads down or whose heartbeat in ``beats`` reads all-ones. A chip gone from the bus counts only
+        with the gone-chip opt-in, as in the rung."""
         if not off_ids:
             return []
         done = self._sbr_hold[1] if self._sbr_hold and self._sbr_hold[0] == hold_since else frozenset()
@@ -1782,7 +1783,7 @@ class GalaxyRecovery(Recovery):
             elif bdf and not chip_node_present(bdf):
                 if gone_chip_bridge_reset_enabled():
                     owed.append(c)
-            elif bdf and link_down(bdf):
+            elif bdf and ((beats or {}).get(c) == ALL_ONES or link_down(bdf)):
                 owed.append(c)
         return owed
 
@@ -3578,8 +3579,19 @@ class GalaxyRecovery(Recovery):
         ids_climb = await self._offbus_ids_now(expected)
         failed_unchanged = off_bus > 0 and self.mechanism.rung_failed_unchanged(hold_since, "mesh_reset", ids_climb)
         # Spec 04 I87: the sweep's mesh reset is spent on these chips, but its SBR is not when this hold
-        # has not SBR'd them; it still runs before the host rung.
-        sbr_owed = self._sbr_owed(hold_since, ids_climb) if failed_unchanged else []
+        # has not SBR'd them; it still runs before the host rung. Below the floor only, and never for a
+        # whole tray (A) or all chips off (C): a mass drop goes straight to the power cycle, never
+        # nibbled at with per-chip bridge resets.
+        floor_now = _galaxy_reset_min_dead_chips(expected)
+        sbr_owed = (
+            self._sbr_owed(hold_since, ids_climb, beats)
+            if failed_unchanged
+            and ids_climb
+            and floor_now is not None
+            and 0 < off_bus < floor_now
+            and self._power_cycle_direct_class_now(ids_climb, expected, self._tray_map_now(), log) is None
+            else []
+        )
         hold_age = _hold_age_sec(hold_since)
         reset_spent = self.mechanism.mesh_reset_spent(hold_since)
         if failed_unchanged and hold_age is not None and hold_age < _stuck_hold_ceiling_sec():

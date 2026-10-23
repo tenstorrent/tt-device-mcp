@@ -497,11 +497,11 @@ async def test_a_fabric_check_short_of_the_cabled_links_keeps_the_hold(
 
 def _dead_link(monkeypatch, tmp_path, order, how):
     """Chip 31's node is present (``_rig(enumerated=True)``) but its link reads down (``how`` "link")
-    or its heartbeat reads all-ones (``how`` "all-ones"). Its remove is recorded in ``order`` after the
+    or its heartbeat reads all-ones (``how`` "all-ones"); ``how`` None arms only the hooks. Its remove is recorded in ``order`` after the
     broker's readers are stopped, and makes it an isolated chip, as the real hook does."""
     if how == "link":
         (tmp_path / "pci" / "0000:5f:00.0" / "current_link_speed").write_text("Unknown\n")
-    else:
+    elif how == "all-ones":
         beats = dict(SHORT, **{GONE: ALL_ONES})
         monkeypatch.setattr(srv, "read_heartbeats", lambda: dict(beats))
         monkeypatch.setattr(pcie_guard, "chips_off_bus", lambda expected: 1)
@@ -548,15 +548,20 @@ async def test_a_dead_link_chip_whose_remove_fails_is_not_reset(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("heals, verdict", [(True, True), (True, False), (False, False)])
-async def test_the_sweep_runs_its_sbr_when_none_ran_this_hold(monkeypatch, tmp_path, clear_job_state, heals, verdict):
+@pytest.mark.parametrize(
+    "heals, verdict, how",
+    [(True, True, "link"), (True, False, "link"), (False, False, "link"), (False, False, "all-ones")],
+)
+async def test_the_sweep_runs_its_sbr_when_none_ran_this_hold(
+    monkeypatch, tmp_path, clear_job_state, heals, verdict, how
+):
     """Below the bound, this hold's mesh reset already failed on exactly these chips (I58), so the
     last-chance sweep skips its mesh reset. Its SBR is still owed: no SBR ran on the chip this hold. It
     runs before the host rung, then the full check with fabric; only a pass lifts, else the power cycle."""
     order, events, counters = _rig(
         monkeypatch, tmp_path, held_min=3, enumerated=True, sbr_heals=heals, verdicts=[verdict]
     )
-    _dead_link(monkeypatch, tmp_path, order, "link")
+    _dead_link(monkeypatch, tmp_path, order, how)
     logs = []
     srv.recovery_mechanism.note_rung_failed(srv.device_hold_episode_since, "mesh_reset", {GONE}, {GONE}, rc=1)
     await srv.galaxy_recovery.escalate("offbus-forced", [GONE], 32, logs.append)
@@ -585,3 +590,28 @@ async def test_the_sweep_owes_no_sbr_once_this_hold_ran_one(monkeypatch, tmp_pat
     await srv.galaxy_recovery.escalate("offbus-forced", [GONE], 32, logs.append)
     assert not any(o.startswith("sbr") for o in order) and order[-1] == "power cycle"
     assert any("every rung below the host pair has run once" in m for m in logs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("off", [32, 20], ids=["all-off", "above-floor"])
+async def test_the_sweep_sbr_is_below_the_floor_only(monkeypatch, tmp_path, clear_job_state, off):
+    """At or above the floor (16 of 32) the drop is a mass drop, all chips off (class C) included: once
+    its mesh reset failed on exactly these chips, the climb goes straight to the power cycle. No reader
+    is stopped, no chip removed and no per-chip SBR runs, even with no SBR this hold and every off chip's
+    node present with its link down."""
+    order, _events, counters = _rig(monkeypatch, tmp_path, held_min=3)
+    gone = {str(i) for i in range(32 - off, 32)}
+    beats = {str(i): 100 for i in range(32 - off)}
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: dict(beats))
+    monkeypatch.setattr(pcie_guard, "chips_off_bus", lambda expected: off)
+    for c in gone:
+        node = tmp_path / "pci" / srv.device_pci_map[c]
+        node.mkdir()
+        (node / "current_link_speed").write_text("Unknown\n")
+    _dead_link(monkeypatch, tmp_path, order, None)
+    hold_since = srv.device_hold_episode_since
+    srv.recovery_mechanism.note_rung_failed(hold_since, "mesh_reset", gone, gone, rc=1)
+    await srv.galaxy_recovery._climb_to_host_recovery_after_failed_reset(32, off, lambda m: None)
+    assert "readers stopped" not in order and not any(o.startswith(("isolate", "sbr")) for o in order)
+    assert order[-1] == "power cycle"
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
