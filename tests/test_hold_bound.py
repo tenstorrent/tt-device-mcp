@@ -1255,6 +1255,7 @@ async def test_a_ladder_below_the_bound_does_not_stand_in_for_the_bounds_ladder(
     real_age = srv._hold_age_now
     monkeypatch.setattr(srv, "_hold_age_now", lambda now=None: 120.0)  # the one-shot, 2 min into the hold
     monkeypatch.setattr(srv, "device_hold_escalation_kind", "offbus_one_shot")
+    monkeypatch.setattr(srv, "_offbus_hold_chips", {"31"})  # the gate's below-floor pass armed it (spec 04 I96)
     await srv._force_escalate_stuck_hold()
     assert escalations == [ladder] and "host_rung" not in events
     monkeypatch.setattr(srv, "_hold_age_now", real_age)

@@ -678,6 +678,8 @@ async def test_forced_escalation_event_names_trigger_and_thresholds(monkeypatch,
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
     monkeypatch.setattr(srv, "device_op_lock", None)
     monkeypatch.setattr(srv, "device_hold_escalation_kind", kind)
+    # The one-shot runs only for chips that armed it and are still off the bus (spec 04 I96).
+    monkeypatch.setattr(srv, "_offbus_hold_chips", {"0"})
 
     async def _noop(indices, expected, log, *, force=False):
         pass
