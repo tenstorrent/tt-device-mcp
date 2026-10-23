@@ -16,6 +16,7 @@ from tests.test_offbus_one_shot_idle import IDLE, _below_floor_hold
 from tests.test_post_reset_gate import _assert_settled, _verify_returning
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
+from tt_device_mcp.health import evidence as health
 from tt_device_mcp.health.monitors import heartbeat, pci
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 
@@ -99,6 +100,46 @@ async def test_an_enumerated_dead_arc_chip_arms_the_one_shot_on_its_short_clock(
     _verify_returning(monkeypatch, evidence, calls)
     resets = _real_mesh_reset(monkeypatch)
     await tick(srv.SAMPLE_INTERVAL_SEC)
+    assert resets == ["mesh reset"], "the one-shot did not run the below-floor mesh reset"
+    _assert_one_shot_ran(count, calls, released)
+    assert bridges == [], "the enumerated chip was bridge-reset (I89)"
+
+
+@pytest.mark.asyncio
+async def test_a_hold_carried_across_a_restart_arms_the_one_shot_for_its_dead_arc_chip(
+    mesh, monkeypatch, tmp_path, verdict
+):
+    """The broker restarts mid-hold: the new process has no isolated chip and no record of the old one's,
+    and its startup gate finds chip 8 enumerated with a dead ARC. The carried hold keeps its clock and the
+    next sampler tick runs the one-shot, not the 10-min bound. Released only through the full check."""
+    evidence, released = verdict
+    _, bridges, count = _below_floor_hold(monkeypatch, mesh, {"now": IDLE})
+    monkeypatch.setattr(health, "HEALTH_DIR", tmp_path)
+    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-a")
+    since = (datetime.now() - timedelta(seconds=2 * srv.SAMPLE_INTERVAL_SEC)).isoformat()
+    srv._persist_hold_episode(since)  # what the old broker left on disk
+    # A new broker process: nothing in memory, only that record.
+    monkeypatch.setattr(srv, "_offbus_hold_chips", set(), raising=False)
+    for name, value in (
+        ("device_hold_logged", False),
+        ("device_hold_episode_since", ""),
+        ("_hold_episode_restorable", True),
+        ("device_hold_offbus_escalated", False),
+    ):
+        monkeypatch.setattr(srv, name, value)
+    _dead_arc_on_bus(monkeypatch)
+
+    async def unhealthy(expected, log, run_fabric=True, **_):
+        return False, {"snapshot": {"ok": False, "detail": f"chip {DEAD} heartbeat unreadable"}}
+
+    prg.patch_recovery(monkeypatch, "_verify_device", unhealthy)
+    await srv._device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
+    assert srv.device_hold_episode_since == since, "the restart restarted the hold's clock"
+    assert count("below_floor_kept_rungs") == 1, "the startup gate did not hold the mesh below the floor"
+    calls = []
+    _verify_returning(monkeypatch, evidence, calls)
+    resets = _real_mesh_reset(monkeypatch)
+    await tick(2 * srv.SAMPLE_INTERVAL_SEC)
     assert resets == ["mesh reset"], "the one-shot did not run the below-floor mesh reset"
     _assert_one_shot_ran(count, calls, released)
     assert bridges == [], "the enumerated chip was bridge-reset (I89)"
