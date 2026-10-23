@@ -15,18 +15,17 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
-from pathlib import Path
 
 import pytest
 
 from tt_device_mcp import privileges
 from tt_device_mcp.health.recovery import base as recovery_base
+from tt_device_mcp.health.recovery import pcie_guard
 
 _real_sleep = asyncio.sleep
 SETTLE_START = "\033[93mWaiting for 30 seconds: 0\033[0m"
 SETTLE = SETTLE_START + "".join(f"\r\033[93mWaiting for 30 seconds: {i}\033[0m" for i in range(1, 31)) + "\n"
 MESH_RESET = ["tt-smi", "-glx_reset"]
-RESCAN = "/sys/bus/pci/rescan"
 
 
 class FakeSysfs:
@@ -37,17 +36,10 @@ class FakeSysfs:
         self.at: list[float] = []
         self.back_after = back_after  # rescans needed before the removed chips reappear
 
-    def path(self, p):
-        if str(p) != RESCAN:
-            return Path(p)
-        sysfs = self
-
-        class _Rescan:
-            def write_text(self, _text):
-                sysfs.rescans += 1
-                sysfs.at.append(time.time())
-
-        return _Rescan()
+    def rescan(self):
+        self.rescans += 1
+        self.at.append(time.time())
+        return ["0000:00:01.0"]
 
     def returned(self, isolated):
         return sorted(isolated, key=int) if self.rescans >= self.back_after else []
@@ -55,7 +47,7 @@ class FakeSysfs:
 
 def _mechanism(monkeypatch, isolated: set, sysfs: FakeSysfs, events: list, *, every=0, scoped=False, tmp=None):
     monkeypatch.setitem(privileges._LATCHED, "systemd", False)
-    monkeypatch.setattr(recovery_base, "Path", sysfs.path)
+    monkeypatch.setattr(pcie_guard, "rescan_tt_root_ports", sysfs.rescan)
     monkeypatch.setattr(recovery_base, "returned_chips", sysfs.returned)
     monkeypatch.setattr(recovery_base, "health_event", lambda name, **kw: events.append((name, kw)))
     monkeypatch.setattr(recovery_base, "DRIVER_WAIT_RESCAN_EVERY_SEC", every)
@@ -64,6 +56,17 @@ def _mechanism(monkeypatch, isolated: set, sysfs: FakeSysfs, events: list, *, ev
         await _real_sleep(min(sec, 0.05))  # the 3 s post-reset settle; the file backend's 50 ms poll
 
     monkeypatch.setattr(recovery_base.asyncio, "sleep", fast_sleep)
+
+    real_to_thread = asyncio.to_thread
+
+    async def to_thread(fn, *a, **kw):
+        # The fake rescan runs inline: on a loaded host a worker thread can outlast the few loop turns
+        # a test waits after each output chunk, and the rescan count it reads would then lag.
+        if fn is recovery_base._scoped_rescan:
+            return fn(*a, **kw)
+        return await real_to_thread(fn, *a, **kw)
+
+    monkeypatch.setattr(recovery_base.asyncio, "to_thread", to_thread)
 
     async def pollers(_active, _log):
         return []
@@ -242,6 +245,9 @@ async def test_both_backends_rescan_only_once_the_settle_is_over(monkeypatch, tm
     mechanism = _mechanism(monkeypatch, isolated, sysfs, events, scoped=scoped, tmp=tmp_path)
     if scoped:
         mechanism._reset_scope_argv = lambda argv: ("ttdev-reset-test", list(argv))
+    # The fake carries -glx_reset, so it is a mesh reset (spec 04 I91); this test times the rescan,
+    # not the ipmitool guard, whose unshare a sandboxed suite may not be allowed to run.
+    mechanism._launch_argv = list
     argv = [sys.executable, "-c", _FAKE_TT_SMI, "-glx_reset", str(tmp_path)]
 
     rc, text = await asyncio.wait_for(mechanism.reset_with_quiesce(argv, lambda _m: None), timeout=30)

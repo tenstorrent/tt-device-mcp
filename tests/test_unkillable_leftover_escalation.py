@@ -5,9 +5,9 @@
 
 Fault class J-unkillable-leftover: a reaped job's process stuck in the kernel keeps
 /dev/tenstorrent open, the fence (01 I16, 04 I21) refuses every reset over it, and no reset would
-free it anyway. Past its budget the idle sampler asks for the host reboot (every chip present) or
-the power cycle (a chip off the bus), under the host rung's own guards. Nothing in the path releases
-the device: the boot that follows runs the startup gate. No test reaches a real reboot or cycle."""
+free it anyway. Past its budget the idle sampler asks for the power cycle, the only host rung,
+whether every chip is present or not, under the host rung's own guards. Nothing in the path releases
+the device: the boot that follows runs the startup gate. No test reaches a real power cycle."""
 
 import types
 from datetime import datetime, timedelta
@@ -31,7 +31,7 @@ _REAL_POWER_CYCLE = srv._auto_power_cycle_host  # captured at import, before the
 @pytest.fixture
 def fence(leftover, rig, monkeypatch):  # noqa: F811 - the imported fixtures
     """A staged unkillable leftover on a 32-chip host with every chip present, the rig's rung seams
-    and a reboot recorder. ``fence['holders']`` is the live holder scan; ``fence['order']`` what fired."""
+    ``fence['holders']`` is the live holder scan; ``fence['order']`` what fired."""
     state = {
         "holders": [DeviceHolder(pid=LEFTOVER_PID, uid=1234)],
         "order": rig["order"],
@@ -42,19 +42,15 @@ def fence(leftover, rig, monkeypatch):  # noqa: F811 - the imported fixtures
     monkeypatch.setattr(srv, "_present_chip_indices", lambda: [str(i) for i in range(EXPECTED)])
     monkeypatch.setattr(srv.health_monitor, "expected", lambda n=0: EXPECTED)
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=state["holders"], complete=True))
-    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: True)
-    monkeypatch.setattr(srv.recovery_mechanism, "_reboot_already_attempted", lambda **k: False)
     # A fired rung leaves its host action pending (I34), as the real request marker does.
-    fired = []
-    monkeypatch.setattr(srv.recovery_mechanism, "host_action_pending", lambda: ("reboot", 1.0) if fired else None)
+    monkeypatch.setattr(
+        srv.recovery_mechanism,
+        "host_action_pending",
+        lambda: ("power-cycle", 1.0) if "power_cycle" in rig["order"] else None,
+    )
     monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
     monkeypatch.setattr(srv, "_clear_device_dirty", lambda **k: rig["order"].append("cleared_dirty"))
 
-    async def reboot(log, reason):
-        rig["order"].append("reboot")
-        fired.append("reboot")
-
-    monkeypatch.setattr(rig["g"], "_auto_reboot_host", reboot)
     return state
 
 
@@ -88,15 +84,15 @@ async def test_no_rung_before_the_budget(fence):
     assert srv._health_payload()["leftover_fence"]["escalation_stage"] == "waiting-budget"
 
 
-async def test_a_reboot_once_past_the_budget_with_every_chip_present(fence):
+async def test_a_power_cycle_once_past_the_budget_with_every_chip_present(fence):
     t0 = _open(fence)
 
     assert await _tick(t0 + BUDGET)
-    assert fence["order"] == ["reboot"]
+    assert fence["order"] == ["power_cycle"]
     r = fence["rig"]
     assert len(_events(r, "leftover_unkillable_deadline")) == 1
     (rung,) = _events(r, "leftover_host_rung")
-    assert rung["phase"] == "requested" and rung["detail"].startswith("reboot")
+    assert rung["phase"] == "requested" and rung["detail"].startswith("power-cycle")
     assert srv._health_payload()["leftover_fence"]["escalation_stage"] == "requested"
 
 
@@ -212,7 +208,7 @@ async def test_a_governor_denial_holds_then_fires_on_a_later_try(fence):
 
     r["allowed"] = (True, "")
     assert await _tick(t0 + BUDGET + 2 * RETRY)
-    assert fence["order"] == ["reboot"]
+    assert fence["order"] == ["power_cycle"]
     assert [e["phase"] for e in _events(r, "leftover_host_rung")] == ["held", "requested"]
     assert len(_events(r, "leftover_unkillable_deadline")) == 1  # once per episode
 
@@ -227,8 +223,8 @@ async def test_a_held_stage_is_journaled_once_while_it_stands(fence):
 
 
 async def test_a_pending_host_action_asks_for_nothing(fence, monkeypatch):
-    monkeypatch.setattr(srv.recovery_mechanism, "host_action_pending", lambda: ("reboot", 30.0))
-    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", ("reboot", 1.0))
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_pending", lambda: ("power-cycle", 30.0))
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", ("power-cycle", 1.0))
     t0 = _open(fence)
 
     assert not await _tick(t0 + BUDGET)
@@ -255,7 +251,8 @@ async def test_another_tenant_blocks_the_rung_but_the_leftover_itself_does_not(f
 
 async def test_a_running_job_blocks_the_rung(fence, monkeypatch):
     t0 = _open(fence)
-    monkeypatch.setattr(srv.galaxy_recovery.deps, "job_running", lambda: True)
+    # The rung's guard asks for a running job the broker did not kill for recovery (spec 04 I77).
+    monkeypatch.setattr(srv.galaxy_recovery.deps, "live_job_running", lambda: True)
 
     assert await _tick(t0 + BUDGET)
     assert fence["order"] == []
@@ -263,14 +260,13 @@ async def test_a_running_job_blocks_the_rung(fence, monkeypatch):
 
 
 async def test_no_host_rung_opted_in_journals_no_host_rung(fence, monkeypatch):
-    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: False)
     t0 = _open(fence)
 
     assert await _tick(t0 + BUDGET)
     assert fence["order"] == []
     (rung,) = _events(fence["rig"], "leftover_host_rung")
-    assert rung["phase"] == "no_host_rung" and "an operator must reboot" in rung["detail"]
+    assert rung["phase"] == "no_host_rung" and "an operator must power-cycle" in rung["detail"]
     assert srv._health_payload()["leftover_fence"]["escalation_stage"] == "no-host-rung"
 
 
@@ -334,7 +330,7 @@ async def test_time_to_request_is_bounded_and_nothing_releases_the_device(fence)
         if fence["order"] and requested_at is None:
             requested_at = s
     assert requested_at == BUDGET  # the first tick at the budget asks, well inside budget + one retry
-    assert fence["order"] == ["reboot"]  # one request, then the pending host action / stage holds
+    assert fence["order"] == ["power_cycle"]  # one request, then the pending host action / stage holds
     assert "released" not in fence["order"] and "cleared_dirty" not in fence["order"]
     assert srv._leftover_unkillable_mono == t0  # the fence episode still stands until the host goes
 
@@ -351,7 +347,6 @@ def both(fence, monkeypatch, clear_job_state):  # noqa: F811 - the imported fixt
     r = fence["rig"]
     m = srv.recovery_mechanism
     _present_hold_at_the_bound(r, monkeypatch, why="job_killed", detail="job 7 killed: device left dirty")
-    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
     monkeypatch.setattr(m, "auto_recovery_allowed", partial(type(m).auto_recovery_allowed, m))
     monkeypatch.setattr(m, "host_action_pending", types.MethodType(type(m).host_action_pending, m))
     monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-A")

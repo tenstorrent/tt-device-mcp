@@ -4,8 +4,8 @@
 """Spec 08 I21: the apply rate limit.
 
 Every apply restarts the broker, and every start runs the full startup check, fabric traffic pass
-included. With TTDEV_MIN_APPLY_INTERVAL_SEC set, a burst of pushes becomes one restart onto its
-newest sha. The laps below run the script's own lines, cut from it, under a fake clock and a stub
+included. The limit is on by default (TTDEV_MIN_APPLY_INTERVAL_SEC, 1800 s; 0 turns it off), so a
+burst of pushes becomes one restart onto its newest sha. The laps below run the script's own lines, cut from it, under a fake clock and a stub
 `systemctl restart` that records each restart. The limit is for a healthy broker only: one that is
 down, restarting itself, holding the device or failing its health check applies a new sha at once.
 A broker in its startup check is booting, not broken, and stays limited for a bounded time.
@@ -33,10 +33,12 @@ def _cut(text, start, end):
 _HEALTHY = '{"status":"ok","held":false,"fsm_state":"healthy","fsm_why":null}'
 
 
-def _lap(tmp_path, *, now, sha, interval=None, active="active", nrestarts="0", health=_HEALTHY):
-    """One lap at fake time `now` that has just resolved `sha`: the already-current check and the
-    rate limit, then (as if every gate passed) the tail that marks the sha current and restarts.
-    `active`, `nrestarts` and `health` are what systemd and the broker's /health report."""
+def _lap(tmp_path, *, now, sha, interval=None, quiet=0, active="active", nrestarts="0", health=_HEALTHY):
+    """One lap at fake time `now` that has just resolved `sha`: the already-current check, burst
+    coalescing and the rate limit, then (as if every gate passed) the tail that marks the sha
+    current and restarts. `active`, `nrestarts` and `health` are what systemd and the broker's
+    /health report. `quiet` is TTDEV_APPLY_QUIET_SEC: 0 (coalescing off) for the rate-limit tests
+    here, None for the script's default (tests/test_deploy_autoupdate_coalesce.py)."""
     quoted_health = health.replace("'", "'\\''")  # a /health body may carry single quotes
     text = _SCRIPT.read_text()
     head = _cut(text, 'installed_sha="$(cat "$STATE"', "INHIBIT=/run/")
@@ -46,7 +48,7 @@ def _lap(tmp_path, *, now, sha, interval=None, active="active", nrestarts="0", h
     restarts = tmp_path / "restarts"
     prelude = f"""set -u
 ROOT={root}; STATE={root}/installed.sha; VENV={tmp_path}/venv; BR=main; src_desc=test
-idle=true; drained_s=0; TT_DEVICE_MCP_HEALTH_DIR={root}
+idle=true; drained_s=0; TT_DEVICE_MCP_HEALTH_DIR={root}; RECOVERY_PENDING={root}/recovery.defer
 remote_sha={sha}
 date() {{ echo {now}; }}
 chmod() {{ :; }}
@@ -58,21 +60,49 @@ systemctl() {{
     esac
 }}
 curl() {{ printf '%s' '{quoted_health}'; }}
+logger() {{ :; }}
 """
-    env = {"PATH": "/usr/bin:/bin"}
+    env = {"PATH": "/usr/bin:/bin", "TTDEV_LOG_DIR": str(tmp_path / "logs")}
     if interval is not None:
         env["TTDEV_MIN_APPLY_INTERVAL_SEC"] = str(interval)
+    if quiet is not None:
+        env["TTDEV_APPLY_QUIET_SEC"] = str(quiet)
     done = subprocess.run(["bash", "-c", prelude + head + tail], capture_output=True, text=True, env=env, timeout=30)
     assert done.returncode == 0, done.stderr
     lines = restarts.read_text().splitlines() if restarts.exists() else []
     return done, lines, root
 
 
-def test_the_rate_limit_is_off_by_default(tmp_path):
-    assert 'MIN_APPLY="${TTDEV_MIN_APPLY_INTERVAL_SEC:-0}"' in _SCRIPT.read_text()
+def test_the_rate_limit_is_on_by_default_at_1800s(tmp_path):
+    assert 'MIN_APPLY="${TTDEV_MIN_APPLY_INTERVAL_SEC:-1800}"' in _SCRIPT.read_text()
     _lap(tmp_path, now=1000, sha="a1")
-    _, restarts, _ = _lap(tmp_path, now=1001, sha="b2")
+    done, restarts, _ = _lap(tmp_path, now=1060, sha="b2")
+    assert restarts == ["1000 a1"], done.stderr
+    assert "(min 1800s); b2 applies in 1740s" in done.stderr, done.stderr
+    _, restarts, _ = _lap(tmp_path, now=2800, sha="b2")
+    assert restarts == ["1000 a1", "2800 b2"]
+
+
+def test_an_interval_of_0_turns_the_rate_limit_off(tmp_path):
+    _lap(tmp_path, now=1000, sha="a1", interval=0)
+    _, restarts, _ = _lap(tmp_path, now=1001, sha="b2", interval=0)
     assert restarts == ["1000 a1", "1001 b2"]
+
+
+def test_a_push_burst_under_the_default_is_paced_to_one_restart_per_interval(tmp_path):
+    # Nine pushes over about two hours, a lap a minute, no interval configured: one restart per
+    # 1800 s at most, each onto the newest sha, and the last push still applies.
+    t0 = 1_700_000_000
+    pushes = [t0 + m * 60 for m in (0, 8, 15, 31, 47, 60, 79, 95, 128)]
+    sha = None
+    for now in range(t0, pushes[-1] + 1800 + 120, 60):
+        sha = f"s{sum(p <= now for p in pushes)}"
+        _, restarts, _ = _lap(tmp_path, now=now, sha=sha)
+    assert restarts[-1].endswith(f" {sha}"), restarts
+    # The first push applies at once; the rest wait out the interval: 6 restarts, not 9.
+    assert len(restarts) <= 1 + -(-(pushes[-1] - t0) // 1800) == 6, restarts
+    times = [int(r.split()[0]) for r in restarts]
+    assert all(b - a >= 1800 for a, b in zip(times, times[1:])), restarts
 
 
 def test_a_burst_of_pushes_becomes_one_restart_onto_the_newest_sha(tmp_path):
@@ -94,6 +124,17 @@ def test_the_wait_names_the_time_left(tmp_path):
     _lap(tmp_path, now=5000, sha="a1", interval=3600)
     done, _, _ = _lap(tmp_path, now=5600, sha="b2", interval=3600)
     assert "last apply 600s ago (min 3600s); b2 applies in 3000s" in done.stderr, done.stderr
+
+
+def test_a_rate_limited_lap_logs_its_deferral(tmp_path):
+    """Spec 08 I22: the rate limit's deferral is a decision like any other, logged with its gate and
+    its deadline; the apply that set the stamp is logged as applied."""
+    _lap(tmp_path, now=5000, sha="a1", interval=3600)
+    _lap(tmp_path, now=5600, sha="b2", interval=3600)
+    log = (tmp_path / "logs" / "autoupdate.log").read_text().splitlines()
+    assert len(log) == 2 and "decision=applied" in log[0] and "new=a1" in log[0], log
+    assert "decision=deferred" in log[1] and "new=b2" in log[1], log
+    assert "reason=apply rate limit: last apply 600s ago (min 3600s); apply_by=" in log[1], log
 
 
 def test_no_stamp_a_bad_stamp_or_a_future_stamp_bars_nothing(tmp_path):
@@ -145,6 +186,15 @@ _BROKEN = {
 def test_a_broken_broker_applies_a_new_sha_inside_the_interval(tmp_path, state):
     _lap(tmp_path, now=10_000, sha="a1", interval=3600)
     done, restarts, _ = _lap(tmp_path, now=10_060, sha="b2", interval=3600, **_BROKEN[state])
+    assert restarts == ["10000 a1", "10060 b2"], done.stderr
+    assert "rate limit skipped: the broker" in done.stderr and "b2 applies now" in done.stderr, done.stderr
+
+
+@pytest.mark.parametrize("state", sorted(_BROKEN))
+def test_a_broken_broker_applies_at_once_under_the_default_interval(tmp_path, state):
+    # The default is on, so a fix for a broken broker must not wait for it either.
+    _lap(tmp_path, now=10_000, sha="a1")
+    done, restarts, _ = _lap(tmp_path, now=10_060, sha="b2", **_BROKEN[state])
     assert restarts == ["10000 a1", "10060 b2"], done.stderr
     assert "rate limit skipped: the broker" in done.stderr and "b2 applies now" in done.stderr, done.stderr
 
@@ -221,6 +271,12 @@ def test_a_startup_check_past_its_bound_or_held_applies_at_once(tmp_path, monkey
     done, restarts, _ = _lap(tmp_path, now=t, sha="b2", interval=3600, health=health)
     assert restarts == ["10000 a1", f"{t} b2"], done.stderr
     assert "rate limit skipped: the broker" in done.stderr and "b2 applies now" in done.stderr, done.stderr
+    # The same under the default interval, which is longer than the bound.
+    assert _startup_bound() < 1800
+    (tmp_path / "default").mkdir()
+    _lap(tmp_path / "default", now=10_000, sha="a1")
+    done, restarts, _ = _lap(tmp_path / "default", now=t, sha="b2", health=health)
+    assert restarts == ["10000 a1", f"{t} b2"], done.stderr
 
 
 def test_the_crash_loop_baseline_is_the_count_after_the_last_apply(tmp_path):

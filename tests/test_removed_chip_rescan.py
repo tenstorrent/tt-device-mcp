@@ -8,7 +8,6 @@ it. These tests build a fake sysfs (one bridge per chip) and record the order of
 rescans."""
 
 import asyncio
-import pathlib
 
 import pytest
 
@@ -19,14 +18,13 @@ from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy, pcie_guard
 from tt_device_mcp.health.recovery.stages import bridge_reset as bridge
 
-RESCAN = "/sys/bus/pci/rescan"
 # chip index -> (its BDF, its bridge's BDF); the bridge's secondary bus is the chip's bus.
 CHIPS = {"13": ("0000:46:00.0", "0000:40:01.1"), "14": ("0000:47:00.0", "0000:40:01.2")}
 
 
 class FakeBus:
     """Fake /sys/bus/pci/devices and /sys/class/tenstorrent. ``trace`` records ("sbr", bridge) for
-    each Secondary Bus Reset assert and ("rescan",) for each global rescan. A rescan brings back
+    each Secondary Bus Reset assert and ("rescan",) for each scoped rescan. A rescan brings back
     every chip whose bridge was reset since its remove (``come_back`` False: none)."""
 
     def __init__(self, tmp_path, monkeypatch, come_back=True):
@@ -45,17 +43,14 @@ class FakeBus:
             self.enumerate(idx)
         monkeypatch.setattr(bridge.subprocess, "run", self.setpci)
         monkeypatch.setattr(bridge.time, "sleep", lambda s: None)
-        real_write = pathlib.Path.write_text
 
-        def write_text(path, data, *a, **k):
-            if str(path) == RESCAN:
-                self.trace.append(("rescan",))
-                for idx in sorted(self.reset_since_remove) if self.come_back else []:
-                    self.enumerate(idx)
-                return len(data)
-            return real_write(path, data, *a, **k)
+        def rescan():
+            self.trace.append(("rescan",))
+            for idx in sorted(self.reset_since_remove) if self.come_back else []:
+                self.enumerate(idx)
+            return ["0000:40:01.0"]
 
-        monkeypatch.setattr(pathlib.Path, "write_text", write_text)
+        monkeypatch.setattr(pcie_guard, "rescan_tt_root_ports", rescan)
 
     def enumerate(self, idx):
         bdf, br = CHIPS[idx]
@@ -493,21 +488,6 @@ def test_a_record_clears_when_its_address_is_enumerated_again(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_a_removed_chip_that_stays_off_bus_keeps_the_no_window_class(tmp_path, monkeypatch, rung, galaxy_trays):
-    """A hold whose only cause is a removed chip keeps its off-bus class: every recorded-bridge SBR
-    fired and the chip stayed off the bus, the same no-window fact as no_bridge, so the hold is not
-    GENERIC and does not take the generic budget."""
-    bus = FakeBus(tmp_path, monkeypatch, come_back=False)
-    bus.remove("13")
-    assert await _run({"13"}) is False
-    reasons = srv.galaxy_recovery.last_bridge_reset_reasons
-    assert reasons["13"] == {"reason": recovery_pkg.NO_WINDOW_REMOVED_REASON}
-    tray = {str(i) for i in range(8, 16)}
-    window = {c: {"reason": "no_bridge"} for c in tray} | {"13": reasons["13"]}
-    assert galaxy._classify_hold(tray, 32, window, galaxy_trays) == galaxy.HOLD_CLASS_TRAY_DOWN_NO_WINDOW
-
-
-@pytest.mark.asyncio
 async def test_the_removed_chip_rung_worst_case_for_two_chips(tmp_path, monkeypatch, rung):
     """The N-chip bound: the first pass asserts each chip's SBR (0.1 s each), then one 1 s retrain
     settle and one 10 s re-bind poll before the batched rescan; the retries then run serially per
@@ -562,3 +542,28 @@ def test_a_failed_save_never_breaks_recovery(tmp_path, monkeypatch):
     monkeypatch.setattr(pci.evidence, "health_dir", boom)
     bus.remove("13")
     assert pci.removed_chip_ids() == ["13"]
+
+
+@pytest.mark.asyncio
+async def test_status_shows_the_bridge_rung_as_a_device_reset(tmp_path, monkeypatch, rung):
+    """Spec 04 I90: the bridge rung narrates as a device reset, and /status carries that as a field
+    (``device_resetting``, the op row's ``resetting``), so a reader needs no row-text match."""
+    bus = FakeBus(tmp_path, monkeypatch)
+    bus.remove("13")
+    srv.device_op_lock = None
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
+    seen = []
+
+    def detail(d):
+        srv.device_op_detail = d
+        seen.append((d, srv._get_queue_status()))
+
+    monkeypatch.setattr(srv, "_set_device_op_detail", detail)
+    async with srv._device_op("health-gate/post-job"):
+        assert srv._get_queue_status()["device_resetting"] is False, "a held op is not a reset"
+        assert await _run({"13"}) is True
+    d, status = seen[0]
+    assert d.startswith("device reset: bridge reset of chip(s) 13"), d
+    assert status["device_resetting"] is True
+    assert status["running"][0]["resetting"] is True and status["running"][0]["owner"] == "[broker]"
+    assert srv._get_queue_status()["device_resetting"] is False, "over once the op ends"

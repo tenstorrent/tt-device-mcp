@@ -317,8 +317,15 @@ case "$drc" in
     137) save_to_last "$DOUT"
          log "dispatch probe last output: $(grep -vE '^\s*$' "$DOUT" | sed -n '$p' | cut -c1-160)"
          cannot_check "dispatch probe hit its ${DTMO}s cap without a verdict (typical is 14s)" ;;
-    *)   reason="$(grep -m1 -oE 'Timed out.*|TT_THROW.*|what\(\):.*|terminate called.*' "$DOUT")"
+    *)   # what() carries the cause; "terminate called" sits above it and names only the type.
+         reason=""
+         for pat in 'what\(\):.*' 'TT_THROW.*' 'Timed out.*' 'terminate called.*'; do
+             reason="$(grep -m1 -oE "$pat" "$DOUT")"
+             [ -n "$reason" ] && break
+         done
          grep -vE '^\s*$' "$DOUT" | sed -n '1,40p' | sed 's/^/fabric-check|  /' >&2
+         echo "fabric-check|  ... last 20 lines:" >&2
+         grep -vE '^\s*$' "$DOUT" | tail -n 20 | sed 's/^/fabric-check|  /' >&2
          save_to_last "$DOUT"
          log "the bus and the links are fine and the mesh still cannot run a program -> UNHEALTHY, the broker will reset"
          log "dispatch FAILED on a green fabric (rc=$drc)${reason:+: $reason}"

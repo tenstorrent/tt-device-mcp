@@ -5,8 +5,8 @@
 # Build the fabric validator from the pinned tt-metal commit (deploy/fabric-validator.pin)
 # and publish it under /opt, so every host validates its fabric with identical code.
 #
-# Idempotent and SHA-keyed: each pin gets its own prefix, and `current` flips to it only
-# once the build succeeds. Re-running for an already-built pin is a no-op, so the reconcile
+# Idempotent and SHA-keyed: each pin gets its own prefix (and a second slot beside it for a
+# repair under a live `current`), and `current` flips to it only once the build succeeds. Re-running for an already-built pin is a no-op, so the reconcile
 # timer can call this freely.
 #
 # Runs OUT OF BAND (a systemd oneshot), never inside the health gate or the auto-updater:
@@ -41,31 +41,72 @@ if ! flock -n 9; then
     exit 0
 fi
 
-# Both binaries, or this prefix is not done. Checking only the validator would leave a host that
+# All three binaries, or a prefix is not done. Checking only the validator would leave a host that
 # was built before the dispatch probe existed reporting "already built" forever, and the fabric
 # check silently skipping its dispatch stage.
-if [ -x "$PREFIX/$TTDEV_VALIDATOR_BIN_REL" ] && [ -x "$PREFIX/$TTDEV_DISPATCH_BIN_REL" ] \
-        && [ -x "$PREFIX/$TTDEV_PREJOB_DISPATCH_BIN_REL" ]; then
-    # Already built for this pin. Make sure `current` points at it (a previous run could
-    # have died between the build and the symlink flip) and stop.
-    ln -sfn "$PREFIX" "$CURRENT.tmp" && mv -Tf "$CURRENT.tmp" "$CURRENT"
-    log "pin $SHA already built at $PREFIX"
+built() {
+    [ -x "$1/$TTDEV_VALIDATOR_BIN_REL" ] && [ -x "$1/$TTDEV_DISPATCH_BIN_REL" ] \
+        && [ -x "$1/$TTDEV_PREJOB_DISPATCH_BIN_REL" ]
+}
+# Flip atomically, so a health check can never observe a half-built prefix.
+flip() { ln -sfn "$1" "$CURRENT.tmp" && mv -Tf "$CURRENT.tmp" "$CURRENT"; }
+
+# Spec 08 I27: each pin has two build slots, $SHA and $SHA.build, and a build only ever runs in the
+# slot `current` does not point at. A built tree cannot be renamed into place afterwards (its RPATH
+# and runtime root are absolute paths into the tree it was built in), so the slot is its final path.
+# A same-pin repair therefore builds beside the live prefix, never in it: the fabric checks keep the
+# old tree until the flip.
+# Slots are told apart by resolved path, not by the link's text: a root spelled differently from
+# the run that wrote `current` (a trailing slash, a symlinked parent) must still find the live slot,
+# or the build below would land in it. LIVE keeps this run's spelling for the comparisons below.
+LIVE=""
+CUR_REAL=""
+if [ -e "$CURRENT" ]; then
+    CUR_REAL="$(readlink -f -- "$CURRENT")" || CUR_REAL=""
+    [ -n "$CUR_REAL" ] || { log "cannot resolve live $CURRENT; refusing to build"; exit 1; }
+    for slot in "$PREFIX" "$PREFIX.build"; do
+        if [ "$CUR_REAL" = "$(readlink -m -- "$slot")" ]; then LIVE="$slot"; fi
+    done
+fi
+for slot in ${LIVE:+"$LIVE"} "$PREFIX" "$PREFIX.build"; do
+    built "$slot" || continue
+    if [ "$slot" != "$LIVE" ]; then
+        # Already built for this pin. Make sure `current` points at it (a previous run could
+        # have died between the build and the symlink flip) and stop.
+        flip "$slot"
+    elif [ $(( $(date +%s) - $(stat -c %Y "$CURRENT") )) -ge 3600 ]; then
+        # Live for an hour (the link's own mtime is its last flip), far longer than any fabric
+        # check, so no check still runs from the other slot: a stale repair source, removed.
+        for other in "$PREFIX" "$PREFIX.build"; do
+            [ "$other" = "$slot" ] || rm -rf "$other"
+        done
+    fi
+    log "pin $SHA already built at $slot"
     exit 0
+done
+if [ "$LIVE" = "$PREFIX" ]; then BUILD="$PREFIX.build"; else BUILD="$PREFIX"; fi
+# The live tree must never be the build slot or inside it, whatever `current` points at.
+BUILD_REAL="$(readlink -m -- "$BUILD")"
+case "$CUR_REAL" in
+    "$BUILD_REAL" | "$BUILD_REAL"/*)
+        log "live $CURRENT resolves into build slot $BUILD; refusing to build over it"
+        exit 1
+        ;;
+esac
+
+log "building validator from tt-metal $SHA in $BUILD (this takes tens of minutes; the fabric check reports CANNOT CHECK until it lands)"
+
+if [ ! -d "$BUILD/.git" ]; then
+    rm -rf "$BUILD"
+    mkdir -p "$BUILD"
+    git -C "$BUILD" init -q
+    git -C "$BUILD" remote add origin "$TTDEV_VALIDATOR_REPO"
 fi
+git -C "$BUILD" fetch -q --depth 1 origin "$SHA"
+git -C "$BUILD" checkout -q --detach FETCH_HEAD
+git -C "$BUILD" submodule update -q --init --recursive --depth 1
 
-log "building validator from tt-metal $SHA (this takes tens of minutes; the fabric check reports CANNOT CHECK until it lands)"
-
-if [ ! -d "$PREFIX/.git" ]; then
-    rm -rf "$PREFIX"
-    mkdir -p "$PREFIX"
-    git -C "$PREFIX" init -q
-    git -C "$PREFIX" remote add origin "$TTDEV_VALIDATOR_REPO"
-fi
-git -C "$PREFIX" fetch -q --depth 1 origin "$SHA"
-git -C "$PREFIX" checkout -q --detach FETCH_HEAD
-git -C "$PREFIX" submodule update -q --init --recursive --depth 1
-
-TOOLCHAIN="$PREFIX/${TTDEV_VALIDATOR_TOOLCHAIN:?pin is missing TTDEV_VALIDATOR_TOOLCHAIN}"
+TOOLCHAIN="$BUILD/${TTDEV_VALIDATOR_TOOLCHAIN:?pin is missing TTDEV_VALIDATOR_TOOLCHAIN}"
 [ -f "$TOOLCHAIN" ] || { log "toolchain '$TOOLCHAIN' not in the checkout"; exit 1; }
 
 # Fail on a missing compiler here, with its name, rather than letting cmake fall back
@@ -81,7 +122,7 @@ done
 # because nothing ever re-downloads it. Likewise a failed configure leaves a CMakeCache
 # pinning the compiler it chose. Both caches are worthless without a build to show for
 # them, so a retry starts clean.
-rm -rf "$PREFIX/build" "$PREFIX/.cpmcache"
+rm -rf "$BUILD/build" "$BUILD/.cpmcache"
 # Ninja, not the cmake default. tt-metal builds its HALs as object libraries, and the
 # Unix Makefiles generator does not emit rules for their objects when you ask for one
 # target rather than `all` — the build dies on "No rule to make target wh_hal.cpp.o".
@@ -89,7 +130,7 @@ rm -rf "$PREFIX/build" "$PREFIX/.cpmcache"
 command -v ninja >/dev/null || { log "ninja is required to build tt-metal and is not installed"; exit 1; }
 # BUILD_PROGRAMMING_EXAMPLES is off by default and the dispatch probe is one of them: without it
 # the target is not configured at all and the build fails with "no rule to make target".
-cmake -S "$PREFIX" -B "$PREFIX/build" -G Ninja \
+cmake -S "$BUILD" -B "$BUILD/build" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
     -DBUILD_PROGRAMMING_EXAMPLES=ON \
     -DCMAKE_BUILD_TYPE=Release >&2
@@ -100,22 +141,21 @@ cmake -S "$PREFIX" -B "$PREFIX/build" -G Ninja \
 # checkout dies with "unable to open output file .../erisc-b0-kernel.ld". A tree that
 # has been built before already has the directory and never sees this, which is why it
 # reproduces only here. Create what the build is about to write into.
-archs="$(sed -n '/^set(ARCHS/,/^)/p' "$PREFIX/tt_metal/hw/CMakeLists.txt" | sed -n 's/^[[:space:]]\{1,\}\([a-z0-9_]\{1,\}\)[[:space:]]*$/\1/p')"
+archs="$(sed -n '/^set(ARCHS/,/^)/p' "$BUILD/tt_metal/hw/CMakeLists.txt" | sed -n 's/^[[:space:]]\{1,\}\([a-z0-9_]\{1,\}\)[[:space:]]*$/\1/p')"
 [ -n "$archs" ] || { log "could not read ARCHS from tt_metal/hw/CMakeLists.txt"; exit 1; }
 for arch in $archs; do
-    mkdir -p "$PREFIX/runtime/hw/toolchain/$arch"
+    mkdir -p "$BUILD/runtime/hw/toolchain/$arch"
 done
 log "prepared runtime/hw/toolchain for: $(echo $archs | tr '\n' ' ')"
 
 # Named targets only — a full tt-metal build is far more than we need.
-cmake --build "$PREFIX/build" \
+cmake --build "$BUILD/build" \
     --target "$TTDEV_VALIDATOR_TARGET" "$TTDEV_DISPATCH_TARGET" "$TTDEV_PREJOB_DISPATCH_TARGET" \
     -j "$(nproc)" >&2
 
 for rel in "$TTDEV_VALIDATOR_BIN_REL" "$TTDEV_DISPATCH_BIN_REL" "$TTDEV_PREJOB_DISPATCH_BIN_REL"; do
-    [ -x "$PREFIX/$rel" ] || { log "build finished but $rel is missing"; exit 1; }
+    [ -x "$BUILD/$rel" ] || { log "build finished but $rel is missing"; exit 1; }
 done
 
-# Flip atomically, so a health check can never observe a half-built prefix.
-ln -sfn "$PREFIX" "$CURRENT.tmp" && mv -Tf "$CURRENT.tmp" "$CURRENT"
+flip "$BUILD"
 log "validator ready: $CURRENT/$TTDEV_VALIDATOR_BIN_REL (tt-metal $SHA)"

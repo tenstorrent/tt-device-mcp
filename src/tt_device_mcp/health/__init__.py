@@ -47,6 +47,7 @@ from tt_device_mcp.health.evidence import (
     read_health_events,
 )
 from tt_device_mcp.health.monitor import (
+    FABRIC_KILLED_BY_ISOLATION,
     HealthMonitor,
     _normalized_board,
     eth_read_timed_out,
@@ -65,6 +66,7 @@ from tt_device_mcp.health.monitors.heartbeat import (
     ALL_ONES,
     arc_not_ready_chips,
     dead_chips,
+    enodata_presence,
     heartbeat_supported,
     heartbeat_verdict,
     offbus_chip_ids,
@@ -75,7 +77,12 @@ from tt_device_mcp.health.monitors.heartbeat import (
 
 # The host-software version floors the startup preflight reports. Sysfs reads only, so the
 # preflight can assert them without spawning anything or touching a device.
-from tt_device_mcp.health.monitors.hostpci import hugepages_shortfall, version_floor_warnings
+from tt_device_mcp.health.monitors.hostpci import (
+    CONFIG_UNREADABLE,
+    hugepages_shortfall,
+    link_down,
+    version_floor_warnings,
+)
 
 # The tt-smi/sysfs telemetry-sampler primitives server.py's own polling loop runs directly.
 from tt_device_mcp.health.monitors.pci import (
@@ -97,8 +104,13 @@ from tt_device_mcp.health.monitors.pci import (
 
 # The post-reset fabric debt (spec 04 I32): every reset path and broker start marks it owed, and
 # server.py's release funnel and the gate read it to hold fabric-unverified until a pass settles it.
+# The one in-flight PCI sysfs writer and its PCI-wedged latch (spec 04 I76): server.py wires the latch
+# to the hold and the power-cycle request, and clears it only on a verified lift; telemetry.py's
+# dead-chip valve skips chips while it is set and removes chips only through it.
+from tt_device_mcp.health.pci_writer import PCI_WRITER, PciWedged
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (
+    BELOW_FLOOR,
     BLOCKED,
     DEFER,
     HOLD_FABRIC_UNVERIFIED,
@@ -120,6 +132,7 @@ from tt_device_mcp.health.recovery import select_recovery as _select_recovery  #
 from tt_device_mcp.health.recovery.base import (
     HOLD_ESCALATION_REARM_SEC,
     RESET_COOLDOWN_SEC,
+    RESET_SCOPE_PREFIX,
     RecoveryMechanism,
     host_action_pending_sec,
     mesh_hold_repage_sec,
@@ -144,7 +157,6 @@ from tt_device_mcp.health.recovery.galaxy import (
     _reboot_min_dead_chips,
     _stuck_hold_ceiling_sec,
     _ubb_bus_id_tables,
-    _ubb_reset_enabled,
 )
 from tt_device_mcp.health.recovery.pcie_guard import pcie_guard_at_start
 from tt_device_mcp.health.recovery.per_target import PerTargetRecovery
@@ -162,6 +174,9 @@ from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle
 from tt_device_mcp.health.shutdown import note_broker_stopping
 
 __all__ = [
+    # the one in-flight PCI sysfs writer and its PCI-wedged latch (spec 04 I76)
+    "PCI_WRITER",
+    "PciWedged",
     # the /health hold report (spec 03 I72, spec 04 I75) and the read-only probes it is fed
     "hold_report",
     "_normalized_board",
@@ -175,6 +190,7 @@ __all__ = [
     "CEILING",
     # construction pieces ServerFsm.boot assembles into the process singletons
     "HealthMonitor",
+    "FABRIC_KILLED_BY_ISOLATION",  # spec 03 I82: the gate holds a pass the isolation killed dirty
     "journal_interrupted_fabric_check",
     "note_broker_stopping",
     "eth_read_timed_out",  # spec 03 I61: the stuck eth read the post-job present-mesh reset answers
@@ -206,6 +222,9 @@ __all__ = [
     "chip_state",
     "dead_chips",
     "arc_not_ready_chips",
+    "enodata_presence",
+    "CONFIG_UNREADABLE",
+    "link_down",
     "offbus_chip_ids",
     "offbus_count",
     "returned_chips",
@@ -234,6 +253,8 @@ __all__ = [
     "RESET_MODE_TARGET",
     "HOLD_ESCALATION_REARM_SEC",
     "RESET_COOLDOWN_SEC",
+    # the reset's own systemd scope prefix: the in-flight reader cut never kills it (spec 03 I83)
+    "RESET_SCOPE_PREFIX",
     "_declared_reset_mode",
     # how often a standing hardware-fault hold is paged again (spec 03 I42)
     "mesh_hold_repage_sec",
@@ -248,6 +269,7 @@ __all__ = [
     "DEFER",
     "RELEASE",
     "HOLD_FABRIC_UNVERIFIED",
+    "BELOW_FLOOR",
     "BLOCKED",
     # Galaxy escalation ladder: the thresholds and vocabulary the gate reads around the router's
     # decisions
@@ -259,7 +281,6 @@ __all__ = [
     "_present_mesh_reset_grace_sec",
     "_reboot_min_dead_chips",
     "_stuck_hold_ceiling_sec",
-    "_ubb_reset_enabled",
     "bridge_reset_enabled",
     "bridge_reset_unavailable_reason",
     "gone_chip_bridge_reset_enabled",

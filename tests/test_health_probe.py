@@ -446,19 +446,21 @@ def test_device_op_lock_reads_the_broker_inhibit_file(tmp_path, monkeypatch):
 def test_the_broker_device_op_flock_is_tested_and_the_rescan_written_under_it(tmp_path, monkeypatch):
     import fcntl
 
+    from tt_device_mcp.health.recovery import pcie_guard
+
+    rescans: list = []
+    monkeypatch.setattr(pcie_guard, "rescan_tt_root_ports", lambda: rescans.append(1) or ["0000:00:01.0"])
     p = hp.Probe(tmp_path)
-    p.rescan_path.parent.mkdir(parents=True)
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", str(tmp_path / "device-op.lock"))
     monkeypatch.delenv("TT_DEVICE_MCP_DEVICE_OP_FLOCK", raising=False)
     flock = tmp_path / "device-op.flock"  # the broker's default: a sibling of the inhibit file
     assert p.device_op_lock() is None and p.rescan() is True  # no lock on offer (older broker)
-    assert p.rescan_path.read_text() == "1"
-    p.rescan_path.unlink()
+    assert rescans == [1]
     flock.touch()
     held = os.open(flock, os.O_RDONLY)
     fcntl.flock(held, fcntl.LOCK_EX)  # a broker device op in flight
     assert p.device_op_lock() == "unnamed (device-op flock held)"
-    assert p.rescan() is False and not p.rescan_path.exists()
+    assert p.rescan() is False and rescans == [1]
     (tmp_path / "device-op.lock").write_text("999999 galaxy_reset\n")  # a killed broker's file
     assert p.device_op_lock() == "unnamed (device-op flock held)"  # the flock still counts
     os.close(held)

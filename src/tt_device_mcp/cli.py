@@ -25,6 +25,7 @@ import json
 import os
 import pwd
 import queue
+import shlex
 import signal
 import subprocess
 import sys
@@ -42,6 +43,7 @@ from tt_device_mcp.constants import (
     PRE_STEP_DEADLINE_DEFAULT_SEC,
     PRE_STEP_DEADLINE_ENV,
     PREEMPT_GRACE_SEC,
+    PREEMPT_KILL_GRACE_SEC,
     RESET_STREAM_KEEPALIVE_LINE,
     resolve_socket,
     step_client_timeout_sec,
@@ -1222,7 +1224,9 @@ def _wait_and_stream(
             if result["status"] == "timeout" and result.get("hint"):
                 print(f"\n!! TIMED OUT after {result.get('timeout_sec')}s !!\n{result['hint']}")
             if result["status"] == "preempted":
-                print(f"\n!! PREEMPTED: another job was waiting past the {result.get('timeout_sec')}s limit !!")
+                print(
+                    f"\n!! PREEMPTED: another job waited {PREEMPT_GRACE_SEC}s past the {result.get('timeout_sec')}s limit !!"
+                )
 
             # Show last N lines summary if requested
             if output_lines > 0 and all_output:
@@ -1361,6 +1365,7 @@ _UDEV_RULE = (
 _LOCK_GROUP = "ttdev"
 _BROKER_UNIT = "/etc/systemd/system/tt-device-broker.service"
 _LOCK_BANNER = "/etc/profile.d/tt-device-mcp-banner.sh"
+_PROC_ROOT = "/proc"
 _LOCK_BANNER_TEXT = (
     'echo "*** Tenstorrent devices are LOCKED for fair sharing! Run device work via '
     "'tt-device-mcp run ...', smi via 'tt-device-mcp smi ...', etc. "
@@ -1387,20 +1392,67 @@ def _udev_reload() -> bool:
     return reload_rc == 0 and trigger_rc == 0
 
 
-def _set_service_device_group(enable: bool) -> None:
+def _configured_device_group() -> bool:
+    """True if the broker unit or one of its drop-ins already sets
+    ``TT_DEVICE_MCP_DEVICE_GROUP`` to the lock group."""
+    want = f"TT_DEVICE_MCP_DEVICE_GROUP={_LOCK_GROUP}"
+    paths = [Path(_BROKER_UNIT), *sorted(Path(_BROKER_UNIT + ".d").glob("*.conf"))]
+    for path in paths:
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        for ln in text.splitlines():
+            key, _, value = ln.strip().partition("=")
+            if key != "Environment":
+                continue
+            try:
+                assignments = shlex.split(value)
+            except ValueError:
+                continue
+            if want in assignments:
+                return True
+    return False
+
+
+def _broker_runs_with_device_group() -> bool:
+    """True if the running broker already carries the lock group in its env, or is not
+    running (it picks the env up when it starts). False when that can't be shown."""
+    show = subprocess.run(
+        ["systemctl", "show", "--property=MainPID", "--value", "tt-device-broker"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    pid = (show.stdout or "").strip()
+    if show.returncode != 0 or not pid.isdigit():
+        return False
+    if pid == "0":
+        return True
+    try:
+        env = Path(_PROC_ROOT, pid, "environ").read_bytes().split(b"\0")
+    except OSError:
+        return False
+    return f"TT_DEVICE_MCP_DEVICE_GROUP={_LOCK_GROUP}".encode() in env
+
+
+def _set_service_device_group(enable: bool) -> bool:
     """Add/remove ``Environment=TT_DEVICE_MCP_DEVICE_GROUP=ttdev`` in the broker unit
-    so privsep jobs run with gid=ttdev (DAC access to the locked node); daemon-reload."""
+    so privsep jobs run with gid=ttdev (DAC access to the locked node); daemon-reload.
+    Returns True only if it changed the unit. Enabling is a no-op when the unit or a
+    drop-in already sets the group."""
     text = Path(_BROKER_UNIT).read_text()
     has = "TT_DEVICE_MCP_DEVICE_GROUP" in text
     line = f"Environment=TT_DEVICE_MCP_DEVICE_GROUP={_LOCK_GROUP}\n"
-    if enable and not has:
+    if enable and not has and not _configured_device_group():
         text = text.replace("Environment=TT_DEVICE_MCP_PRIVSEP=1\n", "Environment=TT_DEVICE_MCP_PRIVSEP=1\n" + line, 1)
     elif not enable and has:
         text = "".join(ln for ln in text.splitlines(keepends=True) if "TT_DEVICE_MCP_DEVICE_GROUP" not in ln)
     else:
-        return
+        return False
     Path(_BROKER_UNIT).write_text(text)
     subprocess.run(["systemctl", "daemon-reload"], check=False)
+    return True
 
 
 # Read-only tt-smi wrapper so `tt-device-mcp smi` works on a locked host: any user
@@ -1492,13 +1544,18 @@ def cmd_lock(args) -> int:
         return 1
     subprocess.run(["groupadd", "--system", _LOCK_GROUP], check=False, stderr=subprocess.DEVNULL)
     # Service env first: privsep jobs must already get gid=ttdev before the node locks.
-    _set_service_device_group(True)
-    restart_rc = subprocess.run(["systemctl", "restart", "tt-device-broker"], check=False).returncode
-    if restart_rc != 0:
-        print(
-            f"Warning: 'systemctl restart tt-device-broker' exited {restart_rc}; privsep jobs "
-            "may not hold gid=ttdev until it restarts — admitted device work can be denied."
-        )
+    # A restart reruns the startup gate (fabric pass included), so restart only when the
+    # broker's env actually changes — a repeat `lock` must leave a healthy broker alone.
+    changed = _set_service_device_group(True)
+    if not changed and _broker_runs_with_device_group():
+        print(f"Broker env already has TT_DEVICE_MCP_DEVICE_GROUP={_LOCK_GROUP} (already locked); not restarting it.")
+    else:
+        restart_rc = subprocess.run(["systemctl", "restart", "tt-device-broker"], check=False).returncode
+        if restart_rc != 0:
+            print(
+                f"Warning: 'systemctl restart tt-device-broker' exited {restart_rc}; privsep jobs "
+                "may not hold gid=ttdev until it restarts — admitted device work can be denied."
+            )
     Path(_UDEV_RULE_PATH).write_text(_UDEV_RULE)
     udev_ok = _udev_reload()
     if not udev_ok:
@@ -1681,8 +1738,11 @@ def cmd_refresh_banner(args) -> int:
 
 _NO_TIMEOUT_HELP = (
     f"No timeout except on contention: -t is the time limit, but while no other job waits the job "
-    f"is never stopped for time. Once the limit has passed and a job is waiting, it must shut down "
-    f"gracefully within {PREEMPT_GRACE_SEC}s (SIGINT, then SIGTERM) or be killed. Status shows "
+    f"is never stopped for time. Once the limit has passed and a job is waiting, it has "
+    f"{PREEMPT_GRACE_SEC}s to end itself (no signal is sent), then it gets SIGTERM and, "
+    f"{PREEMPT_KILL_GRACE_SEC}s later, SIGKILL. Returning 0 (on its own or on SIGTERM) means no "
+    f"check and no reset; ending cleanly on SIGTERM with another status gets the fast check; a "
+    f"SIGKILL means a device reset and the full check before the next job. Status shows "
     f"PREEMPTABLE <x>min, then PREEMPTING <s>s. You MUST watch the broker (tt-device-mcp status)."
 )
 

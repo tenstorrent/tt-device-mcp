@@ -5,6 +5,7 @@
 
 import asyncio
 import errno
+import fnmatch
 import os
 import shutil
 import subprocess
@@ -24,7 +25,7 @@ if str(src_path) not in sys.path:
 import tt_device_mcp.device_holders as device_holders
 import tt_device_mcp.job_reap as job_reap
 import tt_device_mcp.server as srv
-from tt_device_mcp import privileges
+from tt_device_mcp import pre_reset_scan, privileges
 from tt_device_mcp.fsm import ServerFsm
 from tt_device_mcp.health import bmc_capture, post_reset
 from tt_device_mcp.health import evidence as health
@@ -34,6 +35,7 @@ from tt_device_mcp.health.monitors import eth, heartbeat, pci
 from tt_device_mcp.health.recovery import RecoveryDeps, offbus_power_cycle, pcie_guard
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy as recovery_galaxy
+from tt_device_mcp.health.recovery.stages import power_cycle as power_cycle_stage
 from tt_device_mcp.server import (
     _ensure_async_primitives,
     _reset_for_testing,
@@ -82,6 +84,19 @@ def reset_removed_chip_records():
 
 
 @pytest.fixture(autouse=True)
+def reset_pci_writer():
+    """Clear the one in-flight PCI writer and its PCI-wedged latch (spec 04 I76) around every test."""
+    try:
+        from tt_device_mcp.health.pci_writer import PCI_WRITER
+    except ImportError:
+        yield
+        return
+    PCI_WRITER.reset_for_tests()
+    yield
+    PCI_WRITER.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def reset_broker_internal_pids():
     """Clear the broker-internal pid registry (spec 04 I59) around every test: a probe one test
     spawned through run_probe must not discount a holder in the next."""
@@ -104,6 +119,8 @@ def reset_host_action_state():
             return
         m.host_action_requested = None
         m._host_action_reset_refused = None
+        # The last mesh reset's per-process record (spec 04 I93): one test's reset does not space the next's sweep.
+        m.last_mesh_reset_run = None
 
     clear()
     yield
@@ -424,6 +441,12 @@ def _seal_real_hardware(monkeypatch, tmp_dirs):
     monkeypatch.setattr(srv, "_leftover_rung_stage", "")
     monkeypatch.setattr(srv, "_leftover_rung_detail", "")
     monkeypatch.setattr(srv, "_leftover_rung_task", None)
+    monkeypatch.setattr(srv, "_dead_chip_stuck", {})
+    monkeypatch.setattr(srv, "_dead_chip_stuck_seen", None)
+    monkeypatch.setattr(job_reap, "_outstanding_reads", {})
+    monkeypatch.setattr(srv, "_dead_chip_page_pending", None)
+    monkeypatch.setattr(srv, "_leftover_dead_chip", False)
+    monkeypatch.setattr(recovery_base, "_reenumerate_withheld_journaled", {})
     # The pollers a quiesce stopped and owes a restore. None: read again from the per-test health dir.
     monkeypatch.setattr(srv, "_pollers_to_restore", None)
     # The reset argv/mode env vars are read live (never cached), so an operator's own shell/CI
@@ -463,6 +486,18 @@ def _seal_real_hardware(monkeypatch, tmp_dirs):
     # is how three of them failed on a developer box mid-incident and nowhere else. A test
     # that means to exercise the guard patches this itself.
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
+    # Same hole for a job's own scope: _terminate_job asks systemd whether ttdev-job-<id>.scope
+    # is active. On a broker host whose live job shares a test job's id, the real answer is yes
+    # and the kill path goes to `systemctl kill` on the host's job. A test about scopes patches it.
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
+
+    # The pre-reset holder scan (spec 04 I92) walks /proc and signals the readers it finds. Unstubbed,
+    # a unit test's reset would scan this machine's real processes. Every reset here sees a clear
+    # scan; the scan's own tests drive it through its seams.
+    async def _clear_scan(**_kw):
+        return pre_reset_scan.PreResetScan()
+
+    monkeypatch.setattr(srv, "clear_device_readers", _clear_scan)
 
 
 def _redirect_probe_caches(monkeypatch, tmp_dirs, device_marked, session_root):
@@ -502,6 +537,17 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     _redirect_probe_caches(monkeypatch, tmp_dirs, device_marked, device_probe_cache_root)
     health_tmp = tmp_dirs.mktemp("health")
     monkeypatch.setattr(health, "HEALTH_DIR", health_tmp)
+    # Spec 04 I91: a mesh reset's BMC preflight runs `ipmitool mc info`; ipmitool is never spawned
+    # by the suite, so every test sees a healthy BMC unless it patches its own answer.
+    from tt_device_mcp.health.recovery import ipmi_guard
+
+    monkeypatch.setattr(
+        ipmi_guard,
+        "_run_mc_info",
+        lambda timeout: subprocess.CompletedProcess(
+            ["ipmitool", "mc", "info"], 0, "Firmware Revision : 0.05\nAux Firmware Rev Info : 0x23 0x00 0x00 0x00\n", ""
+        ),
+    )
     monkeypatch.setattr(heartbeat, "_heartbeat_supported", None)
     # raising=False so a base tree without the re-arm latch (a fails-on-base stash) still sets up.
     monkeypatch.setattr(heartbeat, "_heartbeat_absent_journaled", False, raising=False)
@@ -551,6 +597,9 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     from tt_device_mcp.health import chip_state
 
     chip_state.reset()
+    # The dead-chip valve's per-chip strikes: a strike left by an earlier test on the same worker
+    # marks a chip lost on its first all-ones sample in the next one.
+    monkeypatch.setattr(srv.sampler, "dead_chip_strikes", {})
     monkeypatch.setattr(srv, "_last_offbus_state", {})
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 0.0)
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", False)
@@ -564,8 +613,9 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     # A host reboot/power cycle a test requested (with a stub fire) must not suppress the NEXT
     # test's forced escalation. raising=False so a base tree without the marker still sets up.
     monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None, raising=False)
-    # A power cycle a test failed to launch must not hand the NEXT test's chooser the reboot (04 I10).
-    monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_unlaunched_at", None, raising=False)
+    # A failed-launch page a test sent must not leak into the NEXT test.
+    if srv.galaxy_recovery is not None:
+        monkeypatch.setattr(srv.galaxy_recovery, "_cycle_launch_paged", None, raising=False)
     monkeypatch.setattr(srv, "_host_action_suppressed_logged", None, raising=False)
     monkeypatch.setattr(srv, "last_fabric_check_monotonic", 0.0)
     # When the last job's device work ended, the anchor the inter-job cooldown measures from.
@@ -588,6 +638,8 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     # The startup gate task (spec 03 I75): left pending, a later test's startup hold would never escalate.
     monkeypatch.setattr(srv, "_startup_verify_task", None, raising=False)
     monkeypatch.setattr(srv, "_startup_verify_ready_at", None, raising=False)
+    monkeypatch.setattr(srv, "_startup_verify_started_wall", None, raising=False)
+    monkeypatch.setattr(srv, "_startup_verify_ready_wall", None, raising=False)
     monkeypatch.setattr(srv, "_startup_verify_deferral_logged", None, raising=False)
     # The 10-min hold bound's bookkeeping (spec 04 I76) is keyed by the episode's start stamp: two tests
     # that open a hold at the same fixed stamp would share one ladder record.
@@ -602,6 +654,10 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
         ("_hold_bound_denied_why", ""),
         ("_hold_bound_tenant_paged", ""),
         ("_hold_bound_tenant_blocker", None),
+        # The holders the dead-chip valve refused to kill (spec 03 I84), which the bound routes.
+        ("_kill_refused_pids", {}),
+        ("_kill_refused_job_pid", None),
+        ("_kill_refused_since", ""),
     ):
         monkeypatch.setattr(srv, name, value, raising=False)
     monkeypatch.setattr(srv, "post_job_gate_pending", False, raising=False)
@@ -619,6 +675,7 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     # The hung-chip poller stop's per-episode latch and its previous heartbeats, and the reset scope
     # the sampler saw still running (spec 03 I66), for the same reason.
     monkeypatch.setattr(srv.sampler, "pollers_stopped_for", frozenset(), raising=False)
+    monkeypatch.setattr(srv.sampler, "pollers_deferred_for", frozenset(), raising=False)
     monkeypatch.setattr(srv.sampler, "prev_beats", {}, raising=False)
     monkeypatch.setattr(srv.sampler, "scope_seen", False, raising=False)
     monkeypatch.setattr(srv, "_last_dispatch_recheck_at", None, raising=False)
@@ -628,9 +685,18 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     monkeypatch.setattr(srv, "_fabric_ok_retire_monotonic", 0.0)
     monkeypatch.setattr(srv, "_fabric_ok_retire_streak", 0)
     monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRY_SLEEP_SEC", 0.0)  # no real eth-training wait in tests
+    # Spec 04 I94: a chip a stubbed bridge reset brings back has a live ARC unless the test says not
+    # (tests/test_bridge_reset_arc_dead.py reads real fake-sysfs heartbeats).
+    monkeypatch.setattr(recovery_pkg, "arc_live_chips", lambda ids: sorted({str(i) for i in ids}, key=int))
     monkeypatch.setattr(
         recovery_galaxy, "_settle_before_host_rung_sec", lambda: 0
     )  # no real pre-host-rung settle in tests
+
+    async def _no_gap_sleep(seconds):
+        return None
+
+    # No real wait for the spaced second mesh reset (spec 04 I93); its tests move a fake clock instead.
+    monkeypatch.setattr(recovery_galaxy, "_mesh_reset_gap_sleep", _no_gap_sleep)
     monkeypatch.setattr(srv, "device_op_active", "")
     monkeypatch.setattr(srv, "device_op_detail", "")
     monkeypatch.setattr(srv, "device_op_owner", "[broker]", raising=False)
@@ -687,36 +753,15 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     # leaves its per-kind key set, which would suppress the NEXT test's expected notify warning.
     monkeypatch.setattr(srv, "_sd_notify_errors_logged", set(), raising=False)
 
-    # The suite must never actually reboot or power-cycle the box it runs on. Both rungs default ON
-    # (a ladder nobody armed is a ladder that ends in a permanent hold), so this pins them OFF
-    # explicitly — deleting the vars would now select the armed default and point every gate test at
-    # the real thing. The fires below stay loud tripwires so a test that DOES reach one fails instead
-    # of taking CI (or a dev box) down. A test exercising either path re-patches the fire itself.
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
+    # The suite must never actually power-cycle the box it runs on. The host rung defaults ON
+    # (a ladder nobody armed is a ladder that ends in a permanent hold), so this pins it OFF
+    # explicitly — deleting the var would select the armed default and point every gate test at
+    # the real thing. The fire below stays a loud tripwire so a test that DOES reach it fails instead
+    # of taking CI (or a dev box) down. A test exercising that path re-patches the fire itself.
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    # Same for the per-tray BMC reset: clear its opt-in so no test reaches the fire by accident, and
-    # make the real fire a loud tripwire so a test that DOES reach it fails rather than issuing real
-    # reset ioctls / ipmitool. A test exercising the tray-reset path re-patches _fire_ubb_reset itself.
-    monkeypatch.delenv("TT_DEVICE_MCP_AUTO_UBB_RESET", raising=False)
-    # A developer shell that opted the single-tray walk back in must not change what the suite tests.
-    monkeypatch.delenv("TT_DEVICE_MCP_UBB_SINGLE_TRAY_WALK", raising=False)
-    # The two pins above plus a test's own AUTO_UBB_RESET=0 would read as an operator outage hold and
-    # hold every mesh reset (spec 04 I28); arm it explicitly. A test of the hold deletes this.
+    # Arm the automatic mesh reset explicitly; only AUTO_MESH_RESET=0 is the outage hold (spec 04
+    # I28). A test of the hold sets it to 0.
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "1")
-
-    def _no_reboot_in_tests():
-        raise AssertionError("a test reached the real host reboot; _fire_host_reboot must be mocked")
-
-    monkeypatch.setattr(recovery_galaxy, "_fire_host_reboot", _no_reboot_in_tests)
-
-    def _no_ubb_reset_in_tests(*a, **k):
-        raise AssertionError("a test reached the real per-tray BMC reset; _fire_ubb_reset must be mocked")
-
-    monkeypatch.setattr(recovery_galaxy, "_fire_ubb_reset", _no_ubb_reset_in_tests, raising=False)
-    # A regressed tray walk disables the rung for the rest of the process: every test starts armed.
-    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_DISABLED", None)
-    monkeypatch.setattr(pcie_guard, "_TRAY_RUNG_PERSISTED", False, raising=False)
-    monkeypatch.setattr(pcie_guard, "_LAST_TRAY_PULSE", None, raising=False)
 
     # The bounded off-bus hold (spec 04 I27) runs a host-supplied power-cycle command: unset here, a
     # loud tripwire if reached anyway, and its per-process episode tracking starts empty per test.
@@ -726,6 +771,15 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
         raise AssertionError("a test reached the real off-bus power cycle; fire_command must be mocked")
 
     monkeypatch.setattr(offbus_power_cycle, "fire_command", _no_offbus_power_cycle_in_tests)
+    # The OS-first power cycle (spec 04 I88) reads the installed shutdown hook: on a box that has it,
+    # a test reaching the real fire would queue a reboot. Here it reads as not installed, and every
+    # step it would spawn is a loud tripwire; the I88 tests re-patch both.
+    monkeypatch.setattr(power_cycle_stage, "installed_shutdown_hook", lambda: "")
+
+    def _no_os_first_step_in_tests(*a, **k):
+        raise AssertionError("a test reached a real OS-first power-cycle step; _run_step must be mocked")
+
+    monkeypatch.setattr(power_cycle_stage, "_run_step", _no_os_first_step_in_tests)
     monkeypatch.setattr(offbus_power_cycle, "_pending", {})
 
     # The tray-down prelude (spec 04 I19) rescans the bus and reads the BMC: never the real sysfs
@@ -761,6 +815,39 @@ _DEVICE_ONLY_SPAWN = ("tt-smi", "systemd-run")
 # systemctl is both a read-only query (scope liveness, which several gate paths genuinely need) and
 # a way to stop the host's services. Only the mutating verbs are refused.
 _FORBIDDEN_SYSTEMCTL_VERBS = ("stop", "start", "restart", "reload", "enable", "disable", "mask", "kill")
+# The units a broker runs its jobs and direct execs in (spec 09 I10). On a broker host the live
+# broker's ttdev-job-<id>.scope can share its id with a test's job, so no test may reach them:
+# a query reads none live, an action or a systemd-run in that namespace is refused, marker or not.
+_BROKER_UNIT_SAMPLES = ("ttdev-job-1.scope", "ttdev-exec-1-1.scope")
+_READ_ONLY_SYSTEMCTL_VERBS = ("is-active", "is-failed", "is-enabled", "status", "show", "list-units", "cat")
+
+
+def _names_broker_unit(parts) -> bool:
+    """Whether a systemctl/systemd-run argv names a broker job or exec unit, a glob included."""
+    if not any(os.path.basename(p) in ("systemctl", "systemd-run") for p in parts):
+        return False
+    for tok in parts:
+        if tok.startswith("-"):
+            if "=" not in tok:
+                continue
+            tok = tok.split("=", 1)[1]
+        if "ttdev-job-" in tok or "ttdev-exec-" in tok:
+            return True
+        if any(ch in tok for ch in "*?[") and any(fnmatch.fnmatchcase(u, tok) for u in _BROKER_UNIT_SAMPLES):
+            return True
+    return False
+
+
+def _argv_parts(argv) -> list:
+    if isinstance(argv, (str, bytes)):
+        return (argv.decode() if isinstance(argv, bytes) else argv).split()
+    return [a.decode() if isinstance(a, bytes) else str(a) for a in argv]
+
+
+def _is_broker_unit_query(argv) -> bool:
+    """A read-only systemctl naming a broker unit: it runs, but never against the host (I10)."""
+    parts = _argv_parts(argv)
+    return _names_broker_unit(parts) and _spawn_is_forbidden(parts, allow_device_spawns=True) is None
 
 
 def _only_touches_device_pollers(parts, verb_at: int) -> bool:
@@ -779,20 +866,27 @@ def _only_touches_device_pollers(parts, verb_at: int) -> bool:
 
 def _spawn_is_forbidden(argv, allow_device_spawns: bool = False) -> "str | None":
     """The reason this spawn must not reach the kernel, or None when it is harmless."""
-    if isinstance(argv, (str, bytes)):
-        parts = (argv.decode() if isinstance(argv, bytes) else argv).split()
-    else:
-        parts = [a.decode() if isinstance(a, bytes) else str(a) for a in argv]
+    parts = _argv_parts(argv)
     if not parts:
         return None
+    broker_unit = _names_broker_unit(parts)
     for tok in parts:
         prog = os.path.basename(tok)
         if prog in _NEVER_SPAWN:
             return f"{prog} would reboot, power-cycle, or escape this test run"
+        if prog == "systemd-run" and broker_unit:
+            return "systemd-run would start a unit in the host broker's ttdev-job/ttdev-exec namespace"
         if prog in _DEVICE_ONLY_SPAWN and not allow_device_spawns:
             return f"{prog} touches the device; declare @pytest.mark.device or assert on the argv"
         if prog == "systemctl":
             at = parts.index(tok)
+            if broker_unit:
+                # Fail closed: on a broker unit only a known query verb runs (answered by the
+                # stand-in); every other verb, kill/stop or one not listed here, is refused.
+                rest = {os.path.basename(p) for p in parts[at + 1 :]}
+                if not rest & set(_READ_ONLY_SYSTEMCTL_VERBS) or rest & set(_FORBIDDEN_SYSTEMCTL_VERBS):
+                    return "systemctl would act on the host broker's live job or exec unit"
+                return None
             for offset, p in enumerate(parts[at + 1 :]):
                 v = os.path.basename(p)
                 if v in _FORBIDDEN_SYSTEMCTL_VERBS:
@@ -813,6 +907,13 @@ def _install_spawn_tripwire(monkeypatch, allow_device_spawns: bool = False):
 
     `allow_device_spawns` moves _DEVICE_ONLY_SPAWN from refused to permitted for a
     device-marked test. _NEVER_SPAWN and the mutating systemctl verbs are unaffected by it.
+
+    A read-only systemctl naming a broker job or exec unit (spec 09 I10) is not refused but
+    answered here, marker or not: it runs a stand-in that prints nothing and exits 3 (systemctl's
+    "inactive"), so every caller reads no such unit live and never the host broker's. A test that
+    means a live scope stubs the query (`srv._scope_active`, `srv.list_active_job_scopes`) or
+    `subprocess.run` itself. asyncio's subprocess transport spawns through Popen, so it is
+    answered the same way.
     """
 
     def _refuse(argv, kind):
@@ -828,6 +929,10 @@ def _install_spawn_tripwire(monkeypatch, allow_device_spawns: bool = False):
 
     def guarded_popen_init(self, args, *a, **k):
         _refuse(args, "subprocess.Popen")
+        if _is_broker_unit_query(args):
+            k.pop("executable", None)
+            a = a[:1] + (None,) + a[2:] if len(a) >= 2 else a
+            args = "exit 3" if k.get("shell") else ["/bin/sh", "-c", "exit 3"]
         return real_popen_init(self, args, *a, **k)
 
     real_exec = asyncio.create_subprocess_exec
@@ -901,7 +1006,7 @@ def health_deps():
     """A RecoveryDeps wired to tt_device_mcp.server's OWN module globals/functions via lambdas —
     the same late-bound pattern server.py uses for its own module-level ``recovery_mechanism`` and
     ``_recovery_deps`` — so a test that monkeypatches e.g. ``srv.health_monitor._board_types`` or
-    ``srv._auto_reboot_enabled`` still takes effect through a Recovery (or HealthMonitor) built
+    ``srv._auto_power_cycle_enabled`` still takes effect through a Recovery (or HealthMonitor) built
     from this fixture."""
     return RecoveryDeps(
         current_boot_id=lambda: srv._current_boot_id(),
@@ -912,7 +1017,6 @@ def health_deps():
         begin_action_row=lambda *a, **k: srv._begin_action_row(*a, **k),
         write_action_log=lambda *a, **k: srv.write_action_log(*a, **k),
         device_hold_episode_since=lambda: srv.device_hold_episode_since,
-        auto_reboot_enabled=lambda: srv._auto_reboot_enabled(),
         auto_power_cycle_enabled=lambda: srv._auto_power_cycle_enabled(),
         board_types_provider=lambda: srv.health_monitor._board_types,
         glx_board_types_provider=lambda: srv.health_monitor._glx_board_types(),
@@ -929,8 +1033,6 @@ def health_deps():
         device_hold_episode_escalated=lambda: srv.fsm.latch("escalated"),
         hold_escalation_latched=lambda: srv._hold_escalation_latched(),
         set_device_hold_episode_escalated=srv._set_hold_escalated,
-        device_hold_episode_ubb_reset_fired=lambda: srv.fsm.latch("ubb_reset_fired"),
-        set_device_hold_episode_ubb_reset_fired=lambda v: srv.fsm.set_latch("ubb_reset_fired", v),
         clear_device_reported_fault=lambda why: srv._clear_device_reported_fault(why),
         clear_device_dirty=lambda **kw: srv._clear_device_dirty(**kw),
         note_fabric_77_reset_passes=lambda n: srv._note_fabric_77_reset_passes(n),
@@ -1042,3 +1144,16 @@ def patch_recovery(monkeypatch, name: str, fn) -> None:
     (and ignore) ``self``."""
     monkeypatch.setattr(srv.galaxy_recovery, name, fn)
     monkeypatch.setattr(srv.per_target_recovery, name, fn)
+
+
+@pytest.fixture
+def armed_power_cycle(monkeypatch):
+    """The host rung (the BMC power cycle, spec 04 I71) armed with a recording stub fire: the list it
+    returns gets one entry per power cycle the broker fires. Nothing real is spawned."""
+    from tt_device_mcp import privileges
+
+    fired = []
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
+    monkeypatch.setattr(privileges, "can_ipmi", lambda: True)
+    monkeypatch.setattr(srv, "_fire_power_cycle", lambda: fired.append("power-cycle"))
+    return fired

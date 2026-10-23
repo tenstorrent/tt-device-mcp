@@ -23,6 +23,7 @@ from tests.test_eth_timeout_reset import mesh as eth_mesh  # noqa: F401  (fixtur
 from tests.test_fabric_topology_mismatch import _LOST
 from tests.test_post_reset_gate import mesh  # noqa: F401
 from tests.test_startup_fabric_hugepages import _bound
+from tt_device_mcp import alert
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import monitor as monitor_mod
@@ -31,6 +32,7 @@ from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.monitors import fabric
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import galaxy
+from tt_device_mcp.health.recovery import offbus_power_cycle as opc
 
 FABRIC = {
     "pass": {"ok": True, "detail": "fabric links healthy (53s)"},
@@ -156,6 +158,56 @@ async def test_a_down_off_bus_recheck_lifts_only_on_a_passing_full_check(
     _stub_verify(monkeypatch, verdict)
     await srv._attempt_down_offbus_recheck()
     assert srv.fsm.state is (ServerState.HEALTHY if verdict == "pass" else ServerState.DOWN)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdict", VERDICTS)
+async def test_a_handed_off_hold_with_no_power_cycle_lifts_only_on_a_passing_full_check(
+    monkeypatch, tmp_path, clear_job_state, verdict
+):
+    """No power cycle is opted in, the hold's one mesh reset ran and failed, and the hold went to an
+    operator, latched and paged once (spec 04 I33, I87), past the 10-min bound (I76). The hand-off
+    neither blocks nor loosens the lift: once the chips are back, the relift lifts it only on a full
+    check whose fabric passed on every cabled link. A failed check or a link short of the cabling keeps
+    the hold, its episode and its hand-off, fires no rung, and pages no more."""
+    _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
+    fsm_dirty(srv, "gate/post-job: 4/32 off-bus below the reset floor — held, not reset", why="off_bus")
+    monkeypatch.delenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", raising=False)
+    monkeypatch.setattr(srv, "_hugepages_shortfall", lambda: None)
+    _past_the_bound(monkeypatch)
+    episode = srv.device_hold_episode_since
+    monkeypatch.setattr(srv.recovery_mechanism, "mesh_reset_failed_since_release", True)
+    monkeypatch.setattr(srv.recovery_mechanism, "mesh_reset_failed_episode", episode)
+    assert srv.recovery_mechanism.mesh_reset_spent(episode)
+    alerts, resets, cycles = [], [], []
+    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: alerts.append(event))
+    monkeypatch.setattr(opc, "_pending", {})
+    opc.note_hold_handoff(episode, 4, 32, "mesh reset failed", lambda m: None, latched="no power cycle")
+
+    async def reset(indices, log):
+        resets.append(indices)
+        return True
+
+    async def power_cycle(log, reason):
+        cycles.append(reason)
+
+    patch_recovery(monkeypatch, "_reset_and_verify_device", reset)
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    _stub_verify(monkeypatch, verdict)
+
+    async def eth_unconfigured(timeout_sec=60.0):
+        return None, "skipped"
+
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_unconfigured)
+    for _ in range(2):  # a second pass pages nothing new and still fires no rung
+        srv.last_relift_monotonic = 0.0
+        await srv._attempt_idle_relift()
+    assert (srv.fsm.state is ServerState.HEALTHY) is (verdict == "pass")
+    assert resets == [] and cycles == [], "the relift fires no rung: no mesh reset, no power cycle"
+    assert [a["kind"] for a in alerts] == ["offbus_gated_hold_page"], "the hand-off pages once"
+    if verdict != "pass":
+        assert srv.fsm.record.why == "off_bus" and srv.device_hold_episode_since == episode
+        assert opc.hold_handoff_status(episode)["owner"] == "operator"
 
 
 @pytest.mark.asyncio
@@ -339,7 +391,6 @@ async def test_a_kill_reset_whose_full_check_still_finds_the_port_missing_never_
     I76) the ladder runs once more, its full check fails the same way, and the broker asks for exactly
     one power cycle. Nothing releases the device at any step."""
     wrapper["reset_heals"] = False
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = _stub_power_cycle(monkeypatch)
     fsm_dirty(srv, "job 7 ended timeout")
@@ -369,7 +420,6 @@ async def test_a_latched_topology_hold_whose_bound_ladder_leaves_the_port_missin
     ``fabric_known_fault``) and nothing releases the device."""
     mon = srv.health_monitor
     wrapper["reset_heals"] = False
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = _stub_power_cycle(monkeypatch)
     monkeypatch.setattr(mon, "topology_lift_pending", True)
@@ -478,7 +528,6 @@ async def test_a_reset_that_brings_the_port_back_releases_on_a_passing_verdict(w
     on the monitor's own fabric pass: the reset brings the cabled port back, the full check passes, and
     every release event carries that pass with no link short. No power cycle is asked for."""
     wrapper["reset_heals"] = True
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = _stub_power_cycle(monkeypatch)
     if path == "kill-reset":

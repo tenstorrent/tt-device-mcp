@@ -62,7 +62,9 @@ if TYPE_CHECKING:
 # A boot-attribution clause names how THIS boot came up; it must not ride forward on a long episode's
 # carried detail (an 18h-old reboot then reads as this boot's cause). Stripped on carry so only the
 # current boot's adjacency-guarded attribution, if any, is present. action may be hyphenated (power-cycle).
-_BOOT_ATTRIBUTION_RE = re.compile(r"\s*boot attributed to a broker-fired [\w-]+ recorded at \S+")
+_BOOT_ATTRIBUTION_RE = re.compile(
+    r"\s*boot attributed to a (?:broker-fired [\w-]+|warm reboot \([^)]*\)) recorded at \S+"
+)
 
 
 def _strip_boot_attribution(detail: str) -> str:
@@ -203,6 +205,12 @@ class ServerFsm:
         # startup_verify.readopted_job_ids reports them (server.py syncs it). Report-only: nothing in
         # the broker reads it back, so it never lifts a hold or skips a check. [] outside BOOT/RECOVERING.
         self._readopted_jobs: list[str] = []
+        # Spec 03 I76, report-only: while the startup gate owns the startup hold, when the gate began
+        # and the latest its check may end (ISO strings, deadline None while a re-adopted job runs),
+        # as /health's startup_verify reports them; None otherwise. fsm.json carries it as
+        # startup_check_in_progress / startup_check_started_at / startup_check_deadline. Nothing in
+        # the broker reads it back. Not loaded from the file: each broker start syncs it afresh.
+        self._startup_check: Optional[dict] = None
         # Whether _load restored an episode a previous boot wrote — see reopen_after_boot. One-shot.
         self._crossed_boot = False
         # Whether _load read a file this same boot wrote: an earlier broker of this boot already
@@ -420,6 +428,8 @@ class ServerFsm:
         self._crossed_boot = bool(file_boot_id) and bool(self._boot_id) and not same_boot
         self._loaded_same_boot = same_boot
         self._record = record
+        # A latch an older broker wrote for the removed BMC tray re-power rung means nothing now.
+        latches.pop("ubb_reset_fired", None)
         self._latches = latches
         # No job survives a reboot; within one boot the startup sync re-derives it from the live scopes.
         self._readopted_jobs = readopted if same_boot and record.state in _READOPT_STATES else []
@@ -431,6 +441,7 @@ class ServerFsm:
         Never raises: a durable record we could not write must not take the gate down with it."""
         if self._record.state not in _READOPT_STATES:
             self._readopted_jobs = []  # a release (HEALTHY) or DOWN ends the startup verify it reported
+            self._startup_check = None
         payload = {
             "state": self._record.state.value,
             "why": self._record.why,
@@ -440,6 +451,9 @@ class ServerFsm:
             "dirty": self._record.dirty,
             "latches": self._latches,
             "readopted_jobs": list(self._readopted_jobs),
+            "startup_check_in_progress": self._startup_check is not None,
+            "startup_check_started_at": (self._startup_check or {}).get("started_at"),
+            "startup_check_deadline": (self._startup_check or {}).get("deadline"),
             "boot_id": self._boot_id,
             # Not read back by anything in this class — purely so an operator staring at the raw
             # file can tell how stale it is without cross-referencing a log timestamp.
@@ -493,6 +507,23 @@ class ServerFsm:
         ids = [str(j) for j in job_ids] if self._record.state in _READOPT_STATES else []
         if ids != self._readopted_jobs:
             self._readopted_jobs = ids
+            self._persist()
+
+    @property
+    def startup_check_in_progress(self) -> bool:
+        """Spec 03 I76: whether the startup gate owns the startup hold right now. Report-only."""
+        return self._startup_check is not None and self._record.state in _READOPT_STATES
+
+    def set_startup_check(self, started_at: Optional[str], deadline: Optional[str], *, in_progress: bool) -> None:
+        """Record that the startup check is in progress, when it began and the latest it may end (spec
+        03 I76), or that it no longer is. Persists only on a change. Ignored outside BOOT/RECOVERING;
+        a release, DOWN or a fault hold (on_fault with any other why) clears it. Report-only: no gate,
+        hold, bound or escalation reads it."""
+        value = {"started_at": started_at, "deadline": deadline} if in_progress else None
+        if self._record.state not in _READOPT_STATES:
+            value = None
+        if value != self._startup_check:
+            self._startup_check = value
             self._persist()
 
     @property
@@ -608,6 +639,8 @@ class ServerFsm:
         replace it."""
         why = _validate_why(why) or "gate_error"
         self.fault_monotonic = time.monotonic()
+        if why != "startup_unverified":
+            self._startup_check = None  # spec 03 I76: a fault hold ends the startup check it reported
         if self._record.state in (ServerState.HEALTHY, ServerState.BOOT):
             self._open_episode(ServerState.RECOVERING, why, detail=detail, job=job, dirty=dirty)
         else:
@@ -653,7 +686,7 @@ class ServerFsm:
         back, spec 03 I52). That is right within one boot, where
         the ladder that took it there ran on this silicon; a reboot since is itself the biggest reset
         the ladder has, so a carried DOWN is a verdict about a boot that is gone. Only when the record
-        was loaded from another boot and is still DOWN: ``why`` and ``ubb_reset_fired`` stay, ``since``
+        was loaded from another boot and is still DOWN: ``why`` stays, ``since``
         starts over (the bound counts from this boot), ``dirty`` clears (the caller has just placed a
         no-reset hold) and the ``escalated`` latch drops so this boot's ladder is not pre-spent.
         Returns whether it reopened."""
@@ -706,8 +739,15 @@ class ServerFsm:
         if attributed_boot and not self.restarted_this_boot:
             action = attributed_boot.get("action", "?")
             at = attributed_boot.get("at", "?")
+            refuted = attributed_boot.get("cycle_refuted")
+            # Spec 04 I88: the BMC refuted the cycle, so this boot is a warm reboot, not a power cycle.
+            cause = (
+                f"warm reboot (the broker-fired {action} did not happen: BMC restart cause {refuted})"
+                if refuted
+                else f"broker-fired {action}"
+            )
             self._record.detail = (f"{self._record.detail} " if self._record.detail else "") + (
-                f"boot attributed to a broker-fired {action} recorded at {at}"
+                f"boot attributed to a {cause} recorded at {at}"
             )
         self._persist()
         return self._record.state

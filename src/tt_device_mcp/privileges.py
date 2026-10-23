@@ -22,11 +22,11 @@ import shutil
 from typing import Optional
 
 # What sd_booted(3) reads. Not `systemctl` on PATH: a restricted-PATH host still runs systemd, and
-# reading that as a container would silently drop the scoped-reset backend and the reboot rung.
+# reading that as a container would silently drop the scoped-reset backend and the power-cycle rung.
 SYSTEMD_DIR = "/run/systemd/system"
 
 # Where the kernel's IPMI driver puts the local BMC interface, in the spellings different distros
-# and driver versions use. `ipmitool raw` with no `-I lanplus` — the form both IPMI rungs issue —
+# and driver versions use. `ipmitool` with no `-I lanplus` — the form the cold rung issues —
 # reaches the BMC through one of these, so no openable node means no reachable BMC.
 IPMI_DEVICE_NODES = ("/dev/ipmi0", "/dev/ipmi/0", "/dev/ipmidev/0")
 
@@ -78,7 +78,7 @@ def is_root() -> bool:
 
 
 def has_systemd() -> bool:
-    """Whether systemd is running: a PID-1 reset scope and `systemctl reboot` both need it."""
+    """Whether systemd is running: a PID-1 reset scope needs it."""
     return _state()["systemd"]
 
 
