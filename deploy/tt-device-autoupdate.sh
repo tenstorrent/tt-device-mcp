@@ -240,8 +240,9 @@ fi
 # An in-flight device operation is an ABSOLUTE bar — not the bounded defer below.
 # Restarting the broker mid-reset lets KillMode=control-group SIGTERM the running
 # tt-smi, leaving 32 ASICs half-reset, which is the state that costs a power-cycle.
-# Unlike a long job, a device op is bounded (DEVICE_RESET_TIMEOUT_SEC), so waiting
-# it out can never starve the updater.
+# A device op is not bounded by the broker: a reset scope that outlives its timeout is
+# left running. So the waits below hold dispatch for an op at most OP_CAP, then let go
+# of it and leave the update to the next lap; never restart over one (wait_job_boundary).
 INHIBIT=/run/tt-device-broker/device-op.lock
 if [ -f "$INHIBIT" ]; then
     op_pid=""; op_name=""
@@ -364,6 +365,10 @@ fi
 # (preempt grace plus kill grace); until then the update waits, with no bound while nothing is queued. Only a device holder outside every broker job, which no broker
 # kill ends, stops holding the update at the bound, so a box busy around the clock still updates.
 JOB_CAP=1560
+# A device op's own bound, DEVICE_RESET_TIMEOUT_SEC (600) plus the same kill grace: how long an op
+# with no job running may keep the hold (see wait_job_boundary). It bounds the wait, never the
+# bar: past it the lap releases dispatch and restarts nothing (I7); the next lap retries.
+OP_CAP=660
 UPTIME=/proc/uptime
 count_busy() {
     local mp p uu q
@@ -409,22 +414,32 @@ youngest_job_age() {
 }
 # The device-op bar above, asked again while a drain waits: the broker can start a device op (a
 # gate pass, a reset) on its own while dispatch is held, and the apply must not restart over it.
-op_in_flight() {
+# op_lock_live: the broker itself runs the op (the device-op lock names a live pid), inside its own
+# cgroup, so a restart SIGTERMs it. reset_scope_listed: a ttdev-reset-* scope, its own systemd unit,
+# which a broker restart does not stop; a new broker's startup waits it out (await_foreign_scope)
+# before anything touches the device.
+op_lock_live() {
     local op_pid="" op_name=""
-    if [ -f "$INHIBIT" ]; then
-        read -r op_pid op_name < "$INHIBIT" 2>/dev/null || true
-        [ -n "${op_pid:-}" ] && kill -0 "$op_pid" 2>/dev/null && return 0
-    fi
+    [ -f "$INHIBIT" ] || return 1
+    read -r op_pid op_name < "$INHIBIT" 2>/dev/null || true
+    [ -n "${op_pid:-}" ] && kill -0 "$op_pid" 2>/dev/null
+}
+reset_scope_listed() {
     systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-reset-*' 2>/dev/null \
         | grep -q 'ttdev-reset-'
 }
+op_in_flight() { op_lock_live || reset_scope_listed; }
 # Wait, under the dispatch hold, for the job boundary: nothing running and no device op in flight.
-# Returns 0 there, 0 when the broker is down (a down broker protects no job by waiting, and the
-# restart is what starts it again), and 0 at JOB_CAP when only a device holder outside every broker
-# job is left; 1 at JOB_CAP when a broker job is still running or a device op is in flight. $1 names
+# Returns 0 there, 0 when the broker is down and runs no op of its own (a down broker protects no
+# job by waiting, and the restart is what starts it again; a reset scope outlives it in its own unit
+# and the new broker's startup waits that out before the queue opens), and 0 at JOB_CAP when only a
+# device holder outside every broker job is left; 1 at JOB_CAP when a broker job is still running or
+# a device op is in flight. A device op with no job running holds the wait for at most OP_CAP from
+# when it is first seen alone, then 1 too: the broker does not bound every op (a reset that outlives
+# its timeout is left running in its scope), and an update never restarts over one (I7). $1 names
 # the wait in the log.
 wait_job_boundary() {
-    local w_start w_now w_bound
+    local w_start w_now w_bound op_since=""
     youngest_job_age
     w_bound=$(( JOB_CAP - j_age )); [ "$w_bound" -gt 0 ] || w_bound=0
     w_start="$(date +%s)"
@@ -437,24 +452,36 @@ wait_job_boundary() {
             return 0
         fi
         w_now="$(date +%s)"
-        if ! op_in_flight; then
+        if ! op_lock_live; then
             case "$(systemctl is-active tt-device-broker 2>/dev/null)" in
                 active|activating|deactivating|reloading) ;;
-                *)  echo "autoupdate: $1: the broker is down after $(( w_now - w_start ))s; applying (the restart starts it)" >&2
+                *)  echo "autoupdate: $1: the broker is down after $(( w_now - w_start ))s; applying (the restart starts it, and its startup waits out any reset scope before the queue opens)" >&2
                     return 0 ;;
             esac
         fi
-        if [ $(( w_now - w_start )) -ge "$w_bound" ]; then
-            if op_in_flight; then
-                echo "autoupdate: $1: a device op is still in flight at the job cap after $(( w_now - w_start ))s; dispatch released, the next lap retries" >&2
+        if op_in_flight && [ "$running" -eq 0 ]; then
+            if [ -z "$op_since" ]; then
+                op_since="$w_now"
+                echo "autoupdate: $1: a device op is in flight after $(( w_now - w_start ))s with no job running; it is waited out under the hold for at most ${OP_CAP}s" >&2
+            fi
+            if [ $(( w_now - op_since )) -ge "$OP_CAP" ]; then
+                echo "autoupdate: $1: a device op is still in flight ${OP_CAP}s on; never restarted over (I7): dispatch released, the next lap retries" >&2
                 return 1
             fi
-            if [ "$kids" -eq 0 ] && [ "${scopes:-0}" -eq 0 ] && [ "$jobholders" -eq 0 ] && [ "$holders" -gt 0 ]; then
-                echo "autoupdate: $1: a device holder outside any broker job is past the job cap (${JOB_CAP}s) after $(( w_now - w_start ))s (children=$kids holders=$holders scopes=${scopes:-0}); it no longer holds the update, applying" >&2
-                return 0
+        else
+            op_since=""
+            if [ $(( w_now - w_start )) -ge "$w_bound" ]; then
+                if op_in_flight; then
+                    echo "autoupdate: $1: a device op is still in flight at the job cap after $(( w_now - w_start ))s; dispatch released, the next lap retries" >&2
+                    return 1
+                fi
+                if [ "$kids" -eq 0 ] && [ "${scopes:-0}" -eq 0 ] && [ "$jobholders" -eq 0 ] && [ "$holders" -gt 0 ]; then
+                    echo "autoupdate: $1: a device holder outside any broker job is past the job cap (${JOB_CAP}s) after $(( w_now - w_start ))s (children=$kids holders=$holders scopes=${scopes:-0}); it no longer holds the update, applying" >&2
+                    return 0
+                fi
+                echo "autoupdate: $1: the running job is past the job cap (${JOB_CAP}s) after $(( w_now - w_start ))s (children=$kids holders=$holders job_holders=$jobholders scopes=${scopes:-0}); a running broker job always holds the update: dispatch released, the next lap retries" >&2
+                return 1
             fi
-            echo "autoupdate: $1: the running job is past the job cap (${JOB_CAP}s) after $(( w_now - w_start ))s (children=$kids holders=$holders job_holders=$jobholders scopes=${scopes:-0}); a running broker job always holds the update: dispatch released, the next lap retries" >&2
-            return 1
         fi
         sleep 5
         # Refreshed, so the broker's overdue bound on a hold counts from the last poll: a drain
@@ -643,8 +670,9 @@ rm -f "$ROOT/pending.defer"
 # Last look before the restart (spec 08 I24). The install ran under the dispatch hold, but a job
 # can still be running here: a tenant that opened the device on its own, or a dispatch after an
 # install slow enough for the broker to drop the hold as overdue. It is waited out the same way;
-# a broker job or device op still running at the cap restarts nothing and leaves installed.sha on
-# the old sha, so the next lap retries.
+# a broker job still running at the job cap, or a device op still in flight at its bound (the job
+# cap, or OP_CAP with no job running), restarts nothing and leaves installed.sha on the old sha, so
+# the next lap retries.
 hold_write
 count_busy
 if [ $(( kids + holders + ${scopes:-0} )) -ne 0 ] || op_in_flight; then
