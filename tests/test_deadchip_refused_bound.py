@@ -10,6 +10,7 @@ the bound they are no tenants: the broker skips the ladder (whose reset would ki
 power cycle, still killing nobody. A tenant the valve never refused still blocks, and no lift happens
 without a just-passed full check with fabric. No process is spawned and no device touched."""
 
+import signal
 from datetime import datetime
 
 import pytest
@@ -43,7 +44,7 @@ def _arm(r, monkeypatch, holder):
     """A chip off the bus whose PCI remove fails, under a running broker job or a tenant process."""
     kills = []
     monkeypatch.setattr(srv.os, "kill", lambda pid, sig: kills.append(pid))
-    monkeypatch.setattr(srv.os, "killpg", lambda pid, sig: kills.append(pid))
+    monkeypatch.setattr(srv.os, "killpg", lambda pid, sig: sig == signal.SIGSTOP or kills.append(pid))
     monkeypatch.setattr(srv, "_read_proc_starttime", lambda pid: "100", raising=False)
     monkeypatch.setattr(srv, "isolate_chip", lambda idx: False)
     monkeypatch.setattr(srv, "chip_pci_bdf", lambda idx: f"0000:46:00.{idx}")

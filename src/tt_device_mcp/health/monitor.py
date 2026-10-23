@@ -31,6 +31,7 @@ from tt_device_mcp.constants import (
     FABRIC_CHECK_HARDWARE_FAULT_RC,
     FABRIC_CHECK_TIMEOUT_SEC,
 )
+from tt_device_mcp.device_holders import note_broker_internal
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.core import HealthState, Observation, Verdict
 from tt_device_mcp.health.evidence import capture_incident, health_dir, health_event
@@ -283,6 +284,7 @@ def _normalized_board(raw) -> str:
 # The detail every fabric pass the dead-chip isolation killed starts with (spec 03 I82): the gate reads
 # it off its own evidence to keep the off-bus hold dirty rather than hold it as a plain 77.
 FABRIC_KILLED_BY_ISOLATION = "fabric check KILLED by dead-chip isolation"
+SNAPSHOT_KILLED_BY_ISOLATION = "tt-smi snapshot STOPPED by dead-chip isolation"
 
 
 class HealthMonitor:
@@ -382,6 +384,10 @@ class HealthMonitor:
         # Why the broker's dead-chip isolation killed the in-flight fabric pass ("" when it did not):
         # that run's exit is no verdict (spec 03 I82). Set by note_fabric_check_killed, read once.
         self._fabric_killed: str = ""
+        # The in-flight full check's tt-smi snapshot, in its own session so a dead chip can stop and
+        # kill its group like the fabric pass's (spec 03 I86); and why the isolation did ("" if not).
+        self.snapshot_proc: subprocess.Popen | None = None
+        self._snapshot_killed: str = ""
 
         # The last pass's readings blackboard. None until update() runs once.
         self._readings: Optional[HealthState] = None
@@ -969,17 +975,53 @@ class HealthMonitor:
         metrics.probe_observed("pci", _verdict_label(ok), time.monotonic() - _t0)
         return ok, detail
 
-    def _verify_device_health_body(self, expected_count: int, *, timeout_sec: float = 90.0) -> tuple[bool, str]:
+    def note_snapshot_killed(self, reason: str) -> None:
+        """The dead-chip isolation stopped or killed the in-flight tt-smi snapshot (spec 03 I86): its
+        exit or timeout says nothing about the chips. That check is no verdict, never a pass, and
+        a full pass with fabric is owed before any release (04 I32)."""
+        self._snapshot_killed = reason or "dead-chip isolation"
+        FABRIC_DEBT.note_fabric_killed(f"tt-smi snapshot killed ({self._snapshot_killed})")
+
+    def _run_snapshot(self, argv: list[str], timeout_sec: float) -> subprocess.CompletedProcess:
+        """``subprocess.run`` for the snapshot, but in its own session and tracked on
+        ``snapshot_proc`` while it runs, so the dead-chip valve can SIGSTOP its group before a PCI
+        remove and SIGKILL it after (spec 03 I86). Raises TimeoutExpired as run does, after killing
+        the group."""
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        # Its own session takes it out of the broker's process group: register it, or a holder scan
+        # reads the broker's own snapshot as a tenant (spec 04 I59).
+        note_broker_internal(proc.pid)
+        self.snapshot_proc = proc
         try:
             try:
-                proc = subprocess.run(
-                    ["tt-smi", "-s", "--snapshot_no_tty"],
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_sec,
-                )
+                out, err = proc.communicate(timeout=timeout_sec)
             except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+                try:
+                    proc.communicate(timeout=5)
+                except Exception:  # noqa: BLE001 - a reader stuck past SIGKILL is the holder scan's
+                    pass
+                raise
+        finally:
+            self.snapshot_proc = None
+        return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+    def _verify_device_health_body(self, expected_count: int, *, timeout_sec: float = 90.0) -> tuple[bool, str]:
+        self._snapshot_killed = ""
+        try:
+            try:
+                proc = self._run_snapshot(["tt-smi", "-s", "--snapshot_no_tty"], timeout_sec)
+            except subprocess.TimeoutExpired:
+                if self._snapshot_killed:
+                    return False, self._snapshot_no_verdict()
                 return False, f"tt-smi snapshot timed out after {timeout_sec:.0f}s (ARC unresponsive)"
+            if self._snapshot_killed:
+                # Stopped or killed by the dead-chip valve: whatever it printed or returned is no
+                # verdict (spec 03 I86). Never a pass; the hold stays and a full pass is owed.
+                return False, self._snapshot_no_verdict()
             if proc.returncode != 0:
                 interrupted = interrupted_by_shutdown("tt-smi", proc.returncode)
                 if interrupted is not None:
@@ -1119,6 +1161,11 @@ class HealthMonitor:
         pass is owed before any release (04 I32)."""
         self._fabric_killed = reason or "dead-chip isolation"
         FABRIC_DEBT.note_fabric_killed(f"fabric check killed ({self._fabric_killed})")
+
+    def _snapshot_no_verdict(self) -> str:
+        why, self._snapshot_killed = self._snapshot_killed, ""
+        health_event("snapshot_no_verdict", cause="killed_by_dead_chip_isolation", reason=why[:400])
+        return f"{SNAPSHOT_KILLED_BY_ISOLATION}: {why}; no verdict, a full pass is owed after recovery"
 
     async def _verify_fabric_health_body(self, timeout_sec: float) -> tuple[Optional[bool], str]:
         self._fabric_killed = ""

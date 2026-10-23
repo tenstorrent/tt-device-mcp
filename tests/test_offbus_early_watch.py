@@ -47,6 +47,9 @@ def watch(monkeypatch):
     monkeypatch.setattr(s, "_cycle_at", 0.0)
     monkeypatch.setattr(s, "scope_seen", False)
     monkeypatch.setattr(s, "dead_chip_strikes", {})
+    monkeypatch.setattr(s, "aer_at", {})
+    monkeypatch.setattr(s, "_aer_rose_chips", [])
+    monkeypatch.setattr(s, "_step_seen_at", None, raising=False)
     monkeypatch.setattr(s, "all_chips_gone_strikes", 0)
     monkeypatch.setattr(s, "short_count_strikes", 0)
     monkeypatch.setattr(srv.recovery_mechanism, "reset_in_flight", False)
@@ -102,7 +105,7 @@ def test_link_signals_reads_uncorrectable_aer_up_the_chip_path(tmp_path):
 
 def test_link_signals_with_no_class_dir_reads_as_nothing(monkeypatch, tmp_path):
     monkeypatch.setattr(pci, "SYSFS_CLASS_DIR", tmp_path / "absent")
-    assert pci.link_signals() == {"chips": [], "aer": {}}
+    assert pci.link_signals() == {"chips": [], "aer": {}, "paths": {}}
 
 
 def test_link_signal_baselines_then_reports_a_rise_or_a_vanished_node(watch):

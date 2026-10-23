@@ -317,6 +317,9 @@ class RecoveryDeps:
     chip_pci_bdf: Optional[Callable[[str], Optional[str]]] = None
     health_event: Optional[Callable[..., None]] = None
     kill_device_holders: Optional[Callable[[str], Awaitable[list]]] = None
+    # Spec 03 I86: SIGSTOP the broker's own device readers (fabric check, aiclk ceiling) before the
+    # valve's PCI remove; returns the pids stopped (server._freeze_device_readers). None: no stop.
+    freeze_device_readers: Optional[Callable[[str], list]] = None
     # Bounded wait for the pids it killed to drop out of the holder scan; returns those still
     # listed (spec 03 I19, the shared spec 01 I67 helper).
     wait_device_released: Optional[Callable[[list], Awaitable[set]]] = None

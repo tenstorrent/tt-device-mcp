@@ -1194,6 +1194,7 @@ _recovery_deps = RecoveryDeps(
     chip_pci_bdf=lambda idx: chip_pci_bdf(idx),
     health_event=lambda kind, **f: health_event(kind, **f),
     kill_device_holders=lambda reason: _kill_device_holders(reason),
+    freeze_device_readers=lambda reason: _freeze_device_readers(reason),
     wait_device_released=lambda pids: wait_device_released(pids, HOLDER_RELEASE_WAIT_SEC),
     note_stuck_holders=lambda chips, killed, bdfs: _note_dead_chip_stuck_holders(chips, killed, bdfs),
     stuck_holder_pids=lambda: {f.pid for f in _dead_chip_stuck_leftovers()},
@@ -4092,6 +4093,11 @@ _eth_selftest_runs: int = 0
 # Counts the self-test retries _rearm_eth_before_check ran; a relift compares it across its own pass.
 _eth_rearm_retries: int = 0
 _eth_rearm_task: Optional[asyncio.Task] = None
+# The eth self-test's read while it runs (its own session): it attaches to every chip, so the
+# dead-chip valve stops and kills its group like the fabric check's (spec 03 I86).
+eth_selftest_proc: Optional[asyncio.subprocess.Process] = None
+# Why the dead-chip isolation stopped that read ("" when it did not): its exit is then no verdict.
+_eth_selftest_killed: str = ""
 
 
 async def _eth_read_rearmed() -> tuple[Optional[bool], str]:
@@ -4108,6 +4114,10 @@ def _fault_episode_open() -> bool:
     start opens is not one. Read off the record, so before boot_merge it answers for the episode
     the last broker left open."""
     return fsm.state in (ServerState.RECOVERING, ServerState.DOWN) and fsm.record.why != "startup_unverified"
+
+
+class _EthSelftestKilled(Exception):
+    """The dead-chip valve stopped the eth self-test's read mid-run (spec 03 I86)."""
 
 
 async def selftest_eth_heartbeat() -> str:
@@ -4129,7 +4139,7 @@ async def selftest_eth_heartbeat() -> str:
     caller holds the device on it; the rung stays off and retryable either way.
     """
     global eth_check_armed, eth_check_disarm_reason, eth_rearm_retryable, _last_eth_rearm_monotonic
-    global eth_rearm_no_reader, eth_check_armed_late, _eth_selftest_runs
+    global eth_rearm_no_reader, eth_check_armed_late, _eth_selftest_runs, eth_selftest_proc, _eth_selftest_killed
     # Stamped here, so the first idle retry comes a full interval after this attempt.
     _last_eth_rearm_monotonic = time.monotonic()
     eth_rearm_retryable = False
@@ -4158,6 +4168,7 @@ async def selftest_eth_heartbeat() -> str:
         argv, env = built
         t0 = datetime.now()
         proc = None
+        _eth_selftest_killed = ""
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -4166,9 +4177,14 @@ async def selftest_eth_heartbeat() -> str:
                 env=env,
                 preexec_fn=os.setsid,
             )
+            note_broker_internal(proc.pid)  # its own session: never read as a tenant (spec 04 I59)
+            eth_selftest_proc = proc
             out, _ = await aio.wait_for(proc.communicate(), timeout=ETH_CHECK_SELFTEST_BUDGET_SEC)
             rc = proc.returncode
             dt = (datetime.now() - t0).total_seconds()
+            if _eth_selftest_killed:
+                # Stopped or killed by the dead-chip valve (spec 03 I86): its exit measured nothing.
+                raise _EthSelftestKilled()
             tail = (out.decode("utf-8", "replace") if out else "").strip().splitlines()
             last = tail[-1][:200] if tail else ""
             # Same override/built-in split verify_eth_heartbeat applies: an operator's own command
@@ -4202,6 +4218,8 @@ async def selftest_eth_heartbeat() -> str:
                         f"(budget {ETH_CHECK_SELFTEST_BUDGET_SEC:.0f}s, rc={rc})"
                         + (f"; it was off: {prior_reason}" if retry else "")
                     )
+        except _EthSelftestKilled:
+            eth_check_disarm_reason = f"read stopped by dead-chip isolation ({_eth_selftest_killed}): no verdict"
         except asyncio.TimeoutError:
             # The OUTER budget, not the probe's own: a read this slow cannot be told apart from a
             # frozen core at gate time, and the gate would HOLD the box on it.
@@ -4210,13 +4228,20 @@ async def selftest_eth_heartbeat() -> str:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except (ProcessLookupError, OSError):
                     pass
-            eth_check_disarm_reason = (
-                f"read hung past the {ETH_CHECK_SELFTEST_BUDGET_SEC:.0f}s self-test budget — too slow "
-                "to distinguish from a frozen core"
-            )
-            hung = True
+            if _eth_selftest_killed:
+                # A read the valve stopped ran out the budget stopped: no verdict, not a frozen core.
+                eth_check_disarm_reason = f"read stopped by dead-chip isolation ({_eth_selftest_killed}): no verdict"
+            else:
+                eth_check_disarm_reason = (
+                    f"read hung past the {ETH_CHECK_SELFTEST_BUDGET_SEC:.0f}s self-test budget — too slow "
+                    "to distinguish from a frozen core"
+                )
+                hung = True
         except Exception as e:  # noqa: BLE001 - a self-test must never block startup
             eth_check_disarm_reason = f"read not runnable: {e}"
+        finally:
+            eth_selftest_proc = None
+            _eth_selftest_killed = ""
     if not eth_check_armed:
         # Leave the process exactly as unarmed as it was, so eth.build() keeps returning None.
         if prior is None:
@@ -5843,6 +5868,59 @@ def _maybe_spawn_idle_holder_watch() -> None:
     _idle_holder_task = asyncio.create_task(_idle_holder_watch_pass())
 
 
+def _note_eth_selftest_killed(reason: str) -> None:
+    global _eth_selftest_killed
+    _eth_selftest_killed = reason or "dead-chip isolation"
+
+
+def _broker_device_readers() -> list:
+    """The broker's own device readers still running, as (proc, who) (spec 03 I86): each runs in
+    its own process group, so a killpg reaches every member."""
+    readers = []
+    for proc, who in (
+        (health_monitor.fabric_check_proc, "[broker]fabric-check"),
+        (health_monitor.snapshot_proc, "[broker]tt-smi-snapshot"),
+        (eth_selftest_proc, "[broker]eth-selftest"),
+        (CEILING.proc, "[broker]aiclk-ceiling"),
+    ):
+        if proc is None or getattr(proc, "returncode", None) is not None:
+            continue
+        readers.append((proc, who))
+    return readers
+
+
+def _note_reader_killed(who: str, reason: str) -> None:
+    """A stopped or killed broker reader is no verdict (spec 03 I82, I86): mark its check killed."""
+    if who == "[broker]fabric-check":
+        health_monitor.note_fabric_check_killed(reason)
+    elif who == "[broker]tt-smi-snapshot":
+        health_monitor.note_snapshot_killed(reason)
+    elif who == "[broker]eth-selftest":
+        _note_eth_selftest_killed(reason)
+
+
+def _freeze_device_readers(reason: str) -> list:
+    """SIGSTOP the broker's own device readers (spec 03 I86): the fabric check's, the full check's
+    tt-smi snapshot's, the eth self-test's and the aiclk ceiling's process groups. The dead-chip valve calls it the moment it confirms a chip off the
+    bus, before the PCI remove, so no further read of the mesh is issued while the remove runs.
+    A stop closes no fd, so the driver never reaches the still-attached chip, which a kill would
+    (spec 03 I84); the SIGKILL after the remove still ends them. A user job is not stopped here:
+    its fate is the valve's kill, unchanged. Returns the pids stopped. Never raises."""
+    stopped = []
+    for proc, who in _broker_device_readers():
+        try:
+            os.killpg(proc.pid, signal.SIGSTOP)
+            stopped.append({"pid": proc.pid, "user": who})
+        except (ProcessLookupError, OSError):
+            continue
+        # A stopped run measures nothing either: no verdict, a full pass owed (spec 03 I82), even
+        # if the valve then refuses the kill and the reader's own timeout ends it.
+        _note_reader_killed(who, reason)
+    if stopped and logger:
+        logger.error(f"DEAD-CHIP stopped the broker's own device readers before the remove — {reason}: {stopped}")
+    return stopped
+
+
 async def _kill_device_holders(reason: str) -> list:
     """SIGKILL every process holding the device, because their mappings outlive the endpoint.
 
@@ -5883,10 +5961,7 @@ async def _kill_device_holders(reason: str) -> list:
     # all — it maps every chip — and it is the one that killed a host, twice.
     for proc, who in (
         (health_monitor.fabric_check_proc, "[broker]fabric-check"),
-        (
-            CEILING.proc if CEILING.proc is not None and CEILING.proc.returncode is None else None,
-            "[broker]aiclk-ceiling",
-        ),
+        *[(p, w) for p, w in _broker_device_readers() if w != "[broker]fabric-check"],
         (current_process, "[broker]job"),
     ):
         if proc is None:
@@ -5915,6 +5990,8 @@ async def _kill_device_holders(reason: str) -> list:
             # even when killpg raised (the group already gone): conservative on purpose, as a pass
             # that races a dead chip proves nothing either.
             health_monitor.note_fabric_check_killed(reason)
+        elif signalled:
+            _note_reader_killed(who, reason)  # the snapshot's or eth self-test's -9 is ours too (I86)
     if logger:
         logger.error(
             f"DEAD-CHIP killed {len(killed)} device holder(s) — {reason}. Their "

@@ -43,6 +43,11 @@ FAST_SAMPLE_SEC = 2.0
 FAST_WINDOW_SEC = 30.0
 FAST_MAX_SEC = 60.0
 FAST_CONFIRM_SEC = 4.0
+# Spec 03 I86: an AER rise read this soon after a reset or recovery step last owned the chips
+# corroborates no all-ones read. The firmware-first (GHES) path can post the step's own errors a
+# poll or two after it ends; such a rise still arms the fast cadence, and a real drop in the window
+# is proved by I79's FAST_CONFIRM_SEC instead of the first sample.
+POST_STEP_AER_QUIET_SEC = 5.0
 
 # Spec 03 I83's cut after a failed POST_RESET: all PCI removes together get at most this long (a
 # remove behind a hung endpoint can block in the kernel for good; nobody is killed then), and the
@@ -241,6 +246,11 @@ class TelemetrySampler:
         self._storm_capped: bool = False
         self._cycle_at: float = 0.0
         self._clock = time.monotonic
+        # Spec 03 I86: when an AER counter last rose on each chip's own path (chip index -> clock),
+        # outside any reset, and the chips the latest link_signals read pinned a rise to.
+        self.aer_at: dict = {}
+        self._aer_rose_chips: list = []
+        self._step_seen_at: Optional[float] = None
 
     def tick(self) -> None:
         self.last_tick = time.monotonic()
@@ -337,6 +347,7 @@ class TelemetrySampler:
         uncorrectable AER counter that rose on a chip's path, or a chip node that left sysfs.
         The first read is only a baseline; a counter that could not be read compares as nothing."""
         prev, self._link_prev = self._link_prev, now
+        self._aer_rose_chips = []
         if prev is None:
             return None
         why = []
@@ -354,7 +365,17 @@ class TelemetrySampler:
         )
         if rose:
             why.append(f"uncorrectable AER errors on {', '.join(rose)}")
+            # The chips below a port that counted (I86): only their own all-ones read is corroborated.
+            hit = set(rose)
+            self._aer_rose_chips = sorted(
+                (c for c, path in (now.get("paths") or {}).items() if hit & set(path or ())), key=int
+            )
         return "; ".join(why) or None
+
+    def aer_recent(self, idx: str) -> bool:
+        """An AER counter on chip ``idx``'s own path rose within the last FAST_WINDOW_SEC (I86)."""
+        at = self.aer_at.get(idx)
+        return at is not None and self._clock() - at <= FAST_WINDOW_SEC
 
     async def poll_link(self) -> bool:
         """One early-watch read. True on the arming edge of the fast cadence. While a reset or
@@ -367,10 +388,17 @@ class TelemetrySampler:
             reason = self.link_signal(await asyncio.to_thread(read))
         except Exception:  # noqa: BLE001 - the watch only speeds the sampler up; never stop it
             return False
+        if self._mechanism.reset_in_flight or self.scope_seen or chip_state.recovering():
+            # A rise from before or during the step corroborates nothing after it (I86).
+            self.aer_at.clear()
+            self._step_seen_at = self._clock()
+            return False
         if reason is None:
             return False
-        if self._mechanism.reset_in_flight or self.scope_seen or chip_state.recovering():
-            return False
+        now = self._clock()
+        if self._step_seen_at is None or now - self._step_seen_at > POST_STEP_AER_QUIET_SEC:
+            for idx in self._aer_rose_chips:
+                self.aer_at[idx] = now
         return self.arm_fast(reason)
 
     async def wait_for_next_sample(self) -> None:
@@ -730,6 +758,19 @@ class TelemetrySampler:
         # Under the fast cadence (I79) the reading must also have lasted FAST_CONFIRM_SEC.
         seen_twice = [i for i in dead if self.dead_chip_strikes.get(i, 0) >= 1]
         confirmed = [i for i in seen_twice if self._lasted(f"chip:{i}")]
+        # Spec 03 I86: an all-ones read on a chip whose own path just counted an AER error is the
+        # chip leaving the bus with reads in flight, not a re-init blip, so one sample proves it: the
+        # second sample (SAMPLE_INTERVAL_SEC later) is time every reader of the mesh keeps issuing
+        # reads at an endpoint that no longer answers, which is what stalls a core.
+        corroborated = [i for i in dead if i not in confirmed and self.aer_recent(i)]
+        if corroborated:
+            confirmed = sorted(set(confirmed) | set(corroborated), key=int)
+            self._deps.health_event("offbus_aer_confirmed", chips=corroborated)
+            if log:
+                log.error(
+                    f"chip(s) {corroborated} read all-ones right after an AER error on their own PCIe "
+                    f"path — off the bus; isolating on this sample"
+                )
         for i in dead:
             self.dead_chip_strikes[i] = self.dead_chip_strikes.get(i, 0) + 1
             self._mark_bad(f"chip:{i}")
@@ -738,13 +779,14 @@ class TelemetrySampler:
                 del self.dead_chip_strikes[i]
                 self.bad_since.pop(f"chip:{i}", None)
 
-        if seen_twice:
-            # Lost on the second sample, before the isolation runs and apart from the fast cadence's
+        lost = sorted(set(seen_twice) | set(corroborated), key=int)
+        if lost:
+            # Lost on the second sample (or the AER-corroborated first, I86), before the isolation runs and apart from the fast cadence's
             # FAST_CONFIRM_SEC gate: a chip the kernel will not let go of, or one still inside that
             # gate, is never read on the poll clock again (spec 03 I66). One still inside the gate
             # gets its heartbeat read once for real at the next sample, so the proof rests on reads.
-            chip_state.mark_lost(seen_twice, "all-ones on two samples", self._nodes(seen_twice))
-            pending = [i for i in seen_twice if i not in confirmed]
+            chip_state.mark_lost(lost, "all-ones on two samples or after AER", self._nodes(lost))
+            pending = [i for i in lost if i not in confirmed]
             if pending:
                 chip_state.reprobe_due(pending)
         if confirmed:
@@ -873,6 +915,18 @@ class TelemetrySampler:
             self._deps.health_event("chip_isolation_skipped", chips=fresh, reason=PCI_WRITER.reason, host_at_risk=True)
             self._deps.mark_device_dirty(f"chip(s) {','.join(fresh)} fell off the PCIe bus", why="heartbeat")
             return
+
+        # Spec 03 I86: stop the broker's own readers of the mesh (the fabric check, the aiclk ceiling)
+        # first, before the remove's up to DETACH_TIMEOUT_SEC: a SIGSTOP issues no further read and
+        # closes no fd, so it is safe while the chip is still attached; the kill below still ends them.
+        freeze = getattr(self._deps, "freeze_device_readers", None)
+        if freeze is not None:
+            try:
+                stopped = freeze(f"chip(s) {','.join(fresh)} fell off the PCIe bus")
+            except Exception:  # noqa: BLE001 - a failed stop must not stop the remove
+                stopped = []
+            if stopped:
+                self._deps.health_event("device_readers_stopped", chips=fresh, readers=stopped)
 
         if log:
             log.error(
