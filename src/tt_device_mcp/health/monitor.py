@@ -25,11 +25,14 @@ from typing import Callable, Optional
 
 from tt_device_mcp import aio, alert, metrics
 from tt_device_mcp.constants import (
+    ETH_FULL_CHECK_TIMEOUT_SEC,
     ETH_POST_JOB_TIMEOUT_SEC,
     ETH_REAP_SEC,
     FABRIC_CHECK_CANNOT_CHECK_RC,
     FABRIC_CHECK_HARDWARE_FAULT_RC,
     FABRIC_CHECK_TIMEOUT_SEC,
+    SNAPSHOT_KILL_GRACE_SEC,
+    SNAPSHOT_TIMEOUT_SEC,
 )
 from tt_device_mcp.device_holders import note_broker_internal
 from tt_device_mcp.health.aiclk_ceiling import CEILING
@@ -943,7 +946,9 @@ class HealthMonitor:
                 self._glx_cache = ()
         return self._glx_cache
 
-    def verify_device_health(self, expected_count: int, *, timeout_sec: float = 90.0) -> tuple[bool, str]:
+    def verify_device_health(
+        self, expected_count: int, *, timeout_sec: float = SNAPSHOT_TIMEOUT_SEC
+    ) -> tuple[bool, str]:
         """Verify the mesh is actually usable after a reset, via a read-only tt-smi
         snapshot. A reset exiting 0 only means the command ran — it does NOT prove the
         chips came back. This is the check that turns "reset ran" into "device healthy".
@@ -1001,7 +1006,7 @@ class HealthMonitor:
                 except (ProcessLookupError, OSError):
                     pass
                 try:
-                    proc.communicate(timeout=5)
+                    proc.communicate(timeout=SNAPSHOT_KILL_GRACE_SEC)
                 except Exception:  # noqa: BLE001 - a reader stuck past SIGKILL is the holder scan's
                     pass
                 raise
@@ -1009,7 +1014,9 @@ class HealthMonitor:
             self.snapshot_proc = None
         return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
-    def _verify_device_health_body(self, expected_count: int, *, timeout_sec: float = 90.0) -> tuple[bool, str]:
+    def _verify_device_health_body(
+        self, expected_count: int, *, timeout_sec: float = SNAPSHOT_TIMEOUT_SEC
+    ) -> tuple[bool, str]:
         self._snapshot_killed = ""
         try:
             try:
@@ -1608,7 +1615,7 @@ class HealthMonitor:
             self._fabric_route_fault_streak = _env_int("TT_DEVICE_MCP_FABRIC_ROUTE_FAULT_JOBS", 2, 1) - 1
         return self.fabric_known_fault
 
-    async def verify_eth_heartbeat(self, timeout_sec: float = 60.0) -> tuple[Optional[bool], str]:
+    async def verify_eth_heartbeat(self, timeout_sec: float = ETH_FULL_CHECK_TIMEOUT_SEC) -> tuple[Optional[bool], str]:
         """Read the active-ethernet-core firmware heartbeats — a passive check that never pushes
         traffic — and say whether any core is frozen. Same override/built-in split as
         ``verify_fabric_health`` (see ``health.monitors.eth``): ``TT_DEVICE_MCP_ETH_HEARTBEAT_CMD``

@@ -21,6 +21,7 @@ power cycle, once per hold and only when it ends before the bound. No test reach
 or power cycle."""
 
 import asyncio
+import inspect
 import signal
 import threading
 import time
@@ -34,8 +35,10 @@ from tests.test_fabric_topology_mismatch import _LOST, topo  # noqa: F401 - the 
 from tests.test_inflight_reader_cut import _World
 from tt_device_mcp import server as srv
 from tt_device_mcp import telemetry
-from tt_device_mcp.health import ALL_ONES
+from tt_device_mcp.health import ALL_ONES, aiclk_ceiling
+from tt_device_mcp.health import monitor as monitor_mod
 from tt_device_mcp.health import recovery as recovery_pkg
+from tt_device_mcp.health.monitor import HealthMonitor
 from tt_device_mcp.health.monitors import heartbeat, hostpci, pci
 from tt_device_mcp.health.recovery import (
     OUTCOME_RECOVERED,
@@ -774,7 +777,7 @@ NOT_READY = {"0", "1", "2", "3"}
 MESH_COST = galaxy.MESH_RESET_BEFORE_HOST_RUNG_SEC + galaxy.MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC
 WORST = galaxy._mesh_reset_before_host_rung_cost()  # a reset that gives up, or one in budget + its check
 GAVE_UP = galaxy.MESH_RESET_BEFORE_HOST_RUNG_GAVE_UP_SEC
-CHECK = galaxy.MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC
+CHECK = galaxy._mesh_reset_before_host_rung_check_sec()
 
 
 def _clock(monkeypatch):
@@ -792,7 +795,7 @@ def _clock(monkeypatch):
     return Clock
 
 
-def _b1_sweep(monkeypatch, tmp_path, *, verdicts, mesh_heals=False, held_sec=180):
+def _b1_sweep(monkeypatch, tmp_path, *, verdicts, mesh_heals=False, held_sec=120):
     """Class B1 after a mesh reset whose tt-smi gave up at its driver wait: chip 31 is off the bus (node
     present, link down) and that reset failed on exactly it, so the climb skips the sweep's mesh reset
     and runs the SBR this hold owes. The SBR brings chip 31 back, but the chips tt-smi found never got
@@ -829,6 +832,61 @@ def _b1_sweep(monkeypatch, tmp_path, *, verdicts, mesh_heals=False, held_sec=180
     monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
     srv.recovery_mechanism.note_rung_failed(srv.device_hold_episode_since, "mesh_reset", {GONE}, {GONE}, rc=1)
     return order, events, counters, reasons
+
+
+_FULL_CHECK_STEPS = ("snapshot", "aiclk ceiling", "eth self-test", "eth read", "fabric")
+
+
+def _slowest_full_check(monkeypatch, clock) -> dict:
+    """The full check with fabric as the monitor runs it, each probe taking the whole bound it is run
+    with: the snapshot passes at its timeout plus its kill grace, the AICLK ceiling and the eth
+    self-test (the rung is off) at theirs, the eth read passes at the bound the pass gives it, and the
+    traffic pass fails at its own. Bounds the caller does not pass are each method's own default, read
+    from its signature, never from the bound under test. Returns the seconds each step spent."""
+    m, spent = srv.galaxy_recovery.monitor, {}
+
+    def default(fn) -> float:
+        return inspect.signature(fn).parameters["timeout_sec"].default
+
+    def take(step, sec):
+        spent[step] = sec
+        clock.shift += sec
+
+    def snapshot(expected, timeout_sec=default(HealthMonitor.verify_device_health)):
+        take("snapshot", timeout_sec + monitor_mod.SNAPSHOT_KILL_GRACE_SEC)
+        return True, "ok"
+
+    async def ceiling(phase, log=None, terminate=None, **k):
+        take("aiclk ceiling", aiclk_ceiling.timeout_sec())
+        return True, "at the ceiling", {}
+
+    async def selftest():
+        take("eth self-test", srv.ETH_CHECK_SELFTEST_BUDGET_SEC)
+        return ""
+
+    async def eth(timeout_sec=default(HealthMonitor.verify_eth_heartbeat)):
+        take("eth read", timeout_sec)
+        return True, "all advancing"
+
+    async def fabric(timeout_sec=default(HealthMonitor.verify_fabric_health)):
+        take("fabric", timeout_sec)
+        return False, f"fabric check timed out after {timeout_sec:.0f}s"
+
+    monkeypatch.setattr(monitor_mod.hostpci, "host_pci_verdict", lambda: (True, "ok", {}))
+    monkeypatch.setattr(pcie_guard, "record_topology", lambda: None)
+    monkeypatch.setattr(srv, "heartbeat_supported", lambda: False)
+    monkeypatch.setattr(m, "verify_device_health", snapshot)
+    monkeypatch.setenv(aiclk_ceiling.ENV_MHZ, "1000")
+    monkeypatch.setattr(aiclk_ceiling.CEILING, "disarmed", False)
+    monkeypatch.setattr(aiclk_ceiling.CEILING, "apply", ceiling)
+    monkeypatch.setattr(srv, "eth_check_armed", False)
+    monkeypatch.setattr(srv, "eth_rearm_retryable", True)
+    monkeypatch.setattr(srv, "eth_rearm_no_reader", False)
+    monkeypatch.setattr(srv, "_fault_episode_open", lambda: True)
+    monkeypatch.setattr(srv, "selftest_eth_heartbeat", selftest)
+    monkeypatch.setattr(m, "verify_eth_heartbeat", eth)
+    monkeypatch.setattr(m, "verify_fabric_health", fabric)
+    return spent
 
 
 def _i97(events) -> list:
@@ -882,9 +940,9 @@ async def test_the_mesh_reset_before_the_host_rung_starts_only_when_it_ends_befo
 ):
     """The reset's worst case must still request the power cycle by the 10-min bound (I76): a reset
     that gives up at its driver wait (300 s), or one in its 60 s budget, the 10 s settle and the full
-    check's 280 s. A hold older than the bound minus 350 s gets no extra reset: the power cycle at
+    check's 353 s. A hold older than the bound minus 423 s gets no extra reset: the power cycle at
     once, as before."""
-    assert MESH_COST == 70 and GAVE_UP == 300 and CHECK == 280 and WORST == 350
+    assert MESH_COST == 70 and GAVE_UP == 300 and CHECK == 353 and WORST == 423
     ceiling = galaxy._stuck_hold_ceiling_sec()
     order, events, counters, reasons = _b1_sweep(
         monkeypatch, tmp_path, verdicts=[False, False], held_sec=ceiling - WORST + margin
@@ -909,11 +967,12 @@ async def test_the_mesh_reset_before_the_host_rung_starts_only_when_it_ends_befo
 async def test_the_power_cycle_after_the_mesh_reset_before_the_host_rung_is_requested_by_the_bound(
     monkeypatch, tmp_path, clear_job_state, reset_sec, gives_up, checked
 ):
-    """The reset starts at the latest hold age the bound allows. In its budget, the full check runs
-    (taking its whole 280 s) and its failure requests the power cycle. A reset that runs past its budget
-    leaves no room for the check, and one whose tt-smi gave up at its driver wait again left the chips
-    ARC-not-ready: no check, the power cycle at once. Either way the power cycle is requested by the
-    600 s bound, never after it."""
+    """The reset starts at the latest hold age the bound allows. In its budget, the full check runs, the
+    real pass with fabric with every probe taking the whole bound it is run with (the snapshot and its
+    kill grace, the AICLK ceiling, the eth self-test, the eth read, the traffic pass), and its failure
+    requests the power cycle. A reset that runs past its budget leaves no room for the check, and one
+    whose tt-smi gave up at its driver wait again left the chips ARC-not-ready: no check, the power
+    cycle at once. Either way the power cycle is requested by the 600 s bound, never after it."""
     ceiling = galaxy._stuck_hold_ceiling_sec()
     order, events, counters, reasons = _b1_sweep(
         monkeypatch, tmp_path, verdicts=[False, False], held_sec=ceiling - WORST - 10
@@ -928,11 +987,16 @@ async def test_the_power_cycle_after_the_mesh_reset_before_the_host_rung_is_requ
         monkeypatch.setattr(mech, "last_reset_rc", 1 if gives_up else 0)
         return mech.last_reset_rc, ""
 
+    spent = _slowest_full_check(monkeypatch, clock)
+
     async def verify(expected, log, run_fabric=True, **k):
         order.append("full check")
-        if "mesh reset" in order:
-            clock.shift += CHECK
-        return False, {"snapshot": {"ok": False}, "fabric": {"ok": False}}
+        if "mesh reset" not in order:
+            return False, {"snapshot": {"ok": False}, "fabric": {"ok": False}}
+        state = await srv.galaxy_recovery.monitor.update(
+            "verify_device", run_fabric=run_fabric, expected=expected, log=log, fabric_stale=True
+        )
+        return state.healthy, state.as_evidence()
 
     async def power_cycle(log, reason):
         order.append("power cycle")
@@ -949,6 +1013,7 @@ async def test_the_power_cycle_after_the_mesh_reset_before_the_host_rung_is_requ
     assert [k["fired"] for k in _i97(events)] == [True]
     assert len(cycled_at) == 1 and cycled_at[0] <= ceiling, f"power cycle requested at {cycled_at[0]:.0f}s"
     assert counters["dirty_cleared"] == 0
+    assert sorted(spent) == (sorted(_FULL_CHECK_STEPS) if checked else []), "every step of the check ran"
     if not checked:
         skipped = [k for n, k in events if n == "whole_mesh_reset_before_host_rung_unverified"]
         assert len(skipped) == 1 and ("gave up" in skipped[0]["reason"]) is gives_up

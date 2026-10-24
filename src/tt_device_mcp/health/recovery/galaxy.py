@@ -21,8 +21,15 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from tt_device_mcp import alert, metrics
-from tt_device_mcp.constants import ETH_POST_JOB_TIMEOUT_SEC, FABRIC_CHECK_TIMEOUT_SEC
+from tt_device_mcp.constants import (
+    ETH_CHECK_SELFTEST_BUDGET_SEC,
+    ETH_FULL_CHECK_TIMEOUT_SEC,
+    FABRIC_CHECK_TIMEOUT_SEC,
+    SNAPSHOT_KILL_GRACE_SEC,
+    SNAPSHOT_TIMEOUT_SEC,
+)
 from tt_device_mcp.device_holders import discount_broker_internal, holder_comm, is_tenant, username_for_uid
+from tt_device_mcp.health import aiclk_ceiling
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
 from tt_device_mcp.health.monitors.heartbeat import (
@@ -815,13 +822,26 @@ TRAY_DOWN_RESCAN_SETTLE_SEC = 3
 
 # Spec 04 I97: the budget for one Galaxy mesh reset of a whole mesh (about 35 s seen) and the settle
 # after it. Every chip is already on the bus and tt-smi re-inits the boards itself, so the settle is
-# short. The reset's worst case is a tt-smi that gives up at its 100 s driver wait (about 263 s seen),
-# and the full check after it is bounded by its snapshot (90 s), fabric and eth-heartbeat timeouts. The
-# I97 reset starts only when the worst of both paths still requests the power cycle by the 10-min bound.
+# short. The reset's worst case is a tt-smi that gives up at its 100 s driver wait (about 263 s seen).
+# The I97 reset starts only when the worst of both paths still requests the power cycle by the 10-min
+# bound.
 MESH_RESET_BEFORE_HOST_RUNG_SEC = 60
 MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC = 10
 MESH_RESET_BEFORE_HOST_RUNG_GAVE_UP_SEC = 300
-MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC = 90 + FABRIC_CHECK_TIMEOUT_SEC + int(ETH_POST_JOB_TIMEOUT_SEC)
+
+
+def _mesh_reset_before_host_rung_check_sec() -> int:
+    """Spec 04 I97: the most the full check after the reset can take, from the bounds that check runs
+    with (fabric asked): the tt-smi snapshot and its kill grace, the AICLK ceiling's apply, the eth
+    self-test a full pass re-runs while the rung is off, the eth-heartbeat read and the traffic pass."""
+    return math.ceil(
+        SNAPSHOT_TIMEOUT_SEC
+        + SNAPSHOT_KILL_GRACE_SEC
+        + aiclk_ceiling.timeout_sec()
+        + ETH_CHECK_SELFTEST_BUDGET_SEC
+        + ETH_FULL_CHECK_TIMEOUT_SEC
+        + FABRIC_CHECK_TIMEOUT_SEC
+    )
 
 
 def _mesh_reset_before_host_rung_cost() -> int:
@@ -831,7 +851,7 @@ def _mesh_reset_before_host_rung_cost() -> int:
         MESH_RESET_BEFORE_HOST_RUNG_GAVE_UP_SEC,
         MESH_RESET_BEFORE_HOST_RUNG_SEC
         + MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC
-        + MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC,
+        + _mesh_reset_before_host_rung_check_sec(),
     )
 
 
@@ -3413,7 +3433,7 @@ class GalaxyRecovery(Recovery):
             log("the mesh reset before the host rung was refused — the power cycle decides")
             return False
         late = (_hold_age_sec(hold_since) or age) + MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC
-        late += MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC
+        late += _mesh_reset_before_host_rung_check_sec()
         no_check = ""
         if self.mechanism.last_reset_driver_wait_failed:
             no_check = "tt-smi gave up at its driver wait again"
