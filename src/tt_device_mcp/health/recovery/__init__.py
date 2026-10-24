@@ -501,7 +501,7 @@ class Recovery(ABC):
         )
         return state.healthy, state.as_evidence()
 
-    async def _recover_isolated_chips(self, log) -> bool:
+    async def _recover_isolated_chips(self, log, exclude=frozenset()) -> bool:
         """Bring back chips that were cut out of the kernel after leaving the PCIe bus.
 
         Reset through the parent bridge, not the chip: a dead endpoint cannot be reset through
@@ -512,6 +512,10 @@ class Recovery(ABC):
 
         Caller MUST hold the device lock: this ends with a PCI rescan, and nothing else may be
         touching the device while the endpoint re-enumerates.
+
+        ``exclude``: chips that already had their SBR round this hold (spec 04 I98). They get no
+        bridge write and stay isolated; a removed one among them was reset this hold, so it does not
+        withhold the rescan (I69).
         """
         # ladder-v2: the per-chip SBR window this rung reads, chip id -> {"reason": "no_bridge"} for
         # every chip whose reset could not fire because the endpoint left the bus. Reset FRESH every
@@ -528,7 +532,12 @@ class Recovery(ABC):
             health_event("removed_chips_isolated", chips=adopted, context="bridge_reset")
         if not isolated_chips:
             return True
-        targets = sorted(isolated_chips, key=int)
+        spent = {str(c) for c in exclude} & {str(c) for c in isolated_chips}
+        for idx in spent:
+            self.last_bridge_reset_reasons[idx] = {"reason": "sbr_spent_this_hold"}
+        targets = sorted((c for c in isolated_chips if str(c) not in spent), key=int)
+        if not targets:
+            return False
         # Spec 04 I76: a PCI sysfs write is blocked in the kernel (PCI-wedged). Every bridge reset ends in
         # a rescan on that same lock, so none can run: the rung fails at once, its chips stay withheld,
         # and the power cycle is already requested.
@@ -789,7 +798,7 @@ class Recovery(ABC):
         # lets the driver probe a hung chip. Every record counts, not only this pass's targets: the
         # rescan is global. A refused host reset gate withholds it only then (the removed chips were
         # not reset because of it); chips the broker never removed keep the bare rescan, as before.
-        unreset_dead = [i for i in pci.removed_chip_ids() if i not in reset_this_pass]
+        unreset_dead = [i for i in pci.removed_chip_ids() if i not in reset_this_pass and str(i) not in spent]
         withhold = ("host_reset_gated" if gated else "removed_chip_not_reset") if unreset_dead else ""
         if wedged or PCI_WRITER.latched:
             withhold = "pci_wedged"
@@ -832,7 +841,7 @@ class Recovery(ABC):
                         "[broker]pci-rescan", f"pci rescan recovered chip(s) {','.join(back)}", 0.0, "completed", 0
                     )
                 if not still_dead:
-                    return True
+                    return not spent & set(map(str, isolated_chips))
         if still_dead:
             if inapplicable:
                 log(
@@ -853,7 +862,8 @@ class Recovery(ABC):
                 )
             return False
         log(f"chip(s) {recovered} are back on the bus and bound to the driver")
-        return True
+        # Spec 04 I98: a chip left out as spent this hold and still off the bus keeps the rung failed.
+        return not spent & set(map(str, isolated_chips))
 
     async def _arc_dead_after_bridge_reset(self, chips: list, log) -> list:
         """Spec 04 I94: of the chips the bridge rung brought back on the bus, those whose ARC heartbeat

@@ -8903,6 +8903,9 @@ def _note_tenant_gate_verdict(reason: str) -> None:
             recovery_mechanism.regressed_reset_since = None  # spec 04 I31: the next episode may reset again
         if galaxy_recovery is not None:
             galaxy_recovery.tray_down_episode_end()  # spec 04 I19: the next drop is a fresh onset
+            # Spec 04 I98: the hold's SBR record ends with it, so a hold that carries this episode
+            # (I82) gives a chip that drops again its own round.
+            galaxy_recovery.sbr_record_clear()
         offbus_power_cycle.end_hold_handoff()  # spec 04 I33: no hold is handed off any more
         _persist_hold_episode("")  # the device came back fit: the episode is over, on disk too
         device_hold_episode_reason = ""

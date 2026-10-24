@@ -32,7 +32,13 @@ from tt_device_mcp.health.monitors.heartbeat import (
     unreadable_on_bus_chips,
 )
 from tt_device_mcp.health.monitors.hostpci import link_down
-from tt_device_mcp.health.monitors.pci import chip_node_present, chip_pci_bdfs, pci_bus_number, removed_chip_ids
+from tt_device_mcp.health.monitors.pci import (
+    chip_back_seq,
+    chip_node_present,
+    chip_pci_bdfs,
+    pci_bus_number,
+    removed_chip_ids,
+)
 from tt_device_mcp.health.pci_writer import PCI_WRITER, PciWedged
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (
@@ -1780,62 +1786,78 @@ class GalaxyRecovery(Recovery):
         """The SBR rung (:meth:`_recover_isolated_chips`), recording in this hold's record the chips a
         bridge write reached and that are still off the bus (spec 04 I98), and those with no bridge to
         write to. A chip the rung declined (gated, no privilege, PCI wedged) is not recorded; one reset
-        and still off is, whatever reason the rung gave it. When every target already had its SBR round this hold, none runs: the
-        rung reports not recovered, so the caller goes on to the next rung (the mesh reset or the power
-        cycle request, as the ladder orders them)."""
+        and still off is, whatever reason the rung gave it. A chip that already had its SBR round this
+        hold gets no bridge write; when every target had one, none runs. Either way a spent chip still
+        off the bus keeps the rung not recovered, so the caller goes on to the next rung (the mesh
+        reset or the power cycle request, as the ladder orders them)."""
         targets = {str(c) for c in set(self.deps.isolated_chips()) | set(removed_chip_ids())}
         since = self.deps.device_hold_episode_since() or ""
         spent = sorted(targets & self._sbr_done(since), key=int)
-        if targets and len(spent) == len(targets):
+        if spent:
             log(
                 f"chip(s) {spent} already had a bridge reset this hold and are still off the bus — "
-                "no second SBR round; the next rung runs"
+                "no second SBR round for them"
+                + ("; the next rung runs" if len(spent) == len(targets) else "")
             )
-            health_event("sbr_skipped_spent", chips=spent, held_since=since)
+            health_event("sbr_skipped_spent", chips=spent, held_since=since, others=len(targets) - len(spent))
+        if targets and len(spent) == len(targets):
             self.last_bridge_reset_reasons = {c: {"reason": "sbr_spent_this_hold"} for c in spent}
             self.last_bridge_reset_fired = set()
             return False
         self.last_bridge_reset_reasons = {}
         self.last_bridge_reset_fired = set()
-        ok = await self._recover_isolated_chips(log)
+        # Spec 04 I98, per chip: the spent ones get no bridge write in this round.
+        ok = await self._recover_isolated_chips(log, **({"exclude": frozenset(spent)} if spent else {}))
         fired = {str(c) for c in getattr(self, "last_bridge_reset_fired", set()) or set()}
         # A chip with no bridge to write to is a topology fact no retry in this hold changes: its SBR
         # round is spent too (the gated, unprivileged and wedged declines are not).
         reasons = getattr(self, "last_bridge_reset_reasons", {}) or {}
         fired |= {str(c) for c, r in reasons.items() if (r or {}).get("reason") == "no_bridge"}
-        still = {str(c) for c in set(self.deps.isolated_chips()) | set(removed_chip_ids())}
-        self._note_sbr_fired(fired, recovered=fired - still)
+        self._note_sbr_fired(fired)
         return ok
 
+    def _off_bus_now(self) -> set:
+        """The chips off the bus now: isolated by this broker or removed from the kernel."""
+        return {str(c) for c in set(self.deps.isolated_chips()) | set(removed_chip_ids())}
+
     def _sbr_done(self, hold_since: Optional[str]) -> frozenset:
-        """The chips this hold already SBR'd that are still off the bus (spec 04 I98). Keyed by the hold
-        episode, so a new hold starts empty. A record made before the hold's clock was set (an SBR in
-        the same pass that opened it) counts for a hold whose start is at most SBR_RECORD_ADOPT_SEC
-        after it."""
+        """The chips this hold already SBR'd that have not been seen back on the bus since (spec 04
+        I98). Keyed by the hold episode, so a new hold starts empty. A record made before the hold's
+        clock was set (an SBR in the same pass that opened it) counts for a hold whose start is at most
+        SBR_RECORD_ADOPT_SEC after it."""
         rec = self._sbr_hold
         if not rec:
             return frozenset()
+        chips = frozenset()
         if rec[0] == (hold_since or ""):
-            return rec[1]
-        if not rec[0] and hold_since and len(rec) > 2:
+            chips = rec[1]
+        elif not rec[0] and hold_since and len(rec) > 2:
             try:
                 start = datetime.fromisoformat(hold_since).timestamp()
             except ValueError:
                 return frozenset()
             if rec[2] >= start - SBR_RECORD_ADOPT_SEC:
-                return rec[1]
-        return frozenset()
+                chips = rec[1]
+        # A chip seen back on the bus since its round (the rung, a rescan, the mesh reset, the driver
+        # wait's rescans) is out of the record: a later drop is a new one and gets its own round.
+        seqs = rec[3] if len(rec) > 3 else {}
+        return frozenset(c for c in chips if seqs.get(c, chip_back_seq(c)) == chip_back_seq(c))
 
-    def _note_sbr_fired(self, fired, recovered=()) -> None:
-        """Add to this hold's SBR record the chips a bridge write reached (spec 04 I98); drop the ones
-        it brought back, so a chip that drops again later in the hold gets its own SBR."""
-        fired = {str(c) for c in fired}
-        back = {str(c) for c in recovered}
+    def _note_sbr_fired(self, fired) -> None:
+        """Add to this hold's SBR record the chips a bridge write reached that are still off the bus
+        (spec 04 I98); drop every chip seen back on the bus, so a chip that drops again later in the hold
+        gets its own SBR."""
+        off = self._off_bus_now()
         since = self.deps.device_hold_episode_since() or ""
-        done = self._sbr_done(since)
-        if not fired and not (done & back):
+        done = (set(self._sbr_done(since)) | {str(c) for c in fired}) & off
+        if not done and not self._sbr_hold:
             return
-        self._sbr_hold = (since, frozenset((set(done) | fired) - back), time.time())
+        self._sbr_hold = (since, frozenset(done), time.time(), {c: chip_back_seq(c) for c in done})
+
+    def sbr_record_clear(self) -> None:
+        """A hold lifted on a just-passed full check: its SBR record ends with it (spec 04 I98), so a hold
+        that carries the same episode (I82) starts with an empty one."""
+        self._sbr_hold = None
 
     def _sbr_owed(self, hold_since: Optional[str], off_ids: Optional[set], beats: Optional[dict] = None) -> list:
         """The off-bus chips the kept SBR rung could reset that this hold has not SBR'd yet (spec 04

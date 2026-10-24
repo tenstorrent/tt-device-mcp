@@ -378,6 +378,9 @@ REMOVED_CHIPS: dict = {}
 # The rung, the sampler and the gate read and write the records from worker threads.
 _REMOVED_LOCK = threading.RLock()
 REMOVED_CHIPS_FILE = "removed_chips.json"
+# Spec 04 I98: how many times each chip was seen back on the bus (forget_removed_chip), so the hold's
+# SBR record can tell a chip that came back and dropped again from one that never returned.
+_BACK_SEQ: dict = {}
 BOOT_ID_FILE = Path("/proc/sys/kernel/random/boot_id")
 
 _BDF_RE = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]")
@@ -492,8 +495,15 @@ def forget_removed_chip(idx) -> None:
     """Drop the removal record of a chip that is back on the bus."""
     with _REMOVED_LOCK:
         gone = REMOVED_CHIPS.pop(str(idx), None)
+        _BACK_SEQ[str(idx)] = _BACK_SEQ.get(str(idx), 0) + 1
     if gone is not None:
         _save_removed_chips()
+
+
+def chip_back_seq(idx) -> int:
+    """How many times chip ``idx`` was seen back on the bus in this process (spec 04 I98)."""
+    with _REMOVED_LOCK:
+        return _BACK_SEQ.get(str(idx), 0)
 
 
 def isolate_chip(idx: str) -> bool:
