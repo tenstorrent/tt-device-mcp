@@ -956,6 +956,43 @@ async def test_the_power_cycle_after_the_mesh_reset_before_the_host_rung_is_requ
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("bound", [False, True], ids=["next-pass", "the-bound-pass"])
+async def test_a_refused_lift_after_the_mesh_reset_before_the_host_rung_still_power_cycles_by_the_bound(
+    monkeypatch, tmp_path, clear_job_state, bound
+):
+    """The mesh reset heals the chips and the full check passes, but the release funnel refuses the
+    lift (a fabric pass still owed, say): the hold stays, and no power cycle comes on a check that
+    passed. The next pass, before the bound or the bound's own, runs no third mesh reset and requests
+    the power cycle by the bound."""
+    order, events, counters, reasons = _b1_sweep(monkeypatch, tmp_path, verdicts=[False, True], mesh_heals=True)
+    lifts = []
+    monkeypatch.setattr(srv, "_clear_device_dirty", lambda **kw: lifts.append(kw["why"]) or False)
+    clock, cycled_at = _clock(monkeypatch), []
+    await srv.galaxy_recovery.escalate("offbus-forced", [GONE], 32, lambda m: None)
+    sbr = f"sbr ['{GONE}']"
+    assert order[order.index(sbr) :] == [sbr, "full check", "mesh reset", "full check"], "no power cycle yet"
+    assert [k["fired"] for k in _i97(events)] == [True]
+    assert "host_rung_sweep_unverified" in [n for n, _ in events]
+    assert len(lifts) == 1 and "mesh reset of the whole mesh" in lifts[0], "the lift was asked once, and refused"
+    assert counters["dirty_cleared"] == 0 and not reasons
+
+    async def power_cycle(log, reason):
+        order.append("power cycle")
+        cycled_at.append(galaxy._hold_age_sec(srv.device_hold_episode_since))
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    ceiling = galaxy._stuck_hold_ceiling_sec()
+    age = galaxy._hold_age_sec(srv.device_hold_episode_since)
+    clock.shift = (ceiling if bound else ceiling - 60) - age
+    await srv.galaxy_recovery.escalate("offbus-forced", [GONE], 32, lambda m: None, bound=bound)
+    assert order.count("mesh reset") <= 2, "no third mesh reset in the hold"
+    assert len(_i97(events)) == 1 or _i97(events)[-1]["fired"] is False, "the I97 reset runs once per hold"
+    assert order[-1] == "power cycle" and order.count("power cycle") == 1
+    assert cycled_at[0] <= ceiling + 1, f"power cycle requested at {cycled_at[0]:.0f}s"
+    assert len(lifts) == 1, "the next pass's failed check asks for no lift"
+
+
+@pytest.mark.asyncio
 async def test_the_mesh_reset_before_the_host_rung_runs_once_per_hold_episode(monkeypatch, tmp_path, clear_job_state):
     order, events, _counters, _reasons = _b1_sweep(monkeypatch, tmp_path, verdicts=[False, False])
     await srv.galaxy_recovery.escalate("offbus-forced", [GONE], 32, lambda m: None)
