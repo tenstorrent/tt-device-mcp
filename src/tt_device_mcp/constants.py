@@ -101,11 +101,17 @@ PRE_RESET_DETACH_TIMEOUT_SEC = 30
 # often one mid-exit) scans once more after this long before it refuses the reset (spec 04 I92).
 PRE_RESET_RESCAN_SETTLE_SEC = 1.0
 
-# A holder the driver still names whose process is a zombie (state Z) is one whose device release
-# is still running: tt-kmd drops a pid only when the last reference to the file goes, so a dying
-# thread or an inherited fd still holds it. The pre-reset scan waits up to this long for that
-# release, once per zombie, before it refuses the reset (spec 04 I92): the driver-release bound.
+# A zombie the driver still names whose live threads cannot show whether they hold the device (its
+# release may be running in one of them) is rescanned until that settles, once per zombie (spec 04
+# I92). An automatic reset under a hold waits until PRE_RESET_ZOMBIE_LADDER_RESERVE_SEC before the
+# hold's 10-min ladder mark; any other reset (an operator's, or one with no hold clock) waits up to
+# this long: the driver-release bound. A zombie whose whole thread group exited costs no wait at all.
 PRE_RESET_ZOMBIE_WAIT_SEC = HOLDER_RELEASE_WAIT_SEC
+
+# What the hold's own ladder is expected to take on a healthy Galaxy: a mesh reset (~60 s) and its
+# full check with fabric (45-75 s). An automatic reset's zombie wait ends this long before the hold's
+# 10-min ladder mark (spec 04 I76/I92), so a zombie that never settles leaves the ladder its time.
+PRE_RESET_ZOMBIE_LADDER_RESERVE_SEC = 135
 
 # When a device reset has run long enough to be worth saying so (a 6U Galaxy reset is
 # ~30-60s). This is a WARNING line, not a verdict: the reset owns its own systemd scope and

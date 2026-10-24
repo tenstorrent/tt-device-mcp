@@ -529,60 +529,180 @@ async def test_a_pid_gap_that_clears_on_the_rescan_lets_the_reset_proceed(monkey
     assert box.sent[READER.pid][0] == "TERM"
 
 
-def _ticks():
-    """A clock that moves one second per read, so a bounded wait ends without sleeping."""
-    t = iter(range(10**6))
-    return lambda: float(next(t))
-
-
 @pytest.fixture
 def fresh_zombies(monkeypatch):
     monkeypatch.setattr(prs, "_zombies_waited", set())
 
 
-@pytest.mark.asyncio
-async def test_a_zombie_gap_is_waited_for_and_the_reset_runs_once_its_release_ends(monkeypatch, fresh_zombies):
-    """A killed job's leader is a zombie while its device release runs: wait for it, not refuse."""
-    box = _Box(monkeypatch, [])
-    calls = _scans(monkeypatch, _gap(4303), _gap(4303), _gap(4303), HolderScan())
-    result = await box.run(
-        tenants_block=True, rescan_settle_sec=0, zombie_wait_sec=30, clock=_ticks(), pid_state=lambda pid: "Z"
+def _zombie(verdict, pid=4303):
+    """A zombie the driver names: ``exited`` (whole thread group gone), ``holds`` (a live thread shows a
+    device fd) or ``unknown`` (live threads whose fds cannot be read)."""
+    live = [] if verdict == "exited" else [pid + 1]
+    return device_holders.ZombieInfo(
+        pid=pid,
+        state="Z",
+        threads=1 + len(live),
+        live_tids=live,
+        ppid=4000,
+        parent_comm="pytest",
+        parent_state="S",
+        holds=True if verdict == "holds" else None,
     )
-    assert len(calls) == 4, "polled until the driver dropped the zombie"
-    assert result.outcome == "clear" and result.refusal() == "" and result.gaps == []
-    assert box.sent == {}
+
+
+def _zombies(**by_pid):
+    """zombie_of answering from ``by_pid`` (pid -> verdict, or a callable of the scan count)."""
+    return lambda pid: (lambda v: _zombie(v, pid) if v else None)(by_pid.get(f"p{pid}"))
+
+
+def _clock_of(calls):
+    """One second per scan: the bounded wait runs on the scan count, without sleeping."""
+    return lambda: float(len(calls))
 
 
 @pytest.mark.asyncio
-async def test_a_zombie_that_outlives_the_wait_refuses_and_is_not_waited_for_twice(monkeypatch, fresh_zombies):
-    """Still named after the bound: refused as before (the I76 bound runs), and its wait is spent."""
+async def test_a_zombie_whose_whole_thread_group_exited_is_no_holder_and_the_reset_runs_at_once(
+    monkeypatch, fresh_zombies
+):
+    """Spec 04 I92: a killed job's leader that is a zombie with no thread left holds no fd and no mapping
+    (do_exit releases both before EXIT_ZOMBIE): the owed reset runs with no rescan and no wait, and the
+    reader beside it is cleared as before. The post-reset full check with fabric still decides the lift."""
+    box = _Box(monkeypatch, [])
+    calls = _scans(monkeypatch, _gap(4303, READER))
+    walked = []
+    result = await box.run(
+        tenants_block=True,
+        rescan_settle_sec=0,
+        zombie_wait_sec=465,
+        clock=_clock_of(calls),
+        zombie_of=_zombies(p4303="exited"),
+        users_outside=lambda named: walked.append(set(named)) or ([], True),
+    )
+    assert len(calls) == 1, "no rescan, no wait"
+    assert result.gaps == [] and result.refusal() == "" and result.outcome == "killed"
+    assert walked == [{4303, READER.pid}], "the file the zombie opened is looked for in every other process"
+    assert [z["verdict"] for z in result.zombies] == ["exited"] and result.zombies[0]["waited_sec"] == 0.0
+    assert box.sent[READER.pid][0] == "TERM" and 4303 not in box.sent, "nothing new is signalled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outside", [([4999], True), ([], False)], ids=["open_elsewhere", "walk_incomplete"])
+async def test_an_exited_zombie_whose_file_may_be_open_elsewhere_still_refuses(monkeypatch, fresh_zombies, outside):
+    """The driver names only the opener: a forked child can still hold its file. Found, or a walk that
+    could not see every process: the gap stands, one rescan, refused; nothing is signalled."""
     box = _Box(monkeypatch, [])
     calls = _scans(monkeypatch, _gap(4303))
-    zombie = dict(tenants_block=True, rescan_settle_sec=0, zombie_wait_sec=5, pid_state=lambda pid: "Z")
-    result = await box.run(clock=_ticks(), **zombie)
-    assert 2 < len(calls) <= 8, "a bounded number of rescans"
+    result = await box.run(
+        tenants_block=True,
+        rescan_settle_sec=0,
+        zombie_wait_sec=465,
+        clock=_clock_of(calls),
+        zombie_of=_zombies(p4303="exited"),
+        users_outside=lambda named: outside,
+    )
+    assert len(calls) == 2 and result.outcome == "scan_incomplete" and "4303" in result.refusal()
+    assert result.zombies[0]["verdict"] in ("open_elsewhere", "walk_incomplete") and box.sent == {}
+
+
+@pytest.mark.asyncio
+async def test_a_zombie_leader_with_a_live_thread_holding_a_device_fd_is_refused(monkeypatch, fresh_zombies):
+    """A live thread shows a device fd: a real holder. One rescan, no zombie wait, refused; the hold then
+    runs the full ladder at 10 min and the power cycle (I76)."""
+    box = _Box(monkeypatch, [])
+    calls = _scans(monkeypatch, _gap(4303))
+    result = await box.run(
+        tenants_block=True,
+        rescan_settle_sec=0,
+        zombie_wait_sec=465,
+        clock=_clock_of(calls),
+        zombie_of=_zombies(p4303="holds"),
+        users_outside=lambda named: pytest.fail("no walk for a zombie that is not exited"),
+    )
+    assert len(calls) == 2 and result.outcome == "scan_incomplete" and result.refusal()
+    assert result.zombies[0]["verdict"] == "holds" and box.sent == {}
+
+
+@pytest.mark.asyncio
+async def test_a_zombie_leader_whose_live_threads_cannot_be_read_is_rescanned_until_it_settles_45s_later(
+    monkeypatch, fresh_zombies
+):
+    """Live threads whose fds cannot be read: the release may be running in one. Rescanned every second;
+    the driver drops it 45 s on and the owed reset runs then, inside the bound."""
+    box = _Box(monkeypatch, [])
+    calls = _scans(monkeypatch, *([_gap(4303)] * 46), HolderScan())
+    result = await box.run(
+        tenants_block=True,
+        rescan_settle_sec=0,
+        zombie_wait_sec=465,
+        clock=_clock_of(calls),
+        zombie_of=_zombies(p4303="unknown"),
+    )
+    assert len(calls) == 47, "polled every second until the driver dropped it"
+    assert result.outcome == "clear" and result.refusal() == "" and result.gaps == [] and box.sent == {}
+    assert result.zombies[0]["verdict"] == "unknown" and result.zombies[0]["waited_sec"] == 45.0
+
+
+@pytest.mark.asyncio
+async def test_a_zombie_leader_that_settles_as_exited_lets_the_reset_run(monkeypatch, fresh_zombies):
+    """Its last live thread exits mid-wait: the zombie is now exited, no holder, and the reset runs."""
+    box = _Box(monkeypatch, [])
+    calls = _scans(monkeypatch, _gap(4303))
+    result = await box.run(
+        tenants_block=True,
+        rescan_settle_sec=0,
+        zombie_wait_sec=465,
+        clock=_clock_of(calls),
+        zombie_of=lambda pid: _zombie("unknown" if len(calls) < 10 else "exited", pid),
+        users_outside=lambda named: ([], True),
+    )
+    assert len(calls) == 10 and result.outcome == "clear" and result.gaps == []
+
+
+@pytest.mark.asyncio
+async def test_a_zombie_that_never_settles_hits_the_bound_refuses_and_is_waited_for_once(monkeypatch, fresh_zombies):
+    """Never settled: the wait ends at its bound (an automatic reset's ends before the 10-min ladder
+    mark), the refusal stands with nothing signalled, and the same (pid, start time) is not waited for
+    again, so the ladder's own resets at 10 min are not delayed by it."""
+    box = _Box(monkeypatch, [])
+    calls = _scans(monkeypatch, _gap(4303))
+    unknown = dict(tenants_block=True, rescan_settle_sec=0, zombie_wait_sec=465, zombie_of=_zombies(p4303="unknown"))
+    result = await box.run(clock=_clock_of(calls), **unknown)
+    assert 465 <= len(calls) <= 468, "bounded by zombie_wait_sec"
     assert result.outcome == "scan_incomplete" and "4303" in result.refusal() and box.sent == {}
     calls.clear()
-    again = await box.run(clock=_ticks(), **zombie)
-    assert len(calls) == 2, "the same zombie gets the one rescan only"
-    assert again.outcome == "scan_incomplete"
+    again = await box.run(clock=_clock_of(calls), **unknown)
+    assert len(calls) == 2 and again.outcome == "scan_incomplete", "the same zombie gets the one rescan only"
+
+
+@pytest.mark.asyncio
+async def test_the_wait_is_once_per_pid_and_start_time_not_per_pid(monkeypatch, fresh_zombies):
+    """A reused pid is another process: a new start time gets its own wait; the same one does not."""
+    box = _Box(monkeypatch, [])
+    calls = _scans(monkeypatch, _gap(4303))
+    start = {"t": "100"}
+    unknown = dict(tenants_block=True, rescan_settle_sec=0, zombie_wait_sec=5, zombie_of=_zombies(p4303="unknown"))
+    await box.run(clock=_clock_of(calls), read_starttime=lambda pid: start["t"], **unknown)
+    assert (4303, "100") in prs._zombies_waited
+    for t, rescans in (("100", 2), ("200", 7), ("200", 2)):
+        calls.clear()
+        start["t"] = t
+        await box.run(clock=_clock_of(calls), read_starttime=lambda pid: start["t"], **unknown)
+        assert len(calls) == rescans, t
 
 
 @pytest.mark.asyncio
 async def test_a_live_pid_gap_gets_no_zombie_wait_and_still_refuses(monkeypatch, fresh_zombies):
-    """A gap on a live process (state S, R, D) or one already gone keeps today's single rescan."""
-    for state in ("S", "R", "D", "?"):
-        box = _Box(monkeypatch, [])
-        calls = _scans(monkeypatch, _gap(4303))
-        result = await box.run(
-            tenants_block=True, rescan_settle_sec=0, zombie_wait_sec=30, clock=_ticks(), pid_state=lambda pid: state
-        )
-        assert len(calls) == 2, state
-        assert result.outcome == "scan_incomplete" and box.sent == {}
+    """A gap on a process that is not a zombie (or one already gone) keeps the single rescan."""
+    box = _Box(monkeypatch, [])
+    calls = _scans(monkeypatch, _gap(4303))
+    result = await box.run(
+        tenants_block=True, rescan_settle_sec=0, zombie_wait_sec=465, clock=_clock_of(calls), zombie_of=_zombies()
+    )
+    assert len(calls) == 2 and result.outcome == "scan_incomplete" and result.zombies == [] and box.sent == {}
 
 
 @pytest.mark.asyncio
-async def test_a_zombie_gap_beside_a_live_one_gets_no_wait(monkeypatch, fresh_zombies):
+async def test_an_unknown_zombie_beside_a_live_gap_gets_no_wait(monkeypatch, fresh_zombies):
     box = _Box(monkeypatch, [])
     scan = _gap(4303)
     scan.mark_incomplete("pid 4304 named by the driver, not attributable", pid=4304)
@@ -590,32 +710,68 @@ async def test_a_zombie_gap_beside_a_live_one_gets_no_wait(monkeypatch, fresh_zo
     result = await box.run(
         tenants_block=True,
         rescan_settle_sec=0,
-        zombie_wait_sec=30,
-        clock=_ticks(),
-        pid_state=lambda pid: "Z" if pid == 4303 else "S",
+        zombie_wait_sec=465,
+        clock=_clock_of(calls),
+        zombie_of=_zombies(p4303="unknown"),
     )
     assert len(calls) == 2 and result.outcome == "scan_incomplete"
 
 
 @pytest.mark.asyncio
-async def test_a_live_holder_still_blocks_after_a_zombie_clears_and_the_job_is_never_signalled(
+async def test_a_live_holder_still_blocks_beside_an_exited_zombie_and_the_job_is_never_signalled(
     monkeypatch, fresh_zombies
 ):
-    """The zombie's release ends, but the running job and a tenant still hold: refused, nothing sent."""
+    """The zombie is no holder, but the running job and a tenant still hold: refused, nothing sent."""
     job = DeviceHolder(pid=4500, uid=1000)
     box = _Box(monkeypatch, [], tenants=[TENANT])
-    _scans(monkeypatch, _gap(4303, job, TENANT), HolderScan(holders=[job, TENANT]))
+    _scans(monkeypatch, _gap(4303, job, TENANT))
     result = await box.run(
         tenants_block=True,
         protected=[job.pid],
         rescan_settle_sec=0,
-        zombie_wait_sec=30,
-        clock=_ticks(),
-        pid_state=lambda pid: "Z",
+        zombie_of=_zombies(p4303="exited"),
+        users_outside=lambda named: ([], True),
     )
-    assert result.outcome == "tenant_blocked" and result.refusal()
+    assert result.outcome == "tenant_blocked" and result.refusal() and result.gaps == []
     assert {t["pid"] for t in result.tenants} == {job.pid, TENANT.pid}
     assert box.sent == {}, "neither the running job nor a tenant is signalled"
+
+
+def test_an_automatic_resets_zombie_wait_ends_before_the_hold_ladder_mark(monkeypatch):
+    """Spec 04 I76/I92: the wait ends PRE_RESET_ZOMBIE_LADDER_RESERVE_SEC before the hold's ladder mark,
+    never past it; an operator reset or one with no hold clock waits the driver-release bound."""
+    from datetime import datetime, timedelta
+
+    from tt_device_mcp.constants import PRE_RESET_ZOMBIE_LADDER_RESERVE_SEC, PRE_RESET_ZOMBIE_WAIT_SEC
+
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    reserve = PRE_RESET_ZOMBIE_LADDER_RESERVE_SEC
+    for age, want in ((0, 600 - reserve), (300, 300 - reserve), (500, 0.0), (900, 0.0)):
+        mark = now - timedelta(seconds=age) + timedelta(seconds=600)
+        monkeypatch.setattr(srv, "hold_bound_deadline", lambda n=None, m=mark: m)
+        assert srv._pre_reset_zombie_wait_sec(True, now) == want, age
+        assert srv._pre_reset_zombie_wait_sec(False, now) == PRE_RESET_ZOMBIE_WAIT_SEC
+    monkeypatch.setattr(srv, "hold_bound_deadline", lambda n=None: None)
+    assert srv._pre_reset_zombie_wait_sec(True, now) == PRE_RESET_ZOMBIE_WAIT_SEC
+
+
+@pytest.mark.asyncio
+async def test_the_scan_event_names_the_zombie_its_parent_and_its_threads(monkeypatch, fresh_zombies):
+    """The pre_reset_holder_scan event shows each zombie gap's parent (pid, comm, state) and thread count,
+    so a parent that does not reap its children is visible."""
+    order, events = [], []
+    box = _Box(monkeypatch, [], order=order)
+    _scans(monkeypatch, _gap(4303))
+    _broker_seams(monkeypatch, box, order, events)
+    monkeypatch.setattr(device_holders, "zombie_info", _zombies(p4303="exited"))
+    monkeypatch.setattr(device_holders, "device_users_outside", lambda named: ([], True))
+    rc, _ = await srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-r"], lambda m: None)
+    assert rc == 0 and "reset" in order
+    (scan,) = [f for k, f in events if k == "pre_reset_holder_scan"]
+    assert scan["outcome"] == "clear" and scan["gaps"] == []
+    (z,) = scan["zombies"]
+    assert z["pid"] == 4303 and z["verdict"] == "exited"
+    assert (z["ppid"], z["parent_comm"], z["parent_state"], z["threads"]) == (4000, "pytest", "S", 1)
 
 
 @pytest.mark.asyncio

@@ -69,6 +69,8 @@ from tt_device_mcp.constants import (
     JOB_RETENTION_SEC,
     POST_STEP_DEADLINE_DEFAULT_SEC,
     POST_STEP_DEADLINE_ENV,
+    PRE_RESET_ZOMBIE_LADDER_RESERVE_SEC,
+    PRE_RESET_ZOMBIE_WAIT_SEC,
     PRE_STEP_DEADLINE_DEFAULT_SEC,
     PRE_STEP_DEADLINE_ENV,
     PREEMPT_GRACE_SEC,
@@ -10682,6 +10684,18 @@ async def _reset_in_flight() -> Optional[str]:
     return f"a reset is already in flight ({unit})" if unit else None
 
 
+def _pre_reset_zombie_wait_sec(automatic: bool, now: Optional[datetime] = None) -> float:
+    """How long the pre-reset scan may rescan a zombie whose live threads cannot settle (spec 04 I92).
+    An automatic reset under a hold: until PRE_RESET_ZOMBIE_LADDER_RESERVE_SEC before the hold's 10-min
+    ladder mark (I76), never past it, so a zombie that never settles leaves the ladder its time. Any
+    other reset (an operator's, or no hold clock): PRE_RESET_ZOMBIE_WAIT_SEC."""
+    deadline = hold_bound_deadline(now) if automatic else None
+    if deadline is None:
+        return float(PRE_RESET_ZOMBIE_WAIT_SEC)
+    left = (deadline - (now or datetime.now(deadline.tzinfo))).total_seconds()
+    return max(0.0, left - PRE_RESET_ZOMBIE_LADDER_RESERVE_SEC)
+
+
 async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
     """The broker's pre-reset holder scan (spec 04 I92), run by every reset with the pollers stopped.
 
@@ -10695,7 +10709,10 @@ async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
     job = current_process
     protected = [job.pid] if job is not None and job.returncode is None and job.pid else []
     result = await clear_device_readers(
-        tenants_block=automatic, protected=protected, reset_active=recovery_mechanism.scope_active
+        tenants_block=automatic,
+        protected=protected,
+        reset_active=recovery_mechanism.scope_active,
+        zombie_wait_sec=_pre_reset_zombie_wait_sec(automatic),
     )
     refused = result.refusal()
     health_event(
@@ -10713,6 +10730,7 @@ async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
         detach_timed_out=result.detach_timed_out,
         reset_in_flight=result.reset_in_flight or None,
         gaps=result.gaps,
+        zombies=result.zombies,
         scan_complete=result.scan_complete,
         source=result.source,
         seconds=result.seconds,
