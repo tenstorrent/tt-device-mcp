@@ -196,7 +196,11 @@ def _process_holds_device(pid: int) -> bool:
     Raises PermissionError when the fd directory cannot be read (other uid,
     no CAP_DAC_READ_SEARCH) so the caller can mark the scan incomplete.
     """
-    fd_dir = f"/proc/{pid}/fd"
+    return _fd_dir_holds_device(f"/proc/{pid}/fd")
+
+
+def _fd_dir_holds_device(fd_dir: str) -> bool:
+    """``_process_holds_device`` for one fd directory (a process's, or one thread's under ``task/``)."""
     for entry in os.listdir(fd_dir):  # may raise PermissionError / FileNotFoundError
         try:
             target = os.readlink(f"{fd_dir}/{entry}")
@@ -486,6 +490,135 @@ def holder_state(pid: int) -> str:
             return f.read().rsplit(")", 1)[1].split()[0]
     except (OSError, IndexError):
         return "?"
+
+
+def _maps_hold_device(maps_path: str) -> bool:
+    """True if a ``/proc/.../maps`` file maps a Tenstorrent device node. Raises OSError when unreadable.
+
+    A mapping holds the device file open with no fd at all (a reader that closed its fd after mmap, or
+    a forked child that inherited the mapping), so the fd table alone cannot rule a holder out."""
+    with open(maps_path) as f:
+        for line in f:
+            path = line.rstrip("\n").split(None, 5)[5:] or [""]
+            target = path[0]
+            if target.endswith(" (deleted)"):
+                continue
+            if target.startswith(DEVICE_DIR + "/"):
+                return True
+    return False
+
+
+@dataclass
+class ZombieInfo:
+    """What /proc shows of a zombie the driver still names (see ``zombie_info``)."""
+
+    pid: int
+    state: str
+    threads: int | None  # tasks under /proc/<pid>/task, the zombie leader included; None if unreadable
+    live_tids: list  # the group's threads that have not exited
+    ppid: int | None
+    parent_comm: str
+    parent_state: str
+    holds: bool | None  # a live thread's fd table or mappings show a device node: True; else None
+
+    @property
+    def verdict(self) -> str:
+        """``exited``: the whole thread group has exited, so it holds no fd and no mapping. ``holds``: a
+        live thread shows a device fd or mapping. ``unknown``: live threads whose holding /proc cannot
+        settle (an fd table already gone or unreadable while that thread's release may still run)."""
+        if self.threads is not None and not self.live_tids:
+            return "exited"
+        return "holds" if self.holds else "unknown"
+
+    def row(self) -> dict:
+        return {
+            "pid": self.pid,
+            "state": self.state,
+            "threads": self.threads,
+            "live_threads": len(self.live_tids),
+            "verdict": self.verdict,
+            "ppid": self.ppid,
+            "parent_comm": self.parent_comm,
+            "parent_state": self.parent_state,
+        }
+
+
+def zombie_info(pid: int) -> ZombieInfo | None:
+    """Classify ``pid`` when it is a zombie (state Z, or X while being reaped); None for any other state.
+
+    Linux releases a task's files and memory before it becomes a zombie. In do_exit() (kernel/exit.c),
+    exit_mm() and exit_files() drop the task's references to its mm and fd table; fput() of a last
+    reference queues the file's release as task work (fs/file_table.c), which exit_task_work() runs
+    (the driver's release() included) before exit_notify() sets EXIT_ZOMBIE. So a zombie whose whole
+    thread group has exited holds no fd and no mapping. A thread-group leader that exits first stays a
+    zombie while its other threads live (delay_group_leader() in kernel/exit.c), and those threads share
+    the fd table and mm (CLONE_FILES, CLONE_VM): the leader's exit dropped only its own references, so
+    the live threads are where a holder can still be, read through /proc/<pid>/task/<tid>/."""
+    state = holder_state(pid)
+    if state not in ("Z", "X"):
+        return None
+    try:
+        tids = sorted(int(t) for t in os.listdir(f"/proc/{pid}/task") if t.isdigit())
+    except OSError:
+        tids = None
+    live: list = []
+    holds = None
+    for tid in tids or []:
+        if tid == pid or holder_state_task(pid, tid) in ("Z", "X", "?"):
+            continue
+        live.append(tid)
+        for check, path in ((_fd_dir_holds_device, "fd"), (_maps_hold_device, "maps")):
+            try:
+                if check(f"/proc/{pid}/task/{tid}/{path}"):
+                    holds = True
+            except OSError:
+                pass
+    ppid = _read_proc_ppid(pid)
+    return ZombieInfo(
+        pid=pid,
+        state=state,
+        threads=len(tids) if tids is not None else None,
+        live_tids=live,
+        ppid=ppid,
+        parent_comm=holder_comm(ppid) if ppid else "?",
+        parent_state=holder_state(ppid) if ppid else "?",
+        holds=holds,
+    )
+
+
+def holder_state_task(pid: int, tid: int) -> str:
+    """``holder_state`` for one thread of ``pid``; ``?`` if unreadable (a thread already gone)."""
+    try:
+        with open(f"/proc/{pid}/task/{tid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return "?"
+
+
+def device_users_outside(named: Iterable[int]) -> "tuple[list[int], bool]":
+    """Processes outside ``named`` with a device fd or mapping, by walking /proc; and whether the walk
+    saw every process. The driver names only the process that opened a file, so this is how a file a
+    zombie opened can be found still open elsewhere (a forked child's inherited fd or mapping)."""
+    named = set(int(p) for p in named) | {os.getpid()}
+    found: list = []
+    complete = True
+    try:
+        pids = _iter_pids()
+    except OSError:
+        return [], False
+    for pid in pids:
+        if pid in named:
+            continue
+        try:
+            if _fd_dir_holds_device(f"/proc/{pid}/fd") or _maps_hold_device(f"/proc/{pid}/maps"):
+                found.append(pid)
+        except FileNotFoundError:
+            continue  # exited mid-walk
+        except PermissionError:
+            complete = False
+        except OSError:
+            continue  # a kernel thread's maps read empty; a vanished pid reads ESRCH
+    return found, complete
 
 
 def _read_proc_starttime(pid: int) -> str | None:

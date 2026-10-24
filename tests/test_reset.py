@@ -837,14 +837,15 @@ def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
     retries = int(re.search(r'"TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES", "(\d+)"', src).group(1))
     sleep = float(re.search(r'"TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC", "([\d.]+)"', src).group(1))
     # The other bounded steps reset_with_quiesce runs under the same lock: the BMC check a mesh reset
-    # starts with; the pre-reset holder clear (in-flight detach, one rescan settle, SIGTERM grace,
-    # then the wait after SIGKILL); the post-reset cut of a chip that failed (detach, one stop per
+    # starts with; the pre-reset holder clear (in-flight detach, one rescan settle, the wait for a
+    # zombie's release, SIGTERM grace, then the wait after SIGKILL); the post-reset cut of a chip that failed (detach, one stop per
     # poller service, the reader kill); and the clock-cap re-apply (a run plus its settle retries).
     bmc = ipmi_guard.BMC_PREFLIGHT_TIMEOUT_SEC
     clear = pre_reset_scan.clear_device_readers
     holder_clear = (
         default(clear, "detach_timeout_sec")
         + default(clear, "rescan_settle_sec")
+        + default(clear, "zombie_wait_sec")
         + default(clear, "grace_sec")
         + default(clear, "release_sec")
     )

@@ -70,6 +70,17 @@ fi
 [ "$RESET_MODE" = galaxy ] && echo "    machine: Galaxy (board_type) -> reset uses -glx_reset"
 export TTDEV_BOARD_TYPES="$BOARD_TYPES"
 
+echo "==> preflight: 1G hugepage pool"
+# A function behind no IOMMU or an identity one needs one 1G page; with too few and nothing set up to
+# fill them at boot, the startup and fabric checks can only report cannot-check and the device stays
+# held. The broker's own rule (the one its startup wait and fabric-check.sh apply), from the new venv.
+# A warning, not a failure: the install itself is fine, and the operator decides how to set the pool up.
+HP_WARN="$("$NEW_VENV/bin/python" -c '
+from tt_device_mcp.health.monitors.hostpci import hugepages_install_warning
+print(hugepages_install_warning() or "")')" \
+    || HP_WARN="the 1G hugepage preflight could not run; check the pool by hand"
+[ -n "$HP_WARN" ] && echo "warn: $HP_WARN" >&2
+
 # Post-job fabric traffic check (run_cluster_validation) — EVERY machine. Chip liveness cannot see an
 # ethernet core that never retrained, and with no fabric evidence the health gate falls back to a full
 # board reset after every abnormal exit. The traffic pass needs no cabling descriptor (it drives the

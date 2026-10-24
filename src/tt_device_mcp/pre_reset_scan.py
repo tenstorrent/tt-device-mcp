@@ -32,7 +32,13 @@ Two more refusals come before any signal. A holder inside a reset (a process in 
 one the broker launched as a reset and registered here) is never signalled: killing a reset partway
 through the chips is worse than any reader, so the reset is refused while another is in flight. And
 an automatic reset is refused while the scan cannot see a holder the driver names (after one rescan):
-an unseen reader is the one the scan exists to remove.
+an unseen reader is the one the scan exists to remove. A zombie the driver still names (a killed
+job's leader) is classified rather than read as unseen. One whose whole thread group has exited holds
+no fd and no mapping (``device_holders.zombie_info``), so it is no holder and the reset goes ahead at
+once, unless the file it opened is still open in another process. A zombie leader whose live threads
+show a device fd or mapping is a holder: refused. One whose live threads cannot be read either way is
+rescanned until it settles or the caller's bound passes, once per zombie: the release may be running
+in one of those threads, and a killed job's exit is often that close to allowing the reset.
 """
 
 from __future__ import annotations
@@ -50,6 +56,7 @@ from tt_device_mcp.constants import (
     PRE_RESET_DETACH_TIMEOUT_SEC,
     PRE_RESET_RESCAN_SETTLE_SEC,
     PRE_RESET_TERM_GRACE_SEC,
+    PRE_RESET_ZOMBIE_WAIT_SEC,
 )
 from tt_device_mcp.device_holders import SCOPE_PROC_DIR, DeviceHolder, is_tenant
 from tt_device_mcp.peercred import username_for_uid
@@ -59,6 +66,10 @@ RESET_SCOPE_PREFIX = "ttdev-reset-"
 # Pids of resets the broker launched outside a reset scope (the no-systemd local reset), live while
 # they run. A holder that is one of them, or below one, is a reset in flight, never a reader.
 _reset_pids: set[int] = set()
+
+# Zombies (pid, starttime) the scan already waited for: each costs its wait once, so a zombie that
+# outlives it adds nothing to the later rungs of the bounded recovery (the 10-min ladder included).
+_zombies_waited: set[tuple] = set()
 
 
 def note_reset_pid(pid: int) -> None:
@@ -115,6 +126,7 @@ class PreResetScan:
     detach_timed_out: bool = False  # the detach deadline passed before every off-bus chip was detached
     reset_in_flight: str = ""  # a reset already running (its unit, or the holder that is one)
     gaps: list = field(default_factory=list)  # holders the driver names that the scan could not read
+    zombies: list = field(default_factory=list)  # zombie gap pids, classified (ZombieInfo.row, waited_sec)
     tenants_block: bool = True  # whether a tenant refuses this reset (automatic resets)
     scan_complete: bool = True
     source: str = "proc"
@@ -209,6 +221,9 @@ async def clear_device_readers(
     reset_active: Optional[Callable[[], Optional[str]]] = None,
     holder_in_reset: Optional[Callable[[int], bool]] = None,
     rescan_settle_sec: float = PRE_RESET_RESCAN_SETTLE_SEC,
+    zombie_wait_sec: float = PRE_RESET_ZOMBIE_WAIT_SEC,
+    zombie_of: Optional[Callable[[int], Optional[device_holders.ZombieInfo]]] = None,
+    users_outside: Optional[Callable[[set], tuple]] = None,
 ) -> PreResetScan:
     """Scan the device holders and remove every reader before a reset (spec 04 I92). Never raises.
 
@@ -228,22 +243,67 @@ async def clear_device_readers(
     incomplete by a pid the driver names (after one rescan ``rescan_settle_sec`` later) refuses an
     automatic reset; an operator reset records it, its own gate having ruled (04 I6/I7). A gap no
     pid explains (an unprivileged /proc walk) is recorded only: no pid is there to signal or wait for.
+    A gap whose pid is a zombie (``zombie_of``) is classified first, with no wait: one whose whole
+    thread group has exited is no holder and leaves the gaps, unless ``users_outside`` finds the device
+    open in a process the driver does not name or cannot walk every process (then it stays a gap). A
+    zombie leader whose live threads show a device fd or mapping stays a gap: refused after the one
+    rescan. When every gap left is a zombie whose live threads cannot settle it, the scan looks again
+    every ``rescan_settle_sec`` until they do or ``zombie_wait_sec`` passes (the caller's bound: an
+    automatic reset's ends before the hold's 10-min ladder), once per (pid, start time). A gap on a live
+    or unreadable pid gets the one rescan. Nothing is signalled for any of this.
     """
     read_starttime = read_starttime or device_holders._read_proc_starttime
     unkillable = unkillable or _unkillable
     offbus_chips = offbus_chips or _offbus_bound_chips
     detach_chip = detach_chip or _detach_chip
     holder_in_reset = holder_in_reset or in_reset
+    zombie_of = zombie_of or device_holders.zombie_info
+    users_outside = users_outside or device_holders.device_users_outside
     t0 = clock()
     result = PreResetScan(tenants_block=tenants_block)
     loop = asyncio.get_running_loop()
 
-    def _pid_gaps(scan) -> list:
+    def _pid_gap_rows(scan) -> list:
         scan = device_holders.discount_broker_internal(scan)
         if scan.complete:
             return []
         pids = list(getattr(scan, "gap_pids", None) or [])
-        return [why for why, pid in zip(scan.gaps, pids) if pid is not None]
+        return [(why, pid) for why, pid in zip(scan.gaps, pids) if pid is not None]
+
+    def _pid_gaps(scan) -> list:
+        return [why for why, _ in _pid_gap_rows(scan)]
+
+    cleared: set = set()  # exited zombies: no holder, out of the gaps
+    zombie_rows: dict = {}
+
+    def _classify(scan) -> tuple:
+        """Settle each gap pid that is a zombie. Returns (gap pids left, the left ones that are unknown
+        zombies). An exited zombie leaves the gaps unless its file may still be open elsewhere."""
+        rows = _pid_gap_rows(scan)
+        left, unknown, exited = [], [], []
+        for _, pid in rows:
+            z = zombie_of(pid)
+            if z is None:
+                left.append(pid)
+                continue
+            zombie_rows[pid] = {**z.row(), "waited_sec": 0.0}
+            if z.verdict == "exited":
+                exited.append(pid)
+            else:
+                left.append(pid)
+                if z.verdict == "unknown":
+                    unknown.append(pid)
+        if exited:
+            named = {h.pid for h in scan.holders} | {pid for _, pid in rows}
+            others, complete = users_outside(named)
+            for pid in exited:
+                if others or not complete:
+                    zombie_rows[pid]["verdict"] = "open_elsewhere" if others else "walk_incomplete"
+                    zombie_rows[pid]["open_in"] = list(others)
+                    left.append(pid)
+                else:
+                    cleared.add(pid)
+        return left, unknown
 
     try:
         if reset_active is not None:
@@ -254,16 +314,39 @@ async def clear_device_readers(
                 return result
         # The executor, not asyncio.to_thread: a reset step's own seams may stand in for to_thread.
         scan = await loop.run_in_executor(None, device_holders.enumerate_device_holders)
-        if _pid_gaps(scan):
+        left, unknown = await loop.run_in_executor(None, _classify, scan) if _pid_gaps(scan) else ([], [])
+        if left:
             # A pid the driver names but /proc could not show is most often one mid-exit: look again.
             await asyncio.sleep(rescan_settle_sec)
             scan = await loop.run_in_executor(None, device_holders.enumerate_device_holders)
+            cleared.clear()
+            left, unknown = await loop.run_in_executor(None, _classify, scan)
+            waited: set = set()
+            deadline = clock() + zombie_wait_sec
+            started = clock()
+            while left and len(unknown) == len(left) and clock() < deadline:
+                # Every gap left is a zombie whose live threads cannot settle it: its release may be
+                # running in one of them. Look again, bounded, once per zombie.
+                keys = {(pid, read_starttime(pid)) for pid in unknown}
+                if keys & _zombies_waited:
+                    break
+                waited |= keys
+                await asyncio.sleep(rescan_settle_sec)
+                scan = await loop.run_in_executor(None, device_holders.enumerate_device_holders)
+                cleared.clear()
+                left, unknown = await loop.run_in_executor(None, _classify, scan)
+            for row in zombie_rows.values():
+                row["waited_sec"] = round(clock() - started, 3) if waited else 0.0
+            if len(_zombies_waited) > 256:
+                _zombies_waited.clear()
+            _zombies_waited.update(waited)
     except Exception as e:  # noqa: BLE001 - a scan bug must not stop a recovery
         result.error = str(e) or type(e).__name__
         result.seconds = round(clock() - t0, 3)
         return result
     result.scan_complete, result.source = scan.complete, scan.source
-    result.gaps = _pid_gaps(scan)
+    result.gaps = [why for why, pid in _pid_gap_rows(scan) if pid not in cleared]
+    result.zombies = list(zombie_rows.values())
     own_pid = getpid()
     try:
         own_pgid = getpgid(own_pid)

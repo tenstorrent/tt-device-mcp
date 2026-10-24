@@ -70,6 +70,8 @@ from tt_device_mcp.constants import (
     JOB_RETENTION_SEC,
     POST_STEP_DEADLINE_DEFAULT_SEC,
     POST_STEP_DEADLINE_ENV,
+    PRE_RESET_ZOMBIE_DEFAULT_CHIPS,
+    PRE_RESET_ZOMBIE_WAIT_SEC,
     PRE_STEP_DEADLINE_DEFAULT_SEC,
     PRE_STEP_DEADLINE_ENV,
     PREEMPT_GRACE_SEC,
@@ -81,6 +83,7 @@ from tt_device_mcp.constants import (
     STAGE_POWER_CYCLE,
     STAGE_SMI_RESET,
     STATS_UPDATE_SEC,
+    pre_reset_zombie_ladder_reserve_sec,
 )
 from tt_device_mcp.constants import step_deadline_sec as _shared_step_deadline_sec
 
@@ -10683,6 +10686,31 @@ async def _reset_in_flight() -> Optional[str]:
     return f"a reset is already in flight ({unit})" if unit else None
 
 
+def _zombie_reserve_chips() -> int:
+    """The chip count the zombie wait's reserve sizes the full check for: the host's expected count, or
+    a full Galaxy while that is not known."""
+    try:
+        chips = health_monitor.expected(0) if health_monitor is not None else 0
+    except Exception:  # noqa: BLE001 - an unreadable baseline must not stop a recovery
+        chips = 0
+    return chips if chips > 0 else PRE_RESET_ZOMBIE_DEFAULT_CHIPS
+
+
+def _pre_reset_zombie_wait_sec(automatic: bool, now: Optional[datetime] = None) -> float:
+    """How long the pre-reset scan may rescan a zombie whose live threads cannot settle (spec 04 I92).
+    An automatic reset under a hold: until pre_reset_zombie_ladder_reserve_sec() before the hold's
+    10-min ladder mark (I76), so a zombie that clears on the last poll still has its reset and full
+    check with fabric done before the ladder needs the device lock. The mark is the hold's start plus
+    _hold_bound_mark_sec(), not hold_bound_deadline(): a power-cycle cooldown moves only the cycle, and
+    the ladder still runs at the mark inside it. Any other reset (an operator's, or no hold clock):
+    PRE_RESET_ZOMBIE_WAIT_SEC."""
+    if not automatic or hold_bound_deadline(now) is None:
+        return float(PRE_RESET_ZOMBIE_WAIT_SEC)
+    mark = datetime.fromisoformat(device_hold_episode_since) + timedelta(seconds=_hold_bound_mark_sec())
+    left = (mark - (now or datetime.now(mark.tzinfo))).total_seconds()
+    return max(0.0, left - pre_reset_zombie_ladder_reserve_sec(_zombie_reserve_chips()))
+
+
 async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
     """The broker's pre-reset holder scan (spec 04 I92), run by every reset with the pollers stopped.
 
@@ -10696,7 +10724,10 @@ async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
     job = current_process
     protected = [job.pid] if job is not None and job.returncode is None and job.pid else []
     result = await clear_device_readers(
-        tenants_block=automatic, protected=protected, reset_active=recovery_mechanism.scope_active
+        tenants_block=automatic,
+        protected=protected,
+        reset_active=recovery_mechanism.scope_active,
+        zombie_wait_sec=_pre_reset_zombie_wait_sec(automatic),
     )
     refused = result.refusal()
     health_event(
@@ -10714,6 +10745,7 @@ async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
         detach_timed_out=result.detach_timed_out,
         reset_in_flight=result.reset_in_flight or None,
         gaps=result.gaps,
+        zombies=result.zombies,
         scan_complete=result.scan_complete,
         source=result.source,
         seconds=result.seconds,
@@ -17318,7 +17350,7 @@ def create_mcp_server() -> MCPServer:
         Duration: about 2 minutes on a healthy Galaxy (reset ~60s + fabric pass
         45-75s), about 4 minutes when the first fabric pass finds no trained link
         and is re-checked after a 60s wait. Worst case at the defaults: about 30
-        minutes (BMC check 10s + pre-reset holder clear up to 71s + poller stop
+        minutes (BMC check 10s + pre-reset holder clear up to 101s + poller stop
         and restart up to 120s + reset 600s + post-reset reader cut up to 105s
         + PCI rescan 3s + clock-cap re-apply up to 16s + a first verify pass of
         up to 361s + the 60s wait + a last verify pass of up to 436s, which

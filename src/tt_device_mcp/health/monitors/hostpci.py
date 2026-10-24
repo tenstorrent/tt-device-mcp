@@ -431,6 +431,40 @@ def hugepages_shortfall() -> Optional[tuple[int, int]]:
     return (have, need) if have < need else None
 
 
+# What fills the 1G pool at boot on a host that needs one. The installer only checks it is there:
+# the broker never orders itself After= it (deploy/apply-host-config.sh: an ordering cycle).
+HUGEPAGES_SETUP_UNIT = "tenstorrent-hugepages.service"
+SYSTEMD_UNIT_DIRS = tuple(
+    Path(d) for d in ("/etc/systemd/system", "/run/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system")
+)
+
+
+def hugepages_install_warning() -> Optional[str]:
+    """The installer's preflight: why this host's startup and fabric checks cannot run, or None.
+
+    Same rule as :func:`hugepages_shortfall` (and the fabric-check wrapper): one 1G page per function
+    behind an identity IOMMU domain or none. Warns only when such a function exists, the pool holds
+    fewer pages than they need (or this kernel has no 1G pool to read) and no
+    ``tenstorrent-hugepages.service`` is installed to fill it at boot. Sysfs and unit-file reads only."""
+    need = _functions_needing_hugepages()
+    if need <= 0:
+        return None
+    raw = _read(HUGEPAGES_1G_NR)
+    have = int(raw) if raw is not None and raw.isdigit() else None
+    if have is not None and have >= need:
+        return None
+    if any((d / HUGEPAGES_SETUP_UNIT).exists() for d in SYSTEMD_UNIT_DIRS):
+        return None
+    pool = f"holds {have}" if have is not None else f"is unreadable ({HUGEPAGES_1G_NR})"
+    return (
+        f"{need} Tenstorrent PCI function(s) sit behind no IOMMU or an identity one and need one 1G hugepage "
+        f"each ({need} pages), but the 1G hugepage pool {pool} and no {HUGEPAGES_SETUP_UNIT} is installed "
+        "to fill it. The broker's startup and fabric checks cannot run without it: they report cannot-check "
+        f"and the device stays held. Set up a pool of at least {need} 1G pages (the {HUGEPAGES_SETUP_UNIT} "
+        f"from Tenstorrent's system tools, or the kernel arguments hugepagesz=1G hugepages={need})."
+    )
+
+
 # Minimum host software the broker's own reset and probe semantics were matched against. Read
 # from sysfs only, so the check costs nothing and cannot touch a device. Overridable per site:
 # a floor that cannot be lowered is a floor that gets deleted the first time it is inconvenient.
