@@ -426,6 +426,153 @@ async def test_a_job_started_after_the_window_does_not_extend_it(monkeypatch, tm
     assert _age() < 60
 
 
+# A release's fabric verdict (spec 03 I78): a fresh pass on the full cabling verifies it.
+_PASS = {"result": "pass", "missing_vs_cabling": 0, "extra_vs_cabling": 0, "links_short": False, "age_s": 3.0}
+_UNVERIFIED = {
+    "no verdict": {"result": "none"},
+    "failed": {**_PASS, "result": "fail", "missing_vs_cabling": 2, "links_short": True},
+    "short pass": {**_PASS, "missing_vs_cabling": 2, "links_short": True},
+    "stale pass": {**_PASS, "age_s": 400.0},
+}
+
+
+def _release_on(monkeypatch, verdict):
+    """The open hold is released on a check whose fabric verdict is ``verdict``."""
+    monkeypatch.setattr(srv.health_monitor, "fabric_verdict", lambda: dict(verdict))
+    srv._note_tenant_gate_verdict("")
+    assert not srv.device_hold_logged and srv._hold_carry is not None
+
+
+def _first_job_ran_and_was_killed(seconds):
+    """The first job started at the release, ran ``seconds`` and ended killed (exit 143), naming no fault.
+    The released episode's start moves back with it. Returns that start."""
+    srv._note_hold_carry_job("start")
+    srv._hold_carry["released"] = srv._hold_carry["job_started"] = time.time() - seconds
+    since = (datetime.fromisoformat(srv._hold_carry["since"]) - timedelta(seconds=seconds)).isoformat()
+    srv._hold_carry["since"] = since
+    srv._note_hold_carry_job("end")
+    assert srv._hold_carry is not None, "a kill is no clean end: the carry stays on record"
+    return since
+
+
+_GENERIC_REHOLD = "gate/post-job: eth/fabric fault on a present mesh"
+
+
+@pytest.mark.asyncio
+async def test_replay_a_hold_after_a_verified_release_and_a_long_first_job_is_a_new_episode(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """A Galaxy host: a 138 s hold was released on a full check whose fabric pass found every cabled link;
+    the next job ran 29 min, was killed for its time limit, and the reset after it held the device again.
+    That hold took the released episode's start, was born 32 min old ('held 1929s past 1200s bound') and
+    escalated at once. Fails on base: the re-hold continues the episode, far past the bound."""
+    _isolate(monkeypatch, tmp_path)
+    _watchdog(monkeypatch)
+    escalations, events, _detail = _open_hold(monkeypatch, "generic", 138)
+    _release_on(monkeypatch, _PASS)
+    since = _first_job_ran_and_was_killed(29 * 60)
+    srv._note_tenant_gate_verdict(_GENERIC_REHOLD)
+
+    assert srv.device_hold_episode_since != since, "a new episode"
+    assert _age() < 60, "its clock starts at the re-hold"
+    assert "hold_carry_ended" in events and "hold_bound_carried" not in events
+    assert not srv._hold_bound_cycle_due(_age())
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert escalations == [] and "host_rung" not in events, "no early ladder and no early power cycle"
+    assert "hold_deadline_forced_escalation" not in events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdict", list(_UNVERIFIED))
+async def test_a_long_first_job_after_an_unverified_release_keeps_the_episode(
+    monkeypatch, tmp_path, clear_job_state, verdict
+):
+    """A release on no fresh fabric pass of the full cabling proved nothing: the first job that fails keeps
+    the episode, however long it ran. Fails on base: the carry does not record whether its release was
+    verified."""
+    _isolate(monkeypatch, tmp_path)
+    _watchdog(monkeypatch)
+    _esc, events, _detail = _open_hold(monkeypatch, "generic", 138)
+    _release_on(monkeypatch, _UNVERIFIED[verdict])
+    assert srv._hold_carry["verified"] is False
+    since = _first_job_ran_and_was_killed(29 * 60)
+    srv._note_tenant_gate_verdict(_GENERIC_REHOLD)
+    assert srv.device_hold_episode_since == since and _age() >= BOUND, "the clock keeps the episode start"
+    assert "hold_carry_ended" not in events
+
+
+@pytest.mark.asyncio
+async def test_a_quick_rehold_after_a_verified_release_keeps_the_episode(monkeypatch, tmp_path, clear_job_state):
+    """Flapping stays one episode: a re-hold seconds after a verified release, no passing full check in
+    between, keeps the clock, so the bound still fires no later than the episode start + 600 s."""
+    _isolate(monkeypatch, tmp_path)
+    _watchdog(monkeypatch)
+    _esc, events, _detail = _open_hold(monkeypatch, "generic", 400)
+    since = srv.device_hold_episode_since
+    _release_on(monkeypatch, _PASS)
+    srv._hold_carry["released"] = time.time() - 20
+    srv._note_tenant_gate_verdict(_GENERIC_REHOLD)
+    assert srv.device_hold_episode_since == since and _age() >= 400
+    assert "hold_carry_ended" not in events
+
+
+@pytest.mark.asyncio
+async def test_a_verified_release_by_the_bound_ladder_then_a_long_failed_first_job_still_goes_to_the_power_cycle(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """The bound ladder's check may pass on a device the ladder did not heal: a verified pass does not end
+    that carry, so the re-hold after a long failed first job still asks for the host rung at once."""
+    _isolate(monkeypatch, tmp_path)
+    _watchdog(monkeypatch)
+    escalations, events, detail = _open_hold(monkeypatch, "missing port (topology mismatch)", BOUND + 5)
+    srv._note_hold_bound_ladder(_age(), OUTCOME_RECOVERED)
+    _release_on(monkeypatch, _PASS)
+    assert srv._hold_carry["verified"] is True
+    since = _first_job_ran_and_was_killed(3600)
+    srv._note_tenant_gate_verdict(f"job 8: {detail}")
+    assert srv.device_hold_episode_since == since
+    assert srv._hold_bound_cycle_due(_age())
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert escalations == [] and events.count("host_rung") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_new_episode_after_a_verified_release_runs_its_ladder_at_its_own_10_min_mark_then_the_power_cycle(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """The fresh clock is a whole clock: nothing before the new hold's own 10-min mark, then the full
+    ladder, and a full check that still fails asks for the power cycle in the same run. Fails on base:
+    the re-hold is born past the bound and the ladder runs at once."""
+    _isolate(monkeypatch, tmp_path)
+    _watchdog(monkeypatch)
+    escalations, events, _detail = _open_hold(monkeypatch, "generic", 138)
+    _release_on(monkeypatch, _PASS)
+    _first_job_ran_and_was_killed(29 * 60)
+    srv._note_tenant_gate_verdict(_GENERIC_REHOLD)
+
+    async def recovered_ladder(kind, indices, expected, log, **_):
+        escalations.append(kind)
+        return OUTCOME_RECOVERED  # chips back, the full check gave no pass: the hold stands
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", recovered_ladder)
+    srv._check_hold_deadline(now=datetime.now())  # the re-hold's first tick, on its own clock
+    await _drain()
+    assert escalations == [] and "host_rung" not in events, "nothing on the re-hold's first tick"
+    for age in (5, BOUND - 30):
+        srv.device_hold_episode_since = (datetime.now() - timedelta(seconds=age)).isoformat()
+        srv._check_hold_deadline(now=datetime.now())
+        await _drain()
+        assert escalations == [] and "host_rung" not in events, f"nothing at {age}s, below its own bound"
+    srv.device_hold_episode_since = (datetime.now() - timedelta(seconds=BOUND + 3)).isoformat()
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert escalations == ["present-forced"], "the full ladder at its own 10-min mark"
+    assert srv._recovery_degraded(), "no release without a passing full check"
+    assert events.count("host_rung") == 1, "the failed check asks for the power cycle"
+
+
 @pytest.mark.asyncio
 async def test_the_carry_does_not_cross_a_reboot(monkeypatch, tmp_path, clear_job_state):
     """A reboot or power cycle is the biggest reset there is: the next hold is a new episode."""
