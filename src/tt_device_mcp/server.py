@@ -1466,7 +1466,11 @@ def _forget_stale_hold_episode() -> None:
 # bound ladder's check released the device, the first job died on the same missing link, and the new
 # hold started a new clock, so the host rung after the ladder was never due. Only within one boot: a
 # reboot or power cycle ends the episode. A successful first job or a full check passed with no hold
-# open ends the carry; a tenant hold neither saves, takes nor spends one.
+# open ends the carry; a tenant hold neither saves, takes nor spends one. The first job keeps the
+# window open past _HOLD_CARRY_SEC only while the release is in doubt: its check was no fresh fabric
+# pass on the full cabling, or the episode's bound ladder had run. A verified release whose first job
+# outran the window was not a quick re-hold: one Galaxy host's 29-min first job, killed for its time
+# limit, left the hold after it born 32 min old, past the bound, and escalated at once.
 HOLD_CARRY_FILE = "hold_carry.json"
 _HOLD_CARRY_SEC = 300
 _hold_carry: Optional[dict] = None
@@ -1514,12 +1518,27 @@ def _save_hold_carry(
         "ladder_age": ladder_age,
         "ladder_early": ladder_early,
         "cycle_age": None,
+        "verified": _release_verified(),
     }
     if _hold_bound_episode == since and _hold_bound_ladder_age is not None:
         _hold_carry["ladder_age"] = _hold_bound_ladder_age
         _hold_carry["ladder_early"] = _hold_bound_early
         _hold_carry["cycle_age"] = _hold_bound_cycle_age
     _write_hold_carry()
+
+
+def _release_verified() -> bool:
+    """Whether the release happening now follows a just-passed full check, fabric included: a fresh
+    pass that found every cabled link (spec 03 I78). False on a host with no fabric verdict."""
+    try:
+        v = _lift_fabric()
+        return (
+            v.get("result") == "pass"
+            and not v.get("links_short")
+            and float(v.get("age_s", HOLD_LIFT_PASS_FRESH_SEC + 1)) <= HOLD_LIFT_PASS_FRESH_SEC
+        )
+    except Exception:  # never let bookkeeping break the release
+        return False
 
 
 def _drop_hold_carry() -> None:
@@ -1587,10 +1606,15 @@ def _take_hold_carry() -> Optional[dict]:
         return None
     now = time.time()
     open_window = now - released <= _HOLD_CARRY_SEC
-    if rec.get("job_started") and (not job_ended or now - job_ended <= _HOLD_CARRY_SEC):
-        open_window = True
+    # Past the window only a release in doubt carries: an unverified one, or the bound ladder's.
+    in_doubt = not rec.get("verified") or rec.get("ladder_age") is not None
+    extended = bool(rec.get("job_started")) and (not job_ended or now - job_ended <= _HOLD_CARRY_SEC)
     if rec.get("startup_pinned") and _hold_episode_startup:
-        open_window = True  # the startup hold its first job ended under turns now, however long its gate ran
+        extended = True  # the startup hold its first job ended under turns now, however long its gate ran
+    if extended and not open_window and not in_doubt:
+        health_event("hold_carry_ended", held_since=since, why="verified release, first job outran the window")
+    elif extended:
+        open_window = True
     return rec if open_window else None
 
 
