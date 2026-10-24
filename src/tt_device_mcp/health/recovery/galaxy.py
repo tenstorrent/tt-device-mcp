@@ -1796,8 +1796,7 @@ class GalaxyRecovery(Recovery):
         if spent:
             log(
                 f"chip(s) {spent} already had a bridge reset this hold and are still off the bus — "
-                "no second SBR round for them"
-                + ("; the next rung runs" if len(spent) == len(targets) else "")
+                "no second SBR round for them" + ("; the next rung runs" if len(spent) == len(targets) else "")
             )
             health_event("sbr_skipped_spent", chips=spent, held_since=since, others=len(targets) - len(spent))
         if targets and len(spent) == len(targets):

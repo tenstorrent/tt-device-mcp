@@ -20,16 +20,17 @@ from tests.test_below_floor_offbus_ladder import GONE, _gate, _rig
 from tests.test_hold_episode_carry import _GENERIC_REHOLD, _PASS, _isolate
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.monitors import pci
-from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import NO_WINDOW_REMOVED_REASON, OUTCOME_WAITING
+from tt_device_mcp.health.recovery import base as recovery_base
 
 
 def _reset_still_off(monkeypatch, order):
     """The SBR rung as the real one ends for a chip reset on every try and still off the bus: a bridge
-    write reached it and it is tagged with the no-window reason."""
+    write reached it and it is tagged with the no-window reason. As the real rung, it writes no bridge
+    reset to a chip in ``exclude`` (already spent this hold)."""
 
-    async def sbr(log):
-        targets = set(srv.isolated_chips) | set(pci.removed_chip_ids())
+    async def sbr(log, exclude=frozenset()):
+        targets = (set(srv.isolated_chips) | set(pci.removed_chip_ids())) - set(exclude)
         order.append(f"sbr {sorted(targets, key=int)}")
         srv.galaxy_recovery.last_bridge_reset_fired = set(targets)
         srv.galaxy_recovery.last_bridge_reset_reasons = {c: {"reason": NO_WINDOW_REMOVED_REASON} for c in targets}
@@ -107,20 +108,6 @@ async def test_after_a_skipped_round_only_the_full_check_with_fabric_lifts(
         assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "a failed check keeps the hold"
 
 
-def _partial_aware(monkeypatch, order):
-    """As _reset_still_off, but the rung honours ``exclude`` as the real one does: no bridge write to a
-    chip already spent this hold."""
-
-    async def sbr(log, exclude=frozenset()):
-        targets = (set(srv.isolated_chips) | set(pci.removed_chip_ids())) - set(exclude)
-        order.append(f"sbr {sorted(targets, key=int)}")
-        srv.galaxy_recovery.last_bridge_reset_fired = set(targets)
-        srv.galaxy_recovery.last_bridge_reset_reasons = {c: {"reason": NO_WINDOW_REMOVED_REASON} for c in targets}
-        return False
-
-    patch_recovery(monkeypatch, "_recover_isolated_chips", sbr)
-
-
 def _seen_back(monkeypatch, chips):
     """A rescan or mesh reset brought ``chips`` back: the broker's own re-read after it (I81, I97 b)."""
     monkeypatch.setattr(recovery_base, "returned_chips", lambda ids: sorted(set(ids) & set(chips), key=int))
@@ -133,7 +120,7 @@ async def test_a_partial_round_writes_no_bridge_reset_to_the_spent_chip(monkeypa
     out. The new chip gets its round; the spent one gets no second bridge write, and the rung reports
     not recovered while it is still off the bus."""
     order, events, _counters = _rig(monkeypatch, tmp_path, opt_in=True, held_min=3)
-    _partial_aware(monkeypatch, order)
+    _reset_still_off(monkeypatch, order)
     srv.isolated_chips.add(GONE)
     await srv.galaxy_recovery._sbr(lambda m: None)
     assert _sbrs(order) == [f"sbr ['{GONE}']"]
@@ -184,9 +171,7 @@ async def test_a_chip_the_mesh_reset_healed_gets_a_round_when_it_drops_again(mon
 
 
 @pytest.mark.asyncio
-async def test_a_hold_carried_after_a_verified_lift_starts_with_an_empty_record(
-    monkeypatch, tmp_path, clear_job_state
-):
+async def test_a_hold_carried_after_a_verified_lift_starts_with_an_empty_record(monkeypatch, tmp_path, clear_job_state):
     """(g) The record ends with the hold: a lift on a just-passed full check clears it, so a hold that
     carries the same episode (I82) gives a chip that drops again its own round."""
     order, events, _counters = _rig(monkeypatch, tmp_path, opt_in=True, held_min=3)
