@@ -49,8 +49,9 @@ HUNG_SIGINT_GRACE_SEC = 10
 # After a job is finalized, any of its processes still alive (a child that left the process
 # group, or one the ladder never reached) gets SIGTERM, then SIGKILL after this window. The
 # job itself is already gone, so this is a sweep of leftovers, not a teardown: it is kept
-# short because the next job waits on it.
-SURVIVOR_TERM_GRACE_SEC = 5
+# short because the next job waits on it, but never shorter than the 10 s every job process gets
+# between SIGTERM and SIGKILL (preemption's PREEMPT_KILL_GRACE_SEC).
+SURVIVOR_TERM_GRACE_SEC = 10
 
 # How long to wait after the survivors' SIGKILL before naming whoever is still alive. A
 # process that outlives SIGKILL is stuck in the kernel (state D, most often inside the
@@ -114,6 +115,19 @@ PRE_RESET_ZOMBIE_MESH_RESET_SEC = 60
 FULL_CHECK_PER_CHIP_SEC = 3.0
 # The chip count the reserve assumes when the host's own is not known yet: a full Galaxy.
 PRE_RESET_ZOMBIE_DEFAULT_CHIPS = 32
+
+# Spec 03 I89: on a multi-tray mesh the reset a job the broker stopped mid-run owes (I69) first waits,
+# at most this long, for every process of the job to be gone and for no process to hold a device node.
+# A mesh reset issued 1-2 s after the SIGKILL, while the job's teardown was still running, left a chip
+# off the bus or failing its post-reset check far more often than an abnormal end with no reset.
+POST_KILL_REAP_WAIT_SEC = 30
+
+# Spec 03 I89: once the job is gone, the mesh settles this long before the chips are read and the reset
+# runs. Both waits count inside the hold's 10-min ladder bound (spec 04 I76).
+POST_KILL_SETTLE_SEC = 10
+
+# How often the post-kill wait re-reads the job's processes and the device holders.
+POST_KILL_POLL_SEC = 0.5
 
 # When a device reset has run long enough to be worth saying so (a 6U Galaxy reset is
 # ~30-60s). This is a WARNING line, not a verdict: the reset owns its own systemd scope and

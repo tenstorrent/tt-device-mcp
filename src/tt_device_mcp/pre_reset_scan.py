@@ -203,6 +203,66 @@ def _unkillable(pid: int) -> bool:
     return state == "D" or bool(job_reap._sigkill_pending(pid))
 
 
+def pid_gap_rows(scan) -> list:
+    """(why, pid) for each gap of ``scan`` on a pid the driver names, the broker's own work discounted."""
+    scan = device_holders.discount_broker_internal(scan)
+    if scan.complete:
+        return []
+    pids = list(getattr(scan, "gap_pids", None) or [])
+    return [(why, pid) for why, pid in zip(scan.gaps, pids) if pid is not None]
+
+
+@dataclass
+class GapVerdicts:
+    """What ``classify_gap_pids`` made of the pids a holder scan could not attribute."""
+
+    left: list = field(default_factory=list)  # pids that still count as holders
+    unknown: list = field(default_factory=list)  # the left ones: zombies whose live threads cannot settle it
+    cleared: list = field(default_factory=list)  # exited zombies: no holder
+    zombies: dict = field(default_factory=dict)  # pid -> ZombieInfo.row(), verdict as ruled here
+
+
+def classify_gap_pids(
+    pids: Iterable[int],
+    named: Iterable[int],
+    zombie_of: Optional[Callable[[int], Optional[device_holders.ZombieInfo]]] = None,
+    users_outside: Optional[Callable[[set], tuple]] = None,
+) -> GapVerdicts:
+    """Spec 04 I92: settle each pid the driver names that the scan could not show holding the device.
+    A zombie whose whole thread group has exited is no holder (``cleared``), unless ``users_outside``
+    finds the device open in a process outside ``named`` (every pid the driver names) or cannot walk
+    every process: then its verdict is ``open_elsewhere`` or ``walk_incomplete`` and it stays. A zombie
+    leader whose live threads hold, or cannot show whether they hold (``unknown``), stays; so does any
+    pid that is no zombie (live, or gone from /proc)."""
+    zombie_of = zombie_of or device_holders.zombie_info
+    users_outside = users_outside or device_holders.device_users_outside
+    pids = list(pids)
+    out = GapVerdicts()
+    exited = []
+    for pid in pids:
+        z = zombie_of(pid)
+        if z is None:
+            out.left.append(pid)
+            continue
+        out.zombies[pid] = z.row()
+        if z.verdict == "exited":
+            exited.append(pid)
+        else:
+            out.left.append(pid)
+            if z.verdict == "unknown":
+                out.unknown.append(pid)
+    if exited:
+        others, complete = users_outside(set(named) | set(pids))
+        for pid in exited:
+            if others or not complete:
+                out.zombies[pid]["verdict"] = "open_elsewhere" if others else "walk_incomplete"
+                out.zombies[pid]["open_in"] = list(others)
+                out.left.append(pid)
+            else:
+                out.cleared.append(pid)
+    return out
+
+
 async def clear_device_readers(
     *,
     tenants_block: bool,
@@ -257,53 +317,26 @@ async def clear_device_readers(
     offbus_chips = offbus_chips or _offbus_bound_chips
     detach_chip = detach_chip or _detach_chip
     holder_in_reset = holder_in_reset or in_reset
-    zombie_of = zombie_of or device_holders.zombie_info
-    users_outside = users_outside or device_holders.device_users_outside
     t0 = clock()
     result = PreResetScan(tenants_block=tenants_block)
     loop = asyncio.get_running_loop()
 
-    def _pid_gap_rows(scan) -> list:
-        scan = device_holders.discount_broker_internal(scan)
-        if scan.complete:
-            return []
-        pids = list(getattr(scan, "gap_pids", None) or [])
-        return [(why, pid) for why, pid in zip(scan.gaps, pids) if pid is not None]
-
     def _pid_gaps(scan) -> list:
-        return [why for why, _ in _pid_gap_rows(scan)]
+        return [why for why, _ in pid_gap_rows(scan)]
 
     cleared: set = set()  # exited zombies: no holder, out of the gaps
     zombie_rows: dict = {}
 
     def _classify(scan) -> tuple:
-        """Settle each gap pid that is a zombie. Returns (gap pids left, the left ones that are unknown
-        zombies). An exited zombie leaves the gaps unless its file may still be open elsewhere."""
-        rows = _pid_gap_rows(scan)
-        left, unknown, exited = [], [], []
-        for _, pid in rows:
-            z = zombie_of(pid)
-            if z is None:
-                left.append(pid)
-                continue
-            zombie_rows[pid] = {**z.row(), "waited_sec": 0.0}
-            if z.verdict == "exited":
-                exited.append(pid)
-            else:
-                left.append(pid)
-                if z.verdict == "unknown":
-                    unknown.append(pid)
-        if exited:
-            named = {h.pid for h in scan.holders} | {pid for _, pid in rows}
-            others, complete = users_outside(named)
-            for pid in exited:
-                if others or not complete:
-                    zombie_rows[pid]["verdict"] = "open_elsewhere" if others else "walk_incomplete"
-                    zombie_rows[pid]["open_in"] = list(others)
-                    left.append(pid)
-                else:
-                    cleared.add(pid)
-        return left, unknown
+        """Settle each gap pid that is a zombie (``classify_gap_pids``). Returns (gap pids left, the left
+        ones that are unknown zombies)."""
+        v = classify_gap_pids(
+            (pid for _, pid in pid_gap_rows(scan)), (h.pid for h in scan.holders), zombie_of, users_outside
+        )
+        for pid, row in v.zombies.items():
+            zombie_rows[pid] = {**row, "waited_sec": 0.0}
+        cleared.update(v.cleared)
+        return v.left, v.unknown
 
     try:
         if reset_active is not None:
@@ -345,7 +378,7 @@ async def clear_device_readers(
         result.seconds = round(clock() - t0, 3)
         return result
     result.scan_complete, result.source = scan.complete, scan.source
-    result.gaps = [why for why, pid in _pid_gap_rows(scan) if pid not in cleared]
+    result.gaps = [why for why, pid in pid_gap_rows(scan) if pid not in cleared]
     result.zombies = list(zombie_rows.values())
     own_pid = getpid()
     try:

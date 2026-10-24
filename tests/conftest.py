@@ -61,6 +61,17 @@ def old_host_boot(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def quick_post_kill_settle(monkeypatch):
+    """The post-kill wait and settle (spec 03 I89) take no wall time unless a test sets them: a
+    32-chip kill test would otherwise sleep the settle, and wait out a real holder on a device host.
+    The job record behind the debt never outlives a test."""
+    monkeypatch.setattr(srv, "POST_KILL_REAP_WAIT_SEC", 0)
+    monkeypatch.setattr(srv, "POST_KILL_SETTLE_SEC", 0)
+    monkeypatch.setattr(srv, "POST_KILL_POLL_SEC", 0.01)
+    monkeypatch.setattr(srv, "_kill_reset_job", {})
+
+
+@pytest.fixture(autouse=True)
 def reset_post_reset_fabric_debt():
     """Clear the process-wide post-reset fabric debt (spec 04 I32) around every test: a reset one
     test drove must not hold a release in the next."""
