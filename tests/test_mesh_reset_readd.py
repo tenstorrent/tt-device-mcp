@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 import time
 
 import pytest
@@ -21,6 +22,7 @@ import pytest
 from tt_device_mcp import privileges
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import pcie_guard
+from tt_device_mcp.health.recovery.stages import bridge_reset
 
 _real_sleep = asyncio.sleep
 SETTLE_START = "\033[93mWaiting for 30 seconds: 0\033[0m"
@@ -51,6 +53,7 @@ def _mechanism(monkeypatch, isolated: set, sysfs: FakeSysfs, events: list, *, ev
     monkeypatch.setattr(recovery_base, "returned_chips", sysfs.returned)
     monkeypatch.setattr(recovery_base, "health_event", lambda name, **kw: events.append((name, kw)))
     monkeypatch.setattr(recovery_base, "DRIVER_WAIT_RESCAN_EVERY_SEC", every)
+    monkeypatch.setattr(bridge_reset, "bridge_reset_enabled", lambda: False)  # no SBR unless a test arms it
 
     async def fast_sleep(sec, *a, **kw):
         await _real_sleep(min(sec, 0.05))  # the 3 s post-reset settle; the file backend's 50 ms poll
@@ -259,3 +262,120 @@ async def test_both_backends_rescan_only_once_the_settle_is_over(monkeypatch, tm
     assert sysfs.at[0] >= settle_end, f"rescan {settle_end - sysfs.at[0]:.2f}s before the settle ended"
     assert sysfs.at[0] < child_exit, "the rescan ran inside tt-smi's driver wait, not after it"
     assert isolated == set()
+
+
+# --- spec 04 I97: the SBR in tt-smi's driver wait, and a driver wait that gave up ----------------
+
+GAVE_UP = "Didn't find all 32 chips in /dev/tenstorrent after 100 seconds, giving up\n"
+
+
+def _arm_sbr(monkeypatch, sysfs: FakeSysfs, *, heals: bool, started=None, hold_sec: float = 0.0) -> list:
+    """Give the process the SBR capability. Each SBR is recorded as (chip, rescans so far); ``heals``:
+    the next rescan brings the chip back. ``started`` (a threading.Event) is set as the write begins,
+    which then takes ``hold_sec``. The fabric and AICLK debts it notes are recorded, not kept."""
+    sbrs: list = []
+
+    def reset_removed_chip(idx):
+        if started is not None:
+            started.set()
+        time.sleep(hold_sec)
+        sbrs.append((idx, sysfs.rescans))
+        if heals:
+            sysfs.back_after = sysfs.rescans + 1
+        return True
+
+    monkeypatch.setattr(bridge_reset, "bridge_reset_enabled", lambda: True)
+    monkeypatch.setattr(bridge_reset, "reset_removed_chip", reset_removed_chip)
+    monkeypatch.setattr(recovery_base.FABRIC_DEBT, "note_reset", lambda why: None)
+    monkeypatch.setattr(recovery_base.CEILING, "mark_owed", lambda why: None)
+    return sbrs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("heals", [True, False], ids=["sbr-heals", "chip-stays-out"])
+async def test_an_sbr_follows_the_rescans_that_left_a_chip_out_in_the_driver_wait(monkeypatch, heals):
+    """Four rescans in tt-smi's driver wait leave chip 6 out: one SBR through its recorded bridge, then
+    the rescans go on (they add it back, I69). A chip the SBR brought back is in by the next rescan and
+    the reset succeeds; one it did not keeps the rescans to their tries and the reset fails as before."""
+    isolated, sysfs, events, seen = {"6"}, FakeSysfs(back_after=10_000), [], {}
+    mechanism = _mechanism(monkeypatch, isolated, sysfs, events)
+    sbrs = _arm_sbr(monkeypatch, sysfs, heals=heals)
+    _fake_glx_reset(mechanism, sysfs, isolated, [SETTLE], seen, wait_sec=0.5)
+
+    rc, _ = await mechanism.reset_with_quiesce(MESH_RESET, lambda _m: None)
+
+    assert sbrs == [("6", recovery_base.DRIVER_WAIT_SBR_AFTER_TRIES)], "one SBR, after the fourth rescan"
+    assert [kw for n, kw in events if n == "reset_driver_wait_sbr"] == [{"chip": "6", "ok": True}]
+    if heals:
+        assert rc == 0 and isolated == set()
+        assert seen["rescans_at_wait_end"] == recovery_base.DRIVER_WAIT_SBR_AFTER_TRIES + 1
+    else:
+        assert rc == 1 and isolated == {"6"}
+        assert seen["rescans_at_wait_end"] == recovery_base.DRIVER_WAIT_RESCAN_TRIES
+
+
+@pytest.mark.asyncio
+async def test_a_reset_that_ends_during_the_driver_wait_sbr_takes_no_more_rescans_in_it(monkeypatch):
+    """tt-smi exits while the SBR's write is in flight: the write finishes (the cleanup waits for it),
+    the loop rescans no more, and the one rescan after the reset follows."""
+    isolated, sysfs, events = {"6"}, FakeSysfs(back_after=10_000), []
+    mechanism = _mechanism(monkeypatch, isolated, sysfs, events)
+    started = threading.Event()
+    sbrs = _arm_sbr(monkeypatch, sysfs, heals=False, started=started, hold_sec=0.3)
+
+    async def run_scoped(argv, log, owner, on_output=None):
+        on_output(SETTLE)
+        deadline = time.monotonic() + 5
+        while not started.is_set() and time.monotonic() < deadline:
+            await _real_sleep(0.01)
+        return 1, "Driver not loaded with 32 devices after 100 seconds"
+
+    mechanism.run_scoped = run_scoped
+    rc, _ = await asyncio.wait_for(mechanism.reset_with_quiesce(MESH_RESET, lambda _m: None), timeout=10)
+
+    assert rc == 1 and sbrs == [("6", recovery_base.DRIVER_WAIT_SBR_AFTER_TRIES)]
+    assert sysfs.rescans == recovery_base.DRIVER_WAIT_SBR_AFTER_TRIES + 1  # none after the SBR in the wait
+    assert mechanism.reset_in_flight is False
+
+
+@pytest.mark.asyncio
+async def test_no_sbr_in_the_driver_wait_without_the_capability(monkeypatch):
+    isolated, sysfs, events, seen = {"6"}, FakeSysfs(back_after=10_000), [], {}
+    mechanism = _mechanism(monkeypatch, isolated, sysfs, events)
+    monkeypatch.setattr(bridge_reset, "reset_removed_chip", lambda idx: pytest.fail("SBR without setpci"))
+    _fake_glx_reset(mechanism, sysfs, isolated, [SETTLE], seen, wait_sec=0.5)
+
+    rc, _ = await mechanism.reset_with_quiesce(MESH_RESET, lambda _m: None)
+
+    assert rc == 1 and seen["rescans_at_wait_end"] == recovery_base.DRIVER_WAIT_RESCAN_TRIES
+    assert "reset_driver_wait_sbr" not in [n for n, _ in events]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gave_up", [True, False], ids=["gave-up", "completed"])
+async def test_a_reset_whose_tt_smi_gave_up_at_its_driver_wait_is_logged_as_failed(monkeypatch, gave_up):
+    """tt-smi gives up when a chip never shows up at its driver wait: no POST_RESET and no board
+    re-init ran, so the reset's one line (spec 03 I83) says FAILED rather than "no POST_RESET
+    failure", and the mechanism remembers it for the ladder."""
+    sysfs, events, logs = FakeSysfs(), [], []
+    mechanism = _mechanism(monkeypatch, set(), sysfs, events)
+
+    async def run_scoped(argv, log, owner, on_output=None):
+        on_output(SETTLE)
+        if gave_up:
+            on_output(GAVE_UP)
+            return 1, SETTLE + GAVE_UP
+        return 0, "ok"
+
+    mechanism.run_scoped = run_scoped
+    rc, _ = await mechanism.reset_with_quiesce(MESH_RESET, logs.append)
+
+    failed = [m for m in logs if m.startswith("mesh reset FAILED")]
+    if gave_up:
+        assert rc == 1 and failed and failed[0].startswith("mesh reset FAILED (rc 1)")
+        assert ("reset_driver_wait_gave_up", {"rc": 1}) in events
+        assert not any("no POST_RESET failure" in m for m in logs)
+    else:
+        assert rc == 0 and not failed and any("no POST_RESET failure" in m for m in logs)
+        assert "reset_driver_wait_gave_up" not in [n for n, _ in events]
+    assert mechanism.last_reset_driver_wait_failed is gave_up

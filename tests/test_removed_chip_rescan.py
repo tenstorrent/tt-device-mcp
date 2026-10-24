@@ -202,6 +202,30 @@ async def test_no_rescan_when_a_removed_chip_has_no_usable_bridge(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_a_partial_round_resets_only_the_new_chip_and_the_spent_one_does_not_withhold_the_rescan(
+    tmp_path, monkeypatch, rung
+):
+    """Spec 04 I98 with I69: chip 13 had its SBR round this hold and is still off the bus; chip 14 drops
+    later. The round writes no bridge reset to 13, resets 14, and the rescan still runs: 13's bridge
+    was already reset this hold, so it does not count as a removed chip left unreset."""
+    monkeypatch.setattr(galaxy, "health_event", lambda kind, **f: rung.append((kind, f)))
+    monkeypatch.setattr(srv, "device_hold_episode_since", "2026-01-01T00:00:00")
+    bus = FakeBus(tmp_path, monkeypatch)
+    bus.remove("13")
+    bus.remove("14")
+    srv.isolated_chips = {"13", "14"}
+    srv.galaxy_recovery._sbr_hold = None
+    srv.galaxy_recovery._note_sbr_fired({"13"})
+    assert await srv.galaxy_recovery._sbr(lambda m: None) is False, "13 is still off the bus"
+    assert [t for t in bus.trace if t[0] == "sbr"] == [("sbr", "0000:40:01.2")], bus.trace
+    assert ("rescan",) in bus.trace, bus.trace
+    assert not _kinds(rung, "pci_rescan_withheld")
+    assert srv.isolated_chips == {"13"}
+    assert pci.removed_chip("14") is None
+    assert srv.galaxy_recovery.last_bridge_reset_reasons.get("13") == {"reason": "sbr_spent_this_hold"}
+
+
+@pytest.mark.asyncio
 async def test_no_rescan_for_a_removed_chip_without_privilege(tmp_path, monkeypatch, rung):
     bus = FakeBus(tmp_path, monkeypatch)
     bus.remove("13")

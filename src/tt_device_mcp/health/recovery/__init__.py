@@ -409,6 +409,9 @@ class Recovery(ABC):
         # Set fresh by every _recover_isolated_chips call; defined here so the gate can read it
         # even when no bridge rung has run on this instance yet.
         self.last_bridge_reset_reasons: dict = {}
+        # The chips the last _recover_isolated_chips call reached with a bridge write, whatever came of
+        # it (spec 04 I98): the hold's SBR record keys on this, not on the reasons above.
+        self.last_bridge_reset_fired: set = set()
 
     @abstractmethod
     def next_stage(self, ev: Evidence) -> str:
@@ -498,7 +501,7 @@ class Recovery(ABC):
         )
         return state.healthy, state.as_evidence()
 
-    async def _recover_isolated_chips(self, log) -> bool:
+    async def _recover_isolated_chips(self, log, exclude=frozenset(), not_reset=frozenset()) -> bool:
         """Bring back chips that were cut out of the kernel after leaving the PCIe bus.
 
         Reset through the parent bridge, not the chip: a dead endpoint cannot be reset through
@@ -509,11 +512,17 @@ class Recovery(ABC):
 
         Caller MUST hold the device lock: this ends with a PCI rescan, and nothing else may be
         touching the device while the endpoint re-enumerates.
+
+        ``exclude``: chips that already had their SBR round this hold (spec 04 I98). They get no
+        bridge write and stay isolated; a removed one among them was reset this hold, so it does not
+        withhold the rescan (I69), unless it is in ``not_reset``: spent with no bridge write (no_bridge),
+        never reset, so it still withholds every rescan of the pass.
         """
         # ladder-v2: the per-chip SBR window this rung reads, chip id -> {"reason": "no_bridge"} for
         # every chip whose reset could not fire because the endpoint left the bus. Reset FRESH every
         # call (before the empty-set early return), so a later reader never sees a stale prior pass.
         self.last_bridge_reset_reasons: dict = {}
+        self.last_bridge_reset_fired: set = set()
         isolated_chips = self.deps.isolated_chips()
         # Spec 04 I69: every chip the broker removed is off the bus and un-reset, so it is a target
         # whether or not this pass was asked for it (a record reloaded after a restart, say). Left out,
@@ -524,7 +533,13 @@ class Recovery(ABC):
             health_event("removed_chips_isolated", chips=adopted, context="bridge_reset")
         if not isolated_chips:
             return True
-        targets = sorted(isolated_chips, key=int)
+        spent = {str(c) for c in exclude} & {str(c) for c in isolated_chips}
+        never_reset = spent & {str(c) for c in not_reset}
+        for idx in spent:
+            self.last_bridge_reset_reasons[idx] = {"reason": "sbr_spent_this_hold"}
+        targets = sorted((c for c in isolated_chips if str(c) not in spent), key=int)
+        if not targets:
+            return False
         # Spec 04 I76: a PCI sysfs write is blocked in the kernel (PCI-wedged). Every bridge reset ends in
         # a rescan on that same lock, so none can run: the rung fails at once, its chips stay withheld,
         # and the power cycle is already requested.
@@ -597,7 +612,9 @@ class Recovery(ABC):
         # no further bridge call, no rescan; every chip not yet tried is withheld.
         wedged = False
         removed = [t for t in targets if pci.removed_chip(t)]
-        unreset: list = []
+        # A spent removed chip no bridge write reached this hold is as un-reset as one this pass could
+        # not reset: no rescan this pass (spec 04 I69).
+        unreset: list = [i for i in pci.removed_chip_ids() if str(i) in never_reset]
         if sbr and not gated and removed:
             for idx in removed:
                 for attempt in range(BRIDGE_RESET_MAX_TRIES):
@@ -618,6 +635,7 @@ class Recovery(ABC):
                         break
                     if fired:
                         reset_this_pass.add(idx)
+                        self.last_bridge_reset_fired.add(idx)
                         break
                     if fired is None:
                         # Same no-window signal as reset_chip_via_bridge's no_bridge (see below).
@@ -726,6 +744,8 @@ class Recovery(ABC):
                     metrics.stage_fired("bridge_reset", "failed")
                     wedged = True
                     break
+                if result is not None:
+                    self.last_bridge_reset_fired.add(idx)
                 if result:
                     recovered.append(idx)
                     break
@@ -782,7 +802,9 @@ class Recovery(ABC):
         # lets the driver probe a hung chip. Every record counts, not only this pass's targets: the
         # rescan is global. A refused host reset gate withholds it only then (the removed chips were
         # not reset because of it); chips the broker never removed keep the bare rescan, as before.
-        unreset_dead = [i for i in pci.removed_chip_ids() if i not in reset_this_pass]
+        unreset_dead = [
+            i for i in pci.removed_chip_ids() if i not in reset_this_pass and str(i) not in spent - never_reset
+        ]
         withhold = ("host_reset_gated" if gated else "removed_chip_not_reset") if unreset_dead else ""
         if wedged or PCI_WRITER.latched:
             withhold = "pci_wedged"
@@ -825,7 +847,7 @@ class Recovery(ABC):
                         "[broker]pci-rescan", f"pci rescan recovered chip(s) {','.join(back)}", 0.0, "completed", 0
                     )
                 if not still_dead:
-                    return True
+                    return not spent & set(map(str, isolated_chips))
         if still_dead:
             if inapplicable:
                 log(
@@ -846,7 +868,8 @@ class Recovery(ABC):
                 )
             return False
         log(f"chip(s) {recovered} are back on the bus and bound to the driver")
-        return True
+        # Spec 04 I98: a chip left out as spent this hold and still off the bus keeps the rung failed.
+        return not spent & set(map(str, isolated_chips))
 
     async def _arc_dead_after_bridge_reset(self, chips: list, log) -> list:
         """Spec 04 I94: of the chips the bridge rung brought back on the bus, those whose ARC heartbeat
