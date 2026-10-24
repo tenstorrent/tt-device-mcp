@@ -2570,16 +2570,27 @@ reset's verify is the ladder's own post-reset verify (eth read + fabric pass, 77
 `reset_complete` there means the fabric moved traffic. This costs nothing per job; it lengthens the
 operator's reset by one fabric pass (about 45-75 s on a healthy mesh), plus the retry sleep and a second pass on a 77.
 **Duration bound.** From the moment the reset holds the device-op lock, the call takes at most:
-the poller stop and restart (30 s per `systemctl` call, 120 s with the two default services), the
-reset (`DEVICE_RESET_TIMEOUT_SEC`, 600 s; a reset still running then is `reset_failed` with no
-verify), the 3 s PCI-rescan settle, and the verify passes. A re-check follows only a 77, so every
+the BMC check a mesh reset starts with (`BMC_PREFLIGHT_TIMEOUT_SEC`, 10 s); the pre-reset holder
+clear (in-flight detach `PRE_RESET_DETACH_TIMEOUT_SEC` 30 s + one rescan `PRE_RESET_RESCAN_SETTLE_SEC`
+1 s + SIGTERM grace `PRE_RESET_TERM_GRACE_SEC` 10 s + the wait after SIGKILL `HOLDER_RELEASE_WAIT_SEC`
+30 s: 71 s); the poller stop and restart (30 s per `systemctl` call, 120 s with the two default
+services); the reset (`DEVICE_RESET_TIMEOUT_SEC`, 600 s; a reset still running then is
+`reset_failed` with no verify); the post-reset cut of a chip that failed (detach
+`INFLIGHT_DETACH_TIMEOUT_SEC` 15 s + one poller stop per service, 60 s + the reader kill
+`INFLIGHT_KILL_TIMEOUT_SEC` 30 s: 105 s); the 3 s PCI-rescan settle; the clock-cap re-apply when a
+cap is set (one helper run, 8 s, plus its settle retries, at most max(8 s, settle 3 s + 4 s margin):
+16 s); and the verify passes. A re-check follows only a 77, so every
 pass but the last one finished: up to 361 s (heartbeat settle 0.5 s + snapshot 90 s + eth python
 probe 3 × 10 s + eth read 60 s + fabric `FABRIC_CHECK_TIMEOUT_SEC` 180 s). The last pass can time
 out and adds the 75 s kill sequence (`GRACEFUL_KILL_GRACE_SEC` + `SIGTERM_GRACE_SEC`): up to
 436 s. With `POST_RESET_FABRIC_RETRIES` (1) re-checks, each after `POST_RESET_FABRIC_RETRY_SLEEP_SEC`
-(60 s): 1579 s, about 26 minutes, at the defaults. Not counted: stopping a running job first (60 s
-grace, then the kill), waiting for a broker operation already holding the lock, and the PCI-rescan
-write itself; the bound also assumes a killed process exits. Typical on a healthy Galaxy:
+(60 s): 1781 s, about 30 minutes, at the defaults. Not counted, each bounded on its own: stopping a
+running job first, including a killed re-adopted job still ending its scope (60 s grace, the stop,
+then up to `READOPTED_FINALIZE_WAIT_SEC` 15 s for its record); waiting for a broker operation
+already holding the lock (that operation's own bound); the `/proc` holder scans and the cut's
+heartbeat read and reader scan (one pass each, no wait); and the PCI-rescan and PCI-remove writes
+themselves (the remove within its detach deadline above). The bound also assumes a killed process
+exits. Typical on a healthy Galaxy:
 about 2 minutes, about 4 with a 77 retry. The tool's docstring states this bound and a test
 recomputes it from the timeouts. The MCP tool sends nothing until it returns, which is safe through
 the stdio shim: its 300 s read timeout bounds the gap between reads, and the SSE keepalives fill
