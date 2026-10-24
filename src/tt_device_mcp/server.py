@@ -69,6 +69,9 @@ from tt_device_mcp.constants import (
     JOB_RETENTION_SEC,
     POST_STEP_DEADLINE_DEFAULT_SEC,
     POST_STEP_DEADLINE_ENV,
+    POST_KILL_POLL_SEC,
+    POST_KILL_REAP_WAIT_SEC,
+    POST_KILL_SETTLE_SEC,
     PRE_RESET_ZOMBIE_LADDER_RESERVE_SEC,
     PRE_RESET_ZOMBIE_WAIT_SEC,
     PRE_STEP_DEADLINE_DEFAULT_SEC,
@@ -78,6 +81,7 @@ from tt_device_mcp.constants import (
     RESET_STREAM_KEEPALIVE_LINE,
     RESET_STREAM_KEEPALIVE_SEC,
     SIGTERM_GRACE_SEC,
+    SURVIVOR_KILL_WAIT_SEC,
     STAGE_BRIDGE_RESET,
     STAGE_POWER_CYCLE,
     STAGE_SMI_RESET,
@@ -87,6 +91,7 @@ from tt_device_mcp.constants import step_deadline_sec as _shared_step_deadline_s
 
 # Device node directory; module-level so tests can point it at a fixture dir.
 TT_DEV_DIR = "/dev/tenstorrent"
+from tt_device_mcp.health.recovery.galaxy import _whole_trays_off
 from tt_device_mcp.device_holders import (
     MIN_TENANT_UID,  # noqa: F401 - re-exported: tests read srv.MIN_TENANT_UID
     HolderScan,
@@ -96,6 +101,7 @@ from tt_device_mcp.device_holders import (
     discount_broker_internal,
     enumerate_device_holders,
     evaluate_reset_gate,
+    holder_state,
     in_broker_scope,
     is_broker_internal,
     is_tenant,
@@ -105,6 +111,7 @@ from tt_device_mcp.device_holders import (
     read_proc_starttime,
     reclaim_foreign_holders,
     wait_device_released,
+    zombie_info,
 )
 from tt_device_mcp.exit_witness import ExitWitness
 from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState, _episode_elapsed_sec, add_close_listener
@@ -202,6 +209,7 @@ from tt_device_mcp.job_reap import (
     DEAD_CHIP_LABEL_PREFIX,
     JOB_TAG_ENV,
     ReapedLeftover,
+    _cmdline,
     _leftover_state,
     find_reaped_leftovers,
     io_advanced,
@@ -1145,6 +1153,10 @@ preempt_forced_job_ids: set = set()
 # and why, and when the debt was taken (monotonic); 0.0 is none. Any reset since settles it.
 _kill_reset_owed: str = ""
 _kill_reset_owed_at: float = 0.0
+# Spec 03 I89: the stopped job behind the debt, so the reset can wait for it to be gone: its scope,
+# its tag, the (pid, starttime) of every process its end's sweep left alive, and when that sweep
+# ended (monotonic). Empty for a debt with no job record (a re-adopted job): only holders are waited on.
+_kill_reset_job: dict = {}
 # Spec 01 I66: the kills a job_run started as its client went away, kept so none is collected
 # while it runs.
 _client_gone_kills: set = set()
@@ -4826,20 +4838,141 @@ def _eth_timeout_reset_shape(evidence: dict) -> bool:
     )
 
 
-def _owe_kill_reset(why: str) -> None:
-    """Spec 03 I69: a job the broker stopped mid-run owes the mesh one reset, then the full check."""
-    global _kill_reset_owed, _kill_reset_owed_at
+def _owe_kill_reset(why: str, job: Optional[dict] = None) -> None:
+    """Spec 03 I69: a job the broker stopped mid-run owes the mesh one reset, then the full check.
+    ``job`` names the stopped job's processes for the wait before that reset (I89)."""
+    global _kill_reset_owed, _kill_reset_owed_at, _kill_reset_job
     _kill_reset_owed = why
     _kill_reset_owed_at = time.monotonic()
+    _kill_reset_job = dict(job or {})
     if logger:
         logger.info(f"CLEAN-GATE {why}: the mesh owes one reset, then the full check, before release")
     health_event("kill_reset_owed", why=why)
 
 
 def _clear_kill_reset_debt() -> None:
-    global _kill_reset_owed, _kill_reset_owed_at
+    global _kill_reset_owed, _kill_reset_owed_at, _kill_reset_job
     _kill_reset_owed = ""
     _kill_reset_owed_at = 0.0
+    _kill_reset_job = {}
+
+
+def _post_kill_job_left(job: dict) -> dict:
+    """Spec 03 I89: pid -> starttime of the stopped job's processes still alive (zombies are gone).
+    Found by the job's scope and tag (a child that left the group or session keeps both) and by the
+    exact identity of each process its end's sweep left alive; never by pid alone, which may be reused."""
+    left = {}
+    if job.get("scope") or job.get("tag"):
+        for pid, info in job_processes(None, job.get("scope"), job.get("tag")).items():
+            left[pid] = info.starttime
+    for pid, start in job.get("survivors") or ():
+        state, now = _leftover_state(pid)
+        if start and now == start and state not in ("Z", "X", "?"):
+            left[pid] = start
+    return left
+
+
+def _post_kill_blocking_holders(scan) -> list:
+    """Spec 03 I89: the device holders the post-kill reset waits on. Not the broker's own readers, and
+    not a zombie whose whole thread group has exited: it holds no fd and no mapping."""
+    out = []
+    for h in scan.holders:
+        if h.pid == os.getpid() or is_broker_internal(h.pid) or in_broker_scope(h.pid, (RESET_SCOPE_PREFIX,)):
+            continue
+        z = zombie_info(h.pid)
+        if z is not None and z.verdict == "exited":
+            continue
+        out.append({"pid": h.pid, "state": holder_state(h.pid), "zombie": z.verdict if z is not None else None})
+    return out
+
+
+async def _post_kill_quiesce(expected: int, log) -> dict:
+    """Spec 03 I89: before a multi-tray mesh pays its post-kill reset, wait (at most
+    POST_KILL_REAP_WAIT_SEC) until every process of the stopped job is gone and nothing outside the
+    broker holds a device node, then let the mesh settle POST_KILL_SETTLE_SEC and read every chip.
+
+    A job process still alive at the bound gets SIGKILL and is logged with its pid and cmdline. A live
+    holder that is not the job's is never signalled here: the settle is skipped and the reset's own
+    pre-reset holder scan (04 I92) rules on it, so the hold stays and the bounded ladder decides. Both
+    waits count inside that ladder's 10-min bound. Returns what the ``post_kill_settle`` event logs."""
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    job = dict(_kill_reset_job)
+    last_exit = job.get("exited_at") or time.monotonic()
+    killed: list = []
+    while True:
+        left = await asyncio.to_thread(_post_kill_job_left, job)
+        scan = await asyncio.to_thread(enumerate_device_holders)
+        holders = _post_kill_blocking_holders(scan)
+        if left:
+            last_exit = time.monotonic()
+        if not left and not holders and scan.complete:
+            break
+        if loop.time() - start >= POST_KILL_REAP_WAIT_SEC:
+            if left:
+                for pid, st in left.items():
+                    if _leftover_state(pid)[1] != st:
+                        continue
+                    cmd = _cmdline(pid)
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        continue
+                    killed.append({"pid": pid, "cmdline": cmd[:200]})
+                    msg = f"post-kill: job process pid {pid} still alive after {POST_KILL_REAP_WAIT_SEC}s, SIGKILL: {cmd}"
+                    log(msg)
+                    if logger:
+                        logger.warning(msg)
+                wait_end = loop.time() + SURVIVOR_KILL_WAIT_SEC
+                while loop.time() < wait_end and await asyncio.to_thread(_post_kill_job_left, job):
+                    await asyncio.sleep(POST_KILL_POLL_SEC)
+                left = await asyncio.to_thread(_post_kill_job_left, job)
+                if not left:
+                    last_exit = time.monotonic()
+                scan = await asyncio.to_thread(enumerate_device_holders)
+                holders = _post_kill_blocking_holders(scan)
+            break
+        await asyncio.sleep(POST_KILL_POLL_SEC)
+    reap_wait = loop.time() - start
+    out = {
+        "reap_wait_sec": round(reap_wait, 1),
+        "settle_sec": 0.0,
+        "killed": killed,
+        "job_left": sorted(left),
+        "holders": holders,
+        "scan_complete": scan.complete,
+        "chips": {},
+        "off": [],
+        "whole_trays": [],
+    }
+    if left or holders:
+        # Not quiet: no settle; the reset's own holder scan refuses or clears, and the hold stands.
+        out["since_exit_sec"] = round(time.monotonic() - last_exit, 1)
+        return out
+    if POST_KILL_SETTLE_SEC > 0:
+        await asyncio.sleep(POST_KILL_SETTLE_SEC)
+    out["settle_sec"] = float(POST_KILL_SETTLE_SEC)
+    beats = await asyncio.to_thread(_decision_heartbeats)
+    off = offbus_chip_ids(beats, expected)
+    out["chips"] = {str(i): ("off" if str(i) in off else "ok") for i in range(expected)}
+    out["off"] = sorted(off, key=lambda c: int(c) if c.isdigit() else 0)
+    tray_map = galaxy_recovery._tray_map_now() if galaxy_recovery is not None else None
+    out["whole_trays"] = _whole_trays_off(off, expected, tray_map) if off else []
+    out["since_exit_sec"] = round(time.monotonic() - last_exit, 1)
+    return out
+
+
+def _post_kill_route(q: dict, expected: int, kill_reset_due: bool) -> str:
+    """Spec 03 I89: the path the post-kill episode takes from the chip read after the settle."""
+    if q["job_left"] or q["holders"]:
+        return "holder_left"
+    if kill_reset_due:
+        return "mesh_reset"
+    if q["off"] and (q["whole_trays"] or len(q["off"]) >= expected):
+        return "power_cycle"
+    if q["off"]:
+        return "sbr"
+    return "own_rung"
 
 
 def _kill_reset_debt() -> str:
@@ -7142,6 +7275,11 @@ async def device_health_gate(
                 _clear_kill_reset_debt()
                 kill_debt = ""
         kill_reset = bool(kill_debt)
+        # Spec 03 I89: on a multi-tray mesh the reset waits until the stopped job is gone and the mesh
+        # has settled; the chips read after the settle route it (observe below reads them again).
+        post_kill = (
+            await _post_kill_quiesce(expected, _log) if kill_reset and expected >= 2 * UBB_CHIP_COUNT else None
+        )
         # Spec 03 I78: a dirty hold lifts only on a fresh passing full check, fabric included. Pre-job,
         # with no such pass on record, the funnel would refuse this gate's release on every job, and
         # nothing else runs a fabric pass on a dirty hold with jobs queued until the 10-min bound
@@ -7233,6 +7371,33 @@ async def device_health_gate(
                 f"leave the mesh wedged — one reset, then the full check, before release"
             )
             health_event("kill_mesh_reset", phase=phase, expected=expected, why=kill_debt[:200])
+        if post_kill is not None:
+            route = _post_kill_route(post_kill, expected, kill_reset_due)
+            off = post_kill["off"]
+            _log(
+                f"post_kill_settle: route {route}; job gone after {post_kill['reap_wait_sec']}s "
+                f"({len(post_kill['killed'])} killed at the bound), settle {post_kill['settle_sec']:.0f}s, "
+                f"{post_kill['since_exit_sec']}s since the last job process exited; "
+                f"{len(post_kill['holders'])} holder(s) left; chips off before the reset: "
+                f"{', '.join(off) if off else 'none'}"
+            )
+            health_event(
+                "post_kill_settle",
+                phase=phase,
+                expected=expected,
+                why=kill_debt[:200],
+                route=route,
+                reap_wait_sec=post_kill["reap_wait_sec"],
+                settle_sec=post_kill["settle_sec"],
+                since_exit_sec=post_kill["since_exit_sec"],
+                killed=post_kill["killed"],
+                job_left=post_kill["job_left"],
+                holders=post_kill["holders"],
+                scan_complete=post_kill["scan_complete"],
+                chips=post_kill["chips"],
+                sbr_chips=off if route == "sbr" else [],
+                whole_trays=post_kill["whole_trays"],
+            )
         if relax_exit1 and healthy and fabric_ok is None:
             # Worded so nothing reads it as a fabric verdict: no pass ran, so it is neither an OK nor
             # an exit-77 skip.
@@ -14128,7 +14293,13 @@ export {JOB_TAG_ENV}={job_tag}
                             f"(max {max(left_busy.values())} MHz)"
                             if left_busy and job.status not in (JobStatus.TIMEOUT, JobStatus.HUNG)
                             else ""
-                        )
+                        ),
+                        job={
+                            "scope": job_scope_unit(job_id) if privsep_prefix else None,
+                            "tag": job_tag,
+                            "survivors": [(s.pid, s.starttime) for s in survivors if s.starttime],
+                            "exited_at": time.monotonic(),
+                        },
                     )
                 request_killed_job_ids.discard(job_id)
                 preempt_forced_job_ids.discard(job_id)
