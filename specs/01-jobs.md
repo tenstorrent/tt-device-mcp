@@ -59,7 +59,8 @@ the queue and a running job outlive the broker process.
   per scan for all of them together. A process the first scan found stays the job's in the
   re-scan while it lives (same pid and starttime): past exit_mm its tag no longer reads.
   Leftovers get SIGTERM, then SIGKILL after
-  `SURVIVOR_TERM_GRACE_SEC` (5 s); with nothing left, the sweep costs one /proc scan and a
+  `SURVIVOR_TERM_GRACE_SEC` (10 s, the window every job process gets between SIGTERM and
+  SIGKILL); with nothing left, the sweep costs one /proc scan and a
   `killpg` backstop. A process still alive after SIGKILL (state D: stuck in the kernel) is
   named in the broker log and the job log, and if it holds or may hold the device, the
   device is marked dirty with the job and pid, so the next job waits until it is gone. A

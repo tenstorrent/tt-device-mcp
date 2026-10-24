@@ -1102,6 +1102,32 @@ cooldown (spec 04 I65) holds longer.
   off-bus chip's 0xFFFFFFFF read (above `AICLK_READ_MAX_MHZ`) is unreadable, not busy, so it owes no
   I69 reset: an off-bus fault (class A whole-tray drop, class B1 partial off-bus) takes its own path
   instead of the kill reset.
+- **I89 — On a multi-tray mesh the owed post-kill reset waits for the job's teardown, then
+  settles.** On a mesh of two or more UBB trays (`expected >= 2 * UBB_CHIP_COUNT`), the gate that
+  pays an I69 debt first waits until every process of the stopped job is gone and no process
+  outside the broker holds a device node. A mesh reset issued 1-2 s after the SIGKILL, while the
+  job's teardown still ran, left a chip off the bus or failing its post-reset check in 5 of 20
+  cases, against 3 of 49 abnormal ends with no reset; the 8-chip reset showed no such effect.
+  The job's processes are found by its scope, by its tag (a child that called setsid or
+  double-forked keeps both) and by the exact (pid, starttime) of each process its end's survivor
+  sweep left alive; a zombie counts as gone. A device holder counts unless it is the broker's own
+  or a zombie whose whole thread group has exited (spec 04 I92: it holds no fd and no mapping).
+  The wait is bounded by `POST_KILL_REAP_WAIT_SEC` (30 s). At the bound each job process still
+  alive gets SIGKILL and is logged with its pid and cmdline, then `SURVIVOR_KILL_WAIT_SEC` is
+  allowed for it to go. A holder that is not the job's is never signalled here: the settle is
+  skipped and the reset's own pre-reset holder scan rules on it, so the hold stays and the
+  bounded ladder decides. Once quiet, the mesh settles `POST_KILL_SETTLE_SEC` (10 s) and every
+  chip is read. The probe pass then routes the episode as before: a mesh read whole pays the debt
+  with the present-mesh reset (`mesh_reset`); a chip still unreadable is an off-bus fault and
+  takes its own rung, bridge reset and rescan first (`sbr`), never the whole-mesh reset; a whole
+  tray or every chip off goes to the broker's own power-cycle path (`power_cycle`). The full
+  check, fabric over every cabled link included, must pass before release, and a failed one keeps
+  the hold (I69). The wait and the settle count inside the hold's 10-min ladder bound (spec 04
+  I76). Each such gate logs one `post_kill_settle` health event and one server.log line
+  (`post_kill_settle: route <route>; ...`) with the route, the reap wait, the settle time, the
+  seconds since the last job process was seen alive, the processes killed at the bound, the
+  holders left, the per-chip readability before the reset and the chips sent to their bridge
+  reset (`sbr_chips`). An 8-chip mesh and a job that ended itself are unchanged.
 - **I74 — The startup gate pays a kill-reset debt it finds open: reset, then the one full check.**
   A re-adopted job (spec 01 I7) that the broker stopped before the startup check ran (its timeout,
   a requested kill, or a preemption kill) leaves an I69 debt open when the startup gate (I4)
@@ -2335,6 +2361,12 @@ refuses.
 | I69 (every broker kill logs one KILLED process-tree line) | `tests/test_job_kill_reset.py::test_a_broker_kill_logs_the_process_tree_it_stopped`, `tests/test_job_kill_reset.py::test_a_preempt_kill_that_outlives_sigterm_logs_the_process_tree`, `tests/test_job_kill_reset.py::test_a_reset_that_stops_a_readopted_job_logs_the_process_tree` |
 | I69 (every preemption kill owes the reset unless every process was witnessed to exit by its own code on SIGTERM, which takes the fast check (none when its own status is a proven 0) and its job's own post-job gate pays it, reset then full check, before the waiting job's door; a job that ends itself inside its minute is not preempted; the re-adopted path too, leaving no id) | `tests/test_job_kill_reset.py::test_every_preemption_kill_owes_the_reset`, `tests/test_preemptable.py::test_a_job_that_ends_itself_inside_the_minute_is_a_normal_end`, `tests/test_job_kill_reset.py::test_a_preemption_owes_and_pays_the_reset_before_the_next_job`, `tests/test_job_kill_reset.py::test_a_preemption_debt_resets_then_runs_the_full_check_before_release`, `tests/test_job_kill_reset.py::test_a_preempted_readopted_job_owes_the_reset`, `tests/test_preemptable.py::test_a_preempted_job_that_ends_cleanly_on_sigterm_takes_the_fast_check`, `tests/test_preemptable.py::test_a_preempted_job_that_returns_0_on_sigterm_gets_no_check_and_no_reset`, `tests/test_preemptable.py::test_a_preempted_exit_0_on_a_held_or_owing_device_keeps_its_gate`, `tests/test_preemptable.py::test_a_preempted_job_with_a_signal_death_is_reset_and_fully_checked`, `tests/test_preemptable.py::test_a_preempted_job_that_needed_sigkill_is_reset_and_fully_checked`, `tests/test_preemptable.py::test_an_unwitnessed_preemption_is_reset_and_fully_checked`, `tests/test_preemptable.py::test_a_preemption_witnessed_from_a_pid_namespace_is_reset_and_fully_checked`, `tests/test_preemptable.py::test_a_witness_error_keeps_the_reset_debt_and_the_kill_completes` |
 | I69 (the door payment waits out an external step's reservation) | `tests/test_job_kill_reset.py::test_the_door_payment_waits_out_an_external_step` |
+| I89 (the post-kill reset waits for the job's processes, a setsid child included; a zombie or a fully exited zombie holder does not block it; a zombie with a live holding thread does) | `tests/test_post_kill_settle.py::test_the_reset_waits_for_the_jobs_processes_to_exit`, `tests/test_post_kill_settle.py::test_a_setsid_child_that_ignores_term_is_killed_at_the_bound_and_logged`, `tests/test_post_kill_settle.py::test_a_zombie_holder_whose_threads_all_exited_does_not_block`, `tests/test_post_kill_settle.py::test_a_zombie_with_a_live_holding_thread_still_blocks` |
+| I89 (a live holder past the bound is never signalled and keeps the hold; a job process alive at the bound is SIGKILLed and logged with pid and cmdline) | `tests/test_post_kill_settle.py::test_a_live_holder_past_the_bound_is_never_signalled`, `tests/test_post_kill_settle.py::test_a_live_holder_past_the_bound_keeps_the_hold`, `tests/test_post_kill_settle.py::test_a_setsid_child_that_ignores_term_is_killed_at_the_bound_and_logged` |
+| I89 (the settle runs before the reset; the waits fit the 10-min ladder bound) | `tests/test_post_kill_settle.py::test_the_settle_delay_is_applied_before_the_reset`, `tests/test_post_kill_settle.py::test_the_defaults_wait_and_settle_inside_the_ladder_bound` |
+| I89 (an unreadable chip takes its own bridge-reset rung, not the mesh reset; a whole tray or every chip off goes to the power cycle) | `tests/test_post_kill_settle.py::test_an_unreadable_chip_routes_to_its_bridge_reset`, `tests/test_post_kill_settle.py::test_an_unreadable_chip_takes_its_own_rung_not_the_mesh_reset`, `tests/test_post_kill_settle.py::test_a_whole_tray_off_routes_to_the_power_cycle`, `tests/test_post_kill_settle.py::test_all_chips_off_routes_to_the_power_cycle` |
+| I89 (release still needs a just-passed full check with fabric; a failed or unrun fabric pass keeps the hold; the power cycle still fires) | `tests/test_post_kill_settle.py::test_release_still_needs_the_full_check_with_fabric`, `tests/test_post_kill_settle.py::test_a_post_kill_fabric_that_fails_or_cannot_check_keeps_the_hold`, `tests/test_post_kill_settle.py::test_a_failed_post_kill_check_still_climbs_to_the_power_cycle` |
+| I89 (one `post_kill_settle` event and log line per post-kill reset, none without a debt) | `tests/test_post_kill_settle.py::test_one_post_kill_settle_event_and_line_per_reset`, `tests/test_post_kill_settle.py::test_no_post_kill_settle_without_a_debt` |
 | I69 (a reaped leftover skips before the debt: no reset, debt kept, no wait; a reboot drops it and the startup full check runs; a cooldown skips and clears it with no wait) | `tests/test_job_kill_reset.py::test_a_reaped_leftover_defers_the_debt_with_no_reset_and_no_wait`, `tests/test_job_kill_reset.py::test_a_debt_inside_a_failed_resets_cooldown_is_skipped_with_no_wait` |
 | I69 (a failed job that left chips at the busy AI clock owes the reset; an idle clock, an exit 0 or our own reset's kill owes none; nor does an off-bus chip's 0xFFFFFFFF read) | `tests/test_job_kill_reset.py::test_a_failed_job_that_left_the_clock_busy_owes_the_reset`, `tests/test_job_kill_reset.py::test_no_clock_debt_for_a_closed_device_an_exit0_or_our_own_kill`, `tests/test_job_kill_reset.py::test_an_off_bus_clock_read_is_not_a_busy_clock` |
 | I74 (the startup gate pays an open debt: one reset, one full check after it, no pass before; a failed check stays held; the read-only probe leaves it; a later debt is paid by the post-job gate) | `tests/test_job_kill_reset.py::test_the_startup_gate_pays_an_open_debt_with_one_full_check`, `tests/test_job_kill_reset.py::test_a_failed_startup_kill_check_stays_held`, `tests/test_job_kill_reset.py::test_the_read_only_startup_probe_leaves_the_debt`, `tests/test_job_kill_reset.py::test_a_debt_owed_after_the_startup_check_is_paid_by_the_post_job_gate` |
