@@ -878,7 +878,9 @@ async def test_a_refused_mesh_reset_before_the_host_rung_goes_to_the_power_cycle
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("margin, fires", [(-5, True), (5, False)], ids=["ends-before-the-deadline", "would-end-past-it"])
+@pytest.mark.parametrize(
+    "margin, fires", [(-5, True), (5, False)], ids=["ends-before-the-deadline", "would-end-past-it"]
+)
 async def test_the_mesh_reset_before_the_host_rung_starts_only_when_it_ends_before_the_deadline(
     monkeypatch, tmp_path, clear_job_state, margin, fires
 ):
@@ -1004,7 +1006,9 @@ async def test_a_full_check_still_running_at_the_deadline_fails_and_power_cycles
     await srv.galaxy_recovery.escalate("offbus-forced", [GONE], 32, lambda m: None)
     sbr = f"sbr ['{GONE}']"
     assert order[order.index(sbr) :] == [sbr, "full check", "mesh reset", "full check", "power cycle"]
-    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "a check cut at the deadline lifts nothing"
+    assert (
+        counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
+    ), "a check cut at the deadline lifts nothing"
     took = cycled_at[0][1] - started[0]
     rc = await asyncio.wait_for(readers[0].wait(), 3)
     assert rc == -signal.SIGKILL, "the reader that ignored SIGTERM got SIGKILL after the grace"

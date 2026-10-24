@@ -831,9 +831,7 @@ def _mesh_reset_before_host_rung_deadline_sec() -> float:
     """Spec 04 I97: the hold age at which the full check after the reset counts as failed. Measured
     from hold start: the I76 bound less the kill grace and the reap, so the power cycle is requested
     by the bound."""
-    return (
-        _stuck_hold_ceiling_sec() - MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC - MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC
-    )
+    return _stuck_hold_ceiling_sec() - MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC - MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC
 
 
 TRAY_DOWN_ONSET = "TRAY_DOWN"
@@ -3377,10 +3375,14 @@ class GalaxyRecovery(Recovery):
         deadline = _mesh_reset_before_host_rung_deadline_sec()
         needs = max(
             MESH_RESET_BEFORE_HOST_RUNG_GAVE_UP_SEC,
-            MESH_RESET_BEFORE_HOST_RUNG_SEC + MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC + MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC,
+            MESH_RESET_BEFORE_HOST_RUNG_SEC
+            + MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC
+            + MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC,
         )
         if age + needs > deadline:
-            return skip(f"the hold is {int(age)}s old; the reset and its check would not end by the {deadline:.0f}s deadline")
+            return skip(
+                f"the hold is {int(age)}s old; the reset and its check would not end by the {deadline:.0f}s deadline"
+            )
         try:
             beats = await asyncio.to_thread(self.deps.read_heartbeats)
             whole = not (
