@@ -1933,12 +1933,100 @@ def test_forced_reset_waits_for_a_killed_readopted_job_seen_only_by_the_recheck(
     assert any(s.startswith("waiting for re-adopted job 906-1 (killed)") for s in d["steps"])
 
 
+# A fabric pass that found fewer links than the cabling expects: a failed check, not a pass on the
+# links it could see.
+_FEWER_LINKS = (
+    False,
+    {
+        "snapshot": {"ok": True},
+        "fabric": {"ok": False, "detail": "links missing: found 2 missing port/cable connections"},
+    },
+)
+
+
+async def _assert_held_until_a_full_fabric_pass(monkeypatch, tmp_path):
+    """A reset-killed job owes no kill reset, so only the startup gate's forced full check, fabric
+    included, may lift the hold: fewer links than cabled keeps it, only a full pass lifts it."""
+    from tests.test_boot_fabric_reverify import _FABRIC_OK, _broker
+
+    assert srv.fsm.state is not srv.ServerState.HEALTHY, "the hold lifted with no check"
+    assert srv._device_unavailable_for_tenant(), "the device went back to the queue with no check"
+    _events, seen = _broker(monkeypatch, tmp_path, srv.fsm, verdict=_FEWER_LINKS)
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "fabric-check")
+
+    await srv._device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
+
+    assert seen["fabric"] and seen["fabric"][-1] is True, "the gate did not run the fabric check"
+    assert srv.fsm.state is not srv.ServerState.HEALTHY, "fewer links than cabled lifted the hold"
+    assert srv._device_unavailable_for_tenant()
+
+    seen["verdict"] = _FABRIC_OK
+    await srv._device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
+
+    assert seen["fabric"][-1] is True
+    assert srv.fsm.state is srv.ServerState.HEALTHY, "a full pass with fabric did not lift the hold"
+    assert not srv._device_unavailable_for_tenant()
+
+
+@pytest.mark.parametrize("path", ["reset_in_flight", "no_devices", "reset_failed", "finalize_wait_expired"])
+def test_a_forced_reset_that_kills_a_readopted_job_and_ends_early_keeps_the_hold(
+    monkeypatch, tmp_path, clear_job_state, path
+):
+    """After the reset claims a re-adopted job it can end without a reset or a verify: another
+    reset in flight, no chips, a failed reset, or (in every case here) the wait for the job's
+    record expired and the reset went on. The job's end then owes no kill reset, so nothing on
+    these paths may lift the startup hold: only the gate's full check with fabric does."""
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "reset_killed_job_ids", set())
+    fsm_dirty(srv, "startup: not verified yet", why="startup_unverified", dirty=False)
+    job = _readopted_job(monkeypatch)  # READOPTED_FINALIZE_WAIT_SEC 0: the wait always expires
+    scope = srv.readopted_scopes["905-1"]
+    devs = tmp_path / "reset-dev"
+    devs.mkdir()
+    if path == "finalize_wait_expired":
+        # A mesh reset that runs to its verify; the fabric could not be proven.
+        _mesh_with_fabric_check(monkeypatch, devs)
+        _verify_seam(monkeypatch, fabric_ok=None)
+    elif path != "no_devices":
+        (devs / "0").write_text("")
+    if path == "reset_in_flight":
+
+        async def in_flight():
+            return "another reset is in flight"
+
+        monkeypatch.setattr(srv, "_reset_in_flight", in_flight)
+    monkeypatch.setattr(srv.subprocess, "run", _fake_tt_smi(0, snapshot_chips=1))
+    if path != "finalize_wait_expired":
+        _fake_scoped_reset(monkeypatch, 1 if path == "reset_failed" else 0, "Resetting...\n")
+    _record_terminators(monkeypatch)
+
+    d = _client(monkeypatch, devs).post("/api/tt_device_reset", json={"force": True}).json()
+
+    want = {
+        "reset_in_flight": "refused",
+        "no_devices": "no_devices",
+        "reset_failed": "reset_failed",
+        "finalize_wait_expired": "reset_unverified",
+    }[path]
+    assert d["status"] == want, d
+    assert job.status == srv.JobStatus.KILLED and "905-1" in srv.reset_killed_job_ids
+    assert srv.fsm.state is not srv.ServerState.HEALTHY
+
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
+    asyncio.run(srv._monitor_readopted_scope("905-1", scope))
+    assert "905-1" not in srv.readopted_scopes
+
+    asyncio.run(_assert_held_until_a_full_fabric_pass(monkeypatch, tmp_path))
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("held", [False, True])
 async def test_a_readopted_job_killed_by_a_forced_reset_does_not_flag_the_device(
-    monkeypatch, tmp_path, clear_job_state
+    monkeypatch, tmp_path, clear_job_state, held
 ):
     """The monitor finalizes the job once its scope ends. KILLED is a wedge-risk end, but this kill
-    was the reset's own: flagging the device for it would make the reset its own justification."""
+    was the reset's own: flagging the device for it would make the reset its own justification.
+    It owes no kill reset either, so a hold already standing still needs the full check to lift."""
     monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
     monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
     monkeypatch.setattr(srv, "device_fault_reported", "")
@@ -1956,12 +2044,19 @@ async def test_a_readopted_job_killed_by_a_forced_reset_does_not_flag_the_device
     async with srv.get_lock():
         assert srv._claim_readopted_job_for_reset(srv._reset_blocking_job()) == scope
 
+    if held:
+        fsm_dirty(srv, "startup: not verified yet", why="startup_unverified", dirty=False)
+
     await srv._monitor_readopted_scope("907-1", scope)
 
     assert job.status == srv.JobStatus.KILLED and "forced device reset" in job.error
-    assert not srv._device_unavailable_for_tenant(), "a reset-killed job must not flag the device"
     assert "907-1" not in srv.reset_killed_job_ids and "907-1" not in srv.readopted_scopes
     assert "[KILLED by device reset]" in log.read_text()
+    if held:
+        assert not srv.fsm.record.dirty, "a reset-killed job must not flag the device"
+        await _assert_held_until_a_full_fabric_pass(monkeypatch, tmp_path)
+    else:
+        assert not srv._device_unavailable_for_tenant(), "a reset-killed job must not flag the device"
 
 
 @pytest.mark.asyncio
