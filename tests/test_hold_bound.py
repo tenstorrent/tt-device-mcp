@@ -575,6 +575,10 @@ def _refusing_scan(outcome: str) -> PreResetScan:
     if outcome == "unkillable":
         row["state"] = "D"
         return PreResetScan(found=[row], killed=[dict(row, signal="SIGKILL", released=False)], unkillable=[row])
+    if outcome == "scan_incomplete":
+        # a zombie leader whose live threads never settled within the wait: the gap refuses the reset
+        zombie = {"pid": 4303, "state": "Z", "threads": 2, "live_threads": 1, "verdict": "unknown", "waited_sec": 465.0}
+        return PreResetScan(gaps=["pid 4303 named by the driver, not attributable"], zombies=[zombie])
     assert outcome == "tenant_blocked"
     return PreResetScan(found=[row], tenants=[row])
 
@@ -650,12 +654,13 @@ def _bound_hold_with_a_failing_full_check(rig, monkeypatch):  # noqa: F811
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["survivor", "offbus_undetached", "unkillable"])
+@pytest.mark.parametrize("outcome", ["survivor", "offbus_undetached", "unkillable", "scan_incomplete"])
 async def test_a_reset_the_holder_scan_refuses_keeps_the_hold_and_the_bound_cycles(
     rig, monkeypatch, clear_job_state, outcome  # noqa: F811
 ):
     """Spec 04 I92 with I76: the pre-reset scan refuses the bound ladder's mesh reset (a reader that would
-    not let go, an off-bus chip it could not detach, a reader stuck in the kernel). No reset runs and none
+    not let go, an off-bus chip it could not detach, a reader stuck in the kernel, a zombie whose live
+    threads never settled within its wait). No reset runs and none
     is counted; the hold stays, the full check with fabric still fails, and the broker's own code asks for
     the power cycle once. Nothing is released and the fabric stays owed."""
     order, g = rig["order"], rig["g"]
