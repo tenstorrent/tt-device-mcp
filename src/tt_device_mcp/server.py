@@ -1023,6 +1023,10 @@ _hold_row: Optional[dict] = None
 # episode closes) — or a broker op takes over the RUNNING row (that op IS the recovery, and owns
 # the row while it runs).
 device_held_since: str = ""
+# Spec 03 I88: when a running tenant job's own live reading (a chip off the bus, a short count)
+# was first seen with no hold episode open. Reported as /health `tenant_job_degraded`, never as
+# a hold; cleared the moment that reading clears, the job ends or a hold episode opens.
+tenant_job_degraded_since: str = ""
 
 # Whether the CURRENT tenant-refused episode has been written to the durable health
 # timeline. The synthetic HOLD row lives only in memory and the per-job refusals only in
@@ -2793,7 +2797,7 @@ def _reset_for_testing():
     global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
     global _dispatch_reset_spent, _kill_reset_owed, _kill_reset_owed_at, _pre_reset_blocker
     global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
-    global device_op_stage_started_at, device_held_since, device_hold_escalated_monotonic
+    global device_op_stage_started_at, device_held_since, device_hold_escalated_monotonic, tenant_job_degraded_since
     global device_hold_deadline_bucket, device_hold_alert_next_bucket, device_hold_alert_gap
     global device_hold_escalate_bucket, device_hold_offbus_escalated, device_hold_offbus_tenant_wait
     global device_hold_offbus_idle_early, device_hold_offbus_prior_bucket, device_hold_tenant_deferred
@@ -2835,6 +2839,7 @@ def _reset_for_testing():
     # Hold escalation: the deadline/alert buckets, the latches one escalation sets and what triggered it.
     device_op_stage_started_at = ""
     device_held_since = ""
+    tenant_job_degraded_since = ""
     device_hold_escalated_monotonic = 0.0
     device_hold_deadline_bucket = 0
     device_hold_alert_next_bucket = 0
@@ -8167,9 +8172,37 @@ def _device_hold_state(now: Optional[datetime] = None) -> Optional[tuple[str, st
         return None
     if device_op_active:
         return None  # the op's row is the recovery; don't double it. Keep the latch running.
+    if _tenant_job_reading(reason):
+        return None  # spec 03 I88: a running job's own reading, no hold episode open: not a hold
     if not device_held_since:
         device_held_since = _held_since_latch(now)
     return reason, device_held_since
+
+
+def _tenant_job_reading(reason: str) -> str:
+    """The RUNNING tenant job's id when ``reason`` is only a live reading taken under that job, with
+    no hold episode open and no broker op running (spec 03 I88); else ''. A job that resets the mesh
+    itself takes every chip off the bus for a few seconds: that is the job's own work, not a hold.
+    Any in-memory verdict (the FSM off HEALTHY, a runtime fault report) or an open episode is not
+    this case and keeps reading as a hold. Reporting only: the post-job gate still reads the live
+    probe and opens the hold for a chip still off when the job ends."""
+    if not reason or device_op_active or device_hold_logged or _device_unavailable_for_tenant():
+        return ""
+    return next((j.id for j in jobs.values() if j.status is JobStatus.RUNNING), "")
+
+
+def _tenant_job_degraded_view(now: Optional[datetime] = None) -> Optional[dict]:
+    """/health ``tenant_job_degraded`` (spec 03 I88): ``{job_id, reason, since}`` while a running
+    tenant job's own live reading says degraded and no hold episode is open, else ``None``."""
+    global tenant_job_degraded_since
+    reason = _device_degraded_for_tenant()
+    job_id = _tenant_job_reading(reason)
+    if not job_id:
+        tenant_job_degraded_since = ""
+        return None
+    if not tenant_job_degraded_since:
+        tenant_job_degraded_since = (now or datetime.now()).isoformat()
+    return {"job_id": job_id, "reason": reason, "since": tenant_job_degraded_since}
 
 
 def _held_since_latch(now: Optional[datetime] = None) -> str:
@@ -8589,6 +8622,8 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         "total_jobs": len(jobs),
         "device_degraded": _device_degraded_for_tenant(),
         "held": hold is not None,
+        # Spec 03 I88: a running tenant job's own off-bus/degraded reading with no hold open; not a hold.
+        "tenant_job_degraded": _tenant_job_degraded_view(now),
         # The FSM's own record, straight from the source every field above is now derived from.
         "fsm_state": fsm.state.value,
         "fsm_why": fsm.record.why,
