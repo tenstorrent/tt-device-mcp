@@ -165,8 +165,8 @@ async def test_a_live_holder_past_the_bound_is_never_signalled(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_live_holder_past_the_bound_keeps_the_hold(
-    killed, events, monkeypatch, armed_power_cycle
-):  # noqa: F811
+    killed, events, monkeypatch, armed_power_cycle  # noqa: F811
+):
     """With a holder still there, the episode goes on through the owed-reset path; the gate never
     releases a device whose post-kill check has not passed."""
     monkeypatch.setattr(srv, "POST_KILL_REAP_WAIT_SEC", 0.2)
@@ -318,8 +318,8 @@ async def test_a_post_kill_fabric_that_fails_or_cannot_check_keeps_the_hold(kill
 
 @pytest.mark.asyncio
 async def test_a_failed_post_kill_check_still_climbs_to_the_power_cycle(
-    killed, events, armed_power_cycle, monkeypatch
-):  # noqa: F811
+    killed, events, armed_power_cycle, monkeypatch  # noqa: F811
+):
     monkeypatch.setattr(srv, "POST_KILL_SETTLE_SEC", 0.05)
     killed["reset_heals"] = False
     srv.recovery_mechanism.last_reset_failed = True
