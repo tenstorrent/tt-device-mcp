@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
 """Event-loop stall watchdog.
 
 Every broker surface (/health, the REST API, the MCP tools, the sampler, the job runner) shares one
@@ -63,7 +66,9 @@ def _watcher(warn_sec: float, tick_sec: float, log: logging.Logger, loop: asynci
             )
 
 
-def start(log: Optional[logging.Logger] = None, warn_sec: float = LOOP_LAG_WARN_SEC, tick_sec: float = TICK_SEC) -> None:
+def start(
+    log: Optional[logging.Logger] = None, warn_sec: float = LOOP_LAG_WARN_SEC, tick_sec: float = TICK_SEC
+) -> None:
     """Start the watchdog on the running loop. Idempotent per loop."""
     loop = asyncio.get_running_loop()
     task = _state["task"]

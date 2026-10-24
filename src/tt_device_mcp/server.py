@@ -8006,7 +8006,7 @@ async def _status_beats_now() -> tuple[dict, Optional[float]]:
         _status_read = (loop, asyncio.ensure_future(asyncio.to_thread(_status_chip_read)))
     fut = _status_read[1]
     try:
-        return await asyncio.wait_for(asyncio.shield(fut), STATUS_CHIP_READ_WAIT_SEC), None
+        return await aio.wait_for(asyncio.shield(fut), STATUS_CHIP_READ_WAIT_SEC), None
     except asyncio.TimeoutError:
         pass
     if _status_read_last is None:
