@@ -1638,6 +1638,14 @@ cooldown (spec 04 I65) holds longer.
   drop keeps its path straight to the power cycle after the cooldown (I19, I65). Time to detach,
   first all-ones read with a rise on the chip's path: that sample (was one more sample, 10 s, or
   `FAST_CONFIRM_SEC` under the fast cadence); the stop precedes the remove.
+- **I87 — A slow chip never stalls the broker's event loop.** The status surfaces (`/health`, the
+  REST and MCP queue status) read the chips' heartbeats in a worker thread, at most one such read at
+  a time, and wait `STATUS_CHIP_READ_WAIT_SEC` (0.5 s) for it; past that they answer from the last
+  completed read and add `chip_read_stale_sec`, its age. A read slower than 2 s is logged. Nothing is
+  read while a reset step owns the chips (I66). Decision reads (the gate, admission, holds, rungs)
+  are unchanged and still read fresh. A watchdog logs `event loop stalled ... blocked in: <stack>`
+  once the loop has not run for `LOOP_LAG_WARN_SEC` (2 s), and `event loop was blocked for Ns` when
+  it resumes. No hold, lift, ladder or power-cycle path changes.
 
 ## Interfaces
 
