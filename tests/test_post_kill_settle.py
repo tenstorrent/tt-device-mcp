@@ -8,19 +8,21 @@ The gate tests run the real probe pass on the kill-reset tests' 32-chip mesh (le
 
 import asyncio
 import os
+import platform
 import re
 import signal
 import subprocess
 import sys
+import time
 
 import pytest
 
 from tests.conftest import patch_health_event
 from tests.test_eth_timeout_reset import ADVANCING, mesh  # noqa: F401 (fixture)
 from tests.test_job_kill_reset import killed  # noqa: F401 (fixture)
-from tt_device_mcp import constants, job_reap
+from tt_device_mcp import constants, device_holders, job_reap
 from tt_device_mcp import server as srv
-from tt_device_mcp.device_holders import DeviceHolder, HolderScan, ZombieInfo
+from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health.monitors.heartbeat import ALL_ONES
 from tt_device_mcp.job_reap import JOB_TAG_ENV
@@ -28,6 +30,7 @@ from tt_device_mcp.job_reap import JOB_TAG_ENV
 CHIPS = 32
 # The one line each post-kill reset logs; nothing else in the broker uses the name.
 LINE_RE = re.compile(r"\bpost_kill_settle: route (mesh_reset|sbr|power_cycle|holder_left|own_rung);")
+_SYS_EXIT = {"x86_64": 60, "aarch64": 93}.get(platform.machine())
 FAKE_PID = 4_000_000  # above any pid_max: never a real process, so nothing real is read or signalled
 
 
@@ -117,33 +120,183 @@ async def test_the_reset_waits_for_the_jobs_processes_to_exit(killed, events, mo
     assert killed["resets"] == [["tt-smi", "-glx_reset"]]
 
 
+# ------------------------------------------- zombies and gaps on the driver route (spec 04 I92 rules)
+#
+# These read tt-kmd's pids file (staged), /proc and the tests' own children for real. The broker runs
+# as root, which reads an exited process's fd table as empty: the driver-named pid is a scan gap
+# ("holds no device fd here"). An unprivileged scan gets EACCES there and attributes the pid instead.
+# ``_view`` pins which of the two the fd read gives a zombie, whoever runs the suite; everything else is
+# the real scan. The /proc walk for the file open elsewhere sees only the test's own processes.
+
+
+def _driver_route(monkeypatch, tmp_path, *pids) -> str:
+    """Stage tt-kmd's pids file naming ``pids`` and the device node; returns the node's path."""
+    (tmp_path / "driver" / "0").mkdir(parents=True)
+    (tmp_path / "driver" / "0" / "pids").write_text("".join(f"{p}\n" for p in pids))
+    (tmp_path / "dev").mkdir(exist_ok=True)
+    (tmp_path / "dev" / "0").touch()
+    monkeypatch.setattr(device_holders, "DRIVER_PROC_DIR", str(tmp_path / "driver"))
+    monkeypatch.setattr(device_holders, "DEVICE_DIR", str(tmp_path / "dev"))
+    monkeypatch.setattr(srv, "enumerate_device_holders", device_holders.enumerate_device_holders)
+    return str(tmp_path / "dev" / "0")
+
+
+def _driver_route_names(tmp_path, *pids) -> None:
+    (tmp_path / "driver" / "0" / "pids").write_text("".join(f"{p}\n" for p in pids))
+
+
+def _view(monkeypatch, as_root: bool) -> None:
+    """What the fd read of a zombie gives: root reads it empty, an unprivileged scan gets EACCES."""
+    real = device_holders._process_holds_device
+
+    def holds(pid):
+        if device_holders.holder_state(pid) not in ("Z", "X"):
+            return real(pid)
+        if as_root:
+            return False
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(device_holders, "_process_holds_device", holds)
+
+
+def _walk_only(monkeypatch, *pids) -> None:
+    monkeypatch.setattr(device_holders, "_iter_pids", lambda: [os.getpid(), *pids])
+
+
+def _until(cond, timeout=10.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.02)
+    return cond()
+
+
+def _zombie(*argv, kill=True, **kw) -> subprocess.Popen:
+    """A child that prints its line, then (``kill``) is SIGKILLed; left unreaped: a zombie of this process."""
+    proc = subprocess.Popen(list(argv), stdout=subprocess.PIPE, text=True, **kw)
+    proc.line = proc.stdout.readline().strip()
+    if not proc.line.startswith("ready"):
+        proc.kill()
+        proc.wait()
+        raise AssertionError(f"child did not start: {proc.line!r}")
+    if kill:
+        os.kill(proc.pid, signal.SIGKILL)
+    assert _until(lambda: device_holders.holder_state(proc.pid) == "Z"), "a zombie"
+    return proc
+
+
+def _reap(proc) -> None:
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+    proc.wait(timeout=10)
+
+
 @pytest.mark.asyncio
-async def test_a_zombie_holder_whose_threads_all_exited_does_not_block(monkeypatch):
+async def test_an_exited_zombie_the_driver_still_names_ends_the_wait_at_once(monkeypatch, tmp_path):
+    """Root's view: the zombie is a scan gap, ruled exited with nothing open elsewhere, so the wait
+    ends on the first look and the settle runs; the 30 s bound is not paid."""
     monkeypatch.setattr(srv, "POST_KILL_REAP_WAIT_SEC", 5)
+    monkeypatch.setattr(srv, "POST_KILL_SETTLE_SEC", 0.2)
     monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(CHIPS)})
-    _holders(monkeypatch, FAKE_PID)
-    monkeypatch.setattr(
-        srv,
-        "zombie_info",
-        lambda pid: ZombieInfo(pid, "Z", 1, [], 1, "python3", "S", None) if pid == FAKE_PID else None,
-    )
-    q = await srv._post_kill_quiesce(CHIPS, _Log())
-    assert q["holders"] == [] and q["reap_wait_sec"] < 1.0, q
+    _view(monkeypatch, as_root=True)
+    proc = _zombie(sys.executable, "-c", "import time; print('ready', flush=True); time.sleep(60)")
+    try:
+        _driver_route(monkeypatch, tmp_path, proc.pid)
+        _walk_only(monkeypatch, proc.pid)
+        scan = device_holders.enumerate_device_holders()
+        assert scan.holders == [] and scan.gap_pids == [proc.pid], "root's shape: a gap, not a holder"
+        q = await srv._post_kill_quiesce(CHIPS, _Log())
+    finally:
+        _reap(proc)
+    assert q["reap_wait_sec"] < 1.0 and q["holders"] == [] and q["gaps"] == [], q
+    assert q["settle_sec"] == 0.2 and q["chips"], "the settle ran and every chip was read"
     assert srv._post_kill_route(q, CHIPS, True) == "mesh_reset"
 
 
+@pytest.mark.skipif(_SYS_EXIT is None, reason="raw exit syscall number known for x86_64 and aarch64 only")
 @pytest.mark.asyncio
-async def test_a_zombie_with_a_live_holding_thread_still_blocks(monkeypatch):
+async def test_a_zombie_leader_with_a_live_thread_holding_the_node_is_a_holder(
+    killed, events, monkeypatch, tmp_path  # noqa: F811
+):
+    """The leader exited, a thread still holds the node: a holder in the post_kill_settle event, with
+    its verdict, and the episode routes holder_left with no settle (the reset's own scan rules next)."""
     monkeypatch.setattr(srv, "POST_KILL_REAP_WAIT_SEC", 0.2)
-    _holders(monkeypatch, FAKE_PID)
-    monkeypatch.setattr(
-        srv,
-        "zombie_info",
-        lambda pid: ZombieInfo(pid, "Z", 2, [pid + 1], 1, "python3", "S", True) if pid == FAKE_PID else None,
+    monkeypatch.setattr(srv, "POST_KILL_SETTLE_SEC", 5)
+    _view(monkeypatch, as_root=True)
+    node = str(tmp_path / "dev" / "0")
+    child = (
+        "import ctypes, threading, time\n"
+        f"fd = open({node!r})\n"
+        "threading.Thread(target=time.sleep, args=(60,)).start()\n"
+        "print('ready', flush=True)\n"
+        f"ctypes.CDLL(None).syscall({_SYS_EXIT}, 0)\n"  # only this thread exits; the leader turns zombie
     )
-    q = await srv._post_kill_quiesce(CHIPS, _Log())
-    assert [h["pid"] for h in q["holders"]] == [FAKE_PID] and q["holders"][0]["zombie"] == "holds"
-    assert srv._post_kill_route(q, CHIPS, True) == "holder_left"
+    _driver_route(monkeypatch, tmp_path)
+    proc = _zombie(sys.executable, "-c", child, kill=False)
+    try:
+        _driver_route_names(tmp_path, proc.pid)
+        assert _until(lambda: (z := device_holders.zombie_info(proc.pid)) is not None and z.verdict == "holds")
+        await _gate()
+    finally:
+        _reap(proc)
+    ev = _settle(events)
+    assert ev["route"] == "holder_left" and ev["settle_sec"] == 0.0, ev
+    assert [(h["pid"], h["verdict"]) for h in ev["holders"]] == [(proc.pid, "holds")], ev["holders"]
+
+
+@pytest.mark.asyncio
+async def test_an_unattributed_live_gap_pid_is_reported_and_never_signalled(monkeypatch, tmp_path):
+    """A live pid the driver names that shows no device fd here is a holder (verdict live), not quiet:
+    no settle, route holder_left, and it is never signalled."""
+    monkeypatch.setattr(srv, "POST_KILL_REAP_WAIT_SEC", 0.2)
+    monkeypatch.setattr(srv, "POST_KILL_SETTLE_SEC", 5)
+    proc = _spawn("sleep", "30")
+    try:
+        _driver_route(monkeypatch, tmp_path, proc.pid)
+        assert device_holders.enumerate_device_holders().gap_pids == [proc.pid]
+        q = await srv._post_kill_quiesce(CHIPS, _Log())
+        assert proc.poll() is None, "a holder that is not the job's is never signalled"
+    finally:
+        proc.kill()
+        proc.wait()
+    assert [(h["pid"], h["verdict"]) for h in q["holders"]] == [(proc.pid, "live")], q
+    assert "holds no device fd here" in q["holders"][0]["why"]
+    assert q["settle_sec"] == 0.0 and srv._post_kill_route(q, CHIPS, True) == "holder_left"
+
+
+@pytest.mark.parametrize("as_root", [True, False], ids=["root-gap", "unprivileged-holder"])
+@pytest.mark.asyncio
+async def test_an_exited_zombie_whose_node_is_open_in_a_forked_child_still_holds(monkeypatch, tmp_path, as_root):
+    """The pre-reset scan's rule, not a weaker copy: an exited zombie whose file a forked child still
+    holds is a holder (verdict open_elsewhere), whether the scan saw it as a gap or a holder."""
+    monkeypatch.setattr(srv, "POST_KILL_REAP_WAIT_SEC", 0.2)
+    monkeypatch.setattr(srv, "POST_KILL_SETTLE_SEC", 5)
+    _view(monkeypatch, as_root=as_root)
+    node = _driver_route(monkeypatch, tmp_path)
+    child = (
+        "import os, sys, time\n"
+        f"fd = open({node!r})\n"
+        "pid = os.fork()\n"
+        "if pid == 0:\n"
+        "    sys.stdin.read()\n"  # the forked child keeps the node open until the test closes stdin
+        "    os._exit(0)\n"
+        "print(f'ready {pid}', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    proc = _zombie(sys.executable, "-c", child, stdin=subprocess.PIPE)
+    forked = int(proc.line.split()[1])
+    try:
+        _driver_route_names(tmp_path, proc.pid)
+        _walk_only(monkeypatch, proc.pid, forked)
+        q = await srv._post_kill_quiesce(CHIPS, _Log())
+    finally:
+        proc.stdin.close()
+        _reap(proc)
+    assert [(h["pid"], h["verdict"]) for h in q["holders"]] == [(proc.pid, "open_elsewhere")], q
+    assert q["settle_sec"] == 0.0 and srv._post_kill_route(q, CHIPS, True) == "holder_left"
 
 
 @pytest.mark.asyncio

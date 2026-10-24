@@ -230,7 +230,7 @@ from tt_device_mcp.job_spool import (
     sweep_job_spools,
 )
 from tt_device_mcp.peercred import username_for_uid
-from tt_device_mcp.pre_reset_scan import clear_device_readers
+from tt_device_mcp.pre_reset_scan import classify_gap_pids, clear_device_readers, pid_gap_rows
 from tt_device_mcp.privsep import privsep_enabled, privsep_prefix_for, privsep_refusal, should_privsep
 from tt_device_mcp.socket_transport import (
     PeerCredMiddleware,
@@ -4880,17 +4880,36 @@ def _post_kill_job_left(job: dict) -> dict:
 
 
 def _post_kill_blocking_holders(scan) -> list:
-    """Spec 03 I89: the device holders the post-kill reset waits on. Not the broker's own readers, and
-    not a zombie whose whole thread group has exited: it holds no fd and no mapping."""
-    out = []
-    for h in scan.holders:
-        if h.pid == os.getpid() or is_broker_internal(h.pid) or in_broker_scope(h.pid, (RESET_SCOPE_PREFIX,)):
-            continue
-        z = zombie_info(h.pid)
-        if z is not None and z.verdict == "exited":
-            continue
-        out.append({"pid": h.pid, "state": holder_state(h.pid), "zombie": z.verdict if z is not None else None})
+    """Spec 03 I89: the device holders the post-kill reset waits on, each with its verdict; never the
+    broker's own. A pid the driver names that the scan could not attribute (root reads an exited
+    process's fd table as empty) and a holder that is a zombie are ruled on by the pre-reset scan's
+    rules (spec 04 I92, ``classify_gap_pids``): an exited zombie whose file is open nowhere else, by a
+    complete walk, holds nothing; a zombie with a live holding thread or unknown threads, a live or
+    unreadable gap pid, and an exited zombie the walk cannot clear all hold."""
+
+    def _ours(pid: int) -> bool:
+        return pid == os.getpid() or is_broker_internal(pid) or in_broker_scope(pid, (RESET_SCOPE_PREFIX,))
+
+    held = [h.pid for h in scan.holders if not _ours(h.pid)]
+    zombie_held = [pid for pid in held if holder_state(pid) in ("Z", "X")]
+    gaps = {pid: why for why, pid in pid_gap_rows(scan) if not _ours(pid)}
+    v = classify_gap_pids([*gaps, *zombie_held], [h.pid for h in scan.holders], zombie_of=zombie_info)
+    out = [{"pid": pid, "state": holder_state(pid), "verdict": "holds"} for pid in held if pid not in zombie_held]
+    for pid in v.left:
+        state = holder_state(pid)
+        z = v.zombies.get(pid)
+        row = {"pid": pid, "state": state, "verdict": z["verdict"] if z else ("unreadable" if state == "?" else "live")}
+        if pid in gaps:
+            row["why"] = gaps[pid]
+        out.append(row)
     return out
+
+
+def _post_kill_unexplained_gaps(scan) -> list:
+    """Spec 03 I89: the scan's blind spots no pid explains (an unreadable driver pids file); the wait
+    runs to its bound on them, then the reset's own holder scan (04 I92) rules."""
+    scan = discount_broker_internal(scan)
+    return [why for why, pid in zip(scan.gaps, getattr(scan, "gap_pids", None) or []) if pid is None]
 
 
 async def _post_kill_quiesce(expected: int, log) -> dict:
@@ -4913,7 +4932,7 @@ async def _post_kill_quiesce(expected: int, log) -> dict:
         holders = _post_kill_blocking_holders(scan)
         if left:
             last_exit = time.monotonic()
-        if not left and not holders and scan.complete:
+        if not left and not holders and not _post_kill_unexplained_gaps(scan):
             break
         if loop.time() - start >= POST_KILL_REAP_WAIT_SEC:
             if left:
@@ -4950,6 +4969,7 @@ async def _post_kill_quiesce(expected: int, log) -> dict:
         "job_left": sorted(left),
         "holders": holders,
         "scan_complete": scan.complete,
+        "gaps": _post_kill_unexplained_gaps(scan),
         "chips": {},
         "off": [],
         "whole_trays": [],
@@ -7392,11 +7412,12 @@ async def device_health_gate(
         if post_kill is not None:
             route = _post_kill_route(post_kill, expected, kill_reset_due)
             off = post_kill["off"]
+            held = "".join(f" (pid {h['pid']} {h['verdict']})" for h in post_kill["holders"][:4])
             _log(
                 f"post_kill_settle: route {route}; job gone after {post_kill['reap_wait_sec']}s "
                 f"({len(post_kill['killed'])} killed at the bound), settle {post_kill['settle_sec']:.0f}s, "
                 f"{post_kill['since_exit_sec']}s since the last job process exited; "
-                f"{len(post_kill['holders'])} holder(s) left; chips off before the reset: "
+                f"{len(post_kill['holders'])} holder(s) left{held}; chips off before the reset: "
                 f"{', '.join(off) if off else 'none'}"
             )
             health_event(
@@ -7412,6 +7433,7 @@ async def device_health_gate(
                 job_left=post_kill["job_left"],
                 holders=post_kill["holders"],
                 scan_complete=post_kill["scan_complete"],
+                gaps=post_kill["gaps"],
                 chips=post_kill["chips"],
                 sbr_chips=off if route == "sbr" else [],
                 whole_trays=post_kill["whole_trays"],
