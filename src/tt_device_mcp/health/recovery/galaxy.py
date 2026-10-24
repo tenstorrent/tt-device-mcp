@@ -2278,7 +2278,7 @@ class GalaxyRecovery(Recovery):
                 off_bus=len(offbus_chips),
                 expected=expected,
             )
-            return False
+            return await self._owed_sbr_before_host_rung(expected, log, gate_phase, where)
         sweep_phase = self._sweep_phase()
         if (
             sweep_phase is not None
@@ -2299,7 +2299,7 @@ class GalaxyRecovery(Recovery):
                 off_bus=len(offbus_chips),
                 expected=expected,
             )
-            return False
+            return await self._owed_sbr_before_host_rung(expected, log, gate_phase, where)
         trays = _affected_trays(offbus_chips, expected, tray_map) or []
         placement = _offbus_placement(offbus_chips, self._chip_buses_now(), tray_map)
         swept = False
@@ -2326,7 +2326,9 @@ class GalaxyRecovery(Recovery):
                     f"(SBR -> bus re-probe -> mesh reset) — nothing to lose before the "
                     f"power cycle; off the bus now: {_placement_text(placement)}"
                 )
-                if self.deps.isolated_chips():
+                if fault_class is None:
+                    await self._isolate_dead_link_for_sweep(offbus_chips, expected, log, context or gate_phase)
+                if self.deps.isolated_chips() or removed_chip_ids():
                     # Spec 04 I86: SBR first, then a cheap re-probe of the bus. Once every expected chip
                     # is back, no further rung fires before the full check: the mesh reset runs only if
                     # that check fails.
@@ -2375,7 +2377,7 @@ class GalaxyRecovery(Recovery):
                 )
                 return None
             self.mechanism.sweep_spent = sweep_phase
-            return False
+            return await self._owed_sbr_before_host_rung(expected, log, gate_phase, where)
         via = "last-chance-reset-sweep" if swept else "settle-before-host-rung"
         if swept and mesh_reset_left:
             via = "last-chance-reset-sweep (SBR, bus whole)"
@@ -2393,6 +2395,64 @@ class GalaxyRecovery(Recovery):
         log(f"the mesh verified after the {via} — no power cycle needed")
         health_event("gate", phase=gate_phase, healthy=True, recovered_via=via, evidence=evidence)
         return True
+
+    async def _isolate_dead_link_for_sweep(self, offbus_chips: set, expected: int, log, context: str) -> list:
+        """Spec 04 I89 in the last-chance sweep: below the galaxy floor, an off-bus chip whose node is
+        still present but whose PCIe link reads down or whose heartbeat reads all-ones is removed (the
+        broker's readers stopped first, :meth:`_isolate_dead_link_chips`), so the sweep's SBR resets it
+        through its bridge even when nothing was isolated before: a mesh reset that itself dropped the
+        chip, say. Classes A and C never reach the sweep. Returns the chips removed."""
+        floor = _galaxy_reset_min_dead_chips(expected)
+        if not offbus_chips or floor is None or not 0 < len(offbus_chips) < floor:
+            return []
+        try:
+            beats = await asyncio.to_thread(self.deps.read_heartbeats)
+        except Exception:  # noqa: BLE001 - an unreadable heartbeat leaves the link state to decide
+            beats = {}
+        done = set(self.deps.isolated_chips()) | set(removed_chip_ids())
+        pci_map = self.deps.device_pci_map()
+        dead_link = {}
+        for c in sorted({str(i) for i in offbus_chips} - done, key=int):
+            bdf = pci_map.get(c)
+            if not bdf or not await asyncio.to_thread(chip_node_present, bdf):
+                continue
+            if (beats or {}).get(c) == ALL_ONES or await asyncio.to_thread(link_down, bdf):
+                dead_link[c] = bdf
+        if not dead_link:
+            return []
+        return await self._isolate_dead_link_chips(dead_link, log, f"last-chance sweep, {context}")
+
+    async def _owed_sbr_before_host_rung(self, expected: int, log, gate_phase: str, where: str = "") -> bool:
+        """Spec 04 I89: the last step before the host rung once the sweep has run or been skipped. Below
+        the galaxy floor and for neither class A nor C, an off-bus chip the SBR rung could reset that
+        this hold has not SBR'd (one the dead-chip valve isolated during the sweep's settle, or one a
+        skipped sweep never reached) gets the kept rungs (PCI rescan, its remove when its node is still
+        present, SBR), then the full check with fabric. True only when that check passed and the hold
+        lifted; otherwise False, and the caller goes on to the power cycle."""
+        floor = _galaxy_reset_min_dead_chips(expected)
+        if floor is None:
+            return False
+        try:
+            beats = await asyncio.to_thread(self.deps.read_heartbeats)
+        except Exception as exc:  # noqa: BLE001 - no read, no SBR target: the power cycle decides
+            log(f"could not read the heartbeats before the host rung: {exc!r}")
+            return False
+        ids = _offbus_chip_ids(beats or {}, expected)
+        if not 0 < len(ids) < floor:
+            return False
+        if self._power_cycle_direct_class_now(ids, expected, self._tray_map_now(), log) is not None:
+            return False
+        owed = self._sbr_owed(self.deps.device_hold_episode_since(), ids, beats)
+        if not owed:
+            return False
+        log(
+            f"before the host rung{where}: no SBR has run on chip(s) {owed} this hold — it runs first, "
+            "then the full check with fabric"
+        )
+        health_event("host_rung_sbr_owed", context=gate_phase, chips=owed, off_bus=len(ids), expected=expected)
+        return await self._below_floor_bound_rungs(
+            set(ids), expected, log, context="SBR before the host rung", phase=gate_phase
+        )
 
     def _bus_whole_now(self, expected: int, log) -> bool:
         """The cheap re-probe between sweep rungs (spec 04 I86): every expected chip is in sysfs with a
@@ -3199,6 +3259,7 @@ class GalaxyRecovery(Recovery):
         log,
         sbr_tried: frozenset = frozenset(),
         context: str = "I76 bound ladder",
+        phase: str = "idle-escalation",
     ) -> bool:
         """The I76 bound's kept rungs ahead of its one mesh reset (spec 04 I89): PCI rescan, then SBR of
         the bridged off-bus chips (a gone chip only with the opt-in: see _below_floor_kept_rungs). True only when every chip is back and the full
@@ -3210,11 +3271,11 @@ class GalaxyRecovery(Recovery):
         )
         if still_off is None or still_off:
             return False
-        healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase="idle-escalation")
+        healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=phase)
         FABRIC_DEBT.note_evidence(evidence)
         if not healthy:
             log("every chip is back after the bound's rescan/SBR but the full check failed — the ladder goes on")
-            health_event("below_floor_kept_rungs_unverified", phase="idle-escalation", evidence=evidence)
+            health_event("below_floor_kept_rungs_unverified", phase=phase, evidence=evidence)
             return False
         why = "I76 bound: below-floor rescan/SBR recovered the mesh"
         self.deps.clear_device_reported_fault(why)
