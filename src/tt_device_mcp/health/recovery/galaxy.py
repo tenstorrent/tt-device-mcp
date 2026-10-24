@@ -946,7 +946,9 @@ class GalaxyRecovery(Recovery):
     # Spec 04 I98: the (episode, chips, wall time) of this hold's bridge resets: every chip a bridge
     # write reached this hold that is still off the bus, whichever path fired it (the gate, the off-bus
     # escalation, the bound's rungs, the last-chance sweep, the driver-wait SBR). No later path gives
-    # those chips another SBR round in the hold (spec 04 I87's owed SBR reads it too).
+    # those chips another SBR round in the hold (spec 04 I87's owed SBR reads it too). Its fifth field
+    # keeps apart the spent chips no bridge write reached (no_bridge): never reset, so for I69 a removed
+    # one still withholds the rescan.
     _sbr_hold: Optional[tuple] = None
 
     def __init__(self, monitor, mechanism, deps) -> None:
@@ -1793,6 +1795,9 @@ class GalaxyRecovery(Recovery):
         targets = {str(c) for c in set(self.deps.isolated_chips()) | set(removed_chip_ids())}
         since = self.deps.device_hold_episode_since() or ""
         spent = sorted(targets & self._sbr_done(since), key=int)
+        # Spec 04 I69: a spent chip no bridge write reached was never reset; a removed one still
+        # withholds the rescan, though it gets no second round either (I98).
+        unreset = frozenset(spent) & self._sbr_unreset(since)
         if spent:
             log(
                 f"chip(s) {spent} already had a bridge reset this hold and are still off the bus — "
@@ -1806,13 +1811,17 @@ class GalaxyRecovery(Recovery):
         self.last_bridge_reset_reasons = {}
         self.last_bridge_reset_fired = set()
         # Spec 04 I98, per chip: the spent ones get no bridge write in this round.
-        ok = await self._recover_isolated_chips(log, **({"exclude": frozenset(spent)} if spent else {}))
+        kw = {"exclude": frozenset(spent)} if spent else {}
+        if unreset:
+            kw["not_reset"] = unreset
+        ok = await self._recover_isolated_chips(log, **kw)
         fired = {str(c) for c in getattr(self, "last_bridge_reset_fired", set()) or set()}
         # A chip with no bridge to write to is a topology fact no retry in this hold changes: its SBR
-        # round is spent too (the gated, unprivileged and wedged declines are not).
+        # round is spent too (the gated, unprivileged and wedged declines are not). No write reached
+        # it, so the record keeps it as not reset.
         reasons = getattr(self, "last_bridge_reset_reasons", {}) or {}
-        fired |= {str(c) for c, r in reasons.items() if (r or {}).get("reason") == "no_bridge"}
-        self._note_sbr_fired(fired)
+        no_bridge = {str(c) for c, r in reasons.items() if (r or {}).get("reason") == "no_bridge"} - fired
+        self._note_sbr_fired(fired | no_bridge, unreset=no_bridge)
         return ok
 
     def _off_bus_now(self) -> set:
@@ -1842,16 +1851,33 @@ class GalaxyRecovery(Recovery):
         seqs = rec[3] if len(rec) > 3 else {}
         return frozenset(c for c in chips if seqs.get(c, chip_back_seq(c)) == chip_back_seq(c))
 
-    def _note_sbr_fired(self, fired) -> None:
+    def _sbr_unreset(self, hold_since: Optional[str]) -> frozenset:
+        """The spent chips of :meth:`_sbr_done` that no bridge write reached this hold (no_bridge): never
+        reset, so a removed one still withholds the rescan (spec 04 I69)."""
+        rec = self._sbr_hold
+        nobr = rec[4] if rec and len(rec) > 4 else frozenset()
+        return self._sbr_done(hold_since) & nobr
+
+    def _note_sbr_fired(self, fired, unreset=()) -> None:
         """Add to this hold's SBR record the chips a bridge write reached that are still off the bus
-        (spec 04 I98); drop every chip seen back on the bus, so a chip that drops again later in the hold
-        gets its own SBR."""
+        (spec 04 I98), and ``unreset``, those spent with no bridge to write to; drop every chip seen back
+        on the bus, so a chip that drops again later in the hold gets its own SBR. A chip a write reached
+        leaves the not-reset set."""
         off = self._off_bus_now()
         since = self.deps.device_hold_episode_since() or ""
-        done = (set(self._sbr_done(since)) | {str(c) for c in fired}) & off
+        new = {str(c) for c in fired} | {str(c) for c in unreset}
+        done = (set(self._sbr_done(since)) | new) & off
         if not done and not self._sbr_hold:
             return
-        self._sbr_hold = (since, frozenset(done), time.time(), {c: chip_back_seq(c) for c in done})
+        written = new - {str(c) for c in unreset}
+        nobr = ((set(self._sbr_unreset(since)) - written) | {str(c) for c in unreset}) & done
+        self._sbr_hold = (
+            since,
+            frozenset(done),
+            time.time(),
+            {c: chip_back_seq(c) for c in done},
+            frozenset(nobr),
+        )
 
     def sbr_record_clear(self) -> None:
         """A hold lifted on a just-passed full check: its SBR record ends with it (spec 04 I98), so a hold

@@ -501,7 +501,7 @@ class Recovery(ABC):
         )
         return state.healthy, state.as_evidence()
 
-    async def _recover_isolated_chips(self, log, exclude=frozenset()) -> bool:
+    async def _recover_isolated_chips(self, log, exclude=frozenset(), not_reset=frozenset()) -> bool:
         """Bring back chips that were cut out of the kernel after leaving the PCIe bus.
 
         Reset through the parent bridge, not the chip: a dead endpoint cannot be reset through
@@ -515,7 +515,8 @@ class Recovery(ABC):
 
         ``exclude``: chips that already had their SBR round this hold (spec 04 I98). They get no
         bridge write and stay isolated; a removed one among them was reset this hold, so it does not
-        withhold the rescan (I69).
+        withhold the rescan (I69), unless it is in ``not_reset``: spent with no bridge write (no_bridge),
+        never reset, so it still withholds every rescan of the pass.
         """
         # ladder-v2: the per-chip SBR window this rung reads, chip id -> {"reason": "no_bridge"} for
         # every chip whose reset could not fire because the endpoint left the bus. Reset FRESH every
@@ -533,6 +534,7 @@ class Recovery(ABC):
         if not isolated_chips:
             return True
         spent = {str(c) for c in exclude} & {str(c) for c in isolated_chips}
+        never_reset = spent & {str(c) for c in not_reset}
         for idx in spent:
             self.last_bridge_reset_reasons[idx] = {"reason": "sbr_spent_this_hold"}
         targets = sorted((c for c in isolated_chips if str(c) not in spent), key=int)
@@ -610,7 +612,9 @@ class Recovery(ABC):
         # no further bridge call, no rescan; every chip not yet tried is withheld.
         wedged = False
         removed = [t for t in targets if pci.removed_chip(t)]
-        unreset: list = []
+        # A spent removed chip no bridge write reached this hold is as un-reset as one this pass could
+        # not reset: no rescan this pass (spec 04 I69).
+        unreset: list = [i for i in pci.removed_chip_ids() if str(i) in never_reset]
         if sbr and not gated and removed:
             for idx in removed:
                 for attempt in range(BRIDGE_RESET_MAX_TRIES):
@@ -798,7 +802,9 @@ class Recovery(ABC):
         # lets the driver probe a hung chip. Every record counts, not only this pass's targets: the
         # rescan is global. A refused host reset gate withholds it only then (the removed chips were
         # not reset because of it); chips the broker never removed keep the bare rescan, as before.
-        unreset_dead = [i for i in pci.removed_chip_ids() if i not in reset_this_pass and str(i) not in spent]
+        unreset_dead = [
+            i for i in pci.removed_chip_ids() if i not in reset_this_pass and str(i) not in spent - never_reset
+        ]
         withhold = ("host_reset_gated" if gated else "removed_chip_not_reset") if unreset_dead else ""
         if wedged or PCI_WRITER.latched:
             withhold = "pci_wedged"

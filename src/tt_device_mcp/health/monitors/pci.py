@@ -467,6 +467,8 @@ def forget_returned_removed_chips(context: str) -> list:
         back = [i for i, rec in sorted(REMOVED_CHIPS.items(), key=lambda kv: int(kv[0])) if _back_on_bus(i, rec)]
         for i in back:
             REMOVED_CHIPS.pop(i, None)
+            # Seen back on the bus, as in forget_removed_chip: out of the hold's SBR record (spec 04 I98).
+            _BACK_SEQ[i] = _BACK_SEQ.get(i, 0) + 1
     if back:
         _save_removed_chips()
         evidence.health_event("removed_chip_records_cleared", chips=back, reason="back_on_bus", context=context)
