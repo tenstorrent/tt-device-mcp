@@ -1594,7 +1594,9 @@ class GalaxyRecovery(Recovery):
             # leaves the episode as it stands for the boot that comes back to verify it.
             if stage == STAGE_POWER_CYCLE:
                 cause = await self._host_rung_cause_now(
-                    expected, "the reset ladder could not recover the device", "the reset ladder could not recover the device"
+                    expected,
+                    "the reset ladder could not recover the device",
+                    "the reset ladder could not recover the device",
                 )
                 if await self.deps.auto_power_cycle_host(log, cause) is False:
                     self._hold_after_cycle_launch_failure(log, cause)

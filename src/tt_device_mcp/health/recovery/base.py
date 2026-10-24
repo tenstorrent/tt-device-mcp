@@ -1686,9 +1686,10 @@ class RecoveryMechanism:
                     await asyncio.to_thread(drop_returned_isolated, still, "mesh reset driver wait", log)
                 if not still:
                     return
-                if attempt == DRIVER_WAIT_SBR_AFTER_TRIES:
-                    await self._driver_wait_sbr(still, state, log)
-                    continue
+                if attempt == DRIVER_WAIT_SBR_AFTER_TRIES and await self._driver_wait_sbr(still, state, log):
+                    if state.get("disarmed"):
+                        return  # the reset ended: the rescan after it takes over
+                    continue  # the SBR's retrain settle stands in for this period's wait
                 if attempt == DRIVER_WAIT_RESCAN_TRIES:
                     log(
                         f"chip(s) {sorted(still, key=int)} still missing after {attempt} rescans in tt-smi's driver wait"
@@ -1740,14 +1741,15 @@ class RecoveryMechanism:
 
         return watch, state
 
-    async def _driver_wait_sbr(self, still, state: dict, log) -> None:
+    async def _driver_wait_sbr(self, still, state: dict, log) -> bool:
         """Spec 04 I97: DRIVER_WAIT_SBR_AFTER_TRIES rescans in tt-smi's driver wait have not brought
         isolated chip(s) ``still`` back. Fire one Secondary Bus Reset through each one's recorded
         bridge (no rescan: the next rescan of the loop adds them, I69), then wait for the link to
         retrain. Once per reset. Nothing fires without the SBR capability, after the reset ended, or
-        for a chip with no usable bridge. Never raises: the rescans and the full check still decide."""
+        for a chip with no usable bridge. True when at least one SBR fired. Never raises: the rescans
+        and the full check still decide."""
         if state.get("sbr_done") or state.get("disarmed"):
-            return
+            return False
         state["sbr_done"] = True
         # Lazy imports: the recovery package and its stages import this module.
         from tt_device_mcp.health.recovery import bridge_reset_call_timeout
@@ -1760,8 +1762,10 @@ class RecoveryMechanism:
         chips = sorted(still, key=int)
         if not bridge_reset_enabled():
             log(f"chip(s) {chips} still missing in tt-smi's driver wait; no SBR capability here")
-            return
-        log(f"chip(s) {chips} still missing after {DRIVER_WAIT_SBR_AFTER_TRIES} rescans in tt-smi's driver wait: SBR of each one's bridge")
+            return False
+        log(
+            f"chip(s) {chips} still missing after {DRIVER_WAIT_SBR_AFTER_TRIES} rescans in tt-smi's driver wait: SBR of each one's bridge"
+        )
         fired: list = []
         for idx in chips:
             if state.get("disarmed"):
@@ -1784,6 +1788,7 @@ class RecoveryMechanism:
                 fired.append(idx)
         if fired:
             await asyncio.sleep(SBR_RETRAIN_SETTLE_SEC)
+        return bool(fired)
 
     async def _reapply_aiclk_ceiling(self, log) -> None:
         """Put an operator's AICLK ceiling back on the freshly reset chips, before the pollers
