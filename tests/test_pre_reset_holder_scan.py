@@ -738,17 +738,20 @@ async def test_a_live_holder_still_blocks_beside_an_exited_zombie_and_the_job_is
 
 
 def test_an_automatic_resets_zombie_wait_ends_before_the_hold_ladder_mark(monkeypatch):
-    """Spec 04 I76/I92: the wait ends PRE_RESET_ZOMBIE_LADDER_RESERVE_SEC before the hold's ladder mark,
-    never past it; an operator reset or one with no hold clock waits the driver-release bound."""
+    """Spec 04 I76/I92: the wait ends the reserve (sized to the host's chips) before the hold's ladder
+    mark, never past it; an operator reset or one with no hold clock waits the driver-release bound."""
     from datetime import datetime, timedelta
 
-    from tt_device_mcp.constants import PRE_RESET_ZOMBIE_LADDER_RESERVE_SEC, PRE_RESET_ZOMBIE_WAIT_SEC
+    from tt_device_mcp.constants import PRE_RESET_ZOMBIE_WAIT_SEC, pre_reset_zombie_ladder_reserve_sec
 
     now = datetime(2026, 1, 1, 12, 0, 0)
-    reserve = PRE_RESET_ZOMBIE_LADDER_RESERVE_SEC
-    for age, want in ((0, 600 - reserve), (300, 300 - reserve), (500, 0.0), (900, 0.0)):
-        mark = now - timedelta(seconds=age) + timedelta(seconds=600)
-        monkeypatch.setattr(srv, "hold_bound_deadline", lambda n=None, m=mark: m)
+    monkeypatch.setattr(srv, "_hold_bound_mark_sec", lambda: 600.0)
+    monkeypatch.setattr(srv, "_zombie_reserve_chips", lambda: 32)
+    reserve = pre_reset_zombie_ladder_reserve_sec(32)
+    for age, want in ((0, 600 - reserve), (100, 500 - reserve), (500, 0.0), (900, 0.0)):
+        since = (now - timedelta(seconds=age)).isoformat()
+        monkeypatch.setattr(srv, "device_hold_episode_since", since)
+        monkeypatch.setattr(srv, "hold_bound_deadline", lambda n=None, s=since: datetime.fromisoformat(s))
         assert srv._pre_reset_zombie_wait_sec(True, now) == want, age
         assert srv._pre_reset_zombie_wait_sec(False, now) == PRE_RESET_ZOMBIE_WAIT_SEC
     monkeypatch.setattr(srv, "hold_bound_deadline", lambda n=None: None)
