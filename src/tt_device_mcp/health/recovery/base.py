@@ -553,6 +553,10 @@ class RecoveryMechanism:
     ``Recovery`` instance: the telemetry sampler and the gate read/write it across calls and
     across whichever platform ``Recovery`` subclass is selected for a given pass."""
 
+    # Spec 04 I98: called with the chips a bridge write reached outside the SBR rung (the driver-wait
+    # SBR), so the Galaxy ladder's per-hold SBR record counts them. Set by GalaxyRecovery.
+    sbr_fired_hook: Optional[Callable[[list], None]] = None
+
     def __init__(
         self,
         *,
@@ -1787,6 +1791,8 @@ class RecoveryMechanism:
             if ok:
                 fired.append(idx)
         if fired:
+            if self.sbr_fired_hook is not None:
+                self.sbr_fired_hook(fired)
             await asyncio.sleep(SBR_RETRAIN_SETTLE_SEC)
         return bool(fired)
 

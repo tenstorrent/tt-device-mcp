@@ -48,6 +48,7 @@ def _episode(monkeypatch, *, held_sec=96, check_passes=False):
         counters["sbr"] += 1
         order.append("sbr")
         galaxy_mod.health_event("bridge_reset_failed", chip=OFF_CHIP, reason="no_bridge")
+        srv.galaxy_recovery.last_bridge_reset_reasons = {OFF_CHIP: {"reason": "no_bridge"}}  # as the real rung
         return False
 
     async def mesh_reset(argv, log):

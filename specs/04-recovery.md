@@ -2505,6 +2505,51 @@ each rung fires only when the gentler one failed or cannot apply.
   5-8 min) or startup check (about 3 min). The worst case is the power cycle requested by 10 min plus
   its about 4.3-5 min, within 15 min, apart from the stuck-reset tail above.
 
+- **I98 — A chip SBR'd this hold and still off the bus gets no second SBR round, per chip; every
+  bridge reset path records it in the hold's SBR record, a chip seen back on the bus leaves it, and a
+  lift clears it.** Seen on a Galaxy (class B1, one chip off the bus): the
+  post-job gate, the off-bus escalation and the last-chance sweep each ran their own three-try SBR
+  round on the same chip in one hold (about 44 s each), and the sweep logged that no SBR had run on it
+  this hold. The record kept only chips the rung gave no reason for, and a chip reset on every try and
+  still off the bus is tagged `removed_not_reenumerated` (I69). The power cycle then healed the chip.
+
+  The bridge rung reports every chip a bridge write reached (`last_bridge_reset_fired`), whatever came
+  of it. The hold's SBR record (`_sbr_hold`: hold episode, chips, wall time, each chip's back-on-bus
+  count) keeps those still off the bus when the path records them, from every path that resets a chip through its bridge: the gate's rung, the off-bus escalation,
+  the bound's kept rungs, the last-chance sweep's owed SBR (I87, I89) and the driver-wait SBR (I97 b).
+  A chip with no bridge to write to (`no_bridge`) counts too: no retry in the hold changes that. A chip
+  the rung declined (gated, no privilege, PCI wedged, a stuck holder) is not recorded. A chip seen back
+  on the bus by any path leaves the record, so a later drop in the same hold gets its own round: the
+  bridge rung, a rescan (including the driver wait's rescans after its SBR, I97 b, which run after
+  the record is written) and the mesh reset all drop the chip's removal record
+  (`pci.forget_removed_chip`, or `pci.forget_returned_removed_chips` when a record read finds the chip
+  back by an outside path), which bumps its back-on-bus count (`pci.chip_back_seq`); a recorded chip
+  whose count moved is no longer spent. The record is keyed by the hold episode: a new hold starts
+  empty. A hold lifted on a just-passed full check clears it, so a hold that carries the same episode
+  after the lift (I82) also starts empty. One made in the pass that opened the hold,
+  before its start was set, counts for a hold that started at most `SBR_RECORD_ADOPT_SEC` (120 s)
+  after it.
+
+  Per chip: an SBR call writes no bridge reset to a target that already had its round this hold
+  (`_recover_isolated_chips(exclude=...)`, reason `sbr_spent_this_hold`) and journals
+  `sbr_skipped_spent` with those chips and the count of the others; the others get their round. A
+  spent removed chip that a bridge write reached this hold was reset, so it does not withhold the
+  batch rescan (I69); the rescan still runs for the new chips. A spent removed chip that no bridge
+  write reached (`no_bridge`) was never reset: the record keeps it apart (`_sbr_hold`'s fifth field,
+  `_recover_isolated_chips(not_reset=...)`), and while it is off the bus it withholds every rescan
+  of the call, as I69 says, though it still gets no second round. A bridge write that reaches it
+  later in the hold moves it to the reset ones. While a spent chip is still off the bus
+  the call reports not recovered; when every target is spent, no bridge write runs at all. Either way
+  the caller goes on to its next rung (the mesh reset or the power cycle request) as the ladder orders
+  it now. The last-chance sweep's owed SBR goes through the same call. The order and the
+  rungs are unchanged; no removed rung comes back. Releases nothing: a skipped round is not a recovery,
+  and only a just-passed full check, fabric included, every cabled link, lifts (I32). The 10-min ladder
+  and the power cycle after it (I76) are unchanged. Time to recover, class B1 with one chip off the bus
+  that no SBR brings back: one episode 9.6 min through the power cycle; est. about 1.5 min less (the
+  escalation's and the sweep's rounds). A second chip that drops later in the hold, or a chip that
+  came back and drops again, gets its own round (about 44 s) instead of going straight to the mesh
+  reset or the power cycle.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -3116,3 +3161,15 @@ sees a silent fabric pass.
 | I97 one SBR in tt-smi's driver wait after four rescans that left a chip out: a healed chip is back by the next rescan, one still out keeps the rescans to their tries; none without the SBR capability | `tests/test_mesh_reset_readd.py::test_an_sbr_follows_the_rescans_that_left_a_chip_out_in_the_driver_wait`, `::test_no_sbr_in_the_driver_wait_without_the_capability` |
 | I97 a reset that ends while the driver-wait SBR's write is in flight lets it finish and rescans no more in the wait | `tests/test_mesh_reset_readd.py::test_a_reset_that_ends_during_the_driver_wait_sbr_takes_no_more_rescans_in_it` |
 | I97 a tt-smi that gave up at its driver wait is logged and journaled as a FAILED mesh reset, never as "no POST_RESET failure" | `tests/test_mesh_reset_readd.py::test_a_reset_whose_tt_smi_gave_up_at_its_driver_wait_is_logged_as_failed` |
+| I98 a chip the gate SBR'd that is still off the bus gets no second round from the off-bus escalation or the last-chance sweep; the sweep reads the gate's round, the hold climbs to the power cycle and stays held | `tests/test_sbr_record_per_hold.py::test_a_chip_the_gate_reset_is_not_reset_again_by_the_escalation_or_the_sweep` |
+| I98 the record is keyed by the hold: a new hold gets exactly one round of its own | `tests/test_sbr_record_per_hold.py::test_the_record_starts_empty_for_each_new_hold` |
+| I98 a skipped round is not a recovery: only a just-passed full check with fabric lifts, a failed one keeps the hold | `tests/test_sbr_record_per_hold.py::test_after_a_skipped_round_only_the_full_check_with_fabric_lifts` |
+| I98 an SBR found inapplicable (no bridge) counts as the hold's round: the sweep tries none again before the power cycle | `tests/test_b1_regressed_no_bridge.py::test_no_bridge_regressed_hold_power_cycles_on_the_first_pass_after_the_kept_rungs` |
+| I98 per chip: a partial call writes no bridge reset to the spent chip, the new chip gets its round, the rung reports not recovered while the spent chip is off the bus | `tests/test_sbr_record_per_hold.py::test_a_partial_round_writes_no_bridge_reset_to_the_spent_chip` |
+| I98 with I69: in a partial call the spent removed chip gets no bridge write and does not withhold the rescan that brings the new chip back | `tests/test_removed_chip_rescan.py::test_a_partial_round_resets_only_the_new_chip_and_the_spent_one_does_not_withhold_the_rescan` |
+| I98 with I69: a removed chip spent with no bridge write (no_bridge) withholds every rescan of a later round in the hold and gets no second try; both chips stay isolated, the rung is not recovered | `tests/test_sbr_no_bridge_rescan.py::test_probe_no_bridge_spent_chip_must_still_withhold_rescan`, `tests/test_sbr_no_bridge_rescan.py::test_a_no_bridge_spent_chip_withholds_the_rescan_and_gets_no_second_round` |
+| I98 the record keeps the no-bridge chips apart until a bridge write reaches one | `tests/test_sbr_no_bridge_rescan.py::test_a_chip_a_bridge_write_reaches_leaves_the_not_reset_set` |
+| I98 a removed chip back on the bus by an outside path leaves the record: a later drop gets a round | `tests/test_sbr_no_bridge_rescan.py::test_a_chip_back_by_an_outside_path_leaves_the_record` |
+| I98 a chip the driver-wait SBR's rescans brought back leaves the record: when it drops again it gets a round | `tests/test_sbr_record_per_hold.py::test_a_chip_the_driver_wait_sbr_healed_gets_a_round_when_it_drops_again` |
+| I98 a chip the mesh reset brought back leaves the record: when it drops again it gets a round | `tests/test_sbr_record_per_hold.py::test_a_chip_the_mesh_reset_healed_gets_a_round_when_it_drops_again` |
+| I98 a lift on a just-passed full check clears the record: a hold that carries the episode (I82) starts empty | `tests/test_sbr_record_per_hold.py::test_a_hold_carried_after_a_verified_lift_starts_with_an_empty_record` |
