@@ -77,9 +77,7 @@ def start(
     log = log or _log
     _state.update(loop=loop, tick=time.monotonic(), loop_thread_id=threading.get_ident())
     _state["task"] = loop.create_task(_ticker(warn_sec, tick_sec, log), name="loop-lag-watch")
-    thread = threading.Thread(
-        target=_watcher, args=(warn_sec, tick_sec, log, loop), name="loop-lag-watch", daemon=True
-    )
+    thread = threading.Thread(target=_watcher, args=(warn_sec, tick_sec, log, loop), name="loop-lag-watch", daemon=True)
     _state["thread"] = thread
     thread.start()
 
