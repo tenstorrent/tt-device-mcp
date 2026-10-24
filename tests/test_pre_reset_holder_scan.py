@@ -529,6 +529,95 @@ async def test_a_pid_gap_that_clears_on_the_rescan_lets_the_reset_proceed(monkey
     assert box.sent[READER.pid][0] == "TERM"
 
 
+def _ticks():
+    """A clock that moves one second per read, so a bounded wait ends without sleeping."""
+    t = iter(range(10**6))
+    return lambda: float(next(t))
+
+
+@pytest.fixture
+def fresh_zombies(monkeypatch):
+    monkeypatch.setattr(prs, "_zombies_waited", set())
+
+
+@pytest.mark.asyncio
+async def test_a_zombie_gap_is_waited_for_and_the_reset_runs_once_its_release_ends(monkeypatch, fresh_zombies):
+    """A killed job's leader is a zombie while its device release runs: wait for it, not refuse."""
+    box = _Box(monkeypatch, [])
+    calls = _scans(monkeypatch, _gap(4303), _gap(4303), _gap(4303), HolderScan())
+    result = await box.run(
+        tenants_block=True, rescan_settle_sec=0, zombie_wait_sec=30, clock=_ticks(), pid_state=lambda pid: "Z"
+    )
+    assert len(calls) == 4, "polled until the driver dropped the zombie"
+    assert result.outcome == "clear" and result.refusal() == "" and result.gaps == []
+    assert box.sent == {}
+
+
+@pytest.mark.asyncio
+async def test_a_zombie_that_outlives_the_wait_refuses_and_is_not_waited_for_twice(monkeypatch, fresh_zombies):
+    """Still named after the bound: refused as before (the I76 bound runs), and its wait is spent."""
+    box = _Box(monkeypatch, [])
+    calls = _scans(monkeypatch, _gap(4303))
+    zombie = dict(tenants_block=True, rescan_settle_sec=0, zombie_wait_sec=5, pid_state=lambda pid: "Z")
+    result = await box.run(clock=_ticks(), **zombie)
+    assert 2 < len(calls) <= 8, "a bounded number of rescans"
+    assert result.outcome == "scan_incomplete" and "4303" in result.refusal() and box.sent == {}
+    calls.clear()
+    again = await box.run(clock=_ticks(), **zombie)
+    assert len(calls) == 2, "the same zombie gets the one rescan only"
+    assert again.outcome == "scan_incomplete"
+
+
+@pytest.mark.asyncio
+async def test_a_live_pid_gap_gets_no_zombie_wait_and_still_refuses(monkeypatch, fresh_zombies):
+    """A gap on a live process (state S, R, D) or one already gone keeps today's single rescan."""
+    for state in ("S", "R", "D", "?"):
+        box = _Box(monkeypatch, [])
+        calls = _scans(monkeypatch, _gap(4303))
+        result = await box.run(
+            tenants_block=True, rescan_settle_sec=0, zombie_wait_sec=30, clock=_ticks(), pid_state=lambda pid: state
+        )
+        assert len(calls) == 2, state
+        assert result.outcome == "scan_incomplete" and box.sent == {}
+
+
+@pytest.mark.asyncio
+async def test_a_zombie_gap_beside_a_live_one_gets_no_wait(monkeypatch, fresh_zombies):
+    box = _Box(monkeypatch, [])
+    scan = _gap(4303)
+    scan.mark_incomplete("pid 4304 named by the driver, not attributable", pid=4304)
+    calls = _scans(monkeypatch, scan)
+    result = await box.run(
+        tenants_block=True,
+        rescan_settle_sec=0,
+        zombie_wait_sec=30,
+        clock=_ticks(),
+        pid_state=lambda pid: "Z" if pid == 4303 else "S",
+    )
+    assert len(calls) == 2 and result.outcome == "scan_incomplete"
+
+
+@pytest.mark.asyncio
+async def test_a_live_holder_still_blocks_after_a_zombie_clears_and_the_job_is_never_signalled(
+    monkeypatch, fresh_zombies
+):
+    """The zombie's release ends, but the running job and a tenant still hold: refused, nothing sent."""
+    job = DeviceHolder(pid=4500, uid=1000)
+    box = _Box(monkeypatch, [], tenants=[TENANT])
+    _scans(monkeypatch, _gap(4303, job, TENANT), HolderScan(holders=[job, TENANT]))
+    result = await box.run(
+        tenants_block=True,
+        protected=[job.pid],
+        rescan_settle_sec=0,
+        zombie_wait_sec=30,
+        clock=_ticks(),
+        pid_state=lambda pid: "Z",
+    )
+    assert result.outcome == "tenant_blocked" and result.refusal()
+    assert {t["pid"] for t in result.tenants} == {job.pid, TENANT.pid}
+    assert box.sent == {}, "neither the running job nor a tenant is signalled"
+
+
 @pytest.mark.asyncio
 async def test_an_operator_reset_records_a_pid_gap_and_still_clears_the_readers(monkeypatch):
     box = _Box(monkeypatch, [])

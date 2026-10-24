@@ -101,6 +101,12 @@ PRE_RESET_DETACH_TIMEOUT_SEC = 30
 # often one mid-exit) scans once more after this long before it refuses the reset (spec 04 I92).
 PRE_RESET_RESCAN_SETTLE_SEC = 1.0
 
+# A holder the driver still names whose process is a zombie (state Z) is one whose device release
+# is still running: tt-kmd drops a pid only when the last reference to the file goes, so a dying
+# thread or an inherited fd still holds it. The pre-reset scan waits up to this long for that
+# release, once per zombie, before it refuses the reset (spec 04 I92): the driver-release bound.
+PRE_RESET_ZOMBIE_WAIT_SEC = HOLDER_RELEASE_WAIT_SEC
+
 # When a device reset has run long enough to be worth saying so (a 6U Galaxy reset is
 # ~30-60s). This is a WARNING line, not a verdict: the reset owns its own systemd scope and
 # is deliberately never killed, because one stopped partway through 32 ASICs is far worse
