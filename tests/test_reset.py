@@ -1800,6 +1800,106 @@ def test_forced_reset_stops_a_readopted_job_seen_only_by_the_recheck(monkeypatch
     assert srv.jobs["906-1"].status == srv.JobStatus.KILLED
 
 
+def _readopted_job_killed_by_its_owner(monkeypatch, tmp_path, events, *, job_id="905-1"):
+    """A re-adopted job its owner killed: KILLED at once, its scope still unwinding (up to
+    GRACEFUL_KILL_GRACE_SEC) with its `readopted_scopes` entry kept until the monitor drops it.
+    A forced reset's wait for that scope records ("wait", interrupt) and ends it 0.3 s later."""
+    job = _readopted_job(monkeypatch, job_id=job_id)
+    monkeypatch.setattr(srv, "READOPTED_FINALIZE_WAIT_SEC", 5)
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: True)
+
+    async def owner_kill(scope, grace_sec=0.0, interrupt=True):
+        pass  # SIGINT sent; the job is still tearing down
+
+    monkeypatch.setattr(srv, "_terminate_scope", owner_kill)
+    d = _client(monkeypatch, tmp_path).post("/api/tt_device_job_kill", json={"job_id": job_id, "owner": "carol"})
+    assert d.json()["status"] == "killed" and job_id in srv.readopted_scopes
+
+    async def scope_ends_later():
+        await asyncio.sleep(0.3)
+        events.append("finalized")
+        srv.readopted_scopes.pop(job_id, None)
+
+    async def slow_teardown(scope, grace_sec=0.0, interrupt=True):
+        events.append(("wait", interrupt))
+        asyncio.get_event_loop().create_task(scope_ends_later())
+        return False
+
+    async def run(argv, log, owner="[broker]health-gate", on_output=None):
+        events.append("reset")
+        return 0, ""
+
+    async def pollers(active, log):
+        return []
+
+    monkeypatch.setattr(srv, "_terminate_scope", slow_teardown)
+    monkeypatch.setattr(srv.recovery_mechanism, "run_scoped", run)
+    monkeypatch.setattr(srv, "_set_device_pollers", pollers)
+    monkeypatch.setattr(srv.subprocess, "run", _fake_tt_smi(0, snapshot_chips=1))
+    return job
+
+
+def test_forced_reset_waits_for_a_killed_readopted_job_to_end_its_scope(monkeypatch, tmp_path):
+    """Goal: no reset under a live job. A killed re-adopted job is no longer RUNNING, so the claim does
+    not take it, but its scope still holds the device while it unwinds: the reset must wait for it."""
+    (tmp_path / "0").write_text("")
+    events = []
+    _readopted_job_killed_by_its_owner(monkeypatch, tmp_path, events)
+
+    d = _client(monkeypatch, tmp_path).post("/api/tt_device_reset", json={"force": True}).json()
+
+    assert d["status"] == "reset_complete"
+    assert events == [("wait", False), "finalized", "reset"], "the reset ran under the job's teardown"
+    assert any(s.startswith("waiting for re-adopted job 905-1 (killed)") for s in d["steps"])
+    assert not any("nothing to kill" in s for s in d["steps"]), "a false step: a job still held the device"
+
+
+def test_streaming_forced_reset_waits_for_a_killed_readopted_job_to_end_its_scope(monkeypatch, tmp_path):
+    (tmp_path / "0").write_text("")
+    events = []
+    _readopted_job_killed_by_its_owner(monkeypatch, tmp_path, events)
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(srv, "write_action_log", lambda *a, **k: None)
+
+    resp = _client(monkeypatch, tmp_path).post("/api/tt_device_reset_stream", json={"force": True})
+
+    assert "::status::refused" not in resp.text
+    assert events == [("wait", False), "finalized", "reset"], "the reset ran under the job's teardown"
+    assert "waiting for re-adopted job 905-1 (killed)" in resp.text
+    assert "nothing to kill" not in resp.text
+
+
+def test_forced_reset_waits_for_a_killed_readopted_job_seen_only_by_the_recheck(monkeypatch, tmp_path):
+    (tmp_path / "0").write_text("")
+    events = []
+    monkeypatch.setattr(srv, "jobs", {})
+    monkeypatch.setattr(srv, "current_process", None)
+    monkeypatch.setattr(srv, "current_job_id", None)
+    real = srv._device_op
+    saved = {}
+
+    @asynccontextmanager
+    async def op(name, owner="[broker]"):
+        if name == "reset":
+            # Re-adopted, then killed by its owner, between the first check and the device-op lock.
+            srv.jobs.update(saved["jobs"])
+            srv.readopted_scopes.update(saved["scopes"])
+        async with real(name, owner) as v:
+            yield v
+
+    _readopted_job_killed_by_its_owner(monkeypatch, tmp_path, events, job_id="906-1")
+    saved["jobs"], saved["scopes"] = dict(srv.jobs), dict(srv.readopted_scopes)
+    srv.jobs.clear()
+    srv.readopted_scopes.clear()
+    monkeypatch.setattr(srv, "_device_op", op)
+
+    d = _client(monkeypatch, tmp_path).post("/api/tt_device_reset", json={"force": True}).json()
+
+    assert d["status"] == "reset_complete"
+    assert events == [("wait", False), "finalized", "reset"], "the reset ran under the job's teardown"
+    assert any(s.startswith("waiting for re-adopted job 906-1 (killed)") for s in d["steps"])
+
+
 @pytest.mark.asyncio
 async def test_a_readopted_job_killed_by_a_forced_reset_does_not_flag_the_device(
     monkeypatch, tmp_path, clear_job_state
