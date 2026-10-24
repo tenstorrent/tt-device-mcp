@@ -98,6 +98,7 @@ def _rig(
 
     async def sbr(log):
         order.append(f"sbr {sorted(srv.isolated_chips, key=int)}")
+        srv.galaxy_recovery.last_bridge_reset_reasons = {}  # as the real rung: every target fired
         if sbr_heals:
             bus["beats"] = dict(ALL)
             srv.isolated_chips.clear()
@@ -622,3 +623,143 @@ async def test_the_sweep_sbr_is_below_the_floor_only(monkeypatch, tmp_path, clea
     assert "readers stopped" not in order and not any(o.startswith(("isolate", "sbr")) for o in order)
     assert order[-1] == "power cycle"
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
+
+
+# --- a mesh reset that dropped a chip: the SBR runs before the power cycle ---------------------
+
+
+def _regressed(monkeypatch, tmp_path, *, heals=False, verdicts=(), how="link"):
+    """This hold's mesh reset found the bus whole and left chip 31 off it (off before [], after [31]):
+    a regressed reset (I31), so the climb skips the mesh-reset ladder and goes to the host rung, whose
+    last-chance sweep runs first. Chip 31's node is still present."""
+    order, events, counters = _rig(
+        monkeypatch, tmp_path, held_min=3, enumerated=True, sbr_heals=heals, verdicts=list(verdicts)
+    )
+    killed = _dead_link(monkeypatch, tmp_path, order, how)
+    hold_since = srv.device_hold_episode_since
+    srv.recovery_mechanism.note_rung_failed(hold_since, "mesh_reset", set(), {GONE}, rc=1)
+    srv.recovery_mechanism.note_reset_regressed(hold_since)
+    return order, events, counters, killed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "heals, verdict, how",
+    [(True, True, "link"), (True, False, "link"), (False, False, "link"), (False, False, "all-ones")],
+)
+async def test_a_regressed_reset_gets_an_sbr_before_the_power_cycle(
+    monkeypatch, tmp_path, clear_job_state, heals, verdict, how
+):
+    """Off before [] and after [31]: the forced run climbs past the regressed reset, and its sweep
+    removes the chip (readers stopped first) and SBRs it before any power cycle, even though nothing was
+    isolated before. Only a just-passed full check with fabric lifts; otherwise the power cycle."""
+    order, events, counters, killed = _regressed(monkeypatch, tmp_path, heals=heals, verdicts=[verdict], how=how)
+    await srv.galaxy_recovery.escalate("offbus-forced", [GONE], 32, lambda m: None)
+    assert "galaxy_reset_skipped_regressed" in events
+    i = order.index("readers stopped")
+    assert order[i : i + 3] == ["readers stopped", f"isolate {GONE}", f"sbr ['{GONE}']"]
+    assert killed == [(4242, signal.SIGKILL)]
+    assert order.count(f"sbr ['{GONE}']") == 1, "one SBR per chip per hold"
+    if heals:
+        assert order[i + 3] == "full check", "the bus is whole: the full check runs before any mesh reset"
+    if heals and verdict:
+        assert "power cycle" not in order and "mesh reset" not in order
+        assert counters["dirty_cleared"] == 1, "lifted once, on the just-passed full check with fabric"
+    else:
+        assert order[-1] == "power cycle", "a failed check after the SBR keeps the hold and escalates"
+        assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["link", "all-ones"])
+async def test_the_sweep_sbrs_a_dead_link_chip_with_nothing_isolated_before(
+    monkeypatch, tmp_path, clear_job_state, how
+):
+    order, events, counters = _rig(monkeypatch, tmp_path, held_min=3, enumerated=True, sbr_heals=True, verdicts=[True])
+    _dead_link(monkeypatch, tmp_path, order, how)
+    assert not srv.isolated_chips
+    assert await srv.galaxy_recovery._settle_and_verify_before_host_rung(32, lambda m: None, "idle-escalation") is True
+    assert order[:3] == ["readers stopped", f"isolate {GONE}", f"sbr ['{GONE}']"]
+    # The all-ones rig keeps the chip's beat all-ones after the SBR, so the bus never reads whole and the
+    # sweep's mesh reset still runs before the one full check.
+    assert order[3:] == (["full check"] if how == "link" else ["mesh reset", "full check"])
+    assert counters["dirty_cleared"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("heals, verdict", [(True, True), (True, False), (False, False)])
+async def test_a_chip_the_valve_isolates_during_the_settle_is_sbrd_before_the_host_rung(
+    monkeypatch, tmp_path, clear_job_state, heals, verdict
+):
+    """The sweep sees chip 31 off the bus with its link up (nothing to remove or SBR) and fires its mesh
+    reset. During the settle the dead-chip valve isolates the chip. The full check fails; before the host
+    rung the chip, never SBR'd this hold, gets the kept rungs and the full check with fabric."""
+    order, events, counters, _killed = _regressed(
+        monkeypatch, tmp_path, heals=heals, verdicts=[False, verdict], how=None
+    )
+
+    async def mesh_then_valve(argv, log, *a, **k):
+        order.append("mesh reset")
+        srv.isolated_chips.add(GONE)  # the dead-chip valve, during the sweep's settle
+        return 1, ""
+
+    monkeypatch.setattr(srv.recovery_mechanism, "reset_with_quiesce", mesh_then_valve)
+    monkeypatch.setattr(galaxy, "TRAY_DOWN_RESCAN_SETTLE_SEC", 0)
+    await srv.galaxy_recovery.escalate("offbus-forced", [GONE], 32, lambda m: None)
+    assert order[:2] == ["mesh reset", "full check"], "the sweep: no SBR target yet"
+    assert order[2:4] == ["rescan", f"sbr ['{GONE}']"], "the SBR runs before the host rung"
+    assert "host_rung_sbr_owed" in events
+    if heals and verdict:
+        assert order[4:] == ["full check"] and counters["dirty_cleared"] == 1
+    else:
+        # A chip still off after the SBR gets no check (nothing could pass); a failed one keeps the hold.
+        assert order[4:] == (["full check"] if heals else []) + ["power cycle"]
+        assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["A", "C"])
+async def test_a_whole_tray_or_all_off_skips_the_sbr_and_power_cycles(
+    monkeypatch, tmp_path, clear_job_state, galaxy_trays, case
+):
+    """Class A (a whole tray off) and class C (every chip off) go straight to the power cycle after a
+    regressed reset: no reader stopped, no chip removed, no SBR, no sweep."""
+    order, _events, counters, _killed = _regressed(monkeypatch, tmp_path, how=None)
+    tray = sorted(galaxy_trays)[-1]
+    gone = {str(c) for c in galaxy_trays[tray]} if case == "A" else {str(i) for i in range(32)}
+    beats = {str(i): 100 for i in range(32) if str(i) not in gone}
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: dict(beats))
+    monkeypatch.setattr(pcie_guard, "chips_off_bus", lambda expected: len(gone))
+    for c in gone:
+        node = tmp_path / "pci" / srv.device_pci_map[c]
+        node.mkdir(exist_ok=True)
+        (node / "current_link_speed").write_text("Unknown\n")
+    if case == "C":
+        # Class C is all-off after a failed mesh reset (an all-off bus gets one mesh reset first).
+        srv.recovery_mechanism.note_rung_failed(srv.device_hold_episode_since, "mesh_reset", gone, gone, rc=1)
+    await srv.galaxy_recovery._climb_to_host_recovery_after_failed_reset(32, len(gone), lambda m: None)
+    assert "readers stopped" not in order and not any(o.startswith(("isolate", "sbr", "rescan")) for o in order)
+    assert order == ["power cycle"]
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
+
+
+@pytest.mark.asyncio
+async def test_after_the_sweep_sbr_a_fabric_check_short_of_the_cabled_links_power_cycles(
+    monkeypatch, tmp_path, clear_job_state, topo  # noqa: F811
+):
+    """The SBR brings chip 31 back, but the validator finds a port connection the cabling expects
+    missing: the check fails, the hold stands and the climb goes on to the power cycle."""
+    m, state = topo
+    state["first"] = _LOST
+    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS", raising=False)
+    order, events, counters, _killed = _regressed(monkeypatch, tmp_path, heals=True)
+
+    async def verify(expected, log, run_fabric=True, **k):
+        order.append("full check")
+        ok, detail = await m._verify_fabric_health_body(60)
+        return ok, {"snapshot": {"ok": True}, "fabric": {"ok": ok, "detail": detail}}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    await srv.galaxy_recovery.escalate("offbus-forced", [GONE], 32, lambda m: None)
+    assert f"sbr ['{GONE}']" in order and order[-1] == "power cycle"
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "short of the cabling is a fail"
