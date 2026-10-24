@@ -21,15 +21,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from tt_device_mcp import alert, metrics
-from tt_device_mcp.constants import (
-    ETH_CHECK_SELFTEST_BUDGET_SEC,
-    ETH_FULL_CHECK_TIMEOUT_SEC,
-    FABRIC_CHECK_TIMEOUT_SEC,
-    SNAPSHOT_KILL_GRACE_SEC,
-    SNAPSHOT_TIMEOUT_SEC,
-)
 from tt_device_mcp.device_holders import discount_broker_internal, holder_comm, is_tenant, username_for_uid
-from tt_device_mcp.health import aiclk_ceiling
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
 from tt_device_mcp.health.monitors.heartbeat import (
@@ -823,35 +815,24 @@ TRAY_DOWN_RESCAN_SETTLE_SEC = 3
 # Spec 04 I97: the budget for one Galaxy mesh reset of a whole mesh (about 35 s seen) and the settle
 # after it. Every chip is already on the bus and tt-smi re-inits the boards itself, so the settle is
 # short. The reset's worst case is a tt-smi that gives up at its 100 s driver wait (about 263 s seen).
-# The I97 reset starts only when the worst of both paths still requests the power cycle by the 10-min
-# bound.
 MESH_RESET_BEFORE_HOST_RUNG_SEC = 60
 MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC = 10
 MESH_RESET_BEFORE_HOST_RUNG_GAVE_UP_SEC = 300
+# The time the settle and the full check with fabric get after the reset: the slowest full check
+# measured on a 32-chip Galaxy (119.5 s) plus a margin. The check runs only with this much left before
+# the deadline; the deadline, not this figure, ends a check that runs longer.
+MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC = 180
+# At the deadline the check's readers get SIGTERM, SIGKILL this much later, then the reap.
+MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC = 10
+MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC = 5
 
 
-def _mesh_reset_before_host_rung_check_sec() -> int:
-    """Spec 04 I97: the most the full check after the reset can take, from the bounds that check runs
-    with (fabric asked): the tt-smi snapshot and its kill grace, the AICLK ceiling's apply, the eth
-    self-test a full pass re-runs while the rung is off, the eth-heartbeat read and the traffic pass."""
-    return math.ceil(
-        SNAPSHOT_TIMEOUT_SEC
-        + SNAPSHOT_KILL_GRACE_SEC
-        + aiclk_ceiling.timeout_sec()
-        + ETH_CHECK_SELFTEST_BUDGET_SEC
-        + ETH_FULL_CHECK_TIMEOUT_SEC
-        + FABRIC_CHECK_TIMEOUT_SEC
-    )
-
-
-def _mesh_reset_before_host_rung_cost() -> int:
-    """Spec 04 I97: the most hold time the reset can take before the power cycle is requested: a reset
-    that gives up (no check follows it), or one inside its budget, the settle and the full check."""
-    return max(
-        MESH_RESET_BEFORE_HOST_RUNG_GAVE_UP_SEC,
-        MESH_RESET_BEFORE_HOST_RUNG_SEC
-        + MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC
-        + _mesh_reset_before_host_rung_check_sec(),
+def _mesh_reset_before_host_rung_deadline_sec() -> float:
+    """Spec 04 I97: the hold age at which the full check after the reset counts as failed. Measured
+    from hold start: the I76 bound less the kill grace and the reap, so the power cycle is requested
+    by the bound."""
+    return (
+        _stuck_hold_ceiling_sec() - MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC - MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC
     )
 
 
@@ -3368,14 +3349,16 @@ class GalaxyRecovery(Recovery):
         to the power cycle at once.
 
         Runs only when all of: a Galaxy ``-glx_reset`` on more than one chip; the hold clock known and
-        this episode's I97 reset not spent; the power cycle can still be requested by the 10-min bound
-        whatever the reset does (I76: the hold age plus :func:`_mesh_reset_before_host_rung_cost` is
-        within it); every expected chip on
+        this episode's I97 reset not spent; a reset that gives up, or one in budget with the settle and
+        the full check's allowance, still ends before the deadline
+        (:func:`_mesh_reset_before_host_rung_deadline_sec`); every expected chip on
         the bus, none isolated or removed; the heartbeat still reads at least one chip ARC-not-ready,
         or the check's heartbeat probe failed; no reset cycling in its scope; and no tenant.
 
         After the reset, the full check runs only when the reset did not give up at its driver wait and
-        the check can still end by the bound; otherwise the caller power-cycles at once."""
+        the check's allowance is still left before the deadline; otherwise the caller power-cycles at
+        once. A check still running at the deadline is failed: its readers are stopped, the hold stays
+        and the caller power-cycles; a result it gives after that is ignored."""
         argv = self.reset_argv(list(range(expected)))
         hold_since = self.deps.device_hold_episode_since() or ""
         age = _hold_age_sec(hold_since)
@@ -3391,11 +3374,13 @@ class GalaxyRecovery(Recovery):
             return skip("no hold clock")
         if self._whole_mesh_reset_spent == hold_since:
             return skip("already ran in this hold")
-        if age + _mesh_reset_before_host_rung_cost() > _stuck_hold_ceiling_sec():
-            return skip(
-                f"the hold is {int(age)}s old; a reset that gives up or its full check would run past the "
-                f"{_stuck_hold_ceiling_sec()}s bound"
-            )
+        deadline = _mesh_reset_before_host_rung_deadline_sec()
+        needs = max(
+            MESH_RESET_BEFORE_HOST_RUNG_GAVE_UP_SEC,
+            MESH_RESET_BEFORE_HOST_RUNG_SEC + MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC + MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC,
+        )
+        if age + needs > deadline:
+            return skip(f"the hold is {int(age)}s old; the reset and its check would not end by the {deadline:.0f}s deadline")
         try:
             beats = await asyncio.to_thread(self.deps.read_heartbeats)
             whole = not (
@@ -3432,26 +3417,32 @@ class GalaxyRecovery(Recovery):
         if not await self._issue_all_resets_back_to_back([], expected, log, do_sbr=False):
             log("the mesh reset before the host rung was refused — the power cycle decides")
             return False
-        late = (_hold_age_sec(hold_since) or age) + MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC
-        late += _mesh_reset_before_host_rung_check_sec()
+        left = deadline - (_hold_age_sec(hold_since) or age)
         no_check = ""
         if self.mechanism.last_reset_driver_wait_failed:
             no_check = "tt-smi gave up at its driver wait again"
-        elif late > _stuck_hold_ceiling_sec():
-            no_check = f"the full check could run past the {_stuck_hold_ceiling_sec()}s bound"
+        elif left < MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC + MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC:
+            no_check = f"the full check could not end by the {deadline:.0f}s deadline"
         if no_check:
             pcie_guard.end_offbus_reset()
             log(f"no full check after the mesh reset of the whole mesh: {no_check} — the power cycle now")
             health_event("whole_mesh_reset_before_host_rung_unverified", phase=phase, reason=no_check)
             return False
-        healthy, evidence = await self._settle_and_verify_sweep(
-            expected,
-            log,
-            phase,
-            MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC,
-            context="mesh reset before the host rung",
-            fabric_77_unverified=False,
+        check = asyncio.ensure_future(
+            self._settle_and_verify_sweep(
+                expected,
+                log,
+                phase,
+                MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC,
+                context="mesh reset before the host rung",
+                fabric_77_unverified=False,
+            )
         )
+        await asyncio.wait({check}, timeout=left)
+        if not check.done():
+            await self._cut_check_at_deadline(check, deadline, log, phase)
+            return False
+        healthy, evidence = check.result()
         if not healthy:
             log("the full check failed after the mesh reset of the whole mesh — the power cycle goes on")
             health_event("whole_mesh_reset_before_host_rung_unverified", phase=phase, evidence=evidence)
@@ -3465,6 +3456,28 @@ class GalaxyRecovery(Recovery):
         log("the mesh verified after the mesh reset of the whole mesh — no power cycle needed")
         health_event("gate", phase=phase, healthy=True, recovered_via="whole-mesh reset", evidence=evidence)
         return True
+
+    async def _cut_check_at_deadline(self, check: asyncio.Future, deadline: float, log, phase: str) -> None:
+        """Spec 04 I97: the full check after the mesh reset is still running at the deadline. It counts
+        as failed and the hold stays: its readers get SIGTERM, SIGKILL after the grace, the check task is
+        reaped (cancelled if it still has not ended) and its result is never read."""
+        reason = f"the full check after the mesh reset ran to the {deadline:.0f}s hold deadline"
+        stopped = await self.monitor.stop_check_readers(reason, MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC)
+        loop = asyncio.get_running_loop()
+        end = loop.time() + MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC
+        await asyncio.wait({check}, timeout=MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC / 2)
+        if not check.done():
+            check.cancel()
+            await asyncio.wait({check}, timeout=max(0.0, end - loop.time()))
+            # A reader the check started after the cut has no task left to end it.
+            stopped += await self.monitor.stop_check_readers(reason, 0)
+        if check.done() and not check.cancelled():
+            check.exception()  # read, so a late error is not logged as never retrieved
+        pcie_guard.end_offbus_reset()
+        log(f"{reason} — failed, the hold stays and the power cycle goes on")
+        health_event(
+            "whole_mesh_reset_before_host_rung_unverified", phase=phase, reason="deadline", stopped_pids=stopped
+        )
 
     async def _note_mesh_reset_failed(
         self, recovered: Optional[bool], hold_since: str, ids_before: Optional[set], expected: int

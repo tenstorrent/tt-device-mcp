@@ -25,14 +25,11 @@ from typing import Callable, Optional
 
 from tt_device_mcp import aio, alert, metrics
 from tt_device_mcp.constants import (
-    ETH_FULL_CHECK_TIMEOUT_SEC,
     ETH_POST_JOB_TIMEOUT_SEC,
     ETH_REAP_SEC,
     FABRIC_CHECK_CANNOT_CHECK_RC,
     FABRIC_CHECK_HARDWARE_FAULT_RC,
     FABRIC_CHECK_TIMEOUT_SEC,
-    SNAPSHOT_KILL_GRACE_SEC,
-    SNAPSHOT_TIMEOUT_SEC,
 )
 from tt_device_mcp.device_holders import note_broker_internal
 from tt_device_mcp.health.aiclk_ceiling import CEILING
@@ -244,6 +241,14 @@ def _env_int(name: str, default: int, floor: int) -> int:
         return max(floor, int(raw)) if raw else default
     except ValueError:
         return default
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, OSError):
+        return False
+    return True
 
 
 def _verdict_label(ok: Optional[bool]) -> str:
@@ -946,9 +951,7 @@ class HealthMonitor:
                 self._glx_cache = ()
         return self._glx_cache
 
-    def verify_device_health(
-        self, expected_count: int, *, timeout_sec: float = SNAPSHOT_TIMEOUT_SEC
-    ) -> tuple[bool, str]:
+    def verify_device_health(self, expected_count: int, *, timeout_sec: float = 90.0) -> tuple[bool, str]:
         """Verify the mesh is actually usable after a reset, via a read-only tt-smi
         snapshot. A reset exiting 0 only means the command ran — it does NOT prove the
         chips came back. This is the check that turns "reset ran" into "device healthy".
@@ -1006,7 +1009,7 @@ class HealthMonitor:
                 except (ProcessLookupError, OSError):
                     pass
                 try:
-                    proc.communicate(timeout=SNAPSHOT_KILL_GRACE_SEC)
+                    proc.communicate(timeout=5)
                 except Exception:  # noqa: BLE001 - a reader stuck past SIGKILL is the holder scan's
                     pass
                 raise
@@ -1014,9 +1017,7 @@ class HealthMonitor:
             self.snapshot_proc = None
         return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
-    def _verify_device_health_body(
-        self, expected_count: int, *, timeout_sec: float = SNAPSHOT_TIMEOUT_SEC
-    ) -> tuple[bool, str]:
+    def _verify_device_health_body(self, expected_count: int, *, timeout_sec: float = 90.0) -> tuple[bool, str]:
         self._snapshot_killed = ""
         try:
             try:
@@ -1168,6 +1169,39 @@ class HealthMonitor:
         pass is owed before any release (04 I32)."""
         self._fabric_killed = reason or "dead-chip isolation"
         FABRIC_DEBT.note_fabric_killed(f"fabric check killed ({self._fabric_killed})")
+
+    async def stop_check_readers(self, reason: str, grace_sec: float) -> list:
+        """Spec 04 I97: end the full check's own readers at its deadline. SIGTERM the process group of
+        the fabric pass, the tt-smi snapshot and the AICLK ceiling, SIGKILL any group still alive
+        ``grace_sec`` later, and mark each killed check no verdict (never a pass). Returns the pids
+        signalled. Never raises."""
+        stopped = []
+        for proc, note in (
+            (self.fabric_check_proc, self.note_fabric_check_killed),
+            (self.snapshot_proc, self.note_snapshot_killed),
+            (CEILING.proc, None),
+        ):
+            if proc is None or getattr(proc, "returncode", None) is not None:
+                continue
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                continue
+            stopped.append(proc.pid)
+            if note is not None:
+                note(reason)
+        loop = asyncio.get_running_loop()
+        end = loop.time() + grace_sec
+        alive = list(stopped)
+        while alive and loop.time() < end:
+            await asyncio.sleep(0.2)
+            alive = [pid for pid in alive if _group_alive(pid)]
+        for pid in alive:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+        return stopped
 
     def _snapshot_no_verdict(self) -> str:
         why, self._snapshot_killed = self._snapshot_killed, ""
@@ -1615,7 +1649,7 @@ class HealthMonitor:
             self._fabric_route_fault_streak = _env_int("TT_DEVICE_MCP_FABRIC_ROUTE_FAULT_JOBS", 2, 1) - 1
         return self.fabric_known_fault
 
-    async def verify_eth_heartbeat(self, timeout_sec: float = ETH_FULL_CHECK_TIMEOUT_SEC) -> tuple[Optional[bool], str]:
+    async def verify_eth_heartbeat(self, timeout_sec: float = 60.0) -> tuple[Optional[bool], str]:
         """Read the active-ethernet-core firmware heartbeats — a passive check that never pushes
         traffic — and say whether any core is frozen. Same override/built-in split as
         ``verify_fabric_health`` (see ``health.monitors.eth``): ``TT_DEVICE_MCP_ETH_HEARTBEAT_CMD``

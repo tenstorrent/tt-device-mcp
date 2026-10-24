@@ -2467,35 +2467,43 @@ each rung fires only when the gentler one failed or cannot apply.
   K ARC not ready after the reset ladder`, or the previous text when that read fails. A chip the SBR
   brought back no longer shows as off the bus.
 
-  The bound (I76): (a) starts only when the hold's age plus its worst case still requests the power
-  cycle by the stuck-hold ceiling (600 s; `TT_DEVICE_MCP_STUCK_HOLD_SEC` only shortens it): age +
-  423 s <= 600 s, so at a hold age of 177 s at most. The worst case is the larger of a reset whose
-  tt-smi gives up at its driver wait (`MESH_RESET_BEFORE_HOST_RUNG_GAVE_UP_SEC`, 300 s; about 263 s
-  seen) and a reset in its budget (`MESH_RESET_BEFORE_HOST_RUNG_SEC`, 60 s; about 35 s seen) plus
-  the settle (`MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC`, 10 s) plus the full check
-  (`_mesh_reset_before_host_rung_check_sec`, 353 s), summed from the bounds that check runs with,
-  fabric asked: the tt-smi snapshot (`SNAPSHOT_TIMEOUT_SEC`, 90 s) and its kill grace
-  (`SNAPSHOT_KILL_GRACE_SEC`, 5 s), the AICLK ceiling's apply (its timeout, 8 s by default), the eth
-  self-test a full pass re-runs while the rung is off (`ETH_CHECK_SELFTEST_BUDGET_SEC`, 10 s), the
-  eth-heartbeat read (`ETH_FULL_CHECK_TIMEOUT_SEC`, 60 s) and the traffic pass
-  (`FABRIC_CHECK_TIMEOUT_SEC`, 180 s). The monitor runs each probe with the same constant, so the two
-  cannot drift. After the reset, a tt-smi that gave up at its driver wait again, or a full
-  check that could end past the ceiling, gets no check: the reset's off-bus intent ends and the
-  power cycle is requested at once, so the request comes by 600 s. The one exception is a reset stuck
-  past 300 s: resets are never killed (I4), up to the 600 s reset timeout, as for every mesh-reset
-  rung. That tail is an accepted, bounded exception, not tightened: a reset started at 177 s that
-  runs to its timeout requests the power cycle at about 777 s, so class B1 then recovers in about
-  17-18 min, past its 15 min budget. Tightening it would mean killing a reset mid-run, which I4
-  forbids, or a start gate that counts the 600 s timeout, which no hold could ever pass.
-  A hold older than 177 s skips (a), journaled with its reason, and requests the power cycle at
+  The bound (I76): one runtime deadline, not a sum of probe timeouts. (a) runs against a hold-age
+  deadline, `_mesh_reset_before_host_rung_deadline_sec()`: the stuck-hold ceiling (600 s;
+  `TT_DEVICE_MCP_STUCK_HOLD_SEC` only shortens it) less the kill grace
+  (`MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC`, 10 s) and the reap (`MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC`,
+  5 s), so 585 s. It is a constant in code, never a per-box setting. (a) starts only when a reset that
+  gives up at its driver wait (`MESH_RESET_BEFORE_HOST_RUNG_GAVE_UP_SEC`, 300 s; about 263 s seen), or
+  one in its budget (`MESH_RESET_BEFORE_HOST_RUNG_SEC`, 60 s; about 35 s seen) with the settle
+  (`MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC`, 10 s) and the check's allowance
+  (`MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC`, 180 s), still ends before the deadline: a hold age of
+  285 s at most. The allowance is the slowest full check with fabric measured on a 32-chip Galaxy
+  (119.5 s; p95 106.9 s, median 95.7 s, n=53) plus a margin. It only decides whether a check is worth
+  starting; the deadline, not the allowance, ends a check that runs longer. After the reset, a tt-smi
+  that gave up at its driver wait again, or less than the settle and the allowance left before the
+  deadline, gets no check: the reset's off-bus intent ends and the power cycle is requested at once.
+  A check still running at the deadline counts as failed, whatever it would have returned: its
+  readers (the fabric pass, the tt-smi snapshot, the AICLK ceiling helper) get SIGTERM and, still
+  alive after the grace, SIGKILL, each marked no verdict; the check task is reaped, or cancelled when
+  it has not ended within the reap; a reader it started after the cut gets SIGKILL; its result is
+  never read. The hold stays and the power cycle is requested at once, by 600 s. This covers every
+  term inside the check (each probe's own timeout and kill sequence, the eth reads, I45's
+  traffic-only rerun) without counting any of them. Accepted gaps: (1) a reset stuck past 300 s is
+  never killed (I4), up to the 600 s reset timeout, as for every mesh-reset rung; a reset started at
+  285 s that runs to its timeout requests the power cycle at about 885 s, so class B1 then recovers
+  in about 19-20 min, past its 15 min budget. Tightening it would mean killing a reset mid-run, which
+  I4 forbids. (2) A check cut at the deadline may have been about to pass; the device is power-cycled
+  rather than lifted, never lifted on a late pass. (3) The eth-heartbeat read has no tracked process
+  to stop: one still running at the cut ends under its own timeout in the background, and its result
+  is ignored. A hold older than 285 s skips (a), journaled with its reason, and requests the power
+  cycle at
   once, as before. The boot and post-cycle cooldown (I65) is unchanged. Releases nothing: only a
   just-passed full check, fabric included, lifts (I32). Time to recover, class B1 with a chip that
   needs an SBR to retrain: one episode before, about 14.3 min through the power cycle, inside its
   15 min budget. With (a) and (b), est.: when the driver-wait SBR retrains the chip, the reset
   succeeds and the failed 263 s reset is gone. Otherwise the best case is the climb, then (a)'s reset
-  (about 35 s), the 10 s settle and the full check (about 60 s), with no power cycle (about 5-8 min)
-  or startup check (about 3 min). The worst case is the power cycle requested by 10 min plus its
-  about 4.3-5 min, within 15 min, apart from the stuck-reset tail above.
+  (about 35 s), the 10 s settle and the full check (about 95-120 s), with no power cycle (about
+  5-8 min) or startup check (about 3 min). The worst case is the power cycle requested by 10 min plus
+  its about 4.3-5 min, within 15 min, apart from the stuck-reset tail above.
 
 ## Interfaces
 
@@ -3097,8 +3105,10 @@ sees a silent fabric pass.
 | I96 a chip back on the bus no longer arms the one-shot (the gate reads after its rescan; the forced run and the idle DOWN re-check prune it); no reset runs, the hold stays, and the 10-min bound's ladder still runs with its full check, fabric included | `tests/test_offbus_one_shot_returned.py::test_a_dead_arc_chip_back_on_the_rescan_does_not_arm_the_one_shot`, `::test_a_chip_back_while_a_tenant_waited_drops_the_one_shot`, `::test_the_down_offbus_recheck_drops_a_returned_chip_and_keeps_the_hold` |
 | I97 the SBR before the power cycle has every chip back and the full check fails on ARC-not-ready chips: one mesh reset of the whole mesh, then the full check with fabric; only its pass lifts, and a failure requests the power cycle in the same pass, its reason read from the bus as it is now | `tests/test_below_floor_offbus_ladder.py::test_an_sbr_that_has_every_chip_back_on_arc_not_ready_chips_gets_one_mesh_reset_first` |
 | I97 a refused mesh reset lifts nothing and requests the power cycle in the same pass | `tests/test_below_floor_offbus_ladder.py::test_a_refused_mesh_reset_before_the_host_rung_goes_to_the_power_cycle` |
-| I97 the reset starts only when its worst case (423 s: a give-up, or the reset, settle and the full check's 353 s) still requests the power cycle by the 10-min bound; an older hold gets the power cycle at once | `tests/test_below_floor_offbus_ladder.py::test_the_mesh_reset_before_the_host_rung_starts_only_when_it_ends_before_the_bound` |
-| I97 started at the latest age the bound allows, the power cycle is requested by 600 s: after a full check in budget whose every probe takes the whole bound it runs with, and with no check after a reset that runs past its budget or gives up at its driver wait again | `tests/test_below_floor_offbus_ladder.py::test_the_power_cycle_after_the_mesh_reset_before_the_host_rung_is_requested_by_the_bound` |
+| I97 the reset starts only when a give-up (300 s), or the reset, settle and the check's 180 s allowance, still ends before the 585 s hold-age deadline; an older hold gets the power cycle at once | `tests/test_below_floor_offbus_ladder.py::test_the_mesh_reset_before_the_host_rung_starts_only_when_it_ends_before_the_deadline` |
+| I97 started at the latest age the deadline allows, the power cycle is requested by 600 s and the hold stays: after a failed check, and with no check after a reset that runs long, runs past the deadline or gives up at its driver wait again | `tests/test_below_floor_offbus_ladder.py::test_the_power_cycle_after_the_mesh_reset_before_the_host_rung_is_requested_by_the_bound` |
+| I97 a full check still running at the deadline is failed: its reader gets SIGTERM, then SIGKILL after the grace, nothing lifts on its late pass, and the power cycle is requested by deadline + grace + reap | `tests/test_below_floor_offbus_ladder.py::test_a_full_check_still_running_at_the_deadline_fails_and_power_cycles` |
+| I97 a fabric pass after the mesh reset short of the cabled links fails the check: the hold stays and the power cycle follows | `tests/test_below_floor_offbus_ladder.py::test_a_fabric_check_short_of_the_cabled_links_after_the_mesh_reset_before_the_host_rung_power_cycles` |
 | I97 a passed check whose lift the funnel refuses keeps the hold with no power cycle; the next pass, or the bound's own, runs no second I97 reset and, on a failed check, requests the power cycle by the bound | `tests/test_below_floor_offbus_ladder.py::test_a_refused_lift_after_the_mesh_reset_before_the_host_rung_still_power_cycles_by_the_bound` |
 | I97 once per hold episode; a new episode gets its own | `tests/test_below_floor_offbus_ladder.py::test_the_mesh_reset_before_the_host_rung_runs_once_per_hold_episode` |
 | I97 a whole tray off still goes straight to the power cycle with no reset, also with chips ARC-not-ready on the other trays | `tests/test_below_floor_offbus_ladder.py::test_a_whole_tray_off_with_arc_not_ready_chips_still_power_cycles_with_no_reset` |

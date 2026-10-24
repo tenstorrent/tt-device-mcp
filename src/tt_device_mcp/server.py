@@ -58,7 +58,6 @@ from tt_device_mcp import __version__, aio, alert, device_activity, loop_watch, 
 from tt_device_mcp.constants import (
     DEFAULT_PORT,
     DEVICE_RESET_DETAIL_PREFIX,
-    ETH_CHECK_SELFTEST_BUDGET_SEC,
     FABRIC_CHECK_CANNOT_CHECK_RC,
     FABRIC_CHECK_TIMEOUT_SEC,
     GRACEFUL_KILL_GRACE_SEC,
@@ -4141,8 +4140,8 @@ def _reset_health_label(verdict: Optional[bool]) -> str:
 # than waiting on an operator to arm it. The eth read sat inert for weeks — 25 SKIPPED, 0 verdicts —
 # because "nobody armed it" and "it is broken" look identical from outside. An opt-in nobody exercises
 # is not a safe default, it is an absent rung. So the box times its own read, arms on a fast answer,
-# and when it cannot, says which rung is off and why at WARNING. Its budget:
-# constants.ETH_CHECK_SELFTEST_BUDGET_SEC.
+# and when it cannot, says which rung is off and why at WARNING.
+ETH_CHECK_SELFTEST_BUDGET_SEC = 10.0
 eth_check_armed: bool = False
 eth_check_disarm_reason: str = "startup self-test has not run yet"
 # A self-test that missed its budget once (a read that hung on a busy box, no device detected at

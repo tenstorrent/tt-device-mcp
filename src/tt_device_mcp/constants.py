@@ -165,16 +165,6 @@ def pre_reset_zombie_ladder_reserve_sec(chips: int) -> float:
 # override's inner bound is this same bound, so its timeout is frozen evidence here as on every
 # other path.
 ETH_POST_JOB_TIMEOUT_SEC = 10.0
-# The caller's bound on the eth-heartbeat read a FULL pass runs (fabric asked: a reset's check, a
-# held device's re-check), where the traffic pass follows and a slow read is still worth waiting
-# for. Shared with the recovery bounds that count a full check's worst case (spec 04 I97).
-ETH_FULL_CHECK_TIMEOUT_SEC = 60.0
-# The startup eth self-test's budget for one read; a full pass re-runs it before it reads while the
-# rung is off (spec 03 I28).
-ETH_CHECK_SELFTEST_BUDGET_SEC = 10.0
-# The tt-smi snapshot's bound, and the most it then waits for the killed snapshot to exit.
-SNAPSHOT_TIMEOUT_SEC = 90.0
-SNAPSHOT_KILL_GRACE_SEC = 5.0
 # The most the eth-heartbeat read waits for its own reader to finish exiting after killing it on
 # a timeout (see monitor._verify_eth_heartbeat_body): a SIGKILLed reader is normally gone in
 # milliseconds, and until it is, a holder scan still sees its pid through the driver.
