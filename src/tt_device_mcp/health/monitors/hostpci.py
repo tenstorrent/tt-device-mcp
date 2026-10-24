@@ -421,14 +421,20 @@ def hugepages_shortfall() -> Optional[tuple[int, int]]:
     None when there is nothing to wait for: every function behind a translating IOMMU, none on the
     bus, or a kernel with no 1G hugepage pool to read (an unreadable pool is not evidence of a short
     one, and waiting on it would hold a box that may not use hugepages at all). Sysfs reads only."""
+    have, need = hugepages_counts()
+    if need <= 0 or have is None:
+        return None
+    return (have, need) if have < need else None
+
+
+def hugepages_counts() -> tuple[Optional[int], int]:
+    """``(have, need)``: the 1G pool's size (None when unreadable) and how many functions need a
+    page. The facts behind hugepages_shortfall, for the record; sysfs reads only."""
     need = _functions_needing_hugepages()
     if need <= 0:
-        return None
+        return None, need
     raw = _read(HUGEPAGES_1G_NR)
-    if raw is None or not raw.isdigit():
-        return None
-    have = int(raw)
-    return (have, need) if have < need else None
+    return (int(raw) if raw is not None and raw.isdigit() else None), need
 
 
 # What fills the 1G pool at boot on a host that needs one. The installer only checks it is there:

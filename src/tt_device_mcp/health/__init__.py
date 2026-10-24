@@ -79,6 +79,7 @@ from tt_device_mcp.health.monitors.heartbeat import (
 # preflight can assert them without spawning anything or touching a device.
 from tt_device_mcp.health.monitors.hostpci import (
     CONFIG_UNREADABLE,
+    hugepages_counts,
     hugepages_shortfall,
     link_down,
     version_floor_warnings,
@@ -231,6 +232,7 @@ __all__ = [
     "heartbeat_supported",
     "heartbeat_verdict",
     "read_heartbeats",
+    "hugepages_counts",
     "hugepages_shortfall",
     "version_floor_warnings",
     "SAMPLE_INTERVAL_SEC",

@@ -348,6 +348,105 @@ async def test_startup_without_hugepages_applies_no_ceiling_and_stays_held(rig, 
     assert srv.fsm.state is ServerState.RECOVERING
 
 
+# --- every startup hugepage path leaves one startup_hugepages record (spec 03 I33) -----------
+
+
+def _record_events(monkeypatch, counts=(32, 32)):
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    monkeypatch.setattr(srv, "health_hugepages_counts", lambda: counts)
+    return events
+
+
+def _startup_hugepages(events):
+    got = [f for kind, f in events if kind == "startup_hugepages"]
+    assert len(got) == 1, f"want exactly one startup_hugepages record: {events}"
+    return got[0]
+
+
+@pytest.mark.asyncio
+async def test_startup_hugepages_ready_after_wait_is_recorded_and_released(rig, monkeypatch, tmp_path):
+    await _restart_broker(monkeypatch, tmp_path / "fsm.json")
+    srv.fsm.on_next_close(rig.released)
+    monkeypatch.setattr(srv, "readopted_scopes", {})
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)
+    _hugepages(monkeypatch, rig, [(0, 32), (16, 32), None])
+    events = _record_events(monkeypatch, counts=(32, 32))
+    await _REAL_VERIFY_ON_START()
+    ev = _startup_hugepages(events)
+    assert ev["outcome"] == "ready" and ev["need"] == 32 and ev["have"] == 32 and ev["waited_s"] >= 0, ev
+    o = rig.order
+    assert o.index("hugepages-ready") < o.index("fabric") < o.index("release"), o
+    assert srv.fsm.state is ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_startup_hugepages_short_is_recorded_and_still_held(rig, monkeypatch, tmp_path):
+    await _restart_broker(monkeypatch, tmp_path / "fsm.json")
+    monkeypatch.setattr(srv, "readopted_scopes", {})
+    monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)
+    monkeypatch.setattr(srv, "STARTUP_HUGEPAGES_WAIT_SEC", 0.03)
+    monkeypatch.setattr(srv, "_await_startup_prerequisites", lambda missing: asyncio.sleep(0))
+    _hugepages(monkeypatch, rig, [(0, 32)])
+    events = _record_events(monkeypatch)
+    await _REAL_VERIFY_ON_START()
+    ev = _startup_hugepages(events)
+    assert ev == {"outcome": "short_held", "need": 32, "have": 0, "waited_s": ev["waited_s"]}, ev
+    assert ev["waited_s"] >= 0
+    assert "fabric_check_unavailable" in [k for k, _ in events], "the cannot-check record is unchanged"
+    assert "fabric" not in rig.order and "release" not in rig.order, rig.order
+    assert srv.fsm.state is ServerState.RECOVERING
+    assert srv.fsm.record.why == srv.FABRIC_RELIFT_WHY, "the short path still holds fabric-unverified"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "counts, outcome, reason",
+    [
+        ((0, 0), "not_needed", "no function needs a 1G page"),
+        ((None, 4), "not_needed", "1G pool unreadable"),
+        ((4, 4), "ready", None),
+    ],
+    ids=["need-0", "pool-unreadable", "already-full"],
+)
+async def test_startup_hugepages_no_wait_is_recorded(rig, monkeypatch, counts, outcome, reason):
+    monkeypatch.setattr(srv, "_hugepages_shortfall", lambda: None)
+    events = _record_events(monkeypatch, counts=counts)
+    assert await srv._await_startup_hugepages() is True
+    ev = _startup_hugepages(events)
+    assert (ev["outcome"], ev["have"], ev["need"], ev["waited_s"], ev.get("reason")) == (
+        outcome,
+        counts[0],
+        counts[1],
+        0.0,
+        reason,
+    ), ev
+
+
+@pytest.mark.asyncio
+async def test_startup_hugepages_opt_out_is_recorded_and_never_waits(rig, monkeypatch):
+    monkeypatch.delenv("TT_DEVICE_MCP_EXPECTED_CHIPS")
+    monkeypatch.setattr(srv, "health_hugepages_shortfall", lambda: (0, 32))  # ignored: opted out
+    events = _record_events(monkeypatch, counts=(0, 32))
+    assert await srv._await_startup_hugepages() is True
+    ev = _startup_hugepages(events)
+    assert ev["outcome"] == "not_needed" and ev["waited_s"] == 0.0, ev
+    assert "TT_DEVICE_MCP_EXPECTED_CHIPS" in ev["reason"], ev
+
+
+@pytest.mark.asyncio
+async def test_startup_hugepages_short_with_a_dirty_episode_is_recorded_and_runs_the_gate(rig, monkeypatch):
+    fsm_dirty(srv, "job 12 crashed", why="job_killed")
+    monkeypatch.setattr(srv, "STARTUP_HUGEPAGES_WAIT_SEC", 0.03)
+    _hugepages(monkeypatch, rig, [(0, 32)])
+    events = _record_events(monkeypatch)
+    assert await srv._await_startup_hugepages() is True, "a dirty episode still goes to the gate"
+    ev = _startup_hugepages(events)
+    assert ev["outcome"] == "short_dirty" and (ev["have"], ev["need"]) == (0, 32), ev
+    assert "fabric_check_unavailable" not in [k for k, _ in events]
+    assert srv.fsm.record.dirty, "the owed reset is not dropped"
+
+
 # --- a disarmed ceiling still runs the full pass ---------------------------------------------
 
 
