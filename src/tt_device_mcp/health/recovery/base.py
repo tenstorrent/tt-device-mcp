@@ -44,6 +44,10 @@ LOCAL_RESET_LOCK = "local-reset.lock"
 # to show up in /dev/tenstorrent. Either line marks the start of that wait (spec 04 I81).
 GLX_DRIVER_WAIT = re.compile(r"Waiting for all \d+ chips to show up|Waiting for (\d+) seconds: \1\b")
 
+# Spec 04 I97: tt-smi's last line when a chip never showed up in that wait. It then exits 1 with no
+# POST_RESET and no board re-init, so every chip it did find is left ARC-not-ready: the reset FAILED.
+GLX_DRIVER_WAIT_GAVE_UP = re.compile(r"Didn't find all (\d+) chips\b[^\n]*giving up")
+
 # Spec 03 I83. tt-smi prints this when the driver's POST_RESET on a chip fails after a mesh reset's
 # re-power: the reset marker did not read back zero, and the driver has just cleared the chip's
 # needs_hw_init, so from here every read of that chip is a real bus read again.
@@ -102,6 +106,10 @@ RESET_COOLDOWN_SEC = 600
 # still missing, at most this many rescans in all: 20 x 5 s spans tt-smi's 100 s driver wait.
 DRIVER_WAIT_RESCAN_EVERY_SEC = 5
 DRIVER_WAIT_RESCAN_TRIES = 20
+# Spec 04 I97: once this many rescans in the driver wait have not brought an isolated chip back, its
+# bridge gets one Secondary Bus Reset (the rescans then go on): a re-powered chip whose link did not
+# retrain on its own trains after an SBR, and the wait still has most of its 100 s left.
+DRIVER_WAIT_SBR_AFTER_TRIES = 4
 
 # The escalation latch stops an episode climbing twice, but "does not repeat" must never mean
 # "never again": keyed on the episode alone, a recovery that failed left the ladder with nothing to
@@ -630,6 +638,8 @@ class RecoveryMechanism:
         # runs on them once tt-smi has exited (the sampler's cut_post_reset_failed; returns False when
         # a chip's remove is still blocked in the kernel). None: no cut.
         self.post_reset_failed: set = set()
+        # Spec 04 I97: the last mesh reset's tt-smi gave up at its driver wait (a failed reset).
+        self.last_reset_driver_wait_failed: bool = False
         self.post_reset_cut: Optional[Callable[[list], Awaitable[bool]]] = None
         # Any reset_with_quiesce (the ladder's or a manual one) since the mesh was last released:
         # an off-bus set first seen after it is the reset's doing, never a tray-down onset (04 I19).
@@ -1465,7 +1475,7 @@ class RecoveryMechanism:
                 try:
                     # Inside the try: the cut can take up to about 45 s, and a cancel that lands in it
                     # must still reach the finally below, or the pollers stay stopped and owed to nobody.
-                    rescan_ok = await self._post_reset_cut(argv, log)
+                    rescan_ok = await self._post_reset_cut(argv, log, rc=rc, text=text)
                     cut_done = True
                     # Spec 04 I69 on the mesh path, decided after the cut so a chip the I83 cut just
                     # removed is also kept out when the BMC re-power did not reach it.
@@ -1583,15 +1593,30 @@ class RecoveryMechanism:
         except Exception:  # noqa: BLE001 - a missed restart leaves them for the health probe
             pass
 
-    async def _post_reset_cut(self, argv: list[str], log) -> bool:
+    async def _post_reset_cut(self, argv: list[str], log, *, rc=None, text: str = "") -> bool:
         """Spec 03 I83: after a mesh reset, hand the chips tt-smi said failed POST_RESET to the cut
         (detach, then kill their foreign readers). Runs once tt-smi has exited, before the rescan that
         ends the reset. Logs one line per mesh reset either way, so every reset's journal shows what
         the cut saw. Returns False only when a chip's remove is still blocked in the kernel, so the
-        caller skips its rescan. Never raises."""
+        caller skips its rescan. Never raises.
+
+        Spec 04 I97: a reset whose tt-smi gave up at its driver wait (``rc`` non-zero with the give-up
+        line, or the line alone) ran no POST_RESET and no re-init, so no POST_RESET failure is not a
+        clean end: it is logged and journalled as a FAILED reset (``last_reset_driver_wait_failed``)."""
         if "-glx_reset" not in argv:
             return True
         failed = sorted(self.post_reset_failed, key=int)
+        gave_up = GLX_DRIVER_WAIT_GAVE_UP.search(str(text or "")) or (
+            rc not in (None, 0) and self.last_reset_driver_wait_failed
+        )
+        if gave_up and not failed:
+            self.last_reset_driver_wait_failed = True
+            log(
+                f"mesh reset FAILED (rc {rc}): tt-smi gave up at its driver wait — not every chip showed up, "
+                "so no POST_RESET and no board re-init ran; the chips it found are left ARC-not-ready"
+            )
+            health_event("reset_driver_wait_gave_up", rc=rc)
+            return True
         if not failed:
             log("mesh reset ended: tt-smi reported no POST_RESET failure; no in-flight cut")
             return True
@@ -1634,6 +1659,7 @@ class RecoveryMechanism:
         starts). Not a mesh reset: the callback is the caller's own."""
         if "-glx_reset" not in argv:
             return on_output, {}
+        self.last_reset_driver_wait_failed = False
         isolated = self._isolated_chips() if self._isolated_chips is not None else None
         chips = sorted(isolated, key=int) if isolated else []
         state: dict = {"tail": "", "ptail": "", "task": None, "stop": asyncio.Event()}
@@ -1660,6 +1686,10 @@ class RecoveryMechanism:
                     await asyncio.to_thread(drop_returned_isolated, still, "mesh reset driver wait", log)
                 if not still:
                     return
+                if attempt == DRIVER_WAIT_SBR_AFTER_TRIES and await self._driver_wait_sbr(still, state, log):
+                    if state.get("disarmed"):
+                        return  # the reset ended: the rescan after it takes over
+                    continue  # the SBR's retrain settle stands in for this period's wait
                 if attempt == DRIVER_WAIT_RESCAN_TRIES:
                     log(
                         f"chip(s) {sorted(still, key=int)} still missing after {attempt} rescans in tt-smi's driver wait"
@@ -1676,6 +1706,8 @@ class RecoveryMechanism:
             if not state.get("disarmed"):
                 text = state["ptail"] + chunk
                 self.post_reset_failed.update(m.group(1) for m in GLX_POST_RESET_FAILED.finditer(text))
+                if GLX_DRIVER_WAIT_GAVE_UP.search(text):
+                    self.last_reset_driver_wait_failed = True
                 state["ptail"] = text[-200:]  # a line split across two reads still matches
             if not state.get("seen") and not state.get("disarmed"):
                 seen = state["tail"] + chunk
@@ -1708,6 +1740,55 @@ class RecoveryMechanism:
                 on_output(chunk)
 
         return watch, state
+
+    async def _driver_wait_sbr(self, still, state: dict, log) -> bool:
+        """Spec 04 I97: DRIVER_WAIT_SBR_AFTER_TRIES rescans in tt-smi's driver wait have not brought
+        isolated chip(s) ``still`` back. Fire one Secondary Bus Reset through each one's recorded
+        bridge (no rescan: the next rescan of the loop adds them, I69), then wait for the link to
+        retrain. Once per reset. Nothing fires without the SBR capability, after the reset ended, or
+        for a chip with no usable bridge. True when at least one SBR fired. Never raises: the rescans
+        and the full check still decide."""
+        if state.get("sbr_done") or state.get("disarmed"):
+            return False
+        state["sbr_done"] = True
+        # Lazy imports: the recovery package and its stages import this module.
+        from tt_device_mcp.health.recovery import bridge_reset_call_timeout
+        from tt_device_mcp.health.recovery.stages.bridge_reset import (
+            SBR_RETRAIN_SETTLE_SEC,
+            bridge_reset_enabled,
+            reset_removed_chip,
+        )
+
+        chips = sorted(still, key=int)
+        if not bridge_reset_enabled():
+            log(f"chip(s) {chips} still missing in tt-smi's driver wait; no SBR capability here")
+            return False
+        log(
+            f"chip(s) {chips} still missing after {DRIVER_WAIT_SBR_AFTER_TRIES} rescans in tt-smi's driver wait: SBR of each one's bridge"
+        )
+        fired: list = []
+        for idx in chips:
+            if state.get("disarmed"):
+                break
+            FABRIC_DEBT.note_reset(f"bridge reset of chip {idx}")
+            CEILING.mark_owed(f"bridge reset of chip {idx}")
+            try:
+                ok = await PCI_WRITER.write(
+                    f"bridge reset of isolated chip {idx} in the driver wait",
+                    reset_removed_chip,
+                    idx,
+                    timeout=bridge_reset_call_timeout(),
+                )
+            except (PciWedged, OSError, asyncio.TimeoutError) as e:
+                log(f"SBR of chip {idx} in tt-smi's driver wait could not run ({e})")
+                health_event("reset_driver_wait_sbr", chip=idx, ok=False, error=str(e))
+                break
+            health_event("reset_driver_wait_sbr", chip=idx, ok=bool(ok))
+            if ok:
+                fired.append(idx)
+        if fired:
+            await asyncio.sleep(SBR_RETRAIN_SETTLE_SEC)
+        return bool(fired)
 
     async def _reapply_aiclk_ceiling(self, log) -> None:
         """Put an operator's AICLK ceiling back on the freshly reset chips, before the pollers
