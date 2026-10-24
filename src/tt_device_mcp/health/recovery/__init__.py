@@ -409,6 +409,9 @@ class Recovery(ABC):
         # Set fresh by every _recover_isolated_chips call; defined here so the gate can read it
         # even when no bridge rung has run on this instance yet.
         self.last_bridge_reset_reasons: dict = {}
+        # The chips the last _recover_isolated_chips call reached with a bridge write, whatever came of
+        # it (spec 04 I98): the hold's SBR record keys on this, not on the reasons above.
+        self.last_bridge_reset_fired: set = set()
 
     @abstractmethod
     def next_stage(self, ev: Evidence) -> str:
@@ -514,6 +517,7 @@ class Recovery(ABC):
         # every chip whose reset could not fire because the endpoint left the bus. Reset FRESH every
         # call (before the empty-set early return), so a later reader never sees a stale prior pass.
         self.last_bridge_reset_reasons: dict = {}
+        self.last_bridge_reset_fired: set = set()
         isolated_chips = self.deps.isolated_chips()
         # Spec 04 I69: every chip the broker removed is off the bus and un-reset, so it is a target
         # whether or not this pass was asked for it (a record reloaded after a restart, say). Left out,
@@ -618,6 +622,7 @@ class Recovery(ABC):
                         break
                     if fired:
                         reset_this_pass.add(idx)
+                        self.last_bridge_reset_fired.add(idx)
                         break
                     if fired is None:
                         # Same no-window signal as reset_chip_via_bridge's no_bridge (see below).
@@ -726,6 +731,8 @@ class Recovery(ABC):
                     metrics.stage_fired("bridge_reset", "failed")
                     wedged = True
                     break
+                if result is not None:
+                    self.last_bridge_reset_fired.add(idx)
                 if result:
                     recovered.append(idx)
                     break

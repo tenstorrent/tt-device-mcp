@@ -898,6 +898,8 @@ HOST_RUNG_FIRED = "fired"
 # Spec 04 I89: the one budget for removing the below-floor rung's link-down chips before their SBR, as
 # the dead-chip valve's (spec 03 I84).
 LINKDOWN_DETACH_TIMEOUT_SEC = 15.0
+# Spec 04 I98: how long after an SBR the hold's clock may start and still count it as this hold's.
+SBR_RECORD_ADOPT_SEC = 120
 HOST_RUNG_DEFERRED = "deferred"
 HOST_RUNG_DENIED = "denied"
 HOST_RUNG_CANNOT_RUN = (NO_HOST_RUNG, HOST_RUNG_DENIED)
@@ -935,9 +937,15 @@ class GalaxyRecovery(Recovery):
     # (episode, off-bus set) whose below-floor gate hold already ran its rescan and SBR.
     _bound: bool = False
     _below_floor_rungs_key: Optional[tuple] = None
-    # Spec 04 I89: the (episode, chips) this hold's below-floor rungs already SBR'd, so the climb's
-    # last-chance sweep knows whether its SBR is still owed (spec 04 I87).
+    # Spec 04 I98: the (episode, chips, wall time) of this hold's bridge resets: every chip a bridge
+    # write reached this hold that is still off the bus, whichever path fired it (the gate, the off-bus
+    # escalation, the bound's rungs, the last-chance sweep, the driver-wait SBR). No later path gives
+    # those chips another SBR round in the hold (spec 04 I87's owed SBR reads it too).
     _sbr_hold: Optional[tuple] = None
+
+    def __init__(self, monitor, mechanism, deps) -> None:
+        super().__init__(monitor, mechanism, deps)
+        mechanism.sbr_fired_hook = lambda chips: self._note_sbr_fired(chips)
 
     def tenant_holds(self) -> bool:
         """The forced ladders' own tenant check, alone: a running broker job or a readable tenant fd."""
@@ -1769,18 +1777,65 @@ class GalaxyRecovery(Recovery):
         return False
 
     async def _sbr(self, log) -> bool:
-        """The SBR rung (:meth:`_recover_isolated_chips`), recording in this hold's record the chips it
-        fired on, so the climb's last-chance sweep knows whether its SBR is still owed (spec 04 I87).
-        A chip the rung could not fire on (no bridge, gated, no privilege) is not recorded."""
-        targets = set(self.deps.isolated_chips()) | set(removed_chip_ids())
+        """The SBR rung (:meth:`_recover_isolated_chips`), recording in this hold's record the chips a
+        bridge write reached and that are still off the bus (spec 04 I98), and those with no bridge to
+        write to. A chip the rung declined (gated, no privilege, PCI wedged) is not recorded; one reset
+        and still off is, whatever reason the rung gave it. When every target already had its SBR round this hold, none runs: the
+        rung reports not recovered, so the caller goes on to the next rung (the mesh reset or the power
+        cycle request, as the ladder orders them)."""
+        targets = {str(c) for c in set(self.deps.isolated_chips()) | set(removed_chip_ids())}
+        since = self.deps.device_hold_episode_since() or ""
+        spent = sorted(targets & self._sbr_done(since), key=int)
+        if targets and len(spent) == len(targets):
+            log(
+                f"chip(s) {spent} already had a bridge reset this hold and are still off the bus — "
+                "no second SBR round; the next rung runs"
+            )
+            health_event("sbr_skipped_spent", chips=spent, held_since=since)
+            self.last_bridge_reset_reasons = {c: {"reason": "sbr_spent_this_hold"} for c in spent}
+            self.last_bridge_reset_fired = set()
+            return False
+        self.last_bridge_reset_reasons = {}
+        self.last_bridge_reset_fired = set()
         ok = await self._recover_isolated_chips(log)
+        fired = {str(c) for c in getattr(self, "last_bridge_reset_fired", set()) or set()}
+        # A chip with no bridge to write to is a topology fact no retry in this hold changes: its SBR
+        # round is spent too (the gated, unprivileged and wedged declines are not).
         reasons = getattr(self, "last_bridge_reset_reasons", {}) or {}
-        fired = {str(c) for c in targets if c not in reasons}
-        if fired:
-            since = self.deps.device_hold_episode_since()
-            prev = self._sbr_hold[1] if self._sbr_hold and self._sbr_hold[0] == since else frozenset()
-            self._sbr_hold = (since, prev | frozenset(fired))
+        fired |= {str(c) for c, r in reasons.items() if (r or {}).get("reason") == "no_bridge"}
+        still = {str(c) for c in set(self.deps.isolated_chips()) | set(removed_chip_ids())}
+        self._note_sbr_fired(fired, recovered=fired - still)
         return ok
+
+    def _sbr_done(self, hold_since: Optional[str]) -> frozenset:
+        """The chips this hold already SBR'd that are still off the bus (spec 04 I98). Keyed by the hold
+        episode, so a new hold starts empty. A record made before the hold's clock was set (an SBR in
+        the same pass that opened it) counts for a hold whose start is at most SBR_RECORD_ADOPT_SEC
+        after it."""
+        rec = self._sbr_hold
+        if not rec:
+            return frozenset()
+        if rec[0] == (hold_since or ""):
+            return rec[1]
+        if not rec[0] and hold_since and len(rec) > 2:
+            try:
+                start = datetime.fromisoformat(hold_since).timestamp()
+            except ValueError:
+                return frozenset()
+            if rec[2] >= start - SBR_RECORD_ADOPT_SEC:
+                return rec[1]
+        return frozenset()
+
+    def _note_sbr_fired(self, fired, recovered=()) -> None:
+        """Add to this hold's SBR record the chips a bridge write reached (spec 04 I98); drop the ones
+        it brought back, so a chip that drops again later in the hold gets its own SBR."""
+        fired = {str(c) for c in fired}
+        back = {str(c) for c in recovered}
+        since = self.deps.device_hold_episode_since() or ""
+        done = self._sbr_done(since)
+        if not fired and not (done & back):
+            return
+        self._sbr_hold = (since, frozenset((set(done) | fired) - back), time.time())
 
     def _sbr_owed(self, hold_since: Optional[str], off_ids: Optional[set], beats: Optional[dict] = None) -> list:
         """The off-bus chips the kept SBR rung could reset that this hold has not SBR'd yet (spec 04
@@ -1789,7 +1844,7 @@ class GalaxyRecovery(Recovery):
         with the gone-chip opt-in, as in the rung."""
         if not off_ids:
             return []
-        done = self._sbr_hold[1] if self._sbr_hold and self._sbr_hold[0] == hold_since else frozenset()
+        done = self._sbr_done(hold_since)
         isolated = set(self.deps.isolated_chips()) | set(removed_chip_ids())
         pci_map = self.deps.device_pci_map()
         owed = []

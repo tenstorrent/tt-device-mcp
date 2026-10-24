@@ -102,6 +102,7 @@ def _rig(
     async def sbr(log):
         order.append(f"sbr {sorted(srv.isolated_chips, key=int)}")
         srv.galaxy_recovery.last_bridge_reset_reasons = {}  # as the real rung: every target fired
+        srv.galaxy_recovery.last_bridge_reset_fired = set(srv.isolated_chips) | set(pci.removed_chip_ids())
         if sbr_heals:
             bus["beats"] = dict(ALL)
             srv.isolated_chips.clear()

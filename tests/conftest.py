@@ -618,6 +618,7 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     # A failed-launch page a test sent must not leak into the NEXT test.
     if srv.galaxy_recovery is not None:
         monkeypatch.setattr(srv.galaxy_recovery, "_cycle_launch_paged", None, raising=False)
+        monkeypatch.setattr(srv.galaxy_recovery, "_sbr_hold", None, raising=False)
     monkeypatch.setattr(srv, "_host_action_suppressed_logged", None, raising=False)
     monkeypatch.setattr(srv, "last_fabric_check_monotonic", 0.0)
     # When the last job's device work ended, the anchor the inter-job cooldown measures from.
