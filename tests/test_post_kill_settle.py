@@ -245,7 +245,7 @@ def test_the_defaults_wait_and_settle_inside_the_ladder_bound():
     10-min ladder mark, ahead of the pre-reset reserve."""
     assert constants.POST_KILL_REAP_WAIT_SEC == 30 and constants.POST_KILL_SETTLE_SEC == 10
     used = constants.POST_KILL_REAP_WAIT_SEC + constants.SURVIVOR_KILL_WAIT_SEC + constants.POST_KILL_SETTLE_SEC
-    assert used + constants.PRE_RESET_ZOMBIE_LADDER_RESERVE_SEC < 600
+    assert used + constants.pre_reset_zombie_ladder_reserve_sec(32) < 600
     assert constants.SURVIVOR_TERM_GRACE_SEC >= 10, "SIGTERM gets 10 s before SIGKILL"
 
 

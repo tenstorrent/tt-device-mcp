@@ -104,15 +104,17 @@ PRE_RESET_RESCAN_SETTLE_SEC = 1.0
 
 # A zombie the driver still names whose live threads cannot show whether they hold the device (its
 # release may be running in one of them) is rescanned until that settles, once per zombie (spec 04
-# I92). An automatic reset under a hold waits until PRE_RESET_ZOMBIE_LADDER_RESERVE_SEC before the
+# I92). An automatic reset under a hold waits until pre_reset_zombie_ladder_reserve_sec() before the
 # hold's 10-min ladder mark; any other reset (an operator's, or one with no hold clock) waits up to
 # this long: the driver-release bound. A zombie whose whole thread group exited costs no wait at all.
 PRE_RESET_ZOMBIE_WAIT_SEC = HOLDER_RELEASE_WAIT_SEC
 
-# What the hold's own ladder is expected to take on a healthy Galaxy: a mesh reset (~60 s) and its
-# full check with fabric (45-75 s). An automatic reset's zombie wait ends this long before the hold's
-# 10-min ladder mark (spec 04 I76/I92), so a zombie that never settles leaves the ladder its time.
-PRE_RESET_ZOMBIE_LADDER_RESERVE_SEC = 135
+# A healthy Galaxy mesh reset (~30-60 s), and what a full check takes per chip beside its fabric pass
+# (enumeration, ARC, eth and clock reads; generous): the parts of the zombie wait's reserve below.
+PRE_RESET_ZOMBIE_MESH_RESET_SEC = 60
+FULL_CHECK_PER_CHIP_SEC = 3.0
+# The chip count the reserve assumes when the host's own is not known yet: a full Galaxy.
+PRE_RESET_ZOMBIE_DEFAULT_CHIPS = 32
 
 # Spec 03 I89: on a multi-tray mesh the reset a job the broker stopped mid-run owes (I69) first waits,
 # at most this long, for every process of the job to be gone and for no process to hold a device node.
@@ -154,6 +156,20 @@ RESET_STREAM_KEEPALIVE_LINE = "::keepalive::"
 # a wedge COSTS: the queue is dead until it expires, and only then does recovery start. A
 # generous margin here is not caution, it is the wedge's dwell time.
 FABRIC_CHECK_TIMEOUT_SEC = 180
+
+
+def pre_reset_zombie_ladder_reserve_sec(chips: int) -> float:
+    """How long before the hold's 10-min ladder mark an automatic reset's zombie wait ends (spec 04
+    I76/I92): all that a zombie which clears on the wait's last poll still lets run, under the device
+    lock the ladder needs, before the device is back. The last poll, the reader phases the scan may
+    still run (detach, grace, release wait), the mesh reset, and its full check with fabric: the fabric
+    pass's own bound plus a per-chip read. 407 s on a 32-chip Galaxy, so the ladder is never late."""
+    scan = (
+        PRE_RESET_RESCAN_SETTLE_SEC + PRE_RESET_DETACH_TIMEOUT_SEC + PRE_RESET_TERM_GRACE_SEC + HOLDER_RELEASE_WAIT_SEC
+    )
+    full_check = FABRIC_CHECK_TIMEOUT_SEC + FULL_CHECK_PER_CHIP_SEC * max(1, int(chips))
+    return scan + PRE_RESET_ZOMBIE_MESH_RESET_SEC + full_check
+
 
 # The caller's bound on the passive eth-heartbeat read a CLEAN post-job gate runs (spec 03 I30);
 # a healthy read answers in ~1s. Matches the self-test's arming budget
