@@ -758,6 +758,91 @@ def test_an_automatic_resets_zombie_wait_ends_before_the_hold_ladder_mark(monkey
     assert srv._pre_reset_zombie_wait_sec(True, now) == PRE_RESET_ZOMBIE_WAIT_SEC
 
 
+def _hold_clock(monkeypatch, since, cooldown_until=None):
+    """The real hold_bound_deadline on a hold that began at ``since``: a 600 s ladder mark, a 32-chip host,
+    and a power-cycle cooldown running until ``cooldown_until`` (epoch), if given."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
+    monkeypatch.setattr(srv, "_hold_bound_mark_sec", lambda: 600.0)
+    monkeypatch.setattr(srv, "_startup_verify_owns_hold", lambda *a, **k: False)
+    if srv.health_monitor is None:
+        monkeypatch.setattr(srv, "health_monitor", SimpleNamespace(expected=lambda default=0: 32))
+    else:
+        monkeypatch.setattr(srv.health_monitor, "expected", lambda default=0: 32)
+    state = {"until": cooldown_until, "cause": "boot"} if cooldown_until else None
+    monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_cooldown_state", state)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reset_age", [0, 60, 150])
+async def test_a_zombie_cleared_on_the_last_poll_has_its_reset_and_full_check_done_before_the_ladder_mark(
+    monkeypatch, fresh_zombies, reset_age
+):
+    """Spec 04 I76/I92: an automatic reset at hold age ``reset_age`` waits on a zombie that clears only on
+    the wait's last poll. The mesh reset (~60 s on a Galaxy) and the full check with fabric after it (the
+    fabric pass's 180 s bound + 3 s a chip, 32 chips) hold the device lock the 10-min ladder needs: on the
+    simulated clock they still end before hold_bound_deadline, so the ladder is never late."""
+    from datetime import datetime, timedelta
+
+    from tt_device_mcp.constants import FABRIC_CHECK_TIMEOUT_SEC
+
+    since = datetime(2026, 1, 1, 12, 0, 0)
+    _hold_clock(monkeypatch, since)
+    wait = srv._pre_reset_zombie_wait_sec(True, since + timedelta(seconds=reset_age))
+    assert wait > 0, "a reset this early in the hold still waits for the zombie"
+    box = _Box(monkeypatch, [])
+    calls = _scans(monkeypatch, _gap(4303))
+    clock = lambda: reset_age + float(len(calls))  # noqa: E731 - hold age: one second per scan
+    # The first scan and the one rescan come before the wait; the zombie clears on its last poll.
+    result = await box.run(
+        tenants_block=True,
+        rescan_settle_sec=0,
+        zombie_wait_sec=wait,
+        clock=clock,
+        zombie_of=lambda pid: _zombie("exited" if len(calls) - 2 >= wait else "unknown", pid),
+        users_outside=lambda named: ([], True),
+    )
+    assert result.outcome == "clear" and result.gaps == [] and result.zombies[0]["waited_sec"] >= wait
+    reset_and_full_check = 60 + FABRIC_CHECK_TIMEOUT_SEC + 3 * 32
+    done = since + timedelta(seconds=clock() + reset_and_full_check)
+    assert done <= srv.hold_bound_deadline(done), "the reset and full check ran past the 10-min ladder mark"
+
+
+@pytest.mark.asyncio
+async def test_a_hold_begun_in_a_power_cycle_cooldown_ends_the_wait_one_reserve_before_the_ladder_mark(
+    monkeypatch, clear_job_state
+):
+    """Spec 04 I76/I92: a hold that began in a boot or post-power-cycle cooldown running past its 10-min
+    mark. hold_bound_deadline is the cooldown's end, but only the power cycle waits for it: the ladder
+    still runs at the mark. So the zombie wait ends one reserve before the mark, not before the
+    cooldown-extended deadline, and the ladder fires at the mark with the cooldown still running."""
+    from datetime import datetime, timedelta
+
+    from tests.test_device_safety import _arm_fabric_only_deadline_hold
+    from tt_device_mcp.constants import pre_reset_zombie_ladder_reserve_sec
+    from tt_device_mcp.health.recovery import OUTCOME_TERMINAL
+
+    escalations, _alerts, _events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why="eth_frozen", detail="gate/post-job: eth/fabric fault on a present mesh", age_min=10.1
+    )
+    since = datetime.fromisoformat(srv.device_hold_episode_since)
+    cooldown_end = since + timedelta(seconds=900)
+    _hold_clock(monkeypatch, since, cooldown_until=cooldown_end.timestamp())
+    reset_at = since + timedelta(seconds=60)
+    assert srv.hold_bound_deadline(reset_at) == cooldown_end, "the cooldown extends the I76 deadline"
+    reserve = pre_reset_zombie_ladder_reserve_sec(32)
+    assert srv._pre_reset_zombie_wait_sec(True, reset_at) == 600 - 60 - reserve
+
+    async def failed_ladder(kind, indices, expected, log, **_):
+        escalations.append(kind)
+        return OUTCOME_TERMINAL
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", failed_ladder)
+    await srv._force_escalate_stuck_hold()
+    assert escalations == ["present-forced"], "the ladder runs at the mark inside the cooldown"
+
+
 @pytest.mark.asyncio
 async def test_the_scan_event_names_the_zombie_its_parent_and_its_threads(monkeypatch, fresh_zombies):
     """The pre_reset_holder_scan event shows each zombie gap's parent (pid, comm, state) and thread count,

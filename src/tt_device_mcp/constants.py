@@ -150,9 +150,12 @@ def pre_reset_zombie_ladder_reserve_sec(chips: int) -> float:
     lock the ladder needs, before the device is back. The last poll, the reader phases the scan may
     still run (detach, grace, release wait), the mesh reset, and its full check with fabric: the fabric
     pass's own bound plus a per-chip read. 407 s on a 32-chip Galaxy, so the ladder is never late."""
-    scan = PRE_RESET_RESCAN_SETTLE_SEC + PRE_RESET_DETACH_TIMEOUT_SEC + PRE_RESET_TERM_GRACE_SEC + HOLDER_RELEASE_WAIT_SEC
+    scan = (
+        PRE_RESET_RESCAN_SETTLE_SEC + PRE_RESET_DETACH_TIMEOUT_SEC + PRE_RESET_TERM_GRACE_SEC + HOLDER_RELEASE_WAIT_SEC
+    )
     full_check = FABRIC_CHECK_TIMEOUT_SEC + FULL_CHECK_PER_CHIP_SEC * max(1, int(chips))
     return scan + PRE_RESET_ZOMBIE_MESH_RESET_SEC + full_check
+
 
 # The caller's bound on the passive eth-heartbeat read a CLEAN post-job gate runs (spec 03 I30);
 # a healthy read answers in ~1s. Matches the self-test's arming budget
