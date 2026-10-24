@@ -91,7 +91,6 @@ from tt_device_mcp.constants import step_deadline_sec as _shared_step_deadline_s
 
 # Device node directory; module-level so tests can point it at a fixture dir.
 TT_DEV_DIR = "/dev/tenstorrent"
-from tt_device_mcp.health.recovery.galaxy import _whole_trays_off
 from tt_device_mcp.device_holders import (
     MIN_TENANT_UID,  # noqa: F401 - re-exported: tests read srv.MIN_TENANT_UID
     HolderScan,
@@ -4838,16 +4837,23 @@ def _eth_timeout_reset_shape(evidence: dict) -> bool:
     )
 
 
-def _owe_kill_reset(why: str, job: Optional[dict] = None) -> None:
-    """Spec 03 I69: a job the broker stopped mid-run owes the mesh one reset, then the full check.
-    ``job`` names the stopped job's processes for the wait before that reset (I89)."""
+def _owe_kill_reset(why: str) -> None:
+    """Spec 03 I69: a job the broker stopped mid-run owes the mesh one reset, then the full check."""
     global _kill_reset_owed, _kill_reset_owed_at, _kill_reset_job
     _kill_reset_owed = why
     _kill_reset_owed_at = time.monotonic()
-    _kill_reset_job = dict(job or {})
+    _kill_reset_job = {}
     if logger:
         logger.info(f"CLEAN-GATE {why}: the mesh owes one reset, then the full check, before release")
     health_event("kill_reset_owed", why=why)
+
+
+def _note_kill_reset_job(job: dict) -> None:
+    """Spec 03 I89: name the stopped job's processes behind the debt just owed, so the reset can wait
+    for them to be gone."""
+    global _kill_reset_job
+    if _kill_reset_owed:
+        _kill_reset_job = dict(job)
 
 
 def _clear_kill_reset_debt() -> None:
@@ -4956,10 +4962,21 @@ async def _post_kill_quiesce(expected: int, log) -> dict:
     off = offbus_chip_ids(beats, expected)
     out["chips"] = {str(i): ("off" if str(i) in off else "ok") for i in range(expected)}
     out["off"] = sorted(off, key=lambda c: int(c) if c.isdigit() else 0)
-    tray_map = galaxy_recovery._tray_map_now() if galaxy_recovery is not None else None
-    out["whole_trays"] = _whole_trays_off(off, expected, tray_map) if off else []
+    out["whole_trays"] = _post_kill_whole_trays(off, expected) if off else []
     out["since_exit_sec"] = round(time.monotonic() - last_exit, 1)
     return out
+
+
+def _post_kill_whole_trays(off: set, expected: int) -> list:
+    """Spec 03 I89: the trays every chip of which read off after the settle, by the ladder's tray map."""
+    tray_map = galaxy_recovery._tray_map_now() if galaxy_recovery is not None else None
+    if not tray_map:
+        return []
+    try:
+        ids = {int(c) for c in off}
+    except (TypeError, ValueError):
+        return []
+    return sorted(t for t, chips in tray_map.items() if chips and {int(c) for c in chips} <= ids)
 
 
 def _post_kill_route(q: dict, expected: int, kill_reset_due: bool) -> str:
@@ -14293,13 +14310,15 @@ export {JOB_TAG_ENV}={job_tag}
                             f"(max {max(left_busy.values())} MHz)"
                             if left_busy and job.status not in (JobStatus.TIMEOUT, JobStatus.HUNG)
                             else ""
-                        ),
-                        job={
+                        )
+                    )
+                    _note_kill_reset_job(
+                        {
                             "scope": job_scope_unit(job_id) if privsep_prefix else None,
                             "tag": job_tag,
                             "survivors": [(s.pid, s.starttime) for s in survivors if s.starttime],
                             "exited_at": time.monotonic(),
-                        },
+                        }
                     )
                 request_killed_job_ids.discard(job_id)
                 preempt_forced_job_ids.discard(job_id)
