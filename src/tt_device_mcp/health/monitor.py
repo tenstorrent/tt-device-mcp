@@ -243,6 +243,14 @@ def _env_int(name: str, default: int, floor: int) -> int:
         return default
 
 
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, OSError):
+        return False
+    return True
+
+
 def _verdict_label(ok: Optional[bool]) -> str:
     """The tri-state ``(ok, unhealthy, could-not-check)`` every probe here returns, in
     :data:`metrics.VERDICTS` terms."""
@@ -1161,6 +1169,39 @@ class HealthMonitor:
         pass is owed before any release (04 I32)."""
         self._fabric_killed = reason or "dead-chip isolation"
         FABRIC_DEBT.note_fabric_killed(f"fabric check killed ({self._fabric_killed})")
+
+    async def stop_check_readers(self, reason: str, grace_sec: float) -> list:
+        """Spec 04 I97: end the full check's own readers at its deadline. SIGTERM the process group of
+        the fabric pass, the tt-smi snapshot and the AICLK ceiling, SIGKILL any group still alive
+        ``grace_sec`` later, and mark each killed check no verdict (never a pass). Returns the pids
+        signalled. Never raises."""
+        stopped = []
+        for proc, note in (
+            (self.fabric_check_proc, self.note_fabric_check_killed),
+            (self.snapshot_proc, self.note_snapshot_killed),
+            (CEILING.proc, None),
+        ):
+            if proc is None or getattr(proc, "returncode", None) is not None:
+                continue
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                continue
+            stopped.append(proc.pid)
+            if note is not None:
+                note(reason)
+        loop = asyncio.get_running_loop()
+        end = loop.time() + grace_sec
+        alive = list(stopped)
+        while alive and loop.time() < end:
+            await asyncio.sleep(0.2)
+            alive = [pid for pid in alive if _group_alive(pid)]
+        for pid in alive:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+        return stopped
 
     def _snapshot_no_verdict(self) -> str:
         why, self._snapshot_killed = self._snapshot_killed, ""
