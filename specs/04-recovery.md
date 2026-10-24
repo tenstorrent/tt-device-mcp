@@ -2003,7 +2003,15 @@ each rung fires only when the gentler one failed or cannot apply.
   is not class A or C (I37) and this hold has not SBR'd those chips (an isolated or removed chip, a node-present chip whose link reads down or whose heartbeat reads
   all-ones, or a gone chip with the opt-in), with the rescan and the full check with fabric after it; only a pass lifts, else the power
   cycle follows (`reset_rung_skipped_failed_unchanged` carries `sbr_owed`). The climb logs that every
-  rung below the host pair has run only when no such SBR is owed. A drop at or above the floor, all
+  rung below the host pair has run only when no such SBR is owed. The same SBR is owed when the mesh reset
+  itself dropped the chip (off before [], off after [n]: a regressed reset, I31) or no reset failed at
+  all. Below the floor and for neither class A nor C, the last-chance sweep first removes each off-bus
+  chip whose node is still present and whose link reads down or heartbeat reads all-ones (readers
+  stopped first, as at the gate), so its SBR runs even when nothing was isolated before. And before the
+  host rung, whether the sweep ran, was skipped or was spent, any such chip this hold has not SBR'd (one
+  the dead-chip valve isolated during the sweep's settle, say) gets the rescan, its remove and the SBR,
+  then the full check with fabric (`host_rung_sbr_owed`); only a pass lifts, else the power cycle. One
+  SBR per chip per hold episode. A drop at or above the floor, all
   chips off included, owes no SBR: it stops no reader, removes no chip and goes straight to the power
   cycle, never nibbled at with per-chip bridge resets. A pass lifts the hold; a failure requests the power cycle (I76), or pages and
   holds when none is opted in (I31). An enumerated chip is still not SBR'd at the bound; the mesh
@@ -2022,6 +2030,7 @@ each rung fires only when the gentler one failed or cannot apply.
   | B1 at the 10-min bound, bridged chips | rescan (about 3 s settle) + SBR (about 10-20 s) ahead of the one mesh reset and its full check (or of the power cycle when this hold's mesh reset is spent, I87), then the power cycle: about 15-30 s more; an SBR that brings every chip back lifts on the full check with no mesh reset (I86) |
   | B1 at the 10-min bound, a gone chip without the opt-in | rescan (about 3 s settle) only, ahead of the mesh reset or power cycle; no SBR is tried (no bridge) and no no-op bridge rung follows at later gate passes |
   | B1 forced run below the bound after a mesh reset failed on the same chips | the host rung fires at once (I58), after the sweep's SBR when this hold has not SBR'd those chips (below the floor only, never class A or C): about 15-60 s more; a drop at or above the floor, all chips off (C) or a whole tray (A) gets no SBR and no time added |
+  | B1 regressed mesh reset (off before [], after [n]) or a valve-isolated chip, node present, below the floor | reader stop + PCI remove (at most 15 s) + SBR (about 10-20 s) + full check with fabric before the host rung: a pass lifts with no power cycle; else about 15-60 s more before the power cycle, well inside the 15 min B1 budget; class A and C unchanged |
   | B1 single chip off the bus with its node present, link down or heartbeat all-ones | reader stop + PCI remove (at most 15 s) + SBR (about 10-20 s) + full check at the gate's first pass, instead of only a rescan and then the mesh reset and power cycle; about 15-60 s more when it does not heal, well inside the B1 budget |
   | B1 at the bound inside a power-cycle cooldown | ladder at the bound, power cycle at the cooldown's end (I65); budget exception unchanged |
   | Whole tray (A), `TRAY_DOWN_NO_WINDOW`, at or above the floor | unchanged (I37, I27) |
