@@ -20,6 +20,7 @@ Claude Configuration:
 
 import argparse
 import asyncio
+import contextvars
 import errno
 import fcntl
 import functools
@@ -53,7 +54,7 @@ from pydantic import AliasChoices, BaseModel, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 
-from tt_device_mcp import __version__, aio, alert, device_activity, metrics, privileges, telemetry
+from tt_device_mcp import __version__, aio, alert, device_activity, loop_watch, metrics, privileges, telemetry
 from tt_device_mcp.constants import (
     DEFAULT_PORT,
     DEVICE_RESET_DETAIL_PREFIX,
@@ -7959,6 +7960,74 @@ def _decision_heartbeats() -> dict:
     return read_heartbeats()
 
 
+# Spec 03 I87: the status surfaces (/health, queue status) read the chips' heartbeats off the event
+# loop. Each read is a PCIe read of the chip; one that is slow to answer (AER errors, a chip leaving
+# the bus) used to block every surface of the broker for as long as the reads took, since /health
+# made several full passes per call on the loop itself. The handler reads once in a worker thread,
+# at most one such read at a time, waits STATUS_CHIP_READ_WAIT_SEC for it and otherwise answers from
+# the last completed read, saying how old it is. Decision reads (_decision_heartbeats) are unchanged.
+STATUS_CHIP_READ_WAIT_SEC = 0.5
+# A status read slower than this is logged: the chips are slow to answer.
+STATUS_CHIP_READ_SLOW_SEC = 2.0
+_status_beats: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar("_status_beats", default=None)
+_status_read: Optional[tuple] = None  # (loop, future) of the status read in flight
+_status_read_last: Optional[tuple[float, dict]] = None  # (wall time, beats) of the last completed one
+
+
+def _status_heartbeats() -> dict:
+    """The heartbeats a status view reads: the ones its async handler read off the loop for this
+    call (spec 03 I87), or a direct read where no handler did (a sync caller, a test)."""
+    pre = _status_beats.get()
+    return pre if pre is not None else read_heartbeats()
+
+
+def _status_chip_read() -> dict:
+    """One status read, in a worker thread. Reads nothing while a reset step owns the chips (I66):
+    the status views do not use the beats then."""
+    global _status_read_last
+    if chip_state.recovering():
+        return _status_read_last[1] if _status_read_last else {}
+    started = time.monotonic()
+    beats = read_heartbeats()
+    took = time.monotonic() - started
+    _status_read_last = (time.time(), beats)
+    if took >= STATUS_CHIP_READ_SLOW_SEC and logger:
+        logger.warning(f"HEALTH status heartbeat read took {took:.1f}s ({len(beats)} chip(s)): chips slow to answer")
+    return beats
+
+
+async def _status_beats_now() -> tuple[dict, Optional[float]]:
+    """``(beats, stale_age_sec)`` for one status call, never blocking the loop. ``stale_age_sec`` is
+    None when the beats are this call's own read; else the age of the last completed read served in
+    its place. With no completed read yet, it waits for the one in flight (in its thread)."""
+    global _status_read
+    loop = asyncio.get_running_loop()
+    if _status_read is None or _status_read[0] is not loop or _status_read[1].done():
+        _status_read = (loop, asyncio.ensure_future(asyncio.to_thread(_status_chip_read)))
+    fut = _status_read[1]
+    try:
+        return await aio.wait_for(asyncio.shield(fut), STATUS_CHIP_READ_WAIT_SEC), None
+    except asyncio.TimeoutError:
+        pass
+    if _status_read_last is None:
+        return await asyncio.shield(fut), None
+    at, beats = _status_read_last
+    return beats, round(max(0.0, time.time() - at), 1)
+
+
+async def _status_view(build: Callable[[], dict]) -> dict:
+    """``build()`` on the loop with this call's heartbeats read off it (spec 03 I87)."""
+    beats, stale = await _status_beats_now()
+    token = _status_beats.set(beats)
+    try:
+        payload = build()
+    finally:
+        _status_beats.reset(token)
+    if stale is not None:
+        payload["chip_read_stale_sec"] = stale
+    return payload
+
+
 def _startup_pci_map() -> dict:
     """``{chip index: PCI address}`` for every chip with a sysfs class node. Built from the
     enumeration, not from heartbeat reads: a chip whose heartbeat cannot be read (e.g. after a
@@ -7983,7 +8052,7 @@ def _device_liveness_reason() -> str:
         # A reset or recovery step owns the chips: they are off the bus by design and no status
         # query reads them (spec 03 I66). Not fit for a tenant until the step and its verify pass.
         return "a device reset or recovery step is still running on the chips"
-    beats = read_heartbeats()
+    beats = _status_heartbeats()
     if not beats:
         listed = sysfs_chip_ids()
         if listed:
@@ -8037,7 +8106,7 @@ def _live_offbus_state() -> dict:
         out["resetting_chips"] = [str(i) for i in range(expected)]
         out["expected_chips"] = expected
         return out
-    beats = read_heartbeats()
+    beats = _status_heartbeats()
     presence = enodata_presence(beats)
     not_ready = arc_not_ready_chips(beats)
     off = offbus_chip_ids(beats, expected, not_ready)
@@ -8361,7 +8430,7 @@ def _hold_report(now: Optional[datetime] = None) -> dict:
     hold_class = hold_report.CLASS_AC_NEEDED if ac_needed else None
     trays = None
     if expected > 0:
-        beats = read_heartbeats()
+        beats = _status_heartbeats()
         not_ready = arc_not_ready_chips(beats)
         off_ids = {int(i) for i in offbus_chip_ids(beats, expected, not_ready)}
         # The ladder's own presence read (galaxy _presence_read): a chip off the bus by the heartbeat,
@@ -15292,7 +15361,7 @@ def create_mcp_server() -> MCPServer:
     @mcp.custom_route("/health", methods=["GET"])
     async def health_check(_request: Request) -> JSONResponse:
         """Health check endpoint."""
-        return JSONResponse(_health_payload())
+        return JSONResponse(await _status_view(_health_payload))
 
     # ============== REST API for CLI ==============
 
@@ -15336,7 +15405,7 @@ def create_mcp_server() -> MCPServer:
     @mcp.custom_route("/api/tt_device_queue_status", methods=["POST"])
     async def api_queue_status(request: Request) -> JSONResponse:
         """REST API: Get queue status."""
-        return JSONResponse(_get_queue_status())
+        return JSONResponse(await _status_view(_get_queue_status))
 
     @mcp.custom_route("/api/tt_device_reset", methods=["POST"])
     async def api_reset(request: Request) -> JSONResponse:
@@ -16640,7 +16709,7 @@ def create_mcp_server() -> MCPServer:
         if logger:
             logger.info("TOOL queue_status")
 
-        result = _get_queue_status()
+        result = await _status_view(_get_queue_status)
 
         if logger:
             logger.info(
@@ -17336,6 +17405,7 @@ async def run_transports(mcp: MCPServer, port: int, socket_path: str | None, ser
     # the reset-scope wait below.
     global job_runner_task
     _ensure_async_primitives()
+    loop_watch.start(logger)  # spec 03 I87: a blocked event loop names the call that blocks it
     seed_job_counter()  # ids continue across a restart instead of running backwards
     ensure_job_exit_dir()  # jobs record their own exit status here; see _monitor_readopted_scope
 
