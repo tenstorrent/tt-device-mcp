@@ -17316,17 +17316,20 @@ def create_mcp_server() -> MCPServer:
 
         Duration: about 2 minutes on a healthy Galaxy (reset ~60s + fabric pass
         45-75s), about 4 minutes when the first fabric pass finds no trained link
-        and is re-checked after a 60s wait. Worst case at the defaults: about 26
-        minutes (poller stop and restart up to 120s + reset 600s + PCI rescan 3s
-        + a first verify pass of up to 361s + the 60s wait + a last verify pass
-        of up to 436s, which adds the 75s kill of a timed-out check). Only the
-        last pass can time out: a re-check follows a pass that finished. Each
-        extra TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES adds a wait and a pass;
+        and is re-checked after a 60s wait. Worst case at the defaults: about 30
+        minutes (BMC check 10s + pre-reset holder clear up to 71s + poller stop
+        and restart up to 120s + reset 600s + post-reset reader cut up to 105s
+        + PCI rescan 3s + clock-cap re-apply up to 16s + a first verify pass of
+        up to 361s + the 60s wait + a last verify pass of up to 436s, which
+        adds the 75s kill of a timed-out check). Only the last pass can time
+        out: a re-check follows a pass that finished. Each extra
+        TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES adds a wait and a pass;
         TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC lengthens each wait and each
-        service in TT_DEVICE_MCP_POLLER_SERVICES adds up to 60s. Not counted:
-        stopping a running job first (60s grace, then the kill) and waiting for
-        a broker operation already holding the device; the bound also assumes
-        a killed process exits. The call sends nothing until it ends; the
+        service in TT_DEVICE_MCP_POLLER_SERVICES adds up to 90s. Not counted:
+        stopping a running job first (60s grace, the stop, then up to 15s for
+        its record), waiting for a broker operation already holding the device,
+        the /proc holder scans and the PCI writes themselves; the bound also
+        assumes a killed process exits. The call sends nothing until it ends; the
         connection stays open on keepalives, so the stdio shim's 300s read
         timeout does not cut it, but a client with its own tool-call timeout
         below this may give up while the reset goes on.
