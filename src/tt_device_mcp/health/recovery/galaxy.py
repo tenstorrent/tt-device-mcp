@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from tt_device_mcp import alert, metrics
+from tt_device_mcp.constants import ETH_POST_JOB_TIMEOUT_SEC, FABRIC_CHECK_TIMEOUT_SEC
 from tt_device_mcp.device_holders import discount_broker_internal, holder_comm, is_tenant, username_for_uid
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
@@ -814,9 +815,26 @@ TRAY_DOWN_RESCAN_SETTLE_SEC = 3
 
 # Spec 04 I97: the budget for one Galaxy mesh reset of a whole mesh (about 35 s seen) and the settle
 # after it. Every chip is already on the bus and tt-smi re-inits the boards itself, so the settle is
-# short. The I97 reset starts only when the hold age plus both still ends before the 10-min bound.
+# short. The reset's worst case is a tt-smi that gives up at its 100 s driver wait (about 263 s seen),
+# and the full check after it is bounded by its snapshot (90 s), fabric and eth-heartbeat timeouts. The
+# I97 reset starts only when the worst of both paths still requests the power cycle by the 10-min bound.
 MESH_RESET_BEFORE_HOST_RUNG_SEC = 60
 MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC = 10
+MESH_RESET_BEFORE_HOST_RUNG_GAVE_UP_SEC = 300
+MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC = 90 + FABRIC_CHECK_TIMEOUT_SEC + int(ETH_POST_JOB_TIMEOUT_SEC)
+
+
+def _mesh_reset_before_host_rung_cost() -> int:
+    """Spec 04 I97: the most hold time the reset can take before the power cycle is requested: a reset
+    that gives up (no check follows it), or one inside its budget, the settle and the full check."""
+    return max(
+        MESH_RESET_BEFORE_HOST_RUNG_GAVE_UP_SEC,
+        MESH_RESET_BEFORE_HOST_RUNG_SEC
+        + MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC
+        + MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC,
+    )
+
+
 TRAY_DOWN_ONSET = "TRAY_DOWN"
 
 
@@ -3330,10 +3348,14 @@ class GalaxyRecovery(Recovery):
         to the power cycle at once.
 
         Runs only when all of: a Galaxy ``-glx_reset`` on more than one chip; the hold clock known and
-        this episode's I97 reset not spent; the reset can end before the 10-min bound (I76: the hold
-        age plus MESH_RESET_BEFORE_HOST_RUNG_SEC and the settle is within it); every expected chip on
+        this episode's I97 reset not spent; the power cycle can still be requested by the 10-min bound
+        whatever the reset does (I76: the hold age plus :func:`_mesh_reset_before_host_rung_cost` is
+        within it); every expected chip on
         the bus, none isolated or removed; the heartbeat still reads at least one chip ARC-not-ready,
-        or the check's heartbeat probe failed; no reset cycling in its scope; and no tenant."""
+        or the check's heartbeat probe failed; no reset cycling in its scope; and no tenant.
+
+        After the reset, the full check runs only when the reset did not give up at its driver wait and
+        the check can still end by the bound; otherwise the caller power-cycles at once."""
         argv = self.reset_argv(list(range(expected)))
         hold_since = self.deps.device_hold_episode_since() or ""
         age = _hold_age_sec(hold_since)
@@ -3349,9 +3371,11 @@ class GalaxyRecovery(Recovery):
             return skip("no hold clock")
         if self._whole_mesh_reset_spent == hold_since:
             return skip("already ran in this hold")
-        cost = MESH_RESET_BEFORE_HOST_RUNG_SEC + MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC
-        if age + cost > _stuck_hold_ceiling_sec():
-            return skip(f"the hold is {int(age)}s old; the reset would run past the {_stuck_hold_ceiling_sec()}s bound")
+        if age + _mesh_reset_before_host_rung_cost() > _stuck_hold_ceiling_sec():
+            return skip(
+                f"the hold is {int(age)}s old; a reset that gives up or its full check would run past the "
+                f"{_stuck_hold_ceiling_sec()}s bound"
+            )
         try:
             beats = await asyncio.to_thread(self.deps.read_heartbeats)
             whole = not (
@@ -3387,6 +3411,18 @@ class GalaxyRecovery(Recovery):
         )
         if not await self._issue_all_resets_back_to_back([], expected, log, do_sbr=False):
             log("the mesh reset before the host rung was refused — the power cycle decides")
+            return False
+        late = (_hold_age_sec(hold_since) or age) + MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC
+        late += MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC
+        no_check = ""
+        if self.mechanism.last_reset_driver_wait_failed:
+            no_check = "tt-smi gave up at its driver wait again"
+        elif late > _stuck_hold_ceiling_sec():
+            no_check = f"the full check could run past the {_stuck_hold_ceiling_sec()}s bound"
+        if no_check:
+            pcie_guard.end_offbus_reset()
+            log(f"no full check after the mesh reset of the whole mesh: {no_check} — the power cycle now")
+            health_event("whole_mesh_reset_before_host_rung_unverified", phase=phase, reason=no_check)
             return False
         healthy, evidence = await self._settle_and_verify_sweep(
             expected,
