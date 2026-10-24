@@ -1646,6 +1646,20 @@ cooldown (spec 04 I65) holds longer.
   are unchanged and still read fresh. A watchdog logs `event loop stalled ... blocked in: <stack>`
   once the loop has not run for `LOOP_LAG_WARN_SEC` (2 s), and `event loop was blocked for Ns` when
   it resumes. No hold, lift, ladder or power-cycle path changes.
+- **I88 — A running tenant job's own off-bus reading is not a hold.** While a tenant job is
+  RUNNING, no broker op runs and no hold episode is open, a degraded reading that comes only from
+  the live probe (`_device_liveness_reason`: a chip reading all-ones, a short chip count, an empty
+  sysfs) is reported in `/health` `tenant_job_degraded` (`{job_id, reason, since}`; `since` is when
+  this reading was first seen, cleared once it clears, the job ends or an episode opens; `null`
+  otherwise). It sets neither `held` nor `held_since`, `status` stays `ok`, and the jobs list shows
+  no HOLD row: a job that resets the whole mesh itself takes every chip off the bus for a few
+  seconds, and that is the job's own work. `device_degraded` and the live chip fields still show
+  the reading. Any in-memory verdict (the FSM off HEALTHY, a reported runtime fault) or an open
+  episode reads as held exactly as before. Reporting only (`server._tenant_job_reading`): when a
+  hold opens, lifts or escalates is unchanged. A chip still off when the job ends is held as
+  before, the post-job gate opens the episode, and only a just-passed full check with fabric on all
+  cabled links lifts it (I78); the 10-min ladder and then the power cycle stay its way out
+  (spec 04 I76).
 
 ## Interfaces
 
@@ -1679,7 +1693,8 @@ subsystem through the root:
   device is HELD: degraded, refused to tenants, no recovery op running, or an op running inside an
   open hold, I80), `startup_verify` (non-null while that hold is only a startup hold behind a live
   re-adopted job or its startup gate, I76), `fsm_state`, `fsm_why`,
-  `held`/`held_since`/`held_reason`/`held_age_sec`, `device_degraded`, queue counts, version.
+  `held`/`held_since`/`held_reason`/`held_age_sec`, `tenant_job_degraded` (a running tenant job's
+  own off-bus reading with no hold open, not a hold, I88), `device_degraded`, queue counts, version.
   `held_reason` and `fsm_why` keep the reason the hold opened with (`held_reason` plus I85's
   bracketed escalation line, which `hold_escalation` gives as fields); the live fields say where it
   stands now, read fresh from sysfs on every call with no device touch: `isolated_chips` (always),
@@ -2350,6 +2365,7 @@ refuses.
 | I85 | `tests/test_hold_escalation_status.py::test_a_fresh_hold_names_the_watchdogs_own_next_rung`, `tests/test_hold_escalation_status.py::test_the_ten_minute_mark_and_the_cooldown_come_from_the_broker_clocks`, `tests/test_hold_escalation_status.py::test_each_logged_step_moves_the_stage`, `tests/test_hold_escalation_status.py::test_a_power_cycle_request_is_read_from_disk_and_survives_a_restart`, `tests/test_hold_escalation_status.py::test_another_episodes_power_cycle_is_not_this_ones`, `tests/test_hold_escalation_status.py::test_the_bound_ladder_ran_before_a_restart`, `tests/test_hold_escalation_status.py::test_a_running_ladder_and_a_tenant_say_so`, `tests/test_hold_escalation_status.py::test_reading_it_moves_no_clock`, `tests/test_hold_escalation_status.py::test_the_hold_row_keeps_its_name`, `tests/test_hold_escalation_status.py::test_a_new_episode_and_the_release_clear_the_stage`, `tests/test_hold_escalation_status.py::test_not_held_reports_no_escalation`, `tests/test_hold_escalation_status.py::test_a_forced_pass_updates_the_stage_and_keeps_the_hold` |
 | I86 | `tests/test_offbus_abort_readers.py::test_link_signals_counts_advisory_nonfatal_and_names_each_chip_path`, `tests/test_offbus_abort_readers.py::test_an_aer_rise_on_the_chips_path_confirms_on_the_first_all_ones_sample`, `tests/test_offbus_abort_readers.py::test_no_false_trigger_from_another_path_a_stale_rise_aer_alone_or_a_reset`, `tests/test_offbus_abort_readers.py::test_drop_during_the_fabric_check_stops_it_before_the_remove_and_keeps_the_hold`, `tests/test_offbus_abort_readers.py::test_drop_during_a_hold_escalation_check_stops_it_and_the_hold_stays`, `tests/test_offbus_abort_readers.py::test_drop_during_the_aiclk_ceiling_stops_it_before_the_remove`, `tests/test_offbus_abort_readers.py::test_a_finished_reader_is_not_signalled`, `tests/test_offbus_abort_readers.py::test_after_the_abort_only_a_fresh_full_fabric_pass_lets_the_hold_lift`, `tests/test_offbus_abort_readers.py::test_an_aer_rise_just_after_a_reset_corroborates_no_first_sample`, `tests/test_offbus_abort_readers.py::test_drop_during_the_snapshot_stops_it_before_the_remove_and_kills_it_after`, `tests/test_offbus_abort_readers.py::test_drop_during_the_eth_selftest_stops_it_before_the_remove_and_kills_it_after`, `tests/test_offbus_abort_readers.py::test_finished_snapshot_and_eth_selftest_are_not_signalled`, `tests/test_offbus_abort_readers.py::test_a_snapshot_the_valve_stopped_mid_run_gives_no_pass`, `tests/test_offbus_abort_readers.py::test_the_snapshot_runs_tracked_in_its_own_session_and_a_timeout_ends_it`, `tests/test_offbus_abort_readers.py::test_a_live_snapshot_is_tracked_so_the_valve_stops_and_kills_it`, `tests/test_offbus_abort_readers.py::test_an_eth_selftest_the_valve_stopped_mid_run_arms_nothing` |
 | I87 | `tests/test_loop_stall.py::test_health_answers_within_a_second_while_the_chip_read_hangs`, `tests/test_loop_stall.py::test_the_first_read_waits_in_its_thread_not_on_the_loop`, `tests/test_loop_stall.py::test_concurrent_status_calls_share_one_read`, `tests/test_loop_stall.py::test_no_status_read_while_a_reset_step_owns_the_chips`, `tests/test_loop_stall.py::test_the_status_routes_build_their_payload_off_the_loop_read`, `tests/test_loop_stall.py::test_a_blocked_loop_is_logged_with_the_call_that_blocks_it`, `tests/test_loop_stall.py::test_a_free_loop_logs_nothing` |
+| I88 | `tests/test_health_tenant_job_degraded.py::test_a_running_jobs_own_off_bus_reading_is_not_a_hold`, `tests/test_health_tenant_job_degraded.py::test_a_chip_still_off_when_the_job_ends_opens_the_hold_and_only_a_full_check_lifts_it`, `tests/test_health_tenant_job_degraded.py::test_an_open_hold_episode_still_reads_held_while_a_job_runs`, `tests/test_health_tenant_job_degraded.py::test_an_in_memory_verdict_under_a_running_job_still_reads_held` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
