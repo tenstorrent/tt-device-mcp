@@ -123,7 +123,9 @@ async def test_a_zombie_holder_whose_threads_all_exited_does_not_block(monkeypat
     monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 for i in range(CHIPS)})
     _holders(monkeypatch, FAKE_PID)
     monkeypatch.setattr(
-        srv, "zombie_info", lambda pid: ZombieInfo(pid, "Z", 1, [], 1, "python3", "S", None) if pid == FAKE_PID else None
+        srv,
+        "zombie_info",
+        lambda pid: ZombieInfo(pid, "Z", 1, [], 1, "python3", "S", None) if pid == FAKE_PID else None,
     )
     q = await srv._post_kill_quiesce(CHIPS, _Log())
     assert q["holders"] == [] and q["reap_wait_sec"] < 1.0, q
@@ -152,7 +154,9 @@ async def test_a_live_holder_past_the_bound_is_never_signalled(monkeypatch):
     _holders(monkeypatch, FAKE_PID)
     sent = []
     real_kill = os.kill
-    monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append((pid, sig)) if pid == FAKE_PID else real_kill(pid, sig))
+    monkeypatch.setattr(
+        os, "kill", lambda pid, sig: sent.append((pid, sig)) if pid == FAKE_PID else real_kill(pid, sig)
+    )
     q = await srv._post_kill_quiesce(CHIPS, _Log())
     assert sent == [] and q["killed"] == []
     assert q["reap_wait_sec"] >= 0.2 and q["settle_sec"] == 0.0, q
@@ -160,14 +164,18 @@ async def test_a_live_holder_past_the_bound_is_never_signalled(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_live_holder_past_the_bound_keeps_the_hold(killed, events, monkeypatch, armed_power_cycle):  # noqa: F811
+async def test_a_live_holder_past_the_bound_keeps_the_hold(
+    killed, events, monkeypatch, armed_power_cycle
+):  # noqa: F811
     """With a holder still there, the episode goes on through the owed-reset path; the gate never
     releases a device whose post-kill check has not passed."""
     monkeypatch.setattr(srv, "POST_KILL_REAP_WAIT_SEC", 0.2)
     _holders(monkeypatch, FAKE_PID)
     sent = []
     real_kill = os.kill
-    monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append((pid, sig)) if pid == FAKE_PID else real_kill(pid, sig))
+    monkeypatch.setattr(
+        os, "kill", lambda pid, sig: sent.append((pid, sig)) if pid == FAKE_PID else real_kill(pid, sig)
+    )
     killed["reset_heals"] = False
     await _gate()
     assert _settle(events)["route"] == "holder_left"
@@ -268,7 +276,9 @@ async def test_an_unreadable_chip_takes_its_own_rung_not_the_mesh_reset(killed, 
 async def test_a_whole_tray_off_routes_to_the_power_cycle(monkeypatch, galaxy_trays):
     tray, chips = next((t, c) for t, c in sorted(galaxy_trays.items()) if c)
     off = {str(c) for c in chips}
-    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): (ALL_ONES if str(i) in off else 100) for i in range(CHIPS)})
+    monkeypatch.setattr(
+        srv, "read_heartbeats", lambda: {str(i): (ALL_ONES if str(i) in off else 100) for i in range(CHIPS)}
+    )
     _holders(monkeypatch)
     q = await srv._post_kill_quiesce(CHIPS, _Log())
     assert q["whole_trays"] == [tray]
@@ -307,7 +317,9 @@ async def test_a_post_kill_fabric_that_fails_or_cannot_check_keeps_the_hold(kill
 
 
 @pytest.mark.asyncio
-async def test_a_failed_post_kill_check_still_climbs_to_the_power_cycle(killed, events, armed_power_cycle, monkeypatch):  # noqa: F811
+async def test_a_failed_post_kill_check_still_climbs_to_the_power_cycle(
+    killed, events, armed_power_cycle, monkeypatch
+):  # noqa: F811
     monkeypatch.setattr(srv, "POST_KILL_SETTLE_SEC", 0.05)
     killed["reset_heals"] = False
     srv.recovery_mechanism.last_reset_failed = True

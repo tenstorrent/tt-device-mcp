@@ -67,11 +67,11 @@ from tt_device_mcp.constants import (
     HUNG_SILENCE_MAX_SEC,
     HUNG_SILENCE_MIN_SEC,
     JOB_RETENTION_SEC,
-    POST_STEP_DEADLINE_DEFAULT_SEC,
-    POST_STEP_DEADLINE_ENV,
     POST_KILL_POLL_SEC,
     POST_KILL_REAP_WAIT_SEC,
     POST_KILL_SETTLE_SEC,
+    POST_STEP_DEADLINE_DEFAULT_SEC,
+    POST_STEP_DEADLINE_ENV,
     PRE_RESET_ZOMBIE_LADDER_RESERVE_SEC,
     PRE_RESET_ZOMBIE_WAIT_SEC,
     PRE_STEP_DEADLINE_DEFAULT_SEC,
@@ -81,11 +81,11 @@ from tt_device_mcp.constants import (
     RESET_STREAM_KEEPALIVE_LINE,
     RESET_STREAM_KEEPALIVE_SEC,
     SIGTERM_GRACE_SEC,
-    SURVIVOR_KILL_WAIT_SEC,
     STAGE_BRIDGE_RESET,
     STAGE_POWER_CYCLE,
     STAGE_SMI_RESET,
     STATS_UPDATE_SEC,
+    SURVIVOR_KILL_WAIT_SEC,
 )
 from tt_device_mcp.constants import step_deadline_sec as _shared_step_deadline_sec
 
@@ -4925,7 +4925,9 @@ async def _post_kill_quiesce(expected: int, log) -> dict:
                     except OSError:
                         continue
                     killed.append({"pid": pid, "cmdline": cmd[:200]})
-                    msg = f"post-kill: job process pid {pid} still alive after {POST_KILL_REAP_WAIT_SEC}s, SIGKILL: {cmd}"
+                    msg = (
+                        f"post-kill: job process pid {pid} still alive after {POST_KILL_REAP_WAIT_SEC}s, SIGKILL: {cmd}"
+                    )
                     log(msg)
                     if logger:
                         logger.warning(msg)
@@ -7294,9 +7296,7 @@ async def device_health_gate(
         kill_reset = bool(kill_debt)
         # Spec 03 I89: on a multi-tray mesh the reset waits until the stopped job is gone and the mesh
         # has settled; the chips read after the settle route it (observe below reads them again).
-        post_kill = (
-            await _post_kill_quiesce(expected, _log) if kill_reset and expected >= 2 * UBB_CHIP_COUNT else None
-        )
+        post_kill = await _post_kill_quiesce(expected, _log) if kill_reset and expected >= 2 * UBB_CHIP_COUNT else None
         # Spec 03 I78: a dirty hold lifts only on a fresh passing full check, fabric included. Pre-job,
         # with no such pass on record, the funnel would refuse this gate's release on every job, and
         # nothing else runs a fabric pass on a dirty hold with jobs queued until the 10-min bound
