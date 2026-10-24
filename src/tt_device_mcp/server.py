@@ -202,6 +202,9 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     version_floor_warnings,
 )
 from tt_device_mcp.health import (
+    hugepages_counts as health_hugepages_counts,
+)
+from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
 from tt_device_mcp.job_preflight import preflight_output_dirs
@@ -14894,10 +14897,48 @@ def _hugepages_shortfall() -> Optional[tuple[int, int]]:
     only a host that declares TT_DEVICE_MCP_EXPECTED_CHIPS is ever held for hugepages. The count
     needed is one page per Tenstorrent PCI function that needs one, never the chip count: a card
     with two chips behind one function would otherwise wait for pages nothing ever allocates."""
-    raw = os.environ.get("TT_DEVICE_MCP_EXPECTED_CHIPS", "").strip()
-    if not raw.isdigit() or int(raw) <= 0:
+    if _hugepages_opted_out():
         return None
     return health_hugepages_shortfall()
+
+
+def _hugepages_opted_out() -> str:
+    """Why this host never waits for hugepages, or "" when it opted in."""
+    raw = os.environ.get("TT_DEVICE_MCP_EXPECTED_CHIPS", "").strip()
+    if not raw.isdigit() or int(raw) <= 0:
+        return "TT_DEVICE_MCP_EXPECTED_CHIPS unset or 0"
+    return ""
+
+
+def _startup_hugepages_event(outcome: str, have, need, waited_s: float, reason: str = "") -> None:
+    """The one ``startup_hugepages`` record per startup gate (spec 03 I33): what the wait saw and
+    how it ended. Record only; it never changes the wait or the hold."""
+    fields = {"outcome": outcome, "need": need, "have": have, "waited_s": round(waited_s, 1)}
+    if reason:
+        fields["reason"] = reason
+    health_event("startup_hugepages", **fields)
+
+
+def _hugepages_counts_for_record() -> tuple[Optional[int], Optional[int]]:
+    try:
+        return health_hugepages_counts()
+    except Exception:  # a record must never break the gate
+        return None, None
+
+
+def _startup_hugepages_not_needed() -> None:
+    """Record the no-wait path: the opt-out, nothing that needs a page, an unreadable pool, or a
+    pool already full (outcome ready, waited 0)."""
+    opted_out = _hugepages_opted_out()
+    have, need = _hugepages_counts_for_record()
+    if opted_out:
+        _startup_hugepages_event("not_needed", have, need, 0.0, reason=opted_out)
+    elif need and have is None:
+        _startup_hugepages_event("not_needed", have, need, 0.0, reason="1G pool unreadable")
+    elif need:
+        _startup_hugepages_event("ready", have, need, 0.0)
+    else:
+        _startup_hugepages_event("not_needed", have, need, 0.0, reason="no function needs a 1G page")
 
 
 async def _await_startup_hugepages() -> bool:
@@ -14911,8 +14952,10 @@ async def _await_startup_hugepages() -> bool:
     or forced escalation acts on the startup hold meanwhile."""
     short = await asyncio.to_thread(_hugepages_shortfall)
     if short is None:
+        await asyncio.to_thread(_startup_hugepages_not_needed)
         return True
     t0 = time.monotonic()
+    first = short
     async with _device_op("startup-hugepages-wait"):
         if logger:
             logger.info(
@@ -14922,12 +14965,18 @@ async def _await_startup_hugepages() -> bool:
         while short is not None and time.monotonic() - t0 < STARTUP_HUGEPAGES_WAIT_SEC:
             await asyncio.sleep(HUGEPAGES_POLL_SEC)
             short = await asyncio.to_thread(_hugepages_shortfall)
+    waited = time.monotonic() - t0
     if short is None:
         if logger:
-            logger.info(f"STARTUP FABRIC hugepages allocated after {time.monotonic() - t0:.0f}s")
+            logger.info(f"STARTUP FABRIC hugepages allocated after {waited:.0f}s")
+        have, _ = await asyncio.to_thread(_hugepages_counts_for_record)
+        _startup_hugepages_event("ready", have, first[1], waited)
         return True
     if fsm.record.dirty:
+        # Still short, but the reset a dirty episode owes is not this wait's to drop: the gate runs.
+        _startup_hugepages_event("short_dirty", short[0], short[1], waited, reason="dirty episode: gate runs")
         return True
+    _startup_hugepages_event("short_held", short[0], short[1], waited)
     reason = f"hugepages not yet allocated: {short[0]}/{short[1]}"
     if logger:
         logger.warning(
