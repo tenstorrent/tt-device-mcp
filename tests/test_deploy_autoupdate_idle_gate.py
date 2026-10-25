@@ -844,9 +844,7 @@ def test_a_limit_too_far_off_for_the_job_cap_is_never_held_through(tmp_path, lim
     hold a minute past its limit, as the broker does."""
     stub, _ = _preemptable(limit_left=limit_left, ends_after=10**9)
     kill = f'[ -e "$HOLD" ] && [ $(cat $M/t) -ge {limit_left + 60} ] && echo "hold-driven kill" >> $M/kills;'
-    done, trace, hold = _drain(
-        tmp_path, running=10_000, queue=0, scope=True, job_age=10, stand_ins=stub, on_sleep=kill
-    )
+    done, trace, hold = _drain(tmp_path, running=10_000, queue=0, scope=True, job_age=10, stand_ins=stub, on_sleep=kill)
     assert done.returncode == 0, done.stderr
     assert not (tmp_path / "model" / "kills").exists(), "the hold preempted a job on a lap that deferred"
     assert "is not held through; dispatch released" in done.stderr, done.stderr
@@ -857,9 +855,7 @@ def test_a_limit_too_far_off_for_the_job_cap_is_never_held_through(tmp_path, lim
 
 def test_a_limit_that_just_fits_the_job_cap_is_held_through(tmp_path):
     stub, end = _preemptable(limit_left=1460, ends_after=1530)
-    done, trace, hold = _drain(
-        tmp_path, running=10_000, queue=0, scope=True, job_age=10, stand_ins=stub, on_sleep=end
-    )
+    done, trace, hold = _drain(tmp_path, running=10_000, queue=0, scope=True, job_age=10, stand_ins=stub, on_sleep=end)
     assert done.returncode == 0, done.stderr
     assert "(bound 1560s:" in done.stderr and "drained after 1530s" in done.stderr, done.stderr
     assert _polls_held(trace) and trace[-1].startswith("restart held "), trace
@@ -869,7 +865,6 @@ def _preempted_then_gate(tmp_path, *, gate_ends, seen_by):
     """The only running job, past its limit, is preempted 70 s in; then the broker's post-job gate
     (a kill reset, the full check) runs as its child under the device-op lock until `gate_ends`.
     `seen_by`: how the drain can tell the job ended, its scope or /health."""
-    m = tmp_path / "model"
     lock = tmp_path / "device-op.lock"
     unit = "990" if seen_by == "scope" else "428"
     names = '[ "$(cat $M/running)" -gt 0 ] && echo 1 || echo 0' if seen_by == "health" else ":"
