@@ -553,12 +553,15 @@ def _witness(monkeypatch, *, clean, ok=True, why="", status=None):
     return made
 
 
-async def _preempt(monkeypatch, job_id, command, *, kill_grace, while_running=None, scope_sent=None):
+async def _preempt(
+    monkeypatch, job_id, command, *, kill_grace, while_running=None, scope_sent=None, contender=_waiting_job
+):
     """Run a preemptable job past its 1 s limit with a job waiting, through the minute (1 s here)
     and the kill, and let the runner reach the post-job gate. ``while_running`` is called once the
     job runs. ``scope_sent``, a list: the job runs in a live scope (_live_scope) and the list gets
-    the signals sent to it. Returns the job, the signals sent to its group or a pid, the gate's
-    calls and the dirty marks."""
+    the signals sent to it. ``contender`` makes the contention once the job runs (default: a queued
+    job). Returns the job, the signals sent to its group or a pid, the gate's calls and the dirty
+    marks."""
     _free_device_lock(monkeypatch)
     _no_workspace_activation(monkeypatch)
     gate = _recording_post_job_gate(monkeypatch)
@@ -579,7 +582,7 @@ async def _preempt(monkeypatch, job_id, command, *, kill_grace, while_running=No
         await _until_running(job)
         if while_running is not None:
             while_running()
-        _waiting_job()
+        contender()
         await _until_finished(job, limit_sec=15)
         for _ in range(20):
             await asyncio.sleep(0.05)
@@ -1978,3 +1981,315 @@ def test_sigkill_comes_ten_seconds_after_sigterm_and_the_docs_say_so():
     doc = srv.JobSubmitInput.model_fields["no_timeout_except_on_contention"].description
     assert "SIGKILL 10s later" in doc, doc
     assert "10s later, SIGKILL" in cli._NO_TIMEOUT_HELP, cli._NO_TIMEOUT_HELP
+
+
+# A pending broker update is contention too (spec 01 I20, spec 08 I20): the auto-updater's live
+# dispatch hold counts as one waiter for a preemptable job past its limit, with the same minute and
+# kill as a queued job, so an update reaches a box whose preemptable job would otherwise run on
+# with no end. The waiter is never dispatched and never counted as queued.
+
+
+def _update_hold(pid=None, age_sec=0.0):
+    """Write the auto-updater's dispatch hold as it does (`<pid> <epoch>`), held for `age_sec`."""
+    path = srv.dispatch_hold()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{os.getpid() if pid is None else pid} {int(time.time() - age_sec)}\n")
+    return path
+
+
+def _reaped_pid():
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    return proc.pid
+
+
+@pytest.fixture
+def no_seen_hold(monkeypatch):
+    monkeypatch.setattr(srv, "_dispatch_hold_waiter_seen", None)
+
+
+def test_a_live_update_hold_past_the_limit_starts_the_minute(clear_job_state, no_seen_hold):
+    """Past the limit with nothing queued, a live hold starts the minute when the broker first sees
+    it (never back-dated to the file's epoch): PREEMPTING, cause 'update', the kill one minute later."""
+    job = _pjob()
+    job.status = srv.JobStatus.RUNNING
+    job.timeout_sec = 1
+    _update_hold(age_sec=5)
+    now = time.monotonic()
+    kill_at = srv._preempt_kill_at(job, now - 100, now)
+    assert kill_at == now + srv.PREEMPT_GRACE_SEC, (kill_at, now)
+    assert srv.preempt_label(job).startswith("PREEMPTING ")
+    assert srv.preempt_cause(job) == "update"
+    # A queued job beside it: the cause names the queue.
+    _waiting_job("980")
+    srv._preempt_kill_at(job, now - 100, time.monotonic())
+    assert srv.preempt_cause(job) == "queued"
+
+
+@pytest.mark.parametrize("hold", ["none", "dead", "overdue", "malformed"])
+def test_no_live_update_hold_is_no_contention(clear_job_state, no_seen_hold, hold):
+    if hold == "dead":
+        _update_hold(pid=_reaped_pid())
+    elif hold == "overdue":
+        _update_hold(age_sec=srv.DISPATCH_HOLD_MAX_SEC + 60)
+    elif hold == "malformed":
+        srv.dispatch_hold().parent.mkdir(parents=True, exist_ok=True)
+        srv.dispatch_hold().write_text("garbage\n")
+    job = _pjob()
+    job.status = srv.JobStatus.RUNNING
+    now = time.monotonic()
+    assert srv._preempt_kill_at(job, now - 100, now) is None
+    assert srv._waiter_arrivals(now) == {}
+    assert srv.preempt_cause(job) is None and srv.preempt_label(job).startswith("PREEMPTABLE ")
+
+
+def test_an_update_hold_before_the_limit_is_no_contention(clear_job_state, no_seen_hold):
+    _update_hold(age_sec=30)
+    job = _pjob()
+    job.status = srv.JobStatus.RUNNING
+    now = time.monotonic()
+    assert srv._preempt_kill_at(job, now + 10, now) is None
+    assert job.contention_since_monotonic is None
+    # Once the limit passes, the minute starts at the first poll that sees the hold.
+    assert srv._preempt_kill_at(job, now + 10, now + 11) == now + 11 + srv.PREEMPT_GRACE_SEC
+
+
+def test_a_refreshed_hold_keeps_the_minute_and_a_new_holder_starts_a_fresh_one(clear_job_state, no_seen_hold):
+    """The updater rewrites its hold's epoch every poll: the same pid is the same waiter, its
+    arrival kept from the first sight. A later lap (another pid) is a new waiter: a fresh minute."""
+    job = _pjob()
+    job.status = srv.JobStatus.RUNNING
+    _update_hold(age_sec=20)
+    now = time.monotonic()
+    first = srv._preempt_kill_at(job, now - 100, now)
+    _update_hold(age_sec=0)  # refreshed
+    assert srv._preempt_kill_at(job, now - 100, now + 5) == first
+    other = subprocess.Popen(["sleep", "30"])
+    try:
+        _update_hold(pid=other.pid, age_sec=0)
+        fresh = srv._preempt_kill_at(job, now - 100, now + 6)
+        assert fresh == now + 6 + srv.PREEMPT_GRACE_SEC, (first, fresh)
+    finally:
+        other.kill()
+        other.wait()
+
+
+def test_a_pending_update_is_not_counted_as_queued(clear_job_state, no_seen_hold):
+    """The hold is a waiter for the preemption only: /health 'queued' (read by health probes and
+    monitors) and queue status count no job for it; /health names the cause."""
+    srv.jobs["981"] = srv.Job(
+        id="981",
+        owner="o",
+        workspace="/w",
+        command="c",
+        queued_at="",
+        status=srv.JobStatus.RUNNING,
+        timeout_sec=1,
+        preemptable=True,
+    )
+    before = srv._health_payload()
+    assert before["queued"] == 0 and "preempt_cause" not in before
+    _update_hold()
+    srv._preempt_kill_at(srv.jobs["981"], time.monotonic() - 100)
+    payload = srv._health_payload()
+    assert payload["queued"] == 0 and payload["running"] == 1, payload
+    assert payload["preempt"].startswith("PREEMPTING ") and payload["preempt_cause"] == "update", payload
+    assert set(srv.jobs) == {"981"}
+
+
+def test_a_pending_update_never_makes_a_silent_job_reapable_before_its_limit(clear_job_state, no_seen_hold):
+    """The hung reaper spares a preemptable job while no JOB waits: a pending update preempts only
+    past the limit, through the minute, never by a reap."""
+    _update_hold()
+    assert srv._first_waiter_arrival() is not None
+    assert srv._first_waiter_arrival(update=False) is None
+
+
+@pytest.mark.asyncio
+async def test_an_update_hold_preempts_a_job_past_its_limit_then_sigkills(monkeypatch, clear_job_state, no_seen_hold):
+    """Nothing queued, past the limit, the updater holds dispatch: PREEMPTING with cause 'update'
+    for the minute and no signal inside it, then SIGTERM, SIGKILL the kill grace later. The job
+    ends PREEMPTED, owes the reset and gets the full gate; the hold's waiter is never dispatched."""
+    fsm_healthy(srv)
+    _witness(monkeypatch, clean=False)
+    seen = []
+
+    def watch():
+        seen.append(srv._health_payload())
+
+    def hold():
+        _update_hold()
+        t0 = time.monotonic()
+        seen.append(t0)
+
+    job, sent, gate, dirty, owed = await _preempt(
+        monkeypatch, "982", "trap '' INT TERM; sleep 60", kill_grace=1, contender=hold
+    )
+    assert sent[:1] == [signal.SIGTERM] and signal.SIGKILL in sent, sent
+    assert job.exit_code in (-9, 137), job.exit_code
+    assert dirty and owed == ["job 982 preempted"], (dirty, owed)
+    assert gate == [{"job_failed": True}], "a SIGKILLed preemption gets the reset and the full gate"
+    assert set(srv.jobs) == {"982"} and srv.get_job_queue().qsize() == 0, "the update waiter was dispatched"
+    assert srv.dispatch_hold().exists(), "the broker must never remove a live hold"
+
+
+@pytest.mark.asyncio
+async def test_an_update_hold_preemption_shows_the_cause_and_waits_the_minute(
+    monkeypatch, clear_job_state, no_seen_hold
+):
+    _free_device_lock(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    gate = _recording_post_job_gate(monkeypatch)
+    _recording_dirty(monkeypatch)
+    _fast_preempt(monkeypatch, grace=2, kill_grace=0.5)
+    job = srv.Job(
+        id="983",
+        owner="server",
+        workspace="/tmp",
+        command="trap '' INT TERM; echo serving; sleep 60",
+        queued_at="t",
+        timeout_sec=1,
+        preemptable=True,
+    )
+    srv.jobs["983"] = job
+    sent = _recording_signals(monkeypatch, job)
+    await srv.get_job_queue().put("983")
+    runner = asyncio.create_task(srv.job_runner())
+    causes = []
+    try:
+        await _until_running(job)
+        await asyncio.sleep(1.5)  # past the 1 s limit, nothing queued, no hold
+        assert job.status is srv.JobStatus.RUNNING and "preempt_cause" not in srv._health_payload()
+        _update_hold()
+        t0 = time.monotonic()
+        while job.finished_at is None and time.monotonic() - t0 < 10:
+            h = srv._health_payload()
+            if job.status is srv.JobStatus.RUNNING:
+                causes.append((h.get("preempt"), h.get("preempt_cause"), h["queued"]))
+            await asyncio.sleep(0.1)
+        await _until_finished(job, limit_sec=1)
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+    assert job.status is srv.JobStatus.PREEMPTED
+    first_signal = sent[0][0] - t0
+    assert first_signal >= 2 - 0.15, f"a signal came {first_signal:.2f}s into the 2 s minute"
+    assert any(p and p.startswith("PREEMPTING ") and c == "update" and q == 0 for p, c, q in causes), causes
+    assert all(q == 0 for _, _, q in causes), causes
+    assert gate == [{"job_failed": True}]
+
+
+@pytest.mark.asyncio
+async def test_a_clean_sigterm_end_on_an_update_keeps_the_fast_check(monkeypatch, clear_job_state, no_seen_hold):
+    fsm_healthy(srv)
+    _witness(monkeypatch, clean=True, status=143)
+    job, sent, gate, dirty, owed = await _preempt(
+        monkeypatch, "984", "sleep 60", kill_grace=5, contender=lambda: _update_hold()
+    )
+    assert sent and sent[0] is signal.SIGTERM and signal.SIGKILL not in sent, sent
+    assert dirty == [] and owed == []
+    assert gate == [{"job_failed": False}], "a clean end on SIGTERM takes the fast check"
+
+
+@pytest.mark.asyncio
+async def test_a_job_that_ends_itself_with_0_on_an_update_is_a_yield(monkeypatch, clear_job_state, no_seen_hold):
+    """It sees PREEMPTING (cause 'update') and exits 0 inside the minute: never signalled, a yield."""
+    fsm_healthy(srv)
+    _free_device_lock(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    gate = _recording_post_job_gate(monkeypatch)
+    _fast_preempt(monkeypatch, grace=30)
+    flag = srv.dispatch_hold().with_name("go")
+    job = srv.Job(
+        id="985",
+        owner="server",
+        workspace="/tmp",
+        command=f"while [ ! -e {flag} ]; do sleep 0.05; done; exit 0",
+        queued_at="t",
+        timeout_sec=1,
+        preemptable=True,
+    )
+    srv.jobs["985"] = job
+    sent = _recording_signals(monkeypatch, job)
+    await srv.get_job_queue().put("985")
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await _until_running(job)
+        await asyncio.sleep(1.2)
+        _update_hold()
+        for _ in range(60):
+            await asyncio.sleep(0.05)
+            if srv._health_payload().get("preempt_cause") == "update":
+                break
+        flag.write_text("")
+        await _until_finished(job, limit_sec=5)
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+    assert job.status is srv.JobStatus.COMPLETED and job.preempt_yielded, (job.status, job.preempt_yielded)
+    assert sent == [], sent
+    assert gate == [], "an exit 0 under contention gets no post-job check (spec 01 I20)"
+
+
+@pytest.mark.asyncio
+async def test_a_readopted_preemptable_job_is_killed_a_full_minute_after_an_update_holds(
+    monkeypatch, tmp_path, clear_job_state, no_seen_hold
+):
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
+    monkeypatch.setattr(srv, "PREEMPT_GRACE_SEC", 1)
+    _recording_dirty(monkeypatch)
+    active = {"v": True}
+    stopped = []
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: active["v"])
+
+    async def fake_kill(job_id, pid):
+        stopped.append((job_id, time.monotonic()))
+        active["v"] = False
+
+    monkeypatch.setattr(srv, "_preempt_kill", fake_kill)
+    _readopted("986", served_sec=2400, timeout_sec=300)
+    _update_hold(age_sec=600)  # held long before the restart: the minute still starts afresh
+
+    t0 = time.monotonic()
+    await asyncio.wait_for(srv._monitor_readopted_scope("986", "ttdev-job-986.scope"), timeout=5)
+    assert [j for j, _ in stopped] == ["986"]
+    assert stopped[0][1] - t0 >= 1 - 0.05, "killed before a full minute of contention after the restart"
+    assert srv.jobs["986"].status is srv.JobStatus.PREEMPTED
+
+
+@pytest.mark.asyncio
+async def test_a_readopted_preemptable_job_is_left_alone_with_no_live_hold(
+    monkeypatch, tmp_path, clear_job_state, no_seen_hold
+):
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
+    calls = {"n": 0}
+    killed = []
+
+    def scope_active(scope):
+        calls["n"] += 1
+        return calls["n"] < 20
+
+    async def fake(*a, **k):
+        killed.append(a)
+
+    monkeypatch.setattr(srv, "_scope_active", scope_active)
+    monkeypatch.setattr(srv, "_preempt_kill", fake)
+    monkeypatch.setattr(srv, "_terminate_scope", fake)
+    _readopted("987", served_sec=2400, timeout_sec=300)
+    _update_hold(pid=_reaped_pid())
+    await asyncio.wait_for(srv._monitor_readopted_scope("987", "ttdev-job-987.scope"), timeout=5)
+    assert killed == [], "a dead hold preempted a re-adopted job"
+
+
+def test_health_shows_the_seconds_left_before_a_preemptable_jobs_limit(clear_job_state):
+    """The auto-updater bounds its drain by the time a preemptable job has before its limit."""
+    srv.jobs["988"] = job = srv.Job(
+        id="988", owner="o", workspace="/w", command="c", queued_at="", status=srv.JobStatus.RUNNING, preemptable=True
+    )
+    assert "preempt_limit_left_sec" not in srv._health_payload()
+    job.preempt_limit_monotonic = time.monotonic() + 120
+    assert 118 <= srv._health_payload()["preempt_limit_left_sec"] <= 120
+    job.preempt_limit_monotonic = time.monotonic() - 5
+    assert srv._health_payload()["preempt_limit_left_sec"] == 0

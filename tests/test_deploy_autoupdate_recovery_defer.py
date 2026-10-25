@@ -341,7 +341,10 @@ def test_no_recovery_deferral_comes_after_the_install_starts():
     after = text[install:]
     assert "if recovery_gate" not in after
     deferrals = re.findall(r'au_log deferred "([^"]*)"', after)
-    assert deferrals == ["broker job or device op still running at restart time (job cap ${JOB_CAP}s)"], deferrals
+    # The drain's own reason (e.g. a post-job gate past GATE_CAP) replaces the default text.
+    assert deferrals == [
+        "${drain_why:-broker job or device op still running at restart time (job cap ${JOB_CAP}s)}"
+    ], deferrals
 
 
 def test_a_device_op_at_restart_time_is_waited_out(tmp_path):

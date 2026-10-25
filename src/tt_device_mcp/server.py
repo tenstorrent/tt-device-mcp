@@ -849,6 +849,7 @@ class Job:
     contention_since_monotonic: Optional[float] = None  # start of the running job's current grace minute
     contention_waiters: frozenset = frozenset()  # the waiters seen at the last contention poll
     preempt_killed_monotonic: Optional[float] = None  # set when the grace minute ran out and the kill began
+    preempt_limit_monotonic: Optional[float] = None  # when its time limit ends; /health shows what is left
     preempt_clean: bool = False  # the kernel saw every process of the tree exit on SIGTERM by its own code
     preempt_exit_status: Optional[int] = None  # the job's own status, witnessed on a clean preemption
     preempt_yielded: bool = False  # it ended itself under contention (past its limit, a job waiting)
@@ -2201,11 +2202,18 @@ def dispatch_hold() -> Path:
 
 def _dispatch_hold_holder() -> str:
     """Who holds dispatch, or '' when nobody does. A dead, malformed or overdue hold is removed."""
+    live = _dispatch_hold_live()
+    return "" if live is None else f"pid {live[0]}, held {int(time.time() - live[1])}s"
+
+
+def _dispatch_hold_live() -> Optional[tuple]:
+    """The live dispatch hold as (pid, epoch of its last write), or None when nobody holds
+    dispatch. A dead, malformed or overdue hold is removed."""
     path = dispatch_hold()
     try:
         text = path.read_text()
     except OSError:
-        return ""
+        return None
     try:
         pid_s, epoch_s = text.split()[:2]
         pid, epoch = int(pid_s), float(epoch_s)
@@ -2224,7 +2232,7 @@ def _dispatch_hold_holder() -> str:
             alive = False
     age = time.time() - epoch
     if alive and 0 <= age <= DISPATCH_HOLD_MAX_SEC:
-        return f"pid {pid}, held {int(age)}s"
+        return pid, epoch
     try:
         path.unlink()
     except OSError:
@@ -2234,7 +2242,7 @@ def _dispatch_hold_holder() -> str:
             f"DISPATCH_HOLD ignoring stale hold {text.strip()!r} "
             f"({'overdue' if alive else 'holder gone or unreadable'}); removed"
         )
-    return ""
+    return None
 
 
 async def _wait_out_dispatch_hold(job: "Job", job_log_file: Optional[Path]) -> bool:
@@ -8898,6 +8906,13 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         if j.status == JobStatus.RUNNING and j.preemptable:
             payload["preempt"] = preempt_label(j)
             payload["preempt_job_id"] = j.id
+            # Spec 01 I20: why it is being preempted ('queued' or 'update'); absent with no contention.
+            cause = preempt_cause(j)
+            if cause:
+                payload["preempt_cause"] = cause
+            # Seconds until its limit ends (0 past it): the auto-updater bounds its drain by it.
+            if j.preempt_limit_monotonic is not None:
+                payload["preempt_limit_left_sec"] = max(0, int(j.preempt_limit_monotonic - time.monotonic()))
             break
     if hold:
         reason, since = hold
@@ -10432,13 +10447,46 @@ def _bounded_hung_silence(value) -> Optional[int]:
 PREEMPT_POLL_SEC = 1.0
 
 
-def _waiter_arrivals(now: Optional[float] = None) -> dict:
+# Spec 01 I20: a pending update is contention too. While the auto-updater holds dispatch (a live,
+# unexpired hold) it counts as one more waiter, never dispatched and never in /health "queued".
+# Its id names the holder's pid, so a later lap's hold is a new waiter and starts a fresh minute.
+# The hold's epoch is rewritten on every poll of the updater, so its arrival is taken once, at the
+# broker's first sight of that pid, and kept: (waiter id, arrival on time.monotonic()).
+DISPATCH_HOLD_WAITER_PREFIX = "dispatch-hold:"
+_dispatch_hold_waiter_seen: Optional[tuple] = None
+
+
+def _dispatch_hold_waiter(now: float) -> Optional[tuple]:
+    """The pending update as (waiter id, arrival on time.monotonic()), or None when nobody holds
+    dispatch or the hold is dead or overdue. Never raises: a bug here only drops the waiter."""
+    global _dispatch_hold_waiter_seen
+    try:
+        live = _dispatch_hold_live()
+    except Exception:  # noqa: BLE001 - a bad hold read must not break the preemption poll
+        live = None
+    if live is None:
+        _dispatch_hold_waiter_seen = None
+        return None
+    waiter = f"{DISPATCH_HOLD_WAITER_PREFIX}{live[0]}"
+    if _dispatch_hold_waiter_seen is None or _dispatch_hold_waiter_seen[0] != waiter:
+        # It arrives when this broker first sees it, never earlier: the file's epoch is only its
+        # last refresh, whole seconds, so it cannot shorten the job's minute.
+        _dispatch_hold_waiter_seen = (waiter, now)
+    return _dispatch_hold_waiter_seen
+
+
+def _waiter_arrivals(now: Optional[float] = None, *, update: bool = True) -> dict:
     """Every job now waiting for the device, by id, with when (time.monotonic) it was queued.
     The monotonic clock keeps a wall-clock step or DST change from moving the kill. A job queued
     before a broker restart has only its queued_at, read against the wall clock once and kept as
-    its queued_monotonic; one that does not parse counts as arriving at that read."""
+    its queued_monotonic; one that does not parse counts as arriving at that read. With `update`,
+    a pending update (the auto-updater's live dispatch hold) is one more waiter (spec 01 I20)."""
     now = time.monotonic() if now is None else now
     arrivals = {}
+    if update:
+        held = _dispatch_hold_waiter(now)
+        if held is not None:
+            arrivals[held[0]] = min(now, held[1])
     for j in jobs.values():
         if j.status != JobStatus.QUEUED:
             continue
@@ -10452,10 +10500,10 @@ def _waiter_arrivals(now: Optional[float] = None) -> dict:
     return arrivals
 
 
-def _first_waiter_arrival() -> Optional[float]:
+def _first_waiter_arrival(*, update: bool = True) -> Optional[float]:
     """When (time.monotonic) the earliest job now waiting for the device was queued, or None while
-    nobody waits."""
-    arrivals = _waiter_arrivals()
+    nobody waits. `update`: count a pending update as a waiter (_waiter_arrivals)."""
+    arrivals = _waiter_arrivals(update=update)
     return min(arrivals.values()) if arrivals else None
 
 
@@ -10519,6 +10567,17 @@ def preempt_label(job: "Job") -> Optional[str]:
             return f"PREEMPTING {left}s"
     minutes = job.timeout_sec / 60
     return f"PREEMPTABLE {minutes:g}min" if minutes == int(minutes) else f"PREEMPTABLE {minutes:.1f}min"
+
+
+def preempt_cause(job: "Job") -> Optional[str]:
+    """Why a running preemptable job is under contention: 'queued' while a job waits for the
+    device, 'update' while only a pending broker update does (spec 01 I20); None otherwise."""
+    label = preempt_label(job)
+    if not label or not label.startswith("PREEMPTING") or not job.contention_waiters:
+        return None
+    if all(w.startswith(DISPATCH_HOLD_WAITER_PREFIX) for w in job.contention_waiters):
+        return "update"
+    return "queued"
 
 
 async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = False) -> bool:
@@ -12920,6 +12979,8 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
         # owed before the restart (a waiter queued long before a slow restart) starts afresh, so the
         # job still gets its full minute with no signal. That only ever gives the job more time.
         preempt_limit = None if limit_mono is None else max(limit_mono, time.monotonic())
+        if job0 is not None:
+            job0.preempt_limit_monotonic = preempt_limit
         while await asyncio.to_thread(_scope_active, scope):
             poll = _SCOPE_POLL_SEC
             if preempt_limit is not None and job0.preemptable:
@@ -13744,6 +13805,7 @@ export {JOB_TAG_ENV}={job_tag}
                 current_job_id = job_id
                 job.pid = proc.pid
                 limit_end = time.monotonic() + job.timeout_sec  # start + x, for preempt_watchdog
+                job.preempt_limit_monotonic = limit_end
                 # A job that never emits a line at all is still measured for silence, so the
                 # clock starts at spawn rather than at first output.
                 job.last_output_monotonic = time.monotonic()
@@ -13915,7 +13977,9 @@ export {JOB_TAG_ENV}={job_tag}
                     # A no-timeout-except-on-contention job is never stopped while nobody waits
                     # (spec 01 I20), for time or for silence; once a job is queued the reaper
                     # applies to it as to any other.
-                    spared = job.preemptable and _first_waiter_arrival() is None
+                    # A pending update is no waiter here: it preempts past the limit (spec 01 I20)
+                    # but never makes a silent job before its limit reapable.
+                    spared = job.preemptable and _first_waiter_arrival(update=False) is None
                     # Past its limit with a job waiting, the preemption owns the stop: its grace
                     # minute sends no signal and its kill is bounded (PREEMPT_GRACE_SEC, then
                     # PREEMPT_KILL_GRACE_SEC). A reap here would signal the job inside the minute it
@@ -14012,9 +14076,15 @@ export {JOB_TAG_ENV}={job_tag}
                         contended = kill_at is not None
                         if contended:
                             left = max(0, math.ceil(kill_at - now))
-                            note(f"PREEMPTING: a job is waiting past the limit; end within {left}s or be killed")
+                            if preempt_cause(job) == "update":
+                                note(
+                                    f"PREEMPTING: a broker update is waiting past the limit; end within {left}s "
+                                    "or be killed"
+                                )
+                            else:
+                                note(f"PREEMPTING: a job is waiting past the limit; end within {left}s or be killed")
                         else:
-                            note("PREEMPTABLE: the waiting job left; no preemption")
+                            note("PREEMPTABLE: the waiting job or update left; no preemption")
                     await asyncio.sleep(PREEMPT_POLL_SEC if kill_at is None else min(PREEMPT_POLL_SEC, kill_at - now))
                 async with get_lock():
                     if job.status != JobStatus.RUNNING:
@@ -16160,6 +16230,9 @@ def create_mcp_server() -> MCPServer:
             result["timeout_sec"] = job.timeout_sec
             if job.status in (JobStatus.QUEUED, JobStatus.RUNNING):
                 result["preempt"] = preempt_label(job)
+                cause = preempt_cause(job)
+                if cause:
+                    result["preempt_cause"] = cause
 
         if job.status not in (JobStatus.QUEUED, JobStatus.RUNNING):
             if job.runtime_sec is not None:
