@@ -299,6 +299,14 @@ left = h.get("preempt_limit_left_sec")
 if h.get("preempt_job_id") and isinstance(left, int) and isinstance(h.get("running"), int):
     print(h["running"], h["preempt_job_id"], max(0, left))' 2>/dev/null
 }
+# Whether /health still names job $1 as the running preemptable job: prints 1 (it does), 0 (it
+# answers without it: the job has ended), nothing if no answer.
+broker_names_preempt_job() {
+    curl -fsS --max-time 5 --unix-socket "$SOCK" http://localhost/health 2>/dev/null \
+        | "$VENV/bin/python" -I -c 'import json, sys
+h = json.load(sys.stdin)
+print(int(h.get("preempt_job_id") == sys.argv[1]))' "$1" 2>/dev/null
+}
 # Succeeds (and names why in $recovery_why) while the update should wait for the recovery.
 recovery_gate() {
     local held="" state="" age="" now since="" sha="" waited
@@ -376,9 +384,14 @@ fi
 # the hold is contention (the broker counts a live hold as one waiting job, never dispatched). So
 # when the broker reports the only running job as one, the bound is the time left before its limit
 # plus PREEMPT_TAIL (the broker's preempt grace, its kill grace and a margin for the job's exit),
-# from this wait's start and at most JOB_CAP; never shorter than the job cap's own bound. Only a
-# device holder outside every broker job, which no broker kill ends, stops holding the update at the
-# bound, so a box busy around the clock still updates.
+# from this wait's start; never shorter than the job cap's own bound. Once that job has ended (its
+# scope gone, or /health no longer names it), the broker's post-job gate runs before the job
+# boundary (a kill reset, the full check with fabric): what is left is held as that gate for at most
+# GATE_CAP from the job's end, so a lap whose hold preempted the job applies under the same hold.
+# A limit too far off for limit + PREEMPT_TAIL to fit under JOB_CAP is never held through: the lap
+# releases dispatch at once, before the hold can preempt anything, and a later lap nearer the limit
+# applies. Only a device holder outside every broker job, which no broker kill ends, stops holding
+# the update at the bound, so a box busy around the clock still updates.
 JOB_CAP=1560
 # PREEMPT_GRACE_SEC (60) + PREEMPT_KILL_GRACE_SEC (10) + 30 s for the job's exit to show.
 PREEMPT_TAIL=100
@@ -386,6 +399,10 @@ PREEMPT_TAIL=100
 # with no job running may keep the hold (see wait_job_boundary). It bounds the wait, never the
 # bar: past it the lap releases dispatch and restarts nothing (I7); the next lap retries.
 OP_CAP=660
+# The post-job gate after a preemption: a kill reset (OP_CAP) and the full check with fabric,
+# FABRIC_CHECK_TIMEOUT_SEC (180) + FULL_CHECK_PER_CHIP_SEC (3) on 32 chips. Past it the lap
+# releases dispatch and restarts nothing (I7); the next lap retries.
+GATE_CAP=936
 UPTIME=/proc/uptime
 count_busy() {
     local mp p uu q
@@ -446,6 +463,16 @@ reset_scope_listed() {
         | grep -q 'ttdev-reset-'
 }
 op_in_flight() { op_lock_live || reset_scope_listed; }
+job_scope_listed() {
+    systemctl list-units --type=scope --state=running --no-legend --no-pager "ttdev-job-$1.scope" 2>/dev/null \
+        | grep -q "ttdev-job-$1\.scope"
+}
+# Whether the preemptable job the drain holds for has ended: its scope, listed when the wait began,
+# is gone, or /health answers without naming it. No answer and no scope to read: not known to.
+preempt_job_ended() {
+    if [ "$p_scope" = 1 ] && ! job_scope_listed "$p_job"; then return 0; fi
+    [ "$(broker_names_preempt_job "$p_job")" = 0 ]
+}
 # Wait, under the dispatch hold, for the job boundary: nothing running and no device op in flight.
 # Returns 0 there, 0 when the broker is down and runs no op of its own (a down broker protects no
 # job by waiting, and the restart is what starts it again; a reset scope outlives it in its own unit
@@ -453,10 +480,13 @@ op_in_flight() { op_lock_live || reset_scope_listed; }
 # device holder outside every broker job is left; 1 at JOB_CAP when a broker job is still running or
 # a device op is in flight. A device op with no job running holds the wait for at most OP_CAP from
 # when it is first seen alone, then 1 too: the broker does not bound every op (a reset that outlives
-# its timeout is left running in its scope), and an update never restarts over one (I7). $1 names
-# the wait in the log.
+# its timeout is left running in its scope), and an update never restarts over one (I7). The only
+# running job preemptable: 1 at once when its limit is too far off to hold through (no kill on a lap
+# that cannot apply), and once it has ended the broker's post-job gate holds the wait for at most
+# GATE_CAP, then 1. $1 names the wait in the log; a return of 1 names why in $drain_why.
 wait_job_boundary() {
-    local w_start w_now w_bound w_why op_since="" p_running="" p_job="" p_left=""
+    local w_start w_now w_bound w_why op_since="" p_running="" p_job="" p_left="" p_scope=0 p_end=""
+    drain_why=""
     youngest_job_age
     w_bound=$(( JOB_CAP - j_age )); [ "$w_bound" -gt 0 ] || w_bound=0
     w_why="job cap ${JOB_CAP}s, youngest job ${j_age}s in"
@@ -466,10 +496,19 @@ wait_job_boundary() {
 $(broker_preempt)
 EOF
     if [ "${p_running:-0}" = 1 ] && [ -n "${p_job:-}" ] && [ "${p_left:--1}" -ge 0 ] 2>/dev/null; then
+        if [ $(( p_left + PREEMPT_TAIL )) -gt "$JOB_CAP" ]; then
+            # Held through, the hold would preempt the job at its limit and then let go at the cap:
+            # a kill on a lap that cannot apply. Let go now; nothing is contention before the limit.
+            echo "autoupdate: $1: the only running job $p_job is preemptable and ${p_left}s before its limit: limit + ${PREEMPT_TAIL}s is past the job cap (${JOB_CAP}s), so it is not held through; dispatch released, a later lap nearer the limit applies" >&2
+            drain_why="preemptable job ${p_left}s before its limit, past the job cap (${JOB_CAP}s)"
+            return 1
+        fi
         p_left=$(( p_left + PREEMPT_TAIL ))
-        [ "$p_left" -le "$JOB_CAP" ] || p_left=$JOB_CAP
         [ "$p_left" -le "$w_bound" ] || w_bound=$p_left
-        w_why="$w_why; preemptable job $p_job: limit + ${PREEMPT_TAIL}s, at most ${JOB_CAP}s"
+        job_scope_listed "$p_job" && p_scope=1
+        w_why="$w_why; preemptable job $p_job: limit + ${PREEMPT_TAIL}s, then its post-job gate for at most ${GATE_CAP}s"
+    else
+        p_job=""
     fi
     w_start="$(date +%s)"
     echo "autoupdate: $1: busy (children=$kids holders=$holders scopes=${scopes:-0} queued=$queued) -> draining: dispatch held, the running job finishes, then the update applies (bound ${w_bound}s: $w_why)" >&2
@@ -488,7 +527,18 @@ EOF
                     return 0 ;;
             esac
         fi
-        if op_in_flight && [ "$running" -eq 0 ]; then
+        if [ -n "$p_job" ] && [ -z "$p_end" ] && preempt_job_ended; then
+            p_end="$w_now"
+            echo "autoupdate: $1: the preemptable job $p_job ended after $(( w_now - w_start ))s; the broker's post-job gate is waited out under the hold for at most ${GATE_CAP}s" >&2
+        fi
+        if [ -n "$p_end" ] && [ "${scopes:-0}" -eq 0 ] && [ "$jobholders" -eq 0 ] && { [ "$kids" -gt 0 ] || op_in_flight; }; then
+            # The broker's own post-job gate: its probes are its children, and its reset holds the op lock.
+            if [ $(( w_now - p_end )) -ge "$GATE_CAP" ]; then
+                echo "autoupdate: $1: the broker's post-job gate is still running ${GATE_CAP}s after the preempted job ended; never restarted over (I7): dispatch released, the next lap retries" >&2
+                drain_why="post-job gate still running ${GATE_CAP}s after the preemption"
+                return 1
+            fi
+        elif op_in_flight && [ "$running" -eq 0 ]; then
             if [ -z "$op_since" ]; then
                 op_since="$w_now"
                 echo "autoupdate: $1: a device op is in flight after $(( w_now - w_start ))s with no job running; it is waited out under the hold for at most ${OP_CAP}s" >&2
@@ -525,7 +575,7 @@ if [ "$busy" -ne 0 ]; then
     idle=false; d_t0="$(date +%s)"
     if ! wait_job_boundary drain; then
         rm -f "$HOLD" 2>/dev/null || true
-        au_log deferred "broker job or device op still running at the job cap (${JOB_CAP}s); dispatch released, the next lap retries"
+        au_log deferred "${drain_why:-broker job or device op still running at the job cap (${JOB_CAP}s)}; dispatch released, the next lap retries"
         exit 0
     fi
     drained_s=$(( $(date +%s) - d_t0 ))
@@ -708,7 +758,7 @@ if [ $(( kids + holders + ${scopes:-0} )) -ne 0 ] || op_in_flight; then
     idle=false; d_t0="$(date +%s)"
     if ! wait_job_boundary "restart point"; then
         echo "autoupdate: not restarting, not marking current" >&2
-        au_log deferred "broker job or device op still running at restart time (job cap ${JOB_CAP}s)"
+        au_log deferred "${drain_why:-broker job or device op still running at restart time (job cap ${JOB_CAP}s)}"
         exit 0
     fi
     drained_s=$(( drained_s + $(date +%s) - d_t0 ))

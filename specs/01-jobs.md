@@ -259,7 +259,9 @@ the queue and a running job outlive the broker process.
   kill and what follows it. `/health` and job status name the cause while the label reads
   `PREEMPTING` (`preempt_cause`: `update` when the hold is the only waiter, else `queued`), and
   `/health` gives the seconds left before the running job's x (`preempt_limit_left_sec`, 0 past
-  it), which the updater bounds its drain by (spec 08 I20). The broker sends the job no signal and takes no action until contention has lasted
+  it), which the updater bounds its drain by (spec 08 I20: the time left plus 100 s, then the
+  post-job gate the preemption leads to, at most `GATE_CAP`; a limit too far off is not held
+  through, so the hold never preempts a job on a lap that cannot apply). The broker sends the job no signal and takes no action until contention has lasted
   `PREEMPT_GRACE_SEC` (60 s) unbroken: that minute is for the job to see the waiter in the
   queue and end itself. The minute starts at the later of x and the earliest current waiter's
   arrival (`_preempt_kill_at`, `Job.contention_since_monotonic`). When every waiter leaves,

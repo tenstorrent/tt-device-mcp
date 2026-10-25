@@ -108,6 +108,7 @@ ls() {{ :; }}  # no real /proc holders
 job_scopes() {{ [ -n "{scopes}" ] && echo "{scopes}"; }}
 recovery_gate() {{ recovery_why=""; return 1; }}  # a healthy broker: spec 08 I23 has its own tests
 broker_preempt() {{ :; }}  # no preemptable job runs (or no answer)
+broker_names_preempt_job() {{ :; }}  # no answer
 systemctl() {{
     case "$*" in
         *list-units*ttdev-job-*) seen scopes; job_scopes ;;
@@ -835,12 +836,86 @@ def test_a_preemptable_job_before_its_limit_keeps_the_hold_until_the_limit_and_t
     assert trace[-1].startswith("restart held "), trace
 
 
-def test_a_preemptable_bound_is_at_most_the_job_cap(tmp_path):
-    """A limit far off: the hold is kept at most JOB_CAP, then let go; the job is never cut."""
-    stub, _ = _preemptable(limit_left=5000, ends_after=10**9)
-    done, trace, hold = _drain(tmp_path, running=10_000, queue=0, scope=True, job_age=10, stand_ins=stub)
-    _no_restart(done, trace, hold)
-    assert "(bound 1560s:" in done.stderr and "past the job cap (1560s) after 1560s" in done.stderr, done.stderr
+@pytest.mark.parametrize("limit_left", [1461, 1480, 5000])
+def test_a_limit_too_far_off_for_the_job_cap_is_never_held_through(tmp_path, limit_left):
+    """limit + 100 s past the job cap: held through, the hold would preempt the job at its limit
+    and still let go at the cap, a kill on a lap that cannot apply. The lap lets go at once, before
+    the limit, so the hold never preempts the job; the model broker SIGTERMs it only under a live
+    hold a minute past its limit, as the broker does."""
+    stub, _ = _preemptable(limit_left=limit_left, ends_after=10**9)
+    kill = f'[ -e "$HOLD" ] && [ $(cat $M/t) -ge {limit_left + 60} ] && echo "hold-driven kill" >> $M/kills;'
+    done, trace, hold = _drain(
+        tmp_path, running=10_000, queue=0, scope=True, job_age=10, stand_ins=stub, on_sleep=kill
+    )
+    assert done.returncode == 0, done.stderr
+    assert not (tmp_path / "model" / "kills").exists(), "the hold preempted a job on a lap that deferred"
+    assert "is not held through; dispatch released" in done.stderr, done.stderr
+    assert _lap_seconds(tmp_path) < 60, done.stderr
+    assert not any(t.startswith("restart") for t in trace), trace
+    assert not hold.exists(), "a lap that restarts nothing kept dispatch held"
+
+
+def test_a_limit_that_just_fits_the_job_cap_is_held_through(tmp_path):
+    stub, end = _preemptable(limit_left=1460, ends_after=1530)
+    done, trace, hold = _drain(
+        tmp_path, running=10_000, queue=0, scope=True, job_age=10, stand_ins=stub, on_sleep=end
+    )
+    assert done.returncode == 0, done.stderr
+    assert "(bound 1560s:" in done.stderr and "drained after 1530s" in done.stderr, done.stderr
+    assert _polls_held(trace) and trace[-1].startswith("restart held "), trace
+
+
+def _preempted_then_gate(tmp_path, *, gate_ends, seen_by):
+    """The only running job, past its limit, is preempted 70 s in; then the broker's post-job gate
+    (a kill reset, the full check) runs as its child under the device-op lock until `gate_ends`.
+    `seen_by`: how the drain can tell the job ended, its scope or /health."""
+    m = tmp_path / "model"
+    lock = tmp_path / "device-op.lock"
+    unit = "990" if seen_by == "scope" else "428"
+    names = '[ "$(cat $M/running)" -gt 0 ] && echo 1 || echo 0' if seen_by == "health" else ":"
+    stub = f"""
+broker_preempt() {{ echo "1 990 0"; }}
+broker_names_preempt_job() {{ {names}; }}
+job_scopes() {{ [ "$(cat $M/running)" -gt 0 ] && echo "ttdev-job-{unit}.scope loaded active running"; }}
+pgrep() {{ seen pgrep; [ -e $M/gate ] && echo 778; return 0; }}
+"""
+    on_sleep = (
+        f"t=$(cat $M/t); if [ $t -ge 70 ] && [ $(cat $M/running) -gt 0 ]; then echo 0 > $M/running;"
+        f" touch $M/gate; echo {os.getpid()} post_job_gate > {lock}; fi;"
+        f" if [ $t -ge {gate_ends} ]; then rm -f $M/gate {lock}; fi;"
+    )
+    return _drain(tmp_path, running=10_000, queue=0, scope=True, job_age=1600, stand_ins=stub, on_sleep=on_sleep)
+
+
+@pytest.mark.parametrize("seen_by", ["health", "scope"])
+def test_a_preempted_job_whose_post_job_gate_runs_long_still_applies_under_the_same_hold(tmp_path, seen_by):
+    """The hold preempted the job; its post-job gate (op lock live, a broker child) runs to 300 s,
+    past limit + 70 + 30 s. The lap keeps the hold through it and applies at the job boundary, never
+    letting go of dispatch in between (a standby resubmitted then would be killed on every lap)."""
+    done, trace, hold = _preempted_then_gate(tmp_path, gate_ends=300, seen_by=seen_by)
+    assert done.returncode == 0, done.stderr
+    assert "the preemptable job 990 ended after 70s" in done.stderr, done.stderr
+    assert "drained after 300s" in done.stderr, done.stderr
+    assert "dispatch released" not in done.stderr, done.stderr
+    assert _polls_held(trace), "the drain let go of dispatch during the post-job gate"
+    assert trace[-1].startswith("restart held "), trace
+
+
+def test_a_post_job_gate_that_never_ends_lets_go_at_the_gate_cap(tmp_path):
+    done, trace, hold = _preempted_then_gate(tmp_path, gate_ends=10**9, seen_by="health")
+    assert done.returncode == 0, done.stderr
+    assert "post-job gate is still running 936s after the preempted job ended" in done.stderr, done.stderr
+    assert 70 + 936 <= _lap_seconds(tmp_path) < 70 + 936 + 5, done.stderr  # 5 s polls
+    assert not any(t.startswith("restart") for t in trace), trace
+    assert not hold.exists(), "a lap that restarts nothing kept dispatch held"
+
+
+def test_the_gate_cap_is_a_kill_reset_plus_a_full_check_on_32_chips():
+    from tt_device_mcp import constants
+
+    assert "\nGATE_CAP=936\n" in _SCRIPT.read_text()
+    full = constants.FABRIC_CHECK_TIMEOUT_SEC + constants.FULL_CHECK_PER_CHIP_SEC * 32
+    assert constants.DEVICE_RESET_TIMEOUT_SEC + constants.GRACEFUL_KILL_GRACE_SEC + full == 936, "GATE_CAP drifted"
 
 
 @pytest.mark.parametrize("report", ["", "2 990 0"])
