@@ -31,10 +31,11 @@
 # A busy lap drains (spec 08 I20): it keeps the hold, lets the running job finish and applies at
 # that job boundary. The wait under the hold is bounded by the broker's hard job limit, counted
 # from the job's start: a broker job past it still gets no restart, so the lap lets go of dispatch
-# and the next lap retries until the job ends (a capped job by the broker's limit kill; a
-# no-timeout-except-on-contention job only by itself or on contention, so with nothing queued the
-# update waits with no bound). A drain blocks this lap (and the
-# reconcile after it) for at most that long.
+# and the next lap retries until the job ends (a capped job by the broker's limit kill). A
+# no-timeout-except-on-contention job is preempted by the hold itself once past its time limit:
+# the broker counts a live hold as a waiting job (spec 01 I20), so the lap keeps the hold through
+# the job's limit, the broker's preempt grace and kill grace, and applies when it ends. A drain
+# blocks this lap (and the reconcile after it) for at most the job cap.
 set -u
 
 [ -r /etc/default/tt-device-broker ] && . /etc/default/tt-device-broker
@@ -288,6 +289,16 @@ h = json.load(sys.stdin)
 age = h.get("held_age_sec")
 print(int(bool(h.get("held"))), h.get("fsm_state") or "unknown", age if isinstance(age, int) else -1)' 2>/dev/null
 }
+# A running no-timeout-except-on-contention job, from the broker's /health: prints "<running jobs>
+# <its job id> <seconds before its time limit ends, 0 past it>", nothing if no answer or none runs.
+broker_preempt() {
+    curl -fsS --max-time 5 --unix-socket "$SOCK" http://localhost/health 2>/dev/null \
+        | "$VENV/bin/python" -I -c 'import json, sys
+h = json.load(sys.stdin)
+left = h.get("preempt_limit_left_sec")
+if h.get("preempt_job_id") and isinstance(left, int) and isinstance(h.get("running"), int):
+    print(h["running"], h["preempt_job_id"], max(0, left))' 2>/dev/null
+}
 # Succeeds (and names why in $recovery_why) while the update should wait for the recovery.
 recovery_gate() {
     local held="" state="" age="" now since="" sha="" waited
@@ -361,10 +372,16 @@ fi
 # a job scope, or a device holder inside one: a re-adopted job) never gets a restart: the lap releases
 # dispatch and the next lap retries, so the update applies at that job's end. A capped job ends by
 # the broker's limit kill, at most JOB_CAP after its start. A no-timeout-except-on-contention job
-# (spec 01 I20) is not killed for time: it runs until it ends, or until a queued job contends for it
-# (preempt grace plus kill grace); until then the update waits, with no bound while nothing is queued. Only a device holder outside every broker job, which no broker
-# kill ends, stops holding the update at the bound, so a box busy around the clock still updates.
+# (spec 01 I20) is not killed for time: it ends by itself, or on contention past its time limit, and
+# the hold is contention (the broker counts a live hold as one waiting job, never dispatched). So
+# when the broker reports the only running job as one, the bound is the time left before its limit
+# plus PREEMPT_TAIL (the broker's preempt grace, its kill grace and a margin for the job's exit),
+# from this wait's start and at most JOB_CAP; never shorter than the job cap's own bound. Only a
+# device holder outside every broker job, which no broker kill ends, stops holding the update at the
+# bound, so a box busy around the clock still updates.
 JOB_CAP=1560
+# PREEMPT_GRACE_SEC (60) + PREEMPT_KILL_GRACE_SEC (10) + 30 s for the job's exit to show.
+PREEMPT_TAIL=100
 # A device op's own bound, DEVICE_RESET_TIMEOUT_SEC (600) plus the same kill grace: how long an op
 # with no job running may keep the hold (see wait_job_boundary). It bounds the wait, never the
 # bar: past it the lap releases dispatch and restarts nothing (I7); the next lap retries.
@@ -439,11 +456,23 @@ op_in_flight() { op_lock_live || reset_scope_listed; }
 # its timeout is left running in its scope), and an update never restarts over one (I7). $1 names
 # the wait in the log.
 wait_job_boundary() {
-    local w_start w_now w_bound op_since=""
+    local w_start w_now w_bound w_why op_since="" p_running="" p_job="" p_left=""
     youngest_job_age
     w_bound=$(( JOB_CAP - j_age )); [ "$w_bound" -gt 0 ] || w_bound=0
+    w_why="job cap ${JOB_CAP}s, youngest job ${j_age}s in"
+    # Spec 01 I20, spec 08 I20: the only running job is preemptable, so the hold preempts it once
+    # past its limit; keep the hold that long.
+    read -r p_running p_job p_left <<EOF
+$(broker_preempt)
+EOF
+    if [ "${p_running:-0}" = 1 ] && [ -n "${p_job:-}" ] && [ "${p_left:--1}" -ge 0 ] 2>/dev/null; then
+        p_left=$(( p_left + PREEMPT_TAIL ))
+        [ "$p_left" -le "$JOB_CAP" ] || p_left=$JOB_CAP
+        [ "$p_left" -le "$w_bound" ] || w_bound=$p_left
+        w_why="$w_why; preemptable job $p_job: limit + ${PREEMPT_TAIL}s, at most ${JOB_CAP}s"
+    fi
     w_start="$(date +%s)"
-    echo "autoupdate: $1: busy (children=$kids holders=$holders scopes=${scopes:-0} queued=$queued) -> draining: dispatch held, the running job finishes, then the update applies (bound ${w_bound}s: job cap ${JOB_CAP}s, youngest job ${j_age}s in)" >&2
+    echo "autoupdate: $1: busy (children=$kids holders=$holders scopes=${scopes:-0} queued=$queued) -> draining: dispatch held, the running job finishes, then the update applies (bound ${w_bound}s: $w_why)" >&2
     while :; do
         count_busy
         running=$(( kids + holders + ${scopes:-0} ))

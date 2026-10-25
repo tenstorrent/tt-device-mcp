@@ -17,6 +17,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 _SCRIPT = Path(__file__).resolve().parent.parent / "deploy" / "tt-device-autoupdate.sh"
 
 
@@ -105,6 +107,7 @@ pgrep() {{ seen pgrep; }}
 ls() {{ :; }}  # no real /proc holders
 job_scopes() {{ [ -n "{scopes}" ] && echo "{scopes}"; }}
 recovery_gate() {{ recovery_why=""; return 1; }}  # a healthy broker: spec 08 I23 has its own tests
+broker_preempt() {{ :; }}  # no preemptable job runs (or no answer)
 systemctl() {{
     case "$*" in
         *list-units*ttdev-job-*) seen scopes; job_scopes ;;
@@ -790,3 +793,61 @@ def test_a_lap_that_drains_reports_busy_and_its_drain_time(tmp_path):
 def test_a_wait_at_the_restart_point_adds_to_the_drain_time(tmp_path):
     lap = _recorded_lap(tmp_path, running=0, queue=0, install="echo 30 > $M/running")
     assert lap == "idle=false drained_s=140"
+
+
+# --- spec 01 I20, spec 08 I20: the hold preempts a no-timeout-except-on-contention job ------------
+# The broker counts a live hold as a waiting job for a preemptable job past its limit: the preempt
+# grace (60 s) then SIGTERM, SIGKILL 10 s later. The model broker ends the job that long after its
+# limit, as the broker does with nothing else queued; the lap keeps the hold through it.
+
+
+def _preemptable(limit_left, ends_after, running=1):
+    """broker_preempt reports one running preemptable job `limit_left` s before its limit; the model
+    job ends `ends_after` s into the drain (the broker's preemption)."""
+    stub = f'\nbroker_preempt() {{ echo "{running} 990 {limit_left}"; }}\n'
+    end = f"[ $(cat $M/t) -ge {ends_after} ] && echo 0 > $M/running;"
+    return stub, end
+
+
+def test_a_preemptable_job_past_its_limit_is_drained_by_the_hold(tmp_path):
+    """Nothing queued, the job past its limit and past the job cap: today's lap would let go at
+    once and retry forever. It now keeps the hold for the preempt bound (60 + 10 + 30 s), the
+    broker preempts the job, and the update applies at that boundary."""
+    stub, end = _preemptable(limit_left=0, ends_after=70)
+    done, trace, hold = _drain(
+        tmp_path, running=10_000, queue=0, scope=True, job_age=1600, stand_ins=stub, on_sleep=end
+    )
+    assert done.returncode == 0, done.stderr
+    assert "(bound 100s: job cap 1560s, youngest job 1600s in; preemptable job 990" in done.stderr, done.stderr
+    assert "drained after 70s" in done.stderr, done.stderr
+    assert _polls_held(trace), "the drain let go of dispatch before the preemption"
+    assert trace[-1].startswith("restart held "), trace
+
+
+def test_a_preemptable_job_before_its_limit_keeps_the_hold_until_the_limit_and_the_preemption(tmp_path):
+    stub, end = _preemptable(limit_left=300, ends_after=370)
+    done, trace, hold = _drain(
+        tmp_path, running=10_000, queue=0, scope=True, job_age=1500, stand_ins=stub, on_sleep=end
+    )
+    assert done.returncode == 0, done.stderr
+    assert "(bound 400s:" in done.stderr and "drained after 370s" in done.stderr, done.stderr
+    assert _polls_held(trace)
+    assert trace[-1].startswith("restart held "), trace
+
+
+def test_a_preemptable_bound_is_at_most_the_job_cap(tmp_path):
+    """A limit far off: the hold is kept at most JOB_CAP, then let go; the job is never cut."""
+    stub, _ = _preemptable(limit_left=5000, ends_after=10**9)
+    done, trace, hold = _drain(tmp_path, running=10_000, queue=0, scope=True, job_age=10, stand_ins=stub)
+    _no_restart(done, trace, hold)
+    assert "(bound 1560s:" in done.stderr and "past the job cap (1560s) after 1560s" in done.stderr, done.stderr
+
+
+@pytest.mark.parametrize("report", ["", "2 990 0"])
+def test_a_job_past_the_cap_still_defers_unless_the_only_running_job_is_preemptable(tmp_path, report):
+    """No preemptable job (or a second job running beside it): the job cap's bound, as before."""
+    stub = f'\nbroker_preempt() {{ [ -n "{report}" ] && echo "{report}"; }}\n'
+    done, trace, hold = _drain(tmp_path, running=10_000, queue=1, scope=True, job_age=1600, stand_ins=stub)
+    _no_restart(done, trace, hold)
+    assert "(bound 0s: job cap 1560s, youngest job 1600s in)" in done.stderr, done.stderr
+    assert "past the job cap (1560s) after 0s" in done.stderr, done.stderr
