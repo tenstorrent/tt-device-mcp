@@ -674,6 +674,10 @@ class RecoveryMechanism:
         self.post_reset_failed: set = set()
         # Spec 04 I97: the last mesh reset's tt-smi gave up at its driver wait (a failed reset).
         self.last_reset_driver_wait_failed: bool = False
+        # Spec 04 I102: that give-up came after the tray re-power ran, and the rescan after that reset
+        # was withheld (I69). The late-chip retry reads both.
+        self.last_reset_tray_repower: bool = False
+        self.last_reset_rescan_withheld: bool = False
         self.post_reset_cut: Optional[Callable[[list], Awaitable[bool]]] = None
         # Any reset_with_quiesce (the ladder's or a manual one) since the mesh was last released:
         # an off-bus set first seen after it is the reset's doing, never a tray-down onset (04 I19).
@@ -1530,6 +1534,7 @@ class RecoveryMechanism:
                     # Spec 04 I69 on the mesh path, decided after the cut so a chip the I83 cut just
                     # removed is also kept out when the BMC re-power did not reach it.
                     withheld = mesh and self._withhold_failed_mesh_rescan(rc, text, log)
+                    self.last_reset_rescan_withheld = bool(withheld)
                     if not withheld:
                         # A reset can leave endpoints un-enumerated — and any chip we isolated earlier is
                         # still out of the kernel, because `remove` is not undone by a reset. Rescan, or the
@@ -1662,6 +1667,7 @@ class RecoveryMechanism:
         repowered = glx_tray_repower_ran(text)
         if gave_up and not failed:
             self.last_reset_driver_wait_failed = True
+            self.last_reset_tray_repower = repowered
             ran = "the tray re-power ran, but" if repowered else "no tray re-power in tt-smi's output, and"
             log(
                 f"mesh reset FAILED (rc {rc}): {ran} tt-smi gave up at its driver wait — not every chip showed "
@@ -1718,6 +1724,8 @@ class RecoveryMechanism:
         if "-glx_reset" not in argv:
             return on_output, {}
         self.last_reset_driver_wait_failed = False
+        self.last_reset_tray_repower = False
+        self.last_reset_rescan_withheld = False
         isolated = self._isolated_chips() if self._isolated_chips is not None else None
         chips = sorted(isolated, key=int) if isolated else []
         state: dict = {"tail": "", "ptail": "", "task": None, "stop": asyncio.Event()}

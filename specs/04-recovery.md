@@ -2622,6 +2622,34 @@ each rung fires only when the gentler one failed or cannot apply.
   `no_bridge` still withholds the I69 rescan. The full check with fabric still decides every lift
   (I32, I94).
 
+- **I102 — Chips that came back after a mesh reset's driver wait gave up get one more mesh reset
+  before the power cycle.** Seen on a Galaxy partial drop: the sweep's `-glx_reset` re-powered the
+  trays, but two chips trained their links after tt-smi's 100 s driver wait, so tt-smi gave up with no
+  POST_RESET and no board re-init. The chips it found stayed ARC-not-ready, the full check failed, and
+  the power cycle followed although every chip was back on the bus by then. tt-smi has no command for
+  POST_RESET or the re-init alone, so the fix is a second full mesh reset. After a sweep mesh reset
+  whose tt-smi gave up at its driver wait (I97) and whose tray re-power ran
+  (`last_reset_tray_repower`), the sweep rescans the Tenstorrent root ports once. Those include the
+  ports the saved topology remembers. The rescan is one write through the PCI writer, bounded by its
+  30 s timeout (`LATE_CHIP_RESCAN_SEC`; well under a second when it succeeds), and no settle follows it.
+  When every expected chip is then enumerated and none is isolated or removed, the broker's check
+  readers are stopped first (I87's host-hang note) and one more mesh reset runs under the AER mask
+  (`late_chips_mesh_reset` fired, then `late_chips_mesh_reset_done`). Then the caller's own full check
+  with fabric decides. Only its pass lifts the hold, through the funnel. A failed check, or one that
+  finds fewer fabric links than the cabling expects, keeps the hold and goes on to the power cycle in
+  the same pass. A chip still missing after the rescan, a failed or refused rescan, or a rescan that
+  I69 withheld ends the step at once: no second reset and no added wait (`late_chips_mesh_reset` not
+  fired, with the reason). It runs once per hold episode. On the I97 path it starts only when the
+  reset, its settle and its check allowance still end by the I97 deadline. A mesh reset that exited
+  before the tray re-power did not run (`reset_did_not_run`) and gets none of this. Classes A and C
+  keep their direct power cycle, and the class A cooldown sweep does not take this step. Cost
+  against the class B1 budget (15 min): the step adds the rescan write and the second reset (about
+  35-60 s) in front of the full check the sweep runs anyway. On the replayed hold, whose power cycle
+  was requested about 11.6 min in, the lift comes about 1 min later than that request, at about
+  12.6 min. That is under the budget, while the power cycle's own recovery ran past it. Remaining risk: the second reset itself
+  gives up at its driver wait (about 263 s); then the power cycle follows as before, later by that
+  reset's time.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -3262,3 +3290,9 @@ sees a silent fabric pass.
 | I101 a banked port that is gone, renumbered, feeds an occupied bus or is malformed is refused | `tests/test_removed_chip_rescan.py::test_a_stale_banked_port_is_refused` |
 | I101 a usable removal record wins over the banked port | `tests/test_removed_chip_rescan.py::test_a_usable_record_still_wins_over_the_banked_port` |
 | I101 the driver-wait SBR hands each chip its address from the broker's live startup map; no map still tries the SBR without one | `tests/test_mesh_reset_readd.py::test_the_driver_wait_sbr_hands_each_chip_its_startup_address`, `tests/test_removed_chip_rescan.py::test_the_broker_hands_the_driver_wait_sbr_its_live_startup_map` |
+| I102 every chip back after the rescan: the readers stop, one more mesh reset runs, and only a just-passed full check with fabric lifts the hold; no power cycle | `tests/test_late_chips_after_driver_wait.py::test_both_chips_back_late_get_one_more_mesh_reset_then_the_full_check_lifts` |
+| I102 a failed full check after the second mesh reset keeps the hold and power-cycles | `tests/test_late_chips_after_driver_wait.py::test_a_failed_full_check_after_the_second_mesh_reset_keeps_the_hold_and_power_cycles` |
+| I102 a chip still missing after the rescan: no second reset and no added wait, the full check, then the power cycle | `tests/test_late_chips_after_driver_wait.py::test_one_chip_still_out_goes_to_the_check_and_the_power_cycle_with_no_wait`, `tests/test_late_chips_after_driver_wait.py::test_the_late_chip_step_alone_is_quick_when_a_chip_is_missing` |
+| I102 no tray re-power (`reset_did_not_run`) or a withheld rescan: no late-chip step | `tests/test_late_chips_after_driver_wait.py::test_no_late_chip_step_without_the_repower_or_when_the_rescan_was_withheld`, `tests/test_mesh_reset_readd.py::test_a_mesh_reset_that_exited_before_the_tray_repower_is_logged_as_not_run` |
+| I102 the give-up after the tray re-power is recorded for the step | `tests/test_mesh_reset_readd.py::test_a_driver_wait_give_up_after_the_tray_repower_says_the_repower_ran` |
+| I102 once per hold episode; a reset that would end past the I97 deadline, or a failed rescan, is skipped | `tests/test_late_chips_after_driver_wait.py::test_the_second_mesh_reset_runs_once_per_hold`, `tests/test_late_chips_after_driver_wait.py::test_a_second_mesh_reset_that_would_end_past_the_deadline_is_skipped`, `tests/test_late_chips_after_driver_wait.py::test_a_failed_rescan_ends_the_step` |

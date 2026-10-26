@@ -479,6 +479,8 @@ async def test_a_driver_wait_give_up_after_the_tray_repower_says_the_repower_ran
     assert ("reset_driver_wait_gave_up", {"rc": 1, "tray_repower": True}) in events
     assert "reset_did_not_run" not in [n for n, _ in events]
     assert mechanism.last_reset_driver_wait_failed is True
+    assert mechanism.last_reset_tray_repower is True, "spec 04 I102 reads it"
+    assert mechanism.last_reset_rescan_withheld is False
 
 
 @pytest.mark.asyncio
@@ -510,6 +512,7 @@ async def test_a_two_chip_partial_drop_that_stays_out_through_the_repower_is_a_f
     assert "reset_did_not_run" not in [n for n, _ in events]
     assert not any("no POST_RESET failure" in m for m in logs)
     assert mechanism.last_reset_driver_wait_failed is True
+    assert mechanism.last_reset_tray_repower is True
 
 
 @pytest.mark.asyncio
@@ -542,3 +545,4 @@ async def test_a_mesh_reset_that_exited_before_the_tray_repower_is_logged_as_not
     assert ("reset_did_not_run", {"rc": 1, **({"ipmi_failed": True} if ipmi_failed else {})}) in events
     assert not any("no POST_RESET failure" in m for m in logs)
     assert mechanism.last_reset_driver_wait_failed is False
+    assert mechanism.last_reset_tray_repower is False, "no I102 late-chip step after a reset that did not run"

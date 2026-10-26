@@ -64,6 +64,7 @@ from tt_device_mcp.health.recovery import (
 from tt_device_mcp.health.recovery.base import (
     CYCLE_LAUNCH_REPAGE_SEC,
     HOLD_ESCALATION_REARM_SEC,
+    PCI_SYSFS_WRITE_TIMEOUT_SEC,
     drop_returned_isolated,
     pci_rescan,
     reenumerate_withheld,
@@ -831,6 +832,10 @@ MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC = 180
 # At the deadline the check's readers get SIGTERM, SIGKILL this much later, then the reap.
 MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC = 10
 MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC = 5
+# Spec 04 I102: the one rescan for chips a mesh reset's re-power brought back after tt-smi's driver wait
+# gave up. It is one write through the PCI writer, so its bound is the writer's (30 s; well under a
+# second on a Galaxy). No settle follows it: a chip that is not back by then costs no wait.
+LATE_CHIP_RESCAN_SEC = PCI_SYSFS_WRITE_TIMEOUT_SEC
 
 
 def _mesh_reset_before_host_rung_deadline_sec() -> float:
@@ -2283,7 +2288,15 @@ class GalaxyRecovery(Recovery):
         return True
 
     async def _issue_all_resets_back_to_back(
-        self, trays: list, expected: int, log, *, do_sbr: bool = True, mesh_reset: bool = True
+        self,
+        trays: list,
+        expected: int,
+        log,
+        *,
+        do_sbr: bool = True,
+        mesh_reset: bool = True,
+        late_chips: bool = True,
+        late_chips_fit: Optional[Callable[[], str]] = None,
     ) -> bool:
         """Fire EVERY reset type once, back-to-back, with no waiting or verifying between them: SBR on
         any chip still bridged, then the mesh-wide reset —
@@ -2298,7 +2311,11 @@ class GalaxyRecovery(Recovery):
         so the caller must not climb to a power cycle on it (I22).
 
         ``mesh_reset=False`` fires SBR only, so the last-chance sweep can re-probe the bus before the
-        mesh reset (spec 04 I86); the caller then fires the mesh reset with ``do_sbr=False``."""
+        mesh reset (spec 04 I86); the caller then fires the mesh reset with ``do_sbr=False``.
+
+        ``late_chips``: a mesh reset whose tt-smi gave up at its driver wait after the tray re-power
+        gets the I102 late-chip step (:meth:`_late_chips_mesh_reset`); ``late_chips_fit`` returns why
+        its second mesh reset may not start (a deadline), or ""."""
         # Every step re-enumerates PCI: none runs under a stuck holder of a removed chip (I77).
         if reenumerate_withheld(self.mechanism, "back-to-back reset sweep", log):
             return False
@@ -2345,12 +2362,81 @@ class GalaxyRecovery(Recovery):
                 # Spec 04 I92: no reset ran. The caller's verify still decides, and a failed one climbs
                 # to the host rung as before; the refusal is journalled as itself, not as a reset.
                 health_event("reset_refused", context="reset_sweep", argv=argv, detail=out)
+            elif late_chips:
+                await self._late_chips_mesh_reset(argv, expected, log, late_chips_fit)
         except Exception as exc:  # noqa: BLE001 - the host rung above must fire even if a reset blew up
             log(f"the back-to-back reset sweep raised {exc!r} — continuing to the host rung")
             health_event("last_chance_reset_sweep_error", error=repr(exc))
         finally:
             self.mechanism.reset_in_flight = False
         return True
+
+    async def _late_chips_mesh_reset(self, argv: list, expected: int, log, fit: Optional[Callable[[], str]]) -> None:
+        """Spec 04 I102: the mesh reset's tray re-power ran, but tt-smi gave up at its driver wait, so no
+        POST_RESET and no board re-init ran. A chip whose link trained after those 100 s is back on the bus
+        by now, or after one more rescan. One rescan of the Tenstorrent root ports (the saved topology's
+        bridges, bounded by LATE_CHIP_RESCAN_SEC, no settle after it); when every expected chip is then
+        enumerated and none is isolated or removed, the broker's readers are stopped and one more mesh
+        reset runs, whose POST_RESET and re-init the chips missed. Once per hold episode. Lifts nothing:
+        the caller's full check with fabric decides, and its failure leads to the power cycle. A chip
+        still missing ends the step at once. Never raises."""
+        mech = self.mechanism
+        if not (mech.last_reset_driver_wait_failed and mech.last_reset_tray_repower):
+            return
+        hold_since = self.deps.device_hold_episode_since() or ""
+
+        def skip(reason: str, **fields) -> None:
+            log(f"no second mesh reset for late chips: {reason} — the full check, then the power cycle if it fails")
+            health_event("late_chips_mesh_reset", fired=False, reason=reason, **fields)
+
+        if self._late_chips_reset_spent == hold_since:
+            return skip("already ran in this hold")
+        if mech.last_reset_rescan_withheld:
+            return skip("the rescan after the reset was withheld (I69)")
+        try:  # the caller holds reset_in_flight, so the sampler defers through the rescan and the reset
+            await pci_rescan("late chips after the driver wait", lambda: _pci_rescan())
+            isolated = self.deps.isolated_chips()
+            if isolated:
+                await asyncio.to_thread(drop_returned_isolated, isolated, "late chips after the driver wait", log)
+            eps = await asyncio.to_thread(pcie_guard.tt_endpoints)
+            isolated, removed = self.deps.isolated_chips(), removed_chip_ids()
+        except (OSError, asyncio.TimeoutError) as exc:
+            return skip(f"the rescan did not complete ({type(exc).__name__}: {exc})")
+        on_bus = len(eps) if eps is not None else 0
+        if eps is None or on_bus < expected or isolated or removed:
+            return skip(
+                f"{on_bus}/{expected} chip(s) on the bus after the rescan",
+                on_bus=on_bus,
+                expected=expected,
+                isolated=sorted(isolated or [], key=int),
+                removed=sorted(removed or [], key=int),
+            )
+        late = fit() if fit is not None else ""
+        if late:
+            return skip(late, on_bus=on_bus, expected=expected)
+        self._late_chips_reset_spent = hold_since
+        reason = "a second mesh reset re-inits the chips that came back after tt-smi's driver wait"
+        try:
+            stopped = await self.monitor.stop_check_readers(reason, MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC)
+        except Exception as exc:  # noqa: BLE001 - the reset quiesces its own pollers
+            log(f"could not stop the check readers before the second mesh reset: {exc!r}")
+            stopped = []
+        log(
+            f"every chip is back on the bus ({on_bus}/{expected}) after tt-smi gave up at its driver wait — "
+            f"one more mesh reset for its POST_RESET and board re-init, readers stopped first ({len(stopped)} ended)"
+        )
+        health_event("late_chips_mesh_reset", fired=True, on_bus=on_bus, expected=expected, stopped_pids=stopped)
+        aer_mask = pcie_guard.mask_for_mesh_reset(log)
+        try:
+            await mech.reset_with_quiesce(argv, log)
+        finally:
+            if aer_mask is not None:
+                await asyncio.to_thread(aer_mask.restore)
+        health_event(
+            "late_chips_mesh_reset_done",
+            rc=mech.last_reset_rc,
+            driver_wait_gave_up=mech.last_reset_driver_wait_failed,
+        )
 
     async def _settle_and_verify_before_host_rung(
         self,
@@ -2736,7 +2822,7 @@ class GalaxyRecovery(Recovery):
         )
         health_event("class_a_cooldown_ladder", off_bus=sorted(offbus, key=int), expected=expected, trays=trays)
         self._td_reset_seen = True  # an onset first sighted after a reset is not an onset (I19)
-        complete = await self._issue_all_resets_back_to_back(trays, expected, log)
+        complete = await self._issue_all_resets_back_to_back(trays, expected, log, late_chips=False)
         if not complete:
             log(
                 "class A 10-min sweep refused (reset gate or outage hold) — holding; the cycle follows at the cooldown's end"
@@ -3520,6 +3606,8 @@ class GalaxyRecovery(Recovery):
 
     # The hold episode whose spec 04 I97 mesh reset has run: once per episode.
     _whole_mesh_reset_spent: Optional[str] = None
+    # The hold episode whose spec 04 I102 late-chip mesh reset has run: once per episode.
+    _late_chips_reset_spent: Optional[str] = None
 
     async def _whole_mesh_reset_before_host_rung(
         self, expected: int, log, phase: str, evidence, *, repeat: bool = False
@@ -3604,7 +3692,17 @@ class GalaxyRecovery(Recovery):
             hold_age_sec=round(age, 1),
             repeat=repeat,
         )
-        if not await self._issue_all_resets_back_to_back([], expected, log, do_sbr=False):
+        def late_chips_fit() -> str:
+            # Spec 04 I102 under I97: the second mesh reset, the settle and the check end by the deadline.
+            now = _hold_age_sec(hold_since) or age
+            needs = MESH_RESET_BEFORE_HOST_RUNG_SEC + MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC
+            if now + needs + MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC > deadline:
+                return f"the hold is {int(now)}s old; it and its check would not end by the {deadline:.0f}s deadline"
+            return ""
+
+        if not await self._issue_all_resets_back_to_back(
+            [], expected, log, do_sbr=False, late_chips_fit=late_chips_fit
+        ):
             log("the mesh reset before the host rung was refused — the power cycle decides")
             return False
         left = deadline - (_hold_age_sec(hold_since) or age)
