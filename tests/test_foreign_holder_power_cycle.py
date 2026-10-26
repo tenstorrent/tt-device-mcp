@@ -9,16 +9,19 @@ Nothing here releases a device: the boot after a cycle runs the startup gate's f
 included (03 I4), and a partial drop still gets the full ladder and sweep first (04 I100)."""
 
 import functools
+import threading
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 
 from tests import test_classac_power_cycle_direct as _direct
+from tests import test_offbus_power_cycle as _gated_cycle
 from tests.conftest import patch_health_event
+from tests.test_host_action_suppress import REASON, held  # noqa: F401 - the auto power cycle's fixture
 from tests.test_classac_power_cycle_direct import EXPECTED, _beats_without, _gate, _off
 from tests.test_pre_reset_holder_scan import READER, _Box, _gap, _scans
-from tt_device_mcp import device_holders
+from tt_device_mcp import device_holders, holder_identity
 from tt_device_mcp import pre_reset_scan as prs
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
@@ -311,3 +314,109 @@ async def test_an_unreadable_scan_outside_a_pre_cycle_run_still_refuses_and_the_
     assert rig["order"] == ["glx_reset:refused"]
     await _gate(rig, galaxy.STAGE_POWER_CYCLE)
     assert rig["order"] == ["glx_reset:refused", "sweep", "power_cycle"]
+
+
+# --- the journal line on every power-cycle road (I103) ---
+
+SCOPED_FD = DeviceHolder(pid=4343, uid=1000, scoped=True)  # a broker job's own process
+
+
+def _fake_proc(tmp_path, monkeypatch, *holders):
+    """/proc for FOREIGN_FD (pid 4242, uid 1000, a secret on its command line) and its parent; the
+    holder scan finds ``holders``."""
+    root = tmp_path / "proc"
+    pdir = root / str(FOREIGN_FD.pid)
+    pdir.mkdir(parents=True)
+    (pdir / "stat").write_text(f"{FOREIGN_FD.pid} (python) S 1 " + " ".join(["0"] * 17) + " 12345 0 0\n")
+    (pdir / "status").write_text("Name:\tpython\nUid:\t1000\t1000\t1000\t1000\n")
+    (pdir / "cmdline").write_bytes(b"python\0train.py\0--token\0hunter2\0")
+    (pdir / "cgroup").write_text("0::/user.slice/user-1000.slice/session-3.scope\n")
+    (root / "1").mkdir()
+    (root / "1" / "comm").write_text("bash\n")
+    monkeypatch.setattr(holder_identity, "PROC_DIR", str(root))
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=list(holders)))
+
+
+def _journal(monkeypatch, events):
+    """Collect the power_cycle_foreign_holders lines in ``events`` (the road's own capture stays)."""
+    real = srv.health_event
+    monkeypatch.setattr(
+        srv, "health_event", lambda kind, **f: events.append(f) if kind == "power_cycle_foreign_holders" else real(kind, **f)
+    )
+    return []
+
+
+async def _auto_road(monkeypatch, tmp_path, held, setup):
+    setup()
+    await srv._auto_power_cycle_host(lambda m: None, REASON)
+    return held["fired"]
+
+
+async def _offbus_road(monkeypatch, tmp_path, setup):
+    hold_since, rec = _gated_cycle._gated(monkeypatch, tmp_path)
+    setup()  # after the arming, which stands in its own holder scan
+    _gated_cycle._ladder_ran(hold_since)
+    assert await _gated_cycle._pass(hold_since) is True
+    return rec["fires"]
+
+
+class _Road:
+    def __init__(self, road, run):
+        self.road, self._run = road, run
+
+    def __call__(self, setup=lambda: None):
+        return self._run(setup)
+
+
+@pytest.fixture
+def road(request, monkeypatch, tmp_path, held, clear_job_state):
+    """Request one power cycle down the named road, ``setup`` run once the road is armed; returns
+    what fired."""
+    if request.param == "auto":
+        return _Road("auto", lambda setup: _auto_road(monkeypatch, tmp_path, held, setup))
+    return _Road(request.param, lambda setup: _offbus_road(monkeypatch, tmp_path, setup))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("road", ["auto", "offbus-gated"], indirect=True)
+async def test_every_power_cycle_road_journals_the_foreign_holder_and_not_a_scoped_one(monkeypatch, tmp_path, road):
+    """Spec 04 I103: the auto power cycle and the off-bus gated cycle each journal
+    ``power_cycle_foreign_holders`` naming the unscoped holder (pid, uid, comm, redacted command
+    line); a scoped holder is not listed. (On the off-bus road a scoped holder is a tenant that holds
+    the cycle, so that road's scan finds the foreign holder only.)"""
+    events: list = []
+    holders = [FOREIGN_FD, SCOPED_FD] if road.road == "auto" else [FOREIGN_FD]
+    fired = await road(lambda: (_fake_proc(tmp_path, monkeypatch, *holders), events.extend(_journal(monkeypatch, events))))
+    assert len(fired) == 1
+    assert len(events) == 1, "one journal line per power-cycle request"
+    rows = events[0]["holders"]
+    assert [r["pid"] for r in rows] == [FOREIGN_FD.pid], "the scoped holder is not listed"
+    row = rows[0]
+    assert row["uid"] == 1000 and row["comm"] == "python" and row["status"] == "live"
+    assert "hunter2" not in row["cmdline"] and "train.py" in row["cmdline"] and "***" in row["cmdline"]
+    assert events[0]["reason"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["hangs", "raises"])
+@pytest.mark.parametrize("road", ["auto", "offbus-gated"], indirect=True)
+async def test_a_holder_read_that_hangs_or_raises_never_holds_the_cycle(monkeypatch, tmp_path, road, fault):
+    events: list = []
+    release = threading.Event()
+    read: list = []
+
+    def rows():
+        read.append(1)
+        if fault == "raises":
+            raise RuntimeError("proc walk failed")
+        release.wait(10)
+        return []
+
+    monkeypatch.setattr(srv, "_foreign_holder_rows", rows)
+    monkeypatch.setattr(srv, "POWER_CYCLE_HOLDER_LOG_SEC", 0.05)
+    try:
+        fired = await road(lambda: _journal(monkeypatch, events))
+    finally:
+        release.set()
+    assert read == [1], "the journal read ran on this road"
+    assert len(fired) == 1 and events == []

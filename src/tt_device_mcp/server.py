@@ -1343,6 +1343,7 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
         )
         PCI_WRITER.on_latch = _on_pci_wedged
         recovery_mechanism.pre_reset_scan = _pre_reset_holder_scan
+        recovery_mechanism.power_cycle_journal = _journal_power_cycle_foreign_holders
         recovery_mechanism.owe_device_pollers = lambda after: _owe_device_pollers(
             _pollers_unfit_reason() or f"{after} did not complete"
         )
@@ -7161,7 +7162,6 @@ async def _auto_power_cycle_host(log, reason: str) -> bool:
     False when it certainly did not launch: the caller keeps the hold, pages, and asks again on the
     next pass — there is no reboot fallback."""
     _void_fabric_ok("auto power cycle")
-    await _journal_power_cycle_foreign_holders(reason)
     return await recovery_mechanism._fire_recovery_escalation(
         "power-cycle",
         row_owner="[broker]power-cycle-request",

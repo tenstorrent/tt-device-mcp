@@ -626,6 +626,9 @@ class RecoveryMechanism:
         # run ('' when it may): a tenant under an automatic reset, or a reader that would not let
         # go. The broker sets it; called with (argv, owner, log).
         self.pre_reset_scan: Optional[Callable[[list, str, Callable[[str], None]], Awaitable[str]]] = None
+        # Spec 04 I103: names the device holders outside every broker scope with each power-cycle request,
+        # whatever road requests it. Bounded by its owner, never raises, never holds the cycle.
+        self.power_cycle_journal: Optional[Callable[[str], Awaitable[None]]] = None
         # Owes the pollers a step left stopped to the broker's next close to HEALTHY (spec 03 I66,
         # 04 I12); the broker sets it. Called with what the step was.
         self.owe_device_pollers: Optional[Callable[[str], None]] = None
@@ -3056,6 +3059,11 @@ class RecoveryMechanism:
         act."""
         ev = action.replace("-", "_")
         stage = _ACTION_TO_STAGE[action]
+        if action == "power-cycle" and self.power_cycle_journal is not None:
+            try:
+                await self.power_cycle_journal(reason)
+            except Exception as exc:  # noqa: BLE001 - logging only; never holds the cycle
+                log(f"{label.upper()}: foreign holder journal failed ({exc!r}); going ahead")
         if not self.record_auto_recovery(action, reason):
             log(
                 f"{label.upper()} ABORTED: could not persist the escalation record; refusing to act "
