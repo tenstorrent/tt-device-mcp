@@ -114,7 +114,14 @@ from tt_device_mcp.device_holders import (
     zombie_info,
 )
 from tt_device_mcp.exit_witness import ExitWitness
-from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState, _episode_elapsed_sec, add_close_listener
+from tt_device_mcp.fsm import (
+    FsmRecord,
+    ServerFsm,
+    ServerState,
+    _episode_elapsed_sec,
+    add_close_listener,
+    unwrap_startup_pending,
+)
 from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 I72)
     _HOST_ESCALATION_ACTION,
     BELOW_FLOOR,
@@ -1435,7 +1442,7 @@ def _hold_is_tenant_held() -> bool:
     """The open episode is a foreign process holding the device (its own why, or a held door the
     holder scan reworded), not a device fault."""
     record = fsm.record
-    return record.why == "foreign_holder" or record.detail.startswith(FOREIGN_HOLDER_NOTE)
+    return record.why == "foreign_holder" or unwrap_startup_pending(record.detail).startswith(FOREIGN_HOLDER_NOTE)
 
 
 # Whether this process's next hold may inherit the clock on disk: only while the device has not
@@ -3486,18 +3493,52 @@ def _aiclk_left_busy(ceiling_mhz: int = IDLE_AICLK_MAX_MHZ) -> dict[str, int]:
     return busy
 
 
-def _note_aiclk_after_job(job: "Job", job_log_file: Optional[Path]) -> None:
+_GATE_FABRIC_WORDS = {"killed": "killed mid-run", "fail": "failed", "skipped": "reached no verdict", "pass": "passed"}
+
+
+def _note_aiclk_after_job(
+    job: "Job",
+    job_log_file: Optional[Path],
+    at_end: Optional[dict[str, int]] = None,
+    gate_since: Optional[float] = None,
+) -> None:
     """Record a job end that left chips at the busy clock (03 B-post-job clock check).
 
     Runs after the post-job gate, and only after a job that did not complete: a clean close is
-    what drops the clock, and a completed job closed cleanly. The gate's forced fabric pass opens
-    and closes the mesh, which should already have settled the clock; a chip still busy here
-    means it did not run (the gate was skipped, e.g. over a holder) or did not close. Only a
-    record: the next open sets the clock anyway, so this never delays or holds a tenant."""
+    what drops the clock, and a completed job closed cleanly. ``at_end`` is the runner's own read
+    at the job's end, before the gate (``None``: not read then); ``gate_since`` is when the gate
+    started (monotonic), so a fabric pass that returned since is the gate's own. The busy clock is
+    blamed on the job only when a chip was already busy at its end. When none was, the gate raised
+    it: its fabric pass opens the mesh, and one stopped mid-run (dead-chip isolation, I82) leaves
+    the clock up. Only a record: the next open sets the clock anyway, so this never delays or
+    holds a tenant."""
     busy = _aiclk_left_busy()
     if not busy:
         return
     top = max(busy.values())
+    outcome_since = getattr(health_monitor, "fabric_outcome_since", None)
+    fabric = outcome_since(gate_since) if gate_since is not None and outcome_since else ""
+    head = (
+        f"{len(busy)} chip(s) at the busy AI clock after job {job.id} ended {job.status.value} "
+        f"and its post-job gate ran (max {top} MHz, idle ceiling {IDLE_AICLK_MAX_MHZ} MHz)"
+    )
+    gate_step = f"the gate's fabric check ({_GATE_FABRIC_WORDS.get(fabric, fabric)})" if fabric else "a gate step"
+    if at_end:
+        state, cause = "busy", "job"
+        line = (
+            f"{len(busy)} chip(s) still at the busy AI clock after job {job.id} ended "
+            f"{job.status.value} (max {top} MHz, idle ceiling {IDLE_AICLK_MAX_MHZ} MHz; "
+            f"{len(at_end)} chip(s) busy at job end): the job did not close the device"
+        )
+    elif at_end is not None:
+        state, cause = "idle", "gate_fabric_check" if fabric else "post_job_gate"
+        line = (
+            f"{head}: no chip was above the idle clock when the job ended, so {gate_step} "
+            f"raised it and did not close the device, not the job"
+        )
+    else:
+        state, cause = "not_read", "unknown"
+        line = f"{head}: the clock was not read at job end, so the job or {gate_step} left it"
     health_event(
         "aiclk_busy_after_job",
         job=job.id,
@@ -3505,11 +3546,9 @@ def _note_aiclk_after_job(job: "Job", job_log_file: Optional[Path]) -> None:
         chips=len(busy),
         max_mhz=top,
         ceiling_mhz=IDLE_AICLK_MAX_MHZ,
-    )
-    line = (
-        f"{len(busy)} chip(s) still at the busy AI clock after job {job.id} ended "
-        f"{job.status.value} (max {top} MHz, idle ceiling {IDLE_AICLK_MAX_MHZ} MHz): "
-        f"the job did not close the device"
+        at_job_end=state,
+        cause=cause,
+        gate_fabric=fabric or "none",
     )
     if logger:
         logger.warning(f"CLEAN-GATE {line}")
@@ -14396,14 +14435,13 @@ export {JOB_TAG_ENV}={job_tag}
                 # debt (03 B-post-job clock check): a forced fabric pass first only 77s or fails on it.
                 # A preempted job is read whatever its exit code: its proven 0 (spec 01 I20) is a
                 # report, not a reason to skip the clock read it always had.
-                left_busy = (
-                    _aiclk_left_busy()
-                    if not killed_by_reset
+                clock_read = (
+                    not killed_by_reset
                     and not known
                     and not topo
                     and (job.exit_code != 0 or job.status == JobStatus.PREEMPTED)
-                    else {}
                 )
+                left_busy = _aiclk_left_busy() if clock_read else {}
                 if (
                     not killed_by_reset
                     and not known
@@ -14489,6 +14527,7 @@ export {JOB_TAG_ENV}={job_tag}
                     except Exception as e:  # noqa: BLE001 - never crash the runner
                         if logger:
                             logger.error(f"JOB_RUNNER verification settle error for job_id={job_id}: {e}")
+                gate_started = time.monotonic()
                 try:
                     # Any non-success exit means we do not know what the job did to the
                     # mesh, so the fabric is proved before the next tenant sees it — the
@@ -14521,10 +14560,13 @@ export {JOB_TAG_ENV}={job_tag}
                     post_job_gate_pending = False
 
                 # A job that did not finish cleanly may not have closed the device, which leaves
-                # its chips at the busy clock. Record it so the timeline shows it (03 B-post-job).
+                # its chips at the busy clock. Record it so the timeline shows it, blamed on the job
+                # only if the job-end read already saw it busy (03 B-post-job).
                 if job.status != JobStatus.COMPLETED or job.exit_code != 0:
                     try:
-                        _note_aiclk_after_job(job, job_log_file)
+                        _note_aiclk_after_job(
+                            job, job_log_file, at_end=left_busy if clock_read else None, gate_since=gate_started
+                        )
                     except Exception as e:  # noqa: BLE001 - a record, never a reason to stop
                         if logger:
                             logger.warning(f"JOB_RUNNER job_id={job_id} clock check failed: {e}")
