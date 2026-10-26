@@ -12,7 +12,7 @@ from typing import Optional
 
 from tt_device_mcp import privileges
 from tt_device_mcp.health.evidence import health_event
-from tt_device_mcp.health.monitors import pci
+from tt_device_mcp.health.monitors import hostpci, pci
 
 _BDF_RE = r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]"
 # After a Secondary Bus Reset release the link must retrain before a rescan reads config space
@@ -107,18 +107,47 @@ def reset_chip_via_bridge(idx: str, bdf: str) -> Optional[bool]:
         return False
 
 
-def reset_removed_chip(idx: str) -> Optional[bool]:
+def reset_removed_chip(idx: str, bdf: Optional[str] = None) -> Optional[bool]:
     """Fire the Secondary Bus Reset of a chip the broker removed, through its recorded bridge, and
     do NOT rescan: the caller resets every removed chip of the pass first, waits
     SBR_RETRAIN_SETTLE_SEC once and rescans once, so no rescan re-enumerates a removed chip that is
     still hung (spec 04 I69). ``True`` the reset fired,
-    ``False`` a setpci write failed, ``None`` no usable bridge or no setpci."""
+    ``False`` a setpci write failed, ``None`` no usable bridge or no setpci.
+
+    ``bdf``, the chip's address from the broker's startup map, lets a chip with no usable record
+    (it came back after an earlier reset and left the bus again, so its record was dropped) reach
+    its bridge through the banked link baseline instead (spec 04 I101, saved_topology_bridge)."""
     bridge = recorded_bridge(idx)
+    rec = pci.removed_chip(idx) or {}
+    if not bridge and (rec.get("bdf") or bdf):
+        bridge = saved_topology_bridge(idx, rec.get("bdf") or bdf)
     if not bridge:
-        rec = pci.removed_chip(idx) or {}
-        health_event("bridge_reset_failed", chip=idx, bdf=rec.get("bdf"), reason="no_bridge")
+        health_event("bridge_reset_failed", chip=idx, bdf=rec.get("bdf") or bdf, reason="no_bridge")
         return None
     return secondary_bus_reset(idx, bridge)
+
+
+def saved_topology_bridge(idx: str, bdf: str) -> Optional[str]:
+    """The bridge above chip ``idx`` at ``bdf`` as the banked link baseline names it, or None (spec 04
+    I101).
+
+    A chip whose own node is gone has no parent link to walk, and one the broker did not remove (or
+    whose removal record was dropped when an earlier reset brought it back) has no recorded bridge
+    either. Every passing check banks each Tenstorrent link with the port above it
+    (pcie_link_baseline.json), so that port is still known. It is used only under the same proof as
+    a recorded bridge: still enumerated, its secondary bus is the chip's bus, and nothing is
+    enumerated on that bus. A mapping that fails the proof is journaled and refused; a chip with no
+    banked mapping returns None quietly, as before."""
+    link = hostpci._load_link_baseline().get(bdf)
+    bridge = link.get("port") if isinstance(link, dict) else None
+    if not bridge:
+        return None
+    why = _bridge_refusal(bridge, bdf) if isinstance(bridge, str) and re.fullmatch(_BDF_RE, bridge) else "bad_port"
+    if why:
+        health_event("saved_topology_bridge_refused", chip=idx, bdf=bdf, bridge=bridge, reason=why)
+        return None
+    health_event("saved_topology_bridge", chip=idx, bdf=bdf, bridge=bridge)
+    return bridge
 
 
 def recorded_bridge(idx: str) -> Optional[str]:
@@ -134,7 +163,18 @@ def recorded_bridge(idx: str) -> Optional[str]:
     if not rec:
         return None
     bridge, bdf = rec.get("bridge"), rec.get("bdf") or ""
-    m = re.fullmatch(r"([0-9a-f]{4}):([0-9a-f]{2}):[0-9a-f]{2}\.[0-9a-f]", bdf)
+    why = _bridge_refusal(bridge, bdf)
+    if why:
+        health_event("recorded_bridge_refused", chip=idx, bdf=bdf, bridge=bridge, reason=why)
+        return None
+    return bridge
+
+
+def _bridge_refusal(bridge: Optional[str], bdf: str) -> Optional[str]:
+    """Why ``bridge`` may not be reset for the chip that was at ``bdf``, or None when it may: it must
+    still be enumerated, its secondary bus must be the chip's bus and nothing may be enumerated on
+    that bus (a renumbered or reoccupied bus means the bridge now feeds live silicon)."""
+    m = re.fullmatch(r"([0-9a-f]{4}):([0-9a-f]{2}):[0-9a-f]{2}\.[0-9a-f]", bdf or "")
     why = None
     if not bridge or not re.fullmatch(_BDF_RE, bridge) or not m:
         why = "no_recorded_bridge"
@@ -156,10 +196,7 @@ def recorded_bridge(idx: str) -> Optional[str]:
                 live = ["unreadable"]
             if live:
                 why = "bus_occupied"
-    if why:
-        health_event("recorded_bridge_refused", chip=idx, bdf=bdf, bridge=bridge, reason=why)
-        return None
-    return bridge
+    return why
 
 
 def secondary_bus_reset(idx: str, bridge: str) -> Optional[bool]:

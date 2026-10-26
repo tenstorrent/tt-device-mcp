@@ -302,11 +302,12 @@ def _calls_named(name):
 
 
 def test_every_reset_path_goes_through_the_guarded_backends():
-    """Gate and ladder (recovery/__init__), the last-chance sweep (galaxy), the operator reset and
-    the startup reset (server) all launch through reset_with_quiesce -> run_scoped, whose two
+    """Gate and ladder (recovery/__init__), the last-chance sweep and its late-chip second mesh reset
+    (galaxy, spec 04 I102), the operator reset and the startup reset (server) all launch through reset_with_quiesce -> run_scoped, whose two
     backends wrap a mesh reset (tests above). Nothing else builds a mesh-reset argv."""
     assert sorted(_calls_named("reset_with_quiesce")) == [
         "health/recovery/__init__.py",
+        "health/recovery/galaxy.py",
         "health/recovery/galaxy.py",
         "server.py",
         "server.py",
