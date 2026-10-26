@@ -919,7 +919,7 @@ async def test_each_holder_is_identified_before_it_is_signalled(monkeypatch):
     """Logging only: the scan reads each holder's identity when it finds it, before any signal, so
     a reader it kills is still named afterwards. The verdict and the signals are unchanged."""
     order: list = []
-    box = _Box(monkeypatch, [TENANT, READER], order=order)
+    box = _Box(monkeypatch, [TENANT, READER], tenants=[TENANT], order=order)
     monkeypatch.setattr(
         prs, "holder_identity", lambda pid: order.append(f"identify:{pid}") or {"pid": pid, "status": "live"}
     )
