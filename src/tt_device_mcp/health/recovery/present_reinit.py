@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
 """Spec 04 I104: POST_RESET and board re-init on the chips present, after tt-smi gave up at its driver wait.
 
 tt-smi's Galaxy mesh reset waits for every chip of the mesh to reappear before it issues POST_RESET and
