@@ -3648,7 +3648,7 @@ PCIE_SNAPSHOT_TIMEOUT_SEC = 5.0
 async def _pcie_snapshot() -> dict:
     """One read-only per-chip AER and link snapshot (spec 03 I91), {} on any error or timeout."""
     try:
-        return await asyncio.wait_for(
+        return await aio.wait_for(
             asyncio.to_thread(pcie_aer.snapshot, _pcie_suspect()), PCIE_SNAPSHOT_TIMEOUT_SEC
         )
     except asyncio.TimeoutError:
