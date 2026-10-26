@@ -62,6 +62,7 @@ from tt_device_mcp.health.recovery import (
     mesh_repeat,
     offbus_power_cycle,
     pcie_guard,
+    present_reinit,
 )
 from tt_device_mcp.health.recovery.base import (
     CYCLE_LAUNCH_REPAGE_SEC,
@@ -72,7 +73,6 @@ from tt_device_mcp.health.recovery.base import (
     reenumerate_withheld,
     refuse_mesh_reset,
 )
-from tt_device_mcp.health.recovery import present_reinit
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
 from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook
 
