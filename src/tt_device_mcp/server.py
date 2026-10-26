@@ -3640,10 +3640,23 @@ def _pcie_suspect() -> set:
         return set()
 
 
+# Spec 03 I91: a snapshot takes ~30 ms on a 32-chip host; one whose sysfs read stalls is left out
+# after this long, so it never holds up a job start or the post-job check.
+PCIE_SNAPSHOT_TIMEOUT_SEC = 5.0
+
+
 async def _pcie_snapshot() -> dict:
-    """One read-only per-chip AER and link snapshot (spec 03 I91), {} on any error."""
+    """One read-only per-chip AER and link snapshot (spec 03 I91), {} on any error or timeout."""
     try:
-        return await asyncio.to_thread(pcie_aer.snapshot, _pcie_suspect())
+        return await asyncio.wait_for(
+            asyncio.to_thread(pcie_aer.snapshot, _pcie_suspect()), PCIE_SNAPSHOT_TIMEOUT_SEC
+        )
+    except asyncio.TimeoutError:
+        try:
+            health_event("pcie_snapshot_timeout", timeout_s=PCIE_SNAPSHOT_TIMEOUT_SEC)
+        except Exception:  # noqa: BLE001
+            pass
+        return {}
     except Exception:  # noqa: BLE001
         return {}
 

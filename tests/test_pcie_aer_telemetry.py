@@ -7,13 +7,18 @@ own link; the gate decides exactly as without it.
 
 Every test runs against a fake sysfs tree: four Blackhole trays, one chip each."""
 
+import asyncio
+import collections
 import sys
+import threading
+import time
 import types
 
 import pytest
 
 from tests.conftest import fsm_dirty
 from tests.test_eth_timeout_reset import ADVANCING, _gate, mesh  # noqa: F401 - the gate fixture
+from tests.test_restart_drain import _job, _quiet_runner
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import chip_state
@@ -164,6 +169,42 @@ def test_a_chip_the_sampler_read_all_ones_is_not_read(bus):
     assert snap["2"]["link_skipped"] == "all_ones" and not _link_reads(bus, 2)
 
 
+@pytest.mark.asyncio
+async def test_the_broker_s_snapshot_never_reads_the_link_of_a_chip_the_sampler_read_all_ones(bus, monkeypatch):
+    """The broker's own snapshot takes the all-ones chips from the sampler's last sample, so a chip
+    that just dropped off the bus is not read (its earlier healthy sample does not count)."""
+    healthy = {str(chip): [100 + chip, 0] for chip, _b, _r in CHIPS}
+    dropped = {**healthy, "2": [chip_state.ALL_ONES, 0]}
+    ring = collections.deque([{"ts": 1.0, "chips": healthy}, {"ts": 2.0, "chips": dropped}])
+    monkeypatch.setattr(srv.sampler, "ring", ring)
+    snap = await srv._pcie_snapshot()
+    assert snap["2"]["link_skipped"] == "all_ones" and "link" not in snap["2"]
+    assert not _link_reads(bus, 2), "the link of a chip the sampler read all-ones was read"
+    assert snap["2"]["aer"]["cor"] == 5, "the kernel's own counters reach no chip"
+    assert all("link" in snap[c] for c in ("0", "1", "3")) and _link_reads(bus, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_snapshot_is_left_out_after_its_bound(bus, monkeypatch):
+    """A sysfs read that stalls never holds up a job start or the post-job check: the snapshot is
+    left out once its bound passes, and a timeout event says so."""
+    events = []
+    monkeypatch.setattr(srv, "health_event", lambda name, *a, **k: events.append((name, k)))
+    monkeypatch.setattr(srv, "PCIE_SNAPSHOT_TIMEOUT_SEC", 0.05)
+    release = threading.Event()
+    monkeypatch.setattr(pcie_aer, "snapshot", lambda *a, **k: (release.wait(10), {"0": {}})[1])
+    t0 = time.monotonic()
+    try:
+        assert await srv._pcie_snapshot() == {}
+    finally:
+        release.set()
+    assert time.monotonic() - t0 < 2.0
+    assert events == [("pcie_snapshot_timeout", {"timeout_s": 0.05})]
+    assert srv.PCIE_SNAPSHOT_TIMEOUT_SEC == 0.05
+    monkeypatch.undo()
+    assert srv.PCIE_SNAPSHOT_TIMEOUT_SEC == 5.0, "the bound in code is 5 s"
+
+
 def test_no_chip_link_is_read_while_a_reset_step_owns_the_chips(bus, monkeypatch):
     monkeypatch.setattr(chip_state, "op_running", lambda: True)
     snap = pcie_aer.snapshot()
@@ -265,6 +306,52 @@ async def test_job_start_end_and_the_check_each_write_one_event_into_the_gate_re
 
 
 @pytest.mark.asyncio
+async def test_the_runner_snapshots_before_and_after_the_job_command_and_the_check_reads_them(
+    mesh, bus, monkeypatch, tmp_path  # noqa: F811
+):
+    """Driven through the real job runner: the job-start snapshot is taken before the job's command
+    runs and the job-end one after it, before the post-job check, which writes all three deltas with
+    the job's id. The job's command itself raises chip 1's correctable count from 5 to 9."""
+    events = _capture(monkeypatch, mesh)
+    mesh["eth"] = ADVANCING
+    ws = _quiet_runner(monkeypatch, tmp_path)
+    gated = asyncio.Event()
+    cycle_at_gate = []
+
+    async def post_job_gate(job_log_file, job_failed=False, **_):
+        cycle_at_gate.append(dict(srv._pcie_cycle))
+        try:
+            await _gate()
+        finally:
+            gated.set()
+
+    monkeypatch.setattr(srv, "_verify_device_after_job", post_job_gate)
+    aer = bus.ep(1) / "aer_dev_correctable"
+    job = _job(tmp_path, ws, "961", f"printf 'RxErr 9\\nBadTLP 0\\nTOTAL_ERR_COR 9\\n' > {aer}")
+    job.queued_at = srv.datetime.now().isoformat()
+    await srv.get_job_queue().put("961")
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await asyncio.wait_for(gated.wait(), 30)
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+    assert job.status is srv.JobStatus.COMPLETED, job.error
+    assert "TOTAL_ERR_COR 9" in aer.read_text(), "the job's command did not run"
+    assert len(cycle_at_gate) == 1, "the runner ran its post-job gate once, on its normal path"
+    assert cycle_at_gate[0]["job"] == "961" and cycle_at_gate[0]["start"] and cycle_at_gate[0]["end"]
+    assert cycle_at_gate[0]["start"]["1"]["aer"]["cor"] == 5, "the start snapshot was not taken before the job"
+    assert cycle_at_gate[0]["end"]["1"]["aer"]["cor"] == 9, "the end snapshot was not taken after the job"
+    deltas = {k["phase"]: k for n, k in events if n == "pcie_aer_delta"}
+    assert set(deltas) == {"job", "job_end_to_check", "check"}
+    assert all(d["job"] == "961" for d in deltas.values())
+    assert [(r["chip"], r["aer"]) for r in deltas["job"]["chips"]] == [(1, {"cor": 4})]
+    assert deltas["job_end_to_check"]["chips"] == [] and deltas["check"]["chips"] == []
+    assert srv._pcie_cycle == {}
+
+
+@pytest.mark.asyncio
 async def test_a_clean_exit_check_writes_its_event_with_no_dirty_job(mesh, bus, monkeypatch):  # noqa: F811
     events = _capture(monkeypatch, mesh)
     mesh["eth"] = ADVANCING
@@ -284,12 +371,15 @@ async def _outcome(mesh, monkeypatch, telemetry, during=lambda: None):  # noqa: 
         monkeypatch.setattr(pcie_aer, "delta", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
     elif telemetry == "off":
         monkeypatch.setattr(pcie_aer, "snapshot", lambda *a, **k: {})
+    elif telemetry == "stalled":
+        monkeypatch.setattr(srv, "PCIE_SNAPSHOT_TIMEOUT_SEC", 0.05)
+        monkeypatch.setattr(pcie_aer, "snapshot", lambda *a, **k: (time.sleep(0.3), {})[1])
     await srv._pcie_job_start("9")
     during()
     await srv._pcie_job_end("9")
     fsm_dirty(srv, "job 9 failed: exit 1")
     await _gate()
-    names = [n for n in mesh["events"] if n != "pcie_aer_delta"]
+    names = [n for n in mesh["events"] if n not in ("pcie_aer_delta", "pcie_snapshot_timeout")]
     return srv.fsm.state.name, list(mesh["fabric"]), len(mesh["resets"]), names
 
 
@@ -315,13 +405,13 @@ GATE_OUTCOME = {
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fabric_bad", [False, True])
-@pytest.mark.parametrize("telemetry", ["off", "live", "broken"])
+@pytest.mark.parametrize("telemetry", ["off", "live", "broken", "stalled"])
 async def test_the_gate_decides_the_same_with_or_without_the_telemetry(
     mesh, bus, monkeypatch, fabric_bad, telemetry  # noqa: F811
 ):
     """After a failed job, the post-job gate reaches the same state, runs the same fabric passes and
     resets and writes the same events (but the telemetry's own) whether the telemetry reads nothing,
-    reads errors on every chip, or raises."""
+    reads errors on every chip, raises, or stalls past its bound."""
     mesh["eth"] = ADVANCING
     mesh["fabric_bad"] = fabric_bad
     mesh["reset_heals"] = False
