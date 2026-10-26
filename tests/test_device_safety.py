@@ -10478,16 +10478,18 @@ async def test_stuck_hold_climb_is_blocked_by_a_fail_closed_ledger(monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_stuck_hold_climb_does_not_reboot_when_a_tenant_arrives(monkeypatch, clear_job_state):
-    """Defense in depth on the destructive rung: the box is idle at the outer gate but a foreign
-    tenant lands on the device by the time the climb re-scans. The climb must re-check holders and
+@pytest.mark.parametrize("scoped", [True, False], ids=["broker-job-holder", "foreign-holder"])
+async def test_stuck_hold_climb_does_not_reboot_when_a_tenant_arrives(monkeypatch, clear_job_state, scoped):
+    """Defense in depth on the destructive rung: the box is idle at the outer gate but a broker job's
+    process lands on the device by the time the climb re-scans. The climb must re-check holders and
     refuse the escalation — the property the outer gate alone cannot pin, since it passed before the
-    tenant arrived. An all-off-bus mesh takes the power-cycle rung, and a tenant must block it."""
+    tenant arrived. An all-off-bus mesh takes the power-cycle rung, and that holder must block it.
+    A holder outside every broker job or exec scope never blocks it (spec 04 I103): the cycle fires."""
     counters = _arm_stuck_hold(monkeypatch, reset_result=False, beats_after_reset={})
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     scans = [
         HolderScan(holders=[], complete=True),  # idle at the outer gate
-        HolderScan(holders=[DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID)], complete=True),
+        HolderScan(holders=[DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID, scoped=scoped)], complete=True),
     ]
     seen = {"n": 0}
 
@@ -10499,16 +10501,19 @@ async def test_stuck_hold_climb_does_not_reboot_when_a_tenant_arrives(monkeypatc
     monkeypatch.setattr(srv, "enumerate_device_holders", scan)
     ran = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
     assert ran is True and counters["resets"] == 1
-    assert (
-        counters["power_cycles"] == 0 and counters["reboots"] == 0
-    ), "a foreign tenant on the device must block the climb's power cycle"
+    if scoped:
+        assert (
+            counters["power_cycles"] == 0 and counters["reboots"] == 0
+        ), "a broker job's holder on the device must block the climb's power cycle"
+    else:
+        assert counters["power_cycles"] == 1, "a foreign holder never vetoes the climb's power cycle (I103)"
 
 
 @pytest.mark.asyncio
-async def test_stuck_hold_climb_does_not_reboot_on_an_incomplete_holder_scan(monkeypatch, clear_job_state):
-    """An unreadable /proc counts as a tenant on the destructive rung too: if the climb's holder scan
-    cannot see every process, it must not take the box down over a tenant it merely could not see. An
-    all-off-bus mesh takes the power-cycle rung, and an incomplete scan must fail it closed."""
+async def test_stuck_hold_climb_cycles_past_an_incomplete_holder_scan(monkeypatch, clear_job_state):
+    """An unreadable /proc never holds the destructive rung (spec 04 I103): a running broker job is
+    known from the queue, not the scan, so what the scan could not see is no broker job. An all-off-bus
+    mesh takes the power-cycle rung, and an incomplete scan does not veto it."""
     counters = _arm_stuck_hold(monkeypatch, reset_result=False, beats_after_reset={})
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     scans = [
@@ -10525,9 +10530,7 @@ async def test_stuck_hold_climb_does_not_reboot_on_an_incomplete_holder_scan(mon
     monkeypatch.setattr(srv, "enumerate_device_holders", scan)
     ran = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
     assert ran is True and counters["resets"] == 1
-    assert (
-        counters["power_cycles"] == 0 and counters["reboots"] == 0
-    ), "an incomplete scan must block the climb's power cycle (fail closed)"
+    assert counters["power_cycles"] == 1, "an incomplete scan never vetoes the climb's power cycle"
 
 
 @pytest.mark.asyncio

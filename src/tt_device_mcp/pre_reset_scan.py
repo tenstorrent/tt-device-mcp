@@ -44,6 +44,8 @@ in one of those threads, and a killed job's exit is often that close to allowing
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import os
 import signal
 import time
@@ -63,6 +65,27 @@ from tt_device_mcp.holder_identity import holder_identity, read_holder_identitie
 from tt_device_mcp.peercred import username_for_uid
 
 RESET_SCOPE_PREFIX = "ttdev-reset-"
+
+# Set while the broker runs the ladder or sweep that comes right before a power cycle it may request
+# (spec 04 I103): a holder outside every broker job or exec scope is then a reader to clear, never a
+# tenant that refuses the reset. The power cycle would end that process anyway; only a broker job holds.
+_foreign_holders_yield: contextvars.ContextVar[bool] = contextvars.ContextVar("foreign_holders_yield", default=False)
+
+
+@contextlib.contextmanager
+def foreign_holders_yield(on: bool = True):
+    """Run the block with foreign (unscoped) holders yielding to automatic resets (spec 04 I103)."""
+    token = _foreign_holders_yield.set(bool(on) or _foreign_holders_yield.get())
+    try:
+        yield
+    finally:
+        _foreign_holders_yield.reset(token)
+
+
+def foreign_holders_yielding() -> bool:
+    """Whether the current task runs a pre-power-cycle ladder or sweep (:func:`foreign_holders_yield`)."""
+    return _foreign_holders_yield.get()
+
 
 # Pids of resets the broker launched outside a reset scope (the no-systemd local reset), live while
 # they run. A holder that is one of them, or below one, is a reset in flight, never a reader.
@@ -129,6 +152,9 @@ class PreResetScan:
     detach_timed_out: bool = False  # the detach deadline passed before every off-bus chip was detached
     reset_in_flight: str = ""  # a reset already running (its unit, or the holder that is one)
     gaps: list = field(default_factory=list)  # holders the driver names that the scan could not read
+    # gaps a pre-power-cycle reset ran past (spec 04 I103): pids in /proc here, outside every broker
+    # scope, not the running job's and not stuck in the kernel; recorded, never signalled
+    gaps_passed: list = field(default_factory=list)
     zombies: list = field(default_factory=list)  # zombie gap pids, classified (ZombieInfo.row, waited_sec)
     tenants_block: bool = True  # whether a tenant refuses this reset (automatic resets)
     scan_complete: bool = True
@@ -269,6 +295,7 @@ def classify_gap_pids(
 async def clear_device_readers(
     *,
     tenants_block: bool,
+    foreign_yield: bool = False,
     protected: Iterable[int] = (),
     grace_sec: float = PRE_RESET_TERM_GRACE_SEC,
     release_sec: float = HOLDER_RELEASE_WAIT_SEC,
@@ -295,6 +322,16 @@ async def clear_device_readers(
     False: its own reset gate (04 I6/I7) already ruled on tenants, ``force`` included, and they are
     only recorded here. The broker itself and its process group are never signalled. A broker-internal
     holder (one the broker already killed, still mid-exit) is a reader whatever its uid.
+
+    ``foreign_yield`` (the ladder and sweep before a power cycle, spec 04 I103): a tenant outside every
+    broker job or exec scope, and not in ``protected``, is a reader like any other and is cleared; only a
+    broker job's process still refuses the reset. A gap pid left after the rescan no longer refuses it
+    either when /proc shows the pid here (its stat and cgroup are world-readable even when its fds are
+    not) outside every broker scope and ``protected``: the reset runs past it, unsignalled, and it is
+    recorded in ``gaps_passed``. One inside a broker scope or ``protected`` is a tenant; one stuck in
+    the kernel (``unkillable``: D state or SIGKILL pending) is unkillable (I21/I70 fence); one with no
+    /proc entry here (another pid namespace's process, which the broker can neither read nor signal,
+    the unseen reader this scan exists for) still refuses.
 
     Before any signal, every chip still bound but off the bus (``offbus_chips``) is detached
     (``detach_chip``, the one in-flight PCI write, all within ``detach_timeout_sec``); if one fails or the deadline
@@ -381,7 +418,8 @@ async def clear_device_readers(
         result.seconds = round(clock() - t0, 3)
         return result
     result.scan_complete, result.source = scan.complete, scan.source
-    result.gaps = [why for why, pid in pid_gap_rows(scan) if pid not in cleared]
+    gap_rows = [(why, pid) for why, pid in pid_gap_rows(scan) if pid not in cleared]
+    result.gaps = [why for why, _ in gap_rows]
     result.zombies = list(zombie_rows.values())
     own_pid = getpid()
     try:
@@ -401,9 +439,28 @@ async def clear_device_readers(
     def _is_tenant(h: DeviceHolder) -> bool:
         if h.pid in protected or any(device_holders.descends_from(h.pid, p) for p in protected):
             return True
-        if not getattr(h, "scoped", False) and device_holders.is_broker_internal(h.pid):
+        if not getattr(h, "scoped", False) and (foreign_yield or device_holders.is_broker_internal(h.pid)):
             return False
         return is_tenant(h)
+
+    if foreign_yield and tenants_block and gap_rows:
+        # Spec 04 I103: right before a power cycle a gap the scan cannot read does not cost the ladder
+        # its resets, except where it may be a broker job's, stuck in the kernel, or wholly unseen.
+        kept: list = []
+        for why, pid in gap_rows:
+            start = read_starttime(pid)
+            if start is None:
+                kept.append(why)
+                continue
+            uid = device_holders._proc_uid(pid)
+            h = DeviceHolder(pid=pid, uid=-1 if uid is None else uid, scoped=device_holders.in_broker_scope(pid))
+            if h.scoped or pid in protected or any(device_holders.descends_from(pid, p) for p in protected):
+                result.tenants.append(_describe(h))
+            elif unkillable(pid):
+                result.unkillable.append(_describe(h, device_holders.holder_state(pid), starttime=start))
+            else:
+                result.gaps_passed.append(why)
+        result.gaps = kept
 
     others = [h for h in scan.holders if not _is_self(h.pid)]
     # Logging only, before any signal: off the loop, all within one fixed bound (a /proc read of a
@@ -421,7 +478,13 @@ async def clear_device_readers(
             result.tenants.append(_describe(h))
         else:
             readers.append(h)
-    if result.reset_in_flight or (result.tenants and tenants_block) or (result.gaps and tenants_block) or not readers:
+    if (
+        result.reset_in_flight
+        or (result.tenants and tenants_block)
+        or (result.gaps and tenants_block)
+        or result.unkillable
+        or not readers
+    ):
         result.seconds = round(clock() - t0, 3)
         return result
 

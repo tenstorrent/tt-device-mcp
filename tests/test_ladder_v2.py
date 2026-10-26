@@ -18,7 +18,7 @@ import pytest
 
 from tests.conftest import patch_health_event, patch_recovery
 from tt_device_mcp import server as srv
-from tt_device_mcp.device_holders import HolderScan
+from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 from tt_device_mcp.health.recovery import Evidence, galaxy
 
 
@@ -135,9 +135,10 @@ async def test_settle_and_verify_gates_the_power_cycle_host_rung(monkeypatch):
         return False, {"snapshot": {"ok": False}}
 
     patch_recovery(monkeypatch, "_verify_device", bad)
-    # The sweep did not run (an unreadable holder scan reads as a tenant): the full ladder has not
-    # been tried, so the host rung holds (spec 04 I22).
-    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=False))
+    # The sweep did not run (a broker job's process holds the mesh): the full ladder has not been
+    # tried, so the host rung holds (spec 04 I22).
+    job_holder = DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID, scoped=True)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[job_holder], complete=True))
     out_held = await g._fire_gate_rung(
         "post-job", galaxy.STAGE_POWER_CYCLE, ["0"], 32, lambda m: None, ev=None, beats={}
     )
@@ -274,7 +275,7 @@ def test_no_fabricated_self_heal_timing_left_in_src():
 # verified but never re-issued the rungs.
 
 
-def _arm_sweep(monkeypatch, *, verify_healthy=False, tenant=False):
+def _arm_sweep(monkeypatch, *, verify_healthy=False, tenant=False, scoped=True):
     """Count every reset the last-chance sweep issues, in order, and stub the host rungs."""
     g = srv.galaxy_recovery
     order, cycles = [], {"n": 0}
@@ -282,7 +283,7 @@ def _arm_sweep(monkeypatch, *, verify_healthy=False, tenant=False):
     patch_health_event(monkeypatch, lambda *a, **k: None)
     monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
     uid = 4242 if tenant else 0
-    holders = [type("H", (), {"uid": uid, "pid": 1, "user": "t", "cmd": "x"})()] if tenant else []
+    holders = [type("H", (), {"uid": uid, "pid": 1, "user": "t", "cmd": "x", "scoped": scoped})()] if tenant else []
     monkeypatch.setattr(g.deps, "enumerate_device_holders", lambda: HolderScan(holders=holders, complete=True))
     monkeypatch.setattr(g.deps, "isolated_chips", lambda: {"0"})
 
@@ -382,7 +383,8 @@ async def test_the_idle_escalation_road_to_a_power_cycle_goes_through_the_sweep(
 
 @pytest.mark.asyncio
 async def test_the_last_chance_sweep_never_resets_over_a_tenant(monkeypatch):
-    """The one guard the sweep never crosses: a tenant on the mesh. The settle+verify still runs."""
+    """The one guard the sweep never crosses: a broker job's process on the mesh. The settle+verify
+    still runs. A holder outside every broker scope is no such guard (spec 04 I103)."""
     g, order, cycles = _arm_sweep(monkeypatch, tenant=True)
     out = await g._fire_gate_rung("post-job", galaxy.STAGE_POWER_CYCLE, ["0"], 32, lambda m: None, ev=None, beats={})
     assert order == [], "no reset may fire over a tenant, not even the last-chance sweep"

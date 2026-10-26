@@ -301,7 +301,7 @@ def _decline(monkeypatch, how):
     if how == "scope":
         monkeypatch.setattr(rec.mechanism, "scope_active", lambda: True)
     elif how == "tenant":
-        monkeypatch.setattr(rec, "_tenant_blocker", lambda scan, force=False: {"pid": 4242, "user": "dev"})
+        monkeypatch.setattr(rec, "_tenant_blocker", lambda scan, force=False, **k: {"pid": 4242, "user": "dev"})
         monkeypatch.setattr(rec, "_describe_blocker", lambda blocker: "a tenant holds the device")
     return how != "below_ceiling"
 

@@ -232,7 +232,7 @@ async def test_a_class_a_sweep_a_guard_holds_runs_no_check_and_the_cycle_still_f
     if guard == "tenant":
         monkeypatch.setattr(galaxy, "is_tenant", lambda h: True)
         monkeypatch.setattr(galaxy, "holder_comm", lambda pid: "python")
-        cool["scan"] = HolderScan(holders=[SimpleNamespace(pid=4242, uid=1000)], complete=True)
+        cool["scan"] = HolderScan(holders=[SimpleNamespace(pid=4242, uid=1000, scoped=True)], complete=True)
     else:
 
         async def refused(trays, expected, log, do_sbr=True, **_kw):

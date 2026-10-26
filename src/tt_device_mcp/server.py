@@ -254,7 +254,13 @@ from tt_device_mcp.job_spool import (
     sweep_job_spools,
 )
 from tt_device_mcp.peercred import username_for_uid
-from tt_device_mcp.pre_reset_scan import classify_gap_pids, clear_device_readers, pid_gap_rows
+from tt_device_mcp.pre_reset_scan import (
+    classify_gap_pids,
+    clear_device_readers,
+    foreign_holders_yield,
+    foreign_holders_yielding,
+    pid_gap_rows,
+)
 from tt_device_mcp.privsep import privsep_enabled, privsep_prefix_for, privsep_refusal, should_privsep
 from tt_device_mcp.socket_transport import (
     PeerCredMiddleware,
@@ -1341,6 +1347,7 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
         )
         PCI_WRITER.on_latch = _on_pci_wedged
         recovery_mechanism.pre_reset_scan = _pre_reset_holder_scan
+        recovery_mechanism.power_cycle_journal = _journal_power_cycle_foreign_holders
         recovery_mechanism.owe_device_pollers = lambda after: _owe_device_pollers(
             _pollers_unfit_reason() or f"{after} did not complete"
         )
@@ -7200,6 +7207,31 @@ async def _auto_power_cycle_host(log, reason: str) -> bool:
     )
 
 
+POWER_CYCLE_HOLDER_LOG_SEC = 3.0
+
+
+def _foreign_holder_rows() -> list:
+    """The identities of the device holders outside every broker job or exec scope (and not the broker's
+    own probes), read from /proc only."""
+    scan = discount_broker_internal(enumerate_device_holders())
+    pids = [h.pid for h in scan.holders if not getattr(h, "scoped", False)]
+    return _log_foreign_holder_identities("power cycle:", pids) if pids else []
+
+
+async def _journal_power_cycle_foreign_holders(reason: str) -> None:
+    """Spec 04 I103: a foreign holder never defers the power cycle, so name it in the journal with the
+    cycle (``power_cycle_foreign_holders``, the holder-identity fields). Bounded by
+    POWER_CYCLE_HOLDER_LOG_SEC and never raises: the cycle fires whatever this read finds."""
+    try:
+        rows = await aio.wait_for(asyncio.to_thread(_foreign_holder_rows), POWER_CYCLE_HOLDER_LOG_SEC)
+    except Exception as e:  # noqa: BLE001 - logging only; never holds the cycle
+        if logger:
+            logger.warning(f"power cycle: foreign holder identities unread: {e!r}")
+        return
+    if rows:
+        health_event("power_cycle_foreign_holders", holders=rows, reason=reason)
+
+
 # The pre-job gate's dispatch proof runs on a tenant's critical path, so it is the minimal
 # single-kernel program, not the whole-mesh probe. distributed_program_dispatch opens all eight
 # chips in ~14s and is the fabric check's stage; paying that per job is the cost this gate exists
@@ -8347,10 +8379,10 @@ async def device_health_gate(
             action = _HOST_ESCALATION_ACTION[stage]
             # The broker's own probes and the holders it killed for a dead chip are not tenants (I59).
             scan2 = discount_broker_internal(await asyncio.to_thread(enumerate_device_holders))
-            # A scan that could not read every holder (no CAP_DAC_READ_SEARCH on a tenant's
-            # /proc) must count as "a tenant is here": the highest-risk action does not get to
-            # take the box down over a tenant it merely could not see.
-            tenant_active = not scan2.complete or any(is_tenant(h) for h in scan2.holders)
+            # Spec 04 I103: only a broker job's holder defers the power cycle. A holder outside every
+            # broker job or exec scope (another project's detached process, whatever its uid) and an
+            # unreadable scan never do: the cycle ends them, and their identities are journaled with it.
+            tenant_active = galaxy_recovery._tenant_active(scan2, waive_job=True, foreign_yields=True)
             allowed, why = recovery_mechanism.auto_recovery_allowed(action, tenant_active=tenant_active)
             if allowed:
                 await _fire(stage)
@@ -10028,7 +10060,7 @@ def _bound_tenant_blocker(bound: bool) -> Optional[dict]:
         waive_job = False
         if bound:
             scan, waive_job = _bound_excused(scan)
-        blocker = galaxy_recovery._tenant_blocker(scan, force=True, waive_job=waive_job)
+        blocker = galaxy_recovery._tenant_blocker(scan, force=True, waive_job=waive_job, foreign_yields=bound)
     except Exception:  # noqa: BLE001 - naming the blocker never decides whether one holds
         blocker = None
     overran = _readopted_job_overran()
@@ -10050,9 +10082,10 @@ def _describe_bound_blocker(blocker: dict) -> str:
 
 
 def _hold_bound_tenant_blocked(blocker: dict, log) -> None:
-    """Spec 04 I76's one exception besides the boot cooldown: past the bound, a live tenant on the device
-    keeps the ladder and the host rung off it (no reset runs over a tenant). Journaled and paged once per
-    episode, naming the blocker; /health shows it. The ladder runs on the first tick after it leaves."""
+    """Spec 04 I76's one exception besides the boot cooldown: past the bound, a running broker job (or a
+    holder inside a broker job or exec scope) keeps the ladder and the host rung off the device; a holder
+    outside every broker scope never does (I103). Journaled and paged once per episode, naming the blocker;
+    /health shows it. The ladder runs on the first tick after it ends."""
     global _hold_bound_tenant_paged, _hold_bound_tenant_blocker
     _hold_bound_sync()
     _hold_bound_tenant_blocker = blocker
@@ -10070,7 +10103,7 @@ def _hold_bound_tenant_blocked(blocker: dict, log) -> None:
     }
     health_event(event["kind"], **{k: v for k, v in event.items() if k != "kind"})
     alert.send_alert(event, logger)
-    log(f"10-min hold bound: {desc} — no reset or host rung runs over a live tenant; it runs once the tenant leaves")
+    log(f"10-min hold bound: {desc} — no reset or host rung runs over a broker job; it runs once the job ends")
 
 
 def _bound_excused(scan: HolderScan) -> tuple[HolderScan, bool]:
@@ -10088,13 +10121,15 @@ def _bound_tenant_holds(bound: bool) -> bool:
     """The forced ladders' tenant check (galaxy_recovery.tenant_holds), except that from the 10-min bound
     on a reaped job's leftover (spec 01 I16) and a holder the dead-chip valve refused to kill (spec 03
     I84, a running broker job included) are no tenants: only a host rung clears either (spec 04 I76).
-    Any other running job or readable tenant still is."""
+    From the bound on, a holder outside every broker job or exec scope is none either (I103). Any other
+    running broker job or broker-scoped holder still is."""
     if bound:
         scan = enumerate_device_holders()
         excused, waive_job = _bound_excused(scan)
         if waive_job or excused is not scan:
-            return galaxy_recovery._tenant_active(excused, force=True, waive_job=waive_job)
-    return galaxy_recovery.tenant_holds()
+            return galaxy_recovery._tenant_active(excused, force=True, waive_job=waive_job, foreign_yields=True)
+    with foreign_holders_yield(bound):
+        return galaxy_recovery.tenant_holds()
 
 
 def _hold_escalated_report() -> bool:
@@ -11247,6 +11282,7 @@ async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
     protected = [job.pid] if job is not None and job.returncode is None and job.pid else []
     result = await clear_device_readers(
         tenants_block=automatic,
+        foreign_yield=automatic and foreign_holders_yielding(),
         protected=protected,
         reset_active=recovery_mechanism.scope_active,
         zombie_wait_sec=_pre_reset_zombie_wait_sec(automatic),
@@ -11268,6 +11304,7 @@ async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
         detach_timed_out=result.detach_timed_out,
         reset_in_flight=result.reset_in_flight or None,
         gaps=result.gaps,
+        gaps_passed=result.gaps_passed or None,
         zombies=result.zombies,
         scan_complete=result.scan_complete,
         source=result.source,
@@ -11277,6 +11314,11 @@ async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
     if logger:
         for row in result.identities:
             logger.info(f"pre-reset: device holder before {' '.join(argv)}: {describe_identity(row)}")
+    if result.gaps_passed:
+        msg = f"pre-reset: {' '.join(argv)} runs past holders the scan could not read, before a power cycle: {'; '.join(result.gaps_passed)}"
+        log(msg)
+        if logger:
+            logger.warning(msg)
     if result.detached:
         msg = f"pre-reset: chips {', '.join(result.detached)} off the bus, detached before their readers were killed"
         log(msg)
