@@ -2462,10 +2462,13 @@ each rung fires only when the gentler one failed or cannot apply.
   `reset_driver_wait_gave_up` with the exit code, and the mechanism keeps
   `last_reset_driver_wait_failed` set until the next mesh reset starts. The line and the journal say
   whether tt-smi's tray re-power ran (its IPMI UBB reset, the 30 s settle or the driver wait in its
-  output): `the tray re-power ran, but tt-smi gave up ...` and `tray_repower` on
+  output; the IPMI call alone does not count when tt-smi reported it failed in both of its modes and
+  exited before the settle): `the tray re-power ran, but tt-smi gave up ...` and `tray_repower` on
   `reset_driver_wait_gave_up` and on every `-glx_reset`'s `reset_done`. A mesh reset that exits non-zero
   with no re-power in its output reset nothing: its line reads `mesh reset FAILED (rc N): reset did not
-  run`, journaled `reset_did_not_run`, never "no POST_RESET failure". Logging only: the ladder treats
+  run` and says why (tt-smi exited before the re-power, or its IPMI re-power failed), journaled
+  `reset_did_not_run` (with `ipmi_failed` for the latter), never "no POST_RESET failure". This holds for a
+  lone chip and for a partial drop of several alike. Logging only: the ladder treats
   both as the failed reset they are (I36, I38, I87), and the bridge rung's escalation line names the
   power cycle that follows a chip the re-power does not bring back, never "no power-cycle required".
 
