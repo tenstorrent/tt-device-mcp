@@ -256,6 +256,7 @@ from tt_device_mcp.peercred import username_for_uid
 from tt_device_mcp.pre_reset_scan import (
     classify_gap_pids,
     clear_device_readers,
+    foreign_holders_yield,
     foreign_holders_yielding,
     pid_gap_rows,
 )
@@ -7189,7 +7190,7 @@ async def _journal_power_cycle_foreign_holders(reason: str) -> None:
     cycle (``power_cycle_foreign_holders``, the holder-identity fields). Bounded by
     POWER_CYCLE_HOLDER_LOG_SEC and never raises: the cycle fires whatever this read finds."""
     try:
-        rows = await asyncio.wait_for(asyncio.to_thread(_foreign_holder_rows), POWER_CYCLE_HOLDER_LOG_SEC)
+        rows = await aio.wait_for(asyncio.to_thread(_foreign_holder_rows), POWER_CYCLE_HOLDER_LOG_SEC)
     except Exception as e:  # noqa: BLE001 - logging only; never holds the cycle
         if logger:
             logger.warning(f"power cycle: foreign holder identities unread: {e!r}")
@@ -10088,7 +10089,8 @@ def _bound_tenant_holds(bound: bool) -> bool:
         excused, waive_job = _bound_excused(scan)
         if waive_job or excused is not scan:
             return galaxy_recovery._tenant_active(excused, force=True, waive_job=waive_job, foreign_yields=True)
-    return galaxy_recovery.tenant_holds(foreign_yields=bound)
+    with foreign_holders_yield(bound):
+        return galaxy_recovery.tenant_holds()
 
 
 def _hold_escalated_report() -> bool:

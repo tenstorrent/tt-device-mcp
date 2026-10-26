@@ -37,7 +37,7 @@ class _JobProc:
 
 
 def _holders(r, *pids):
-    r["scan"] = HolderScan(holders=[DeviceHolder(pid=p, uid=1001, scoped=p == JOB_CHILD) for p in pids], complete=True)
+    r["scan"] = HolderScan(holders=[DeviceHolder(pid=p, uid=1001, scoped=p in (JOB_CHILD, NEWCOMER)) for p in pids], complete=True)
 
 
 def _arm(r, monkeypatch, holder):
@@ -100,8 +100,9 @@ async def test_a_refused_holder_gets_the_power_cycle_at_the_bound(
 
 @pytest.mark.asyncio
 async def test_a_tenant_the_valve_never_refused_still_blocks_the_bound(rig, monkeypatch, clear_job_state):  # noqa: F811
-    """A process that opened the device after the refusal, or one whose pid was recycled, is a live
-    tenant: the bound pages it and runs nothing over it."""
+    """A broker job's process that opened the device after the refusal, or one whose pid was recycled,
+    is a live tenant: the bound pages it and runs nothing over it (a holder outside every broker scope
+    would not hold it, spec 04 I103)."""
     kills = _arm(rig, monkeypatch, "tenant")
     await _refuse()
     _present_hold_at_the_bound(rig, monkeypatch, why="gate_error", detail="chip 13 off the bus")
@@ -117,7 +118,7 @@ async def test_a_tenant_the_valve_never_refused_still_blocks_the_bound(rig, monk
     assert dict(rig["events"])["hold_bound_tenant_blocked"]["pid"] == NEWCOMER
 
     monkeypatch.setattr(srv, "_read_proc_starttime", lambda pid: "300", raising=False)  # TENANT's pid recycled
-    _holders(rig, TENANT)
+    rig["scan"] = HolderScan(holders=[DeviceHolder(pid=TENANT, uid=1001, scoped=True)], complete=True)  # by a job
     assert srv._bound_tenant_holds(True), "a recycled pid is not the refused holder"
 
 

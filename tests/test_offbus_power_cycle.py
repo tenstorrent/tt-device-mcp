@@ -169,18 +169,38 @@ async def test_the_ladder_then_the_power_cycle_through_the_escalation(monkeypatc
 @pytest.mark.parametrize(
     "scan",
     [
-        HolderScan(holders=[DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID)], complete=True),
-        HolderScan(holders=[], complete=False),
+        HolderScan(holders=[DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID, scoped=True)], complete=True),
     ],
-    ids=["tenant", "unreadable-scan"],
+    ids=["broker-job-holder"],
 )
 async def test_a_tenant_or_an_unreadable_scan_holds(monkeypatch, tmp_path, clear_job_state, scan):
+    """Only a broker job's holder holds the gated cycle; a foreign holder or an unreadable scan never
+    does (spec 04 I103, the next test)."""
     hold_since, rec = _gated(monkeypatch, tmp_path)
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: scan)
     _ladder_ran(hold_since)
     assert await _pass(hold_since) is False
     assert rec["fires"] == [] and opc.load_state() == {}
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scan",
+    [
+        HolderScan(holders=[DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID)], complete=True),
+        HolderScan(holders=[], complete=False),
+    ],
+    ids=["foreign-holder", "unreadable-scan"],
+)
+async def test_a_foreign_holder_or_an_unreadable_scan_never_holds(monkeypatch, tmp_path, clear_job_state, scan):
+    """Spec 04 I103: a holder outside every broker job scope, or a scan that cannot see every holder,
+    never vetoes or delays the gated cycle."""
+    hold_since, rec = _gated(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: scan)
+    _ladder_ran(hold_since)
+    assert await _pass(hold_since) is True
+    assert len(rec["fires"]) == 1
 
 @pytest.mark.asyncio
 async def test_a_reset_in_its_own_scope_holds(monkeypatch, tmp_path, clear_job_state):
@@ -239,7 +259,7 @@ async def test_a_blocked_power_cycle_pages_once_past_its_bound(monkeypatch, tmp_
         monkeypatch.setattr(
             srv,
             "enumerate_device_holders",
-            lambda: HolderScan(holders=[DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID)], complete=True),
+            lambda: HolderScan(holders=[DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID, scoped=True)], complete=True),
         )
     elif blocker == "scope":
         monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: "tt-reset@1.scope")
@@ -409,7 +429,7 @@ async def test_a_tenant_arriving_during_the_checks_holds(monkeypatch, tmp_path, 
     scans = iter(
         [
             HolderScan(holders=[], complete=True),
-            HolderScan(holders=[DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID)], complete=True),
+            HolderScan(holders=[DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID, scoped=True)], complete=True),
         ]
     )
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: next(scans))

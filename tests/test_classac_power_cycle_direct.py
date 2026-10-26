@@ -184,26 +184,30 @@ async def test_an_idle_whole_tray_hold_cycles_with_no_reset(rig, monkeypatch, ph
     "phase, blocker, cycled",
     [
         ("offbus-forced", None, True),  # the deadline climb waives a scan it cannot read
-        ("offbus", None, False),  # before the deadline an unreadable scan still holds
+        ("offbus", None, True),  # spec 04 I103: an unreadable scan never holds a class A cycle
         ("offbus-forced", "job_running", False),
-        ("offbus-forced", "tenant", False),
+        ("offbus-forced", "tenant", True),  # I103: a holder outside every broker scope never holds it
+        ("offbus", "tenant", True),
+        ("offbus-forced", "job_tenant", False),  # a broker job's own holder still does
+        ("offbus", "job_tenant", False),
         ("offbus-forced", "startup_verify", False),  # spec 03 I75: the caller's stand-down, re-read here
     ],
 )
 async def test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_tenant(
     rig, monkeypatch, phase, blocker, cycled
 ):
-    """The hold-deadline climb waives an unreadable holder scan, as the tray rung does, so a class A
-    hold at its deadline is not held forever by a scan that cannot see; a running job or a readable
-    tenant still holds it. Nothing is released here: the boot after the cycle runs the startup gate's
+    """A class A cycle is never held by an unreadable holder scan or by a holder outside every broker
+    job scope (spec 04 I103), before or at the deadline; a running job or a broker job's holder still
+    holds it. Nothing is released here: the boot after the cycle runs the startup gate's
     full check, fabric included (03 I4)."""
     rig["scan"] = HolderScan(holders=[], complete=False)
     if blocker == "job_running":
         monkeypatch.setattr(rig["g"].deps, "job_running", lambda: True)
-    elif blocker == "tenant":
+    elif blocker in ("tenant", "job_tenant"):
         monkeypatch.setattr(galaxy, "is_tenant", lambda h: True)
         monkeypatch.setattr(galaxy, "holder_comm", lambda pid: "python")
-        rig["scan"] = HolderScan(holders=[SimpleNamespace(pid=4242, uid=1000)], complete=True)
+        holder = SimpleNamespace(pid=4242, uid=1000, scoped=blocker == "job_tenant")
+        rig["scan"] = HolderScan(holders=[holder], complete=True)
     rig["beats"] = _beats_without(_off(rig["map"], {2: 8}))
     rig["g"]._td_reset_seen = True  # no prelude: only the guard is under test
     stand_down = (lambda: True) if blocker == "startup_verify" else None
@@ -304,17 +308,15 @@ async def test_a_partial_drop_keeps_the_ladder(rig, monkeypatch, spec, prelude):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("guard", ["scope", "tenant", "unreadable_scan", "standback_file", "rate_limit"])
+@pytest.mark.parametrize("guard", ["scope", "tenant", "standback_file", "rate_limit"])
 async def test_a_guard_holds_the_power_cycle_and_fires_nothing(rig, monkeypatch, tmp_path, guard):
     if guard == "scope":
         rig["scope"] = "tt-reset-1.scope"
     elif guard == "tenant":
         rig["scan"] = HolderScan(holders=[object()], complete=True)
         monkeypatch.setattr(
-            rig["g"], "_tenant_active", lambda scan, force=False: bool(scan.holders) or not (force or scan.complete)
+            rig["g"], "_tenant_active", lambda scan, force=False, **k: bool(scan.holders)  # a broker job's holder
         )
-    elif guard == "unreadable_scan":
-        rig["scan"] = HolderScan(holders=[], complete=False)
     elif guard == "standback_file":
         marker = tmp_path / "cycle-in-progress"
         marker.write_text("")

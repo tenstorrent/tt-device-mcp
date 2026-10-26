@@ -983,10 +983,14 @@ class GalaxyRecovery(Recovery):
         super().__init__(monitor, mechanism, deps)
         mechanism.sbr_fired_hook = lambda chips: self._note_sbr_fired(chips)
 
-    def tenant_holds(self, *, foreign_yields: bool = False) -> bool:
+    def tenant_holds(self) -> bool:
         """The forced ladders' own tenant check, alone: a running broker job or a readable tenant fd
-        (with ``foreign_yields``, spec 04 I103, only a broker job's)."""
-        return self._tenant_active(self.deps.enumerate_device_holders(), force=True, foreign_yields=foreign_yields)
+        (inside :func:`pre_reset_scan.foreign_holders_yield`, spec 04 I103, only a broker job's)."""
+        return self._tenant_active(
+            self.deps.enumerate_device_holders(),
+            force=True,
+            foreign_yields=pre_reset_scan.foreign_holders_yielding(),
+        )
 
     async def _offbus_ids_now(self, expected: int) -> Optional[set]:
         """The chip ids off the bus now, or None when the heartbeats cannot be read."""
@@ -2199,7 +2203,7 @@ class GalaxyRecovery(Recovery):
         # The broker's own probes and the holders it killed for a dead chip are not tenants, nor is
         # a gap they leave while exiting (spec 04 I59).
         scan = discount_broker_internal(scan)
-        tenants = [h for h in scan.holders if is_tenant(h) and (h.scoped or not foreign_yields)]
+        tenants = [h for h in scan.holders if is_tenant(h) and (getattr(h, "scoped", False) or not foreign_yields)]
         if tenants:
             h = tenants[0]
             return {
