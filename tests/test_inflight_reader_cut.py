@@ -231,14 +231,18 @@ def _glx(hw, lines, rc, during=None):
         hw["in_reset"] = True
         try:
             hw["resets"].append(list(argv))
-            emit("Issuing USER_RESET on 32 devices before IPMI reset...\n")
+            # Like the real backends, the reset returns everything tt-smi printed.
+            out = ["Issuing USER_RESET on 32 devices before IPMI reset...\n"]
+            emit(out[0])
             hw["repowered"] = True
-            emit(SETTLE + "\n")
+            out.append(SETTLE + "\n")
+            emit(out[-1])
             if during is not None:
                 during()
             for line in lines:
+                out.append(line)
                 emit(line)
-            return rc, "done"
+            return rc, "".join(out)
         finally:
             hw["in_reset"] = False
 

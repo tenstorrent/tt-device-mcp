@@ -373,9 +373,69 @@ async def test_a_reset_whose_tt_smi_gave_up_at_its_driver_wait_is_logged_as_fail
     failed = [m for m in logs if m.startswith("mesh reset FAILED")]
     if gave_up:
         assert rc == 1 and failed and failed[0].startswith("mesh reset FAILED (rc 1)")
-        assert ("reset_driver_wait_gave_up", {"rc": 1}) in events
+        assert ("reset_driver_wait_gave_up", {"rc": 1, "tray_repower": True}) in events
+        assert failed[0].startswith("mesh reset FAILED (rc 1): the tray re-power ran")
         assert not any("no POST_RESET failure" in m for m in logs)
     else:
         assert rc == 0 and not failed and any("no POST_RESET failure" in m for m in logs)
         assert "reset_driver_wait_gave_up" not in [n for n, _ in events]
     assert mechanism.last_reset_driver_wait_failed is gave_up
+
+
+# What tt-smi 6.7's -glx_reset prints, in order: the PCIe link and user resets, the tray re-power (an
+# IPMI UBB reset), the 30 s settle, then the driver wait.
+REPOWER = "Executing command: sudo ipmitool raw 0x30 0x8B 0xF 0xFF 0x3 0xF\n"
+
+
+def test_the_tray_repower_is_read_from_tt_smi_output():
+    assert recovery_base.glx_tray_repower_ran(REPOWER)
+    assert recovery_base.glx_tray_repower_ran(SETTLE)
+    assert recovery_base.glx_tray_repower_ran("x\nExecuting command: ipmitool raw 0x30 0x8b 0xF 0xFF 0x3 0xF")
+    assert not recovery_base.glx_tray_repower_ran("Issuing RESET_PCIE_LINK on 31 devices\n")
+    assert not recovery_base.glx_tray_repower_ran("")
+    assert not recovery_base.glx_tray_repower_ran(None)
+
+
+@pytest.mark.asyncio
+async def test_a_driver_wait_give_up_after_the_tray_repower_says_the_repower_ran(monkeypatch):
+    """The partial-drop case seen on a Galaxy: the re-power ran, the isolated chip never came back in
+    tt-smi's driver wait. The line says the re-power ran, so a reader does not take the failed reset for
+    one that never reset anything; the ladder treats it as the failed reset it is."""
+    sysfs, events, logs = FakeSysfs(), [], []
+    mechanism = _mechanism(monkeypatch, set(), sysfs, events)
+
+    async def run_scoped(argv, log, owner, on_output=None):
+        out = "Issuing RESET_PCIE_LINK on 31 devices\n" + REPOWER + SETTLE + GAVE_UP
+        on_output(out)
+        return 1, out
+
+    mechanism.run_scoped = run_scoped
+    rc, _ = await mechanism.reset_with_quiesce(MESH_RESET, logs.append)
+
+    assert rc == 1
+    assert any(m.startswith("mesh reset FAILED (rc 1): the tray re-power ran, but tt-smi gave up") for m in logs)
+    assert ("reset_driver_wait_gave_up", {"rc": 1, "tray_repower": True}) in events
+    assert "reset_did_not_run" not in [n for n, _ in events]
+    assert mechanism.last_reset_driver_wait_failed is True
+
+
+@pytest.mark.asyncio
+async def test_a_mesh_reset_that_exited_before_the_tray_repower_is_logged_as_not_run(monkeypatch):
+    """tt-smi exits non-zero before it re-powers the trays: nothing was reset. The line says the reset did
+    not run (never "no POST_RESET failure"), journaled reset_did_not_run; it is no driver-wait give-up."""
+    sysfs, events, logs = FakeSysfs(), [], []
+    mechanism = _mechanism(monkeypatch, set(), sysfs, events)
+
+    async def run_scoped(argv, log, owner, on_output=None):
+        out = "Error: could not open /dev/tenstorrent/0\n"
+        on_output(out)
+        return 1, out
+
+    mechanism.run_scoped = run_scoped
+    rc, _ = await mechanism.reset_with_quiesce(MESH_RESET, logs.append)
+
+    assert rc == 1
+    assert any(m.startswith("mesh reset FAILED (rc 1): reset did not run") for m in logs)
+    assert ("reset_did_not_run", {"rc": 1}) in events
+    assert not any("no POST_RESET failure" in m for m in logs)
+    assert mechanism.last_reset_driver_wait_failed is False

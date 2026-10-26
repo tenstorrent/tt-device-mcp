@@ -48,6 +48,18 @@ GLX_DRIVER_WAIT = re.compile(r"Waiting for all \d+ chips to show up|Waiting for 
 # POST_RESET and no board re-init, so every chip it did find is left ARC-not-ready: the reset FAILED.
 GLX_DRIVER_WAIT_GAVE_UP = re.compile(r"Didn't find all (\d+) chips\b[^\n]*giving up")
 
+# Spec 04 I97 (c): tt-smi's tray re-power, the IPMI UBB reset it runs before the 30 s settle, or the
+# settle or driver wait that follow it. A failed mesh reset whose output has neither never re-powered the trays: the reset
+# did not run, as opposed to a re-power that ran and left a chip off the bus.
+GLX_TRAY_REPOWER = re.compile(
+    r"ipmitool raw 0x30 0x8B\b|Waiting for \d+ seconds: \d+|Waiting for all \d+ chips to show up", re.IGNORECASE
+)
+
+
+def glx_tray_repower_ran(text: str) -> bool:
+    """Spec 04 I97 (c): whether a `tt-smi -glx_reset`'s output shows the tray re-power ran."""
+    return bool(GLX_TRAY_REPOWER.search(str(text or "")))
+
 # Spec 03 I83. tt-smi prints this when the driver's POST_RESET on a chip fails after a mesh reset's
 # re-power: the reset marker did not read back zero, and the driver has just cleared the chip's
 # needs_hw_init, so from here every read of that chip is a real bus read again.
@@ -1163,7 +1175,8 @@ class RecoveryMechanism:
         self.last_reset_output = text
         tail = text.splitlines()
         rc = proc.returncode
-        health_event("reset_done", unit=unit, rc=rc, seconds=dt, argv=argv, tail=tail[-3:] if tail else [])
+        health_event("reset_done", unit=unit, rc=rc, seconds=dt, argv=argv, tail=tail[-3:] if tail else [],
+                     **({"tray_repower": glx_tray_repower_ran(text)} if "-glx_reset" in argv else {}))
         self._write_action_log(owner, command, dt, "completed" if rc == 0 else "failed", rc)
         output_path.unlink(missing_ok=True)
         return rc, text
@@ -1271,7 +1284,8 @@ class RecoveryMechanism:
         # mesh half-alive, the interesting line is usually somewhere in the middle.
         self.last_reset_output = text
         tail = text.splitlines()
-        health_event("reset_done", unit=unit, rc=rc, seconds=dt, argv=argv, tail=tail[-3:] if tail else [])
+        health_event("reset_done", unit=unit, rc=rc, seconds=dt, argv=argv, tail=tail[-3:] if tail else [],
+                     **({"tray_repower": glx_tray_repower_ran(text)} if "-glx_reset" in argv else {}))
         self._write_action_log(owner, " ".join(argv), dt, "completed" if rc == 0 else "failed", rc)
         return rc, text
 
@@ -1613,13 +1627,23 @@ class RecoveryMechanism:
         gave_up = GLX_DRIVER_WAIT_GAVE_UP.search(str(text or "")) or (
             rc not in (None, 0) and self.last_reset_driver_wait_failed
         )
+        repowered = glx_tray_repower_ran(text)
         if gave_up and not failed:
             self.last_reset_driver_wait_failed = True
-            log(
-                f"mesh reset FAILED (rc {rc}): tt-smi gave up at its driver wait — not every chip showed up, "
-                "so no POST_RESET and no board re-init ran; the chips it found are left ARC-not-ready"
+            ran = (
+                "the tray re-power ran, but"
+                if repowered
+                else "no tray re-power in tt-smi's output, and"
             )
-            health_event("reset_driver_wait_gave_up", rc=rc)
+            log(
+                f"mesh reset FAILED (rc {rc}): {ran} tt-smi gave up at its driver wait — not every chip showed "
+                "up, so no POST_RESET and no board re-init ran; the chips it found are left ARC-not-ready"
+            )
+            health_event("reset_driver_wait_gave_up", rc=rc, tray_repower=repowered)
+            return True
+        if not failed and rc not in (None, 0) and not repowered:
+            log(f"mesh reset FAILED (rc {rc}): reset did not run — tt-smi exited before the tray re-power")
+            health_event("reset_did_not_run", rc=rc)
             return True
         if not failed:
             log("mesh reset ended: tt-smi reported no POST_RESET failure; no in-flight cut")

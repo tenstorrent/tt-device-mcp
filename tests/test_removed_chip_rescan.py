@@ -153,6 +153,22 @@ async def test_a_removed_chip_that_does_not_return_is_retried_through_the_same_b
 
 
 @pytest.mark.asyncio
+async def test_a_chip_the_bridge_rung_did_not_bring_back_is_not_promised_a_heal_without_a_power_cycle(
+    tmp_path, monkeypatch, rung
+):
+    """The escalation line names what follows honestly: the galaxy reset re-powers the trays, and a chip
+    still off the bus after it goes to the power cycle. It never says no power cycle is needed."""
+    bus = FakeBus(tmp_path, monkeypatch, come_back=False)
+    bus.remove("13")
+    srv.isolated_chips = {"13"}
+    logs: list = []
+    assert await srv.galaxy_recovery._recover_isolated_chips(logs.append) is False
+    line = next(m for m in logs if "did NOT come back from a bridge reset" in m)
+    assert "no power-cycle required" not in line
+    assert "power cycle" in line
+
+
+@pytest.mark.asyncio
 async def test_every_removed_chip_is_reset_before_the_first_rescan(tmp_path, monkeypatch, rung):
     bus = FakeBus(tmp_path, monkeypatch)
     bus.remove("13")
