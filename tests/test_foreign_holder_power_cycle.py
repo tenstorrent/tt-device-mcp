@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Spec 04 I103: only a running broker job holds an automatic power cycle; a holder outside every
 broker job or exec scope never vetoes or delays it, and a queued or waiting job does not either.
 
