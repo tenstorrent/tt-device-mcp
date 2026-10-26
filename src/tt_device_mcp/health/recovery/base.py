@@ -48,11 +48,12 @@ GLX_DRIVER_WAIT = re.compile(r"Waiting for all \d+ chips to show up|Waiting for 
 # POST_RESET and no board re-init, so every chip it did find is left ARC-not-ready: the reset FAILED.
 GLX_DRIVER_WAIT_GAVE_UP = re.compile(r"Didn't find all (\d+) chips\b[^\n]*giving up")
 
-# Spec 04 I97 (c): tt-smi's tray re-power, the IPMI UBB reset it runs before the 30 s settle, or the
-# settle or driver wait that follow it. A failed mesh reset whose output has neither never re-powered the trays: the reset
+# Spec 04 I97 (c): tt-smi's tray re-power, the IPMI UBB reset it runs before the 30 s settle (tt-smi's only
+# raw IPMI call in a mesh reset; the bytes are not spelled out here, spec 04 I23), or the settle or driver
+# wait that follow it. A failed mesh reset whose output has neither never re-powered the trays: the reset
 # did not run, as opposed to a re-power that ran and left a chip off the bus.
 GLX_TRAY_REPOWER = re.compile(
-    r"ipmitool raw 0x30 0x8B\b|Waiting for \d+ seconds: \d+|Waiting for all \d+ chips to show up", re.IGNORECASE
+    r"ipmitool raw\b|Waiting for \d+ seconds: \d+|Waiting for all \d+ chips to show up", re.IGNORECASE
 )
 
 
