@@ -3756,6 +3756,10 @@ async def test_a_stuck_identity_read_never_delays_the_gate_or_its_hold(monkeypat
         took = time.monotonic() - t0
     finally:
         release.set()
+        for _ in range(200):  # the released read ends before the next test reads this pid
+            if 4242 not in holder_identity._reads_in_flight:
+                break
+            time.sleep(0.005)
 
     assert took < 0.3 + 0.5, took
     assert srv.fsm.record.why == "foreign_holder" and "pid 4242" in srv.fsm.record.detail

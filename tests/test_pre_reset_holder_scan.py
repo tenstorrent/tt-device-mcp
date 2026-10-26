@@ -965,6 +965,10 @@ async def test_a_stuck_identity_read_delays_neither_the_scan_nor_its_signals(mon
         finally:
             beat.cancel()
             release.set()
+            for _ in range(200):  # the released read ends before the next one reads this pid
+                if READER.pid not in hi._reads_in_flight:
+                    break
+                time.sleep(0.005)
         live[stuck_read] = (result.outcome, result.found, result.tenants, box.sent, result.refusal())
         if stuck_read:
             assert took < 0.3 + 0.5, took

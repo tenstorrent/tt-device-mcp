@@ -33,40 +33,73 @@ PROC_DIR = "/proc"
 CMDLINE_MAX_CHARS = 256
 REDACTED = "***"
 
-_SECRET_NAME = r"[\w.-]*(?:token|key|secret|passwd|password)[\w.-]*"
+# Every pattern below runs in time linear in its argument: Python's re holds the GIL for a whole
+# match, so a backtracking pattern on a long argument would stall the broker's event loop, whatever
+# bound the read runs under. A name match starts only where a run of name characters starts
+# (lookbehind), finds its secret word with one lazy scan (lookahead), then takes the whole run at
+# once (a lookahead capture, Python's stand-in for an atomic group), so no run is rescanned.
+_SECRET_WORD = r"(?=[\w.-]*?(?:token|key|secret|passwd|password))"
+_SECRET_NAME = rf"(?<![\w.-]){_SECRET_WORD}(?=([\w.-]+))\1"
 # NAME=value / NAME: value, inside one argument (a flag, an env-style arg, a query string, JSON).
-_NAMED_VALUE = re.compile(rf"({_SECRET_NAME})([\"']?\s*[=:]\s*[\"']?)([^\s\"',&;]+)", re.IGNORECASE)
+_NAMED_VALUE = re.compile(rf"{_SECRET_NAME}([\"']?\s*[=:]\s*[\"']?)([^\s\"',&;]+)", re.IGNORECASE)
 # A flag naming a secret whose value is the next argument (``--token abc``).
-_SECRET_FLAG = re.compile(rf"^--?{_SECRET_NAME}$", re.IGNORECASE)
+_SECRET_FLAG = re.compile(rf"--?{_SECRET_WORD}[\w.-]+", re.IGNORECASE)
 # URL userinfo (``scheme://user:pass@host``), up to the last '@' before the host, so a password
-# that contains '@' is covered whole.
-_URL_USERINFO = re.compile(r"([a-z][a-z0-9+.-]*://)[^/?#\s]+@", re.IGNORECASE)
+# that contains '@' is covered whole. Matched from the '://' on, whatever precedes it: each try
+# stops at the next '/', so the tries never overlap.
+_URL_USERINFO = re.compile(r"(://)[^/?#\s]+@")
+# A '://' whose userinfo may run past where a long argument was cut (``ARG_SCAN_MAX_CHARS``).
+_URL_CUT_TAIL = re.compile(r"(://)[^/?#\s]*\Z")
+# The most of one argument that is redacted and kept: a log line shows at most CMDLINE_MAX_CHARS,
+# so the rest of an argument longer than this is dropped unread.
+ARG_SCAN_MAX_CHARS = 4 * CMDLINE_MAX_CHARS
+
+
+def _redacted(argv: Iterable[str]):
+    redact_next = False
+    for arg in argv:
+        if redact_next:
+            redact_next = False
+            yield REDACTED
+            continue
+        if _SECRET_FLAG.fullmatch(arg):
+            redact_next = True
+            yield arg
+            continue
+        arg = _URL_USERINFO.sub(rf"\1{REDACTED}@", arg)
+        yield _NAMED_VALUE.sub(rf"\1\2{REDACTED}", arg)
 
 
 def redact_argv(argv: Iterable[str]) -> list[str]:
     """``argv`` with the values of arguments named like a secret, and URL userinfo, replaced."""
-    out: list[str] = []
-    redact_next = False
-    for arg in argv:
-        if redact_next:
-            out.append(REDACTED)
-            redact_next = False
-            continue
-        if _SECRET_FLAG.match(arg):
-            out.append(arg)
-            redact_next = True
-            continue
-        arg = _URL_USERINFO.sub(rf"\1{REDACTED}@", arg)
-        out.append(_NAMED_VALUE.sub(rf"\1\2{REDACTED}", arg))
-    return out
+    return list(_redacted(argv))
+
+
+def _cut_arg(arg: str, limit: int) -> str:
+    """``arg`` cut to ``limit`` chars. A cut that may fall inside URL userinfo (a '://' with no '/'
+    after it) redacts all after the '://', since the '@' that ends the userinfo may be cut off."""
+    if len(arg) <= limit:
+        return arg
+    return _URL_CUT_TAIL.sub(rf"\1{REDACTED}", arg[:limit])
 
 
 def format_cmdline(raw: bytes, limit: int = CMDLINE_MAX_CHARS) -> str:
-    """A NUL-separated /proc cmdline as one printable line: redacted, then cut to ``limit`` chars."""
-    argv = [a.decode("utf-8", "replace") for a in raw.rstrip(b"\0").split(b"\0")] if raw else []
-    line = " ".join(redact_argv(argv))
-    line = "".join(c if c.isprintable() else "?" for c in line)
-    return line if len(line) <= limit else line[: limit - 3] + "..."
+    """A NUL-separated /proc cmdline as one printable line: redacted, then cut to ``limit`` chars.
+
+    Bounded work whatever the cmdline: each argument is cut to ``ARG_SCAN_MAX_CHARS`` (at least
+    4 x ``limit``) before it is redacted, and arguments past the cut of the line are not redacted."""
+    argv = raw.rstrip(b"\0").split(b"\0") if raw else []
+    scan = max(ARG_SCAN_MAX_CHARS, 4 * limit)
+    parts: list[str] = []
+    size = 0
+    for arg in _redacted(_cut_arg(a.decode("utf-8", "replace"), scan) for a in argv):
+        parts.append(arg)
+        size += len(arg) + 1
+        if size > limit:
+            break
+    line = " ".join(parts)
+    line = line if len(line) <= limit else line[: limit - 3] + "..."
+    return "".join(c if c.isprintable() else "?" for c in line)
 
 
 def _read(path: str, binary: bool = False):
@@ -162,9 +195,11 @@ def holder_identity(pid: int) -> dict:
 # no per-box setting, so it can never stretch a gate or a reset rung.
 HOLDER_IDENTITY_READ_TIMEOUT_SEC = 1.5
 
-# Pids whose earlier read is still running (stuck in the kernel): not read again until it ends, so a
-# holder stuck across many scans leaves one thread behind, not one per scan.
-_reads_in_flight: set = set()
+# The reads still running, by pid: (thread, box its row lands in). A pid with a read in flight, from
+# this scan or another caller's (the gate, the job door and the pre-reset scan can overlap), is not
+# read again: the later caller waits for that read within its own bound. So a holder stuck across
+# many scans leaves one thread behind, not one per scan.
+_reads_in_flight: dict = {}
 _reads_lock = threading.Lock()
 
 
@@ -176,45 +211,43 @@ def read_holder_identities(
     pids: Iterable[int], *, timeout: Optional[float] = None, read: Optional[Callable[[int], dict]] = None
 ) -> list[dict]:
     """``holder_identity`` (or ``read``) for each distinct pid, in order, each on its own daemon thread,
-    all within ``timeout`` (default ``HOLDER_IDENTITY_READ_TIMEOUT_SEC``) in total. A read not back by
-    then, or whose pid already has a read stuck from an earlier call, is recorded as
+    all within ``timeout`` (default ``HOLDER_IDENTITY_READ_TIMEOUT_SEC``) in total. A pid whose read
+    from another call is still running shares that read. A read not back by the bound is recorded as
     ``{pid, status: 'unread', error: 'timeout'}`` and is never waited for. Never raises."""
     timeout = HOLDER_IDENTITY_READ_TIMEOUT_SEC if timeout is None else timeout
     read = read or holder_identity
     order = list(dict.fromkeys(int(p) for p in pids))
-    rows: dict = {}
-    lock = threading.Lock()
 
-    def run(pid: int) -> None:
+    def run(pid: int, box: list) -> None:
+        row = _unread(pid, "error")
         try:
             row = read(pid)
         except Exception as e:  # noqa: BLE001 - logging only
             row = {"pid": pid, "status": "live", "error": type(e).__name__}
         finally:
+            box.append(row)
             with _reads_lock:
-                _reads_in_flight.discard(pid)
-        with lock:
-            rows[pid] = row
+                _reads_in_flight.pop(pid, None)
 
-    threads = []
+    reads = []
     for pid in order:
         with _reads_lock:
-            if pid in _reads_in_flight:
-                continue
-            _reads_in_flight.add(pid)
-        t = threading.Thread(target=run, args=(pid,), name=f"holder-identity-{pid}", daemon=True)
-        try:
-            t.start()
-        except Exception:  # noqa: BLE001 - no thread to spare: the row is left unread
-            with _reads_lock:
-                _reads_in_flight.discard(pid)
-            continue
-        threads.append(t)
+            held = _reads_in_flight.get(pid)
+            if held is None:
+                box: list = []
+                t = threading.Thread(target=run, args=(pid, box), name=f"holder-identity-{pid}", daemon=True)
+                try:
+                    t.start()  # under the lock, so a caller that finds it in flight can join it
+                except Exception:  # noqa: BLE001 - no thread to spare: the row is left unread
+                    continue
+                held = _reads_in_flight[pid] = (t, box)
+        reads.append((pid, held))
     deadline = time.monotonic() + timeout
-    for t in threads:
+    got: dict = {}
+    for pid, (t, box) in reads:
         t.join(max(0.0, deadline - time.monotonic()))
-    with lock:
-        got = dict(rows)
+        if box:
+            got[pid] = box[0]
     return [got.get(pid) or _unread(pid, "timeout") for pid in order]
 
 

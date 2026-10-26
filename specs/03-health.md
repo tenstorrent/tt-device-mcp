@@ -721,8 +721,10 @@ cooldown (spec 04 I65) holds longer.
   command line with secret-named values and URL userinfo redacted, cut to 256 chars), read from
   /proc at first sighting; one gone mid-read is recorded `gone`. The reads run off the event
   loop under one fixed bound (1.5 s per scan); one still blocked then (a holder stuck in the
-  kernel) is recorded `unread` and never waited for. The read never raises or signals, and
-  changes no verdict.
+  kernel) is recorded `unread` and never waited for, and a pid already being read for another
+  caller shares that read. Redaction runs in time linear in the command line and looks at no
+  more than 1024 chars of an argument (Python's `re` holds the GIL while it matches). The read
+  never raises or signals, and changes no verdict.
 - **I44 — An idle foreign holder is named, never signalled.** A tenant process (`is_tenant`) that
   holds a device fd outside every broker job/exec scope and is not a descendant of the broker is
   tracked by its `/proc/<pid>/stat` CPU time (utime+stime+cutime+cstime), keyed on (pid, starttime)

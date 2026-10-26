@@ -132,6 +132,9 @@ def test_an_unexpected_read_error_is_recorded_not_raised(proc):
         (["app", '{"client_secret": "abc123"}'], "abc123", '"client_secret": "***"'),
         (["app", "--db-passwd=abc123"], "abc123", "--db-passwd=***"),
         (["app", "SECRET_KEY:abc123"], "abc123", "SECRET_KEY:***"),
+        (["git", "1https://bob:s3cret@example.com"], "s3cret", "://***@example.com"),
+        (["curl", "https://bob:" + "p" * 2000 + "@example.com"], "bob", "https://***"),
+        (["tool", "--token=" + "a" * 2000], "aaa", "--token=***"),
     ],
 )
 def test_secrets_are_redacted(argv, leaked, kept):
@@ -196,9 +199,9 @@ def test_a_read_stuck_in_the_kernel_is_left_unread_within_the_bound():
         ]
         assert "unread (timeout)" in hi.describe_identity(rows[0])
         t0 = time.monotonic()
-        again = hi.read_holder_identities([21], timeout=5.0, read=read)
+        again = hi.read_holder_identities([21], timeout=0.3, read=read)
         assert again == [{"pid": 21, "status": "unread", "error": "timeout"}]
-        assert time.monotonic() - t0 < 1.0 and started.count(21) == 1
+        assert time.monotonic() - t0 < 0.3 + 0.5 and started.count(21) == 1
     finally:
         release.set()
     for _ in range(100):  # the stuck read ends: the pid is read again next time
@@ -206,6 +209,58 @@ def test_a_read_stuck_in_the_kernel_is_left_unread_within_the_bound():
             break
         time.sleep(0.01)
     assert hi.read_holder_identities([21], timeout=1.0, read=read) == [{"pid": 21, "status": "live"}]
+
+
+def test_a_read_in_flight_for_another_caller_is_shared_not_timed_out():
+    """The gate, the job door and the pre-reset scan can read the same holder at once: a later
+    caller waits for the read already running, within its own bound, and gets its row."""
+    reads = []
+
+    def read(pid):
+        reads.append(pid)
+        time.sleep(0.3)
+        return {"pid": pid, "status": "live"}
+
+    first: list = []
+    t = threading.Thread(target=lambda: first.extend(hi.read_holder_identities([31], timeout=2.0, read=read)))
+    t.start()
+    for _ in range(100):
+        if 31 in hi._reads_in_flight:
+            break
+        time.sleep(0.005)
+    assert hi.read_holder_identities([31], timeout=2.0, read=read) == [{"pid": 31, "status": "live"}]
+    t.join(5)
+    assert first == [{"pid": 31, "status": "live"}] and reads == [31]
+
+
+_LONG = 131072  # the longest single argument Linux takes (MAX_ARG_STRLEN)
+
+
+def _long_arg(prefix: str) -> bytes:
+    return (prefix + ("ab0_.-" * _LONG))[:_LONG].encode()
+
+
+@pytest.mark.parametrize("prefix", ["", "token", "x://", "--api-key=", "a" * 100 + "secret"])
+def test_a_longest_argument_is_redacted_in_linear_bounded_time(prefix):
+    """Python's re holds the GIL for a whole match, so a backtracking pattern on a long argument
+    would stall the broker's loop past any read bound: every argument is redacted in linear time
+    and only its first ARG_SCAN_MAX_CHARS are looked at."""
+    raw = b"tool\0" + _long_arg(prefix) + b"\0" + _long_arg(prefix)
+    t0 = time.perf_counter()
+    line = hi.format_cmdline(raw)
+    assert time.perf_counter() - t0 < 0.05
+    assert len(line) <= hi.CMDLINE_MAX_CHARS
+    t0 = time.perf_counter()
+    hi.redact_argv(["tool", _long_arg(prefix).decode()])  # the whole argument, no cut
+    assert time.perf_counter() - t0 < 0.25
+
+
+def test_a_holder_with_a_longest_argument_is_read_within_the_bound(proc):
+    _stage(proc, 41, argv=(b"python3", _long_arg(""), _long_arg("token"), _long_arg("x://")))
+    t0 = time.monotonic()
+    (row,) = hi.read_holder_identities([41], timeout=1.0)
+    assert time.monotonic() - t0 < 1.0
+    assert row["status"] == "live" and row["cmdline"].startswith("python3 ab0_.-")
 
 
 def test_the_identity_bound_is_a_short_fixed_constant():
