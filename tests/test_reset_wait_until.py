@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
 """Spec 04 I102: a caller's ``wait_until`` ends the wait for a reset sooner, and nothing else changes.
 
 The late-chip step passes its own bound down through reset_with_quiesce -> run_scoped (or the local
@@ -108,7 +111,9 @@ async def test_without_a_bound_the_wait_runs_to_the_reset_timeout(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("overrun, bound", [(0.2, 1.5), (2.0, 1.2)], ids=["past-overrun", "inside-overrun"])
-async def test_a_local_reset_that_outlives_its_bound_keeps_running_and_registered(monkeypatch, tmp_path, overrun, bound):
+async def test_a_local_reset_that_outlives_its_bound_keeps_running_and_registered(
+    monkeypatch, tmp_path, overrun, bound
+):
     """The no-systemd backend: the child keeps its lock (scope_active) and its pid stays registered."""
     monkeypatch.setitem(privileges._LATCHED, "systemd", False)
     events = []
@@ -187,7 +192,9 @@ async def test_quiesce_keeps_the_pollers_down_while_the_bounded_reset_still_cycl
     monkeypatch.setattr(mech, "_post_reset_cut", cut)
     monkeypatch.setattr(mech, "scope_active", lambda: SCOPE)
     t0 = time.monotonic()
-    rc, _ = await asyncio.wait_for(mech.reset_with_quiesce(list(RESET), lambda _m: None, wait_until=t0 + bound), timeout=10)
+    rc, _ = await asyncio.wait_for(
+        mech.reset_with_quiesce(list(RESET), lambda _m: None, wait_until=t0 + bound), timeout=10
+    )
     took = time.monotonic() - t0
     assert rc is None
     assert bound - 0.2 <= took < bound + 1.0

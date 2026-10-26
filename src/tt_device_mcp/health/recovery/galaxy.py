@@ -2810,7 +2810,9 @@ class GalaxyRecovery(Recovery):
                 f"no settle and no full check: the reset is still cycling in its own scope ({scope}) — "
                 "the device stays held"
             )
-            health_event("sweep_verify_skipped", context=context or gate_phase, reason="reset_scope_active", scope=scope)
+            health_event(
+                "sweep_verify_skipped", context=context or gate_phase, reason="reset_scope_active", scope=scope
+            )
             return False, {"skipped": "reset_scope_active", "scope": scope}
         if settle:
             log(f"settling {settle}s for re-enumeration, then one verify before the host rung")
