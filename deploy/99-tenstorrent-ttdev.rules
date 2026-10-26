@@ -7,7 +7,10 @@
 # (whose users are NOT in ttdev) are denied by plain unix permissions. This is
 # what blocks bare-metal device use.
 #
+# The assignments are final (:=): the kmd's own rule sorts after this file and sets MODE="0666",
+# which would otherwise win and leave every node world-rw.
+#
 # Install to /etc/udev/rules.d/ and reload (the install script does this).
 # Verify the match with: udevadm info -a -p $(udevadm info -q path -n /dev/tenstorrent/0)
-SUBSYSTEM=="tenstorrent", GROUP="ttdev", MODE="0660"
-KERNEL=="tenstorrent!*", GROUP="ttdev", MODE="0660"
+SUBSYSTEM=="tenstorrent", GROUP:="ttdev", MODE:="0660"
+KERNEL=="tenstorrent!*", GROUP:="ttdev", MODE:="0660"

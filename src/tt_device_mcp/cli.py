@@ -25,6 +25,7 @@ import json
 import os
 import pwd
 import queue
+import re
 import shlex
 import signal
 import subprocess
@@ -34,7 +35,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-from tt_device_mcp import __version__
+from tt_device_mcp import __version__, device_lock
 from tt_device_mcp.constants import (
     DEFAULT_PORT,
     DEFAULT_SOCKET,
@@ -1313,19 +1314,10 @@ def device_nodes() -> list:
 
 
 def _device_locked() -> bool:
-    """True if /dev/tenstorrent is locked (group ttdev, not world-writable)."""
-    import grp
-
+    """True if /dev/tenstorrent is locked: EVERY node 0660 group ttdev. One node left
+    world-rw is a chip anyone opens, so node 0 alone proves nothing (spec 05 I9)."""
     nodes = device_nodes()
-    if not nodes:
-        return False
-    try:
-        st = os.stat(nodes[0])
-        if st.st_mode & 0o002:  # world-writable => cooperative
-            return False
-        return grp.getgrgid(st.st_gid).gr_name == _LOCK_GROUP
-    except (OSError, KeyError):
-        return False
+    return bool(nodes) and not device_lock.node_drift(nodes)
 
 
 def cmd_smi(args) -> int:
@@ -1364,11 +1356,16 @@ _UDEV_RULE_PATH = "/etc/udev/rules.d/99-tenstorrent-ttdev.rules"
 _UDEV_RULE = (
     "# Managed by tt-device-mcp. Restrict /dev/tenstorrent to group ttdev (0660) so\n"
     "# only broker-admitted jobs (gid=ttdev) open the device; bare-metal is denied.\n"
-    'SUBSYSTEM=="tenstorrent", GROUP="ttdev", MODE="0660"\n'
-    'KERNEL=="tenstorrent!*", GROUP="ttdev", MODE="0660"\n'
+    "# ':=' is final: the kmd's own rule sorts later and sets MODE 0666; it must not win.\n"
+    'SUBSYSTEM=="tenstorrent", GROUP:="ttdev", MODE:="0660"\n'
+    'KERNEL=="tenstorrent!*", GROUP:="ttdev", MODE:="0660"\n'
 )
 _LOCK_GROUP = "ttdev"
 _BROKER_UNIT = "/etc/systemd/system/tt-device-broker.service"
+# The host config auto-update re-renders the unit from: TTDEV_LOCK=1 there re-applies the lock.
+_BROKER_DEFAULTS = "/etc/default/tt-device-broker"
+# Unit lines the lock owns: the job gid and the broker's between-jobs flip switch.
+_LOCK_UNIT_KEYS = ("TT_DEVICE_MCP_DEVICE_GROUP", "TT_DEVICE_MCP_DEVICE_LOCK")
 _LOCK_BANNER = "/etc/profile.d/tt-device-mcp-banner.sh"
 _PROC_ROOT = "/proc"
 _LOCK_BANNER_TEXT = (
@@ -1444,6 +1441,7 @@ def _broker_runs_with_device_group() -> bool:
 def _set_service_device_group(enable: bool) -> bool:
     """Add/remove ``Environment=TT_DEVICE_MCP_DEVICE_GROUP=ttdev`` in the broker unit
     so privsep jobs run with gid=ttdev (DAC access to the locked node); daemon-reload.
+    Removing also drops ``TT_DEVICE_MCP_DEVICE_LOCK``, the opt-in's flip switch.
     Returns True only if it changed the unit. Enabling is a no-op when the unit or a
     drop-in already sets the group."""
     text = Path(_BROKER_UNIT).read_text()
@@ -1451,12 +1449,33 @@ def _set_service_device_group(enable: bool) -> bool:
     line = f"Environment=TT_DEVICE_MCP_DEVICE_GROUP={_LOCK_GROUP}\n"
     if enable and not has and not _configured_device_group():
         text = text.replace("Environment=TT_DEVICE_MCP_PRIVSEP=1\n", "Environment=TT_DEVICE_MCP_PRIVSEP=1\n" + line, 1)
-    elif not enable and has:
-        text = "".join(ln for ln in text.splitlines(keepends=True) if "TT_DEVICE_MCP_DEVICE_GROUP" not in ln)
+    elif not enable and any(k in text for k in _LOCK_UNIT_KEYS):
+        text = "".join(ln for ln in text.splitlines(keepends=True) if not any(k in ln for k in _LOCK_UNIT_KEYS))
     else:
         return False
     Path(_BROKER_UNIT).write_text(text)
     subprocess.run(["systemctl", "daemon-reload"], check=False)
+    return True
+
+
+def _clear_lock_opt_in() -> bool:
+    """Set ``TTDEV_LOCK=0`` in /etc/default/tt-device-broker, so the next auto-update does not
+    re-render the lock into the unit and re-apply it. Returns True only if it changed the file;
+    a host without the file or the key is left alone."""
+    p = Path(_BROKER_DEFAULTS)
+    try:
+        text = p.read_text()
+    except FileNotFoundError:
+        return False
+    key = re.compile(r"^\s*(?:export\s+)?TTDEV_LOCK=")
+    lines = text.splitlines(keepends=True)
+    new = ["TTDEV_LOCK=0\n" if key.match(ln) else ln for ln in lines]
+    if new == lines:
+        return False
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text("".join(new))
+    os.chmod(tmp, p.stat().st_mode & 0o7777)
+    os.replace(tmp, p)
     return True
 
 
@@ -1527,19 +1546,26 @@ def _remove_smi_ro_wrapper() -> None:
             pass
 
 
-# Negative self-check payload: exits 13 on EACCES (the node denied a non-ttdev open, so
-# the lock holds) and 0 if it opened cleanly (the lock leaked). A distinct 13 separates a
-# real denial from a probe that never ran — a systemd-run failure returns its own code.
-_DENY_PROBE = (
+# Self-check payload, run as the probed identity. access() asks the kernel's permission check
+# only; it opens nothing, so no chip sees a probe. Exits 0 when `quantifier` (all/any) of the
+# nodes grant read+write, 13 when not (denied), 1 when a node is missing (no verdict). A distinct
+# 13 separates a real denial from a probe that never ran — a systemd-run failure returns its own code.
+_ACCESS_PROBE = (
     "import os, sys\n"
-    "try:\n"
-    "    os.close(os.open(%r, os.O_RDONLY))\n"
-    "    sys.exit(0)\n"
-    "except PermissionError:\n"
-    "    sys.exit(13)\n"
-    "except OSError:\n"
+    "nodes = %r\n"
+    "if not all(os.path.exists(n) for n in nodes):\n"
     "    sys.exit(1)\n"
+    "sys.exit(0 if %s(os.access(n, os.R_OK | os.W_OK) for n in nodes) else 13)\n"
 )
+
+
+def _access_probe_rc(nodes: list, quantifier: str, admitted: bool) -> int:
+    """Run the access probe as ``nobody`` (with the lock group when ``admitted``)."""
+    argv = ["systemd-run", "--scope", "--quiet", "--uid=nobody"]
+    if admitted:
+        argv.append(f"--gid={_LOCK_GROUP}")
+    argv += [sys.executable, "-c", _ACCESS_PROBE % (list(nodes), quantifier)]
+    return subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
 
 
 def cmd_lock(args) -> int:
@@ -1571,40 +1597,20 @@ def cmd_lock(args) -> int:
     time.sleep(1)
     nodes = device_nodes()  # never `by-id/`: opening a directory would pass vacuously
     if nodes:
-        # Positive self-check: an admitted (gid=ttdev) job must still open the node, or the
-        # lock has bricked the box for legitimate broker work.
-        admitted_ok = (
-            subprocess.run(
-                [
-                    "systemd-run",
-                    "--scope",
-                    "--quiet",
-                    "--uid=nobody",
-                    f"--gid={_LOCK_GROUP}",
-                    sys.executable,
-                    "-c",
-                    f"import os; os.close(os.open({nodes[0]!r}, os.O_RDONLY))",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            ).returncode
-            == 0
-        )
+        # Positive self-check: an admitted (gid=ttdev) job must still have read+write on every
+        # node, or the lock has bricked the box for legitimate broker work.
+        admitted_ok = _access_probe_rc(nodes, "all", admitted=True) == 0
         if not admitted_ok:
-            print("Self-check FAILED: an admitted (gid=ttdev) job could not open the device.")
+            print("Self-check FAILED: an admitted (gid=ttdev) job has no read+write access to the device.")
             print("Reverting to cooperative so the host isn't bricked.")
             return cmd_unlock(args)
-        # Negative self-check: a non-ttdev identity must be DENIED, else the "lock" denies
-        # nobody and printing LOCKED would be a lie (silent fail-open). Same nobody uid as
-        # above, minus gid=ttdev — the only difference is the group the node gates on.
-        deny_rc = subprocess.run(
-            ["systemd-run", "--scope", "--quiet", "--uid=nobody", sys.executable, "-c", _DENY_PROBE % nodes[0]],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
+        # Negative self-check: a non-ttdev identity must be DENIED on every node, else the
+        # "lock" denies nobody there and printing LOCKED would be a lie (silent fail-open). Same
+        # nobody uid as above, minus gid=ttdev — the only difference is the group the node gates on.
+        deny_rc = _access_probe_rc(nodes, "any", admitted=False)
         if deny_rc == 0:
             print(
-                "Self-check FAILED: /dev/tenstorrent is still openable without gid=ttdev — "
+                "Self-check FAILED: /dev/tenstorrent is still accessible without gid=ttdev — "
                 "the lock did not take effect; bare-metal is NOT denied."
             )
             print("Reverting to cooperative so the state isn't a false lock.")
@@ -1621,7 +1627,12 @@ def cmd_lock(args) -> int:
             return 1
     _install_smi_ro_wrapper()
     Path(_LOCK_BANNER).write_text(_LOCK_BANNER_TEXT)
+    if nodes:
+        device_lock.mark_applied()
     print(f"LOCKED: /dev/tenstorrent is 0660 root:{_LOCK_GROUP}; bare-metal denied.")
+    # A member of the group opens the node without the broker: name each one (spec 05 I9).
+    for line in device_lock.not_effective_lines(device_lock.human_members(_LOCK_GROUP)):
+        print(f"Warning: {line} (member of {_LOCK_GROUP}; remove with: sudo gpasswd -d <user> {_LOCK_GROUP})")
     print("Undo: sudo tt-device-mcp unlock")
     return 0
 
@@ -1636,7 +1647,12 @@ def cmd_unlock(args) -> int:
     except FileNotFoundError:
         pass
     _udev_reload()
-    _set_service_device_group(False)
+    device_lock.clear_markers()
+    # Clear the opt-in before the unit: an update in between would otherwise re-render both lines.
+    if _clear_lock_opt_in():
+        print(f"Set TTDEV_LOCK=0 in {_BROKER_DEFAULTS}: updates no longer re-apply the lock.")
+    if _set_service_device_group(False):
+        print(f"Removed {' and '.join(_LOCK_UNIT_KEYS)} from {_BROKER_UNIT}.")
     try:
         Path(_LOCK_BANNER).unlink()
     except FileNotFoundError:

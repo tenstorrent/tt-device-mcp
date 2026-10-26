@@ -216,6 +216,14 @@ fi
 # across a re-render so an update doesn't silently unlock a shared host.
 group_env=""; grep -q 'TT_DEVICE_MCP_DEVICE_GROUP' "$UNIT" 2>/dev/null \
     && group_env="Environment=TT_DEVICE_MCP_DEVICE_GROUP=ttdev"
+# The opt-in lock (spec 05 I9): TTDEV_LOCK=1 in /etc/default renders the device group AND the
+# broker's flip switch into the unit, so the lock comes up inside this update's own restart (never
+# an extra one) and the broker re-applies the node modes itself, between jobs. Unset or 0 changes
+# nothing: a host keeps exactly the unit it had. `tt-device-mcp unlock` stays the undo: it sets
+# TTDEV_LOCK=0 in /etc/default and strips both lines from the unit, so no later update re-locks.
+LOCK="${TTDEV_LOCK:-0}"
+[ "$LOCK" = 1 ] && group_env="Environment=TT_DEVICE_MCP_DEVICE_GROUP=ttdev
+Environment=TT_DEVICE_MCP_DEVICE_LOCK=1"
 
 [ -n "$RENDER_ONLY" ] || mkdir -p /var/log/tt-device-broker
 # Render to stdout under the seam; write the real unit otherwise.
@@ -334,6 +342,15 @@ install -m 0644 "$DEPLOY/tt-device-broker-journald.conf" /etc/systemd/journald.c
 # journald only re-reads its limits on restart; guarded because a retention change must never
 # abort a host-config apply that the broker's own recovery depends on.
 systemctl restart systemd-journald 2>/dev/null || true
+
+# Device lock helper: reconcile's drift check runs it wherever the unit carries the device group.
+install -m 0755 "$DEPLOY/tt-device-lock.sh" "$ROOT/device-lock.sh"
+if [ "$LOCK" = 1 ]; then
+    # Group emptied of people, final-assignment rule installed, rules reloaded; the broker flips
+    # the nodes between jobs. A failure leaves the host as it was (cooperative), loudly.
+    "$ROOT/device-lock.sh" apply "$DEPLOY" \
+        || echo "apply-host-config: warning: device lock apply failed; /dev/tenstorrent stays as it was" >&2
+fi
 
 # Reconcile timer/service + login self-heal + per-user client wiring.
 install -m 0644 "$DEPLOY/tt-device-reconcile.service" /etc/systemd/system/tt-device-reconcile.service
