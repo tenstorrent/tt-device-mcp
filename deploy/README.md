@@ -45,7 +45,9 @@ broker pages instead. The broker runs as root, so it can read both.
 cycle and `TT_DEVICE_MCP_POWER_CYCLE_CMD`) first reboots the OS cleanly; the system-shutdown hook
 `tt-device-mcp-power-cycle.shutdown`, installed by `apply-host-config.sh`, cuts power once the
 filesystems are read-only. A fallback unit cuts it anyway after
-`TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC` (default 120 s), even if the shutdown hangs after
+a bound sized from the host's systemd unit timeouts (90 s + the longer of `DefaultTimeoutStartSec`
+and `DefaultTimeoutStopSec` + 30 s: 210 s on a stock host, at most 600 s;
+`TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC` may only raise it), even if the shutdown hangs after
 systemd hands over to systemd-shutdown. The configured command then runs with the network down, so
 it must be in-band (for example local `ipmitool`); the hook gives it 5-15 s per try
 (`TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC`, clamped), 3 tries. A service that unloads the IPMI

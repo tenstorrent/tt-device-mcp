@@ -14590,6 +14590,22 @@ def test_a_hold_clock_from_an_earlier_boot_is_not_restored(monkeypatch, tmp_path
     assert _hold_age_sec() < 60, f"a hold after a reboot was born {_hold_age_sec():.0f}s old"
 
 
+def test_a_tenant_hold_carried_into_a_cycled_boot_still_reads_as_a_tenants(monkeypatch, tmp_path):
+    """Spec 03 I90: the startup-pending wrapper on a carried detail leaves the foreign-holder reading
+    as it was."""
+    from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState
+
+    f = ServerFsm(tmp_path / "fsm.json", current_boot_id="boot-B")
+    held = f"{srv.FOREIGN_HOLDER_NOTE}alice(pid 7) holds the device; verify deferred"
+    f.boot_merge(
+        open_episode=FsmRecord(state=ServerState.RECOVERING, why="startup_unverified", detail=held),
+        attributed_boot={"action": "power-cycle", "at": "T1"},
+    )
+    assert f.record.detail.startswith("startup check pending")
+    monkeypatch.setattr(srv, "fsm", f)
+    assert srv._hold_is_tenant_held()
+
+
 def test_a_tenant_holds_clock_is_not_restored_after_a_restart(monkeypatch, tmp_path, clear_job_state):
     """A hold opened because another user's process held the device is not a device fault: its age
     must not push the next process's first hold past the escalation windows, even within one boot."""

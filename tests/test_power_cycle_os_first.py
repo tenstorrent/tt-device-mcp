@@ -37,6 +37,8 @@ CYCLE_ABS = ["/usr/bin/ipmitool", "chassis", "power", "cycle"]
 
 
 def _key(argv):
+    if argv[:2] == ["systemctl", "show"]:
+        return "show"
     if argv[0] == "systemd-run":
         return "systemd-run"
     if "reboot" in argv:
@@ -70,24 +72,31 @@ def os_first(monkeypatch, tmp_path):
         "restart_cause": 0,
         "sel_time": 0,
         "sel_list": 0,
+        "show": 0,
     }
-    out = {"restart_cause": " 01 0f"}  # chassis power control command
+    out = {
+        "restart_cause": " 01 0f",  # chassis power control command
+        "show": "DefaultTimeoutStartUSec=1min 30s\nDefaultTimeoutStopUSec=1min 30s\n",  # systemd's defaults
+    }
+    queries = []
     req = tmp_path / "power-cycle.request"
     monkeypatch.setattr(pc, "REQUEST_FILE", str(req))
     monkeypatch.setattr(pc, "os_first_unavailable", lambda: "")
     monkeypatch.setattr(pc, "_resolve_command", lambda c: c if c.startswith("/") else f"/usr/bin/{c}")
     monkeypatch.setattr(pc, "health_event", lambda name, **k: events.append((name, k)))
+    monkeypatch.setattr(pc, "health_dir", lambda: tmp_path)
     monkeypatch.delenv("TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC", raising=False)
     monkeypatch.delenv("TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC", raising=False)
 
     def step(argv, timeout=pc.STEP_TIMEOUT_SEC):
         key = _key(argv)
-        calls.append((key, list(argv), req.exists(), timeout))
+        # The read-only unit-timeout query is kept apart from the steps whose order the tests check.
+        (queries if key == "show" else calls).append((key, list(argv), req.exists(), timeout))
         return rc[key], out.get(key, "" if rc[key] == 0 else f"{key} failed")
 
     monkeypatch.setattr(pc, "_run_step", step)
     monkeypatch.setattr(pc, "_run_query", step)
-    return {"calls": calls, "events": events, "rc": rc, "out": out, "req": req}
+    return {"calls": calls, "queries": queries, "events": events, "rc": rc, "out": out, "req": req}
 
 
 def _steps(s):
@@ -127,7 +136,7 @@ def test_the_fallback_unit_stays_out_of_the_shutdown_and_survives_its_killall(os
     i = argv.index("/bin/bash")
     assert argv[i + 1 : i + 5] == ["-c", pc.FALLBACK_LAUNCH_SH, pc.FALLBACK_ARGV0, pc.FALLBACK_SH]
     assert pc.FALLBACK_ARGV0.startswith("@") and pc.FALLBACK_FIRE_ARGV0.startswith("@")
-    assert argv[i + 5 :] == [pc.fallback_pid_file(), str(pc.SHUTDOWN_BOUND_DEFAULT_SEC), "45", *CYCLE_ABS]
+    assert argv[i + 5 :] == [pc.fallback_pid_file(), "210", "45", *CYCLE_ABS]
     assert os_first["req"].read_text().splitlines()[2] == str(pc.HOOK_TRY_TIMEOUT_MAX_SEC)
 
 
@@ -211,18 +220,97 @@ def test_the_fallback_fires_under_an_at_sign_argv0_and_its_timeout(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "raw,want",
-    [("", 120), ("90", 90), ("0", 30), ("-5", 30), ("99999", 300), ("off", 120), ("inf", 120), ("nan", 120)],
+    "text,want",
+    [
+        ("1min 30s", 90),
+        ("90s", 90),
+        ("2min", 120),
+        ("1h 2min 3.5s", 3723.5),
+        ("500ms", 0.5),
+        ("infinity", float("inf")),
+        ("", None),
+        ("soon", None),
+        ("1min soon", None),
+    ],
 )
-def test_the_shutdown_bound_is_always_finite_and_clamped(monkeypatch, raw, want):
+def test_systemd_timespans_parse(text, want):
+    assert pc.parse_systemd_timespan(text) == want
+
+
+@pytest.mark.parametrize(
+    "show,want",
+    [
+        ("DefaultTimeoutStartUSec=1min 30s\nDefaultTimeoutStopUSec=1min 30s\n", 90),
+        ("DefaultTimeoutStartUSec=1min 30s\nDefaultTimeoutStopUSec=3min\n", 180),
+        ("DefaultTimeoutStartUSec=4min\nDefaultTimeoutStopUSec=1min 30s\n", 240),
+        ("DefaultTimeoutStartUSec=infinity\nDefaultTimeoutStopUSec=1min 30s\n", float("inf")),
+        ("DefaultTimeoutStopUSec=garbage\n", 90),
+        ("", 90),
+    ],
+)
+def test_the_host_unit_timeout_is_the_longer_of_start_and_stop(os_first, show, want):
+    os_first["out"]["show"] = show
+    assert pc.host_unit_timeout_sec() == want
+    (q,) = os_first["queries"]
+    assert q[1][:2] == ["systemctl", "show"] and q[3] == pc.PREFLIGHT_TIMEOUT_SEC
+
+
+def test_an_unreadable_systemd_reads_as_its_default_timeout(os_first):
+    os_first["rc"]["show"] = 1
+    assert pc.host_unit_timeout_sec() == pc.SYSTEMD_DEFAULT_UNIT_TIMEOUT_SEC == 90
+    assert pc.shutdown_bound_sec(90) == 210
+
+
+@pytest.mark.parametrize(
+    "unit_timeout,raw,want",
+    [
+        # The field evidence: a mount's 90 s timeout ran out and the power went off at 116 s, so
+        # the bound must clear clean shutdown + one unit timeout with room to spare.
+        (90, "", 210),
+        (180, "", 300),
+        (float("inf"), "", 600),
+        (float("nan"), "", 210),
+        (90, "300", 300),
+        (90, "120", 210),
+        (90, "0", 210),
+        (90, "-5", 210),
+        (90, "99999", 600),
+        (90, "off", 210),
+        (90, "inf", 600),
+        (90, "nan", 210),
+    ],
+)
+def test_the_shutdown_bound_clears_a_unit_timeout_and_stays_finite(monkeypatch, unit_timeout, raw, want):
+    """Sized from the host (spec 04 I99): never below clean shutdown + the unit timeout + margin,
+    never above the cap, so a hung shutdown still ends in the cycle. The setting may only raise it."""
     monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC", raw)
-    assert pc.shutdown_bound_sec() == want
+    assert pc.shutdown_bound_sec(unit_timeout) == want
+
+
+def test_the_fallback_bound_is_the_hosts_and_the_request_is_kept_for_the_next_boot(os_first):
+    os_first["out"]["show"] = "DefaultTimeoutStartUSec=1min 30s\nDefaultTimeoutStopUSec=3min\n"
+    t0 = time.time()
+    assert pc.fire_os_first(CYCLE, REASON) == "os_first"
+    argv = os_first["calls"][1][1]
+    assert argv[argv.index(pc.fallback_pid_file()) + 1] == "300"
+    event = os_first["events"][-1][1]
+    assert event["bound_sec"] == 300 and event["unit_timeout_sec"] == 180
+    marker = pc.take_os_first_marker()
+    assert marker["bound_sec"] == 300 and marker["unit_timeout_sec"] == 180 and marker["unit"] == event["unit"]
+    assert t0 <= marker["requested_epoch"] <= time.time()
+    assert pc.take_os_first_marker() is None, "read once"
+
+
+def test_a_request_that_never_reached_reboot_keeps_no_marker(os_first):
+    os_first["rc"]["reboot"] = 1
+    _not_launched(os_first)
+    assert pc.take_os_first_marker() is None
 
 
 def test_no_hook_installed_raises_not_launched_and_runs_no_step(os_first, monkeypatch):
     monkeypatch.setattr(pc, "os_first_unavailable", lambda: "no executable hook")
     assert _not_launched(os_first) == "no executable hook"
-    assert _steps(os_first) == []
+    assert _steps(os_first) == [] and os_first["queries"] == []
 
 
 def test_an_unwritable_request_raises_not_launched(os_first, monkeypatch, tmp_path):
@@ -918,6 +1006,71 @@ def test_a_cause_the_bmc_answers_never_reads_the_sel(booted):
     booted["out"]["restart_cause"] = " 0a 0f"
     assert booted["mech"].confirm_power_cycle_on_boot(now_epoch=BOOT_NOW) == "refuted"
     assert not any(c[0].startswith("sel_") for c in booted["calls"])
+
+
+# Spec 04 I99: the boot after an OS-first cycle records how long the shutdown took against its bound.
+
+
+def _keep_request(s, requested, bound=210, unit_timeout=90):
+    (s["tmp"] / pc.POWER_CYCLE_OS_FIRST_FILE).write_text(
+        json.dumps({"requested_epoch": requested, "bound_sec": bound, "unit_timeout_sec": unit_timeout, "unit": "u"})
+    )
+
+
+def test_the_shutdown_time_is_the_sel_power_off_after_the_reboot_request(sel_booted):
+    # The hook ran 10 s, the power went off 16.4 s after the reboot was asked.
+    _keep_request(sel_booted, SEL_REQUEST + 10)
+    assert sel_booted["mech"].confirm_power_cycle_on_boot(now_epoch=SEL_CHECK) == "confirmed"
+    row = _row(sel_booted)
+    assert row["shutdown_sec"] == 16.4 and row["shutdown_bound_sec"] == 210 and row["shutdown_within_bound"] is True
+    assert row["reboot_requested_at"] == recovery_base._local_time(SEL_REQUEST + 10)
+    assert row["host_unit_timeout_sec"] == 90 and "shutdown_sec_unavailable" not in row
+    (event,) = [k for n, k in sel_booted["hevents"] if n == "power_cycle_confirmed"]
+    assert event["shutdown_sec"] == 16.4 and event["shutdown_bound_sec"] == 210
+    assert not (sel_booted["tmp"] / pc.POWER_CYCLE_OS_FIRST_FILE).exists(), "consumed"
+    assert sum(c[0] == "sel_list" for c in sel_booted["calls"]) == 1, "the confirming read is reused"
+
+
+def test_a_shutdown_past_its_bound_is_recorded_as_such(sel_booted, caplog):
+    """The 116-of-120 s case: the power went off at (or past) the bound, so the fallback, not the
+    hook, cut it; the row says so and the log warns."""
+    _keep_request(sel_booted, SEL_REQUEST + 10, bound=15)
+    with caplog.at_level("WARNING"):
+        sel_booted["mech"].confirm_power_cycle_on_boot(now_epoch=SEL_CHECK)
+    row = _row(sel_booted)
+    assert row["shutdown_sec"] == 16.4 and row["shutdown_within_bound"] is False
+    assert "16 s of its 15 s fallback bound" in caplog.text
+
+
+def test_a_cause_confirmed_cycle_reads_the_sel_only_for_the_shutdown_time(booted):
+    """A cycle the restart cause confirmed reads the SEL from the reboot request on; one with no
+    power-off record leaves the time unknown, with why, and the verdict as it was."""
+    requested = BOOT_NOW - 250
+    _keep_request(booted, requested)
+    assert booted["mech"].confirm_power_cycle_on_boot(now_epoch=BOOT_NOW) == "confirmed"
+    row = _row(booted)
+    assert row["shutdown_sec"] is None and row["shutdown_sec_unavailable"].startswith("no SEL power-off")
+    assert row["shutdown_bound_sec"] == 210 and "shutdown_within_bound" not in row
+    assert any(c[0].startswith("sel_") for c in booted["calls"])
+
+
+def test_a_refuted_cycle_has_no_shutdown_time(booted):
+    booted["out"]["restart_cause"] = " 0a 0f"
+    _keep_request(booted, BOOT_NOW - 250)
+    assert booted["mech"].confirm_power_cycle_on_boot(now_epoch=BOOT_NOW) == "refuted"
+    row = _row(booted)
+    assert row["shutdown_sec"] is None and row["shutdown_sec_unavailable"] == "power cycle refuted"
+    assert not any(c[0].startswith("sel_") for c in booted["calls"])
+
+
+@pytest.mark.parametrize("offset", [-150, +300])
+def test_a_request_from_another_window_adds_nothing_and_is_dropped(booted, offset):
+    """A marker older than the row (a request a later one superseded) or after this boot started is
+    not this cycle's: no shutdown fields, and it does not linger."""
+    _keep_request(booted, BOOT_NOW - 300 + offset)
+    assert booted["mech"].confirm_power_cycle_on_boot(now_epoch=BOOT_NOW) == "confirmed"
+    assert not any(k.startswith("shutdown") for k in _row(booted))
+    assert not (booted["tmp"] / pc.POWER_CYCLE_OS_FIRST_FILE).exists()
 
 
 # F3: the I27 contract on both paths.

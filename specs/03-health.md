@@ -1142,6 +1142,15 @@ cooldown (spec 04 I65) holds longer.
   seconds since the last job process was seen alive, the processes killed at the bound, the
   holders left, the per-chip readability before the reset and the chips sent to their bridge
   reset (`sbr_chips`). An 8-chip mesh and a job that ended itself are unchanged.
+- **I90 — A hold carried into a boot the broker's escalation brought up reads as its pending
+  startup check.** The carried episode's detail describes the boot that is gone: after a power cycle
+  that brought every chip back, a hold still reading "1/32 chip(s) off the bus" misleads anyone
+  reading `device unverified: ...`. On the boot's first broker start, when the boot is attributed to
+  a broker-fired escalation (spec 04 I88), the detail becomes `startup check pending (before this
+  boot: <old detail>) boot attributed to ...`. The old detail stays inside, so every text match on
+  the detail (the foreign-holder prefix through `unwrap_startup_pending`) reads as before, and the
+  wrapper never nests across boots or restarts. Only the text changes: the hold, its why, state and
+  dirty flag, and the startup full check with fabric that alone lifts it (I4, I32) are unchanged.
 - **I74 — The startup gate pays a kill-reset debt it finds open: reset, then the one full check.**
   A re-adopted job (spec 01 I7) that the broker stopped before the startup check ran (its timeout,
   a requested kill, or a preemption kill) leaves an I69 debt open when the startup gate (I4)
@@ -2384,6 +2393,8 @@ refuses.
 | I89 (an unreadable chip takes its own bridge-reset rung, not the mesh reset; a whole tray or every chip off goes to the power cycle) | `tests/test_post_kill_settle.py::test_an_unreadable_chip_routes_to_its_bridge_reset`, `tests/test_post_kill_settle.py::test_an_unreadable_chip_takes_its_own_rung_not_the_mesh_reset`, `tests/test_post_kill_settle.py::test_a_whole_tray_off_routes_to_the_power_cycle`, `tests/test_post_kill_settle.py::test_all_chips_off_routes_to_the_power_cycle` |
 | I89 (release still needs a just-passed full check with fabric; a failed or unrun fabric pass keeps the hold; the power cycle still fires) | `tests/test_post_kill_settle.py::test_release_still_needs_the_full_check_with_fabric`, `tests/test_post_kill_settle.py::test_a_post_kill_fabric_that_fails_or_cannot_check_keeps_the_hold`, `tests/test_post_kill_settle.py::test_a_failed_post_kill_check_still_climbs_to_the_power_cycle` |
 | I89 (one `post_kill_settle` event and log line per post-kill reset, none without a debt) | `tests/test_post_kill_settle.py::test_one_post_kill_settle_event_and_line_per_reset`, `tests/test_post_kill_settle.py::test_no_post_kill_settle_without_a_debt` |
+| I90 (a hold carried into an escalation's boot reads as the pending startup check, old detail inside, hold unchanged; no wrapper without an escalation) | `tests/test_fsm.py::test_a_hold_carried_into_a_power_cycled_boot_reads_as_its_pending_startup_check`, `tests/test_fsm.py::test_a_boot_without_an_escalation_keeps_the_carried_detail_as_it_was` |
+| I90 (the wrapper never nests across boots or restarts; a tenant's hold still reads as a tenant's) | `tests/test_fsm.py::test_the_pending_wrapper_never_nests_across_boots_or_restarts`, `tests/test_device_safety.py::test_a_tenant_hold_carried_into_a_cycled_boot_still_reads_as_a_tenants` |
 | I69 (a reaped leftover skips before the debt: no reset, debt kept, no wait; a reboot drops it and the startup full check runs; a cooldown skips and clears it with no wait) | `tests/test_job_kill_reset.py::test_a_reaped_leftover_defers_the_debt_with_no_reset_and_no_wait`, `tests/test_job_kill_reset.py::test_a_debt_inside_a_failed_resets_cooldown_is_skipped_with_no_wait` |
 | I69 (a failed job that left chips at the busy AI clock owes the reset; an idle clock, an exit 0 or our own reset's kill owes none; nor does an off-bus chip's 0xFFFFFFFF read) | `tests/test_job_kill_reset.py::test_a_failed_job_that_left_the_clock_busy_owes_the_reset`, `tests/test_job_kill_reset.py::test_no_clock_debt_for_a_closed_device_an_exit0_or_our_own_kill`, `tests/test_job_kill_reset.py::test_an_off_bus_clock_read_is_not_a_busy_clock` |
 | I74 (the startup gate pays an open debt: one reset, one full check after it, no pass before; a failed check stays held; the read-only probe leaves it; a later debt is paid by the post-job gate) | `tests/test_job_kill_reset.py::test_the_startup_gate_pays_an_open_debt_with_one_full_check`, `tests/test_job_kill_reset.py::test_a_failed_startup_kill_check_stays_held`, `tests/test_job_kill_reset.py::test_the_read_only_startup_probe_leaves_the_debt`, `tests/test_job_kill_reset.py::test_a_debt_owed_after_the_startup_check_is_paid_by_the_post_job_gate` |
