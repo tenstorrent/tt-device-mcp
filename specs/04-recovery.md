@@ -1872,8 +1872,10 @@ each rung fires only when the gentler one failed or cannot apply.
      hook's worst case, 10 + 2 + 3 x 15 + 2 x 2 + 25 = 86 s, stays inside systemd-shutdown's 90 s
      hook timeout. Any other verb, or no request, does nothing.
 
-  The bound is `TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC`, default 120 s, clamped to 30-300 s;
-  a malformed value reads as the default, and no value turns it off. The fallback's clock starts at
+  The bound is sized from the host's own systemd timeouts (I99): 90 s + the longer of
+  `DefaultTimeoutStartSec` and `DefaultTimeoutStopSec` + 30 s, 210 s with systemd's defaults, at
+  most 600 s. `TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC` may only raise it (to the same cap);
+  a lower or malformed value is ignored, and no value turns it off. The fallback's clock starts at
   the request and lives through the hand-over to systemd-shutdown, so a shutdown that hangs at any
   stage before the hook (a stuck service, umount, another hook) is cycled at the bound + 2 s.
 
@@ -2549,6 +2551,33 @@ each rung fires only when the gentler one failed or cannot apply.
   escalation's and the sweep's rounds). A second chip that drops later in the hold, or a chip that
   came back and drops again, gets its own round (about 44 s) instead of going straight to the mesh
   reset or the power cycle.
+- **I99 — The OS-first fallback outlasts one unit timeout, and the shutdown it bounded is timed.**
+  A clean shutdown (I88) that hits one stuck unit waits that unit's systemd timeout before going on:
+  mount units default to `DefaultTimeoutStartSec`, services to `DefaultTimeoutStopSec`, 90 s each
+  on a stock host. A fixed 120 s fallback left 30 s for everything else: on a host whose snapd mount
+  unmount timed out at 90 s, the power went off 116 s after the request, 4 s inside the bound, so the
+  fallback, not the hook, may have cut it before the filesystems were read-only. The bound is
+  therefore `SHUTDOWN_CLEAN_SEC` (90 s; a clean reboot of a Galaxy host measured 86 s) + the host's
+  unit timeout (the longer of the two defaults, read once per cycle with `systemctl show`, bounded
+  like the BMC pre-flight; 90 s when systemd does not answer or a value does not parse, the cap when
+  either is `infinity`) + `SHUTDOWN_MARGIN_SEC` (30 s), capped at `SHUTDOWN_BOUND_MAX_SEC` (600 s)
+  so a hung shutdown is still cycled within 10 min of the request (I76). It is computed only once
+  every check passed, so a cycle that cannot start still runs no step. Why size it rather than arm
+  the fallback at `shutdown.target`: a hang before that target (a unit whose stop never returns, a
+  job queue that never reaches it) would then have no bound, and the fallback is kept out of the
+  shutdown transaction on purpose (`DefaultDependencies=no`) so nothing in it can stop or delay the
+  unit. The `reboot_requested` event carries `bound_sec` and `unit_timeout_sec`.
+
+  The reboot request is timed: once `systemctl reboot` is accepted, the broker writes
+  `power_cycle_os_first.json` in the health dir (request time, bound, unit timeout, unit), fsynced,
+  best effort. On the next boot the I88 confirmation reads and removes it; when the request lies
+  between the ledger row and this boot, the row gets `reboot_requested_at`, `shutdown_bound_sec`,
+  `host_unit_timeout_sec` and, for a confirmed cycle, `shutdown_sec` (the BMC's SEL power-off minus
+  the request; the SEL read that confirmed the cycle is reused, else one bounded read from the
+  request on) with `shutdown_within_bound`. A refuted or unconfirmed cycle, or no SEL record, gives
+  `shutdown_sec` null with `shutdown_sec_unavailable` saying why. A shutdown within 15 s of its bound
+  logs a warning. The confirmed event carries `shutdown_sec` and `shutdown_bound_sec`. Nothing here
+  changes what is released or when: the startup full check with fabric still decides (03 I4, I32).
 
 ## Interfaces
 
@@ -3173,3 +3202,8 @@ sees a silent fabric pass.
 | I98 a chip the driver-wait SBR's rescans brought back leaves the record: when it drops again it gets a round | `tests/test_sbr_record_per_hold.py::test_a_chip_the_driver_wait_sbr_healed_gets_a_round_when_it_drops_again` |
 | I98 a chip the mesh reset brought back leaves the record: when it drops again it gets a round | `tests/test_sbr_record_per_hold.py::test_a_chip_the_mesh_reset_healed_gets_a_round_when_it_drops_again` |
 | I98 a lift on a just-passed full check clears the record: a hold that carries the episode (I82) starts empty | `tests/test_sbr_record_per_hold.py::test_a_hold_carried_after_a_verified_lift_starts_with_an_empty_record` |
+| I99 the bound is clean shutdown + the host's unit timeout + margin, capped; the setting only raises it; never off | `tests/test_power_cycle_os_first.py::test_the_shutdown_bound_clears_a_unit_timeout_and_stays_finite`, `::test_the_fallback_bound_is_the_hosts_and_the_request_is_kept_for_the_next_boot` |
+| I99 the unit timeout is the longer of systemd's start and stop defaults; an unreadable or unparsable answer reads as 90 s | `tests/test_power_cycle_os_first.py::test_the_host_unit_timeout_is_the_longer_of_start_and_stop`, `::test_an_unreadable_systemd_reads_as_its_default_timeout`, `::test_systemd_timespans_parse` |
+| I99 a cycle that cannot start queries nothing and keeps no request marker | `tests/test_power_cycle_os_first.py::test_no_hook_installed_raises_not_launched_and_runs_no_step`, `::test_a_request_that_never_reached_reboot_keeps_no_marker` |
+| I99 the next boot records the shutdown time from the request to the SEL power-off, against the bound, and warns near it | `tests/test_power_cycle_os_first.py::test_the_shutdown_time_is_the_sel_power_off_after_the_reboot_request`, `::test_a_shutdown_past_its_bound_is_recorded_as_such`, `::test_a_cause_confirmed_cycle_reads_the_sel_only_for_the_shutdown_time` |
+| I99 a refuted cycle has no shutdown time; a marker outside the row's window adds nothing and is removed | `tests/test_power_cycle_os_first.py::test_a_refuted_cycle_has_no_shutdown_time`, `::test_a_request_from_another_window_adds_nothing_and_is_dropped` |

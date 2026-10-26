@@ -6,7 +6,7 @@
 import json
 from datetime import datetime
 
-from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState
+from tt_device_mcp.fsm import STARTUP_PENDING_PREFIX, FsmRecord, ServerFsm, ServerState, unwrap_startup_pending
 from tt_device_mcp.health import OUTCOME_RECOVERED, OUTCOME_TERMINAL
 from tt_device_mcp.health.core import HealthState
 
@@ -343,6 +343,53 @@ def test_boot_merge_names_a_refuted_cycle_a_warm_reboot(tmp_path):
         open_episode=FsmRecord(state=ServerState.RECOVERING, why="eth_frozen", detail=d), attributed_boot=None
     )
     assert "boot attributed" not in (carried.record.detail or "")
+
+
+OFF_BUS = "gate/pre-job: 1/32 chip(s) off the bus, below the reset floor — held for self-heal, not reset"
+
+
+def test_a_hold_carried_into_a_power_cycled_boot_reads_as_its_pending_startup_check(tmp_path):
+    """Spec 03 I90: after the power cycle the old off-bus count describes the boot that is gone; the
+    carried hold reads as the pending startup check first, the old detail kept inside it, the hold
+    itself (state, why, dirty) unchanged. Fails on base, where the hold still leads with "1/32"."""
+    open_ep = FsmRecord(state=ServerState.RECOVERING, why="chips_off_bus", detail=OFF_BUS, dirty=True)
+    f = ServerFsm(tmp_path / "fsm.json", current_boot_id="boot-B")
+    f.boot_merge(open_episode=open_ep, attributed_boot={"action": "power-cycle", "at": "T1"})
+    d = f.record.detail
+    assert d.startswith("startup check pending") and d.startswith(STARTUP_PENDING_PREFIX + OFF_BUS + ")")
+    assert d.endswith("boot attributed to a broker-fired power-cycle recorded at T1")
+    assert "off the bus" in d, "text matches on the carried detail still see it"
+    assert (f.record.state, f.record.why, f.record.dirty) == (ServerState.RECOVERING, "chips_off_bus", True)
+
+
+def test_the_pending_wrapper_never_nests_across_boots_or_restarts(tmp_path):
+    path = tmp_path / "fsm.json"
+    first = ServerFsm(path, current_boot_id="boot-B")
+    first.boot_merge(
+        open_episode=FsmRecord(state=ServerState.RECOVERING, why="chips_off_bus", detail=OFF_BUS),
+        attributed_boot={"action": "power-cycle", "at": "T1"},
+    )
+    again = ServerFsm(path, current_boot_id="boot-B")  # a restart within that boot: no new attribution
+    again.boot_merge(
+        open_episode=FsmRecord(state=ServerState.RECOVERING, why="chips_off_bus", detail=first.record.detail),
+        attributed_boot={"action": "power-cycle", "at": "T1"},
+    )
+    assert again.record.detail == STARTUP_PENDING_PREFIX + OFF_BUS + ")"
+    later = ServerFsm(path, current_boot_id="boot-C")  # a second cycle's boot
+    later.boot_merge(
+        open_episode=FsmRecord(state=ServerState.RECOVERING, why="chips_off_bus", detail=again.record.detail),
+        attributed_boot={"action": "power-cycle", "at": "T2"},
+    )
+    d = later.record.detail
+    assert d.count("startup check pending") == 1 and d.count("boot attributed") == 1 and "recorded at T2" in d
+    assert d.startswith(STARTUP_PENDING_PREFIX + OFF_BUS + ") boot attributed") and unwrap_startup_pending(d) == OFF_BUS
+    assert unwrap_startup_pending(again.record.detail) == OFF_BUS and unwrap_startup_pending(OFF_BUS) == OFF_BUS
+
+
+def test_a_boot_without_an_escalation_keeps_the_carried_detail_as_it_was(tmp_path):
+    f = ServerFsm(tmp_path / "fsm.json", current_boot_id="boot-B")
+    f.boot_merge(open_episode=FsmRecord(state=ServerState.RECOVERING, why="chips_off_bus", detail=OFF_BUS))
+    assert f.record.detail == OFF_BUS
 
 
 def test_on_next_close_fires_once_on_whichever_path_reaches_healthy(tmp_path):
