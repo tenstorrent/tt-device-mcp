@@ -57,8 +57,9 @@ from tt_device_mcp.health.monitor import (
 # The fabric probe module itself, not a wrapping function: server.py's own preflight check reads
 # fabric.build_command() directly to warn when no fabric check is configured OR installed, and a
 # test monkeypatches fabric.build_command on this exact binding (see test_device_safety.py) — a
-# wrapper function would leave that patch aimed at a name nothing here reads.
-from tt_device_mcp.health.monitors import eth, fabric
+# wrapper function would leave that patch aimed at a name nothing here reads. pcie_aer is the
+# per-chip PCIe AER and link telemetry the job and gate paths in server.py snapshot (spec 03 I91).
+from tt_device_mcp.health.monitors import eth, fabric, pcie_aer
 
 # Heartbeat probe primitives the gate/telemetry sampler in server.py calls directly (off-bus
 # counts, the dead-chip sampler, the startup probe) — not merely bounced into RecoveryDeps.
@@ -219,6 +220,7 @@ __all__ = [
     # probes
     "eth",
     "fabric",
+    "pcie_aer",
     "ALL_ONES",
     "chip_state",
     "dead_chips",

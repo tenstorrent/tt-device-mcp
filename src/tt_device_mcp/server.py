@@ -192,6 +192,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     offbus_count,
     offbus_power_cycle,
     pci_bus_number,
+    pcie_aer,
     pcie_guard_at_start,
     previous_boot_bus_locks,
     previous_boot_error,
@@ -207,7 +208,6 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
-from tt_device_mcp.health.monitors import pcie_aer
 from tt_device_mcp.job_preflight import preflight_output_dirs
 from tt_device_mcp.job_reap import (
     DEAD_CHIP_LABEL_PREFIX,
