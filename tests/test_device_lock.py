@@ -248,6 +248,7 @@ def _stub_cmd_lock(monkeypatch, tmp_path, nodes, deny_rc):
     monkeypatch.setattr(cli.time, "sleep", lambda *a: None)
     monkeypatch.setattr(cli, "_UDEV_RULE_PATH", str(tmp_path / "99-ttdev.rules"))
     monkeypatch.setattr(cli, "_LOCK_BANNER", str(tmp_path / "banner.sh"))
+    monkeypatch.setattr(cli, "_BROKER_DEFAULTS", str(tmp_path / "etc-default"))  # a revert writes no host path
     monkeypatch.setattr(device_lock, "APPLIED_MARKER", str(tmp_path / "device_lock_applied"))
     monkeypatch.setattr(device_lock, "DRIFT_RECORD", str(tmp_path / "device_lock_drift"))
     monkeypatch.setattr(device_lock, "human_members", lambda group="ttdev": [])
@@ -373,6 +374,60 @@ def test_lock_off_preserves_an_existing_group_line(tmp_path):
     # A host an operator locked by hand (`tt-device-mcp lock`) keeps that lock across an update.
     unit = _render(tmp_path, _base(tmp_path), unit_text=f"[Service]\n{_GROUP_LINE}\n")
     assert _GROUP_LINE in unit.splitlines() and "TT_DEVICE_MCP_DEVICE_LOCK" not in unit
+
+
+def _unlock_sandbox(tmp_path, monkeypatch, defaults_text: str):
+    """A host locked through the opt-in: /etc/default and the unit it rendered, in tmp_path."""
+    box = tmp_path / "box"
+    box.mkdir()
+    conf = box / "tt-device-broker"
+    conf.write_text(defaults_text)
+    conf.chmod(0o644)
+    unit = box / "tt-device-broker.service"
+    unit.write_text(_render(tmp_path, {**_base(tmp_path), "TTDEV_LOCK": "1"}))
+    monkeypatch.setattr(cli, "_require_root_broker", lambda: True)
+    monkeypatch.setattr(cli, "_remove_smi_ro_wrapper", lambda: None)
+    monkeypatch.setattr(cli, "_UDEV_RULE_PATH", str(box / "99-ttdev.rules"))
+    monkeypatch.setattr(cli, "_LOCK_BANNER", str(box / "banner.sh"))
+    monkeypatch.setattr(cli, "_BROKER_UNIT", str(unit))
+    monkeypatch.setattr(cli, "_BROKER_DEFAULTS", str(conf))
+    monkeypatch.setattr(device_lock, "APPLIED_MARKER", str(box / "device_lock_applied"))
+    monkeypatch.setattr(device_lock, "DRIFT_RECORD", str(box / "device_lock_drift"))
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
+    return conf, unit
+
+
+@pytest.mark.parametrize("assign", ["TTDEV_LOCK=1", 'TTDEV_LOCK="1"', "export TTDEV_LOCK=1"])
+def test_unlock_clears_the_opt_in_and_both_unit_lines(tmp_path, monkeypatch, capsys, assign):
+    conf, unit = _unlock_sandbox(tmp_path, monkeypatch, f"TTDEV_VENV=/v\n{assign}\nTTDEV_ROOT=/r\n")
+    assert _GROUP_LINE in unit.read_text() and _LOCK_LINE in unit.read_text()
+    assert cli.cmd_unlock(SimpleNamespace()) == 0
+    assert conf.read_text() == "TTDEV_VENV=/v\nTTDEV_LOCK=0\nTTDEV_ROOT=/r\n"
+    assert conf.stat().st_mode & 0o777 == 0o644
+    left = unit.read_text()
+    assert "TT_DEVICE_MCP_DEVICE_GROUP" not in left and "TT_DEVICE_MCP_DEVICE_LOCK" not in left
+    out = capsys.readouterr().out
+    assert "TTDEV_LOCK=0" in out and "TT_DEVICE_MCP_DEVICE_LOCK" in out
+
+
+def test_unlock_leaves_a_host_without_the_opt_in_alone(tmp_path, monkeypatch):
+    conf, _ = _unlock_sandbox(tmp_path, monkeypatch, "TTDEV_VENV=/v\n")
+    assert cli.cmd_unlock(SimpleNamespace()) == 0
+    assert conf.read_text() == "TTDEV_VENV=/v\n"
+    conf.unlink()
+    assert cli.cmd_unlock(SimpleNamespace()) == 0
+    assert not conf.exists()  # never creates the host config
+
+
+def test_an_update_after_unlock_renders_no_lock_lines(tmp_path, monkeypatch):
+    # The emergency undo must survive the next auto-update's re-render of the unit.
+    real_run = subprocess.run
+    conf, unit = _unlock_sandbox(tmp_path, monkeypatch, f"TTDEV_VENV={tmp_path}/venv\nTTDEV_LOCK=1\n")
+    assert cli.cmd_unlock(SimpleNamespace()) == 0
+    monkeypatch.setattr(subprocess, "run", real_run)  # the render runs the real script
+    defaults = dict(ln.split("=", 1) for ln in conf.read_text().splitlines())
+    rendered = _render(tmp_path, {**_base(tmp_path), **defaults}, unit_text=unit.read_text())
+    assert "TT_DEVICE_MCP_DEVICE_GROUP" not in rendered and "TT_DEVICE_MCP_DEVICE_LOCK" not in rendered
 
 
 def test_apply_runs_only_under_the_opt_in():

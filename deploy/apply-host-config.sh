@@ -219,7 +219,8 @@ group_env=""; grep -q 'TT_DEVICE_MCP_DEVICE_GROUP' "$UNIT" 2>/dev/null \
 # The opt-in lock (spec 05 I9): TTDEV_LOCK=1 in /etc/default renders the device group AND the
 # broker's flip switch into the unit, so the lock comes up inside this update's own restart (never
 # an extra one) and the broker re-applies the node modes itself, between jobs. Unset or 0 changes
-# nothing: a host keeps exactly the unit it had. `tt-device-mcp unlock` stays the undo.
+# nothing: a host keeps exactly the unit it had. `tt-device-mcp unlock` stays the undo: it sets
+# TTDEV_LOCK=0 in /etc/default and strips both lines from the unit, so no later update re-locks.
 LOCK="${TTDEV_LOCK:-0}"
 [ "$LOCK" = 1 ] && group_env="Environment=TT_DEVICE_MCP_DEVICE_GROUP=ttdev
 Environment=TT_DEVICE_MCP_DEVICE_LOCK=1"

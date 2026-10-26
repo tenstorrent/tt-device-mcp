@@ -25,6 +25,7 @@ import json
 import os
 import pwd
 import queue
+import re
 import shlex
 import signal
 import subprocess
@@ -1361,6 +1362,10 @@ _UDEV_RULE = (
 )
 _LOCK_GROUP = "ttdev"
 _BROKER_UNIT = "/etc/systemd/system/tt-device-broker.service"
+# The host config auto-update re-renders the unit from: TTDEV_LOCK=1 there re-applies the lock.
+_BROKER_DEFAULTS = "/etc/default/tt-device-broker"
+# Unit lines the lock owns: the job gid and the broker's between-jobs flip switch.
+_LOCK_UNIT_KEYS = ("TT_DEVICE_MCP_DEVICE_GROUP", "TT_DEVICE_MCP_DEVICE_LOCK")
 _LOCK_BANNER = "/etc/profile.d/tt-device-mcp-banner.sh"
 _PROC_ROOT = "/proc"
 _LOCK_BANNER_TEXT = (
@@ -1436,6 +1441,7 @@ def _broker_runs_with_device_group() -> bool:
 def _set_service_device_group(enable: bool) -> bool:
     """Add/remove ``Environment=TT_DEVICE_MCP_DEVICE_GROUP=ttdev`` in the broker unit
     so privsep jobs run with gid=ttdev (DAC access to the locked node); daemon-reload.
+    Removing also drops ``TT_DEVICE_MCP_DEVICE_LOCK``, the opt-in's flip switch.
     Returns True only if it changed the unit. Enabling is a no-op when the unit or a
     drop-in already sets the group."""
     text = Path(_BROKER_UNIT).read_text()
@@ -1443,12 +1449,33 @@ def _set_service_device_group(enable: bool) -> bool:
     line = f"Environment=TT_DEVICE_MCP_DEVICE_GROUP={_LOCK_GROUP}\n"
     if enable and not has and not _configured_device_group():
         text = text.replace("Environment=TT_DEVICE_MCP_PRIVSEP=1\n", "Environment=TT_DEVICE_MCP_PRIVSEP=1\n" + line, 1)
-    elif not enable and has:
-        text = "".join(ln for ln in text.splitlines(keepends=True) if "TT_DEVICE_MCP_DEVICE_GROUP" not in ln)
+    elif not enable and any(k in text for k in _LOCK_UNIT_KEYS):
+        text = "".join(ln for ln in text.splitlines(keepends=True) if not any(k in ln for k in _LOCK_UNIT_KEYS))
     else:
         return False
     Path(_BROKER_UNIT).write_text(text)
     subprocess.run(["systemctl", "daemon-reload"], check=False)
+    return True
+
+
+def _clear_lock_opt_in() -> bool:
+    """Set ``TTDEV_LOCK=0`` in /etc/default/tt-device-broker, so the next auto-update does not
+    re-render the lock into the unit and re-apply it. Returns True only if it changed the file;
+    a host without the file or the key is left alone."""
+    p = Path(_BROKER_DEFAULTS)
+    try:
+        text = p.read_text()
+    except FileNotFoundError:
+        return False
+    key = re.compile(r"^\s*(?:export\s+)?TTDEV_LOCK=")
+    lines = text.splitlines(keepends=True)
+    new = ["TTDEV_LOCK=0\n" if key.match(ln) else ln for ln in lines]
+    if new == lines:
+        return False
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text("".join(new))
+    os.chmod(tmp, p.stat().st_mode & 0o7777)
+    os.replace(tmp, p)
     return True
 
 
@@ -1621,7 +1648,11 @@ def cmd_unlock(args) -> int:
         pass
     _udev_reload()
     device_lock.clear_markers()
-    _set_service_device_group(False)
+    # Clear the opt-in before the unit: an update in between would otherwise re-render both lines.
+    if _clear_lock_opt_in():
+        print(f"Set TTDEV_LOCK=0 in {_BROKER_DEFAULTS}: updates no longer re-apply the lock.")
+    if _set_service_device_group(False):
+        print(f"Removed {' and '.join(_LOCK_UNIT_KEYS)} from {_BROKER_UNIT}.")
     try:
         Path(_LOCK_BANNER).unlink()
     except FileNotFoundError:
