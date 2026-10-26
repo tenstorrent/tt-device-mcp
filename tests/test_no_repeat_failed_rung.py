@@ -120,15 +120,14 @@ async def test_a_failed_unchanged_reset_is_not_repeated_and_with_no_host_rung_is
 
 @pytest.mark.asyncio
 async def test_with_a_power_cycle_the_failed_reset_climbs_at_once(monkeypatch, clear_job_state):
-    """The early window's reset fails before the ceiling with the same chips off: every rung below the
-    host pair has run once and the mesh reset may not run again, so the power cycle fires in that same
-    pass, with no ceiling wait and no last-chance sweep (whose last step is that mesh reset) (I38)."""
+    """The early window's reset fails before the ceiling with the same chips off: no ceiling wait, but
+    the last-chance sweep (the full ladder) runs right before the power cycle in that same pass (I38)."""
     clock = [0.0]
     counters, events, _ = _episode(monkeypatch, power_cycle=True, clock=clock)
     assert await _window() is True
     assert counters["resets"] == 1 and "host_rung_deferred_until_ladder_end" not in events
-    assert "host_rung_not_deferred" in events and SKIP in events
-    assert counters["sweeps"] == 0, "the sweep would repeat the failed mesh reset"
+    assert "host_rung_not_deferred" in events and SKIP not in events
+    assert counters["sweeps"] == 1, "the full ladder runs right before the power cycle"
     assert counters["power_cycles"] == 1 and counters["reboots"] == 0
     assert counters["dirty_cleared"] == 0, "the power cycle releases nothing; the startup check gates release"
 
@@ -289,7 +288,7 @@ async def test_every_reset_is_verified_with_the_fabric_and_a_failed_verify_keeps
     assert len(fired) == 1
     assert verifies and all(v in (None, True) for v in verifies), "the post-reset verify runs the fabric pass"
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "a failed verify keeps the hold"
-    assert counters["sweeps"] == 0 and counters["power_cycles"] == 1, "it went on to the next rung at once"
+    assert counters["sweeps"] == 1 and counters["power_cycles"] == 1, "the sweep, then the power cycle at once"
     clock[0] = 600.0
     assert await _window() is True
     assert len(fired) == 1, "the failed reset is not repeated"
@@ -336,12 +335,12 @@ async def _replay_in(monkeypatch, *, old: bool, power_cycle: bool, windows: int)
 @pytest.mark.asyncio
 async def test_replay_the_power_cycle_fires_right_after_the_failed_reset(monkeypatch, clear_job_state):
     """Partial off-bus drop, power cycle armed. Old: 0 reset, 263 defer; 600 reset again, 863 sweep,
-    1186 cycle. With I36 alone: 600 skip, sweep, 923 cycle. New (I36 + I38): the cycle fires at 263,
-    right after the one failed reset."""
+    1186 cycle. With I36 alone: 600 skip, sweep, 923 cycle. New (I36 + I38): the sweep runs right
+    after the one failed reset and the cycle fires at 586, at the sweep's end."""
     old_at, old_resets = await _replay(monkeypatch, old=True, power_cycle=True, windows=4)
     new_at, new_resets = await _replay(monkeypatch, old=False, power_cycle=True, windows=4)
     assert (old_at, old_resets) == (1186.0, 2)
-    assert (new_at, new_resets) == (float(RESET_SEC), 1)
+    assert (new_at, new_resets) == (float(RESET_SEC + SWEEP_SEC), 1)
 
 
 @pytest.mark.asyncio
@@ -392,26 +391,24 @@ async def _replay_from_onset(monkeypatch, *, old: bool, off_bus: int, reset_sec:
     "off_bus, reset_sec, old_cycle_at, new_cycle_at",
     [
         # B1, one chip off below the floor; the mesh reset gave up after 132 s (exit 1, chip still off).
-        # Old: 120 reset, 252 deferred; 600 reset again, 732 sweep, 924 cycle. New: 252 cycle.
-        (1, 132, 924.0, 252.0),
+        # Old: 120 reset, 252 deferred; 600 reset again, 732 sweep, 924 cycle. New: 252 sweep, 444 cycle.
+        (1, 132, 924.0, 444.0),
         # B2, four chips off; each mesh reset overran to 263 s (exit 1, the same four still off).
-        # Old: 120 reset, 383 deferred; 600 reset again, 863 sweep, 1186 cycle. New: 383 cycle.
-        (4, 263, 1186.0, 383.0),
+        # Old: 120 reset, 383 deferred; 600 reset again, 863 sweep, 1186 cycle. New: 383 sweep, 706 cycle.
+        (4, 263, 1186.0, 706.0),
     ],
     ids=["b1-one-chip", "b2-four-chips"],
 )
 async def test_partial_offbus_power_cycles_right_after_the_failed_reset(
     monkeypatch, clear_job_state, off_bus, reset_sec, old_cycle_at, new_cycle_at
 ):
-    """Spec 04 I38: a partial off-bus drop whose one mesh reset failed on an unchanged set reaches the
-    power cycle within 300 s of the one-shot plus that reset, not at the 600 s ceiling window."""
+    """Spec 04 I38: a partial off-bus drop whose one mesh reset failed on an unchanged set gets the
+    last-chance sweep at once and reaches the power cycle at its end, not at the 600 s ceiling window."""
     old_at, old_resets = await _replay_from_onset(monkeypatch, old=True, off_bus=off_bus, reset_sec=reset_sec)
     new_at, new_resets = await _replay_from_onset(monkeypatch, old=False, off_bus=off_bus, reset_sec=reset_sec)
     assert (old_at, old_resets) == (old_cycle_at, 2)
     assert (new_at, new_resets) == (new_cycle_at, 1)
-    assert new_at - ONE_SHOT - reset_sec < 5, "no wait between the failed reset and the power cycle"
-    if reset_sec <= 180:
-        assert new_at < 300
+    assert new_at - ONE_SHOT - reset_sec - (reset_sec + 60) < 5, "no wait but the sweep before the power cycle"
 
 
 @pytest.mark.asyncio
@@ -424,7 +421,7 @@ async def test_a_denied_power_cycle_after_the_failed_reset_is_retried_next_windo
     assert await _window() is True
     assert counters["resets"] == 1 and counters["power_cycles"] == 0
     assert await _window() is True
-    assert counters["resets"] == 1 and counters["power_cycles"] == 1 and counters["sweeps"] == 0
+    assert counters["resets"] == 1 and counters["power_cycles"] == 1 and counters["sweeps"] == 1
 
 
 @pytest.mark.asyncio
@@ -432,7 +429,7 @@ async def test_partial_offbus_after_the_failed_reset_waits_only_for_the_power_cy
     monkeypatch, clear_job_state
 ):
     """I38 with I65: the host booted 3 min ago and one chip stays off after the failed mesh reset. The
-    climb still skips the ceiling wait and the sweep (I38), but the power cycle waits out the cooldown
+    climb still skips the ceiling wait (I38); the sweep runs only once the cycle may fire, and the power cycle waits out the cooldown
     counted from that boot, with its deadline set for the watchdog; no reset fires meanwhile (I36,
     I58). /health shows the deadline while it waits, the watchdog asks again at that deadline, and the
     cycle fires once the cooldown has run out: bounded, never open-ended. Nothing releases the hold."""
@@ -446,7 +443,7 @@ async def test_partial_offbus_after_the_failed_reset_waits_only_for_the_power_cy
     monkeypatch.setattr(mech, "power_cycle_cooldown_state", None)
     monkeypatch.delenv(recovery_base.POWER_CYCLE_HISTORY_FILE_ENV, raising=False)
     assert await _window() is True
-    assert "host_rung_not_deferred" in events and counters["sweeps"] == 0, "I38: no ceiling wait, no sweep"
+    assert "host_rung_not_deferred" in events and counters["sweeps"] == 0, "I38: no ceiling wait"
     assert counters["resets"] == 1 and counters["power_cycles"] == 0, "I65: the cycle waits for the cooldown"
     until = int(boot[0]) + POWER_CYCLE_MIN_INTERVAL_SEC
     assert mech.power_cycle_retry[0] == until, "the watchdog asks again at the cooldown's end"
@@ -467,7 +464,7 @@ async def test_partial_offbus_after_the_failed_reset_waits_only_for_the_power_cy
     assert "power_cycle_cooldown" not in srv._health_payload(now=datetime.fromtimestamp(until))
     boot[0] -= POWER_CYCLE_MIN_INTERVAL_SEC  # the cooldown has run out
     assert await _window() is True  # the spawned escalation
-    assert counters["resets"] == 1 and counters["power_cycles"] == 1 and counters["sweeps"] == 0
+    assert counters["resets"] == 1 and counters["power_cycles"] == 1 and counters["sweeps"] == 1
     assert mech.power_cycle_cooldown_state is None and "power_cycle_cooldown" not in srv._health_payload()
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "nothing released the hold"
 
@@ -519,7 +516,7 @@ async def test_e3_offbus_classes_reset_once_then_take_the_next_rung(monkeypatch,
     assert counters["resets"] == 1
     if power_cycle:
         assert order == [1], "the mesh reset ran first, then the power cycle in the same window"
-        assert counters["sweeps"] == 0, "no last-chance sweep: its last step is the failed mesh reset"
+        assert counters["sweeps"] == 1, "the last-chance sweep runs right before the power cycle"
     else:
         pages = [a for a in alerts if a["kind"] == "offbus_gated_hold_page"]
         assert len(pages) == 1 and opc._pending["handoff"]["latched"], "handed to an operator at once"
