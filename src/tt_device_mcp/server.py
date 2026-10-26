@@ -199,6 +199,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     offbus_count,
     offbus_power_cycle,
     pci_bus_number,
+    pcie_aer,
     pcie_guard_at_start,
     previous_boot_bus_locks,
     previous_boot_error,
@@ -3638,6 +3639,68 @@ def _healthy_reading() -> HealthState:
     for the many callers that already know the device just verified fit (an operator's own tt-smi
     check, a reset's post-verify) but hold no HealthMonitor reading of their own to hand ``fsm``."""
     return HealthState(phase="verified", at=datetime.now(), expected=0)
+
+
+# Spec 03 I91: this job cycle's per-chip PCIe snapshots (job start, job end), read by the post-job
+# check that follows. Telemetry only: nothing here changes a verdict, a hold or a release.
+_pcie_cycle: dict = {}
+
+
+def _pcie_suspect() -> set:
+    """Chip ids whose last sampler read was all-ones: their own link is not read (spec 03 I91)."""
+    try:
+        ring = sampler.ring if sampler is not None else None
+        last = ring[-1]["chips"] if ring else {}
+        return {str(i) for i, row in last.items() if row and row[0] == chip_state.ALL_ONES}
+    except Exception:  # noqa: BLE001 - telemetry never fails its caller
+        return set()
+
+
+# Spec 03 I91: a snapshot takes ~30 ms on a 32-chip host; one whose sysfs read stalls is left out
+# after this long, so it never holds up a job start or the post-job check.
+PCIE_SNAPSHOT_TIMEOUT_SEC = 5.0
+
+
+async def _pcie_snapshot() -> dict:
+    """One read-only per-chip AER and link snapshot (spec 03 I91), {} on any error or timeout."""
+    try:
+        return await aio.wait_for(asyncio.to_thread(pcie_aer.snapshot, _pcie_suspect()), PCIE_SNAPSHOT_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        try:
+            health_event("pcie_snapshot_timeout", timeout_s=PCIE_SNAPSHOT_TIMEOUT_SEC)
+        except Exception:  # noqa: BLE001
+            pass
+        return {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _pcie_record(phase: str, before: dict, after: dict, **fields) -> Optional[list]:
+    """One ``pcie_aer_delta`` event for ``phase``, listing only the chips with a non-zero AER delta,
+    a link change or a bus change. None (and no event) when either snapshot is empty."""
+    if not before or not after:
+        return None
+    try:
+        rows = pcie_aer.delta(before, after)
+        health_event("pcie_aer_delta", phase=phase, chips=rows, summary=pcie_aer.totals(rows), **fields)
+        return rows
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _pcie_job_start(job_id: str) -> None:
+    _pcie_cycle.clear()
+    pcie_aer.new_cycle()
+    _pcie_cycle.update(job=job_id, start=await _pcie_snapshot())
+
+
+async def _pcie_job_end(job_id: str) -> None:
+    end = await _pcie_snapshot()
+    if _pcie_cycle.get("job") != job_id:
+        _pcie_cycle.clear()
+        _pcie_cycle["job"] = job_id
+    _pcie_cycle["end"] = end
+    _pcie_cycle["job_rows"] = _pcie_record("job", _pcie_cycle.get("start") or {}, end, job=job_id)
 
 
 def _job_snapshot(job: "Job | None") -> dict:
@@ -7426,6 +7489,10 @@ async def device_health_gate(
             and not mesh_reset_hold_reason()
             and not recovery_mechanism.cooling()
         )
+        # Spec 03 I91: per-chip AER and link counts just before and just after this pass, after a job
+        # or a step only. Read-only telemetry: the verdict below never reads them.
+        pcie_on = phase in ("post-job", "post-step")
+        pcie_before = await _pcie_snapshot() if pcie_on else {}
         healthy, evidence = await fsm.observe(
             expected,
             _log,
@@ -7438,6 +7505,29 @@ async def device_health_gate(
         )
         state = HealthState.from_evidence(evidence, phase=phase, expected=expected)
         fabric_ok = state.fabric_ok
+        pcie: dict = {}
+        if pcie_on:
+            pcie_after = await _pcie_snapshot()
+            cycle_job = _pcie_cycle.get("job")
+            if _pcie_cycle.get("job_rows") is not None:
+                pcie["job"] = _pcie_cycle["job_rows"]
+            gap = _pcie_record("job_end_to_check", _pcie_cycle.get("end") or {}, pcie_before, job=cycle_job)
+            if gap is not None:
+                pcie["job_end_to_check"] = gap
+            check = _pcie_record(
+                "check",
+                pcie_before,
+                pcie_after,
+                job=cycle_job,
+                gate=phase,
+                fabric_ran=fabric_ok is not None,
+                fabric_ok=fabric_ok,
+            )
+            if check is not None:
+                pcie["check"] = check
+            _pcie_cycle.clear()
+            if dirty_job and pcie:
+                dirty_job = {**dirty_job, "pcie": pcie}
         if fabric_ok is not None:
             last_fabric_check_monotonic = time.monotonic()
         if fabric_ok is True:
@@ -7530,6 +7620,7 @@ async def device_health_gate(
             dirty_reason=dirty_reason,
             dirty_job=dirty_job,
             aer=aer_totals(chips),
+            pcie=pcie or None,
             evidence=evidence,
             fabric=_lift_fabric(),  # this gate's own fabric verdict; dirty_reason may be the prior hold's
         )
@@ -13852,6 +13943,9 @@ export {JOB_TAG_ENV}={job_tag}
 {job.command}
 """
 
+            # Spec 03 I91: per-chip AER and link counts at job start (read-only sysfs, never a lost chip).
+            await _pcie_job_start(job_id)
+
             # Create process in new session (os.setsid) so all child processes share the same
             # process group ID. This enables reliable cleanup of nested processes via killpg()
             # in the finally block, preventing orphaned child processes from holding device locks.
@@ -14580,6 +14674,8 @@ export {JOB_TAG_ENV}={job_tag}
                 # gates every later arrival: the runner is single-threaded, so a job
                 # that queues during the check waits for it — and any reset it
                 # triggers — before it starts.
+                # Spec 03 I91: the same counts at job end; the post-job check reads them back.
+                await _pcie_job_end(job_id)
                 if job.verification:
                     try:
                         await _settle_verification_job(job)
