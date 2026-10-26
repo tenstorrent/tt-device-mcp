@@ -1425,8 +1425,8 @@ each rung fires only when the gentler one failed or cannot apply.
   latch; and a killed job's leftover holder (spec 01 I16). That leftover read as a tenant,
   so the ladder stood down and re-armed every window; from the bound on it is no tenant. Its fence
   keeps every reset off the device and only a host rung clears it, so the bound asks for the host
-  rung at once (event `hold_bound_leftover`); a running job or any other readable tenant still
-  refuses it. A holder the spec 03 I84 dead-chip valve refused to kill (a failed or missing PCI
+  rung at once (event `hold_bound_leftover`); a running broker job or a holder inside a broker job
+  or exec scope still refuses it, and a holder outside every broker scope never does (I103). A holder the spec 03 I84 dead-chip valve refused to kill (a failed or missing PCI
   remove, so its fd close would reach an attached chip off the bus) is no tenant at the bound
   either: the valve records the episode's refused pids (pid and start time; a recycled pid does
   not match) and the running job it refused, a passing full check clears the record, and at the
@@ -2624,6 +2624,25 @@ each rung fires only when the gentler one failed or cannot apply.
     sweep's repeat could wait up to 315 s idle for the bound first.
   Remaining risk: a second mesh reset whose tray re-power hangs the host; the I25 latch records it.
 
+- **I103 — Only a running broker job holds a power cycle; a foreign holder never does.** Every road
+  to a power cycle the broker requests on its own (the class A/C direct cycle, the off-bus gated
+  cycle, the host-rung climb after a failed rung or an idle relift's reset, the I76 10-min bound, the
+  startup hold, the last-chance sweep right before the cycle and the bound's own ladder) is held
+  only by a broker job: a job in RUNNING state in the broker's queue, or a device holder inside a
+  broker job or exec scope. A job queued or waiting on a holder is not running. A device holder
+  outside every broker scope (another user's or project's detached process, whatever its uid) and a
+  holder scan that cannot read every process never veto or delay the cycle, and no warning wait is
+  added for them: the cycle ends them. Before a power cycle the ladder and the sweep still run in
+  full (I100) and their pre-reset scan clears such a holder like a reader;
+  a whole-tray or all-chips-off drop still goes straight to the cycle. With the cycle the broker
+  journals `power_cycle_foreign_holders` naming each such holder (pid, uid, user, comm, the redacted
+  command line and parent chain fields of the holder-identity record), bounded at 3 s and never
+  holding the cycle. A running broker job keeps its deferral; the request stays pending and fires
+  on the first tick after the job ends, after the ladder and sweep. The I97 deadline design is
+  unchanged. Known gap: below the bound and outside a pre-cycle run, an automatic reset's pre-reset
+  scan that cannot read a holder still refuses that reset; the bound's ladder and the cycle are not
+  held by it.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -3264,3 +3283,8 @@ sees a silent fabric pass.
 | I100 the I97 reset having run this hold does not skip the sweep's repeat; only its full check passing lifts, once | `tests/test_below_floor_offbus_ladder.py::test_the_repeated_mesh_reset_runs_after_this_holds_i97_reset_already_ran` |
 | I100 an outage hold refuses the whole sweep: nothing lifts and no power cycle is requested; the device stays held for the operator | `tests/test_below_floor_offbus_ladder.py::test_an_outage_hold_refuses_the_sweep_and_holds_for_the_operator` |
 | I100 the sweep never skips a chip's SBR as spent and repeats the failed mesh reset | `tests/test_sbr_record_per_hold.py::test_a_chip_the_gate_reset_is_not_reset_again_by_the_escalation_or_the_sweep` |
+| I103 a holder outside every broker scope never holds a class A/C cycle, before or at the deadline; a broker job's holder or a running job does | `tests/test_classac_power_cycle_direct.py::test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_tenant`, `tests/test_foreign_holder_power_cycle.py::test_a_foreign_holder_never_delays_the_all_chips_off_cycle` |
+| I103 at the 10-min bound a foreign holder on a partial drop gets the full ladder and the sweep, then the cycle; the identity is journaled | `tests/test_foreign_holder_power_cycle.py::test_a_foreign_holder_at_the_bound_gets_the_ladder_and_sweep_then_the_cycle` |
+| I103 a running broker job defers the cycle until it ends, then the cycle fires; a job waiting on a holder or queued does not defer it | `tests/test_foreign_holder_power_cycle.py::test_a_running_broker_job_defers_the_cycle_until_it_ends`, `::test_a_waiting_or_queued_job_does_not_defer_the_cycle` |
+| I103 the host-rung climb and the off-bus gated cycle fire past a foreign holder or an unreadable scan; a broker job's holder holds them | `tests/test_device_safety.py::test_stuck_hold_climb_does_not_reboot_when_a_tenant_arrives`, `::test_stuck_hold_climb_cycles_past_an_incomplete_holder_scan`, `tests/test_offbus_power_cycle.py::test_a_foreign_holder_or_an_unreadable_scan_never_holds` |
+| I103 the pre-power-cycle reset scan clears an unscoped holder like a reader and still refuses a scoped one | `tests/test_foreign_holder_power_cycle.py::test_the_pre_cycle_scan_clears_a_foreign_holder_and_refuses_a_job_holder` |
