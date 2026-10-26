@@ -3649,6 +3649,150 @@ async def test_a_dirty_flag_dropped_without_a_check_leaves_a_durable_trace(monke
     assert cleared[0]["verified"] is False, "no silicon was checked; the clear must say so"
 
 
+class _LineLogger:
+    """A logger that keeps every message, whatever its level."""
+
+    def __init__(self, lines):
+        self.lines = lines
+
+    def __getattr__(self, level):
+        return lambda m, *a, **k: self.lines.append(m)
+
+
+def _stage_holder_proc(root, pid, argv=b"python3\0serve.py\0--api-key\0abc123\0"):
+    (root / "stat").write_text("btime 1700000000\n")
+    d = root / str(pid)
+    d.mkdir(parents=True)
+    (d / "stat").write_text(f"{pid} (python3) S 1 {pid} {pid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 500 0 0\n")
+    (d / "status").write_text("Uid:\t1000\t1000\t1000\t1000\n")
+    (d / "cmdline").write_bytes(argv)
+    (d / "cgroup").write_text("0::/user.slice/user-1000.slice/session-3.scope\n")
+    (root / "1").mkdir()
+    (root / "1" / "comm").write_text("systemd\n")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gone", [False, True])
+async def test_a_foreign_holder_hold_journals_and_logs_who_the_holder_is(monkeypatch, tmp_path, gone):
+    """Logging only: the dropped-held event and a server.log line name each foreign holder by parent,
+    user, unit, start time and redacted command line, read from /proc when the gate first sees it. A
+    holder that exits between the scan and the read is recorded as gone. Either way the hold, its
+    reason and the journaled verdict are what they were without it."""
+    from tt_device_mcp import holder_identity
+    from tt_device_mcp.device_holders import DeviceHolder
+
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    if not gone:
+        _stage_holder_proc(proc, 4242)
+    monkeypatch.setattr(holder_identity, "PROC_DIR", str(proc))
+    monkeypatch.setattr(holder_identity, "_btime_cache", [])
+    (tmp_path / "0").write_text("")
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        srv, "enumerate_device_holders", lambda: HolderScan(holders=[DeviceHolder(pid=4242, uid=1000)], complete=True)
+    )
+    srv.device_op_lock = None
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    lines = []
+    monkeypatch.setattr(srv, "logger", _LineLogger(lines))
+
+    srv._mark_device_dirty("job 511 ended killed (exit -9)")
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+
+    assert srv.fsm.record.why == "foreign_holder" and "pid 4242" in srv.fsm.record.detail
+    (held,) = [f for k, f in events if k == "device_dirty_dropped_held"]
+    assert held["verified"] is False and "foreign holder" in held["why"]
+    (row,) = held["holders"]
+    ident = [m for m in lines if "foreign holder pid 4242" in m]
+    assert ident, lines
+    if gone:
+        assert row == {"pid": 4242, "status": "gone"}
+        return
+    assert row["status"] == "live" and row["ppid"] == 1 and row["parent_comm"] == "systemd"
+    assert row["unit"] == "session-3.scope" and row["cgroup"] == "/user.slice/user-1000.slice/session-3.scope"
+    assert row["started"] and row["uid"] == 1000
+    assert row["cmdline"] == "python3 serve.py --api-key ***"
+    assert "abc123" not in ident[0] and "unit=session-3.scope" in ident[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stuck_read", [False, True])
+async def test_a_stuck_identity_read_never_delays_the_gate_or_its_hold(monkeypatch, tmp_path, stuck_read):
+    """The gate reads a foreign holder's identity off the loop under one fixed bound: a read that
+    blocks (a holder stuck in the kernel holding its mmap lock) is recorded unread at the bound, and
+    the hold, its reason and the journaled verdict are the ones a read that answers gives."""
+    import threading
+    import time
+
+    from tt_device_mcp import holder_identity
+    from tt_device_mcp.device_holders import DeviceHolder
+
+    release = threading.Event()
+
+    def read(pid):
+        if stuck_read:
+            release.wait()
+        return {"pid": pid, "status": "live"}
+
+    monkeypatch.setattr(holder_identity, "holder_identity", read)
+    monkeypatch.setattr(holder_identity, "HOLDER_IDENTITY_READ_TIMEOUT_SEC", 0.3)
+    (tmp_path / "0").write_text("")
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        srv, "enumerate_device_holders", lambda: HolderScan(holders=[DeviceHolder(pid=4242, uid=1000)], complete=True)
+    )
+    srv.device_op_lock = None
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    monkeypatch.setattr(srv, "logger", _LineLogger([]))
+
+    srv._mark_device_dirty("job 512 ended killed (exit -9)")
+    try:
+        t0 = time.monotonic()
+        await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+        took = time.monotonic() - t0
+    finally:
+        release.set()
+        for _ in range(200):  # the released read ends before the next test reads this pid
+            if 4242 not in holder_identity._reads_in_flight:
+                break
+            time.sleep(0.005)
+
+    assert took < 0.3 + 0.5, took
+    assert srv.fsm.record.why == "foreign_holder" and "pid 4242" in srv.fsm.record.detail
+    assert srv.fsm.state is ServerState.RECOVERING and not srv.fsm.record.dirty
+    (held,) = [f for k, f in events if k == "device_dirty_dropped_held"]
+    assert held["verified"] is False and "foreign holder" in held["why"]
+    expected = {"pid": 4242, "status": "unread", "error": "timeout"} if stuck_read else {"pid": 4242, "status": "live"}
+    assert held["holders"] == [expected]
+
+
+def test_a_polled_holder_is_logged_at_first_sighting_only(monkeypatch, tmp_path):
+    """The job door re-scans every few seconds: each holder's identity is logged the first time it is
+    seen, not on every poll, and the reason it returns is unchanged."""
+    from tt_device_mcp import holder_identity
+    from tt_device_mcp.device_holders import DeviceHolder
+
+    _stage_holder_proc(tmp_path, 4242)
+    monkeypatch.setattr(holder_identity, "PROC_DIR", str(tmp_path))
+    monkeypatch.setattr(holder_identity, "_btime_cache", [])
+    monkeypatch.setattr(srv, "_present_chip_indices", lambda: [0])
+    monkeypatch.setattr(
+        srv, "enumerate_device_holders", lambda: HolderScan(holders=[DeviceHolder(pid=4242, uid=1000)], complete=True)
+    )
+    monkeypatch.setattr(srv, "_reaped_leftover_reason", lambda scan: "")
+    monkeypatch.setattr(srv, "descends_from", lambda pid, anc: False)
+    lines = []
+    monkeypatch.setattr(srv, "logger", _LineLogger(lines))
+    reasons = [srv._tenant_holder_reason() for _ in range(3)]
+    assert all("pid 4242" in r for r in reasons) and len(set(reasons)) == 1
+    assert len([m for m in lines if "JOB_RUNNER foreign holder pid 4242" in m]) == 1, lines
+
+
 @pytest.mark.asyncio
 async def test_a_verified_clear_names_itself_and_records_it_was_verified(monkeypatch, tmp_path):
     """The gate's HEALTHY branch used to drop the dirty flag with a bare clear that logged
@@ -11831,6 +11975,34 @@ async def test_a_gone_foreign_holder_hold_lifts_on_the_full_check_without_a_rese
     assert [c["run_fabric"] for c in calls] == [True], "exactly one full check, fabric included"
     assert counters["resets"] == 0, "a healthy verify lifts without a reset"
     assert counters["dirty_cleared"] == 1, "the hold is lifted (a verified clear)"
+    assert ("foreign_holder_verify", {"lifted": True, "healthy": True, "reason": "holder gone"}) in events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("healthy", [True, False])
+async def test_the_foreign_holder_verify_names_the_holder_the_gate_saw(monkeypatch, tmp_path, clear_job_state, healthy):
+    """Logging only: the verify runs once the holder is gone, so its event carries the identity the
+    gate recorded for this hold. Identities recorded for another hold are never attached."""
+    counters, calls, events = _fast_verify_setup(monkeypatch, tmp_path, healthy=healthy)
+    row = {"pid": 4242, "status": "live", "cmdline": "python3 serve.py"}
+    srv._remember_foreign_holders([row])
+    monkeypatch.setattr(srv, "_foreign_holders_seen", srv._foreign_holders_seen)
+
+    await srv._attempt_idle_relift()
+
+    (verify,) = [f for k, f in events if k == "foreign_holder_verify"]
+    assert verify["lifted"] is healthy and verify["holders"] == [row]
+    assert verify["holders_since"] == srv._foreign_holders_seen[0]
+    assert counters["dirty_cleared"] == (1 if healthy else 0)
+
+
+@pytest.mark.asyncio
+async def test_the_foreign_holder_verify_never_names_another_holds_holder(monkeypatch, tmp_path, clear_job_state):
+    counters, calls, events = _fast_verify_setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv, "_foreign_holders_seen", ("2000-01-01T00:00:00", [{"pid": 1, "status": "live"}]))
+
+    await srv._attempt_idle_relift()
+
     assert ("foreign_holder_verify", {"lifted": True, "healthy": True, "reason": "holder gone"}) in events
 
 
