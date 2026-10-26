@@ -384,6 +384,10 @@ def _stub_lock_env(monkeypatch, cli, tmp_path, deny_rc):
     monkeypatch.setattr(cli.time, "sleep", lambda *a: None)
     monkeypatch.setattr(cli, "_UDEV_RULE_PATH", str(tmp_path / "99-ttdev.rules"))
     monkeypatch.setattr(cli, "_LOCK_BANNER", str(tmp_path / "banner.sh"))
+    # The lock's markers live in /run on a host; a test writes none there, and reads no real group.
+    monkeypatch.setattr(cli.device_lock, "APPLIED_MARKER", str(tmp_path / "device_lock_applied"))
+    monkeypatch.setattr(cli.device_lock, "DRIFT_RECORD", str(tmp_path / "device_lock_drift"))
+    monkeypatch.setattr(cli.device_lock, "human_members", lambda group="ttdev": [])
 
     issued = []
 

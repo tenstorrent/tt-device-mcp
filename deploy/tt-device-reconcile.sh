@@ -83,12 +83,14 @@ if [ -x "$t" ] && [ "$(readlink -f /usr/local/bin/tt-device-mcp 2>/dev/null)" !=
     ln -sf "$t" /usr/local/bin/tt-device-mcp
 fi
 
-# 4) Lock drift: if lockdown is configured, the device node must stay group $GROUP.
+# 4) Lock drift: if lockdown is configured, EVERY node must stay 0660 group $GROUP (spec 05 I9).
+#    device-lock.sh re-triggers udev on drift once the lock has been in effect this boot, records
+#    drift that persists for /health, and names group members it is not effective for.
 if grep -q 'TT_DEVICE_MCP_DEVICE_GROUP' /etc/systemd/system/tt-device-broker.service 2>/dev/null; then
-    node="$(ls /dev/tenstorrent/* 2>/dev/null | head -1 || true)"
-    if [ -n "$node" ] && [ "$(stat -c %G "$node" 2>/dev/null)" != "$GROUP" ]; then
-        echo "reconcile: device lock drifted (group != $GROUP) -> re-triggering udev" >&2
-        udevadm trigger --subsystem-match=tenstorrent 2>/dev/null || true
+    if [ -x "$R/device-lock.sh" ]; then
+        "$R/device-lock.sh" check || true
+    else
+        echo "reconcile: device lock configured but $R/device-lock.sh is missing (next update installs it)" >&2
     fi
 fi
 
