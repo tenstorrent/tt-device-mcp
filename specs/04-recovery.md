@@ -2203,6 +2203,8 @@ each rung fires only when the gentler one failed or cannot apply.
     `survivor` or `scan_error`). A scan that itself fails (the holder read errors, or the scan
     raises: outcome `scan_error`) lets the reset run, as before the scan existed; recovery must not
     stop on a scan bug, and the reset's own gates still apply.
+    The event's `identities` names each holder found (the 03 I43 holder identity, read before
+    any signal); logging only, it never delays the scan or changes its outcome.
   - A refusal leaves the device pollers stopped, owed to the next close to HEALTHY (03 I66), which
     only a passing full check, fabric included, reaches: never restarted onto chips a refused
     reset left as they were.

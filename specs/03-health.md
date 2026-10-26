@@ -716,6 +716,11 @@ cooldown (spec 04 I65) holds longer.
   ceiling escalation and the 10-min bound (spec 04 I76). Any other outcome falls
   through to the existing ceiling escalation (I23 generic), which is unchanged. A tenant still there
   means no probe at all. It emits `foreign_holder_verify` with `lifted` either way.
+  Logging only: the gate that places the hold, and this verify, name each foreign holder
+  (`holders`: pid, ppid and parent comm, uid/user, systemd unit and cgroup, start time, and the
+  command line with secret-named values and URL userinfo redacted, cut to 256 chars), read from
+  /proc at first sighting; one gone mid-read is recorded `gone`. The read never raises, signals
+  or waits, and changes no verdict.
 - **I44 — An idle foreign holder is named, never signalled.** A tenant process (`is_tenant`) that
   holds a device fd outside every broker job/exec scope and is not a descendant of the broker is
   tracked by its `/proc/<pid>/stat` CPU time (utime+stime+cutime+cstime), keyed on (pid, starttime)

@@ -59,6 +59,7 @@ from tt_device_mcp.constants import (
     PRE_RESET_ZOMBIE_WAIT_SEC,
 )
 from tt_device_mcp.device_holders import SCOPE_PROC_DIR, DeviceHolder, is_tenant
+from tt_device_mcp.holder_identity import holder_identity
 from tt_device_mcp.peercred import username_for_uid
 
 RESET_SCOPE_PREFIX = "ttdev-reset-"
@@ -116,6 +117,8 @@ class PreResetScan:
     """What one pre-reset scan found and did. Lists hold ``_describe`` dicts."""
 
     found: list = field(default_factory=list)  # every holder seen, the broker itself excluded
+    # ``holder_identity`` of each found holder, read before any signal (logging only)
+    identities: list = field(default_factory=list)
     tenants: list = field(default_factory=list)  # tenants (never signalled)
     killed: list = field(default_factory=list)  # readers signalled, with the last signal sent
     unkillable: list = field(default_factory=list)  # readers left holding, stuck in the kernel
@@ -407,6 +410,7 @@ async def clear_device_readers(
         if _is_self(h.pid):
             continue
         result.found.append(_describe(h))
+        result.identities.append(holder_identity(h.pid))
         if holder_in_reset(h.pid):
             result.reset_in_flight = f"pid {h.pid} comm {device_holders.holder_comm(h.pid)}"
         elif _is_tenant(h):

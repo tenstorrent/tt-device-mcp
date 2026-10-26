@@ -207,6 +207,7 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
+from tt_device_mcp.holder_identity import describe_identity, holder_identities
 from tt_device_mcp.job_preflight import preflight_output_dirs
 from tt_device_mcp.job_reap import (
     DEAD_CHIP_LABEL_PREFIX,
@@ -3850,7 +3851,9 @@ def _clear_device_reported_fault(why: str) -> None:
     device_fault_reported = ""
 
 
-def _journal_fsm_transition(why: str, *, verified: bool, released: Optional[bool] = None) -> None:
+def _journal_fsm_transition(
+    why: str, *, verified: bool, released: Optional[bool] = None, holders: Optional[list] = None
+) -> None:
     """Record a ``device_dirty_cleared`` event naming who moved the device off its PRIOR episode
     (``why``) and whether a check actually proved the mesh healthy first (``verified``) — emitted
     only while there WAS a prior episode to move off of. The one state change a postmortem cannot
@@ -3860,14 +3863,17 @@ def _journal_fsm_transition(why: str, *, verified: bool, released: Optional[bool
     its exit code) must not read the same as one a full snapshot+fabric pass stood behind.
 
     ``released`` (default: ``verified``) says whether the device leaves the hold. One that stays held
-    with only its dirty bit dropped is journaled as ``device_dirty_dropped_held``, never as a clear."""
+    with only its dirty bit dropped is journaled as ``device_dirty_dropped_held``, never as a clear.
+    ``holders`` (``holder_identity`` rows of the foreign holders behind it) is journaled when given."""
     if fsm.state is not ServerState.HEALTHY:
+        extra = {"holders": holders} if holders else {}
         health_event(
             "device_dirty_cleared" if (verified if released is None else released) else "device_dirty_dropped_held",
             why=why,
             verified=verified,
             prior_reason=fsm.record.detail or fsm.record.why,
             fabric=_lift_fabric(),
+            **extra,
         )
 
 
@@ -3989,7 +3995,9 @@ def _stamp_verified_release(evidence: dict, via: str) -> None:
         recovery_mechanism.record_verified_release(via)
 
 
-def _clear_device_dirty_unverified(why: str, *, holds: bool = True, fault: str = "gate_error") -> None:
+def _clear_device_dirty_unverified(
+    why: str, *, holds: bool = True, fault: str = "gate_error", holders: Optional[list] = None
+) -> None:
     """Drop the dirty flag on a path that did NOT verify the silicon — a foreign tenant
     holds the device, no device nodes are present, health checks are off, or the gate
     errored out. Named so those call sites say out loud that nobody checked the mesh.
@@ -3999,10 +4007,12 @@ def _clear_device_dirty_unverified(why: str, *, holds: bool = True, fault: str =
     Holding those would not protect silicon — nothing on that host will ever verify, so
     the door would shut once and never reopen. Every other unverified clear holds: it
     means we tried and could not tell, which is the case the hold exists for.
+
+    ``holders``: the foreign holders' ``holder_identity`` rows, journaled with the transition.
     """
     if PCI_WRITER.latched:
         holds = True  # spec 04 I76: PCI-wedged lifts only on a verified full check
-    _journal_fsm_transition(why, verified=False, released=not holds)
+    _journal_fsm_transition(why, verified=False, released=not holds, holders=holders)
     if not holds:
         fsm.on_readings(_healthy_reading())
         return
@@ -5761,6 +5771,51 @@ async def _attempt_down_offbus_recheck() -> None:
         _log("DOWN off-bus re-check aborted on an unexpected error — holding; the next idle tick retries")
 
 
+# The foreign holders the gate last saw, as (the hold's ``since``, ``holder_identity`` rows): the
+# foreign-holder verify runs once they are gone, so it journals who they were from here.
+_foreign_holders_seen: tuple = ("", [])
+# (pid, start time) of every foreign holder already logged, so a poll logs each one once.
+_foreign_holders_logged: set = set()
+
+
+def _log_foreign_holder_identities(prefix: str, pids, *, first_sighting_only: bool = False) -> list:
+    """Read each foreign holder's ``holder_identity`` (from /proc only; nothing is signalled) and log
+    one server.log line per holder: every call, or with ``first_sighting_only`` once per process,
+    for a caller that polls. Logging only: never a job log, which another user may read, and never
+    raises."""
+    try:
+        rows = holder_identities(pids)
+    except Exception as e:  # noqa: BLE001 - logging only
+        if logger:
+            logger.warning(f"{prefix} foreign holder identity unreadable: {e!r}")
+        return []
+    for row in rows:
+        key = (row["pid"], row.get("started", ""))
+        if first_sighting_only and key in _foreign_holders_logged:
+            continue
+        if len(_foreign_holders_logged) > 256:
+            _foreign_holders_logged.clear()
+        _foreign_holders_logged.add(key)
+        if logger:
+            logger.info(f"{prefix} foreign holder {describe_identity(row)}")
+    return rows
+
+
+def _remember_foreign_holders(rows: list) -> None:
+    global _foreign_holders_seen
+    if rows and fsm.record.why == "foreign_holder":
+        _foreign_holders_seen = (fsm.record.since, rows)
+
+
+def _seen_foreign_holders() -> dict:
+    """``holders``/``holders_since`` for the foreign-holder verify event: the identities the gate
+    recorded for this hold, or nothing when they belong to another hold."""
+    since, rows = _foreign_holders_seen
+    if rows and since and since == fsm.record.since:
+        return {"holders": rows, "holders_since": since}
+    return {}
+
+
 async def _foreign_holder_fast_verify(expected: int, log: Callable[[str], None]) -> bool:
     """Run the pre-job verify on a foreign-holder hold whose holder is gone (spec 03 I43). Called by
     the idle relift under the device-op lock. Returns True when the relift is done with this pass
@@ -5805,17 +5860,18 @@ async def _foreign_holder_fast_verify(expected: int, log: Callable[[str], None])
             )
         )
         log(f"foreign-holder hold: the check did not clear it ({why}) — the ceiling escalation owns it")
-        health_event("foreign_holder_verify", lifted=False, healthy=healthy, reason=why)
+        health_event("foreign_holder_verify", lifted=False, healthy=healthy, reason=why, **_seen_foreign_holders())
         return False
     # Same re-assert as the relift's own lift: the sampler's dead-chip path is lock-free and can
     # re-dirty the device during the awaits above.
     if fsm.state is not ServerState.RECOVERING or fsm.record.dirty or fsm.record.why != "foreign_holder":
         log("state changed mid-verify (a chip dropped, or a gate took over) — holding; the pre-job gate owns it now")
         return True
+    seen = _seen_foreign_holders()  # read before the lift ends the hold it was recorded for
     if not _clear_device_dirty(verified=True, why="idle relift: foreign holder gone, full check passed"):
         return True
     log("foreign-holder hold: the full check passed — hold lifted without a reset")
-    health_event("foreign_holder_verify", lifted=True, healthy=True, reason="holder gone")
+    health_event("foreign_holder_verify", lifted=True, healthy=True, reason="holder gone", **seen)
     health_event("device_relift", evidence=evidence)
     return True
 
@@ -7168,7 +7224,9 @@ async def device_health_gate(
     if foreign:
         who = ", ".join(f"{h.username}(pid {h.pid})" for h in foreign)
         _log(f"skip: device held by {who}; not touching it")
-        _clear_device_dirty_unverified(f"foreign holder present: {who}", fault="foreign_holder")
+        identities = _log_foreign_holder_identities(f"HEALTH-GATE[{phase}]", (h.pid for h in foreign))
+        _clear_device_dirty_unverified(f"foreign holder present: {who}", fault="foreign_holder", holders=identities)
+        _remember_foreign_holders(identities)
         # A door already held (a startup verify, a prior fault) outlives this skip: the verify
         # cannot run beside a foreign tenant, so the hold waits them out — and reads to the tenant
         # queued behind it as a bare "device unverified", a device fault, when the blocker is
@@ -11004,6 +11062,7 @@ async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
         owner=owner,
         outcome=result.outcome,
         found=result.found,
+        identities=result.identities or None,
         killed=result.killed,
         tenants=result.tenants,
         unkillable=result.unkillable,
@@ -11019,6 +11078,9 @@ async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
         seconds=result.seconds,
         error=result.error or None,
     )
+    if logger:
+        for row in result.identities:
+            logger.info(f"pre-reset: device holder before {' '.join(argv)}: {describe_identity(row)}")
     if result.detached:
         msg = f"pre-reset: chips {', '.join(result.detached)} off the bus, detached before their readers were killed"
         log(msg)
@@ -11411,6 +11473,7 @@ def _tenant_holder_reason() -> str:
     held = [h for h in scan.holders if is_tenant(h) and not descends_from(h.pid, me)]
     if not held:
         return ""
+    _log_foreign_holder_identities("JOB_RUNNER", (h.pid for h in held), first_sighting_only=True)
     who = ", ".join(f"{h.username}(pid {h.pid})" for h in held)
     return f"device held outside the broker by {who}; not dispatching beside it"
 

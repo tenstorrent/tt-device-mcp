@@ -912,3 +912,52 @@ async def test_a_scan_that_raises_lets_the_reset_proceed(monkeypatch):
     rc, _ = await srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-r"], lambda m: None)
     assert rc == 0 and "reset" in order
     assert [f["outcome"] for k, f in events if k == "pre_reset_holder_scan"] == ["scan_error"]
+
+
+@pytest.mark.asyncio
+async def test_each_holder_is_identified_before_it_is_signalled(monkeypatch):
+    """Logging only: the scan reads each holder's identity when it finds it, before any signal, so
+    a reader it kills is still named afterwards. The verdict and the signals are unchanged."""
+    order: list = []
+    box = _Box(monkeypatch, [TENANT, READER], order=order)
+    monkeypatch.setattr(
+        prs, "holder_identity", lambda pid: order.append(f"identify:{pid}") or {"pid": pid, "status": "live"}
+    )
+    result = await box.run(tenants_block=False)
+    assert [r["pid"] for r in result.identities] == [TENANT.pid, READER.pid]
+    assert order.index(f"identify:{READER.pid}") < order.index(f"kill:{READER.pid}:TERM")
+    assert box.sent == {READER.pid: ["TERM"]} and result.outcome == "killed"
+
+
+@pytest.mark.asyncio
+async def test_a_holder_gone_before_its_identity_is_read_changes_nothing(monkeypatch, tmp_path):
+    from tt_device_mcp import holder_identity
+
+    monkeypatch.setattr(holder_identity, "PROC_DIR", str(tmp_path))  # no /proc entry: exited after the scan
+    box = _Box(monkeypatch, [READER])
+    result = await box.run(tenants_block=True)
+    assert result.identities == [{"pid": READER.pid, "status": "gone"}]
+    assert box.sent == {READER.pid: ["TERM"]} and result.outcome == "killed"
+
+
+@pytest.mark.asyncio
+async def test_the_scan_event_and_log_carry_the_holder_identities(monkeypatch):
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    row = {"pid": 4101, "status": "live", "ppid": 1, "user": "u", "cmdline": "python3 x.py"}
+    monkeypatch.setattr(srv, "clear_device_readers", _scan_returning(prs.PreResetScan(found=[{}], identities=[row])))
+    lines = []
+    monkeypatch.setattr(
+        srv, "logger", type("L", (), {"info": lambda s, m: lines.append(m), "warning": lambda s, m: None})()
+    )
+    assert await srv._pre_reset_holder_scan(["tt-smi", "-r"], "[broker]ladder", lambda m: None) == ""
+    (scan,) = [f for k, f in events if k == "pre_reset_holder_scan"]
+    assert scan["identities"] == [row]
+    assert any("pid 4101" in m and "cmdline='python3 x.py'" in m for m in lines), lines
+
+
+def _scan_returning(result):
+    async def fake(**kw):
+        return result
+
+    return fake
