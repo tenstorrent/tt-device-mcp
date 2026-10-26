@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -48,6 +49,20 @@ FAST_CONFIRM_SEC = 4.0
 # poll or two after it ends; such a rise still arms the fast cadence, and a real drop in the window
 # is proved by I79's FAST_CONFIRM_SEC instead of the first sample.
 POST_STEP_AER_QUIET_SEC = 5.0
+
+# Spec 03 I92: an AER burst on a chip's path while the broker's own check runs stops that check's
+# readers. On a firmware-first host each uncorrectable (or advisory non-fatal) AER record is a
+# system-management interrupt, and a storm of them steals enough CPU time to trip the hardware
+# watchdog within seconds while something keeps reading the chip. The count is what link_signals
+# reads (the same counters as I79), per PCI function, over AER_STOP_WINDOW_SEC. Basis: in the
+# kernel's per-record AER log over several hundred fabric checks on three galaxy hosts, a storm that
+# went on to a chip drop or a host lockup posted 9-14 records on one function in its first firmware
+# flush and repeated every 4-5 s; outside a storm no function counted more than 2 in any 2 s. Four
+# is twice that and below the smallest first flush, so the first poll after a storm's first flush
+# stops the check. One passing check in about 300 had a storm of the same shape that ended with it:
+# that run is stopped too, and a later full pass decides (a stop is never a fail of the links).
+AER_STOP_COUNT = 4
+AER_STOP_WINDOW_SEC = 2.0
 
 # Spec 03 I83's cut after a failed POST_RESET: all PCI removes together get at most this long (a
 # remove behind a hung endpoint can block in the kernel for good; nobody is killed then), and the
@@ -334,8 +349,11 @@ class TelemetrySampler:
             return False
         if was:
             return False
+        # The journal's own writer thread does the fsync (I92): a storm can stall it for tens of
+        # seconds, and the loop must keep sampling and gating meanwhile.
+        write = getattr(self._deps, "health_event_detached", None) or self._deps.health_event
         try:
-            self._deps.health_event("offbus_watch_armed", reason=reason)
+            write("offbus_watch_armed", reason=reason)
         except Exception:  # noqa: BLE001 - the journal must not stop the watch
             pass
         if log:
@@ -1072,3 +1090,104 @@ class TelemetrySampler:
                 f"{stuck_holders} are stuck on them in the kernel — the host is STILL at "
                 f"risk; no rung re-enumerates PCI until they are gone (spec 04 I77)"
             )
+
+
+class CheckAerWatch:
+    """Spec 03 I92: stop the broker's own check readers on an AER burst, off the event loop.
+
+    A dedicated thread, not the sampler's loop task: on the hosts this guards, the loop itself was
+    seen blocked for 12 s and then 48 s inside a journal fsync during the very storm it had to stop,
+    so a watch on the loop would wait on the I/O the storm slows. Every LINK_WATCH_SEC, while any of
+    the broker's own readers (the fabric pass, the full check's tt-smi snapshot, the eth self-test,
+    the aiclk ceiling) runs, it reads link_signals (sysfs only, no device open) and keeps the reads
+    of the last AER_STOP_WINDOW_SEC. A rise of AER_STOP_COUNT or more on one function on any chip's
+    path calls ``deps.stop_check_readers_on_aer``, which signals the readers' process groups before
+    any journal or log write; the event is queued after the stop. While a reset or recovery step
+    owns the chips (I66), and for POST_STEP_AER_QUIET_SEC after, a rise only moves the baseline: the
+    step's own errors are expected. Never raises out of its thread."""
+
+    def __init__(self, deps: "RecoveryDeps", mechanism: "RecoveryMechanism", sampler: "TelemetrySampler") -> None:
+        self._deps = deps
+        self._mechanism = mechanism
+        self._sampler = sampler
+        self._clock = time.monotonic
+        # (clock, {bdf: count}) reads taken while a check ran, oldest first, at most the window long.
+        self._reads: deque = deque()
+        self._step_seen_at: Optional[float] = None
+        self._halt = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        self.last_stop: str = ""
+
+    def start(self) -> None:
+        if self.thread is None or not self.thread.is_alive():
+            self._halt.clear()
+            self.thread = threading.Thread(target=self._run, name="check-aer-watch", daemon=True)
+            self.thread.start()
+
+    def stop(self) -> None:
+        self._halt.set()
+
+    def _run(self) -> None:
+        while not self._halt.wait(LINK_WATCH_SEC):
+            try:
+                self.poll_once()
+            except Exception:  # noqa: BLE001 - the watch must outlive any one bad read
+                continue
+
+    def _excused(self, now: float) -> bool:
+        """A reset or recovery step owns the chips, or ended under POST_STEP_AER_QUIET_SEC ago (I66)."""
+        if self._mechanism.reset_in_flight or self._sampler.scope_seen or chip_state.recovering():
+            self._step_seen_at = now
+            return True
+        return self._step_seen_at is not None and now - self._step_seen_at <= POST_STEP_AER_QUIET_SEC
+
+    def burst(self, sig: dict, now: float) -> Optional[str]:
+        """Fold one link_signals read in: the burst on a chip's path it completes, as a reason, or None."""
+        aer = sig.get("aer") or {}
+        while self._reads and now - self._reads[0][0] > AER_STOP_WINDOW_SEC:
+            self._reads.popleft()
+        paths = sig.get("paths") or {}
+        hits = {}
+        for bdf in sorted({b for path in paths.values() for b in (path or ())}):
+            v = aer.get(bdf)
+            base = next((r[bdf] for _, r in self._reads if r.get(bdf) is not None), None)
+            if v is not None and base is not None and v - base >= AER_STOP_COUNT:
+                hits[bdf] = v - base
+        self._reads.append((now, aer))
+        if not hits:
+            return None
+        chips = sorted((c for c, path in paths.items() if set(path or ()) & set(hits)), key=int)
+        rose = ", ".join(f"{b} +{n}" for b, n in hits.items())
+        return f"AER burst on chip(s) {', '.join(chips)} ({rose} in {AER_STOP_WINDOW_SEC:g}s)"
+
+    def poll_once(self) -> Optional[str]:
+        """One watch read. Returns the reason when it stopped the readers, else None."""
+        readers = getattr(self._deps, "broker_check_readers", None)
+        stop = getattr(self._deps, "stop_check_readers_on_aer", None)
+        read = getattr(self._deps, "link_signals", None)
+        if readers is None or stop is None or read is None or not readers():
+            self._reads.clear()
+            return None
+        sig = read()
+        now = self._clock()
+        if self._excused(now):
+            # The step's own errors: the read after it is the baseline, never a burst (I66).
+            self._reads.clear()
+            self._reads.append((now, (sig or {}).get("aer") or {}))
+            return None
+        reason = self.burst(sig or {}, now)
+        if reason is None:
+            return None
+        # Signal first: no journal, log or fsync stands between the burst and the stop.
+        stopped = stop(reason)
+        self._reads.clear()
+        self.last_stop = reason
+        write = getattr(self._deps, "health_event_detached", None) or self._deps.health_event
+        try:
+            write("check_aer_stop", reason=reason, stopped=stopped)
+        except Exception:  # noqa: BLE001 - the journal must not stop the watch
+            pass
+        log = self._deps.logger()
+        if log:
+            log.error(f"AER WATCH {reason} during the broker's own check — stopped {stopped}; no verdict, hold kept")
+        return reason

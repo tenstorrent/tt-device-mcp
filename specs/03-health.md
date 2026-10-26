@@ -1414,7 +1414,8 @@ cooldown (spec 04 I65) holds longer.
   fast cadence at most `FAST_MAX_SEC` (60 s) from its first signal, so at most about 30 fast
   samples; after that the regular cadence runs (one warning) until the link has been quiet for
   `FAST_WINDOW_SEC`, and the next signal arms a new window. The first arm in a window journals
-  `offbus_watch_armed`. While a reset or recovery step owns the chips (I66: `reset_in_flight`, a
+  `offbus_watch_armed` through the journal's own writer thread (I92), so the sampling loop never
+  waits on its fsync. While a reset or recovery step owns the chips (I66: `reset_in_flight`, a
   reset scope still running, or `chip_state.recovering()`), a signal only moves the baseline and
   arms nothing: a reset journals no `offbus_watch_armed`. The signal decides nothing: the existing
   two-sample proof (I19, I31 and the all-gone/blackout checks) still confirms, into the same
@@ -1697,7 +1698,8 @@ cooldown (spec 04 I65) holds longer.
   ladder (full ladder at 10 min, then the power cycle, spec 04 I76); a whole-tray or all-chips-off
   drop keeps its path straight to the power cycle after the cooldown (I19, I65). Time to detach,
   first all-ones read with a rise on the chip's path: that sample (was one more sample, 10 s, or
-  `FAST_CONFIRM_SEC` under the fast cadence); the stop precedes the remove.
+  `FAST_CONFIRM_SEC` under the fast cadence); the stop precedes the remove. A broker check's
+  readers are also stopped on an AER burst alone, with every chip still answering (I92).
 - **I87 — A slow chip never stalls the broker's event loop.** The status surfaces (`/health`, the
   REST and MCP queue status) read the chips' heartbeats in a worker thread, at most one such read at
   a time, and wait `STATUS_CHIP_READ_WAIT_SEC` (0.5 s) for it; past that they answer from the last
@@ -1739,6 +1741,31 @@ cooldown (spec 04 I65) holds longer.
   returned within `PCIE_SNAPSHOT_TIMEOUT_SEC` (5 s), which writes a `pcie_snapshot_timeout` event.
   The gate's verdict, its probes and their order, every hold, rung and release are the same with or
   without it, and the full check with fabric still decides every lift and release (I78).
+- **I92 — An AER burst stops the broker's own check readers, from its own thread.** On a
+  firmware-first host each counted AER record is a system-management interrupt, and a storm of them
+  while something keeps reading the chips can trip the hardware watchdog within seconds. While any
+  broker check reader runs (the fabric check, the full check's `tt-smi` snapshot, the eth
+  self-test, the aiclk ceiling; I86), `telemetry.CheckAerWatch` reads `link_signals()` (I79's
+  counters, sysfs only) every `LINK_WATCH_SEC` on a dedicated thread, never on the event loop, so
+  an event loop stalled on journal I/O cannot delay it. An AER burst, a rise of `AER_STOP_COUNT`
+  (4) counted errors on one function of any chip's path within `AER_STOP_WINDOW_SEC` (2 s), stops
+  the readers' process groups within one `LINK_WATCH_SEC`: SIGSTOP each group, mark each run no
+  verdict, then SIGKILL each group (`server._stop_check_readers_on_aer`). No journal, log or fsync
+  comes before either signal: the no-verdict mark's journal append and the `check_aer_stop` event
+  go through the journal's own writer thread (`health_event_detached`), and the log line follows.
+  The run is a failed check: a fabric run is marked killed (I82; `FABRIC_DEBT` owed, the last
+  pass's vouching dropped), a snapshot fails with no verdict, an eth self-test arms nothing. The
+  hold stays and its bounded recovery follows unchanged (the full ladder at 10 min, then the power
+  cycle, spec 04 I76; a failed `_full_check_gate` hands it on as any failed check does); only a
+  just-passed full check with fabric on all cabled links lifts it (I78). A reset rung's own AER is
+  excused: while a reset or recovery step owns the chips (I66) and for `POST_STEP_AER_QUIET_SEC`
+  after, a read only moves the baseline. With no reader running nothing is read. The count's basis
+  (in `telemetry.py`): storms that went on to a chip drop or a host lockup posted 9-14 records on
+  one function in their first flush, while outside a storm no function counted more than 2 in 2 s.
+  Known gaps: in-kernel tt-kmd reads cannot be stopped, including the driver's close path after the
+  SIGKILL (I84); about one passing check in 300 met a benign storm of the same shape and is stopped
+  too (a later full pass decides); and that ending the reads ends the storm is a model, not yet
+  shown on a device.
 
 ## Interfaces
 
@@ -2465,6 +2492,7 @@ refuses.
 | I87 | `tests/test_loop_stall.py::test_health_answers_within_a_second_while_the_chip_read_hangs`, `tests/test_loop_stall.py::test_the_first_read_waits_in_its_thread_not_on_the_loop`, `tests/test_loop_stall.py::test_concurrent_status_calls_share_one_read`, `tests/test_loop_stall.py::test_no_status_read_while_a_reset_step_owns_the_chips`, `tests/test_loop_stall.py::test_the_status_routes_build_their_payload_off_the_loop_read`, `tests/test_loop_stall.py::test_a_blocked_loop_is_logged_with_the_call_that_blocks_it`, `tests/test_loop_stall.py::test_a_free_loop_logs_nothing` |
 | I88 | `tests/test_health_tenant_job_degraded.py::test_a_running_jobs_own_off_bus_reading_is_not_a_hold`, `tests/test_health_tenant_job_degraded.py::test_a_chip_still_off_when_the_job_ends_opens_the_hold_and_only_a_full_check_lifts_it`, `tests/test_health_tenant_job_degraded.py::test_an_open_hold_episode_still_reads_held_while_a_job_runs`, `tests/test_health_tenant_job_degraded.py::test_an_in_memory_verdict_under_a_running_job_still_reads_held` |
 | I91 | `tests/test_pcie_aer_telemetry.py::test_snapshot_reads_both_ends_and_names_bdf_root_port_and_tray`, `tests/test_pcie_aer_telemetry.py::test_delta_lists_only_chips_with_errors_or_a_link_change`, `tests/test_pcie_aer_telemetry.py::test_delta_names_a_chip_that_left_the_bus_and_reads_nothing_of_it`, `tests/test_pcie_aer_telemetry.py::test_a_lost_chip_s_own_link_is_never_read`, `tests/test_pcie_aer_telemetry.py::test_a_chip_the_sampler_read_all_ones_is_not_read`, `tests/test_pcie_aer_telemetry.py::test_the_broker_s_snapshot_never_reads_the_link_of_a_chip_the_sampler_read_all_ones`, `tests/test_pcie_aer_telemetry.py::test_no_chip_link_is_read_while_a_reset_step_owns_the_chips`, `tests/test_pcie_aer_telemetry.py::test_an_all_ones_link_read_is_not_repeated_in_the_same_job_cycle`, `tests/test_pcie_aer_telemetry.py::test_no_write_and_no_config_space_read`, `tests/test_pcie_aer_telemetry.py::test_job_start_end_and_the_check_each_write_one_event_into_the_gate_record`, `tests/test_pcie_aer_telemetry.py::test_the_runner_snapshots_before_and_after_the_job_command_and_the_check_reads_them`, `tests/test_pcie_aer_telemetry.py::test_a_stalled_snapshot_is_left_out_after_its_bound`, `tests/test_pcie_aer_telemetry.py::test_the_gate_decides_the_same_with_or_without_the_telemetry` |
+| I92 | `tests/test_aer_check_stop.py::test_a_burst_stops_every_reader_before_any_write_and_owes_a_full_pass`, `tests/test_aer_check_stop.py::test_the_stop_keeps_the_hold_and_the_earlier_pass_no_longer_vouches`, `tests/test_aer_check_stop.py::test_a_stopped_fabric_run_is_no_verdict`, `tests/test_aer_check_stop.py::test_a_burst_during_the_full_check_gate_fails_it_into_the_bounded_recovery`, `tests/test_aer_check_stop.py::test_a_reset_steps_own_aer_is_excused_then_a_real_burst_still_stops`, `tests/test_aer_check_stop.py::test_a_slow_rise_another_path_or_one_below_the_count_never_stops`, `tests/test_aer_check_stop.py::test_no_reader_running_means_no_read`, `tests/test_aer_check_stop.py::test_a_journal_stalled_in_fsync_delays_neither_signal`, `tests/test_aer_check_stop.py::test_boot_builds_the_watch_beside_the_sampler`, `tests/test_aer_check_stop.py::test_the_watch_runs_on_its_own_thread_and_stops` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

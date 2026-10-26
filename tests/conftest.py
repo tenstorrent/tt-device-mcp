@@ -1163,6 +1163,7 @@ def patch_health_event(monkeypatch, fn) -> None:
     event any of these bodies emits has to patch all three, and ``pcie_guard`` (the tray re-power
     envelope and the tray rung's disable, which the walk reaches), and ``base`` (the outage hold)."""
     monkeypatch.setattr(srv, "health_event", fn)
+    monkeypatch.setattr(srv, "health_event_detached", fn)
     monkeypatch.setattr(recovery_pkg, "health_event", fn)
     monkeypatch.setattr(recovery_galaxy, "health_event", fn)
     monkeypatch.setattr(pcie_guard, "health_event", fn)

@@ -54,7 +54,7 @@ from tt_device_mcp.health import (
     _persistent_recovery,
     _select_recovery,
 )
-from tt_device_mcp.telemetry import TelemetrySampler
+from tt_device_mcp.telemetry import CheckAerWatch, TelemetrySampler
 
 if TYPE_CHECKING:
     from tt_device_mcp.health import HealthState, Recovery
@@ -243,6 +243,7 @@ class ServerFsm:
         self.galaxy: Optional[GalaxyRecovery] = None
         self.per_target: Optional[PerTargetRecovery] = None
         self.sampler: Optional[TelemetrySampler] = None
+        self.aer_watch: Optional[CheckAerWatch] = None
         self.deps: Optional[RecoveryDeps] = None
         # The platform this host IS, fixed once by resolve_platform(). None means it could not be
         # determined at boot — the mesh could not be read and the operator declared nothing — and
@@ -299,6 +300,7 @@ class ServerFsm:
         self.galaxy = _persistent_recovery(GalaxyRecovery, monitor, self.mechanism, deps)
         self.per_target = _persistent_recovery(PerTargetRecovery, monitor, self.mechanism, deps)
         self.sampler = TelemetrySampler(monitor, self.mechanism, deps)
+        self.aer_watch = CheckAerWatch(deps, self.mechanism, self.sampler)
 
     def resolve_platform(self, probe: "Optional[Callable[[], None]]" = None) -> Optional[str]:
         """Fix this host's platform once, at broker start, and commit the Recovery that fits it.

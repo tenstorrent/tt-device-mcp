@@ -15,8 +15,10 @@ from __future__ import annotations
 import json
 import os
 import platform
+import queue
 import re
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -91,6 +93,36 @@ def health_event(kind: str, **fields) -> None:
     rec = {"ts": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "kind": kind}
     rec.update(fields)
     _append_durable(HEALTH_DIR / EVENTS_FILE, rec, MAX_EVENTS_BYTES)
+
+
+# Spec 03 I92: records queued for the journal's own writer thread, which does their fsync, so a
+# caller on the event loop (or the AER watch thread, right after its stop) never waits on the disk.
+# One writer keeps them in order; an fsync a storm stalls for tens of seconds delays only them.
+_detached: "queue.SimpleQueue" = queue.SimpleQueue()
+_detached_writer: Optional[threading.Thread] = None
+_detached_lock = threading.Lock()
+
+
+def _drain_detached() -> None:
+    while True:
+        path, rec, max_bytes = _detached.get()
+        _append_durable(path, rec, max_bytes)
+
+
+def health_event_detached(kind: str, **fields) -> None:
+    """Queue one decision for the journal's writer thread and return at once. The record carries the
+    time of this call, not of the write. Never raises."""
+    global _detached_writer
+    rec = {"ts": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "kind": kind}
+    rec.update(fields)
+    try:
+        with _detached_lock:
+            if _detached_writer is None or not _detached_writer.is_alive():
+                _detached_writer = threading.Thread(target=_drain_detached, name="health-journal", daemon=True)
+                _detached_writer.start()
+        _detached.put((HEALTH_DIR / EVENTS_FILE, rec, MAX_EVENTS_BYTES))
+    except RuntimeError:
+        pass
 
 
 def read_health_events(since_ts: float | None = None, kinds: "set[str] | None" = None) -> list[dict]:
