@@ -738,6 +738,8 @@ async def test_the_runner_hands_the_job_end_clock_and_the_gates_fabric_pass_to_t
     job, runner = await _start("939", "exit 1")
     try:
         assert await _until(lambda: _runner_done(job))
+        # The runner is done before the post-job gate records the event: wait for the record.
+        assert await _until(lambda: any(n == "aiclk_busy_after_job" for n, _ in fields))
     finally:
         await _stop(runner)
     noted = [(k["at_job_end"], k["cause"], k["gate_fabric"]) for n, k in fields if n == "aiclk_busy_after_job"]
@@ -766,6 +768,8 @@ async def test_an_off_bus_clock_read_is_not_a_busy_clock(runner_env, monkeypatch
     job, runner = await _start("938", "exit 1")
     try:
         assert await _until(lambda: _runner_done(job))
+        if want_debt:
+            assert await _until(lambda: "aiclk_busy_after_job" in runner_env["events"])
     finally:
         await _stop(runner)
     assert job.status is srv.JobStatus.FAILED and job.exit_code == 1
