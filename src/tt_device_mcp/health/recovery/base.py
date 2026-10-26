@@ -152,6 +152,9 @@ HOLD_ESCALATION_REARM_SEC = int(os.environ.get("TT_DEVICE_MCP_HOLD_REARM_SEC", "
 AUTO_RECOVERY_MIN_INTERVAL_SEC = int(os.environ.get("TT_DEVICE_MCP_AUTO_RECOVERY_INTERVAL_SEC", "3600"))
 AUTO_RECOVERY_MAX_PER_BOOT = 1
 AUTO_RECOVERY_LEDGER = "auto_recovery.jsonl"
+# Spec 04 I99: a shutdown this close to its fallback bound is logged, as the fallback may have cut the
+# power before the filesystems were read-only.
+SHUTDOWN_BOUND_WARN_HEADROOM_SEC = 15
 # This boot's failed mesh resets (spec 04 I58): which off-bus set each one ran on and left, and its exit
 # code. On disk, so a broker restart in the middle of an episode does not forget a reset that already
 # failed and run it again; keyed by the kernel boot id, so the boot a power cycle brings starts empty.
@@ -2493,6 +2496,7 @@ class RecoveryMechanism:
             mark["sel_power_off"] = _local_time(sel_off)
         if verdict == "refuted":
             mark.update(took_host_down=False, cycle_refuted=cause)
+        mark.update(self._os_first_shutdown_marks(argv, verdict, sel_off, at, btime))
         rec.update(mark)
         try:
             self._rewrite_ledger_marks({(rec.get("boot_id"), rec.get("at_epoch")): mark})
@@ -2501,6 +2505,9 @@ class RecoveryMechanism:
         requested = rec.get("at")
         if verdict == "confirmed":
             extra = {"sel_power_off": mark["sel_power_off"]} if sel_off is not None else {}
+            for k in ("shutdown_sec", "shutdown_bound_sec"):
+                if mark.get(k) is not None:
+                    extra[k] = mark[k]
             if cause is None:
                 extra["restart_cause_unavailable"] = cause_why
             health_event("power_cycle_confirmed", requested_at=requested, restart_cause=cause, **extra)
@@ -2522,6 +2529,45 @@ class RecoveryMechanism:
             )
             self._journal_missed_power_cycles([rec], ledger, now_epoch, refuted=cause)
         return verdict
+
+    def _os_first_shutdown_marks(
+        self, argv: list, verdict: str, sel_off: Optional[float], at: float, btime: float
+    ) -> dict:
+        """How long the OS-first shutdown took (spec 04 I99): from the reboot request the previous boot
+        kept to the BMC's SEL power-off, beside the fallback bound it had. Empty when that request was
+        not this row's (no marker, or one from outside the row's window); ``shutdown_sec`` None with the
+        reason when the power-off cannot be read. The marker is consumed either way."""
+        from tt_device_mcp.health.recovery.stages import power_cycle as power_cycle_stage
+
+        marker = power_cycle_stage.take_os_first_marker()
+        if marker is None:
+            return {}
+        requested = float(marker["requested_epoch"])
+        if not at - 1 <= requested <= btime:
+            return {}
+        bound = marker.get("bound_sec")
+        out: dict = {"reboot_requested_at": _local_time(requested), "shutdown_bound_sec": bound}
+        if marker.get("unit_timeout_sec") is not None:
+            out["host_unit_timeout_sec"] = marker["unit_timeout_sec"]
+        if verdict != "confirmed":
+            out.update(shutdown_sec=None, shutdown_sec_unavailable=f"power cycle {verdict}")
+            return out
+        off = sel_off if sel_off is not None and sel_off >= requested else None
+        if off is None:
+            off = power_cycle_stage.read_sel_power_off(argv, requested, btime)
+        if off is None:
+            out.update(shutdown_sec=None, shutdown_sec_unavailable="no SEL power-off after the reboot request")
+            return out
+        took = round(max(0.0, off - requested), 1)
+        out["shutdown_sec"] = took
+        if isinstance(bound, (int, float)):
+            out["shutdown_within_bound"] = took < bound
+            if took >= bound - SHUTDOWN_BOUND_WARN_HEADROOM_SEC:
+                log.warning(
+                    f"power cycle: the OS shutdown took {took:.0f} s of its {bound} s fallback bound; the "
+                    f"power may have gone off before the filesystems were read-only (spec 04 I99)"
+                )
+        return out
 
     def mark_late_power_cycle(self, *, now_epoch: Optional[float] = None) -> None:
         """Run once at broker startup: if a power-cycle request marked missed brought this boot up

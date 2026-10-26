@@ -71,6 +71,20 @@ def _strip_boot_attribution(detail: str) -> str:
     return _BOOT_ATTRIBUTION_RE.sub("", detail or "").strip()
 
 
+# Spec 03 I90: a fault detail carried into a boot a broker-fired escalation brought up describes the
+# boot that is gone (an off-bus count the power cycle has since cleared): the hold reads as this
+# pending startup check, with the old detail kept inside it, so text matches on the detail still see it.
+STARTUP_PENDING_PREFIX = "startup check pending (before this boot: "
+_STARTUP_PENDING_RE = re.compile(r"^" + re.escape(STARTUP_PENDING_PREFIX) + r"(.*)\)$", re.DOTALL)
+
+
+def unwrap_startup_pending(detail: str) -> str:
+    """The detail a :data:`STARTUP_PENDING_PREFIX` wrapper carries (its boot attribution dropped), or
+    ``detail`` unchanged."""
+    m = _STARTUP_PENDING_RE.match(_strip_boot_attribution(detail))
+    return m.group(1) if m else (detail or "")
+
+
 _logger = logging.getLogger(__name__)
 
 
@@ -746,8 +760,8 @@ class ServerFsm:
                 if refuted
                 else f"broker-fired {action}"
             )
-            self._record.detail = (f"{self._record.detail} " if self._record.detail else "") + (
-                f"boot attributed to a {cause} recorded at {at}"
-            )
+            prior = unwrap_startup_pending(self._record.detail)
+            pending = f"{STARTUP_PENDING_PREFIX}{prior}) " if prior else ""
+            self._record.detail = f"{pending}boot attributed to a {cause} recorded at {at}"
         self._persist()
         return self._record.state
