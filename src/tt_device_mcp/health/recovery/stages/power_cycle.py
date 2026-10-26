@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import calendar
+import json
 import logging
 import os
 import re
@@ -16,7 +17,7 @@ import tempfile
 import time
 from typing import Callable, Optional
 
-from tt_device_mcp.health.evidence import health_event
+from tt_device_mcp.health.evidence import health_dir, health_event
 
 _logger = logging.getLogger("tt-device-mcp")
 
@@ -67,11 +68,20 @@ FALLBACK_UNIT_PREFIX = "tt-device-mcp-power-cycle-fallback"
 # hook finds it by the pid it writes and stops it before firing the cycle itself.
 FALLBACK_ARGV0 = "@" + FALLBACK_UNIT_PREFIX
 FALLBACK_FIRE_ARGV0 = "@tt-device-mcp-power-cycle-fire"
-# A clean reboot of a Galaxy host reached systemd-shutdown in 86 s (measured); past the bound the
-# fallback cycles a shutdown that hangs. Configurable within [MIN, MAX], never off.
-SHUTDOWN_BOUND_DEFAULT_SEC = 120
-SHUTDOWN_BOUND_MIN_SEC = 30
-SHUTDOWN_BOUND_MAX_SEC = 300
+# Spec 04 I99. Past the bound the fallback cycles a shutdown that hangs, so the bound must cover a
+# slow shutdown that still ends with the filesystems read-only: a clean reboot of a Galaxy host
+# reached systemd-shutdown in 86 s (measured), and one unit that hangs (an unmount, a service stop)
+# adds up to systemd's own timeout for it before systemd gives up on it and goes on (a mount unit
+# timed out at 90 s and the power went off 116 s after the request, 4 s inside a fixed 120 s bound).
+# So the bound is the clean shutdown, plus the host's longer default unit timeout (start covers
+# mount units, stop covers services), plus a margin: 210 s with systemd's 90 s defaults. Read from
+# the host at each request; a value it cannot read counts as systemd's default. Never off, never
+# past MAX, so the cycle stays bounded.
+SHUTDOWN_CLEAN_SEC = 90
+SHUTDOWN_MARGIN_SEC = 30
+SYSTEMD_DEFAULT_UNIT_TIMEOUT_SEC = 90
+SHUTDOWN_BOUND_MAX_SEC = 600
+SYSTEMD_TIMEOUT_PROPERTIES = ("DefaultTimeoutStartUSec", "DefaultTimeoutStopUSec")
 STEP_TIMEOUT_SEC = 30
 # The read-only BMC check before anything is written: a BMC that does not answer it cannot cycle, so
 # the host would only reboot warm (F2 of the I88 review).
@@ -129,15 +139,85 @@ def hook_worst_case_sec() -> int:
     )
 
 
-def shutdown_bound_sec() -> int:
-    """``TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC``: how long the clean shutdown gets before the
-    fallback cycles the host anyway. Malformed reads as the default; any value is clamped, so no
-    setting turns the bound off or stretches it past SHUTDOWN_BOUND_MAX_SEC."""
+_TIMESPAN_UNITS = {
+    "us": 1e-6,
+    "usec": 1e-6,
+    "ms": 1e-3,
+    "msec": 1e-3,
+    "s": 1,
+    "sec": 1,
+    "second": 1,
+    "seconds": 1,
+    "m": 60,
+    "min": 60,
+    "minute": 60,
+    "minutes": 60,
+    "h": 3600,
+    "hr": 3600,
+    "hour": 3600,
+    "hours": 3600,
+    "d": 86400,
+    "day": 86400,
+    "days": 86400,
+}
+_TIMESPAN_PART = re.compile(r"(\d+(?:\.\d+)?)\s*([a-z]+)")
+
+
+def parse_systemd_timespan(text: str) -> Optional[float]:
+    """Seconds in a timespan as ``systemctl show`` prints it (``1min 30s``, ``90s``, ``500ms``),
+    ``inf`` for ``infinity``, None when it does not parse."""
+    t = (text or "").strip().lower()
+    if t == "infinity":
+        return float("inf")
+    if not t:
+        return None
+    total, pos = 0.0, 0
+    for m in _TIMESPAN_PART.finditer(t):
+        if t[pos : m.start()].strip() or m.group(2) not in _TIMESPAN_UNITS:
+            return None
+        total += float(m.group(1)) * _TIMESPAN_UNITS[m.group(2)]
+        pos = m.end()
+    if pos == 0 or t[pos:].strip():
+        return None
+    return total
+
+
+def host_unit_timeout_sec() -> float:
+    """The longer of the host's systemd DefaultTimeoutStartSec and DefaultTimeoutStopSec, read-only
+    and bounded; systemd's 90 s default when the manager does not answer or a value does not parse.
+    ``inf`` when either is infinity."""
+    argv = ["systemctl", "show", "--property=" + ",".join(SYSTEMD_TIMEOUT_PROPERTIES)]
+    rc, out = _run_query(argv, PREFLIGHT_TIMEOUT_SEC)
+    seen = {}
+    for ln in (out or "").splitlines() if rc == 0 else ():
+        key, _, val = ln.partition("=")
+        if key.strip() in SYSTEMD_TIMEOUT_PROPERTIES:
+            v = parse_systemd_timespan(val)
+            if v is not None and v >= 0:
+                seen[key.strip()] = v
+    if not seen:
+        return float(SYSTEMD_DEFAULT_UNIT_TIMEOUT_SEC)
+    return max(seen.values())
+
+
+def shutdown_bound_sec(unit_timeout: Optional[float] = None) -> int:
+    """How long the clean shutdown gets before the fallback cycles the host anyway (spec 04 I99):
+    SHUTDOWN_CLEAN_SEC + the host's unit timeout (:func:`host_unit_timeout_sec` unless given) +
+    SHUTDOWN_MARGIN_SEC. ``TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC`` may only raise it; a lower or
+    malformed value is ignored. Always within SHUTDOWN_BOUND_MAX_SEC (``inf`` reads as that cap), so
+    no host and no setting turns the bound off."""
+    if unit_timeout is None:
+        unit_timeout = host_unit_timeout_sec()
+    if not unit_timeout >= 0:  # NaN
+        unit_timeout = float(SYSTEMD_DEFAULT_UNIT_TIMEOUT_SEC)
+    bound = min(SHUTDOWN_CLEAN_SEC + unit_timeout + SHUTDOWN_MARGIN_SEC, float(SHUTDOWN_BOUND_MAX_SEC))
     try:
-        v = int(float(os.environ.get("TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC", "").strip()))
-    except (ValueError, OverflowError):
-        return SHUTDOWN_BOUND_DEFAULT_SEC
-    return max(SHUTDOWN_BOUND_MIN_SEC, min(v, SHUTDOWN_BOUND_MAX_SEC))
+        v = float(os.environ.get("TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC", "").strip())
+    except ValueError:
+        v = 0.0
+    if v == v and v > bound:
+        bound = min(v, float(SHUTDOWN_BOUND_MAX_SEC))
+    return int(bound)
 
 
 def installed_shutdown_hook() -> str:
@@ -399,6 +479,60 @@ def _write_request(argv: list, reason: str, timeout: float) -> None:
     os.replace(tmp, REQUEST_FILE)
 
 
+# Spec 04 I99: when the reboot was asked, kept across it so the next boot can record how long the
+# shutdown took (the BMC's power-off minus this) beside the bound it had.
+POWER_CYCLE_OS_FIRST_FILE = "power_cycle_os_first.json"
+
+
+def _json_seconds(v: Optional[float]):
+    """Seconds as JSON can hold them: infinity as the string "infinity"."""
+    if v is None:
+        return None
+    return "infinity" if v == float("inf") else round(v, 1)
+
+
+def _write_os_first_marker(requested: float, bound: Optional[int], unit_timeout: Optional[float], unit: str) -> None:
+    """Best effort: a marker that cannot be written only loses the shutdown's duration."""
+    path = health_dir() / POWER_CYCLE_OS_FIRST_FILE
+    row = {
+        "requested_epoch": requested,
+        "bound_sec": bound,
+        "unit_timeout_sec": _json_seconds(unit_timeout),
+        "unit": unit,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError as e:
+        _logger.warning("power-cycle reboot-request marker not written, its shutdown time is lost: %s", e)
+
+
+def take_os_first_marker() -> Optional[dict]:
+    """The last OS-first reboot request's marker, removed as it is read; None when there is none or it
+    does not parse."""
+    path = health_dir() / POWER_CYCLE_OS_FIRST_FILE
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    try:
+        row = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(row, dict) or not isinstance(row.get("requested_epoch"), (int, float)):
+        return None
+    return row
+
+
 def _drop_request() -> None:
     for p in (REQUEST_FILE, REQUEST_FILE + ".tmp", fallback_pid_file()):
         try:
@@ -449,7 +583,11 @@ def fire_os_first(argv: list, reason: str, timeout: float = DEFAULT_POWER_CYCLE_
             rc, out = _run_step(probe, PREFLIGHT_TIMEOUT_SEC)
             if rc != 0:
                 why = f"BMC did not answer the read-only pre-flight {' '.join(probe[-2:])} (rc {rc}): {out}"
-    bound = shutdown_bound_sec()
+    unit_timeout: Optional[float] = None
+    bound: Optional[int] = None
+    if not why:
+        unit_timeout = host_unit_timeout_sec()
+        bound = shutdown_bound_sec(unit_timeout)
     unit = f"{FALLBACK_UNIT_PREFIX}-{int(time.time())}"
     started = False
     if not why:
@@ -466,7 +604,16 @@ def fire_os_first(argv: list, reason: str, timeout: float = DEFAULT_POWER_CYCLE_
     if not why:
         rc, out = _run_step(list(REBOOT_ARGV))
         if rc == 0:
-            health_event("power_cycle_os_first", phase="reboot_requested", reason=reason, bound_sec=bound, unit=unit)
+            requested = time.time()
+            _write_os_first_marker(requested, bound, unit_timeout, unit)
+            health_event(
+                "power_cycle_os_first",
+                phase="reboot_requested",
+                reason=reason,
+                bound_sec=bound,
+                unit_timeout_sec=_json_seconds(unit_timeout),
+                unit=unit,
+            )
             _logger.warning(
                 "POWER CYCLE (OS first): reboot requested; the shutdown hook cycles the host once the "
                 "filesystems are read-only, the fallback unit %s at %ss if the shutdown hangs",

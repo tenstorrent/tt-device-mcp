@@ -114,7 +114,14 @@ from tt_device_mcp.device_holders import (
     zombie_info,
 )
 from tt_device_mcp.exit_witness import ExitWitness
-from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState, _episode_elapsed_sec, add_close_listener
+from tt_device_mcp.fsm import (
+    FsmRecord,
+    ServerFsm,
+    ServerState,
+    _episode_elapsed_sec,
+    add_close_listener,
+    unwrap_startup_pending,
+)
 from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 I72)
     _HOST_ESCALATION_ACTION,
     BELOW_FLOOR,
@@ -1435,7 +1442,7 @@ def _hold_is_tenant_held() -> bool:
     """The open episode is a foreign process holding the device (its own why, or a held door the
     holder scan reworded), not a device fault."""
     record = fsm.record
-    return record.why == "foreign_holder" or record.detail.startswith(FOREIGN_HOLDER_NOTE)
+    return record.why == "foreign_holder" or unwrap_startup_pending(record.detail).startswith(FOREIGN_HOLDER_NOTE)
 
 
 # Whether this process's next hold may inherit the clock on disk: only while the device has not
