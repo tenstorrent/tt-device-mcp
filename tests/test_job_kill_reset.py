@@ -768,6 +768,8 @@ async def test_an_off_bus_clock_read_is_not_a_busy_clock(runner_env, monkeypatch
     job, runner = await _start("938", "exit 1")
     try:
         assert await _until(lambda: _runner_done(job))
+        if want_debt:
+            assert await _until(lambda: "aiclk_busy_after_job" in runner_env["events"])
     finally:
         await _stop(runner)
     assert job.status is srv.JobStatus.FAILED and job.exit_code == 1
