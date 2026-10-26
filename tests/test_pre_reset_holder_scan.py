@@ -912,3 +912,104 @@ async def test_a_scan_that_raises_lets_the_reset_proceed(monkeypatch):
     rc, _ = await srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-r"], lambda m: None)
     assert rc == 0 and "reset" in order
     assert [f["outcome"] for k, f in events if k == "pre_reset_holder_scan"] == ["scan_error"]
+
+
+@pytest.mark.asyncio
+async def test_each_holder_is_identified_before_it_is_signalled(monkeypatch):
+    """Logging only: the scan reads each holder's identity when it finds it, before any signal, so
+    a reader it kills is still named afterwards. The verdict and the signals are unchanged."""
+    order: list = []
+    box = _Box(monkeypatch, [TENANT, READER], tenants=[TENANT], order=order)
+    monkeypatch.setattr(
+        prs, "holder_identity", lambda pid: order.append(f"identify:{pid}") or {"pid": pid, "status": "live"}
+    )
+    result = await box.run(tenants_block=False)
+    assert [r["pid"] for r in result.identities] == [TENANT.pid, READER.pid]
+    assert order.index(f"identify:{READER.pid}") < order.index(f"kill:{READER.pid}:TERM")
+    assert box.sent == {READER.pid: ["TERM"]} and result.outcome == "killed"
+
+
+@pytest.mark.asyncio
+async def test_a_stuck_identity_read_delays_neither_the_scan_nor_its_signals(monkeypatch):
+    """A holder stuck in the kernel can block its /proc read: the scan reads identities off the loop
+    under one fixed bound, records that holder unread and goes on. The verdict, the holders found and
+    the signals are the ones a read that answers at once gives, and the loop keeps running."""
+    import threading
+
+    from tt_device_mcp import holder_identity as hi
+
+    monkeypatch.setattr(hi, "HOLDER_IDENTITY_READ_TIMEOUT_SEC", 0.3)
+    live = {}
+    for stuck_read in (False, True):
+        release = threading.Event()
+
+        def read(pid, stuck_read=stuck_read, release=release):
+            if stuck_read and pid == READER.pid:
+                release.wait()
+            return {"pid": pid, "status": "live"}
+
+        monkeypatch.setattr(prs, "holder_identity", read)
+        box = _Box(monkeypatch, [TENANT, READER], tenants=[TENANT])
+        ticks = []
+
+        async def heartbeat():
+            while True:
+                ticks.append(1)
+                await asyncio.sleep(0.02)
+
+        beat = asyncio.ensure_future(heartbeat())
+        try:
+            t0 = time.monotonic()
+            result = await box.run(tenants_block=False)
+            took = time.monotonic() - t0
+        finally:
+            beat.cancel()
+            release.set()
+            for _ in range(200):  # the released read ends before the next one reads this pid
+                if READER.pid not in hi._reads_in_flight:
+                    break
+                time.sleep(0.005)
+        live[stuck_read] = (result.outcome, result.found, result.tenants, box.sent, result.refusal())
+        if stuck_read:
+            assert took < 0.3 + 0.5, took
+            assert len(ticks) >= 5, "the event loop stalled behind the identity read"
+            assert result.identities == [
+                {"pid": TENANT.pid, "status": "live"},
+                {"pid": READER.pid, "status": "unread", "error": "timeout"},
+            ]
+    assert live[True] == live[False]
+    assert live[True][0] == "killed" and live[True][3] == {READER.pid: ["TERM"]}
+
+
+@pytest.mark.asyncio
+async def test_a_holder_gone_before_its_identity_is_read_changes_nothing(monkeypatch, tmp_path):
+    from tt_device_mcp import holder_identity
+
+    monkeypatch.setattr(holder_identity, "PROC_DIR", str(tmp_path))  # no /proc entry: exited after the scan
+    box = _Box(monkeypatch, [READER])
+    result = await box.run(tenants_block=True)
+    assert result.identities == [{"pid": READER.pid, "status": "gone"}]
+    assert box.sent == {READER.pid: ["TERM"]} and result.outcome == "killed"
+
+
+@pytest.mark.asyncio
+async def test_the_scan_event_and_log_carry_the_holder_identities(monkeypatch):
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    row = {"pid": 4101, "status": "live", "ppid": 1, "user": "u", "cmdline": "python3 x.py"}
+    monkeypatch.setattr(srv, "clear_device_readers", _scan_returning(prs.PreResetScan(found=[{}], identities=[row])))
+    lines = []
+    monkeypatch.setattr(
+        srv, "logger", type("L", (), {"info": lambda s, m: lines.append(m), "warning": lambda s, m: None})()
+    )
+    assert await srv._pre_reset_holder_scan(["tt-smi", "-r"], "[broker]ladder", lambda m: None) == ""
+    (scan,) = [f for k, f in events if k == "pre_reset_holder_scan"]
+    assert scan["identities"] == [row]
+    assert any("pid 4101" in m and "cmdline='python3 x.py'" in m for m in lines), lines
+
+
+def _scan_returning(result):
+    async def fake(**kw):
+        return result
+
+    return fake

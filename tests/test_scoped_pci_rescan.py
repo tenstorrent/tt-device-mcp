@@ -300,8 +300,9 @@ async def test_the_10_min_ladders_rescan_is_scoped_and_a_failed_one_still_reache
     monkeypatch, tmp_path, clear_job_state, tt_port
 ):
     """The bound ladder (goal 10) with the real rescan: it writes only the Tenstorrent root port, or,
-    with none to rescan, fails that rung and still climbs to the mesh reset, the full check and the
-    power cycle. A failed check never lifts the hold."""
+    with none to rescan, fails that rung and still climbs to the mesh reset, the full check, the
+    last-chance sweep (the failed mesh reset again, its full check) and the power cycle. A failed check
+    never lifts the hold."""
     order, _events, counters = _rig(monkeypatch, tmp_path)
     fake = FakeSysfs(tmp_path / "root", tt_port=tt_port)
     monkeypatch.setattr(pcie_guard, "SYS_ROOT", fake.root)
@@ -309,7 +310,7 @@ async def test_the_10_min_ladders_rescan_is_scoped_and_a_failed_one_still_reache
     monkeypatch.setattr(galaxy, "_pci_rescan", REAL_GALAXY_RESCAN)
     PCI_WRITER.reset_for_tests()
     assert await _bound_ladder() == OUTCOME_TERMINAL
-    assert order == ["mesh reset", "full check", "power cycle"]
+    assert order == ["mesh reset", "full check", "mesh reset", "full check", "power cycle"]
     assert fake.writes() == (SCOPED if tt_port else {})
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "a failed check never lifts"
     assert not PCI_WRITER.latched

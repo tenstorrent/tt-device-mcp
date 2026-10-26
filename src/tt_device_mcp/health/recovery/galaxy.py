@@ -840,6 +840,17 @@ def _mesh_reset_before_host_rung_deadline_sec() -> float:
     return _stuck_hold_ceiling_sec() - MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC - MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC
 
 
+def _mesh_reset_before_host_rung_needs_sec() -> float:
+    """Spec 04 I97: the hold time the reset and its full check need before the deadline: a reset that
+    gives up at its driver wait, or the reset, the settle and the check."""
+    return max(
+        MESH_RESET_BEFORE_HOST_RUNG_GAVE_UP_SEC,
+        MESH_RESET_BEFORE_HOST_RUNG_SEC
+        + MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC
+        + MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC,
+    )
+
+
 TRAY_DOWN_ONSET = "TRAY_DOWN"
 
 
@@ -1801,17 +1812,20 @@ class GalaxyRecovery(Recovery):
         health_event("tray_down_prelude", rescan=rescan, off=len(off), trays=trays, capture=capture)
         return False
 
-    async def _sbr(self, log) -> bool:
+    async def _sbr(self, log, *, sweep: bool = False) -> bool:
         """The SBR rung (:meth:`_recover_isolated_chips`), recording in this hold's record the chips a
         bridge write reached and that are still off the bus (spec 04 I98), and those with no bridge to
         write to. A chip the rung declined (gated, no privilege, PCI wedged) is not recorded; one reset
         and still off is, whatever reason the rung gave it. A chip that already had its SBR round this
         hold gets no bridge write; when every target had one, none runs. Either way a spent chip still
         off the bus keeps the rung not recovered, so the caller goes on to the next rung (the mesh
-        reset or the power cycle request, as the ladder orders them)."""
+        reset or the power cycle request, as the ladder orders them).
+
+        ``sweep``: the last-chance sweep right before the power cycle (spec 04 I58). Every target gets
+        its bridge write there, whatever rounds it had earlier in this hold."""
         targets = {str(c) for c in set(self.deps.isolated_chips()) | set(removed_chip_ids())}
         since = self.deps.device_hold_episode_since() or ""
-        spent = sorted(targets & self._sbr_done(since), key=int)
+        spent = [] if sweep else sorted(targets & self._sbr_done(since), key=int)
         # Spec 04 I69: a spent chip no bridge write reached was never reset; a removed one still
         # withholds the rescan, though it gets no second round either (I98).
         unreset = frozenset(spent) & self._sbr_unreset(since)
@@ -2308,7 +2322,7 @@ class GalaxyRecovery(Recovery):
             # actually isolated, because a mass drop must never be nibbled at with per-chip bridge
             # resets — that is the galaxy reset's case, not the gentle rung's.
             if do_sbr:
-                await self._sbr(log)
+                await self._sbr(log, sweep=True)
             if not mesh_reset:
                 return True
             # 2) mesh-wide reset, no verify (the ONE verify belongs to the caller). Lazy import:
@@ -2396,24 +2410,10 @@ class GalaxyRecovery(Recovery):
                 expected=expected,
             )
             return False
-        if (
-            offbus_chips
-            and self.mechanism.rung_failed_unchanged("", "mesh_reset", offbus_chips)
-            and not await asyncio.to_thread(self.mechanism.scope_active)
-        ):
-            # Spec 04 I58: this boot's mesh reset already ran and failed on exactly these chips, so the
-            # sweep would end in the same reset again, which measures nothing new. Climb.
-            log(
-                f"last chance before the host rung{where}: the mesh reset already failed on these chips this boot — skipping the sweep"
-            )
-            health_event(
-                "last_chance_sweep_skipped",
-                context=context or gate_phase,
-                reason="mesh_reset_failed_unchanged",
-                off_bus=len(offbus_chips),
-                expected=expected,
-            )
-            return await self._owed_sbr_before_host_rung(expected, log, gate_phase, where)
+        # Spec 04 I38/I58: a mesh reset that already failed on exactly these chips this boot does not skip
+        # the sweep. The full ladder runs right before every power cycle the broker requests: the readers
+        # are stopped first, and the repeated mesh reset and its full check run under a deadline (I100).
+        repeat_failed = bool(offbus_chips) and self.mechanism.rung_failed_unchanged("", "mesh_reset", offbus_chips)
         sweep_phase = self._sweep_phase()
         if (
             sweep_phase is not None
@@ -2435,10 +2435,15 @@ class GalaxyRecovery(Recovery):
                 expected=expected,
             )
             return await self._owed_sbr_before_host_rung(expected, log, gate_phase, where)
+        # Spec 04 I100: the repeated mesh reset and its full check run at once, under the I97 deadline or,
+        # when that is too close, under one taken from the repeat's own start: never an idle wait for the
+        # 10-min bound, and the power cycle request stays bounded.
+        bounded = repeat_failed and self._repeat_runs_under_deadline(expected)
         trays = _affected_trays(offbus_chips, expected, tray_map) or []
         placement = _offbus_placement(offbus_chips, self._chip_buses_now(), tray_map)
         swept = False
         mesh_reset_left = False
+        bounded_left = False  # the repeated mesh reset is left to the I97 deadline-bounded path
         if await asyncio.to_thread(self.mechanism.scope_active):
             log(f"last chance before the host rung{where}: a reset is already cycling in its own scope — adopting it")
         else:
@@ -2461,6 +2466,8 @@ class GalaxyRecovery(Recovery):
                     f"(SBR -> bus re-probe -> mesh reset) — nothing to lose before the "
                     f"power cycle; off the bus now: {_placement_text(placement)}"
                 )
+                if repeat_failed:
+                    await self._stop_readers_before_repeat_mesh_reset(offbus_chips, log, context or gate_phase)
                 if fault_class is None:
                     await self._isolate_dead_link_for_sweep(offbus_chips, expected, log, context or gate_phase)
                 if self.deps.isolated_chips() or removed_chip_ids():
@@ -2478,16 +2485,28 @@ class GalaxyRecovery(Recovery):
                         health_event(
                             "last_chance_sweep_bus_whole", context=context or gate_phase, after="sbr", expected=expected
                         )
+                    elif swept and bounded:
+                        bounded_left = True
                     elif swept:
                         swept = await self._issue_all_resets_back_to_back(trays, expected, log, do_sbr=False)
+                elif bounded:
+                    bounded_left = True
                 else:
                     swept = await self._issue_all_resets_back_to_back(trays, expected, log, do_sbr=False)
+        if bounded_left:
+            return await self._repeat_mesh_reset_before_host_rung(
+                expected, log, gate_phase, where, sweep_phase, None, fabric_77_unverified
+            )
         # The bus is already whole: no re-enumeration left to settle for (the bridge-reset rung verifies
         # at once too).
         settle = 0 if mesh_reset_left else _settle_before_host_rung_sec()
         healthy, evidence = await self._settle_and_verify_sweep(
             expected, log, gate_phase, settle, context=context, fabric_77_unverified=fabric_77_unverified
         )
+        if not healthy and mesh_reset_left and bounded:
+            return await self._repeat_mesh_reset_before_host_rung(
+                expected, log, gate_phase, where, sweep_phase, evidence, fabric_77_unverified
+            )
         if not healthy and mesh_reset_left:
             # The bus probe alone never lifts (I86): the full check failed, so the remaining rung runs and
             # the caller climbs to the power cycle if the mesh still does not verify.
@@ -2530,6 +2549,61 @@ class GalaxyRecovery(Recovery):
         log(f"the mesh verified after the {via} — no power cycle needed")
         health_event("gate", phase=gate_phase, healthy=True, recovered_via=via, evidence=evidence)
         return True
+
+    async def _repeat_mesh_reset_before_host_rung(
+        self, expected: int, log, gate_phase: str, where: str, sweep_phase, evidence, fabric_77_unverified: bool
+    ) -> Optional[bool]:
+        """Spec 04 I38/I100: the sweep's mesh reset repeats one that already failed on these chips. It runs
+        as the I97 mesh reset, the check cut at its deadline (:meth:`_whole_mesh_reset_before_host_rung`).
+        The sweep has run its SBR. True only when the check with fabric passed and the hold lifted. None
+        when the reset did not run (a tenant, a reset cycling in its scope, a refused reset): the full
+        ladder has not run, so the sweep is not spent, and the caller holds and requests no power cycle
+        this pass (I22). Otherwise the sweep is spent and the power cycle follows."""
+        healed = await self._whole_mesh_reset_before_host_rung(
+            expected, log, gate_phase, evidence, repeat=True, fabric_77_unverified=fabric_77_unverified
+        )
+        pcie_guard.end_offbus_reset()  # the SBR's note, when the reset did not run
+        if healed:
+            return True
+        if healed is None:
+            log(f"the repeated mesh reset did not run{where} — holding; no power cycle this pass")
+            health_event("host_rung_held", context=gate_phase, reason="repeated mesh reset did not run")
+            return None
+        self.mechanism.sweep_spent = sweep_phase
+        return await self._owed_sbr_before_host_rung(expected, log, gate_phase, where)
+
+    def _repeat_runs_under_deadline(self, expected: int) -> bool:
+        """Spec 04 I100: the sweep's repeated mesh reset runs as the I97 mesh reset, under its deadline: a
+        Galaxy ``-glx_reset`` on more than one chip with the hold clock known. Otherwise the sweep fires
+        it as any other mesh reset."""
+        argv = self.reset_argv(list(range(expected)))
+        if expected <= 1 or "-glx_reset" not in argv or not ipmi_guard.is_mesh_reset(argv):
+            return False
+        return _hold_age_sec(self.deps.device_hold_episode_since() or "") is not None
+
+    async def _stop_readers_before_repeat_mesh_reset(self, offbus_chips: set, log, context: str) -> list:
+        """Spec 04 I58: the sweep is about to repeat a mesh reset that already failed on exactly these
+        chips. A second mesh reset after a failed one once took a Galaxy host down; the broker's own
+        readers (fabric pass, tt-smi snapshot, AICLK ceiling) are ended first, so none is mid-read on a
+        chip the reset re-powers. The sweep's SBR then runs before its mesh reset (I86). Never raises."""
+        reason = "the last-chance sweep repeats a mesh reset that failed on these chips"
+        try:
+            stopped = await self.monitor.stop_check_readers(reason, MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC)
+        except Exception as exc:  # noqa: BLE001 - the ladder runs anyway; the reset quiesces its own pollers
+            log(f"could not stop the check readers before the repeated mesh reset: {exc!r}")
+            stopped = []
+        log(
+            f"last chance before the host rung: this boot's mesh reset already failed on chip(s) "
+            f"{sorted(offbus_chips, key=lambda c: (len(str(c)), str(c)))} — the full ladder runs once more before the power "
+            f"cycle, readers stopped first ({len(stopped)} ended)"
+        )
+        health_event(
+            "last_chance_sweep_repeats_failed_reset",
+            context=context,
+            off_bus=len(offbus_chips),
+            stopped_pids=stopped,
+        )
+        return stopped
 
     async def _isolate_dead_link_for_sweep(self, offbus_chips: set, expected: int, log, context: str) -> list:
         """Spec 04 I89 in the last-chance sweep: below the galaxy floor, an off-bus chip whose node is
@@ -3441,7 +3515,9 @@ class GalaxyRecovery(Recovery):
     # The hold episode whose spec 04 I97 mesh reset has run: once per episode.
     _whole_mesh_reset_spent: Optional[str] = None
 
-    async def _whole_mesh_reset_before_host_rung(self, expected: int, log, phase: str, evidence) -> bool:
+    async def _whole_mesh_reset_before_host_rung(
+        self, expected: int, log, phase: str, evidence, *, repeat: bool = False, fabric_77_unverified: bool = False
+    ) -> Optional[bool]:
         """Spec 04 I97: the SBR before the host rung brought every chip back, but the full check failed
         because the other chips are ARC-not-ready (a mesh reset that tt-smi aborted at its driver wait
         leaves them so). One mesh reset of the now-whole mesh and the full check with fabric run before
@@ -3454,6 +3530,11 @@ class GalaxyRecovery(Recovery):
         (:func:`_mesh_reset_before_host_rung_deadline_sec`); every expected chip on
         the bus, none isolated or removed; the heartbeat still reads at least one chip ARC-not-ready,
         or the check's heartbeat probe failed; no reset cycling in its scope; and no tenant.
+        ``repeat``: the last-chance sweep's mesh reset, repeating one that failed on these chips (spec 04
+        I38, I100). It runs whatever the bus reads and whether or not this episode's I97 reset ran (the
+        sweep's own record spends it, I87). Its deadline is the I97 one or, when that is too close, the
+        hold's age at its start plus the reset's and check's allowance: it never waits for the 10-min
+        bound. A tenant, a reset cycling in its scope or a refused reset returns None (it did not run).
 
         After the reset, the full check runs only when the reset did not give up at its driver wait and
         the check's allowance is still left before the deadline; otherwise the caller power-cycles at
@@ -3463,24 +3544,21 @@ class GalaxyRecovery(Recovery):
         hold_since = self.deps.device_hold_episode_since() or ""
         age = _hold_age_sec(hold_since)
 
-        def skip(reason: str) -> bool:
+        def skip(reason: str) -> Optional[bool]:
             log(f"no mesh reset of the whole mesh before the host rung: {reason}")
-            health_event("whole_mesh_reset_before_host_rung", phase=phase, fired=False, reason=reason)
-            return False
+            health_event("whole_mesh_reset_before_host_rung", phase=phase, fired=False, reason=reason, repeat=repeat)
+            return None if repeat else False
 
         if expected <= 1 or "-glx_reset" not in argv or not ipmi_guard.is_mesh_reset(argv):
             return False
         if age is None:
             return skip("no hold clock")
-        if self._whole_mesh_reset_spent == hold_since:
+        if self._whole_mesh_reset_spent == hold_since and not repeat:
             return skip("already ran in this hold")
         deadline = _mesh_reset_before_host_rung_deadline_sec()
-        needs = max(
-            MESH_RESET_BEFORE_HOST_RUNG_GAVE_UP_SEC,
-            MESH_RESET_BEFORE_HOST_RUNG_SEC
-            + MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC
-            + MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC,
-        )
+        needs = _mesh_reset_before_host_rung_needs_sec()
+        if repeat:
+            deadline = max(deadline, age + needs)
         if age + needs > deadline:
             return skip(
                 f"the hold is {int(age)}s old; the reset and its check would not end by the {deadline:.0f}s deadline"
@@ -3494,31 +3572,44 @@ class GalaxyRecovery(Recovery):
                 or removed_chip_ids()
             )
         except Exception as exc:  # noqa: BLE001 - an unreadable bus is not a whole one
-            return skip(f"could not read the bus: {exc!r}")
-        if not whole:
+            if not repeat:
+                return skip(f"could not read the bus: {exc!r}")
+            beats, whole = {}, False
+        if not whole and not repeat:
             return skip("a chip is still off the bus")
         not_ready = sorted(arc_not_ready_chips(beats or {}), key=int)
         hb = (evidence or {}).get("heartbeat") if isinstance(evidence, Mapping) else None
         hb_failed = isinstance(hb, Mapping) and hb.get("verdict") not in (None, "healthy")
-        if not not_ready and not hb_failed:
+        if not not_ready and not hb_failed and not repeat:
             return skip("the check did not fail on ARC-not-ready or the heartbeat")
         if await asyncio.to_thread(self.mechanism.scope_active):
             return skip("a reset is cycling in its own scope")
         if self._tenant_active(await asyncio.to_thread(self.deps.enumerate_device_holders)):
             return skip("a tenant holds the device or the scan is unreadable")
         self._whole_mesh_reset_spent = hold_since
-        log(
-            f"every chip is on the bus but {len(not_ready)} read ARC-not-ready — one mesh reset of the whole "
-            "mesh and the full check with fabric run before the host rung"
-        )
+        if repeat:
+            log(
+                "last-chance sweep: the mesh reset that failed on these chips runs once more, then the full "
+                "check with fabric, before the host rung"
+            )
+        else:
+            log(
+                f"every chip is on the bus but {len(not_ready)} read ARC-not-ready — one mesh reset of the "
+                "whole mesh and the full check with fabric run before the host rung"
+            )
         health_event(
             "whole_mesh_reset_before_host_rung",
             phase=phase,
             fired=True,
             arc_not_ready=not_ready,
             hold_age_sec=round(age, 1),
+            deadline_sec=round(deadline, 1),
+            repeat=repeat,
         )
         if not await self._issue_all_resets_back_to_back([], expected, log, do_sbr=False):
+            if repeat:
+                log("the repeated mesh reset before the host rung was refused — it did not run")
+                return None
             log("the mesh reset before the host rung was refused — the power cycle decides")
             return False
         left = deadline - (_hold_age_sec(hold_since) or age)
@@ -3539,7 +3630,7 @@ class GalaxyRecovery(Recovery):
                 phase,
                 MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC,
                 context="mesh reset before the host rung",
-                fabric_77_unverified=False,
+                fabric_77_unverified=fabric_77_unverified,
             )
         )
         await asyncio.wait({check}, timeout=left)
@@ -3943,38 +4034,18 @@ class GalaxyRecovery(Recovery):
                 f"{expected} chip(s) off the bus. Climbing to the power cycle; no further mesh reset this hold."
             )
         episode_regressed = self.mechanism.reset_regressed_in(hold_since)
-        # This episode's mesh reset already ran and failed on exactly the chips off the bus now (I36).
-        # Every rung below the host pair has had its one try and the mesh reset may not run again on
-        # this set, so neither the ceiling wait nor the last-chance sweep (whose last step is that same
-        # mesh reset) has anything left to try: the host rung fires now (spec 04 I38). A second mesh
-        # reset after an rc 1 on the same chips killed one Galaxy host.
+        # This episode's mesh reset already ran and failed on exactly the chips off the bus now (I36):
+        # no ceiling wait. The last-chance sweep (the full ladder: SBR, mesh reset, settle, full check
+        # with fabric) still runs right before the host rung (spec 04 I38); classes A and C skip it there.
         ids_climb = await self._offbus_ids_now(expected)
         failed_unchanged = off_bus > 0 and self.mechanism.rung_failed_unchanged(hold_since, "mesh_reset", ids_climb)
-        # Spec 04 I87: the sweep's mesh reset is spent on these chips, but its SBR is not when this hold
-        # has not SBR'd them; it still runs before the host rung. Below the floor only, and never for a
-        # whole tray (A) or all chips off (C): a mass drop goes straight to the power cycle, never
-        # nibbled at with per-chip bridge resets.
-        floor_now = _galaxy_reset_min_dead_chips(expected)
-        sbr_owed = (
-            self._sbr_owed(hold_since, ids_climb, beats)
-            if failed_unchanged
-            and ids_climb
-            and floor_now is not None
-            and 0 < off_bus < floor_now
-            and self._power_cycle_direct_class_now(ids_climb, expected, self._tray_map_now(), log) is None
-            else []
-        )
         hold_age = _hold_age_sec(hold_since)
         reset_spent = self.mechanism.mesh_reset_spent(hold_since)
         if failed_unchanged and hold_age is not None and hold_age < _stuck_hold_ceiling_sec():
             log(
                 f"{off_bus}/{expected} off-bus and this hold's mesh reset already failed on exactly these "
-                + (
-                    f"chips — no SBR has run on chip(s) {sbr_owed} this hold; it runs before the host rung; "
-                    if sbr_owed
-                    else "chips — every rung below the host pair has run once; "
-                )
-                + f"not waiting for the {_stuck_hold_ceiling_sec()}s ladder end"
+                f"chips — not waiting for the {_stuck_hold_ceiling_sec()}s ladder end; the full ladder runs "
+                "once more right before the host rung"
             )
             health_event(
                 "host_rung_not_deferred",
@@ -4105,25 +4176,10 @@ class GalaxyRecovery(Recovery):
         )
         # Last chance: every reset type once more, back-to-back, then one settle and one verify. This
         # is the road MOST real power cycles took (the idle/stuck-hold escalation), and before ladder-v2
-        # it climbed to the host rung without ever re-trying the cheaper rungs. Skipped when the caller
-        # already swept this episode (_sweep_after_unverified_reset).
-        if failed_unchanged and not swept:
-            log(
-                "last-chance sweep: its mesh reset already failed on these chips in this hold — skipped"
-                + (f"; its SBR has not run on chip(s) {sbr_owed} this hold and runs now" if sbr_owed else "")
-            )
-            health_event(
-                "reset_rung_skipped_failed_unchanged",
-                rung="last_chance_sweep",
-                held_since=hold_since,
-                off_bus=off_bus,
-                sbr_owed=sbr_owed,
-            )
-            if sbr_owed and await self._below_floor_bound_rungs(
-                set(ids_climb or ()), expected, log, context="last-chance sweep SBR", before_host_rung=True
-            ):
-                return HOST_RUNG_DEFERRED
-        elif not swept and (
+        # it climbed to the host rung without ever re-trying the cheaper rungs. Skipped only when the
+        # caller already swept this episode (_sweep_after_unverified_reset). A mesh reset that already
+        # failed on these chips does not skip it (spec 04 I38): the sweep runs it again, readers stopped.
+        if not swept and (
             await self._settle_and_verify_before_host_rung(
                 expected, log, "idle-escalation", context=f"idle escalation, {off_bus}/{expected} off the bus"
             )
