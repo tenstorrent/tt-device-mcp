@@ -17,7 +17,8 @@ import pytest
 from tests import test_classac_power_cycle_direct as _direct
 from tests.conftest import patch_health_event
 from tests.test_classac_power_cycle_direct import EXPECTED, _beats_without, _gate, _off
-from tests.test_pre_reset_holder_scan import READER, _Box
+from tests.test_pre_reset_holder_scan import READER, _Box, _gap, _scans
+from tt_device_mcp import device_holders
 from tt_device_mcp import pre_reset_scan as prs
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
@@ -231,3 +232,82 @@ async def test_the_pre_cycle_scan_still_refuses_a_job_holder_through_the_broker(
     box.sent.clear()
     assert f"pid {FOREIGN_FD.pid}" in await scan(), "outside a pre-cycle run the unscoped holder still refuses"
     assert box.sent == {}
+
+
+GAP = 4303  # a pid the driver names whose fd table the scan cannot read
+
+
+def _gap_seams(monkeypatch, *, scoped=False):
+    monkeypatch.setattr(device_holders, "_proc_uid", lambda pid: 1000)
+    monkeypatch.setattr(device_holders, "in_broker_scope", lambda pid, *a: scoped)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case, outcome",
+    [("visible", "killed"), ("no-proc", "scan_incomplete"), ("scoped", "tenant_blocked"), ("d-state", "unkillable")],
+)
+async def test_a_pre_cycle_reset_runs_past_a_visible_gap_but_not_an_unseen_scoped_or_stuck_one(monkeypatch, case, outcome):
+    """Spec 04 I103: in a pre-cycle run, a gap pid /proc shows here outside every broker scope is run
+    past, unsignalled, and recorded; one with no /proc entry here (another pid namespace) still refuses,
+    one inside a broker scope is a tenant, one stuck in the kernel keeps the I21 refusal."""
+    _gap_seams(monkeypatch, scoped=case == "scoped")
+    box = _Box(monkeypatch, [], stuck=[GAP] if case == "d-state" else [])
+    _scans(monkeypatch, _gap(GAP, READER))
+    starts = {GAP: None} if case == "no-proc" else {}
+    result = await box.run(
+        tenants_block=True, foreign_yield=True, rescan_settle_sec=0, read_starttime=lambda pid: starts.get(pid, "100")
+    )
+    assert result.outcome == outcome
+    if case == "visible":
+        assert not result.refusal() and box.sent == {READER.pid: ["TERM"]}
+        assert result.gaps == [] and len(result.gaps_passed) == 1 and str(GAP) in result.gaps_passed[0]
+    else:
+        assert str(GAP) in result.refusal() and box.sent == {} and result.gaps_passed == []
+
+
+@pytest.mark.asyncio
+async def test_a_visible_gap_still_refuses_outside_a_pre_cycle_run(monkeypatch):
+    _gap_seams(monkeypatch)
+    box = _Box(monkeypatch, [])
+    _scans(monkeypatch, _gap(GAP, READER))
+    result = await box.run(tenants_block=True, rescan_settle_sec=0)
+    assert result.outcome == "scan_incomplete" and box.sent == {} and result.gaps_passed == []
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_scan_at_the_bound_runs_the_ladder_and_sweep_resets_then_the_cycle(rig, monkeypatch):
+    """Spec 04 I103 at the 10-min bound: a holder scan left incomplete by a pid /proc shows here
+    outside every broker scope costs neither the ladder's reset nor the sweep's; the full check still
+    fails, so the cycle fires and nothing is released. The pre_reset_holder_scan event names the gap."""
+    events: list = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    monkeypatch.setattr(srv, "device_hold_episode_since", (datetime.now() - timedelta(minutes=10)).isoformat())
+    _holders(rig, monkeypatch)
+    _gap_seams(monkeypatch)
+    box = _Box(monkeypatch, [])
+    _scans(monkeypatch, _gap(GAP))
+    _scanned_resets(rig, monkeypatch, box)
+    rig["beats"] = _beats_without(_off(rig["map"], {3: 1}))
+    off = sorted(set(map(str, range(EXPECTED))) - set(rig["beats"]), key=int)
+    await rig["g"].escalate("offbus-forced", off, EXPECTED, lambda m: None, bound=True)
+    assert rig["order"] == ["rescan", "glx_reset", "sweep", "power_cycle"], "no tenant: the rescan rung runs first"
+    assert [name for name, refused in rig["refusals"] if refused] == []
+    assert box.sent == {} and "released" not in rig["order"]
+    scans = [f for kind, f in events if kind == "pre_reset_holder_scan"]
+    assert len(scans) == 2 and all(str(GAP) in " ".join(f["gaps_passed"]) for f in scans)
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_scan_outside_a_pre_cycle_run_still_refuses_and_the_sweep_runs(rig, monkeypatch):
+    monkeypatch.setattr(srv, "device_hold_episode_since", (datetime.now() - timedelta(minutes=10)).isoformat())
+    _holders(rig, monkeypatch)
+    _gap_seams(monkeypatch)
+    box = _Box(monkeypatch, [])
+    _scans(monkeypatch, _gap(GAP))
+    _scanned_resets(rig, monkeypatch, box)
+    rig["beats"] = _beats_without(_off(rig["map"], {3: 1}))
+    await _gate(rig, galaxy.STAGE_SMI_RESET)
+    assert rig["order"] == ["glx_reset:refused"]
+    await _gate(rig, galaxy.STAGE_POWER_CYCLE)
+    assert rig["order"] == ["glx_reset:refused", "sweep", "power_cycle"]

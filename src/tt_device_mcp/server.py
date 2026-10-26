@@ -11265,6 +11265,7 @@ async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
         detach_timed_out=result.detach_timed_out,
         reset_in_flight=result.reset_in_flight or None,
         gaps=result.gaps,
+        gaps_passed=result.gaps_passed or None,
         zombies=result.zombies,
         scan_complete=result.scan_complete,
         source=result.source,
@@ -11274,6 +11275,11 @@ async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
     if logger:
         for row in result.identities:
             logger.info(f"pre-reset: device holder before {' '.join(argv)}: {describe_identity(row)}")
+    if result.gaps_passed:
+        msg = f"pre-reset: {' '.join(argv)} runs past holders the scan could not read, before a power cycle: {'; '.join(result.gaps_passed)}"
+        log(msg)
+        if logger:
+            logger.warning(msg)
     if result.detached:
         msg = f"pre-reset: chips {', '.join(result.detached)} off the bus, detached before their readers were killed"
         log(msg)
