@@ -235,7 +235,7 @@ async def test_a_class_a_sweep_a_guard_holds_runs_no_check_and_the_cycle_still_f
         cool["scan"] = HolderScan(holders=[SimpleNamespace(pid=4242, uid=1000)], complete=True)
     else:
 
-        async def refused(trays, expected, log, do_sbr=True):
+        async def refused(trays, expected, log, do_sbr=True, **_kw):
             cool["order"].append("refused")
             return False
 
