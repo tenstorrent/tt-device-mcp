@@ -901,7 +901,10 @@ each rung fires only when the gentler one failed or cannot apply.
   guard of the host rung: a reset cycling in
   its scope, a tenant or an unreadable holder scan, an operator stand-back marker or check, and the
   power-cycle rate limits (journaled as denied) each hold and fire nothing; the next window asks
-  again. The hold-deadline climb (`offbus-forced`) waives an unreadable scan,
+  again. The governor counts each requested cycle once: once the gate's rung has requested it (or
+  any host action is pending), the gate's own host-rung step that follows in the same pass asks the
+  governor nothing, so the cycle under way is never counted against the I65 backstop as a fourth,
+  paged or retried. The hold-deadline climb (`offbus-forced`) waives an unreadable scan,
   but never a readable tenant or a running job. A missing manual-recovery check does not hold it, as
   it does not hold the host rung this replaces. With no power cycle opted in, the ordinary ladder runs as before (I36 still stops a repeat
   of a failed reset). The host that comes back runs the startup gate, which waits for the hugepage
@@ -2493,9 +2496,10 @@ each rung fires only when the gentler one failed or cannot apply.
   (`MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC`, 180 s), still ends before the deadline: a hold age of
   285 s at most. The allowance is the slowest full check with fabric measured on a 32-chip Galaxy
   (119.5 s; p95 106.9 s, median 95.7 s, n=53) plus a margin. It only decides whether a check is worth
-  starting; the deadline, not the allowance, ends a check that runs longer. After the reset, a tt-smi
-  that gave up at its driver wait again, or less than the settle and the allowance left before the
-  deadline, gets no check: the reset's off-bus intent ends and the power cycle is requested at once.
+  starting; the deadline, not the allowance, ends a check that runs longer. After the reset, less than
+  the settle and the allowance left before the deadline gets no check (the reason also says when tt-smi
+  gave up at its driver wait again): the reset's off-bus intent ends and the power cycle is requested
+  at once.
   A check still running at the deadline counts as failed, whatever it would have returned: its
   readers (the fabric pass, the tt-smi snapshot, the AICLK ceiling helper) get SIGTERM and, still
   alive after the grace, SIGKILL, each marked no verdict; the check task is reaped, or cancelled when
@@ -2622,7 +2626,99 @@ each rung fires only when the gentler one failed or cannot apply.
   - **Hold-deadline expiry at the 10-min bound** (I76): 600 s, the bound's kept rungs and their full
     check (about 3.5 min), then the sweep as above: about 22 min at most. Before this invariant the
     sweep's repeat could wait up to 315 s idle for the bound first.
+  - **With the I102 late-chip step** (only when the sweep's mesh reset is not a repeat, so it runs on
+    the plain sweep path, gave up at its driver wait after the tray re-power, and every chip is back
+    after the rescan): the sweep's mesh reset (about 263 s), then the step (at most about 458 s: its 380 s
+    wait plus the second reset's post-reset tail of up to about 78 s; about 275 s plus that tail when
+    the second reset gives up too, about 45 s plus it when it ends in budget), the settle (60 s) and the
+    full check (allowance 180 s; 119.5 s slowest measured). B1/B2: the climb at 5-6 min, about 3.5 min
+    to the mesh reset, then those: success (the check passes and lifts) at about 16 min with a second
+    reset in budget, failure (the check fails and the power cycle is requested) at about 21 min with a
+    second give-up, at most about 25.5 min. Hold-deadline expiry: the 600 s bound and its kept rungs
+    (about 3.5 min) in front of the same sweep: success at about 21 min, failure at about 26 min, at
+    most about 30.5 min. Without the step the same hold power-cycles about 1 min after its mesh reset;
+    the step costs the power cycle up to about 458 s more and saves it whenever the check passes. Both
+    classes then exceed their 15 min budget on a failure, a cost accepted for the power cycles the
+    step saves.
   Remaining risk: a second mesh reset whose tray re-power hangs the host; the I25 latch records it.
+
+- **I101 — The SBR of a chip with no usable removal record finds its bridge in the banked link
+  baseline.** Seen on a Galaxy: in a last-chance sweep's mesh reset, tt-smi's driver wait asked for
+  the SBR (I97 b) of a chip that sysfs no longer listed. An earlier SBR in the hold had brought it
+  back, which dropped its removal record, and it then left the bus again. The SBR found no bridge
+  (`bridge_reset_failed`, `no_bridge`) although the banked link baseline named its root port. Now
+  `reset_removed_chip(idx, bdf)` takes the chip's startup address (the driver-wait SBR passes it from
+  the startup map). When the removal record has no usable bridge, it reads the port the banked link
+  baseline (`pcie_link_baseline.json`) stores for that address. That port gets the recorded bridge's
+  proof: still enumerated, its secondary bus is the chip's bus, and nothing is enumerated on that bus.
+  A port that fails the proof, or a malformed entry, fires nothing (`saved_topology_bridge_refused`).
+  A port that passes it gets the SBR (`saved_topology_bridge`). A usable removal record still wins. A
+  chip with no address, no banked link or no baseline keeps `no_bridge` as before, so a chip spent on
+  `no_bridge` still withholds the I69 rescan. The full check with fabric still decides every lift
+  (I32, I94).
+
+- **I102 — Chips that came back after a mesh reset's driver wait gave up get one more mesh reset
+  before the power cycle.** Seen on a Galaxy partial drop: the sweep's `-glx_reset` re-powered the
+  trays, but two chips trained their links after tt-smi's 100 s driver wait, so tt-smi gave up with no
+  POST_RESET and no board re-init. The chips it found stayed ARC-not-ready, the full check failed, and
+  the power cycle followed although every chip was back on the bus by then. tt-smi has no command for
+  POST_RESET or the re-init alone, so the fix is a second full mesh reset. After a sweep mesh reset
+  whose tt-smi gave up at its driver wait (I97) and whose tray re-power ran
+  (`last_reset_tray_repower`), the sweep rescans the Tenstorrent root ports once. Those include the
+  ports the saved topology remembers. The rescan is one write through the PCI writer, bounded by its
+  30 s timeout (`LATE_CHIP_RESCAN_SEC`; well under a second when it succeeds), and no settle follows it.
+  When every expected chip is then enumerated and none is isolated or removed, the broker's check
+  readers are stopped first (I87's host-hang note) and one more mesh reset runs under the AER mask
+  (`late_chips_mesh_reset` fired, then `late_chips_mesh_reset_done`). Then the caller's own full check
+  with fabric decides. Only its pass lifts the hold, through the funnel. A failed check, or one that
+  finds fewer fabric links than the cabling expects, keeps the hold and goes on to the power cycle in
+  the same pass. A chip still missing after the rescan, a failed or refused rescan, or a rescan that
+  I69 withheld ends the step at once: no second reset and no added wait (`late_chips_mesh_reset` not
+  fired, with the reason). It runs once per hold episode. The step is bounded from its own start
+  (`LATE_CHIP_STEP_SEC`, 380 s): the rescan (30 s), the readers' stop grace (10 s), the BMC preflight
+  (10 s), the wait for a dying holder (30 s) and the second reset (`LATE_CHIP_RESET_SEC`, 300 s: one in
+  budget ends with rc 0 in 32-35 s, one that gives up at its driver wait in about 263 s). The wait for
+  that reset ends at the step's start plus 380 s; the reset itself is never killed (I4). A reset that
+  returns an exit code by then still runs reset_with_quiesce's post-reset tail: the I83 cut (up to
+  about 45 s), the rescan (up to 30 s) and a 3 s sleep, so up to about 78 s more. On the plain sweep
+  path the caller's settle and full check so start at most about 458 s after the step starts (about
+  275 s plus that tail when the second reset gives up, about 45 s plus it when it ends in budget).
+  A second reset still cycling in its scope when the wait ends (rc None and `scope_active()`) gets no
+  settle, no full check and no chip read: its pollers stay down, the sweep journals
+  `sweep_verify_skipped` (reason `reset_scope_active`), the verify counts as failed, the hold stays,
+  and the broker requests the power cycle in the same pass. The owed SBR and the power cycle's cause
+  read no chip either. The ladder ran, but its full check could not run safely over a reset still
+  cycling. The power-cycle request opens no device; the scope is not killed, it ends with the power
+  cycle, and the startup full check with fabric after the cycle gates the lift. A cycle that cannot be
+  launched keeps the hold; later passes adopt the still-running scope and skip the verify again until
+  it ends. On an I97 path (the I97 mesh
+  reset, or the sweep's repeat run as one, I100) the step is taken only when it, the settle and the
+  check's allowance (570 s in all, `_late_chips_needs_sec()`) end by that path's deadline. Otherwise it
+  stops before its rescan, adds no time and journals the deadline it would miss; the check after the
+  reset keeps the I97 deadline. `_late_chips_needs_sec()` does not count the post-reset tail: the check
+  is bounded by that deadline from the hold start, so the tail can only shorten or skip the check, never
+  move the deadline. Under I97's deadline (585 s from hold start, or the repeat's start plus
+  300 s) that is never the case after a give-up, so in practice the step runs on the plain sweep path
+  only: a repeated mesh reset that gives up at its driver wait still goes to the power cycle within
+  I100's 315 s. A mesh reset that exited
+  before the tray re-power did not run (`reset_did_not_run`) and gets none of this. Classes A and C
+  keep their direct power cycle, and the class A cooldown sweep does not take this step. Cost
+  against the class B1 budget (15 min): the step adds the rescan write and the second reset (about
+  35-60 s) in front of the full check the sweep runs anyway. On the replayed hold, whose power cycle
+  was requested about 11.6 min in, the lift comes about 1 min later than that request, at about
+  12.6 min. That is under the budget, while the power cycle's own recovery ran past it. Remaining risk: the second reset itself
+  gives up at its driver wait (about 263 s); the full check still runs and decides, and its failure
+  requests the power cycle as before, later by at most about 458 s (the step's 380 s wait plus the
+  post-reset tail; about 275 s plus that tail seen-based).
+
+  **Known gap (accepted).** Under the I97 deadline (hold start plus 585 s) and the I100 repeat deadline
+  (repeat start plus 300 s), the step always skips after a tt-smi driver-wait give-up: a give-up
+  measured 130-263 s on a 32-chip galaxy, so the age plus the step's 570 s is past the deadline. With
+  less than about 190 s left, no full check runs and the broker requests the power cycle at once,
+  journaling `deadline_sec`. The climb's own mesh-reset rung has no I102 step; only the last-chance
+  sweep, which runs before every power cycle, has it. The goal-10 bound wins: on these paths the broker
+  power-cycles without the late-chip retry, and a chip that would have come back late may cost a cycle.
+  The full check with fabric (all cabled links) still gates every release and every hold lift.
 
 - **I103 — Only a running broker job holds a power cycle; a foreign holder never does.** Every road
   to a power cycle the broker requests on its own (the class A/C direct cycle, the off-bus gated
@@ -3126,6 +3222,7 @@ sees a silent fabric pass.
 | I71 a denied cycle holds and asks only for the cycle; one that does not launch holds, pages and is asked for again; BLOCKED only with no live reset scope; the launch verdict the hold reads | `tests/test_power_cycle_host_rung.py::test_a_denied_cycle_holds_and_asks_only_for_the_cycle`, `::test_a_cycle_that_does_not_launch_holds_pages_and_retries`, `::test_a_live_scope_waits_instead_of_blocking`, `::test_fire_recovery_escalation_reports_whether_the_action_may_have_launched` |
 | I71 with I65: a cooldown-held cycle fires at the cooldown end, with the real governor and ledger | `tests/test_power_cycle_host_rung.py::test_a_cooldown_held_cycle_fires_at_the_cooldown_end_with_the_real_governor` |
 | I37/I65 class C at startup: one mesh reset with no failed reset or broker cycle; none after the broker's own cycle, which then waits only for the cooldown | `tests/test_power_cycle_cooldown.py::test_all_off_at_startup_with_no_failed_reset_or_broker_cycle_gets_one_reset`, `::test_all_off_after_the_broker_cycle_brought_this_boot_up_skips_the_reset`, `::test_a_cycle_requested_this_episode_counts_and_one_before_it_does_not` |
+| I37/I65 the gate counts a class A/C direct cycle once: one pass with two cycles already in the backstop window requests one cycle, journals no backstop denial, pages nobody and arms no retry; a pass while it is pending asks nothing; a real fourth cycle in the window is still denied, paged and retried | `tests/test_power_cycle_backstop_once.py::test_one_gate_pass_on_all_off_counts_its_cycle_once`, `::test_a_second_pass_while_the_cycle_is_pending_asks_nothing`, `::test_the_backstop_still_denies_a_real_fourth_cycle` |
 | I78 the driver-wait rescan repeats until every isolated chip is back and then stops; it gives up after its tries, journaled; it ends with the reset and never delays its cleanup; a cancelled reset stops it; no rescan while the settle counts; on both backends (line reader and file reader) the rescan runs after the settle and inside the driver wait | `tests/test_mesh_reset_readd.py::test_the_rescan_repeats_until_the_chip_is_back_and_then_stops`, `::test_the_repeat_gives_up_after_its_tries`, `::test_the_repeat_ends_with_the_reset_and_never_delays_its_cleanup`, `::test_a_cancelled_reset_stops_the_repeats`, `::test_no_rescan_while_the_settle_counts`, `::test_both_backends_rescan_only_once_the_settle_is_over` |
 | I76 every hold kind (77-only, topology mismatch, known fabric fault, latched, generic) runs the full ladder at the 10-min bound, then the host rung; below the bound a no-reset hold keeps its fast path; a latched I42 hold escalates with its latch standing | `tests/test_hold_bound.py::test_every_hold_kind_runs_the_ladder_at_the_bound_then_the_host_rung`, `::test_below_the_bound_a_no_reset_hold_keeps_its_fast_path`, `::test_a_latched_i42_hold_still_escalates_and_its_latch_stands`, `::test_replay_a_latched_topology_mismatch_hold_gets_the_ladder_then_the_power_cycle` |
 | I76 the I29 77 hold with no host rung (reset and sweep already ran this episode) gets the power cycle at the bound in the same run; a killed job's leftover holder (01 I16) does not stand the bound down: no reset runs over it and the host rung is asked for, which a live tenant still refuses | `tests/test_hold_bound.py::test_replay_a_77_held_with_no_host_rung_gets_the_power_cycle_at_the_bound`, `::test_a_killed_jobs_leftover_holder_does_not_stop_the_bound` |
@@ -3292,6 +3389,29 @@ sees a silent fabric pass.
 | I100 the I97 reset having run this hold does not skip the sweep's repeat; only its full check passing lifts, once | `tests/test_below_floor_offbus_ladder.py::test_the_repeated_mesh_reset_runs_after_this_holds_i97_reset_already_ran` |
 | I100 an outage hold refuses the whole sweep: nothing lifts and no power cycle is requested; the device stays held for the operator | `tests/test_below_floor_offbus_ladder.py::test_an_outage_hold_refuses_the_sweep_and_holds_for_the_operator` |
 | I100 the sweep never skips a chip's SBR as spent and repeats the failed mesh reset | `tests/test_sbr_record_per_hold.py::test_a_chip_the_gate_reset_is_not_reset_again_by_the_escalation_or_the_sweep` |
+| I101 a chip whose removal record was dropped and that left the bus again gets its SBR through the port its banked link names, with no rescan of its own | `tests/test_removed_chip_rescan.py::test_a_chip_whose_record_was_dropped_gets_its_sbr_through_the_banked_port` |
+| I101 a chip with no startup address, no banked link or no baseline keeps `no_bridge` and fires nothing | `tests/test_removed_chip_rescan.py::test_a_chip_with_no_saved_mapping_keeps_no_bridge`, `tests/test_mesh_reset_readd.py::test_a_chip_with_no_bridge_is_not_reported_fired` |
+| I101 a banked port that is gone, renumbered, feeds an occupied bus or is malformed is refused | `tests/test_removed_chip_rescan.py::test_a_stale_banked_port_is_refused` |
+| I101 a usable removal record wins over the banked port | `tests/test_removed_chip_rescan.py::test_a_usable_record_still_wins_over_the_banked_port` |
+| I101 the driver-wait SBR hands each chip its address from the broker's live startup map; no map still tries the SBR without one | `tests/test_mesh_reset_readd.py::test_the_driver_wait_sbr_hands_each_chip_its_startup_address`, `tests/test_removed_chip_rescan.py::test_the_broker_hands_the_driver_wait_sbr_its_live_startup_map` |
+| I102 every chip back after the rescan: the readers stop, one more mesh reset runs, and only a just-passed full check with fabric lifts the hold; no power cycle | `tests/test_late_chips_after_driver_wait.py::test_both_chips_back_late_get_one_more_mesh_reset_then_the_full_check_lifts` |
+| I102 a failed full check after the second mesh reset keeps the hold and power-cycles | `tests/test_late_chips_after_driver_wait.py::test_a_failed_full_check_after_the_second_mesh_reset_keeps_the_hold_and_power_cycles` |
+| I102 a chip still missing after the rescan: no second reset and no added wait, the full check, then the power cycle | `tests/test_late_chips_after_driver_wait.py::test_one_chip_still_out_goes_to_the_check_and_the_power_cycle_with_no_wait`, `tests/test_late_chips_after_driver_wait.py::test_the_late_chip_step_alone_is_quick_when_a_chip_is_missing` |
+| I102 no tray re-power (`reset_did_not_run`) or a withheld rescan: no late-chip step | `tests/test_late_chips_after_driver_wait.py::test_no_late_chip_step_without_the_repower_or_when_the_rescan_was_withheld`, `tests/test_mesh_reset_readd.py::test_a_mesh_reset_that_exited_before_the_tray_repower_is_logged_as_not_run` |
+| I102 the give-up after the tray re-power is recorded for the step | `tests/test_mesh_reset_readd.py::test_a_driver_wait_give_up_after_the_tray_repower_says_the_repower_ran` |
+| I102 once per hold episode; a failed rescan ends the step | `tests/test_late_chips_after_driver_wait.py::test_the_second_mesh_reset_runs_once_per_hold`, `tests/test_late_chips_after_driver_wait.py::test_a_failed_rescan_ends_the_step` |
+| I102 under an I97 deadline the step runs only when it, the settle and the check's allowance end by it; otherwise it stops before the rescan and journals the deadline; with room the wait for the second reset ends at the step's start plus 380 s | `tests/test_late_chips_after_driver_wait.py::test_under_an_i97_deadline_the_step_runs_only_when_it_and_the_check_end_by_it` |
+| I102 with I100: a repeated mesh reset that gives up is not followed by the step, and the power cycle comes within the repeat's bound | `tests/test_late_chips_after_driver_wait.py::test_on_the_i100_repeat_the_step_is_not_taken_and_the_power_cycle_keeps_its_bound` |
+| I102 with I97: a mesh reset before the host rung that gives up is not followed by the step, the reason names the give-up and the deadline, and the power cycle comes by the bound | `tests/test_late_chips_after_driver_wait.py::test_on_the_i97_path_the_step_is_not_taken_and_the_power_cycle_comes_by_the_bound` |
+| I102 the class A cooldown sweep takes no late-chip step | `tests/test_late_chips_after_driver_wait.py::test_the_class_a_cooldown_sweep_takes_no_late_chip_step` |
+| I102 a second give-up on the plain sweep: the full check still runs and decides, its failure power-cycles, and the wait for the second reset ends by the step's start plus 380 s | `tests/test_late_chips_after_driver_wait.py::test_a_second_give_up_on_the_plain_sweep_is_checked_and_power_cycles_within_the_step_bound` |
+| I102 a second reset still cycling in its scope at the step's bound: no settle, no full check and no chip read, no lift, the power cycle is requested | `tests/test_late_chips_after_driver_wait.py::test_a_second_reset_still_cycling_at_its_bound_gets_no_check_and_the_power_cycle` |
+| I102 the second reset's scope ended by the bound: the normal settle and full check run and decide | `tests/test_late_chips_after_driver_wait.py::test_with_the_scope_ended_the_normal_settle_and_full_check_run` |
+| I102 `wait_until` past the overrun line: `reset_overran`, then `reset_timeout` at the bound; rc None, nothing killed | `tests/test_reset_wait_until.py::test_a_bound_past_the_overrun_line_journals_the_overrun_then_times_out_at_the_bound`, `tests/test_reset_wait_until.py::test_a_local_reset_that_outlives_its_bound_keeps_running_and_registered[past-overrun]` |
+| I102 `wait_until` inside the overrun line: `reset_timeout` at the bound, no overrun line; rc None, nothing killed | `tests/test_reset_wait_until.py::test_a_bound_inside_the_overrun_line_times_out_at_the_bound_with_no_overrun`, `tests/test_reset_wait_until.py::test_a_local_reset_that_outlives_its_bound_keeps_running_and_registered[inside-overrun]` |
+| I102 a local reset that outlives its bound keeps its lock (`scope_active()`) and its registered pid | `tests/test_reset_wait_until.py::test_a_local_reset_that_outlives_its_bound_keeps_running_and_registered` |
+| I102 reset_with_quiesce at the bound with the scope still cycling: no cut, no rescan, pollers not restored | `tests/test_reset_wait_until.py::test_quiesce_keeps_the_pollers_down_while_the_bounded_reset_still_cycles` |
+| I102 no `wait_until`: the wait stays `DEVICE_RESET_TIMEOUT_SEC`; a bound only shortens it | `tests/test_reset_wait_until.py::test_no_wait_until_keeps_the_reset_timeout_and_a_bound_only_shortens_it`, `tests/test_reset_wait_until.py::test_without_a_bound_the_wait_runs_to_the_reset_timeout` |
 | I103 a holder outside every broker scope never holds a class A/C cycle, before or at the deadline; a broker job's holder or a running job does | `tests/test_classac_power_cycle_direct.py::test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_tenant`, `tests/test_foreign_holder_power_cycle.py::test_a_foreign_holder_never_delays_the_all_chips_off_cycle` |
 | I103 at the 10-min bound a foreign holder on a partial drop gets the full ladder and the sweep, then the cycle; the identity is journaled | `tests/test_foreign_holder_power_cycle.py::test_the_bound_ladder_and_sweep_resets_clear_a_foreign_holder_then_the_cycle`, `::test_a_foreign_holder_at_the_bound_gets_the_ladder_and_sweep_then_the_cycle` |
 | I103 a running broker job defers the cycle until it ends, then the cycle fires; a job waiting on a holder or queued does not defer it | `tests/test_foreign_holder_power_cycle.py::test_a_running_broker_job_defers_the_cycle_until_it_ends`, `::test_a_waiting_or_queued_job_does_not_defer_the_cycle` |

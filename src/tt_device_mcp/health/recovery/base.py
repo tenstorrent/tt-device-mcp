@@ -216,6 +216,14 @@ def power_cycle_interval_sec(failed_cycles: int) -> int:
     return max(base, min(base * 2 ** (failed_cycles - 1), POWER_CYCLE_BACKOFF_CAP_SEC))
 
 
+def _reset_wait_sec(wait_until: Optional[float]) -> float:
+    """How long to wait for one reset: DEVICE_RESET_TIMEOUT_SEC, or less when the caller's own bound
+    (a ``time.monotonic()`` instant) ends sooner. The reset itself is never killed."""
+    if wait_until is None:
+        return DEVICE_RESET_TIMEOUT_SEC
+    return max(1.0, min(DEVICE_RESET_TIMEOUT_SEC, wait_until - time.monotonic()))
+
+
 def _local_time(epoch: float) -> str:
     return datetime.fromtimestamp(epoch).isoformat(sep=" ", timespec="seconds")
 
@@ -582,6 +590,10 @@ class RecoveryMechanism:
     # Spec 04 I98: called with the chips a bridge write reached outside the SBR rung (the driver-wait
     # SBR), so the Galaxy ladder's per-hold SBR record counts them. Set by GalaxyRecovery.
     sbr_fired_hook: Optional[Callable[[list], None]] = None
+    # Spec 04 I101: the broker's startup chip-index-to-PCI-address map, so the driver-wait SBR can
+    # name the bridge of a chip with no removal record from the banked link baseline. Set by
+    # GalaxyRecovery.
+    chip_pci_map: Optional[Callable[[], dict]] = None
 
     def __init__(
         self,
@@ -673,6 +685,10 @@ class RecoveryMechanism:
         self.post_reset_failed: set = set()
         # Spec 04 I97: the last mesh reset's tt-smi gave up at its driver wait (a failed reset).
         self.last_reset_driver_wait_failed: bool = False
+        # Spec 04 I102: that give-up came after the tray re-power ran, and the rescan after that reset
+        # was withheld (I69). The late-chip retry reads both.
+        self.last_reset_tray_repower: bool = False
+        self.last_reset_rescan_withheld: bool = False
         self.post_reset_cut: Optional[Callable[[list], Awaitable[bool]]] = None
         # Any reset_with_quiesce (the ladder's or a manual one) since the mesh was last released:
         # an off-bus set first seen after it is the reset's doing, never a tray-down onset (04 I19).
@@ -1091,6 +1107,7 @@ class RecoveryMechanism:
         log,
         owner: str = "[broker]health-gate",
         on_output: Optional[Callable[[str], None]] = None,
+        wait_until: Optional[float] = None,
     ) -> tuple[Optional[int], str]:
         """Run a detached no-systemd reset whose inherited flock survives the daemon."""
         self.reset_scope_seq += 1
@@ -1149,18 +1166,19 @@ class RecoveryMechanism:
                 return proc.returncode
 
             wait_task = asyncio.create_task(wait_and_stream())
+            limit = _reset_wait_sec(wait_until)
             try:
-                await aio.wait_for(asyncio.shield(wait_task), timeout=DEVICE_RESET_OVERRUN_SEC)
+                await aio.wait_for(asyncio.shield(wait_task), timeout=min(DEVICE_RESET_OVERRUN_SEC, limit))
             except asyncio.TimeoutError:
+                if limit <= DEVICE_RESET_OVERRUN_SEC:
+                    raise
                 over = (datetime.now() - started).total_seconds()
                 log(
                     f"reset still running after {int(over)}s ({unit}); waiting — it is not "
                     f"killed, and only a reset that never ends is a failure"
                 )
                 health_event("reset_overran", unit=unit, seconds=over, argv=argv)
-                await aio.wait_for(
-                    asyncio.shield(wait_task), timeout=max(1, DEVICE_RESET_TIMEOUT_SEC - DEVICE_RESET_OVERRUN_SEC)
-                )
+                await aio.wait_for(asyncio.shield(wait_task), timeout=max(1, limit - DEVICE_RESET_OVERRUN_SEC))
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
@@ -1211,6 +1229,7 @@ class RecoveryMechanism:
         log,
         owner: str = "[broker]health-gate",
         on_output: Optional[Callable[[str], None]] = None,
+        wait_until: Optional[float] = None,
     ) -> tuple[Optional[int], str]:
         """Run one device reset through the available restart-safe backend.
 
@@ -1223,6 +1242,9 @@ class RecoveryMechanism:
         tool passes the human who asked, so an operator-run reset is one row attributed to
         them, not the gate's row plus a duplicate.
 
+        ``wait_until`` (a ``time.monotonic()`` instant) ends the wait for the reset sooner than
+        DEVICE_RESET_TIMEOUT_SEC; the reset is still never killed (spec 04 I102).
+
         Returns (exit code, combined output). The code is None if the reset timed out or
         could not be launched.
         """
@@ -1230,7 +1252,7 @@ class RecoveryMechanism:
             # `tt-smi -r` is an ioctl on a device node the submitter already holds (spec 04
             # I17), so lacking a PID-1 scope selects the other backend, it does not cancel the
             # reset.
-            return await self._run_local_reset(argv, log, owner, on_output)
+            return await self._run_local_reset(argv, log, owner, on_output, wait_until)
         unit, scoped = self._reset_scope_argv(argv)
         _t0 = datetime.now()
         # Open the jobs-list row now, not on completion: a reset that overruns or never returns is
@@ -1266,8 +1288,11 @@ class RecoveryMechanism:
                 return await proc.communicate()
 
             try:
-                out, _ = await aio.wait_for(communicate(), timeout=DEVICE_RESET_OVERRUN_SEC)
+                limit = _reset_wait_sec(wait_until)
+                out, _ = await aio.wait_for(communicate(), timeout=min(DEVICE_RESET_OVERRUN_SEC, limit))
             except asyncio.TimeoutError:
+                if limit <= DEVICE_RESET_OVERRUN_SEC:
+                    raise
                 # Our timer is not the reset's deadline. The scope is deliberately never killed —
                 # a reset stopped partway through 32 ASICs is far worse than one that overran —
                 # so it is still going, and calling it failed here reports only that we stopped
@@ -1281,9 +1306,7 @@ class RecoveryMechanism:
                     f"killed, and only a scope that never ends is a failure"
                 )
                 health_event("reset_overran", unit=unit, seconds=over, argv=argv)
-                out, _ = await aio.wait_for(
-                    communicate(), timeout=max(1, DEVICE_RESET_TIMEOUT_SEC - DEVICE_RESET_OVERRUN_SEC)
-                )
+                out, _ = await aio.wait_for(communicate(), timeout=max(1, limit - DEVICE_RESET_OVERRUN_SEC))
             rc = proc.returncode
         except asyncio.TimeoutError:
             dt = (datetime.now() - _t0).total_seconds()
@@ -1415,6 +1438,7 @@ class RecoveryMechanism:
         log,
         owner: str = "[broker]health-gate",
         on_output: Optional[Callable[[str], None]] = None,
+        wait_until: Optional[float] = None,
     ) -> tuple[Optional[int], str]:
         """One reset, done safely: quiet the bus, run it where nothing can interrupt it,
         put the pollers back. Every reset in the broker goes through here — the health
@@ -1424,6 +1448,8 @@ class RecoveryMechanism:
         caller's critical section usually spans the verification too).
 
         ``owner`` is passed straight to the jobs-list row (see ``run_scoped``).
+
+        ``wait_until``: see ``run_scoped``.
 
         Returns (exit code, combined output); the code is None on timeout/launch failure.
         """
@@ -1472,10 +1498,11 @@ class RecoveryMechanism:
         rc = None
         text = ""
         try:
+            bound = {} if wait_until is None else {"wait_until": wait_until}
             if stream is None:
-                rc, text = await self.run_scoped(argv, log, owner)
+                rc, text = await self.run_scoped(argv, log, owner, **bound)
             else:
-                rc, text = await self.run_scoped(argv, log, owner, stream)
+                rc, text = await self.run_scoped(argv, log, owner, stream, **bound)
             if mesh:
                 rc = self._note_bmc_guard_output(argv, owner, rc, text, log)
             return rc, text
@@ -1529,6 +1556,7 @@ class RecoveryMechanism:
                     # Spec 04 I69 on the mesh path, decided after the cut so a chip the I83 cut just
                     # removed is also kept out when the BMC re-power did not reach it.
                     withheld = mesh and self._withhold_failed_mesh_rescan(rc, text, log)
+                    self.last_reset_rescan_withheld = bool(withheld)
                     if not withheld:
                         # A reset can leave endpoints un-enumerated — and any chip we isolated earlier is
                         # still out of the kernel, because `remove` is not undone by a reset. Rescan, or the
@@ -1661,6 +1689,7 @@ class RecoveryMechanism:
         repowered = glx_tray_repower_ran(text)
         if gave_up and not failed:
             self.last_reset_driver_wait_failed = True
+            self.last_reset_tray_repower = repowered
             ran = "the tray re-power ran, but" if repowered else "no tray re-power in tt-smi's output, and"
             log(
                 f"mesh reset FAILED (rc {rc}): {ran} tt-smi gave up at its driver wait — not every chip showed "
@@ -1717,6 +1746,8 @@ class RecoveryMechanism:
         if "-glx_reset" not in argv:
             return on_output, {}
         self.last_reset_driver_wait_failed = False
+        self.last_reset_tray_repower = False
+        self.last_reset_rescan_withheld = False
         isolated = self._isolated_chips() if self._isolated_chips is not None else None
         chips = sorted(isolated, key=int) if isolated else []
         state: dict = {"tail": "", "ptail": "", "task": None, "stop": asyncio.Event()}
@@ -1801,8 +1832,9 @@ class RecoveryMechanism:
     async def _driver_wait_sbr(self, still, state: dict, log) -> bool:
         """Spec 04 I97: DRIVER_WAIT_SBR_AFTER_TRIES rescans in tt-smi's driver wait have not brought
         isolated chip(s) ``still`` back. Fire one Secondary Bus Reset through each one's recorded
-        bridge (no rescan: the next rescan of the loop adds them, I69), then wait for the link to
-        retrain. Once per reset. Nothing fires without the SBR capability, after the reset ended, or
+        bridge, or for a chip with no usable record the bridge the banked link baseline names for its
+        startup address (I101). No rescan: the next rescan of the loop adds them (I69). Then wait for
+        the link to retrain. Once per reset. Nothing fires without the SBR capability, after the reset ended, or
         for a chip with no usable bridge. True when at least one SBR fired. Never raises: the rescans
         and the full check still decide."""
         if state.get("sbr_done") or state.get("disarmed"):
@@ -1820,6 +1852,10 @@ class RecoveryMechanism:
         if not bridge_reset_enabled():
             log(f"chip(s) {chips} still missing in tt-smi's driver wait; no SBR capability here")
             return False
+        try:
+            pci_map = (self.chip_pci_map() if self.chip_pci_map is not None else None) or {}
+        except Exception:  # noqa: BLE001 - no map only loses the I101 fallback; the record path still runs
+            pci_map = {}
         log(
             f"chip(s) {chips} still missing after {DRIVER_WAIT_SBR_AFTER_TRIES} rescans in tt-smi's driver wait: SBR of each one's bridge"
         )
@@ -1834,6 +1870,7 @@ class RecoveryMechanism:
                     f"bridge reset of isolated chip {idx} in the driver wait",
                     reset_removed_chip,
                     idx,
+                    pci_map.get(str(idx)),
                     timeout=bridge_reset_call_timeout(),
                 )
             except (PciWedged, OSError, asyncio.TimeoutError) as e:

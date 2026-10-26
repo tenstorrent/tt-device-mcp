@@ -13766,7 +13766,7 @@ async def test_a_sweep_verify_that_reads_77_is_not_a_release(
     g = srv.galaxy_recovery
     cleared = []
 
-    async def fire_all(trays_, expected, log, do_sbr=True):
+    async def fire_all(trays_, expected, log, do_sbr=True, **_kw):
         return True
 
     async def verify_77(expected, log, run_fabric=True, **k):

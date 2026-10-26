@@ -8,12 +8,14 @@ it. These tests build a fake sysfs (one bridge per chip) and record the order of
 rescans."""
 
 import asyncio
+import json
 
 import pytest
 
 from tt_device_mcp import server as srv
+from tt_device_mcp.health import evidence
 from tt_device_mcp.health import recovery as recovery_pkg
-from tt_device_mcp.health.monitors import pci
+from tt_device_mcp.health.monitors import hostpci, pci
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy, pcie_guard
 from tt_device_mcp.health.recovery.stages import bridge_reset as bridge
@@ -611,3 +613,98 @@ async def test_status_shows_the_bridge_rung_as_a_device_reset(tmp_path, monkeypa
     assert status["device_resetting"] is True
     assert status["running"][0]["resetting"] is True and status["running"][0]["owner"] == "[broker]"
     assert srv._get_queue_status()["device_resetting"] is False, "over once the op ends"
+
+
+# --- spec 04 I101: a chip with no usable removal record reaches its bridge through the banked baseline -
+
+
+def _bank(*bdfs):
+    """Bank each chip's link with the port above it, as a passing check does."""
+    links = {
+        bdf: {"port": br, "width_cap": 1, "speed_cap": 32.0, "width": 1, "speed": 32.0}
+        for bdf, br in CHIPS.values()
+        if bdf in bdfs
+    }
+    (evidence.health_dir() / hostpci.PCIE_LINK_BASELINE_FILE).write_text(json.dumps({"links": links}))
+
+
+def _drop_again(bus, idx):
+    """Isolated, brought back by a reset (its record dropped), then off the bus again on its own."""
+    bus.remove(idx)
+    bus.enumerate(idx)
+    assert pci.removed_chip(idx) is None, "back on the bus: the record is gone"
+    bdf, _ = CHIPS[idx]
+    (bus.devices / bdf).unlink()
+    (bus.cls / f"tenstorrent!{idx}" / "device").unlink()
+    (bus.cls / f"tenstorrent!{idx}").rmdir()
+
+
+def test_a_chip_whose_record_was_dropped_gets_its_sbr_through_the_banked_port(tmp_path, monkeypatch, rung):
+    """The mesh reset's driver wait asks for the SBR of a chip that an earlier SBR brought back (so its
+    removal record is gone) and that left the bus again. The banked link names its root port, the port
+    still feeds the chip's now-empty bus, so the reset fires there."""
+    bus = FakeBus(tmp_path, monkeypatch)
+    _bank("0000:46:00.0", "0000:47:00.0")
+    _drop_again(bus, "13")
+    assert bridge.reset_removed_chip("13", "0000:46:00.0") is True
+    assert [t for t in bus.trace if t[0] == "sbr"] == [("sbr", "0000:40:01.1")]
+    assert ("rescan",) not in bus.trace, "no rescan of its own (I69): the caller's next one adds it"
+    assert _kinds(rung, "saved_topology_bridge") == [{"chip": "13", "bdf": "0000:46:00.0", "bridge": "0000:40:01.1"}]
+    assert not _kinds(rung, "bridge_reset_failed")
+
+
+@pytest.mark.parametrize("why", ["no_bdf", "not_banked", "no_baseline"])
+def test_a_chip_with_no_saved_mapping_keeps_no_bridge(tmp_path, monkeypatch, rung, why):
+    """No address from the startup map, no banked link for it, or no baseline at all: nothing fires,
+    the same no_bridge as before (a spent no_bridge chip still withholds the I69 rescan)."""
+    bus = FakeBus(tmp_path, monkeypatch)
+    if why == "not_banked":
+        _bank("0000:47:00.0")
+    elif why == "no_bdf":
+        _bank("0000:46:00.0", "0000:47:00.0")
+    _drop_again(bus, "13")
+    bdf = None if why == "no_bdf" else "0000:46:00.0"
+    assert bridge.reset_removed_chip("13", bdf) is None
+    assert bus.trace == []
+    assert _kinds(rung, "bridge_reset_failed") == [{"chip": "13", "bdf": bdf, "reason": "no_bridge"}]
+    assert not _kinds(rung, "saved_topology_bridge")
+
+
+@pytest.mark.parametrize("stale", ["bridge_gone", "bridge_renumbered", "bus_occupied", "port_not_a_bdf"])
+def test_a_stale_banked_port_is_refused(tmp_path, monkeypatch, rung, stale):
+    """The banked port gets the same proof as a recorded bridge: a gone, renumbered or reoccupied bus
+    (or a malformed entry) fires no reset through it."""
+    bus = FakeBus(tmp_path, monkeypatch)
+    _bank("0000:46:00.0")
+    _drop_again(bus, "13")
+    br = "0000:40:01.1"
+    if stale == "bridge_gone":
+        (bus.devices / br).unlink()
+    elif stale == "bridge_renumbered":
+        (bus.real / br / "secondary_bus_number").write_text("99\n")
+    elif stale == "bus_occupied":
+        (bus.devices / "0000:46:00.1").mkdir()  # live silicon now on the chip's old bus
+    else:
+        path = evidence.health_dir() / hostpci.PCIE_LINK_BASELINE_FILE
+        path.write_text(json.dumps({"links": {"0000:46:00.0": {"port": "../../evil"}}}))
+    assert bridge.reset_removed_chip("13", "0000:46:00.0") is None
+    assert bus.trace == []
+    reason = "bad_port" if stale == "port_not_a_bdf" else stale
+    assert [f["reason"] for f in _kinds(rung, "saved_topology_bridge_refused")] == [reason]
+    assert [f["reason"] for f in _kinds(rung, "bridge_reset_failed")] == ["no_bridge"]
+
+
+def test_a_usable_record_still_wins_over_the_banked_port(tmp_path, monkeypatch, rung):
+    """A chip the broker removed keeps its recorded bridge; the baseline is not read."""
+    bus = FakeBus(tmp_path, monkeypatch)
+    _bank("0000:46:00.0")
+    bus.remove("13")
+    assert bridge.reset_removed_chip("13", "0000:46:00.0") is True
+    assert [t for t in bus.trace if t[0] == "sbr"] == [("sbr", "0000:40:01.1")]
+    assert not _kinds(rung, "saved_topology_bridge")
+
+
+def test_the_broker_hands_the_driver_wait_sbr_its_live_startup_map(monkeypatch):
+    """The shared mechanism reads the broker's startup map at SBR time, not a copy from construction."""
+    monkeypatch.setattr(srv, "device_pci_map", {"24": "0000:81:00.0"})
+    assert srv.recovery_mechanism.chip_pci_map() == {"24": "0000:81:00.0"}
