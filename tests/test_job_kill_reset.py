@@ -22,6 +22,7 @@ from tests.test_eth_timeout_reset import ADVANCING, OUTAGE_HOLD, mesh  # noqa: F
 from tt_device_mcp import constants
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
+from tt_device_mcp.health import monitor as monitor_mod
 from tt_device_mcp.health.recovery import STAGE_SMI_RESET
 from tt_device_mcp.health.recovery.galaxy import _route
 
@@ -709,6 +710,39 @@ async def test_a_failed_job_that_left_the_clock_busy_owes_the_reset(runner_env, 
     debt = srv._kill_reset_debt()
     assert debt.startswith("job 936 failed with 2 chip(s) left at the busy AI clock (max 1350 MHz)")
     assert "kill_reset_owed" in runner_env["events"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("at_end", [{}, {"0": 1350}], ids=["idle-at-job-end", "busy-at-job-end"])
+async def test_the_runner_hands_the_job_end_clock_and_the_gates_fabric_pass_to_the_record(
+    runner_env, monkeypatch, at_end
+):
+    """03 B-post-job clock check: the runner's own read at the job's end, before the gate, decides
+    who the busy clock after the gate is blamed on. Idle then, and the gate's fabric pass killed by
+    dead-chip isolation: the pass. Busy then: the job."""
+    m = srv.health_monitor
+    monkeypatch.setattr(m, "_fabric_verdict", {})
+    monkeypatch.setattr(m, "_fabric_outcome", (0.0, ""))
+    monkeypatch.setattr(m, "last_fabric_ok", None)
+    clocks = {"now": dict(at_end) or {"0": 800}}
+    monkeypatch.setattr(srv, "chip_snapshot", lambda: {i: {"tt_aiclk": v} for i, v in clocks["now"].items()})
+
+    async def _gate(*a, **k):
+        # The gate's fabric pass opened the mesh (busy clock) and was killed mid-run.
+        clocks["now"] = {"0": 1350, "1": 1350}
+        m._note_fabric_verdict(None, f"{monitor_mod.FABRIC_KILLED_BY_ISOLATION} (70s, exit -9): chip 1; no verdict")
+
+    monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
+    fields = []
+    monkeypatch.setattr(srv, "health_event", lambda name, *a, **k: fields.append((name, k)))
+    job, runner = await _start("939", "exit 1")
+    try:
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    noted = [(k["at_job_end"], k["cause"], k["gate_fabric"]) for n, k in fields if n == "aiclk_busy_after_job"]
+    want = ("busy", "job", "killed") if at_end else ("idle", "gate_fabric_check", "killed")
+    assert noted == [want]
 
 
 OFF_BUS = 0xFFFFFFFF
