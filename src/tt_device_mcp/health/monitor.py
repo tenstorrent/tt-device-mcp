@@ -985,12 +985,12 @@ class HealthMonitor:
         metrics.probe_observed("pci", _verdict_label(ok), time.monotonic() - _t0)
         return ok, detail
 
-    def note_snapshot_killed(self, reason: str) -> None:
+    def note_snapshot_killed(self, reason: str, journal: Optional[Callable[..., None]] = None) -> None:
         """The dead-chip isolation stopped or killed the in-flight tt-smi snapshot (spec 03 I86): its
         exit or timeout says nothing about the chips. That check is no verdict, never a pass, and
         a full pass with fabric is owed before any release (04 I32)."""
         self._snapshot_killed = reason or "dead-chip isolation"
-        FABRIC_DEBT.note_fabric_killed(f"tt-smi snapshot killed ({self._snapshot_killed})")
+        FABRIC_DEBT.note_fabric_killed(f"tt-smi snapshot killed ({self._snapshot_killed})", journal)
 
     def _run_snapshot(self, argv: list[str], timeout_sec: float) -> subprocess.CompletedProcess:
         """``subprocess.run`` for the snapshot, but in its own session and tracked on
@@ -1174,12 +1174,12 @@ class HealthMonitor:
         v["age_s"] = round(time.monotonic() - v.pop("_at"), 1)
         return v
 
-    def note_fabric_check_killed(self, reason: str) -> None:
+    def note_fabric_check_killed(self, reason: str, journal: Optional[Callable[..., None]] = None) -> None:
         """The broker's dead-chip isolation SIGKILLed the in-flight fabric pass (spec 03 I82). Its exit
         (-9) then says nothing about the links: the run is no verdict, the fabric unknown, and a full
         pass is owed before any release (04 I32)."""
         self._fabric_killed = reason or "dead-chip isolation"
-        FABRIC_DEBT.note_fabric_killed(f"fabric check killed ({self._fabric_killed})")
+        FABRIC_DEBT.note_fabric_killed(f"fabric check killed ({self._fabric_killed})", journal)
 
     async def stop_check_readers(self, reason: str, grace_sec: float) -> list:
         """Spec 04 I97: end the full check's own readers at its deadline. SIGTERM the process group of

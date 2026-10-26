@@ -193,6 +193,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     gone_chip_bridge_reset_enabled,
     health_dir,
     health_event,
+    health_event_detached,
     heartbeat_supported,
     heartbeat_verdict,
     hold_report,
@@ -1238,6 +1239,9 @@ _recovery_deps = RecoveryDeps(
     health_event=lambda kind, **f: health_event(kind, **f),
     kill_device_holders=lambda reason: _kill_device_holders(reason),
     freeze_device_readers=lambda reason: _freeze_device_readers(reason),
+    broker_check_readers=lambda: _broker_device_readers(),
+    stop_check_readers_on_aer=lambda reason: _stop_check_readers_on_aer(reason),
+    health_event_detached=lambda kind, **f: health_event_detached(kind, **f),
     wait_device_released=lambda pids: wait_device_released(pids, HOLDER_RELEASE_WAIT_SEC),
     note_stuck_holders=lambda chips, killed, bdfs: _note_dead_chip_stuck_holders(chips, killed, bdfs),
     stuck_holder_pids=lambda: {f.pid for f in _dead_chip_stuck_leftovers()},
@@ -6320,12 +6324,13 @@ def _broker_device_readers() -> list:
     return readers
 
 
-def _note_reader_killed(who: str, reason: str) -> None:
-    """A stopped or killed broker reader is no verdict (spec 03 I82, I86): mark its check killed."""
+def _note_reader_killed(who: str, reason: str, journal: Optional[Callable[..., None]] = None) -> None:
+    """A stopped or killed broker reader is no verdict (spec 03 I82, I86): mark its check killed.
+    ``journal`` replaces the synchronous append of the owed pass (I92 passes the detached writer)."""
     if who == "[broker]fabric-check":
-        health_monitor.note_fabric_check_killed(reason)
+        health_monitor.note_fabric_check_killed(reason, journal)
     elif who == "[broker]tt-smi-snapshot":
-        health_monitor.note_snapshot_killed(reason)
+        health_monitor.note_snapshot_killed(reason, journal)
     elif who == "[broker]eth-selftest":
         _note_eth_selftest_killed(reason)
 
@@ -6350,6 +6355,34 @@ def _freeze_device_readers(reason: str) -> list:
     if stopped and logger:
         logger.error(f"DEAD-CHIP stopped the broker's own device readers before the remove — {reason}: {stopped}")
     return stopped
+
+
+def _stop_check_readers_on_aer(reason: str) -> list:
+    """Spec 03 I92: end the broker's own check readers on an AER burst on a chip's path. Called from
+    the AER watch thread, never the event loop: SIGSTOP every reader's process group first, so no
+    further read reaches the chips, then mark each run killed (no verdict, a full pass owed, I82),
+    then SIGKILL the groups. Nothing that can block on I/O comes before either signal: the mark's
+    journal of the owed pass goes through the detached writer. A kill closes the reader's fds, and the
+    driver's close path still messages each chip it had open (I84): an in-kernel read the broker
+    cannot stop. Returns the readers signalled. Never raises."""
+    stopped = []
+    for proc, who in _broker_device_readers():
+        try:
+            os.killpg(proc.pid, signal.SIGSTOP)
+        except (ProcessLookupError, OSError):
+            continue
+        stopped.append((proc, who))
+    for _proc, who in stopped:
+        try:
+            _note_reader_killed(who, reason, health_event_detached)
+        except Exception:  # noqa: BLE001 - the kill below must still run
+            pass
+    for proc, _who in stopped:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+    return [{"pid": proc.pid, "user": who} for proc, who in stopped]
 
 
 async def _kill_device_holders(reason: str) -> list:
@@ -18284,6 +18317,8 @@ async def run_transports(mcp: MCPServer, port: int, socket_path: str | None, ser
     # Always-on: the reboot we are chasing does not wait for a job to be running, and the
     # in-memory ring does not survive it. Each sample also lands on disk.
     sampler.start()
+    # Spec 03 I92: its own thread, so an event loop stalled on I/O never delays a stop.
+    fsm.aer_watch.start()
 
     socket_server = None
     if socket_path:

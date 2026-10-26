@@ -52,18 +52,19 @@ class FabricDebt:
         if callback not in self._settle_listeners:
             self._settle_listeners.append(callback)
 
-    def note_reset(self, what: str) -> None:
+    def note_reset(self, what: str, journal: Optional[Callable[..., None]] = None) -> None:
         """A reset (or a broker start) happened: the fabric is unproven until a pass clears it.
-        Journaled on the transition only; a newer reset while owed just renames it."""
-        if not self.owed:
-            health_event("post_reset_fabric_owed", reset=what)
-        self.owed = what
+        Journaled on the transition only; a newer reset while owed just renames it. ``journal``
+        replaces the synchronous append (spec 03 I92 passes the detached writer)."""
+        was, self.owed = self.owed, what
+        if not was:
+            (journal or health_event)("post_reset_fabric_owed", reset=what)
 
-    def note_fabric_killed(self, what: str) -> None:
+    def note_fabric_killed(self, what: str, journal: Optional[Callable[..., None]] = None) -> None:
         """A fabric pass was cut short before its verdict (spec 03 I82): no earlier pass vouches for
         the fabric any more, and a fresh pass is owed before a release."""
         self.pass_monotonic = 0.0
-        self.note_reset(what)
+        self.note_reset(what, journal)
 
     def note_fabric(self, ok: Optional[bool]) -> None:
         """Fold one fabric verdict in: only a healthy one settles the debt."""

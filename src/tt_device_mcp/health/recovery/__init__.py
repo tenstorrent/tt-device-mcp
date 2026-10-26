@@ -320,6 +320,13 @@ class RecoveryDeps:
     # Spec 03 I86: SIGSTOP the broker's own device readers (fabric check, aiclk ceiling) before the
     # valve's PCI remove; returns the pids stopped (server._freeze_device_readers). None: no stop.
     freeze_device_readers: Optional[Callable[[str], list]] = None
+    # Spec 03 I92: the broker's own check readers still running (server._broker_device_readers), and
+    # the AER watch's stop for them: SIGSTOP then SIGKILL their groups, no verdict, from the watch
+    # thread with no I/O before the signals (server._stop_check_readers_on_aer). None: no watch.
+    broker_check_readers: Optional[Callable[[], list]] = None
+    stop_check_readers_on_aer: Optional[Callable[[str], list]] = None
+    # A journal append the journal's own writer thread fsyncs, so the caller never waits on it.
+    health_event_detached: Optional[Callable[..., None]] = None
     # Bounded wait for the pids it killed to drop out of the holder scan; returns those still
     # listed (spec 03 I19, the shared spec 01 I67 helper).
     wait_device_released: Optional[Callable[[list], Awaitable[set]]] = None
