@@ -863,8 +863,8 @@ class Recovery(ABC):
                 log(
                     f"chip(s) {[i for i in lost if i not in arc_dead]} did NOT come back from a bridge reset after "
                     f"{BRIDGE_RESET_MAX_TRIES} tries; they stay out of the kernel so they cannot take "
-                    f"the host down. Escalating to a galaxy reset — they re-enumerate on the next PCI "
-                    f"rescan, no power-cycle required."
+                    f"the host down. Escalating to a galaxy reset: it re-powers every tray and rescans them "
+                    f"back in; a chip still off the bus after it goes on to the power cycle."
                 )
             return False
         log(f"chip(s) {recovered} are back on the bus and bound to the driver")

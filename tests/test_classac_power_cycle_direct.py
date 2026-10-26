@@ -10,6 +10,7 @@ has healed an all-off bus, at startup (after a broker restart) as at run time, s
 runs. These pin the short path: the cycle is requested in the first window, behind the host rung's
 own guards, and partial drops keep the full ladder. No test reaches a real reset, sweep or power cycle."""
 
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -286,15 +287,17 @@ async def test_the_failed_reset_mark_is_set_by_a_failed_reset_and_cleared_at_the
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("spec, prelude", [({3: 1}, []), ({3: 4}, ["rescan", "capture"])])
-async def test_a_partial_drop_keeps_the_ladder(rig, spec, prelude):
+async def test_a_partial_drop_keeps_the_ladder(rig, monkeypatch, spec, prelude):
+    monkeypatch.setattr(srv, "device_hold_episode_since", (datetime.now() - timedelta(minutes=2)).isoformat())
     rig["beats"] = _beats_without(_off(rig["map"], spec))
     await _gate(rig, galaxy.STAGE_SMI_RESET)
     await _gate(rig, galaxy.STAGE_POWER_CYCLE)
-    # The mesh reset failed on this same set, so the last-chance sweep, whose last step is that same
-    # reset, is skipped and the host rung follows (spec 04 I58).
-    assert rig["order"] == [*prelude, "glx_reset", "power_cycle"]
+    # The mesh reset failed on this same set. The last-chance sweep still runs right before the host
+    # rung (spec 04 I58): its mesh reset repeats once under the I97 deadline, then the power cycle.
+    assert rig["order"] == [*prelude, "glx_reset", "sweep", "power_cycle"]
     assert "power_cycle_direct" not in _kinds(rig)
-    assert [f.get("reason") for k, f in rig["events"] if k == SKIPPED] == ["mesh_reset_failed_unchanged"]
+    assert [f.get("reason") for k, f in rig["events"] if k == SKIPPED] == []
+    assert [f["fired"] for k, f in rig["events"] if k == "whole_mesh_reset_before_host_rung"] == [True]
 
 
 # ---- the guards ---------------------------------------------------------------------------------
@@ -395,7 +398,8 @@ async def test_a_failed_startup_check_after_the_cycle_keeps_the_hold(rig):
 async def test_time_to_recover_on_a_fake_clock(rig):
     """When the cycle is requested, on the clock each failed reset (262 s) and sweep (323 s) advance.
     Class A: at once. Class C, at startup as at run time: after its one reset. The partial-tray
-    ladder (B2): after its one reset; the sweep would repeat it (I58), so it is skipped."""
+    ladder (B2): after its one reset and the last-chance sweep, which repeats it right before the
+    power cycle (I58/I100): a repeat that did not run never counts as run."""
 
     async def episode(beats, stages, phase="post-job"):
         g = rig["g"]
@@ -416,7 +420,9 @@ async def test_time_to_recover_on_a_fake_clock(rig):
     all_off_startup = await episode({}, climb, phase="startup")
     all_off_run_time = await episode({}, climb)
     part_tray = await episode(_beats_without(_off(rig["map"], {3: 5})), climb)
-    assert (whole_tray, all_off_startup, all_off_run_time, part_tray) == (0, RESET_SEC, RESET_SEC, RESET_SEC)
+    assert rig["order"][-3:] == ["glx_reset", "sweep", "power_cycle"], "the full ladder runs right before the cycle"
+    times = (whole_tray, all_off_startup, all_off_run_time, part_tray)
+    assert times == (0, RESET_SEC, RESET_SEC, RESET_SEC + SWEEP_SEC)
 
 
 # ---- across a broker restart (spec 04 I58) ------------------------------------------------------
