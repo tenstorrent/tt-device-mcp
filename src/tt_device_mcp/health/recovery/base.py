@@ -55,11 +55,20 @@ GLX_DRIVER_WAIT_GAVE_UP = re.compile(r"Didn't find all (\d+) chips\b[^\n]*giving
 GLX_TRAY_REPOWER = re.compile(
     r"ipmitool raw\b|Waiting for \d+ seconds: \d+|Waiting for all \d+ chips to show up", re.IGNORECASE
 )
+# The settle and the driver wait start only once that IPMI call returned. tt-smi raises this when the call
+# failed in both of its modes and exits before the settle: its command line alone then re-powered nothing.
+GLX_TRAY_REPOWER_FOLLOWED = re.compile(
+    r"Waiting for \d+ seconds: \d+|Waiting for all \d+ chips to show up", re.IGNORECASE
+)
+GLX_TRAY_REPOWER_FAILED = re.compile(r"IPMI command failed\b", re.IGNORECASE)
 
 
 def glx_tray_repower_ran(text: str) -> bool:
     """Spec 04 I97 (c): whether a `tt-smi -glx_reset`'s output shows the tray re-power ran."""
-    return bool(GLX_TRAY_REPOWER.search(str(text or "")))
+    text = str(text or "")
+    if GLX_TRAY_REPOWER_FOLLOWED.search(text):
+        return True
+    return bool(GLX_TRAY_REPOWER.search(text)) and not GLX_TRAY_REPOWER_FAILED.search(text)
 
 # Spec 03 I83. tt-smi prints this when the driver's POST_RESET on a chip fails after a mesh reset's
 # re-power: the reset marker did not read back zero, and the driver has just cleared the chip's
@@ -1643,8 +1652,10 @@ class RecoveryMechanism:
             health_event("reset_driver_wait_gave_up", rc=rc, tray_repower=repowered)
             return True
         if not failed and rc not in (None, 0) and not repowered:
-            log(f"mesh reset FAILED (rc {rc}): reset did not run — tt-smi exited before the tray re-power")
-            health_event("reset_did_not_run", rc=rc)
+            ipmi_failed = bool(GLX_TRAY_REPOWER_FAILED.search(str(text or "")))
+            why = "tt-smi's IPMI tray re-power failed" if ipmi_failed else "tt-smi exited before the tray re-power"
+            log(f"mesh reset FAILED (rc {rc}): reset did not run — {why}")
+            health_event("reset_did_not_run", rc=rc, **({"ipmi_failed": True} if ipmi_failed else {}))
             return True
         if not failed:
             log("mesh reset ended: tt-smi reported no POST_RESET failure; no in-flight cut")
