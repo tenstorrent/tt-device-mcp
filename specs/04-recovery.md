@@ -2599,13 +2599,27 @@ each rung fires only when the gentler one failed or cannot apply.
   `last_chance_sweep_repeats_failed_reset`), then the full check with fabric. A pass releases the
   device through the lift funnel; a failure keeps the hold and requests the power cycle. Where I36,
   I38, I58, I87 or I98 say a failed rung or a spent round skips the sweep or one of its rungs, this
-  invariant wins for the sweep before the power cycle. The time stays bounded: below the 10-min bound
-  the repeated mesh reset runs only if it and its check end before the I97 deadline (computed as
-  there); a hold too old for that waits for the bound (`last_chance_sweep_waits_for_bound`), whose
-  ladder runs the sweep in full, about 2.5-4.5 min more. The repeat runs once per hold episode
-  (I97's record), after the check readers are stopped (I87's host-hang note), and an outage hold
-  (I28) still refuses the whole sweep and holds for the operator (I22). Remaining risk: a second mesh
-  reset whose tray re-power hangs the host; the I25 latch records it.
+  invariant wins for the sweep before the power cycle. The repeated mesh reset runs at once as the I97
+  mesh reset, after the check readers are stopped (I87's host-hang note): under the I97 deadline when
+  it and its check still end by it, else under a deadline of the hold's age at the repeat's start plus
+  the same allowance (the reset that gives up, 300 s, or the reset, settle and check, 250 s). It never
+  waits idle for the 10-min bound, and the I97 reset having run this hold does not stop it. A check
+  still running at that deadline is cut as in I97. So the power cycle is requested at most 315 s (the
+  allowance, the kill grace and the reap) after the repeat starts. A repeat that did not run (a tenant
+  or a reset cycling in its scope when it would start, or a refused reset) is not a failed one: the
+  sweep holds (`host_rung_held`), requests no power cycle that pass (I22) and is not spent, so the next
+  pass runs it in full. It runs at most once per sweep record (I87): once below the bound and once at
+  it, so at most twice per hold episode. An outage hold (I28) still refuses the whole sweep and holds
+  for the operator (I22). Worst case from the hold's start to the power cycle request, per class
+  (estimates for the steps before the repeat: readers stopped, up to 10 s; isolation and SBR,
+  up to about 20 s; the bus re-probe and, once the bus is whole, one full check, up to about 3 min):
+  - **B1/B2 partial drop** (the climb's sweep below the bound): the sweep's start plus about 3.5 min
+    plus 315 s; with the climb at 5-6 min (after a mesh reset that gave up) that is about 14-15 min,
+    and at most about 19 min for a sweep that starts just before the bound.
+  - **Hold-deadline expiry at the 10-min bound** (I76): 600 s, the bound's kept rungs and their full
+    check (about 3.5 min), then the sweep as above: about 22 min at most. Before this invariant the
+    sweep's repeat could wait up to 315 s idle for the bound first.
+  Remaining risk: a second mesh reset whose tray re-power hangs the host; the I25 latch records it.
 
 ## Interfaces
 
@@ -3206,8 +3220,8 @@ sees a silent fabric pass.
 | I96 a gone chip with the SBR opt-in unset arms the one-shot and gets no SBR; its reset lifts only on a full check that passes on every cabled link (a 77, a missing verdict or a link-short fabric keeps the hold); a whole tray gone still goes to the power cycle with no reset | `tests/test_offbus_one_shot_gone_chip.py::test_a_gone_chip_arms_the_one_shot_without_an_sbr`, `::test_a_whole_gone_tray_goes_to_the_power_cycle_with_no_reset` |
 | I96 a chip back on the bus no longer arms the one-shot (the gate reads after its rescan; the forced run and the idle DOWN re-check prune it); no reset runs, the hold stays, and the 10-min bound's ladder still runs with its full check, fabric included | `tests/test_offbus_one_shot_returned.py::test_a_dead_arc_chip_back_on_the_rescan_does_not_arm_the_one_shot`, `::test_a_chip_back_while_a_tenant_waited_drops_the_one_shot`, `::test_the_down_offbus_recheck_drops_a_returned_chip_and_keeps_the_hold` |
 | I97 the SBR before the power cycle has every chip back and the full check fails on ARC-not-ready chips: one mesh reset of the whole mesh, then the full check with fabric; only its pass lifts, and a failure requests the power cycle in the same pass, its reason read from the bus as it is now | `tests/test_below_floor_offbus_ladder.py::test_an_sbr_that_has_every_chip_back_on_arc_not_ready_chips_gets_one_mesh_reset_first` |
-| I97 a refused mesh reset lifts nothing and requests the power cycle in the same pass | `tests/test_below_floor_offbus_ladder.py::test_a_refused_mesh_reset_before_the_host_rung_goes_to_the_power_cycle` |
-| I97 the reset starts only when a give-up (300 s), or the reset, settle and the check's 180 s allowance, still ends before the 585 s hold-age deadline; an older hold gets the power cycle at once | `tests/test_below_floor_offbus_ladder.py::test_the_mesh_reset_before_the_host_rung_starts_only_when_it_ends_before_the_deadline` |
+| I97 a refused mesh reset lifts nothing and requests the power cycle in the same pass (the sweep's repeat, refused, holds instead: I100) | `tests/test_below_floor_offbus_ladder.py::test_the_i97_reset_keeps_its_deadline_and_a_refusal_power_cycles_but_the_repeat_holds` |
+| I97 the reset starts only when a give-up (300 s), or the reset, settle and the check's 180 s allowance, still ends before the 585 s hold-age deadline; an older hold gets the power cycle at once | `tests/test_below_floor_offbus_ladder.py::test_the_i97_reset_keeps_its_deadline_and_a_refusal_power_cycles_but_the_repeat_holds`, `::test_the_repeated_mesh_reset_runs_at_once_under_the_deadline_or_one_from_its_start` |
 | I97 started at the latest age the deadline allows, the power cycle is requested by 600 s and the hold stays: after a failed check, and with no check after a reset that runs long, runs past the deadline or gives up at its driver wait again | `tests/test_below_floor_offbus_ladder.py::test_the_power_cycle_after_the_mesh_reset_before_the_host_rung_is_requested_by_the_bound` |
 | I97 a full check still running at the deadline is failed: its reader gets SIGTERM, then SIGKILL after the grace, nothing lifts on its late pass, and the power cycle is requested by deadline + grace + reap | `tests/test_below_floor_offbus_ladder.py::test_a_full_check_still_running_at_the_deadline_fails_and_power_cycles` |
 | I97 a fabric pass after the mesh reset short of the cabled links fails the check: the hold stays and the power cycle follows | `tests/test_below_floor_offbus_ladder.py::test_a_fabric_check_short_of_the_cabled_links_after_the_mesh_reset_before_the_host_rung_power_cycles` |
@@ -3239,6 +3253,9 @@ sees a silent fabric pass.
 | I100 below the bound, the sweep SBRs a chip whose round this hold already spent and repeats the failed mesh reset before the power cycle | `tests/test_below_floor_offbus_ladder.py::test_the_sweep_sbrs_a_chip_whose_round_this_hold_already_spent` |
 | I100 a forced run below the bound no longer skips a mesh reset that failed on the same chips: the sweep repeats it with its full check | `tests/test_below_floor_offbus_ladder.py::test_a_forced_run_below_the_bound_repeats_a_failed_mesh_reset_before_the_power_cycle`, `tests/test_below_floor_offbus_ladder.py::test_below_the_bound_a_mesh_reset_that_failed_on_the_same_chips_climbs_at_once` |
 | I100 the bound runs every kept rung, then the sweep repeats the SBR and the failed mesh reset and its full check before the power cycle | `tests/test_below_floor_offbus_ladder.py::test_the_bound_runs_every_kept_rung_in_order_then_the_power_cycle`, `tests/test_below_floor_offbus_ladder.py::test_the_bound_rescans_and_sbrs_before_the_cycle_after_a_failed_mesh_reset`, `tests/test_scoped_pci_rescan.py::test_the_10_min_ladders_rescan_is_scoped_and_a_failed_one_still_reaches_the_power_cycle` |
-| I100 below the bound, a sweep whose repeat of the failed mesh reset can no longer end before the I97 deadline holds for the bound: no SBR and no power cycle on that pass | `tests/test_below_floor_offbus_ladder.py::test_the_mesh_reset_before_the_host_rung_starts_only_when_it_ends_before_the_deadline` |
+| I100 the sweep's repeat of the failed mesh reset runs at once, under the I97 deadline or, when that is too close, one from its own start; it never waits for the bound | `tests/test_below_floor_offbus_ladder.py::test_the_repeated_mesh_reset_runs_at_once_under_the_deadline_or_one_from_its_start` |
+| I100 a hold that crosses the I97 deadline during the sweep's SBR still gets the repeated mesh reset and its full check; the power cycle is requested within 315 s of the repeat's start and nothing lifts on a failed check | `tests/test_below_floor_offbus_ladder.py::test_a_deadline_crossed_during_the_sweep_sbr_still_runs_the_repeated_mesh_reset` |
+| I100 a repeat that did not run (a tenant before it, a refused reset) holds: no power cycle, no lift, the sweep not spent | `tests/test_below_floor_offbus_ladder.py::test_a_tenant_that_arrives_before_the_repeated_mesh_reset_holds_with_no_power_cycle`, `::test_a_refused_repeated_mesh_reset_holds_with_no_power_cycle` |
+| I100 the I97 reset having run this hold does not skip the sweep's repeat; only its full check passing lifts, once | `tests/test_below_floor_offbus_ladder.py::test_the_repeated_mesh_reset_runs_after_this_holds_i97_reset_already_ran` |
 | I100 an outage hold refuses the whole sweep: nothing lifts and no power cycle is requested; the device stays held for the operator | `tests/test_below_floor_offbus_ladder.py::test_an_outage_hold_refuses_the_sweep_and_holds_for_the_operator` |
 | I100 the sweep never skips a chip's SBR as spent and repeats the failed mesh reset | `tests/test_sbr_record_per_hold.py::test_a_chip_the_gate_reset_is_not_reset_again_by_the_escalation_or_the_sweep` |
