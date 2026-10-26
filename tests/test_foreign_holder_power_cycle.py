@@ -18,8 +18,8 @@ import pytest
 from tests import test_classac_power_cycle_direct as _direct
 from tests import test_offbus_power_cycle as _gated_cycle
 from tests.conftest import patch_health_event
-from tests.test_host_action_suppress import REASON, held  # noqa: F401 - the auto power cycle's fixture
 from tests.test_classac_power_cycle_direct import EXPECTED, _beats_without, _gate, _off
+from tests.test_host_action_suppress import REASON, held  # noqa: F401 - the auto power cycle's fixture
 from tests.test_pre_reset_holder_scan import READER, _Box, _gap, _scans
 from tt_device_mcp import device_holders, holder_identity
 from tt_device_mcp import pre_reset_scan as prs
@@ -250,7 +250,9 @@ def _gap_seams(monkeypatch, *, scoped=False):
     "case, outcome",
     [("visible", "killed"), ("no-proc", "scan_incomplete"), ("scoped", "tenant_blocked"), ("d-state", "unkillable")],
 )
-async def test_a_pre_cycle_reset_runs_past_a_visible_gap_but_not_an_unseen_scoped_or_stuck_one(monkeypatch, case, outcome):
+async def test_a_pre_cycle_reset_runs_past_a_visible_gap_but_not_an_unseen_scoped_or_stuck_one(
+    monkeypatch, case, outcome
+):
     """Spec 04 I103: in a pre-cycle run, a gap pid /proc shows here outside every broker scope is run
     past, unsignalled, and recorded; one with no /proc entry here (another pid namespace) still refuses,
     one inside a broker scope is a tenant, one stuck in the kernel keeps the I21 refusal."""
@@ -341,12 +343,14 @@ def _journal(monkeypatch, events):
     """Collect the power_cycle_foreign_holders lines in ``events`` (the road's own capture stays)."""
     real = srv.health_event
     monkeypatch.setattr(
-        srv, "health_event", lambda kind, **f: events.append(f) if kind == "power_cycle_foreign_holders" else real(kind, **f)
+        srv,
+        "health_event",
+        lambda kind, **f: events.append(f) if kind == "power_cycle_foreign_holders" else real(kind, **f),
     )
     return []
 
 
-async def _auto_road(monkeypatch, tmp_path, held, setup):
+async def _auto_road(monkeypatch, tmp_path, held, setup):  # noqa: F811
     setup()
     await srv._auto_power_cycle_host(lambda m: None, REASON)
     return held["fired"]
@@ -369,7 +373,7 @@ class _Road:
 
 
 @pytest.fixture
-def road(request, monkeypatch, tmp_path, held, clear_job_state):
+def road(request, monkeypatch, tmp_path, held, clear_job_state):  # noqa: F811
     """Request one power cycle down the named road, ``setup`` run once the road is armed; returns
     what fired."""
     if request.param == "auto":
@@ -386,7 +390,9 @@ async def test_every_power_cycle_road_journals_the_foreign_holder_and_not_a_scop
     the cycle, so that road's scan finds the foreign holder only.)"""
     events: list = []
     holders = [FOREIGN_FD, SCOPED_FD] if road.road == "auto" else [FOREIGN_FD]
-    fired = await road(lambda: (_fake_proc(tmp_path, monkeypatch, *holders), events.extend(_journal(monkeypatch, events))))
+    fired = await road(
+        lambda: (_fake_proc(tmp_path, monkeypatch, *holders), events.extend(_journal(monkeypatch, events)))
+    )
     assert len(fired) == 1
     assert len(events) == 1, "one journal line per power-cycle request"
     rows = events[0]["holders"]
