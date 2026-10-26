@@ -20,7 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-from tt_device_mcp import alert, metrics
+from tt_device_mcp import alert, metrics, pre_reset_scan
 from tt_device_mcp.constants import PRE_RESET_ZOMBIE_WAIT_SEC
 from tt_device_mcp.device_holders import discount_broker_internal, holder_comm, is_tenant, username_for_uid
 from tt_device_mcp.health.evidence import health_event
@@ -1009,8 +1009,13 @@ class GalaxyRecovery(Recovery):
         mechanism.chip_pci_map = lambda: self.deps.device_pci_map()
 
     def tenant_holds(self) -> bool:
-        """The forced ladders' own tenant check, alone: a running broker job or a readable tenant fd."""
-        return self._tenant_active(self.deps.enumerate_device_holders(), force=True)
+        """The forced ladders' own tenant check, alone: a running broker job or a readable tenant fd
+        (inside :func:`pre_reset_scan.foreign_holders_yield`, spec 04 I103, only a broker job's)."""
+        return self._tenant_active(
+            self.deps.enumerate_device_holders(),
+            force=True,
+            foreign_yields=pre_reset_scan.foreign_holders_yielding(),
+        )
 
     async def _offbus_ids_now(self, expected: int) -> Optional[set]:
         """The chip ids off the bus now, or None when the heartbeats cannot be read."""
@@ -1188,14 +1193,16 @@ class GalaxyRecovery(Recovery):
         ``bound`` (spec 04 I89) marks the I76 10-min bound's own ladder: a below-floor off-bus hold
         then runs its full kept ladder even when an earlier forced run already failed its mesh reset
         on the same chips. A whole tray whose power cycle the cooldown refuses gets its full ladder
-        only in this run, once per cycle or boot (I73)."""
+        only in this run, once per cycle or boot (I73). In that run a holder outside every broker job or
+        exec scope never defers a rung: its pre-reset scan clears it like a reader (spec 04 I103)."""
         self._stand_down = stand_down
         self._bound = bound
         self.startup_verify_deferred = False
         try:
-            return await self._escalate_phase(
-                phase, indices, expected, log, stage=stage, ev=ev, beats=beats, measured_fault=measured_fault
-            )
+            with pre_reset_scan.foreign_holders_yield(bound):
+                return await self._escalate_phase(
+                    phase, indices, expected, log, stage=stage, ev=ev, beats=beats, measured_fault=measured_fault
+                )
         finally:
             self._stand_down = None
             self._bound = False
@@ -1387,8 +1394,8 @@ class GalaxyRecovery(Recovery):
         repeat of a failed reset). False while it holds, firing nothing: a reset is cycling in its own
         scope, a tenant holds the device or the scan is unreadable, an operator stand-back, or the
         power-cycle rate limits deny it (journaled; the next window asks again). True once requested.
-        ``force`` (the hold-deadline climb) waives an unreadable scan, never a
-        readable tenant or a running job.
+        ``force`` is kept for the callers: a holder outside every broker job or exec scope, and an
+        unreadable scan, never hold the cycle (spec 04 I103); a running broker job always does.
         The boot that comes back runs the startup gate, which waits for the hugepage pool and passes
         the full health check, fabric included, before it releases anything (goal 8)."""
         off_bus = len(offbus_chips)
@@ -1401,8 +1408,8 @@ class GalaxyRecovery(Recovery):
         if await asyncio.to_thread(self.mechanism.scope_active):
             log(f"{what}: a reset is cycling in its own scope — holding before the power cycle")
             return False
-        if self._tenant_active(await asyncio.to_thread(self.deps.enumerate_device_holders), force=force):
-            log(f"{what}: a tenant holds the device or the scan is unreadable — holding before the power cycle")
+        if self._tenant_active(await asyncio.to_thread(self.deps.enumerate_device_holders), foreign_yields=True):
+            log(f"{what}: a broker job holds the device — holding before the power cycle")
             return False
         # The operator's stand-back marker and command still hold it; a missing manual-recovery check
         # does not, as on the ladder's own host rung this cycle replaces (holding there would leave the
@@ -1497,7 +1504,7 @@ class GalaxyRecovery(Recovery):
         others = dataclasses.replace(scan, holders=[h for h in scan.holders if int(h.pid) not in leftovers])
         # A job the broker killed for recovery and whose process is stuck is the leftover's own
         # victim, not a running job: it would hold the rung for as long as the host lives (I77).
-        blocker = self._tenant_blocker(others, force=True, job_running=self.deps.live_job_running)
+        blocker = self._tenant_blocker(others, force=True, job_running=self.deps.live_job_running, foreign_yields=True)
         if blocker is not None:
             return "held", self._describe_blocker(blocker)
         return None
@@ -2166,7 +2173,9 @@ class GalaxyRecovery(Recovery):
         self.deps.clear_device_dirty(verified=True, why=f"gate/{gate_phase}: below-floor rescan/SBR recovered the mesh")
         return OUTCOME_RECOVERED
 
-    def _tenant_active(self, scan, *, force: bool = False, waive_job: bool = False) -> bool:
+    def _tenant_active(
+        self, scan, *, force: bool = False, waive_job: bool = False, foreign_yields: bool = False
+    ) -> bool:
         """Is anyone using the device? TWO independent sources, because either one alone lies:
 
         * the holder scan — open ``/dev/tenstorrent`` fds. Blind while a running job is off the
@@ -2184,8 +2193,14 @@ class GalaxyRecovery(Recovery):
         queue-known: resetting out from under a live job is the thing the guard is for.
 
         ``waive_job`` (the 10-min bound only) skips the running-job check for a job whose kill the
-        dead-chip valve refused (spec 03 I84): the bound sends it to the host rung, never a reset."""
-        return self._tenant_blocker(scan, force=force, waive_job=waive_job) is not None
+        dead-chip valve refused (spec 03 I84): the bound sends it to the host rung, never a reset.
+
+        ``foreign_yields`` (a power cycle, the ladder and sweep right before one, and the 10-min bound's
+        ladder; spec 04 I103): only a broker job holds, a RUNNING one in the queue or a holder inside a
+        broker job or exec scope. A holder outside every broker scope (another project's detached
+        process, whatever its uid) and an unreadable scan never defer it; the power cycle ends them.
+        A job waiting on a holder or queued is not running."""
+        return self._tenant_blocker(scan, force=force, waive_job=waive_job, foreign_yields=foreign_yields) is not None
 
     def _tenant_blocker(
         self,
@@ -2194,13 +2209,15 @@ class GalaxyRecovery(Recovery):
         force: bool = False,
         waive_job: bool = False,
         job_running: Optional[Callable[[], bool]] = None,
+        foreign_yields: bool = False,
     ) -> Optional[dict]:
         """Which check of :meth:`_tenant_active` blocks, as health_event fields, or None when none does:
         ``blocker`` is ``job_running``, ``startup_verify`` (the running escalate's I75 stand-down), ``tenant``
         (with the first tenant's pid, uid, user and comm) or ``scan_incomplete`` (with the scan's source
         and gaps). A deferral that names its blocker tells a
         real tenant apart from a scan that merely could not see. ``job_running`` replaces
-        ``deps.job_running`` for the running-job check when given."""
+        ``deps.job_running`` for the running-job check when given. ``foreign_yields``: see
+        :meth:`_tenant_active`."""
         if not waive_job and (job_running or self.deps.job_running)():
             return {"blocker": "job_running"}
         if self._stand_down is not None and self._stand_down():
@@ -2209,7 +2226,7 @@ class GalaxyRecovery(Recovery):
         # The broker's own probes and the holders it killed for a dead chip are not tenants, nor is
         # a gap they leave while exiting (spec 04 I59).
         scan = discount_broker_internal(scan)
-        tenants = [h for h in scan.holders if is_tenant(h)]
+        tenants = [h for h in scan.holders if is_tenant(h) and (getattr(h, "scoped", False) or not foreign_yields)]
         if tenants:
             h = tenants[0]
             return {
@@ -2220,7 +2237,7 @@ class GalaxyRecovery(Recovery):
                 "comm": holder_comm(h.pid),
                 "tenants": len(tenants),
             }
-        if not force and not scan.complete:
+        if not force and not foreign_yields and not scan.complete:
             return {"blocker": "scan_incomplete", "source": scan.source, "gaps": list(scan.gaps)}
         return None
 
@@ -2467,7 +2484,14 @@ class GalaxyRecovery(Recovery):
             driver_wait_gave_up=mech.last_reset_driver_wait_failed,
         )
 
-    async def _settle_and_verify_before_host_rung(
+    async def _settle_and_verify_before_host_rung(self, *args, **kwargs):
+        """The last-chance sweep right before a power cycle (spec 04 I58): run with foreign holders
+        yielding (spec 04 I103), so a holder outside every broker scope is cleared like a reader
+        and never holds the sweep or the cycle after it. See :meth:`_settle_and_verify_body`."""
+        with pre_reset_scan.foreign_holders_yield():
+            return await self._settle_and_verify_body(*args, **kwargs)
+
+    async def _settle_and_verify_body(
         self,
         expected: int,
         log,
@@ -2564,8 +2588,8 @@ class GalaxyRecovery(Recovery):
             log(f"last chance before the host rung{where}: a reset is already cycling in its own scope — adopting it")
         else:
             scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
-            if self._tenant_active(scan):
-                log(f"last chance before the host rung{where}: a tenant holds the mesh — not resetting over it")
+            if self._tenant_active(scan, foreign_yields=True):
+                log(f"last chance before the host rung{where}: a broker job holds the mesh — not resetting over it")
             else:
                 swept = True
                 health_event(
@@ -2847,7 +2871,7 @@ class GalaxyRecovery(Recovery):
             log("class A 10-min sweep: a reset is already cycling in its own scope — holding")
             return OUTCOME_WAITING
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
-        blocker = self._tenant_blocker(scan, force=True)
+        blocker = self._tenant_blocker(scan, force=True, foreign_yields=self._bound)
         if blocker is not None:
             self.tenant_deferred = True
             log(f"class A 10-min sweep: {self._describe_blocker(blocker)} — holding; sweeps once idle")
@@ -2948,7 +2972,7 @@ class GalaxyRecovery(Recovery):
         if await asyncio.to_thread(self.mechanism.scope_active):
             return False
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
-        blocker = self._tenant_blocker(scan, force=force)
+        blocker = self._tenant_blocker(scan, force=force, foreign_yields=self._bound)
         if blocker is not None:
             self.tenant_deferred = True
             log(f"hold past the ceiling but {self._describe_blocker(blocker)} — holding; escalates once idle")
@@ -3094,13 +3118,13 @@ class GalaxyRecovery(Recovery):
             )
             return False
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
-        if self._tenant_active(scan):
-            log("off-bus hold past its grace but a tenant holds the device or the scan is unreadable — holding")
+        if self._tenant_active(scan, foreign_yields=True):
+            log("off-bus hold past its grace but a broker job holds the device — holding")
             offbus_power_cycle.page_if_blocked(
                 hold_since,
                 age,
                 log,
-                "a tenant holds the device or the holder scan is unreadable",
+                "a broker job holds the device",
                 bound=grace,
                 off_bus=off_bus,
             )
@@ -3116,9 +3140,9 @@ class GalaxyRecovery(Recovery):
         # The stand-back checks can take seconds each: a tenant or a reset that arrived meanwhile
         # still holds the cycle.
         if await asyncio.to_thread(self.mechanism.scope_active) or self._tenant_active(
-            await asyncio.to_thread(self.deps.enumerate_device_holders)
+            await asyncio.to_thread(self.deps.enumerate_device_holders), foreign_yields=True
         ):
-            log("off-bus hold: a tenant or a reset arrived during the stand-back checks — holding")
+            log("off-bus hold: a broker job or a reset arrived during the stand-back checks — holding")
             return False
         # Re-read the whole box, not just the dropped tray, right before the cycle: an external power
         # event can take other trays off the bus (or the box can come back on its own) between the caller's read
@@ -3370,7 +3394,7 @@ class GalaxyRecovery(Recovery):
         if await asyncio.to_thread(self.mechanism.scope_active):
             return False
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
-        blocker = self._tenant_blocker(scan, force=force)
+        blocker = self._tenant_blocker(scan, force=force, foreign_yields=self._bound)
         if blocker is not None:
             self.tenant_deferred = True
             log(f"off-bus hold past the ceiling but {self._describe_blocker(blocker)} — holding; escalates once idle")
@@ -3723,8 +3747,8 @@ class GalaxyRecovery(Recovery):
             return skip("the check did not fail on ARC-not-ready or the heartbeat")
         if await asyncio.to_thread(self.mechanism.scope_active):
             return skip("a reset is cycling in its own scope")
-        if self._tenant_active(await asyncio.to_thread(self.deps.enumerate_device_holders)):
-            return skip("a tenant holds the device or the scan is unreadable")
+        if self._tenant_active(await asyncio.to_thread(self.deps.enumerate_device_holders), foreign_yields=True):
+            return skip("a broker job holds the device")
         self._whole_mesh_reset_spent = hold_since
         if repeat:
             log(
@@ -4294,7 +4318,8 @@ class GalaxyRecovery(Recovery):
                 "to the host rung rather than holding indefinitely"
             )
         scan = await asyncio.to_thread(self.deps.enumerate_device_holders)
-        tenant_active = self._tenant_active(scan)
+        # Spec 04 I103: only a broker job defers the host rung; a foreign holder is logged, not obeyed.
+        tenant_active = self._tenant_active(scan, foreign_yields=True)
         allowed, why = self.mechanism.auto_recovery_allowed(escalation, tenant_active=tenant_active)
         if not allowed:
             log(

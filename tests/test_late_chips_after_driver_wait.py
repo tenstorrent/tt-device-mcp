@@ -14,16 +14,23 @@ I97 deadline it is taken only when it, the settle and the full check end by that
 adds no time. Only a just-passed full check lifts the hold. No test reaches a real reset, rescan or
 power cycle."""
 
+import functools
 import time
+from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 
 from tests.conftest import patch_health_event
 from tests.test_below_floor_offbus_ladder import ALL, GONE, NEEDS, _b1_sweep, _bound_ladder, _clock, _i97, _rig
+from tests.test_pre_reset_holder_scan import _Box
+from tt_device_mcp import pre_reset_scan as prs
 from tt_device_mcp import server as srv
-from tt_device_mcp.device_holders import HolderScan
+from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 from tt_device_mcp.health.recovery import OUTCOME_TERMINAL, galaxy, pcie_guard
+from tt_device_mcp.health.recovery import base as recovery_base
 
+_real_auto_power_cycle_host = srv._auto_power_cycle_host  # before a rig stands in for it
 LATE = "30"  # the second chip of the replayed two-chip drop
 BOTH_OUT = {c: v for c, v in ALL.items() if c not in (GONE, LATE)}
 
@@ -416,3 +423,134 @@ async def test_with_the_scope_ended_the_normal_settle_and_full_check_run(monkeyp
     assert _after_sweep_mesh(order)[-1] == "full check" and "power cycle" not in order
     assert not [n for n, _k in events if n == "sweep_verify_skipped"]
     assert counters["dirty_cleared"] == 1
+
+
+# --- the second mesh reset under the pre-cycle yield (spec 04 I103) -----------------------------
+
+FOREIGN = DeviceHolder(pid=4242, uid=1000)  # a host process outside every broker job or exec scope
+IN_JOB = DeviceHolder(pid=4303, uid=1000, scoped=True)  # a process inside a broker job's scope
+JOB_PID = 4404  # the running job's own process, outside any scope the scan can read
+
+
+def _scanned_late(monkeypatch, tmp_path, *, i97, holders, late_holder=None, running_job=False):
+    """``_late`` (both chips back, every full check fails) where each mesh reset first runs the broker's
+    real pre-reset holder scan, as ``reset_with_quiesce`` does (``clear_readers_before_reset`` ->
+    ``_pre_reset_holder_scan`` -> ``clear_device_readers``; only its signal and /proc seams are stubbed).
+    A refused scan runs no reset. ``late_holder`` (and ``running_job``) appear once the sweep's first
+    reset ended, so only the second one meets them. The power cycle is the broker's real request with
+    its fire stubbed, so it writes its foreign-holder journal line. Returns (order, events, counters,
+    box); ``counters["scans"]`` holds (foreign holders yielding, refusal) per mesh reset."""
+    order, events, counters = _late(monkeypatch, tmp_path, back=2, i97=i97, verdicts=[False, False])
+    if i97:  # an early hold: the I97 deadline leaves the step and its check room
+        srv.device_hold_episode_since = datetime.now().isoformat()
+    box = _Box(monkeypatch, holders, tenants=[FOREIGN, IN_JOB, DeviceHolder(pid=JOB_PID, uid=1000)])
+    monkeypatch.setattr(
+        srv,
+        "clear_device_readers",
+        functools.partial(
+            prs.clear_device_readers,
+            kill=box.kill,
+            read_starttime=lambda pid: "100",
+            getpid=lambda: 1,
+            getpgid=lambda pid: 1 if pid == 1 else 2,
+            unkillable=lambda pid: False,
+            holder_in_reset=lambda pid: False,
+            offbus_chips=lambda: [],
+            rescan_settle_sec=0,
+        ),
+    )
+    mech = srv.recovery_mechanism
+    monkeypatch.setattr(mech, "pre_reset_scan", srv._pre_reset_holder_scan)
+    monkeypatch.setattr(mech, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "_pre_reset_blocker", None)
+    monkeypatch.setattr(srv, "current_process", None)
+    # The broker's own holder reads (the cycle's journal) see what the scan sees.
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=list(box.holders)))
+    monkeypatch.setattr(galaxy, "is_tenant", lambda h: True)
+    monkeypatch.setattr(galaxy, "holder_comm", lambda pid: "python")
+    monkeypatch.setattr(mech, "power_cycle_journal", srv._journal_power_cycle_foreign_holders)
+    monkeypatch.setattr(srv, "health_dir", lambda: tmp_path)
+    monkeypatch.setattr(recovery_base, "health_dir", lambda: tmp_path)
+    monkeypatch.setattr(srv, "_fire_power_cycle", lambda: order.append("power cycle"))
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", _real_auto_power_cycle_host)
+    rigged, scans = mech.reset_with_quiesce, []
+    counters["scans"] = scans
+
+    async def mesh(argv, log, *a, **k):
+        refused = await mech.clear_readers_before_reset(argv, "[broker]health-gate", log)
+        scans.append((prs.foreign_holders_yielding(), refused))
+        if refused:
+            order.append("mesh reset refused")
+            return None, f"reset refused: {refused}"
+        result = await rigged(argv, log, *a, **k)
+        if len(scans) == 1:
+            box.holders += [late_holder] if late_holder else []
+            if running_job:
+                monkeypatch.setattr(srv, "current_process", SimpleNamespace(pid=JOB_PID, returncode=None))
+        return result
+
+    monkeypatch.setattr(mech, "reset_with_quiesce", mesh)
+    return order, events, counters, box
+
+
+async def _climb(bound: bool):
+    """The 10-min bound's own ladder (``bound``, foreign holders yield for all of it), or the hold's
+    climb outside it, where only the last-chance sweep right before the cycle yields (a holder there
+    before the climb defers it, so that case's holder comes after the sweep's first reset)."""
+    if bound:
+        return await _bound_ladder()
+    return await srv.galaxy_recovery.escalate("offbus-forced", [GONE], 32, lambda m: None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "i97, bound", [(False, True), (True, True), (False, False)], ids=["plain-sweep", "i97", "sweep-outside-bound"]
+)
+async def test_the_late_chip_second_reset_clears_a_foreign_holder_and_keeps_its_bound(
+    monkeypatch, tmp_path, clear_job_state, i97, bound
+):
+    """Spec 04 I102 under I103: the second mesh reset runs inside the last-chance sweep right before the
+    power cycle, so its pre-reset scan runs with foreign holders yielding. A holder outside every broker
+    scope is TERMed like a reader and refuses neither reset; the second reset's wait still ends at the
+    step's start plus LATE_CHIP_STEP_SEC. Its full check fails, so nothing lifts and the power cycle
+    follows, journaling the holder."""
+    order, events, counters, box = _scanned_late(
+        monkeypatch, tmp_path, i97=i97, holders=[FOREIGN] if bound else [], late_holder=None if bound else FOREIGN
+    )
+    assert await _climb(bound) == OUTCOME_TERMINAL
+    tail = ["mesh reset", "rescan", "readers stopped", "mesh reset", "full check", "power cycle"]
+    assert _after_sweep_mesh(order) == tail
+    assert counters["scans"][-2:] == [(True, ""), (True, "")], "both resets scanned under the yield, none refused"
+    assert box.sent[FOREIGN.pid][0] == "TERM"
+    scans = [k for n, k in events if n == "pre_reset_holder_scan"]
+    assert scans[-1]["outcome"] == "killed" and [r["pid"] for r in scans[-1]["killed"]] == [FOREIGN.pid]
+    assert [k["fired"] for k in _step(events)] == [True]
+    assert [k["fired"] for k in _i97(events)] == ([True] if i97 else []), "the sweep's reset ran as the I97 one"
+    started, wait_until = counters["rescanned_at"][-1], counters["waits"][-1]
+    assert wait_until == pytest.approx(started + galaxy.LATE_CHIP_STEP_SEC, abs=1.0)
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "the failed full check keeps the hold"
+    journal = [k for n, k in events if n == "power_cycle_foreign_holders"]
+    assert len(journal) == 1 and [r["pid"] for r in journal[0]["holders"]] == [FOREIGN.pid]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("i97", [False, True], ids=["plain-sweep", "i97"])
+@pytest.mark.parametrize("who", ["in-job-scope", "running-job"])
+async def test_a_job_holder_still_refuses_the_late_chip_second_reset_and_the_hold_goes_on_to_the_cycle(
+    monkeypatch, tmp_path, clear_job_state, i97, who
+):
+    """The yield covers only holders outside every broker scope: a process inside a broker job's scope,
+    or the running job's own process, that holds the device when the second mesh reset comes still
+    refuses it. Nothing lifts (no full check passed), and the hold goes on to the power cycle."""
+    late = IN_JOB if who == "in-job-scope" else DeviceHolder(pid=JOB_PID, uid=1000)
+    order, events, counters, box = _scanned_late(
+        monkeypatch, tmp_path, i97=i97, holders=[], late_holder=late, running_job=who == "running-job"
+    )
+    assert await _bound_ladder() == OUTCOME_TERMINAL
+    assert counters["scans"][-1][0] is True and f"pid {late.pid}" in counters["scans"][-1][1]
+    assert _after_sweep_mesh(order)[:4] == ["mesh reset", "rescan", "readers stopped", "mesh reset refused"]
+    assert [k["fired"] for k in _step(events)] == [True]
+    assert [k["fired"] for k in _i97(events)] == ([True] if i97 else [])
+    assert order[-1] == "power cycle"
+    assert box.sent == {}, "a job's process is never signalled"
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "nothing lifts"

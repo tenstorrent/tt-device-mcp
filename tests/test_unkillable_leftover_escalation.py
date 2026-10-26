@@ -151,7 +151,7 @@ async def test_a_change_during_the_last_checks_holds_the_rung(fence, monkeypatch
         if change == "gone":
             fence["holders"] = []
         elif change == "tenant":
-            fence["holders"] = fence["holders"] + [DeviceHolder(pid=7300, uid=2345)]
+            fence["holders"] = fence["holders"] + [DeviceHolder(pid=7300, uid=2345, scoped=True)]
         else:
             r["scope"] = "tt-reset-1.scope"
 
@@ -241,7 +241,7 @@ async def test_a_device_op_in_flight_defers_the_try(fence, monkeypatch):
 
 async def test_another_tenant_blocks_the_rung_but_the_leftover_itself_does_not(fence):
     t0 = _open(fence)
-    fence["holders"] = fence["holders"] + [DeviceHolder(pid=7300, uid=2345)]
+    fence["holders"] = fence["holders"] + [DeviceHolder(pid=7300, uid=2345, scoped=True)]
 
     assert await _tick(t0 + BUDGET)
     assert fence["order"] == []

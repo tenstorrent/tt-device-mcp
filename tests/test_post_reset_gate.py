@@ -294,7 +294,8 @@ async def test_a_tenant_deferred_off_bus_one_shot_runs_on_the_next_idle_tick(mes
     monkeypatch.setattr(srv, "_forced_escalation_task", None)
     monkeypatch.setattr(srv, "device_hold_offbus_escalated", False)
     monkeypatch.setattr(srv, "device_hold_escalate_bucket", 0)
-    tenant = HolderScan(holders=[DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID)], complete=True)
+    # A broker job's holder: a holder outside every broker scope defers nothing (spec 04 I103).
+    tenant = HolderScan(holders=[DeviceHolder(pid=4242, uid=srv.MIN_TENANT_UID, scoped=True)], complete=True)
     scan = {"now": tenant}
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: scan["now"])
     bridges = []
