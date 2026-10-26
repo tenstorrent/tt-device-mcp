@@ -44,6 +44,8 @@ in one of those threads, and a killed job's exit is often that close to allowing
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import os
 import signal
 import time
@@ -63,6 +65,27 @@ from tt_device_mcp.holder_identity import holder_identity, read_holder_identitie
 from tt_device_mcp.peercred import username_for_uid
 
 RESET_SCOPE_PREFIX = "ttdev-reset-"
+
+# Set while the broker runs the ladder or sweep that comes right before a power cycle it may request
+# (spec 04 I103): a holder outside every broker job or exec scope is then a reader to clear, never a
+# tenant that refuses the reset. The power cycle would end that process anyway; only a broker job holds.
+_foreign_holders_yield: contextvars.ContextVar[bool] = contextvars.ContextVar("foreign_holders_yield", default=False)
+
+
+@contextlib.contextmanager
+def foreign_holders_yield(on: bool = True):
+    """Run the block with foreign (unscoped) holders yielding to automatic resets (spec 04 I103)."""
+    token = _foreign_holders_yield.set(bool(on) or _foreign_holders_yield.get())
+    try:
+        yield
+    finally:
+        _foreign_holders_yield.reset(token)
+
+
+def foreign_holders_yielding() -> bool:
+    """Whether the current task runs a pre-power-cycle ladder or sweep (:func:`foreign_holders_yield`)."""
+    return _foreign_holders_yield.get()
+
 
 # Pids of resets the broker launched outside a reset scope (the no-systemd local reset), live while
 # they run. A holder that is one of them, or below one, is a reset in flight, never a reader.
@@ -269,6 +292,7 @@ def classify_gap_pids(
 async def clear_device_readers(
     *,
     tenants_block: bool,
+    foreign_yield: bool = False,
     protected: Iterable[int] = (),
     grace_sec: float = PRE_RESET_TERM_GRACE_SEC,
     release_sec: float = HOLDER_RELEASE_WAIT_SEC,
@@ -295,6 +319,10 @@ async def clear_device_readers(
     False: its own reset gate (04 I6/I7) already ruled on tenants, ``force`` included, and they are
     only recorded here. The broker itself and its process group are never signalled. A broker-internal
     holder (one the broker already killed, still mid-exit) is a reader whatever its uid.
+
+    ``foreign_yield`` (the ladder and sweep before a power cycle, spec 04 I103): a tenant outside every
+    broker job or exec scope, and not in ``protected``, is a reader like any other and is cleared; only a
+    broker job's process still refuses the reset.
 
     Before any signal, every chip still bound but off the bus (``offbus_chips``) is detached
     (``detach_chip``, the one in-flight PCI write, all within ``detach_timeout_sec``); if one fails or the deadline
@@ -401,7 +429,7 @@ async def clear_device_readers(
     def _is_tenant(h: DeviceHolder) -> bool:
         if h.pid in protected or any(device_holders.descends_from(h.pid, p) for p in protected):
             return True
-        if not getattr(h, "scoped", False) and device_holders.is_broker_internal(h.pid):
+        if not getattr(h, "scoped", False) and (foreign_yield or device_holders.is_broker_internal(h.pid)):
             return False
         return is_tenant(h)
 
