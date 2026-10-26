@@ -216,6 +216,14 @@ def power_cycle_interval_sec(failed_cycles: int) -> int:
     return max(base, min(base * 2 ** (failed_cycles - 1), POWER_CYCLE_BACKOFF_CAP_SEC))
 
 
+def _reset_wait_sec(wait_until: Optional[float]) -> float:
+    """How long to wait for one reset: DEVICE_RESET_TIMEOUT_SEC, or less when the caller's own bound
+    (a ``time.monotonic()`` instant) ends sooner. The reset itself is never killed."""
+    if wait_until is None:
+        return DEVICE_RESET_TIMEOUT_SEC
+    return max(1.0, min(DEVICE_RESET_TIMEOUT_SEC, wait_until - time.monotonic()))
+
+
 def _local_time(epoch: float) -> str:
     return datetime.fromtimestamp(epoch).isoformat(sep=" ", timespec="seconds")
 
@@ -1096,6 +1104,7 @@ class RecoveryMechanism:
         log,
         owner: str = "[broker]health-gate",
         on_output: Optional[Callable[[str], None]] = None,
+        wait_until: Optional[float] = None,
     ) -> tuple[Optional[int], str]:
         """Run a detached no-systemd reset whose inherited flock survives the daemon."""
         self.reset_scope_seq += 1
@@ -1154,18 +1163,19 @@ class RecoveryMechanism:
                 return proc.returncode
 
             wait_task = asyncio.create_task(wait_and_stream())
+            limit = _reset_wait_sec(wait_until)
             try:
-                await aio.wait_for(asyncio.shield(wait_task), timeout=DEVICE_RESET_OVERRUN_SEC)
+                await aio.wait_for(asyncio.shield(wait_task), timeout=min(DEVICE_RESET_OVERRUN_SEC, limit))
             except asyncio.TimeoutError:
+                if limit <= DEVICE_RESET_OVERRUN_SEC:
+                    raise
                 over = (datetime.now() - started).total_seconds()
                 log(
                     f"reset still running after {int(over)}s ({unit}); waiting — it is not "
                     f"killed, and only a reset that never ends is a failure"
                 )
                 health_event("reset_overran", unit=unit, seconds=over, argv=argv)
-                await aio.wait_for(
-                    asyncio.shield(wait_task), timeout=max(1, DEVICE_RESET_TIMEOUT_SEC - DEVICE_RESET_OVERRUN_SEC)
-                )
+                await aio.wait_for(asyncio.shield(wait_task), timeout=max(1, limit - DEVICE_RESET_OVERRUN_SEC))
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
@@ -1216,6 +1226,7 @@ class RecoveryMechanism:
         log,
         owner: str = "[broker]health-gate",
         on_output: Optional[Callable[[str], None]] = None,
+        wait_until: Optional[float] = None,
     ) -> tuple[Optional[int], str]:
         """Run one device reset through the available restart-safe backend.
 
@@ -1228,6 +1239,9 @@ class RecoveryMechanism:
         tool passes the human who asked, so an operator-run reset is one row attributed to
         them, not the gate's row plus a duplicate.
 
+        ``wait_until`` (a ``time.monotonic()`` instant) ends the wait for the reset sooner than
+        DEVICE_RESET_TIMEOUT_SEC; the reset is still never killed (spec 04 I102).
+
         Returns (exit code, combined output). The code is None if the reset timed out or
         could not be launched.
         """
@@ -1235,7 +1249,7 @@ class RecoveryMechanism:
             # `tt-smi -r` is an ioctl on a device node the submitter already holds (spec 04
             # I17), so lacking a PID-1 scope selects the other backend, it does not cancel the
             # reset.
-            return await self._run_local_reset(argv, log, owner, on_output)
+            return await self._run_local_reset(argv, log, owner, on_output, wait_until)
         unit, scoped = self._reset_scope_argv(argv)
         _t0 = datetime.now()
         # Open the jobs-list row now, not on completion: a reset that overruns or never returns is
@@ -1271,8 +1285,11 @@ class RecoveryMechanism:
                 return await proc.communicate()
 
             try:
-                out, _ = await aio.wait_for(communicate(), timeout=DEVICE_RESET_OVERRUN_SEC)
+                limit = _reset_wait_sec(wait_until)
+                out, _ = await aio.wait_for(communicate(), timeout=min(DEVICE_RESET_OVERRUN_SEC, limit))
             except asyncio.TimeoutError:
+                if limit <= DEVICE_RESET_OVERRUN_SEC:
+                    raise
                 # Our timer is not the reset's deadline. The scope is deliberately never killed —
                 # a reset stopped partway through 32 ASICs is far worse than one that overran —
                 # so it is still going, and calling it failed here reports only that we stopped
@@ -1286,9 +1303,7 @@ class RecoveryMechanism:
                     f"killed, and only a scope that never ends is a failure"
                 )
                 health_event("reset_overran", unit=unit, seconds=over, argv=argv)
-                out, _ = await aio.wait_for(
-                    communicate(), timeout=max(1, DEVICE_RESET_TIMEOUT_SEC - DEVICE_RESET_OVERRUN_SEC)
-                )
+                out, _ = await aio.wait_for(communicate(), timeout=max(1, limit - DEVICE_RESET_OVERRUN_SEC))
             rc = proc.returncode
         except asyncio.TimeoutError:
             dt = (datetime.now() - _t0).total_seconds()
@@ -1420,6 +1435,7 @@ class RecoveryMechanism:
         log,
         owner: str = "[broker]health-gate",
         on_output: Optional[Callable[[str], None]] = None,
+        wait_until: Optional[float] = None,
     ) -> tuple[Optional[int], str]:
         """One reset, done safely: quiet the bus, run it where nothing can interrupt it,
         put the pollers back. Every reset in the broker goes through here — the health
@@ -1429,6 +1445,8 @@ class RecoveryMechanism:
         caller's critical section usually spans the verification too).
 
         ``owner`` is passed straight to the jobs-list row (see ``run_scoped``).
+
+        ``wait_until``: see ``run_scoped``.
 
         Returns (exit code, combined output); the code is None on timeout/launch failure.
         """
@@ -1477,10 +1495,11 @@ class RecoveryMechanism:
         rc = None
         text = ""
         try:
+            bound = {} if wait_until is None else {"wait_until": wait_until}
             if stream is None:
-                rc, text = await self.run_scoped(argv, log, owner)
+                rc, text = await self.run_scoped(argv, log, owner, **bound)
             else:
-                rc, text = await self.run_scoped(argv, log, owner, stream)
+                rc, text = await self.run_scoped(argv, log, owner, stream, **bound)
             if mesh:
                 rc = self._note_bmc_guard_output(argv, owner, rc, text, log)
             return rc, text
