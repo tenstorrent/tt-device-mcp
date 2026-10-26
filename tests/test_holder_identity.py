@@ -7,6 +7,8 @@ redacted, truncated, and never raising when the process is gone or a file is mis
 from __future__ import annotations
 
 import os
+import threading
+import time
 
 import pytest
 
@@ -124,6 +126,8 @@ def test_an_unexpected_read_error_is_recorded_not_raised(proc):
         (["HF_TOKEN=hf_abc123", "python"], "hf_abc123", "HF_TOKEN=***"),
         (["curl", "https://bob:s3cret@example.com/x"], "s3cret", "https://***@example.com/x"),
         (["curl", "https://bob@example.com/x"], "bob", "https://***@example.com/x"),
+        (["psql", "postgres://bob:p@zz9@db.example/x"], "zz9", "postgres://***@db.example/x"),
+        (["psql", "postgres://bob:a@b@zz9@db.example"], "zz9", "postgres://***@db.example"),
         (["app", "https://h/x?access_token=abc123&a=1"], "abc123", "access_token=***&a=1"),
         (["app", '{"client_secret": "abc123"}'], "abc123", '"client_secret": "***"'),
         (["app", "--db-passwd=abc123"], "abc123", "--db-passwd=***"),
@@ -156,6 +160,53 @@ def test_control_characters_never_reach_the_log_line():
 
 def test_identities_are_deduplicated_in_order(proc):
     _stage(proc, 11)
-    rows = hi.holder_identities([11, 12, 11])
+    rows = hi.read_holder_identities([11, 12, 11])
     assert [r["pid"] for r in rows] == [11, 12]
     assert rows[1]["status"] == "gone"
+
+
+def test_an_at_sign_after_the_host_is_not_userinfo():
+    line = hi.format_cmdline(b"curl\0https://example.com/x?to=a@b\0https://h?q=a@b\0")
+    assert line == "curl https://example.com/x?to=a@b https://h?q=a@b"
+
+
+def test_a_read_stuck_in_the_kernel_is_left_unread_within_the_bound():
+    """A /proc read can block (the target's mmap lock, NSS): the reads share one fixed bound, a read
+    still running at it is recorded unread and never waited for, and the others are kept. A pid whose
+    read is still stuck is not read again, so a holder stuck across scans leaves one thread behind."""
+    release = threading.Event()
+    started = []
+
+    def read(pid):
+        started.append(pid)
+        if pid == 21:
+            release.wait()
+        if pid == 23:
+            raise PermissionError("denied")
+        return {"pid": pid, "status": "live"}
+
+    try:
+        t0 = time.monotonic()
+        rows = hi.read_holder_identities([21, 22, 23], timeout=0.3, read=read)
+        assert time.monotonic() - t0 < 0.3 + 0.5
+        assert rows == [
+            {"pid": 21, "status": "unread", "error": "timeout"},
+            {"pid": 22, "status": "live"},
+            {"pid": 23, "status": "live", "error": "PermissionError"},
+        ]
+        assert "unread (timeout)" in hi.describe_identity(rows[0])
+        t0 = time.monotonic()
+        again = hi.read_holder_identities([21], timeout=5.0, read=read)
+        assert again == [{"pid": 21, "status": "unread", "error": "timeout"}]
+        assert time.monotonic() - t0 < 1.0 and started.count(21) == 1
+    finally:
+        release.set()
+    for _ in range(100):  # the stuck read ends: the pid is read again next time
+        if 21 not in hi._reads_in_flight:
+            break
+        time.sleep(0.01)
+    assert hi.read_holder_identities([21], timeout=1.0, read=read) == [{"pid": 21, "status": "live"}]
+
+
+def test_the_identity_bound_is_a_short_fixed_constant():
+    assert 0 < hi.HOLDER_IDENTITY_READ_TIMEOUT_SEC <= 2

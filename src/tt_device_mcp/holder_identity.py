@@ -7,16 +7,23 @@ A holder outside the broker blocks gates and resets, and by the time anyone read
 has usually exited, so a pid and a user name alone cannot say what it was. ``holder_identity``
 reads, from /proc only (no subprocess), what identifies the process afterwards: its parent, uid,
 command line (secrets redacted, truncated), cgroup and systemd unit, and start time. A process that
-exits mid-read is recorded as gone, and an unreadable field is left out: it never raises and never
-waits, so the scan it describes keeps its timing and its verdict.
+exits mid-read is recorded as gone, and an unreadable field is left out: it never raises.
+
+A /proc read can still block: the kernel takes the target's mmap lock to read its command line,
+and a holder stuck in the kernel can hold it; a uid lookup can wait on NSS. So callers use
+``read_holder_identities``: each read runs on its own thread and all of them share one fixed
+bound, ``HOLDER_IDENTITY_READ_TIMEOUT_SEC``. A read still running at the bound is recorded as
+unread and left behind, so the scan it describes keeps its timing and its verdict.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import threading
+import time
 from datetime import datetime
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 from tt_device_mcp.peercred import username_for_uid
 
@@ -31,8 +38,9 @@ _SECRET_NAME = r"[\w.-]*(?:token|key|secret|passwd|password)[\w.-]*"
 _NAMED_VALUE = re.compile(rf"({_SECRET_NAME})([\"']?\s*[=:]\s*[\"']?)([^\s\"',&;]+)", re.IGNORECASE)
 # A flag naming a secret whose value is the next argument (``--token abc``).
 _SECRET_FLAG = re.compile(rf"^--?{_SECRET_NAME}$", re.IGNORECASE)
-# URL userinfo (``scheme://user:pass@host``).
-_URL_USERINFO = re.compile(r"([a-z][a-z0-9+.-]*://)[^/@\s]+@", re.IGNORECASE)
+# URL userinfo (``scheme://user:pass@host``), up to the last '@' before the host, so a password
+# that contains '@' is covered whole.
+_URL_USERINFO = re.compile(r"([a-z][a-z0-9+.-]*://)[^/?#\s]+@", re.IGNORECASE)
 
 
 def redact_argv(argv: Iterable[str]) -> list[str]:
@@ -150,21 +158,72 @@ def holder_identity(pid: int) -> dict:
     return out
 
 
-def holder_identities(pids: Iterable[int]) -> list[dict]:
-    """``holder_identity`` for each distinct pid, in order."""
-    seen: set = set()
-    rows = []
-    for pid in pids:
-        if pid not in seen:
-            seen.add(pid)
-            rows.append(holder_identity(pid))
-    return rows
+# One bound for all the identity reads of a scan (module docstring). Logging only: a fixed constant,
+# no per-box setting, so it can never stretch a gate or a reset rung.
+HOLDER_IDENTITY_READ_TIMEOUT_SEC = 1.5
+
+# Pids whose earlier read is still running (stuck in the kernel): not read again until it ends, so a
+# holder stuck across many scans leaves one thread behind, not one per scan.
+_reads_in_flight: set = set()
+_reads_lock = threading.Lock()
+
+
+def _unread(pid: int, error: str) -> dict:
+    return {"pid": int(pid), "status": "unread", "error": error}
+
+
+def read_holder_identities(
+    pids: Iterable[int], *, timeout: Optional[float] = None, read: Optional[Callable[[int], dict]] = None
+) -> list[dict]:
+    """``holder_identity`` (or ``read``) for each distinct pid, in order, each on its own daemon thread,
+    all within ``timeout`` (default ``HOLDER_IDENTITY_READ_TIMEOUT_SEC``) in total. A read not back by
+    then, or whose pid already has a read stuck from an earlier call, is recorded as
+    ``{pid, status: 'unread', error: 'timeout'}`` and is never waited for. Never raises."""
+    timeout = HOLDER_IDENTITY_READ_TIMEOUT_SEC if timeout is None else timeout
+    read = read or holder_identity
+    order = list(dict.fromkeys(int(p) for p in pids))
+    rows: dict = {}
+    lock = threading.Lock()
+
+    def run(pid: int) -> None:
+        try:
+            row = read(pid)
+        except Exception as e:  # noqa: BLE001 - logging only
+            row = {"pid": pid, "status": "live", "error": type(e).__name__}
+        finally:
+            with _reads_lock:
+                _reads_in_flight.discard(pid)
+        with lock:
+            rows[pid] = row
+
+    threads = []
+    for pid in order:
+        with _reads_lock:
+            if pid in _reads_in_flight:
+                continue
+            _reads_in_flight.add(pid)
+        t = threading.Thread(target=run, args=(pid,), name=f"holder-identity-{pid}", daemon=True)
+        try:
+            t.start()
+        except Exception:  # noqa: BLE001 - no thread to spare: the row is left unread
+            with _reads_lock:
+                _reads_in_flight.discard(pid)
+            continue
+        threads.append(t)
+    deadline = time.monotonic() + timeout
+    for t in threads:
+        t.join(max(0.0, deadline - time.monotonic()))
+    with lock:
+        got = dict(rows)
+    return [got.get(pid) or _unread(pid, "timeout") for pid in order]
 
 
 def describe_identity(row: dict) -> str:
     """One log line for a ``holder_identity`` row."""
     if row.get("status") == "gone" and "cmdline" not in row:
         return f"pid {row['pid']} gone before it could be read"
+    if row.get("status") == "unread":
+        return f"pid {row['pid']} unread ({row.get('error', '')})"
     keys = ("ppid", "parent_comm", "user", "uid", "unit", "cgroup", "started", "cmdline", "error")
     parts = [f"{k}={row[k]!r}" if k == "cmdline" else f"{k}={row[k]}" for k in keys if row.get(k) not in (None, "")]
     gone = " (gone)" if row.get("status") == "gone" else ""

@@ -930,6 +930,54 @@ async def test_each_holder_is_identified_before_it_is_signalled(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_stuck_identity_read_delays_neither_the_scan_nor_its_signals(monkeypatch):
+    """A holder stuck in the kernel can block its /proc read: the scan reads identities off the loop
+    under one fixed bound, records that holder unread and goes on. The verdict, the holders found and
+    the signals are the ones a read that answers at once gives, and the loop keeps running."""
+    import threading
+
+    from tt_device_mcp import holder_identity as hi
+
+    monkeypatch.setattr(hi, "HOLDER_IDENTITY_READ_TIMEOUT_SEC", 0.3)
+    live = {}
+    for stuck_read in (False, True):
+        release = threading.Event()
+
+        def read(pid, stuck_read=stuck_read, release=release):
+            if stuck_read and pid == READER.pid:
+                release.wait()
+            return {"pid": pid, "status": "live"}
+
+        monkeypatch.setattr(prs, "holder_identity", read)
+        box = _Box(monkeypatch, [TENANT, READER], tenants=[TENANT])
+        ticks = []
+
+        async def heartbeat():
+            while True:
+                ticks.append(1)
+                await asyncio.sleep(0.02)
+
+        beat = asyncio.ensure_future(heartbeat())
+        try:
+            t0 = time.monotonic()
+            result = await box.run(tenants_block=False)
+            took = time.monotonic() - t0
+        finally:
+            beat.cancel()
+            release.set()
+        live[stuck_read] = (result.outcome, result.found, result.tenants, box.sent, result.refusal())
+        if stuck_read:
+            assert took < 0.3 + 0.5, took
+            assert len(ticks) >= 5, "the event loop stalled behind the identity read"
+            assert result.identities == [
+                {"pid": TENANT.pid, "status": "live"},
+                {"pid": READER.pid, "status": "unread", "error": "timeout"},
+            ]
+    assert live[True] == live[False]
+    assert live[True][0] == "killed" and live[True][3] == {READER.pid: ["TERM"]}
+
+
+@pytest.mark.asyncio
 async def test_a_holder_gone_before_its_identity_is_read_changes_nothing(monkeypatch, tmp_path):
     from tt_device_mcp import holder_identity
 

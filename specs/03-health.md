@@ -719,8 +719,10 @@ cooldown (spec 04 I65) holds longer.
   Logging only: the gate that places the hold, and this verify, name each foreign holder
   (`holders`: pid, ppid and parent comm, uid/user, systemd unit and cgroup, start time, and the
   command line with secret-named values and URL userinfo redacted, cut to 256 chars), read from
-  /proc at first sighting; one gone mid-read is recorded `gone`. The read never raises, signals
-  or waits, and changes no verdict.
+  /proc at first sighting; one gone mid-read is recorded `gone`. The reads run off the event
+  loop under one fixed bound (1.5 s per scan); one still blocked then (a holder stuck in the
+  kernel) is recorded `unread` and never waited for. The read never raises or signals, and
+  changes no verdict.
 - **I44 — An idle foreign holder is named, never signalled.** A tenant process (`is_tenant`) that
   holds a device fd outside every broker job/exec scope and is not a descendant of the broker is
   tracked by its `/proc/<pid>/stat` CPU time (utime+stime+cutime+cstime), keyed on (pid, starttime)

@@ -207,7 +207,7 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
-from tt_device_mcp.holder_identity import describe_identity, holder_identities
+from tt_device_mcp.holder_identity import describe_identity, read_holder_identities
 from tt_device_mcp.job_preflight import preflight_output_dirs
 from tt_device_mcp.job_reap import (
     DEAD_CHIP_LABEL_PREFIX,
@@ -5782,9 +5782,9 @@ def _log_foreign_holder_identities(prefix: str, pids, *, first_sighting_only: bo
     """Read each foreign holder's ``holder_identity`` (from /proc only; nothing is signalled) and log
     one server.log line per holder: every call, or with ``first_sighting_only`` once per process,
     for a caller that polls. Logging only: never a job log, which another user may read, and never
-    raises."""
+    raises. The reads share one fixed bound (``read_holder_identities``); call it off the event loop."""
     try:
-        rows = holder_identities(pids)
+        rows = read_holder_identities(pids)
     except Exception as e:  # noqa: BLE001 - logging only
         if logger:
             logger.warning(f"{prefix} foreign holder identity unreadable: {e!r}")
@@ -7224,7 +7224,10 @@ async def device_health_gate(
     if foreign:
         who = ", ".join(f"{h.username}(pid {h.pid})" for h in foreign)
         _log(f"skip: device held by {who}; not touching it")
-        identities = _log_foreign_holder_identities(f"HEALTH-GATE[{phase}]", (h.pid for h in foreign))
+        # Off the loop and bounded: a /proc read of a holder stuck in the kernel can block.
+        identities = await asyncio.to_thread(
+            _log_foreign_holder_identities, f"HEALTH-GATE[{phase}]", [h.pid for h in foreign]
+        )
         _clear_device_dirty_unverified(f"foreign holder present: {who}", fault="foreign_holder", holders=identities)
         _remember_foreign_holders(identities)
         # A door already held (a startup verify, a prior fault) outlives this skip: the verify

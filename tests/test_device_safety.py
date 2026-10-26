@@ -3717,6 +3717,55 @@ async def test_a_foreign_holder_hold_journals_and_logs_who_the_holder_is(monkeyp
     assert "abc123" not in ident[0] and "unit=session-3.scope" in ident[0]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stuck_read", [False, True])
+async def test_a_stuck_identity_read_never_delays_the_gate_or_its_hold(monkeypatch, tmp_path, stuck_read):
+    """The gate reads a foreign holder's identity off the loop under one fixed bound: a read that
+    blocks (a holder stuck in the kernel holding its mmap lock) is recorded unread at the bound, and
+    the hold, its reason and the journaled verdict are the ones a read that answers gives."""
+    import threading
+    import time
+
+    from tt_device_mcp import holder_identity
+    from tt_device_mcp.device_holders import DeviceHolder
+
+    release = threading.Event()
+
+    def read(pid):
+        if stuck_read:
+            release.wait()
+        return {"pid": pid, "status": "live"}
+
+    monkeypatch.setattr(holder_identity, "holder_identity", read)
+    monkeypatch.setattr(holder_identity, "HOLDER_IDENTITY_READ_TIMEOUT_SEC", 0.3)
+    (tmp_path / "0").write_text("")
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        srv, "enumerate_device_holders", lambda: HolderScan(holders=[DeviceHolder(pid=4242, uid=1000)], complete=True)
+    )
+    srv.device_op_lock = None
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    monkeypatch.setattr(srv, "logger", _LineLogger([]))
+
+    srv._mark_device_dirty("job 512 ended killed (exit -9)")
+    try:
+        t0 = time.monotonic()
+        await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+        took = time.monotonic() - t0
+    finally:
+        release.set()
+
+    assert took < 0.3 + 0.5, took
+    assert srv.fsm.record.why == "foreign_holder" and "pid 4242" in srv.fsm.record.detail
+    assert srv.fsm.state is ServerState.RECOVERING and not srv.fsm.record.dirty
+    (held,) = [f for k, f in events if k == "device_dirty_dropped_held"]
+    assert held["verified"] is False and "foreign holder" in held["why"]
+    expected = {"pid": 4242, "status": "unread", "error": "timeout"} if stuck_read else {"pid": 4242, "status": "live"}
+    assert held["holders"] == [expected]
+
+
 def test_a_polled_holder_is_logged_at_first_sighting_only(monkeypatch, tmp_path):
     """The job door re-scans every few seconds: each holder's identity is logged the first time it is
     seen, not on every poll, and the reason it returns is unchanged."""
