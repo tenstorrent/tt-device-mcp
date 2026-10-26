@@ -157,7 +157,9 @@ async def test_no_late_chip_step_without_the_repower_or_when_the_rescan_was_with
     assert await _bound_ladder() == OUTCOME_TERMINAL
     assert _after_sweep_mesh(order) == ["mesh reset", "full check", "power cycle"]
     step = _step(events)
-    assert step == ([] if not repower else [{"fired": False, "reason": "the rescan after the reset was withheld (I69)"}])
+    assert step == (
+        [] if not repower else [{"fired": False, "reason": "the rescan after the reset was withheld (I69)"}]
+    )
     assert counters["dirty_cleared"] == 0
 
 

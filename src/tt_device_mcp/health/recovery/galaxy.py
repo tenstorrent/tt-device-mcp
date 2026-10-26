@@ -3692,6 +3692,7 @@ class GalaxyRecovery(Recovery):
             hold_age_sec=round(age, 1),
             repeat=repeat,
         )
+
         def late_chips_fit() -> str:
             # Spec 04 I102 under I97: the second mesh reset, the settle and the check end by the deadline.
             now = _hold_age_sec(hold_since) or age
