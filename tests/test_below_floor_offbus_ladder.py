@@ -1122,6 +1122,85 @@ async def test_the_repeated_mesh_reset_runs_after_this_holds_i97_reset_already_r
         assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0 and len(reasons) == 1
 
 
+def _failed_in_an_earlier_hold():
+    """Re-key the failed mesh reset on chip 31 to an earlier hold of this boot (or one before a broker
+    restart): this hold's one mesh reset is not spent (I87), so the gate meets I58, not the spent rule."""
+    mech = srv.recovery_mechanism
+    earlier = (datetime.now() - timedelta(hours=1)).isoformat()
+    for entry in mech._reset_record()["failed"]:
+        entry["episode"] = earlier
+    mech.mesh_reset_failed_since_release = False
+    assert not mech.mesh_reset_spent(srv.device_hold_episode_since)
+    assert mech.rung_failed_unchanged("", "mesh_reset", {GONE})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["check-passes", "check-fails", "tenant-before-the-repeat"])
+async def test_the_gates_i58_skip_reaches_the_power_cycle_only_through_the_sweep(
+    monkeypatch, tmp_path, clear_job_state, case
+):
+    """The gate's mesh reset meets a reset that already failed on exactly chip 31 this boot (I58): it does
+    not fire it and reports the rung failed, so the router names the host rung. That rung's last-chance
+    sweep stops the readers, isolates the dead link, SBRs chip 31 and repeats the mesh reset under the
+    I97 deadline, then runs the full check with fabric. Only a pass lifts the hold, once; a fail requests
+    the power cycle within the repeat's start plus the reset's and check's 300 s, the kill grace and the
+    reap. A repeat that did not run (a tenant arrived after the SBR) holds with no power cycle."""
+    passes = case == "check-passes"
+    order, events, counters, reasons = _b1_sweep(monkeypatch, tmp_path, verdicts=[False, passes], mesh_heals=passes)
+    _failed_in_an_earlier_hold()
+    clock, cycled_at = _clock(monkeypatch), []
+    mech, gr, tenant = srv.recovery_mechanism, srv.galaxy_recovery, {"on": False}
+    real_sbr = gr._sbr
+
+    async def sbr(log, **k):
+        healed = await real_sbr(log, **k)
+        tenant["on"] = case == "tenant-before-the-repeat"
+        return healed
+
+    async def mesh(argv, log, *a, **k):
+        order.append("mesh reset")
+        clock.shift += 60
+        monkeypatch.setattr(mech, "last_reset_rc", 0 if passes else 1)
+        return mech.last_reset_rc, ""
+
+    async def power_cycle(log, reason):
+        order.append("power cycle")
+        cycled_at.append(galaxy._hold_age_sec(srv.device_hold_episode_since))
+        reasons.append(reason)
+
+    monkeypatch.setattr(gr, "_sbr", sbr)
+    monkeypatch.setattr(gr, "_tenant_active", lambda scan, **k: tenant["on"])
+    monkeypatch.setattr(mech, "reset_with_quiesce", mesh)
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+
+    gate = await gr.escalate("gate/post-job", [GONE], 32, lambda m: None, stage=galaxy.STAGE_SMI_RESET)
+    assert gate == OUTCOME_WAITING and "reset_rung_skipped_failed_unchanged" in [n for n, _ in events]
+    assert "mesh reset" not in order and "power cycle" not in order, "I58 skips the gate's reset, nothing more"
+
+    out = await gr.escalate("gate/post-job", [GONE], 32, lambda m: None, stage=galaxy.STAGE_POWER_CYCLE)
+    sbr_step = f"sbr ['{GONE}']"
+    assert order[: order.index(sbr_step)] == ["readers stopped", f"isolate {GONE}"]
+    tail = order[order.index(sbr_step) :]
+    if case == "tenant-before-the-repeat":
+        assert out == OUTCOME_WAITING and tail == [sbr_step, "full check"], "no reset over the tenant, no cycle"
+        assert not reasons and counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
+        assert [k["reason"] for n, k in events if n == "host_rung_held"] == ["repeated mesh reset did not run"]
+        spent = mech.sweep_spent
+        assert spent is None or spent[0] != srv.device_hold_episode_since, "the next pass runs the sweep in full"
+        return
+    assert tail == [sbr_step, "full check", "mesh reset", "full check"] + ([] if passes else ["power cycle"])
+    fired = _i97(events)
+    assert [(k["fired"], k["repeat"]) for k in fired] == [(True, True)]
+    if passes:
+        assert out == OUTCOME_RECOVERED and counters["dirty_cleared"] == 1 and not reasons
+        return
+    assert out == OUTCOME_WAITING and counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
+    allowance = NEEDS + galaxy.MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC + galaxy.MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC
+    start = fired[0]["hold_age_sec"]
+    assert len(cycled_at) == 1 and cycled_at[0] <= start + allowance, f"power cycle requested at {cycled_at[0]:.0f}s"
+    assert cycled_at[0] <= galaxy._stuck_hold_ceiling_sec(), "requested by the 10-min bound"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "reset_sec, gives_up, checked",

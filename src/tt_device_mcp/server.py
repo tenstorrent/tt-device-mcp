@@ -54,7 +54,17 @@ from pydantic import AliasChoices, BaseModel, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 
-from tt_device_mcp import __version__, aio, alert, device_activity, loop_watch, metrics, privileges, telemetry
+from tt_device_mcp import (
+    __version__,
+    aio,
+    alert,
+    device_activity,
+    device_lock,
+    loop_watch,
+    metrics,
+    privileges,
+    telemetry,
+)
 from tt_device_mcp.constants import (
     DEFAULT_PORT,
     DEVICE_RESET_DETAIL_PREFIX,
@@ -9178,6 +9188,11 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
     payload["leftover_fence"] = _leftover_fence_payload()
     # Spec 04 I92: the tenant or reader the last pre-reset holder scan refused a reset for.
     payload["pre_reset_blocked_by"] = _pre_reset_blocker
+    # Spec 05 I9: where the lock is configured, whether every node is locked, recorded drift and
+    # the group members it is not effective for. Absent on a host that never configured it.
+    lock_view = device_lock.health_view()
+    if lock_view is not None:
+        payload["device_lock"] = lock_view
     return payload
 
 
@@ -15072,6 +15087,61 @@ async def _restore_queued_jobs() -> None:
         health_event("queue_restored", restored=restored, unreadable=broken, dropped=dropped, finished=finished)
 
 
+# Spec 05 I9: the opt-in lock's flip. Seconds between looks at the node modes.
+_DEVICE_LOCK_POLL_SEC = 30
+
+
+def _device_lock_blocker() -> Optional[str]:
+    """What keeps the broker from re-applying the node modes now, or None. Under the opt-in every
+    job this broker started carries the device gid, so only a job re-adopted from before the start
+    could lose the device to the flip; a recovery or reset in flight is left alone entirely."""
+    if readopted_scopes:
+        return "re-adopted job scope live"
+    if current_job_id is not None or any(j.status == JobStatus.RUNNING for j in jobs.values()):
+        return "job running"
+    if fsm.state != ServerState.HEALTHY:
+        return f"device {fsm.state.value}"
+    return None
+
+
+async def _device_lock_step() -> str:
+    """One look: 'locked' (every node 0660 ttdev; marked in effect), 'waiting' (no nodes yet, or a
+    blocker) or 'drift' (the flip ran and a node is still open: recorded once, the loop stops)."""
+    nodes = device_lock.device_nodes()
+    if not nodes:
+        return "waiting"
+    if not device_lock.node_drift(nodes):
+        device_lock.mark_applied()
+        return "locked"
+    if _device_lock_blocker() is not None:
+        return "waiting"
+    drift = await asyncio.to_thread(device_lock.flip)
+    if not drift:
+        device_lock.mark_applied()
+        health_event("device_lock_applied", nodes=len(nodes))
+        if logger:
+            logger.info(f"DEVICE_LOCK applied: {len(nodes)} node(s) 0660 {device_lock.LOCK_GROUP}")
+        return "locked"
+    if device_lock.record_drift(drift, source="broker"):
+        health_event("device_lock_drift", source="broker", nodes=drift)
+    if logger:
+        logger.warning(f"DEVICE_LOCK drift persists after udev trigger on {drift}; lock not in effect there")
+    return "drift"
+
+
+async def _device_lock_loop() -> None:
+    """Runs only under the opt-in (TT_DEVICE_MCP_DEVICE_LOCK=1). Never unlocks, never touches a
+    recovery path: it only asks udev to re-apply the installed rule while the device is idle."""
+    while True:
+        try:
+            if await _device_lock_step() in ("locked", "drift"):
+                return
+        except Exception as e:  # noqa: BLE001 - the lock flip must never take the broker down
+            if logger:
+                logger.error(f"DEVICE_LOCK step failed: {e}")
+        await asyncio.sleep(_DEVICE_LOCK_POLL_SEC)
+
+
 async def _record_startup_health() -> None:
     """Record what the mesh looked like the moment this broker came up.
 
@@ -15999,6 +16069,9 @@ async def run_startup_tasks() -> None:
     # Answers "did it come back?" next to the reboot row that says it went away.
     # Fire-and-forget: a health REPORT must never gate the queue coming up.
     asyncio.create_task(_record_startup_health())
+    # Spec 05 I9: the opt-in lock comes into effect between jobs, never over one.
+    if device_lock.opted_in():
+        asyncio.create_task(_device_lock_loop())
     # And then answers it properly, once the device is ours to test — this lifts the hold above on a
     # healthy verdict, holds/escalates on a wedge.
     _startup_verify_ready_at = None
