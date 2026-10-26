@@ -2634,14 +2634,23 @@ each rung fires only when the gentler one failed or cannot apply.
   holder scan that cannot read every process never veto or delay the cycle, and no warning wait is
   added for them: the cycle ends them. Before a power cycle the ladder and the sweep still run in
   full (I100) and their pre-reset scan clears such a holder like a reader;
-  a whole-tray or all-chips-off drop still goes straight to the cycle. With the cycle the broker
-  journals `power_cycle_foreign_holders` naming each such holder (pid, uid, user, comm, the redacted
-  command line and parent chain fields of the holder-identity record), bounded at 3 s and never
-  holding the cycle. A running broker job keeps its deferral; the request stays pending and fires
-  on the first tick after the job ends, after the ladder and sweep. The I97 deadline design is
-  unchanged. Known gap: below the bound and outside a pre-cycle run, an automatic reset's pre-reset
-  scan that cannot read a holder still refuses that reset; the bound's ladder and the cycle are not
-  held by it.
+  a whole-tray or all-chips-off drop still goes straight to the cycle. In that pre-cycle run the
+  scan also runs past a holder it could not read (a gap) when /proc shows the pid here outside every
+  broker scope, not protected and not the running job: the reset goes ahead without signalling it,
+  and `pre_reset_holder_scan` records it in `gaps_passed`. A gap inside a broker scope or protected
+  still counts as a tenant and refuses the reset; a gap stuck in the kernel (D state or SIGKILL
+  pending) is unkillable and keeps the I21 refusal; a gap with no /proc entry here still refuses,
+  because it may be a reader in another pid namespace that the broker can neither see nor signal,
+  and a reset under a live reader risks completion timeouts and a host reset. Every power-cycle
+  request the broker makes (the automatic cycle and the off-bus gated cycle alike) goes through one
+  hook that journals `power_cycle_foreign_holders` naming each such holder (pid, uid, user, comm,
+  the redacted command line and parent chain fields of the holder-identity record), bounded at 3 s;
+  a journal that hangs or fails never holds the cycle. A running broker job keeps its deferral; the
+  request stays pending and fires on the first tick after the job ends, after the ladder and sweep.
+  The I97 deadline design is unchanged. Known gap: below the bound and outside a pre-cycle run, an
+  automatic reset's pre-reset scan that cannot read a holder still refuses that reset, visible in
+  /proc or not; in a pre-cycle run a gap with no /proc entry still refuses its reset. Neither holds
+  the bound's ladder from running on, the sweep, or the cycle.
 
 ## Interfaces
 
@@ -3284,7 +3293,12 @@ sees a silent fabric pass.
 | I100 an outage hold refuses the whole sweep: nothing lifts and no power cycle is requested; the device stays held for the operator | `tests/test_below_floor_offbus_ladder.py::test_an_outage_hold_refuses_the_sweep_and_holds_for_the_operator` |
 | I100 the sweep never skips a chip's SBR as spent and repeats the failed mesh reset | `tests/test_sbr_record_per_hold.py::test_a_chip_the_gate_reset_is_not_reset_again_by_the_escalation_or_the_sweep` |
 | I103 a holder outside every broker scope never holds a class A/C cycle, before or at the deadline; a broker job's holder or a running job does | `tests/test_classac_power_cycle_direct.py::test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_tenant`, `tests/test_foreign_holder_power_cycle.py::test_a_foreign_holder_never_delays_the_all_chips_off_cycle` |
-| I103 at the 10-min bound a foreign holder on a partial drop gets the full ladder and the sweep, then the cycle; the identity is journaled | `tests/test_foreign_holder_power_cycle.py::test_a_foreign_holder_at_the_bound_gets_the_ladder_and_sweep_then_the_cycle` |
+| I103 at the 10-min bound a foreign holder on a partial drop gets the full ladder and the sweep, then the cycle; the identity is journaled | `tests/test_foreign_holder_power_cycle.py::test_the_bound_ladder_and_sweep_resets_clear_a_foreign_holder_then_the_cycle`, `::test_a_foreign_holder_at_the_bound_gets_the_ladder_and_sweep_then_the_cycle` |
 | I103 a running broker job defers the cycle until it ends, then the cycle fires; a job waiting on a holder or queued does not defer it | `tests/test_foreign_holder_power_cycle.py::test_a_running_broker_job_defers_the_cycle_until_it_ends`, `::test_a_waiting_or_queued_job_does_not_defer_the_cycle` |
 | I103 the host-rung climb and the off-bus gated cycle fire past a foreign holder or an unreadable scan; a broker job's holder holds them | `tests/test_device_safety.py::test_stuck_hold_climb_does_not_reboot_when_a_tenant_arrives`, `::test_stuck_hold_climb_cycles_past_an_incomplete_holder_scan`, `tests/test_offbus_power_cycle.py::test_a_foreign_holder_or_an_unreadable_scan_never_holds` |
 | I103 the pre-power-cycle reset scan clears an unscoped holder like a reader and still refuses a scoped one | `tests/test_foreign_holder_power_cycle.py::test_the_pre_cycle_scan_clears_a_foreign_holder_and_refuses_a_job_holder` |
+| I103 a reset outside a pre-cycle run still refuses a foreign holder; the sweep then clears it | `tests/test_foreign_holder_power_cycle.py::test_a_reset_outside_a_pre_cycle_run_is_refused_and_the_sweep_clears_the_holder` |
+| I103 through the broker's own scan hook, the pre-cycle scan still refuses a broker job's holder | `tests/test_foreign_holder_power_cycle.py::test_the_pre_cycle_scan_still_refuses_a_job_holder_through_the_broker` |
+| I103 a pre-cycle reset runs past a gap /proc shows outside every broker scope (`gaps_passed`); a scoped or protected, stuck or unseen gap still refuses; outside a pre-cycle run a visible gap still refuses | `tests/test_foreign_holder_power_cycle.py::test_a_pre_cycle_reset_runs_past_a_visible_gap_but_not_an_unseen_scoped_or_stuck_one`, `::test_a_visible_gap_still_refuses_outside_a_pre_cycle_run` |
+| I103 an unreadable scan at the bound still lets the ladder and sweep resets run, then the cycle; outside a pre-cycle run it refuses and the sweep runs | `tests/test_foreign_holder_power_cycle.py::test_an_unreadable_scan_at_the_bound_runs_the_ladder_and_sweep_resets_then_the_cycle`, `::test_an_unreadable_scan_outside_a_pre_cycle_run_still_refuses_and_the_sweep_runs` |
+| I103 every power-cycle road (automatic, off-bus gated) journals `power_cycle_foreign_holders` for a foreign holder and not a scoped one; a holder read that hangs or raises never holds the cycle | `tests/test_foreign_holder_power_cycle.py::test_every_power_cycle_road_journals_the_foreign_holder_and_not_a_scoped_one`, `::test_a_holder_read_that_hangs_or_raises_never_holds_the_cycle` |

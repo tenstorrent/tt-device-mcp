@@ -1343,6 +1343,7 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
         )
         PCI_WRITER.on_latch = _on_pci_wedged
         recovery_mechanism.pre_reset_scan = _pre_reset_holder_scan
+        recovery_mechanism.power_cycle_journal = _journal_power_cycle_foreign_holders
         recovery_mechanism.owe_device_pollers = lambda after: _owe_device_pollers(
             _pollers_unfit_reason() or f"{after} did not complete"
         )
@@ -7161,7 +7162,6 @@ async def _auto_power_cycle_host(log, reason: str) -> bool:
     False when it certainly did not launch: the caller keeps the hold, pages, and asks again on the
     next pass — there is no reboot fallback."""
     _void_fabric_ok("auto power cycle")
-    await _journal_power_cycle_foreign_holders(reason)
     return await recovery_mechanism._fire_recovery_escalation(
         "power-cycle",
         row_owner="[broker]power-cycle-request",
@@ -11265,6 +11265,7 @@ async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
         detach_timed_out=result.detach_timed_out,
         reset_in_flight=result.reset_in_flight or None,
         gaps=result.gaps,
+        gaps_passed=result.gaps_passed or None,
         zombies=result.zombies,
         scan_complete=result.scan_complete,
         source=result.source,
@@ -11274,6 +11275,11 @@ async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
     if logger:
         for row in result.identities:
             logger.info(f"pre-reset: device holder before {' '.join(argv)}: {describe_identity(row)}")
+    if result.gaps_passed:
+        msg = f"pre-reset: {' '.join(argv)} runs past holders the scan could not read, before a power cycle: {'; '.join(result.gaps_passed)}"
+        log(msg)
+        if logger:
+            logger.warning(msg)
     if result.detached:
         msg = f"pre-reset: chips {', '.join(result.detached)} off the bus, detached before their readers were killed"
         log(msg)

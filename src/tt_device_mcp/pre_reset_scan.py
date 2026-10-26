@@ -152,6 +152,9 @@ class PreResetScan:
     detach_timed_out: bool = False  # the detach deadline passed before every off-bus chip was detached
     reset_in_flight: str = ""  # a reset already running (its unit, or the holder that is one)
     gaps: list = field(default_factory=list)  # holders the driver names that the scan could not read
+    # gaps a pre-power-cycle reset ran past (spec 04 I103): pids in /proc here, outside every broker
+    # scope, not the running job's and not stuck in the kernel; recorded, never signalled
+    gaps_passed: list = field(default_factory=list)
     zombies: list = field(default_factory=list)  # zombie gap pids, classified (ZombieInfo.row, waited_sec)
     tenants_block: bool = True  # whether a tenant refuses this reset (automatic resets)
     scan_complete: bool = True
@@ -322,7 +325,13 @@ async def clear_device_readers(
 
     ``foreign_yield`` (the ladder and sweep before a power cycle, spec 04 I103): a tenant outside every
     broker job or exec scope, and not in ``protected``, is a reader like any other and is cleared; only a
-    broker job's process still refuses the reset.
+    broker job's process still refuses the reset. A gap pid left after the rescan no longer refuses it
+    either when /proc shows the pid here (its stat and cgroup are world-readable even when its fds are
+    not) outside every broker scope and ``protected``: the reset runs past it, unsignalled, and it is
+    recorded in ``gaps_passed``. One inside a broker scope or ``protected`` is a tenant; one stuck in
+    the kernel (``unkillable``: D state or SIGKILL pending) is unkillable (I21/I70 fence); one with no
+    /proc entry here (another pid namespace's process, which the broker can neither read nor signal,
+    the unseen reader this scan exists for) still refuses.
 
     Before any signal, every chip still bound but off the bus (``offbus_chips``) is detached
     (``detach_chip``, the one in-flight PCI write, all within ``detach_timeout_sec``); if one fails or the deadline
@@ -409,7 +418,8 @@ async def clear_device_readers(
         result.seconds = round(clock() - t0, 3)
         return result
     result.scan_complete, result.source = scan.complete, scan.source
-    result.gaps = [why for why, pid in pid_gap_rows(scan) if pid not in cleared]
+    gap_rows = [(why, pid) for why, pid in pid_gap_rows(scan) if pid not in cleared]
+    result.gaps = [why for why, _ in gap_rows]
     result.zombies = list(zombie_rows.values())
     own_pid = getpid()
     try:
@@ -433,6 +443,25 @@ async def clear_device_readers(
             return False
         return is_tenant(h)
 
+    if foreign_yield and tenants_block and gap_rows:
+        # Spec 04 I103: right before a power cycle a gap the scan cannot read does not cost the ladder
+        # its resets, except where it may be a broker job's, stuck in the kernel, or wholly unseen.
+        kept: list = []
+        for why, pid in gap_rows:
+            start = read_starttime(pid)
+            if start is None:
+                kept.append(why)
+                continue
+            uid = device_holders._proc_uid(pid)
+            h = DeviceHolder(pid=pid, uid=-1 if uid is None else uid, scoped=device_holders.in_broker_scope(pid))
+            if h.scoped or pid in protected or any(device_holders.descends_from(pid, p) for p in protected):
+                result.tenants.append(_describe(h))
+            elif unkillable(pid):
+                result.unkillable.append(_describe(h, device_holders.holder_state(pid), starttime=start))
+            else:
+                result.gaps_passed.append(why)
+        result.gaps = kept
+
     others = [h for h in scan.holders if not _is_self(h.pid)]
     # Logging only, before any signal: off the loop, all within one fixed bound (a /proc read of a
     # holder stuck in the kernel can block); one left unread at the bound changes nothing here.
@@ -449,7 +478,13 @@ async def clear_device_readers(
             result.tenants.append(_describe(h))
         else:
             readers.append(h)
-    if result.reset_in_flight or (result.tenants and tenants_block) or (result.gaps and tenants_block) or not readers:
+    if (
+        result.reset_in_flight
+        or (result.tenants and tenants_block)
+        or (result.gaps and tenants_block)
+        or result.unkillable
+        or not readers
+    ):
         result.seconds = round(clock() - t0, 3)
         return result
 
