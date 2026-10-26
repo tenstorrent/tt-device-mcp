@@ -443,7 +443,8 @@ broker knobs (`TTDEV_RESET_MODE`, `TTDEV_FABRIC_CHECK_CMD`, `TTDEV_FABRIC_DESCRI
 same-named `Environment=TT_DEVICE_MCP_*` (or `TTDEV_*`) unit lines. An unset knob renders **no
 line** (the code default rules); a set knob reaches the unit verbatim. This rendering is the ONLY
 route from `/etc/default` into the broker process — nothing else sources the file into the unit,
-so a knob without a render line is unreachable.
+so a knob without a render line is unreachable. `TTDEV_LOCK=1` (spec 05 I9) renders two lines,
+`TT_DEVICE_MCP_DEVICE_GROUP=ttdev` and `TT_DEVICE_MCP_DEVICE_LOCK=1`, inside the update's own restart.
 
 **Systemd units and timers installed** (system shape):
 

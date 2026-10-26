@@ -202,6 +202,8 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_JOB_EXIT_DIR` | `/run/tt-device-broker/jobexit` | Where jobs record their own exit status | 06 |
 | `TT_DEVICE_MCP_DEVICE_OP_LOCK` | `/run/tt-device-broker/device-op.lock` | Restart-inhibit file for in-flight device ops | 06 |
 | `TT_DEVICE_MCP_JOB_SPOOL_DIR` | `/run/tt-device-broker-spool` | Where a job's stdout/stderr are spooled so they outlive a broker restart (01 I17); unusable → pipes | 06 |
+| `TT_DEVICE_MCP_JOB_LOG_KEEP` | 2000 | Most job logs kept in the log dir; oldest pruned at submit (01 I71) | 01 |
+| `TT_DEVICE_MCP_JOB_LOG_MAX_MB` | 512 | Most MB of job logs kept; oldest pruned at submit (01 I71) | 01 |
 | `TT_DEVICE_MCP_DISPATCH_HOLD` | sibling `dispatch-hold` of the inhibit file | Autoupdate's hold on dispatch across its busy check and restart (01 I18, 08 I18) | 06 |
 | `TT_DEVICE_MCP_DEVICE_OP_FLOCK` | sibling `device-op.flock` of the inhibit file | Advisory flock held for every device op, for external device writers (I8) | 06 |
 | `TT_DEVICE_MCP_CHIP_STATE_FILE` | sibling `chip-state.json` of the inhibit file | Where the broker publishes per-chip `lost`/`recovering` for other readers on the host (03 I66) | 06 |
@@ -209,6 +211,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_INSTALL_DIR` | `/tmp/tt-device-mcp-<uid>` | Per-user base: venv, CLI symlink, and `state/` (deploy-defined, install-user.sh) | 06/08 |
 | `TT_DEVICE_MCP_PRIVSEP` | unset (off) | Run each job as its submitter via systemd-run | 05 |
 | `TT_DEVICE_MCP_DEVICE_GROUP` | unset (off) | Group-membership admission gate for jobs (device lock) | 05 |
+| `TT_DEVICE_MCP_DEVICE_LOCK` | unset (off) | `1`: the broker re-applies the lock's udev rule to the nodes between jobs (opt-in lock, rendered from `TTDEV_LOCK`) | 05 |
 | `TT_DEVICE_MCP_TZ` | unset | CLI TIME-column zone; beats the saved preference | 07 |
 | `TT_DEVICE_MCP_JOB_COOLDOWN_SEC` | 0 | Minimum idle gap between jobs | 01 |
 | `TT_DEVICE_MCP_JOB_BURST_MAX` | 0 (off) | Per-owner burst ceiling | 01 |
@@ -349,6 +352,7 @@ Behavior).
 | `TTDEV_BOARD_TYPES` | set by the installer | Board type of each chip that answered `tt-smi -s`, one per line; input to the expected-count derivation only (spec 08 I28) |
 | `TTDEV_HEALTH_PROBE` | 1 | Read by `apply-host-config.sh` from the config file: `0` disables `tt-device-health-probe.timer` (spec 08 I17), anything else enables it |
 | `TTDEV_NO_LOCK` | unset | Back-compat: force cooperative (no lock) |
+| `TTDEV_LOCK` | unset (0) | Read by `apply-host-config.sh`: `1` opts the host into the device lock (spec 05 I9) — renders `TT_DEVICE_MCP_DEVICE_GROUP=ttdev` and `TT_DEVICE_MCP_DEVICE_LOCK=1` into the unit, empties `ttdev` of people and installs the udev rule; unset or `0` leaves the host as it was; `tt-device-mcp unlock` sets it to `0` |
 | `TTDEV_RESET_MODE`, `TTDEV_FABRIC_CHECK_CMD`, `TTDEV_ETH_HEARTBEAT_CMD`, `TTDEV_RESET_MIN_DEAD_FRAC`, `TTDEV_SELFHEAL_RELIFT`, `TTDEV_EXPECTED_CHIPS`, `TTDEV_AUTO_POWER_CYCLE`, `TTDEV_PREJOB_DISPATCH`, `TTDEV_AICLK_CEILING_MHZ`, `TTDEV_AICLK_CEILING_CMD`, `TTDEV_POLLER_SERVICES` | unset | Per-host config keys; each renders the same-named `TT_DEVICE_MCP_*` unit env line (values already in the unit survive an update; an unset `TTDEV_EXPECTED_CHIPS` is derived from the machine type, spec 08 I28) |
 | `TTDEV_FABRIC_DESCRIPTOR` | galaxy: shipped descriptor; else unset | Cabling descriptor for the fabric check (src, fabric.py) |
 | `TTDEV_FABRIC_BIN` | validator `run_cluster_validation` | Fabric validator binary override (src) |

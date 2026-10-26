@@ -337,6 +337,31 @@ async def test_with_no_power_cycle_opted_in_the_ladder_runs(rig, monkeypatch):
     assert ("power_cycle_direct", "not_opted_in") in [(k, f.get("phase")) for k, f in rig["events"]]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["whole_tray", "all_off"])
+async def test_a_and_c_on_a_set_whose_reset_failed_in_an_earlier_hold_still_cycle_directly(rig, case):
+    """The mesh reset already failed on exactly this off-bus set this boot, in an earlier hold (I58),
+    so the gate's reset stage would skip it. Class A and C do not reach that skip: the reset stage
+    requests the power cycle directly, and the host rung's sweep skips itself, so neither fires a mesh
+    reset, a tray re-power or the sweep (I37). The record alone makes an all-off set class C."""
+    off = _off(rig["map"], {3: 8}) if case == "whole_tray" else set(range(EXPECTED))
+    mech = rig["g"].mechanism
+    earlier = (datetime.now() - timedelta(hours=1)).isoformat()
+    mech.note_rung_failed(earlier, "mesh_reset", off, off, rc=1)
+    assert not mech.mesh_reset_failed_since_release and mech.rung_failed_unchanged("", "mesh_reset", off)
+    rig["beats"] = _beats_without(off)
+    prelude = ["rescan", "capture"] if case == "whole_tray" else []
+    assert await _gate(rig, galaxy.STAGE_SMI_RESET) == galaxy.OUTCOME_WAITING
+    assert rig["order"] == prelude + ["power_cycle"], "no mesh reset, tray re-power or sweep"
+    ((_, fired),) = [(k, f) for k, f in rig["events"] if k == "power_cycle_direct"]
+    want = galaxy.FAULT_CLASS_WHOLE_TRAY if case == "whole_tray" else galaxy.FAULT_CLASS_ALL_OFF
+    assert fired["fault_class"] == want
+    assert "reset_rung_skipped_failed_unchanged" not in _kinds(rig), "the class decides before the I58 skip"
+    await _gate(rig, galaxy.STAGE_POWER_CYCLE)
+    assert rig["order"] == prelude + ["power_cycle", "power_cycle"], "no sweep before the host rung"
+    assert SKIPPED in _kinds(rig) and "released" not in rig["order"]
+
+
 # ---- the host rung's last-chance sweep ----------------------------------------------------------
 
 
@@ -398,7 +423,8 @@ async def test_a_failed_startup_check_after_the_cycle_keeps_the_hold(rig):
 async def test_time_to_recover_on_a_fake_clock(rig):
     """When the cycle is requested, on the clock each failed reset (262 s) and sweep (323 s) advance.
     Class A: at once. Class C, at startup as at run time: after its one reset. The partial-tray
-    ladder (B2): after its one reset; the sweep would repeat it (I58), so it is skipped."""
+    ladder (B2): after its one reset and the last-chance sweep, which repeats it right before the
+    power cycle (I58/I100): a repeat that did not run never counts as run."""
 
     async def episode(beats, stages, phase="post-job"):
         g = rig["g"]
@@ -419,7 +445,9 @@ async def test_time_to_recover_on_a_fake_clock(rig):
     all_off_startup = await episode({}, climb, phase="startup")
     all_off_run_time = await episode({}, climb)
     part_tray = await episode(_beats_without(_off(rig["map"], {3: 5})), climb)
-    assert (whole_tray, all_off_startup, all_off_run_time, part_tray) == (0, RESET_SEC, RESET_SEC, RESET_SEC)
+    assert rig["order"][-3:] == ["glx_reset", "sweep", "power_cycle"], "the full ladder runs right before the cycle"
+    times = (whole_tray, all_off_startup, all_off_run_time, part_tray)
+    assert times == (0, RESET_SEC, RESET_SEC, RESET_SEC + SWEEP_SEC)
 
 
 # ---- across a broker restart (spec 04 I58) ------------------------------------------------------

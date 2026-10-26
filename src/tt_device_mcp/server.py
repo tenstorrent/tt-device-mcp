@@ -54,7 +54,17 @@ from pydantic import AliasChoices, BaseModel, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 
-from tt_device_mcp import __version__, aio, alert, device_activity, loop_watch, metrics, privileges, telemetry
+from tt_device_mcp import (
+    __version__,
+    aio,
+    alert,
+    device_activity,
+    device_lock,
+    loop_watch,
+    metrics,
+    privileges,
+    telemetry,
+)
 from tt_device_mcp.constants import (
     DEFAULT_PORT,
     DEVICE_RESET_DETAIL_PREFIX,
@@ -199,6 +209,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     offbus_count,
     offbus_power_cycle,
     pci_bus_number,
+    pcie_aer,
     pcie_guard_at_start,
     previous_boot_bus_locks,
     previous_boot_error,
@@ -214,6 +225,8 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
+from tt_device_mcp.holder_identity import describe_identity, read_holder_identities
+from tt_device_mcp.job_log_store import exit_signal, find_job_log, prune_job_logs, read_log_tail
 from tt_device_mcp.job_preflight import preflight_output_dirs
 from tt_device_mcp.job_reap import (
     DEAD_CHIP_LABEL_PREFIX,
@@ -3041,6 +3054,7 @@ FOOTER_FIELDS = {
     "EXIT CODE": "exit_code",
     "WAIT TIME": "wait",
     "RUNTIME": "runtime",
+    "SIGNAL": "signal",
 }
 
 # How far back from the end of a job log the footer may sit. The post-job health gate
@@ -3120,7 +3134,14 @@ def write_job_log_footer(job_log_file: Path, job: Job):
             f.write(f"RUNTIME:     {job.runtime_sec:.1f}s\n")
         if job.idle_total_sec is not None:
             f.write(f"DEVICE IDLE: {job.idle_total_sec:.1f}s\n")
+        sig = exit_signal(job.exit_code)
+        if sig:
+            f.write(f"SIGNAL:      {sig}\n")
         f.write("=" * 70 + "\n")
+        # The footer is the job's final record, read back after a restart or a reboot (spec 01
+        # I71): on disk before the post-job gate starts, not in a page cache a power loss drops.
+        f.flush()
+        os.fsync(f.fileno())
 
 
 # The line a queued job's log gets when it is cancelled before it started (spec 01 I69).
@@ -3631,6 +3652,68 @@ def _healthy_reading() -> HealthState:
     return HealthState(phase="verified", at=datetime.now(), expected=0)
 
 
+# Spec 03 I91: this job cycle's per-chip PCIe snapshots (job start, job end), read by the post-job
+# check that follows. Telemetry only: nothing here changes a verdict, a hold or a release.
+_pcie_cycle: dict = {}
+
+
+def _pcie_suspect() -> set:
+    """Chip ids whose last sampler read was all-ones: their own link is not read (spec 03 I91)."""
+    try:
+        ring = sampler.ring if sampler is not None else None
+        last = ring[-1]["chips"] if ring else {}
+        return {str(i) for i, row in last.items() if row and row[0] == chip_state.ALL_ONES}
+    except Exception:  # noqa: BLE001 - telemetry never fails its caller
+        return set()
+
+
+# Spec 03 I91: a snapshot takes ~30 ms on a 32-chip host; one whose sysfs read stalls is left out
+# after this long, so it never holds up a job start or the post-job check.
+PCIE_SNAPSHOT_TIMEOUT_SEC = 5.0
+
+
+async def _pcie_snapshot() -> dict:
+    """One read-only per-chip AER and link snapshot (spec 03 I91), {} on any error or timeout."""
+    try:
+        return await aio.wait_for(asyncio.to_thread(pcie_aer.snapshot, _pcie_suspect()), PCIE_SNAPSHOT_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        try:
+            health_event("pcie_snapshot_timeout", timeout_s=PCIE_SNAPSHOT_TIMEOUT_SEC)
+        except Exception:  # noqa: BLE001
+            pass
+        return {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _pcie_record(phase: str, before: dict, after: dict, **fields) -> Optional[list]:
+    """One ``pcie_aer_delta`` event for ``phase``, listing only the chips with a non-zero AER delta,
+    a link change or a bus change. None (and no event) when either snapshot is empty."""
+    if not before or not after:
+        return None
+    try:
+        rows = pcie_aer.delta(before, after)
+        health_event("pcie_aer_delta", phase=phase, chips=rows, summary=pcie_aer.totals(rows), **fields)
+        return rows
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _pcie_job_start(job_id: str) -> None:
+    _pcie_cycle.clear()
+    pcie_aer.new_cycle()
+    _pcie_cycle.update(job=job_id, start=await _pcie_snapshot())
+
+
+async def _pcie_job_end(job_id: str) -> None:
+    end = await _pcie_snapshot()
+    if _pcie_cycle.get("job") != job_id:
+        _pcie_cycle.clear()
+        _pcie_cycle["job"] = job_id
+    _pcie_cycle["end"] = end
+    _pcie_cycle["job_rows"] = _pcie_record("job", _pcie_cycle.get("start") or {}, end, job=job_id)
+
+
 def _job_snapshot(job: "Job | None") -> dict:
     return (
         {
@@ -3889,7 +3972,9 @@ def _clear_device_reported_fault(why: str) -> None:
     device_fault_reported = ""
 
 
-def _journal_fsm_transition(why: str, *, verified: bool, released: Optional[bool] = None) -> None:
+def _journal_fsm_transition(
+    why: str, *, verified: bool, released: Optional[bool] = None, holders: Optional[list] = None
+) -> None:
     """Record a ``device_dirty_cleared`` event naming who moved the device off its PRIOR episode
     (``why``) and whether a check actually proved the mesh healthy first (``verified``) — emitted
     only while there WAS a prior episode to move off of. The one state change a postmortem cannot
@@ -3899,14 +3984,17 @@ def _journal_fsm_transition(why: str, *, verified: bool, released: Optional[bool
     its exit code) must not read the same as one a full snapshot+fabric pass stood behind.
 
     ``released`` (default: ``verified``) says whether the device leaves the hold. One that stays held
-    with only its dirty bit dropped is journaled as ``device_dirty_dropped_held``, never as a clear."""
+    with only its dirty bit dropped is journaled as ``device_dirty_dropped_held``, never as a clear.
+    ``holders`` (``holder_identity`` rows of the foreign holders behind it) is journaled when given."""
     if fsm.state is not ServerState.HEALTHY:
+        extra = {"holders": holders} if holders else {}
         health_event(
             "device_dirty_cleared" if (verified if released is None else released) else "device_dirty_dropped_held",
             why=why,
             verified=verified,
             prior_reason=fsm.record.detail or fsm.record.why,
             fabric=_lift_fabric(),
+            **extra,
         )
 
 
@@ -4028,7 +4116,9 @@ def _stamp_verified_release(evidence: dict, via: str) -> None:
         recovery_mechanism.record_verified_release(via)
 
 
-def _clear_device_dirty_unverified(why: str, *, holds: bool = True, fault: str = "gate_error") -> None:
+def _clear_device_dirty_unverified(
+    why: str, *, holds: bool = True, fault: str = "gate_error", holders: Optional[list] = None
+) -> None:
     """Drop the dirty flag on a path that did NOT verify the silicon — a foreign tenant
     holds the device, no device nodes are present, health checks are off, or the gate
     errored out. Named so those call sites say out loud that nobody checked the mesh.
@@ -4038,10 +4128,12 @@ def _clear_device_dirty_unverified(why: str, *, holds: bool = True, fault: str =
     Holding those would not protect silicon — nothing on that host will ever verify, so
     the door would shut once and never reopen. Every other unverified clear holds: it
     means we tried and could not tell, which is the case the hold exists for.
+
+    ``holders``: the foreign holders' ``holder_identity`` rows, journaled with the transition.
     """
     if PCI_WRITER.latched:
         holds = True  # spec 04 I76: PCI-wedged lifts only on a verified full check
-    _journal_fsm_transition(why, verified=False, released=not holds)
+    _journal_fsm_transition(why, verified=False, released=not holds, holders=holders)
     if not holds:
         fsm.on_readings(_healthy_reading())
         return
@@ -5800,6 +5892,51 @@ async def _attempt_down_offbus_recheck() -> None:
         _log("DOWN off-bus re-check aborted on an unexpected error — holding; the next idle tick retries")
 
 
+# The foreign holders the gate last saw, as (the hold's ``since``, ``holder_identity`` rows): the
+# foreign-holder verify runs once they are gone, so it journals who they were from here.
+_foreign_holders_seen: tuple = ("", [])
+# (pid, start time) of every foreign holder already logged, so a poll logs each one once.
+_foreign_holders_logged: set = set()
+
+
+def _log_foreign_holder_identities(prefix: str, pids, *, first_sighting_only: bool = False) -> list:
+    """Read each foreign holder's ``holder_identity`` (from /proc only; nothing is signalled) and log
+    one server.log line per holder: every call, or with ``first_sighting_only`` once per process,
+    for a caller that polls. Logging only: never a job log, which another user may read, and never
+    raises. The reads share one fixed bound (``read_holder_identities``); call it off the event loop."""
+    try:
+        rows = read_holder_identities(pids)
+    except Exception as e:  # noqa: BLE001 - logging only
+        if logger:
+            logger.warning(f"{prefix} foreign holder identity unreadable: {e!r}")
+        return []
+    for row in rows:
+        key = (row["pid"], row.get("started", ""))
+        if first_sighting_only and key in _foreign_holders_logged:
+            continue
+        if len(_foreign_holders_logged) > 256:
+            _foreign_holders_logged.clear()
+        _foreign_holders_logged.add(key)
+        if logger:
+            logger.info(f"{prefix} foreign holder {describe_identity(row)}")
+    return rows
+
+
+def _remember_foreign_holders(rows: list) -> None:
+    global _foreign_holders_seen
+    if rows and fsm.record.why == "foreign_holder":
+        _foreign_holders_seen = (fsm.record.since, rows)
+
+
+def _seen_foreign_holders() -> dict:
+    """``holders``/``holders_since`` for the foreign-holder verify event: the identities the gate
+    recorded for this hold, or nothing when they belong to another hold."""
+    since, rows = _foreign_holders_seen
+    if rows and since and since == fsm.record.since:
+        return {"holders": rows, "holders_since": since}
+    return {}
+
+
 async def _foreign_holder_fast_verify(expected: int, log: Callable[[str], None]) -> bool:
     """Run the pre-job verify on a foreign-holder hold whose holder is gone (spec 03 I43). Called by
     the idle relift under the device-op lock. Returns True when the relift is done with this pass
@@ -5844,17 +5981,18 @@ async def _foreign_holder_fast_verify(expected: int, log: Callable[[str], None])
             )
         )
         log(f"foreign-holder hold: the check did not clear it ({why}) — the ceiling escalation owns it")
-        health_event("foreign_holder_verify", lifted=False, healthy=healthy, reason=why)
+        health_event("foreign_holder_verify", lifted=False, healthy=healthy, reason=why, **_seen_foreign_holders())
         return False
     # Same re-assert as the relift's own lift: the sampler's dead-chip path is lock-free and can
     # re-dirty the device during the awaits above.
     if fsm.state is not ServerState.RECOVERING or fsm.record.dirty or fsm.record.why != "foreign_holder":
         log("state changed mid-verify (a chip dropped, or a gate took over) — holding; the pre-job gate owns it now")
         return True
+    seen = _seen_foreign_holders()  # read before the lift ends the hold it was recorded for
     if not _clear_device_dirty(verified=True, why="idle relift: foreign holder gone, full check passed"):
         return True
     log("foreign-holder hold: the full check passed — hold lifted without a reset")
-    health_event("foreign_holder_verify", lifted=True, healthy=True, reason="holder gone")
+    health_event("foreign_holder_verify", lifted=True, healthy=True, reason="holder gone", **seen)
     health_event("device_relift", evidence=evidence)
     return True
 
@@ -7207,7 +7345,12 @@ async def device_health_gate(
     if foreign:
         who = ", ".join(f"{h.username}(pid {h.pid})" for h in foreign)
         _log(f"skip: device held by {who}; not touching it")
-        _clear_device_dirty_unverified(f"foreign holder present: {who}", fault="foreign_holder")
+        # Off the loop and bounded: a /proc read of a holder stuck in the kernel can block.
+        identities = await asyncio.to_thread(
+            _log_foreign_holder_identities, f"HEALTH-GATE[{phase}]", [h.pid for h in foreign]
+        )
+        _clear_device_dirty_unverified(f"foreign holder present: {who}", fault="foreign_holder", holders=identities)
+        _remember_foreign_holders(identities)
         # A door already held (a startup verify, a prior fault) outlives this skip: the verify
         # cannot run beside a foreign tenant, so the hold waits them out — and reads to the tenant
         # queued behind it as a bare "device unverified", a device fault, when the blocker is
@@ -7417,6 +7560,10 @@ async def device_health_gate(
             and not mesh_reset_hold_reason()
             and not recovery_mechanism.cooling()
         )
+        # Spec 03 I91: per-chip AER and link counts just before and just after this pass, after a job
+        # or a step only. Read-only telemetry: the verdict below never reads them.
+        pcie_on = phase in ("post-job", "post-step")
+        pcie_before = await _pcie_snapshot() if pcie_on else {}
         healthy, evidence = await fsm.observe(
             expected,
             _log,
@@ -7429,6 +7576,29 @@ async def device_health_gate(
         )
         state = HealthState.from_evidence(evidence, phase=phase, expected=expected)
         fabric_ok = state.fabric_ok
+        pcie: dict = {}
+        if pcie_on:
+            pcie_after = await _pcie_snapshot()
+            cycle_job = _pcie_cycle.get("job")
+            if _pcie_cycle.get("job_rows") is not None:
+                pcie["job"] = _pcie_cycle["job_rows"]
+            gap = _pcie_record("job_end_to_check", _pcie_cycle.get("end") or {}, pcie_before, job=cycle_job)
+            if gap is not None:
+                pcie["job_end_to_check"] = gap
+            check = _pcie_record(
+                "check",
+                pcie_before,
+                pcie_after,
+                job=cycle_job,
+                gate=phase,
+                fabric_ran=fabric_ok is not None,
+                fabric_ok=fabric_ok,
+            )
+            if check is not None:
+                pcie["check"] = check
+            _pcie_cycle.clear()
+            if dirty_job and pcie:
+                dirty_job = {**dirty_job, "pcie": pcie}
         if fabric_ok is not None:
             last_fabric_check_monotonic = time.monotonic()
         if fabric_ok is True:
@@ -7521,6 +7691,7 @@ async def device_health_gate(
             dirty_reason=dirty_reason,
             dirty_job=dirty_job,
             aer=aer_totals(chips),
+            pcie=pcie or None,
             evidence=evidence,
             fabric=_lift_fabric(),  # this gate's own fabric verdict; dirty_reason may be the prior hold's
         )
@@ -9017,6 +9188,11 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
     payload["leftover_fence"] = _leftover_fence_payload()
     # Spec 04 I92: the tenant or reader the last pre-reset holder scan refused a reset for.
     payload["pre_reset_blocked_by"] = _pre_reset_blocker
+    # Spec 05 I9: where the lock is configured, whether every node is locked, recorded drift and
+    # the group members it is not effective for. Absent on a host that never configured it.
+    lock_view = device_lock.health_view()
+    if lock_view is not None:
+        payload["device_lock"] = lock_view
     return payload
 
 
@@ -11043,6 +11219,7 @@ async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
         owner=owner,
         outcome=result.outcome,
         found=result.found,
+        identities=result.identities or None,
         killed=result.killed,
         tenants=result.tenants,
         unkillable=result.unkillable,
@@ -11058,6 +11235,9 @@ async def _pre_reset_holder_scan(argv: list, owner: str, log) -> str:
         seconds=result.seconds,
         error=result.error or None,
     )
+    if logger:
+        for row in result.identities:
+            logger.info(f"pre-reset: device holder before {' '.join(argv)}: {describe_identity(row)}")
     if result.detached:
         msg = f"pre-reset: chips {', '.join(result.detached)} off the bus, detached before their readers were killed"
         log(msg)
@@ -11450,6 +11630,7 @@ def _tenant_holder_reason() -> str:
     held = [h for h in scan.holders if is_tenant(h) and not descends_from(h.pid, me)]
     if not held:
         return ""
+    _log_foreign_holder_identities("JOB_RUNNER", (h.pid for h in held), first_sighting_only=True)
     who = ", ".join(f"{h.username}(pid {h.pid})" for h in held)
     return f"device held outside the broker by {who}; not dispatching beside it"
 
@@ -12408,7 +12589,7 @@ def _label_recovery_killed(rec: dict) -> None:
         rec["command"] = f"{tag} {rec.get('command') or ''}"
 
 
-def _recent_jobs(limit: int = 20) -> list[dict]:
+def _recent_jobs(limit: int = 20, files: Optional[list[Path]] = None) -> list[dict]:
     """Parse the most recent job log files into history records (owner, command,
     runtime, status, ...). Durable across the in-memory job purge; reads only each
     file's head + tail so it's cheap even for multi-MB device logs.
@@ -12421,20 +12602,23 @@ def _recent_jobs(limit: int = 20) -> list[dict]:
     in-memory state: ``running`` only if this broker is actually running it (so at
     most one shows running — the broker serializes), ``queued`` if it's waiting,
     else ``interrupted`` (footerless + untracked = orphaned by a restart). For a
-    live job, runtime counts up to now and wait is the time it spent queued."""
+    live job, runtime counts up to now and wait is the time it spent queued.
+
+    ``files`` parses exactly those logs instead of the newest ones (one job's record by id)."""
     import collections
 
     if not job_log_dir:
         return []
-    # Over-fetch, then sort by EXECUTION time below. The file name carries the queue time,
-    # and with a deep queue the order jobs were queued in is not the order they ran in — a
-    # job queued long ago may have started moments ago, and the reset it provoked runs
-    # between it and the next job. Taking the newest `limit` names would drop exactly those.
-    files = sorted(
-        (p for p in Path(job_log_dir).glob("*.log") if p.name != "server.log"),
-        key=lambda p: p.name,
-        reverse=True,
-    )[: max(limit * 4, 60)]
+    if files is None:
+        # Over-fetch, then sort by EXECUTION time below. The file name carries the queue time,
+        # and with a deep queue the order jobs were queued in is not the order they ran in — a
+        # job queued long ago may have started moments ago, and the reset it provoked runs
+        # between it and the next job. Taking the newest `limit` names would drop exactly those.
+        files = sorted(
+            (p for p in Path(job_log_dir).glob("*.log") if p.name != "server.log"),
+            key=lambda p: p.name,
+            reverse=True,
+        )[: max(limit * 4, 60)]
 
     # Snapshot the in-memory queue (id -> Job) — the source of truth for what is
     # actually running/queued right now, independent of the durable log footer.
@@ -12661,6 +12845,53 @@ def _recent_jobs(limit: int = 20) -> list[dict]:
     ran.sort(key=_exec_key, reverse=True)
     pending.sort(key=lambda r: r.get("queued_at") or "")
     return (pending + ran)[:limit]
+
+
+# What a job reads as when its log has no footer and no broker tracks it: the broker that ran it
+# went away (a restart, a reboot) before it could record how the job ended (spec 01 I71).
+JOB_LOST_CAUSE = "lost: the broker restarted while the job ran; its final status was never recorded"
+
+
+def _job_record(job_id: str) -> Optional[dict]:
+    """One job's durable record, read from its own log by id, or None when no log answers to it.
+
+    The in-memory table is emptied by a restart and purged after JOB_RETENTION_SEC; the log is
+    not. Read through _recent_jobs, so a footerless log is classified exactly as the recent list
+    classifies it (running, queued, abandoned, interrupted with the journal's cause), and one the
+    journal cannot explain says it was lost, never "not found"."""
+    path = find_job_log(job_log_dir, job_id)
+    if path is None:
+        return None
+    rec = next((r for r in _recent_jobs(files=[path]) if r.get("job_id") == job_id), None)
+    if rec is not None and rec.get("status") == "interrupted" and not rec.get("cause"):
+        rec["cause"] = JOB_LOST_CAUSE
+    return rec
+
+
+def _job_status_from_record(job_id: str, r: dict) -> dict:
+    """A job-status answer built from a durable record (_job_record)."""
+    res = {
+        "job_id": job_id,
+        "owner": r.get("owner", "?"),
+        "status": r.get("status", "?"),
+        "command": r.get("command", "?"),
+        "exit_code": r.get("exit_code"),
+        "log_file": r.get("log_file"),
+    }
+    try:
+        res["exit_code"] = int(res["exit_code"]) if res["exit_code"] not in (None, "None") else None
+    except (TypeError, ValueError):
+        pass
+    for key in ("started_at", "finished_at", "signal", "cause"):
+        if r.get(key):
+            res[key] = r[key]
+    for key, out in (("runtime", "runtime_sec"), ("wait", "wait_sec")):
+        if r.get(key):
+            try:
+                res[out] = float(str(r[key]).rstrip("s"))
+            except ValueError:
+                pass
+    return res
 
 
 async def cleanup_finished_jobs():
@@ -13793,6 +14024,9 @@ export {JOB_TAG_ENV}={job_tag}
 {job.command}
 """
 
+            # Spec 03 I91: per-chip AER and link counts at job start (read-only sysfs, never a lost chip).
+            await _pcie_job_start(job_id)
+
             # Create process in new session (os.setsid) so all child processes share the same
             # process group ID. This enables reliable cleanup of nested processes via killpg()
             # in the finally block, preventing orphaned child processes from holding device locks.
@@ -14521,6 +14755,8 @@ export {JOB_TAG_ENV}={job_tag}
                 # gates every later arrival: the runner is single-threaded, so a job
                 # that queues during the check waits for it — and any reset it
                 # triggers — before it starts.
+                # Spec 03 I91: the same counts at job end; the post-job check reads them back.
+                await _pcie_job_end(job_id)
                 if job.verification:
                     try:
                         await _settle_verification_job(job)
@@ -14849,6 +15085,61 @@ async def _restore_queued_jobs() -> None:
         )
     if restored or broken or dropped or finished:
         health_event("queue_restored", restored=restored, unreadable=broken, dropped=dropped, finished=finished)
+
+
+# Spec 05 I9: the opt-in lock's flip. Seconds between looks at the node modes.
+_DEVICE_LOCK_POLL_SEC = 30
+
+
+def _device_lock_blocker() -> Optional[str]:
+    """What keeps the broker from re-applying the node modes now, or None. Under the opt-in every
+    job this broker started carries the device gid, so only a job re-adopted from before the start
+    could lose the device to the flip; a recovery or reset in flight is left alone entirely."""
+    if readopted_scopes:
+        return "re-adopted job scope live"
+    if current_job_id is not None or any(j.status == JobStatus.RUNNING for j in jobs.values()):
+        return "job running"
+    if fsm.state != ServerState.HEALTHY:
+        return f"device {fsm.state.value}"
+    return None
+
+
+async def _device_lock_step() -> str:
+    """One look: 'locked' (every node 0660 ttdev; marked in effect), 'waiting' (no nodes yet, or a
+    blocker) or 'drift' (the flip ran and a node is still open: recorded once, the loop stops)."""
+    nodes = device_lock.device_nodes()
+    if not nodes:
+        return "waiting"
+    if not device_lock.node_drift(nodes):
+        device_lock.mark_applied()
+        return "locked"
+    if _device_lock_blocker() is not None:
+        return "waiting"
+    drift = await asyncio.to_thread(device_lock.flip)
+    if not drift:
+        device_lock.mark_applied()
+        health_event("device_lock_applied", nodes=len(nodes))
+        if logger:
+            logger.info(f"DEVICE_LOCK applied: {len(nodes)} node(s) 0660 {device_lock.LOCK_GROUP}")
+        return "locked"
+    if device_lock.record_drift(drift, source="broker"):
+        health_event("device_lock_drift", source="broker", nodes=drift)
+    if logger:
+        logger.warning(f"DEVICE_LOCK drift persists after udev trigger on {drift}; lock not in effect there")
+    return "drift"
+
+
+async def _device_lock_loop() -> None:
+    """Runs only under the opt-in (TT_DEVICE_MCP_DEVICE_LOCK=1). Never unlocks, never touches a
+    recovery path: it only asks udev to re-apply the installed rule while the device is idle."""
+    while True:
+        try:
+            if await _device_lock_step() in ("locked", "drift"):
+                return
+        except Exception as e:  # noqa: BLE001 - the lock flip must never take the broker down
+            if logger:
+                logger.error(f"DEVICE_LOCK step failed: {e}")
+        await asyncio.sleep(_DEVICE_LOCK_POLL_SEC)
 
 
 async def _record_startup_health() -> None:
@@ -15778,6 +16069,9 @@ async def run_startup_tasks() -> None:
     # Answers "did it come back?" next to the reboot row that says it went away.
     # Fire-and-forget: a health REPORT must never gate the queue coming up.
     asyncio.create_task(_record_startup_health())
+    # Spec 05 I9: the opt-in lock comes into effect between jobs, never over one.
+    if device_lock.opted_in():
+        asyncio.create_task(_device_lock_loop())
     # And then answers it properly, once the device is ours to test — this lifts the hold above on a
     # healthy verdict, holds/escalates on a wedge.
     _startup_verify_ready_at = None
@@ -16219,25 +16513,9 @@ def create_mcp_server() -> MCPServer:
     def _get_job_status(job_id: str) -> dict:
         """Get job status (shared by REST API and MCP tool)."""
         if job_id not in jobs:
-            for r in _recent_jobs(60):
-                if r.get("job_id") == job_id:
-                    res = {
-                        "job_id": job_id,
-                        "owner": r.get("owner", "?"),
-                        "status": r.get("status", "?"),
-                        "command": r.get("command", "?"),
-                        "exit_code": r.get("exit_code"),
-                        "log_file": r.get("log_file"),
-                    }
-                    if r.get("runtime"):
-                        try:
-                            res["runtime_sec"] = float(str(r["runtime"]).rstrip("s"))
-                        except ValueError:
-                            pass
-                    if r.get("cause"):
-                        res["cause"] = r["cause"]
-                    return res
-            return {"error": "Job not found"}
+            # Gone from memory (a restart, or the retention purge): its log still answers (01 I71).
+            rec = _job_record(job_id)
+            return _job_status_from_record(job_id, rec) if rec else {"error": "Job not found"}
 
         job = jobs[job_id]
         result = {
@@ -16289,24 +16567,26 @@ def create_mcp_server() -> MCPServer:
 
     def _get_job_logs(job_id: str, tail: int = 100) -> dict:
         """Get job logs (shared by REST API and MCP tool)."""
-        if job_id not in jobs:
-            return {"error": "Job not found"}
-
-        job = jobs[job_id]
         # The REST route passes `tail` through raw: clamp it here, as the tool's schema does.
         try:
             tail = max(1, min(int(tail), MAX_LOG_TAIL_LINES))
         except (TypeError, ValueError):
             tail = 100
-        content = ""
-        if job.log_file and os.path.exists(job.log_file):
-            with open(job.log_file, "r") as f:
-                lines = f.readlines()
-                content = "".join(lines[-tail:])
+        if job_id in jobs:
+            log_file = jobs[job_id].log_file
+        else:
+            # Gone from memory (a restart, or the retention purge): its log is still on disk (01 I71).
+            path = find_job_log(job_log_dir, job_id)
+            if path is None:
+                return {"error": "Job not found"}
+            log_file = str(path)
+        # Read from the end, bad bytes replaced: a job log can be gigabytes, carry binary output,
+        # or end mid-character where a write was cut short.
+        content = read_log_tail(log_file, tail) if log_file else ""
 
         return {
             "job_id": job_id,
-            "log_file": job.log_file,
+            "log_file": log_file,
             "content": content,
         }
 
@@ -16524,6 +16804,13 @@ def create_mcp_server() -> MCPServer:
         _persist_queued_job(job)
         await _enqueue_job(job)
         _update_queue_depth_metric()
+        # A new log just landed: keep the dir within its count and size bounds (01 I71). Never the
+        # log of a job this broker still tracks. Best effort, off the loop.
+        try:
+            await asyncio.to_thread(prune_job_logs, job_log_dir, frozenset(jobs) | frozenset(readopted_scopes))
+        except Exception as e:  # noqa: BLE001 - housekeeping only; the job is queued regardless
+            if logger:
+                logger.warning(f"  -> job log retention skipped: {e}")
 
         # Ensure job runner is started (may be first job via REST API before MCP session)
         global job_runner_task
@@ -16732,7 +17019,10 @@ def create_mcp_server() -> MCPServer:
             if logger:
                 logger.info(f"  -> status={job.status.value}, exit_code={job.exit_code}")
         elif logger:
-            logger.warning("  -> ERROR: Job not found")
+            if "error" in result:
+                logger.warning("  -> ERROR: Job not found")
+            else:
+                logger.info(f"  -> from its log: status={result.get('status')}, exit_code={result.get('exit_code')}")
 
         return result
 
@@ -16752,9 +17042,20 @@ def create_mcp_server() -> MCPServer:
             output_lines: Number of lines to include in final result (default: 20)
         """
         if job_id not in jobs:
-            if logger:
-                logger.warning("  -> ERROR: Job not found")
-            return {"error": "Job not found"}
+            # Gone from memory: a job from before a restart, or one purged after it ended. It is not
+            # waited on again, its final record is the answer (01 I71). Not in memory means it
+            # is no longer queued or running here, whatever its log says.
+            rec = await asyncio.to_thread(_job_record, job_id)
+            if rec is None:
+                if logger:
+                    logger.warning("  -> ERROR: Job not found")
+                return {"error": "Job not found"}
+            result = _job_status_from_record(job_id, rec)
+            if output_lines > 0 and rec.get("log_file"):
+                tail = await asyncio.to_thread(_tail_lines, rec["log_file"], output_lines)
+                if tail:
+                    result["output_tail"] = tail
+            return result
 
         job = jobs[job_id]
         poll_interval = 2.0  # seconds

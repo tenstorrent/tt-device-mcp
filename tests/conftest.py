@@ -109,6 +109,17 @@ def reset_pci_writer():
 
 
 @pytest.fixture(autouse=True)
+def reset_foreign_holders_seen():
+    """Forget the foreign holders a gate recorded: one test's must not reach the next test's
+    foreign-holder verify event. Only when the server module is already loaded."""
+    yield
+    srv = sys.modules.get("tt_device_mcp.server")
+    if srv is not None:
+        srv._foreign_holders_seen = ("", [])
+        srv._foreign_holders_logged.clear()
+
+
+@pytest.fixture(autouse=True)
 def reset_broker_internal_pids():
     """Clear the broker-internal pid registry (spec 04 I59) around every test: a probe one test
     spawned through run_probe must not discount a holder in the next."""

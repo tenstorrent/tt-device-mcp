@@ -2499,7 +2499,7 @@ class GalaxyRecovery(Recovery):
             return False
         # Spec 04 I38/I58: a mesh reset that already failed on exactly these chips this boot does not skip
         # the sweep. The full ladder runs right before every power cycle the broker requests: the readers
-        # are stopped first, and the repeated mesh reset and its full check run under the I97 deadline.
+        # are stopped first, and the repeated mesh reset and its full check run under a deadline (I100).
         repeat_failed = bool(offbus_chips) and self.mechanism.rung_failed_unchanged("", "mesh_reset", offbus_chips)
         sweep_phase = self._sweep_phase()
         if (
@@ -2522,23 +2522,10 @@ class GalaxyRecovery(Recovery):
                 expected=expected,
             )
             return await self._owed_sbr_before_host_rung(expected, log, gate_phase, where)
-        # Spec 04 I58/I97: below the 10-min bound the repeated mesh reset runs only under the I97
-        # deadline. When it can no longer end by that deadline, no power cycle is requested without it:
-        # the hold waits for the bound's own full ladder (I76), whose sweep repeats it in full.
-        bounded = repeat_failed and not (sweep_phase is not None and sweep_phase[1])
-        if bounded and not self._repeat_mesh_reset_fits(sweep_phase):
-            log(
-                f"last chance before the host rung{where}: the mesh reset that failed on these chips can no longer "
-                f"run and be checked by the {_mesh_reset_before_host_rung_deadline_sec():.0f}s deadline — holding "
-                f"for the 10-min bound's full ladder, which repeats it before the power cycle"
-            )
-            health_event(
-                "last_chance_sweep_waits_for_bound",
-                context=context or gate_phase,
-                off_bus=len(offbus_chips),
-                expected=expected,
-            )
-            return None
+        # Spec 04 I100: the repeated mesh reset and its full check run at once, under the I97 deadline or,
+        # when that is too close, under one taken from the repeat's own start: never an idle wait for the
+        # 10-min bound, and the power cycle request stays bounded.
+        bounded = repeat_failed and self._repeat_runs_under_deadline(expected)
         trays = _affected_trays(offbus_chips, expected, tray_map) or []
         placement = _offbus_placement(offbus_chips, self._chip_buses_now(), tray_map)
         swept = False
@@ -2594,7 +2581,9 @@ class GalaxyRecovery(Recovery):
                 else:
                     swept = await self._issue_all_resets_back_to_back(trays, expected, log, do_sbr=False)
         if bounded_left:
-            return await self._repeat_mesh_reset_before_host_rung(expected, log, gate_phase, where, sweep_phase, None)
+            return await self._repeat_mesh_reset_before_host_rung(
+                expected, log, gate_phase, where, sweep_phase, None, fabric_77_unverified
+            )
         # The bus is already whole: no re-enumeration left to settle for (the bridge-reset rung verifies
         # at once too).
         settle = 0 if mesh_reset_left else _settle_before_host_rung_sec()
@@ -2603,7 +2592,7 @@ class GalaxyRecovery(Recovery):
         )
         if not healthy and mesh_reset_left and bounded:
             return await self._repeat_mesh_reset_before_host_rung(
-                expected, log, gate_phase, where, sweep_phase, evidence
+                expected, log, gate_phase, where, sweep_phase, evidence, fabric_77_unverified
             )
         if not healthy and mesh_reset_left:
             # The bus probe alone never lifts (I86): the full check failed, so the remaining rung runs and
@@ -2649,29 +2638,35 @@ class GalaxyRecovery(Recovery):
         return True
 
     async def _repeat_mesh_reset_before_host_rung(
-        self, expected: int, log, gate_phase: str, where: str, sweep_phase, evidence
-    ) -> bool:
-        """Spec 04 I38/I97: the sweep's mesh reset repeats one that already failed on these chips. It runs
-        as the I97 mesh reset: started only when it and its full check end by the deadline, the check cut
-        at the deadline, once per hold episode. The sweep has run its SBR. True only when the check with
-        fabric passed and the hold lifted; otherwise the sweep is spent and the power cycle follows."""
-        healed = await self._whole_mesh_reset_before_host_rung(expected, log, gate_phase, evidence, repeat=True)
+        self, expected: int, log, gate_phase: str, where: str, sweep_phase, evidence, fabric_77_unverified: bool
+    ) -> Optional[bool]:
+        """Spec 04 I38/I100: the sweep's mesh reset repeats one that already failed on these chips. It runs
+        as the I97 mesh reset, the check cut at its deadline (:meth:`_whole_mesh_reset_before_host_rung`).
+        The sweep has run its SBR. True only when the check with fabric passed and the hold lifted. None
+        when the reset did not run (a tenant, a reset cycling in its scope, a refused reset): the full
+        ladder has not run, so the sweep is not spent, and the caller holds and requests no power cycle
+        this pass (I22). Otherwise the sweep is spent and the power cycle follows."""
+        healed = await self._whole_mesh_reset_before_host_rung(
+            expected, log, gate_phase, evidence, repeat=True, fabric_77_unverified=fabric_77_unverified
+        )
         pcie_guard.end_offbus_reset()  # the SBR's note, when the reset did not run
         if healed:
             return True
+        if healed is None:
+            log(f"the repeated mesh reset did not run{where} — holding; no power cycle this pass")
+            health_event("host_rung_held", context=gate_phase, reason="repeated mesh reset did not run")
+            return None
         self.mechanism.sweep_spent = sweep_phase
         return await self._owed_sbr_before_host_rung(expected, log, gate_phase, where)
 
-    def _repeat_mesh_reset_fits(self, sweep_phase) -> bool:
-        """Spec 04 I97 as the sweep reads it before it starts: the repeated mesh reset and its full check
-        can still end by the deadline. True without a hold clock or once the I97 reset ran this hold:
-        then nothing is left to wait for, and the sweep runs as before."""
-        if sweep_phase is None or self._whole_mesh_reset_spent == sweep_phase[0]:
-            return True
-        age = _hold_age_sec(sweep_phase[0])
-        if age is None:
-            return True
-        return age + _mesh_reset_before_host_rung_needs_sec() <= _mesh_reset_before_host_rung_deadline_sec()
+    def _repeat_runs_under_deadline(self, expected: int) -> bool:
+        """Spec 04 I100: the sweep's repeated mesh reset runs as the I97 mesh reset, under its deadline: a
+        Galaxy ``-glx_reset`` on more than one chip with the hold clock known. Otherwise the sweep fires
+        it as any other mesh reset."""
+        argv = self.reset_argv(list(range(expected)))
+        if expected <= 1 or "-glx_reset" not in argv or not ipmi_guard.is_mesh_reset(argv):
+            return False
+        return _hold_age_sec(self.deps.device_hold_episode_since() or "") is not None
 
     async def _stop_readers_before_repeat_mesh_reset(self, offbus_chips: set, log, context: str) -> list:
         """Spec 04 I58: the sweep is about to repeat a mesh reset that already failed on exactly these
@@ -3610,8 +3605,8 @@ class GalaxyRecovery(Recovery):
     _late_chips_reset_spent: Optional[str] = None
 
     async def _whole_mesh_reset_before_host_rung(
-        self, expected: int, log, phase: str, evidence, *, repeat: bool = False
-    ) -> bool:
+        self, expected: int, log, phase: str, evidence, *, repeat: bool = False, fabric_77_unverified: bool = False
+    ) -> Optional[bool]:
         """Spec 04 I97: the SBR before the host rung brought every chip back, but the full check failed
         because the other chips are ARC-not-ready (a mesh reset that tt-smi aborted at its driver wait
         leaves them so). One mesh reset of the now-whole mesh and the full check with fabric run before
@@ -3624,8 +3619,11 @@ class GalaxyRecovery(Recovery):
         (:func:`_mesh_reset_before_host_rung_deadline_sec`); every expected chip on
         the bus, none isolated or removed; the heartbeat still reads at least one chip ARC-not-ready,
         or the check's heartbeat probe failed; no reset cycling in its scope; and no tenant.
-        ``repeat``: the last-chance sweep's mesh reset, repeating one that failed on these chips (I38).
-        It runs whatever the bus reads; every other condition, the deadline included, stands.
+        ``repeat``: the last-chance sweep's mesh reset, repeating one that failed on these chips (spec 04
+        I38, I100). It runs whatever the bus reads and whether or not this episode's I97 reset ran (the
+        sweep's own record spends it, I87). Its deadline is the I97 one or, when that is too close, the
+        hold's age at its start plus the reset's and check's allowance: it never waits for the 10-min
+        bound. A tenant, a reset cycling in its scope or a refused reset returns None (it did not run).
 
         After the reset, the full check runs only when the reset did not give up at its driver wait and
         the check's allowance is still left before the deadline; otherwise the caller power-cycles at
@@ -3635,19 +3633,21 @@ class GalaxyRecovery(Recovery):
         hold_since = self.deps.device_hold_episode_since() or ""
         age = _hold_age_sec(hold_since)
 
-        def skip(reason: str) -> bool:
+        def skip(reason: str) -> Optional[bool]:
             log(f"no mesh reset of the whole mesh before the host rung: {reason}")
-            health_event("whole_mesh_reset_before_host_rung", phase=phase, fired=False, reason=reason)
-            return False
+            health_event("whole_mesh_reset_before_host_rung", phase=phase, fired=False, reason=reason, repeat=repeat)
+            return None if repeat else False
 
         if expected <= 1 or "-glx_reset" not in argv or not ipmi_guard.is_mesh_reset(argv):
             return False
         if age is None:
             return skip("no hold clock")
-        if self._whole_mesh_reset_spent == hold_since:
+        if self._whole_mesh_reset_spent == hold_since and not repeat:
             return skip("already ran in this hold")
         deadline = _mesh_reset_before_host_rung_deadline_sec()
         needs = _mesh_reset_before_host_rung_needs_sec()
+        if repeat:
+            deadline = max(deadline, age + needs)
         if age + needs > deadline:
             return skip(
                 f"the hold is {int(age)}s old; the reset and its check would not end by the {deadline:.0f}s deadline"
@@ -3661,7 +3661,9 @@ class GalaxyRecovery(Recovery):
                 or removed_chip_ids()
             )
         except Exception as exc:  # noqa: BLE001 - an unreadable bus is not a whole one
-            return skip(f"could not read the bus: {exc!r}")
+            if not repeat:
+                return skip(f"could not read the bus: {exc!r}")
+            beats, whole = {}, False
         if not whole and not repeat:
             return skip("a chip is still off the bus")
         not_ready = sorted(arc_not_ready_chips(beats or {}), key=int)
@@ -3690,20 +3692,13 @@ class GalaxyRecovery(Recovery):
             fired=True,
             arc_not_ready=not_ready,
             hold_age_sec=round(age, 1),
+            deadline_sec=round(deadline, 1),
             repeat=repeat,
         )
-
-        def late_chips_fit() -> str:
-            # Spec 04 I102 under I97: the second mesh reset, the settle and the check end by the deadline.
-            now = _hold_age_sec(hold_since) or age
-            needs = MESH_RESET_BEFORE_HOST_RUNG_SEC + MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC
-            if now + needs + MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC > deadline:
-                return f"the hold is {int(now)}s old; it and its check would not end by the {deadline:.0f}s deadline"
-            return ""
-
-        if not await self._issue_all_resets_back_to_back(
-            [], expected, log, do_sbr=False, late_chips_fit=late_chips_fit
-        ):
+        if not await self._issue_all_resets_back_to_back([], expected, log, do_sbr=False):
+            if repeat:
+                log("the repeated mesh reset before the host rung was refused — it did not run")
+                return None
             log("the mesh reset before the host rung was refused — the power cycle decides")
             return False
         left = deadline - (_hold_age_sec(hold_since) or age)
@@ -3724,7 +3719,7 @@ class GalaxyRecovery(Recovery):
                 phase,
                 MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC,
                 context="mesh reset before the host rung",
-                fabric_77_unverified=False,
+                fabric_77_unverified=fabric_77_unverified,
             )
         )
         await asyncio.wait({check}, timeout=left)
