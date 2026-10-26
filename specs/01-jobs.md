@@ -441,6 +441,27 @@ the queue and a running job outlive the broker process.
   debt, no dirty flag), because recovery's own reset and full check, fabric included, run before
   the device is released. I20's skipped post-job check for a job that returns 0 under contention is
   for preemption only; a recovery kill is not a preemption.
+- **I71** — A job's status, logs and wait answer from its log on disk once the job has left
+  the in-memory table, whether a broker restart or host reboot emptied it or the
+  `JOB_RETENTION_SEC` cleanup purged it. Never "Job not found" while its log exists. The log is
+  the durable job record: it is written under the log dir while the job runs, and the footer is
+  flushed and fsynced when written. The footer holds the end time, status, exit code, wait time and
+  runtime, plus `SIGNAL` when the exit code names one: a negative code is the signal, and 129-192
+  is given as derived from 128+N. A lookup takes the newest log of that exact id (ids recycle), and
+  an id with glob or path characters matches none. A log with no footer whose job had started
+  reads `interrupted` with the health journal's cause, or failing that `lost: the broker restarted
+  while the job ran; its final status was never recorded`. A job never started reads `abandoned`
+  (unchanged). A log read decodes undecodable bytes (binary output, a write cut mid-character) as
+  replacement characters and never raises. A half-written footer is no final status. Wait on such
+  a job returns its final record and output tail at once. Retention: when a job is submitted, the
+  oldest job logs past `TT_DEVICE_MCP_JOB_LOG_KEEP` (2000) logs or
+  `TT_DEVICE_MCP_JOB_LOG_MAX_MB` (512) MB in total, whichever bound is reached first, are deleted.
+  A log of a job still tracked, or one modified in the last hour, is never deleted and counts
+  toward neither bound. Only job-log names are matched; `server.log` and the queued-spec dir are
+  never touched. A failed prune is logged and never fails the submit. Reason: every self-update
+  restarts the broker, and a client that asked for a job's result after it got "Job not found"
+  while the log was intact on disk. This adds no device access and changes no gate, hold, reset
+  or recovery step.
 
 ## Interfaces
 
@@ -467,8 +488,8 @@ Other subsystems and tenants may rely on:
 - **Job log format**: header block (`JOB ID`/`SUBMITTER UID` (socket submits only, I8)/
   `OWNER`/`WORKSPACE`/`COMMAND`/`ENV FILE`/
   `TIMEOUT`/`QUEUED` + `ENVIRONMENT VARIABLES`), a `[Started at <iso>]` marker, and a
-  footer (`FINISHED`/`STATUS`/`EXIT CODE`/`WAIT TIME`/`RUNTIME`). `_recent_jobs` and
-  `_job_from_log` parse it; the footer may sit up to `FOOTER_TAIL_LINES` (512) from the
+  footer (`FINISHED`/`STATUS`/`EXIT CODE`/`WAIT TIME`/`RUNTIME`/`DEVICE IDLE`, and `SIGNAL`
+  when the exit code names one, I71). `_recent_jobs` and `_job_from_log` parse it; the footer may sit up to `FOOTER_TAIL_LINES` (512) from the
   end because the post-job gate appends after it. Log names are
   `<YYYY-MM-DD_HHMMSS>_<id>.log`, so name order is time order.
 - Owner format and kill authorization are spec 05. One jobs-side fact: submissions carry no
@@ -733,6 +754,7 @@ flowchart LR
 | I66 (a job_run client cancel or disconnect kills its job, whole process group; opt-out keeps it; a queued job is cancelled; job_run_bg unchanged) | `tests/test_job_kill_reset.py::test_a_disconnect_kills_the_whole_process_group`, `tests/test_job_kill_reset.py::test_keep_running_on_disconnect_leaves_the_job_running`, `tests/test_job_kill_reset.py::test_a_cancel_while_queued_cancels_the_job`, `tests/test_job_kill_reset.py::test_the_kill_runs_on_its_own_task_outside_the_cancelled_scope` |
 | I69 (a job cancelled while queued: footer `STATUS: killed` after a marker; the recent list says killed, not abandoned) | `tests/test_recent_jobs.py::test_a_job_cancelled_while_queued_gets_a_footer_and_reads_killed_everywhere`, `tests/test_recent_jobs.py::test_a_running_job_that_prints_the_cancel_marker_is_not_read_as_cancelled` |
 | I70 (a recovery-killed job is `KILLED` with recovery's cause, its log line written, before the sweep; a re-adopted one too, not "the broker restarted"; the recent list reads both kill lines as `broker-kill` and a footerless terminal job by its in-memory status; the per-test reset drops the causes; every clean-gate branch drops the marker; a recovery-killed exit 0 is no clean job) | `tests/test_job_kill_reset.py::test_a_recovery_kill_is_killed_with_its_cause_before_the_sweep`, `tests/test_job_kill_reset.py::test_a_recycled_id_after_a_fault_branch_recovery_kill_owes_its_reset`, `tests/test_job_kill_reset.py::test_a_recovery_killed_job_that_exited_0_is_no_clean_job`, `tests/test_reset.py::test_a_readopted_job_recovery_killed_ends_killed_with_its_cause`, `tests/test_recent_jobs.py::test_job_killed_by_a_device_reset_gets_broker_kill_status_and_cause`, `tests/test_recent_jobs.py::test_a_terminal_job_before_its_footer_shows_its_status_and_cause`, `tests/test_recent_jobs.py::test_job_killed_by_recovery_gets_broker_kill_status_and_cause`, `tests/test_test_isolation.py::test_the_per_test_reset_clears_every_hold_bound_and_escalation_global` |
+| I71 (status, logs and wait answer from the log after a restart or the retention purge; running-at-restart reads lost; a truncated or binary log reads; newest log per recycled id; SIGNAL in the footer; retention by count and size spares tracked and fresh logs) | `tests/test_job_log_store.py::test_status_and_logs_of_a_job_from_before_the_restart`, `tests/test_job_log_store.py::test_job_wait_returns_the_final_record_of_a_pre_restart_job`, `tests/test_job_log_store.py::test_a_job_purged_after_retention_still_answers`, `tests/test_job_log_store.py::test_a_job_running_when_the_broker_stopped_reads_lost`, `tests/test_job_log_store.py::test_the_journals_cause_beats_the_generic_lost`, `tests/test_job_log_store.py::test_a_queued_job_never_started_reads_abandoned_not_lost`, `tests/test_job_log_store.py::test_a_truncated_or_unflushed_log_still_reads`, `tests/test_job_log_store.py::test_an_in_memory_job_with_binary_output_reads_too`, `tests/test_job_log_store.py::test_a_recycled_id_answers_with_its_newest_log`, `tests/test_job_log_store.py::test_an_unknown_id_is_still_not_found`, `tests/test_job_log_store.py::test_the_footer_names_the_signal_and_is_parsed_back`, `tests/test_job_log_store.py::test_retention_keeps_the_newest_n`, `tests/test_job_log_store.py::test_retention_bounds_bytes_and_keeps_only_the_newest`, `tests/test_job_log_store.py::test_retention_never_prunes_a_tracked_or_fresh_log`, `tests/test_job_log_store.py::test_retention_defaults_and_overrides` |
 | I68 | `tests/test_job_preflight.py::test_a_root_owned_existing_dir_is_refused_with_its_owner_and_mode`, `tests/test_job_preflight.py::test_a_writable_dir_passes`, `tests/test_job_preflight.py::test_a_missing_dir_with_a_writable_parent_passes_and_is_not_created`, `tests/test_job_preflight.py::test_a_missing_dir_with_an_unwritable_parent_is_refused_naming_the_parent`, `tests/test_job_preflight.py::test_tt_metal_logs_path_overrides_the_workspace`, `tests/test_job_preflight.py::test_a_missing_workspace_is_left_to_the_job_not_called_an_output_dir_problem`, `tests/test_job_preflight.py::test_the_override_is_what_gets_checked`, `tests/test_job_preflight.py::test_the_runner_fails_the_job_at_the_door_and_spawns_nothing`, `tests/test_job_preflight.py::test_the_runner_checks_as_the_privsep_submitter_with_only_its_env`, `tests/test_job_preflight.py::test_a_preflight_that_errors_or_hangs_lets_the_job_through` |
 | B-Submission (burst cap) | `tests/test_device_safety.py::test_an_armed_burst_cap_refuses_one_owners_flood_but_not_another`, `tests/test_device_safety.py::test_the_default_off_burst_cap_admits_every_submit`, `tests/test_device_safety.py::test_job_burst_decision_prunes_the_window_and_gates_on_the_cap[2-60.0-recent2-110.0-False-50.0-expect_kept2]` |
 | B-Submission (owner derived from the peer uid and the surface) | `tests/test_device_safety.py::test_the_owner_comes_from_the_peer_uid_and_the_surface` |

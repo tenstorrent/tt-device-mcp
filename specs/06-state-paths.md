@@ -202,6 +202,8 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_JOB_EXIT_DIR` | `/run/tt-device-broker/jobexit` | Where jobs record their own exit status | 06 |
 | `TT_DEVICE_MCP_DEVICE_OP_LOCK` | `/run/tt-device-broker/device-op.lock` | Restart-inhibit file for in-flight device ops | 06 |
 | `TT_DEVICE_MCP_JOB_SPOOL_DIR` | `/run/tt-device-broker-spool` | Where a job's stdout/stderr are spooled so they outlive a broker restart (01 I17); unusable → pipes | 06 |
+| `TT_DEVICE_MCP_JOB_LOG_KEEP` | 2000 | Most job logs kept in the log dir; oldest pruned at submit (01 I71) | 01 |
+| `TT_DEVICE_MCP_JOB_LOG_MAX_MB` | 512 | Most MB of job logs kept; oldest pruned at submit (01 I71) | 01 |
 | `TT_DEVICE_MCP_DISPATCH_HOLD` | sibling `dispatch-hold` of the inhibit file | Autoupdate's hold on dispatch across its busy check and restart (01 I18, 08 I18) | 06 |
 | `TT_DEVICE_MCP_DEVICE_OP_FLOCK` | sibling `device-op.flock` of the inhibit file | Advisory flock held for every device op, for external device writers (I8) | 06 |
 | `TT_DEVICE_MCP_CHIP_STATE_FILE` | sibling `chip-state.json` of the inhibit file | Where the broker publishes per-chip `lost`/`recovering` for other readers on the host (03 I66) | 06 |

@@ -199,6 +199,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     offbus_count,
     offbus_power_cycle,
     pci_bus_number,
+    pcie_aer,
     pcie_guard_at_start,
     previous_boot_bus_locks,
     previous_boot_error,
@@ -214,6 +215,7 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
+from tt_device_mcp.job_log_store import exit_signal, find_job_log, prune_job_logs, read_log_tail
 from tt_device_mcp.job_preflight import preflight_output_dirs
 from tt_device_mcp.job_reap import (
     DEAD_CHIP_LABEL_PREFIX,
@@ -3041,6 +3043,7 @@ FOOTER_FIELDS = {
     "EXIT CODE": "exit_code",
     "WAIT TIME": "wait",
     "RUNTIME": "runtime",
+    "SIGNAL": "signal",
 }
 
 # How far back from the end of a job log the footer may sit. The post-job health gate
@@ -3120,7 +3123,14 @@ def write_job_log_footer(job_log_file: Path, job: Job):
             f.write(f"RUNTIME:     {job.runtime_sec:.1f}s\n")
         if job.idle_total_sec is not None:
             f.write(f"DEVICE IDLE: {job.idle_total_sec:.1f}s\n")
+        sig = exit_signal(job.exit_code)
+        if sig:
+            f.write(f"SIGNAL:      {sig}\n")
         f.write("=" * 70 + "\n")
+        # The footer is the job's final record, read back after a restart or a reboot (spec 01
+        # I71): on disk before the post-job gate starts, not in a page cache a power loss drops.
+        f.flush()
+        os.fsync(f.fileno())
 
 
 # The line a queued job's log gets when it is cancelled before it started (spec 01 I69).
@@ -3629,6 +3639,68 @@ def _healthy_reading() -> HealthState:
     for the many callers that already know the device just verified fit (an operator's own tt-smi
     check, a reset's post-verify) but hold no HealthMonitor reading of their own to hand ``fsm``."""
     return HealthState(phase="verified", at=datetime.now(), expected=0)
+
+
+# Spec 03 I91: this job cycle's per-chip PCIe snapshots (job start, job end), read by the post-job
+# check that follows. Telemetry only: nothing here changes a verdict, a hold or a release.
+_pcie_cycle: dict = {}
+
+
+def _pcie_suspect() -> set:
+    """Chip ids whose last sampler read was all-ones: their own link is not read (spec 03 I91)."""
+    try:
+        ring = sampler.ring if sampler is not None else None
+        last = ring[-1]["chips"] if ring else {}
+        return {str(i) for i, row in last.items() if row and row[0] == chip_state.ALL_ONES}
+    except Exception:  # noqa: BLE001 - telemetry never fails its caller
+        return set()
+
+
+# Spec 03 I91: a snapshot takes ~30 ms on a 32-chip host; one whose sysfs read stalls is left out
+# after this long, so it never holds up a job start or the post-job check.
+PCIE_SNAPSHOT_TIMEOUT_SEC = 5.0
+
+
+async def _pcie_snapshot() -> dict:
+    """One read-only per-chip AER and link snapshot (spec 03 I91), {} on any error or timeout."""
+    try:
+        return await aio.wait_for(asyncio.to_thread(pcie_aer.snapshot, _pcie_suspect()), PCIE_SNAPSHOT_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        try:
+            health_event("pcie_snapshot_timeout", timeout_s=PCIE_SNAPSHOT_TIMEOUT_SEC)
+        except Exception:  # noqa: BLE001
+            pass
+        return {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _pcie_record(phase: str, before: dict, after: dict, **fields) -> Optional[list]:
+    """One ``pcie_aer_delta`` event for ``phase``, listing only the chips with a non-zero AER delta,
+    a link change or a bus change. None (and no event) when either snapshot is empty."""
+    if not before or not after:
+        return None
+    try:
+        rows = pcie_aer.delta(before, after)
+        health_event("pcie_aer_delta", phase=phase, chips=rows, summary=pcie_aer.totals(rows), **fields)
+        return rows
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _pcie_job_start(job_id: str) -> None:
+    _pcie_cycle.clear()
+    pcie_aer.new_cycle()
+    _pcie_cycle.update(job=job_id, start=await _pcie_snapshot())
+
+
+async def _pcie_job_end(job_id: str) -> None:
+    end = await _pcie_snapshot()
+    if _pcie_cycle.get("job") != job_id:
+        _pcie_cycle.clear()
+        _pcie_cycle["job"] = job_id
+    _pcie_cycle["end"] = end
+    _pcie_cycle["job_rows"] = _pcie_record("job", _pcie_cycle.get("start") or {}, end, job=job_id)
 
 
 def _job_snapshot(job: "Job | None") -> dict:
@@ -7417,6 +7489,10 @@ async def device_health_gate(
             and not mesh_reset_hold_reason()
             and not recovery_mechanism.cooling()
         )
+        # Spec 03 I91: per-chip AER and link counts just before and just after this pass, after a job
+        # or a step only. Read-only telemetry: the verdict below never reads them.
+        pcie_on = phase in ("post-job", "post-step")
+        pcie_before = await _pcie_snapshot() if pcie_on else {}
         healthy, evidence = await fsm.observe(
             expected,
             _log,
@@ -7429,6 +7505,29 @@ async def device_health_gate(
         )
         state = HealthState.from_evidence(evidence, phase=phase, expected=expected)
         fabric_ok = state.fabric_ok
+        pcie: dict = {}
+        if pcie_on:
+            pcie_after = await _pcie_snapshot()
+            cycle_job = _pcie_cycle.get("job")
+            if _pcie_cycle.get("job_rows") is not None:
+                pcie["job"] = _pcie_cycle["job_rows"]
+            gap = _pcie_record("job_end_to_check", _pcie_cycle.get("end") or {}, pcie_before, job=cycle_job)
+            if gap is not None:
+                pcie["job_end_to_check"] = gap
+            check = _pcie_record(
+                "check",
+                pcie_before,
+                pcie_after,
+                job=cycle_job,
+                gate=phase,
+                fabric_ran=fabric_ok is not None,
+                fabric_ok=fabric_ok,
+            )
+            if check is not None:
+                pcie["check"] = check
+            _pcie_cycle.clear()
+            if dirty_job and pcie:
+                dirty_job = {**dirty_job, "pcie": pcie}
         if fabric_ok is not None:
             last_fabric_check_monotonic = time.monotonic()
         if fabric_ok is True:
@@ -7521,6 +7620,7 @@ async def device_health_gate(
             dirty_reason=dirty_reason,
             dirty_job=dirty_job,
             aer=aer_totals(chips),
+            pcie=pcie or None,
             evidence=evidence,
             fabric=_lift_fabric(),  # this gate's own fabric verdict; dirty_reason may be the prior hold's
         )
@@ -12408,7 +12508,7 @@ def _label_recovery_killed(rec: dict) -> None:
         rec["command"] = f"{tag} {rec.get('command') or ''}"
 
 
-def _recent_jobs(limit: int = 20) -> list[dict]:
+def _recent_jobs(limit: int = 20, files: Optional[list[Path]] = None) -> list[dict]:
     """Parse the most recent job log files into history records (owner, command,
     runtime, status, ...). Durable across the in-memory job purge; reads only each
     file's head + tail so it's cheap even for multi-MB device logs.
@@ -12421,20 +12521,23 @@ def _recent_jobs(limit: int = 20) -> list[dict]:
     in-memory state: ``running`` only if this broker is actually running it (so at
     most one shows running — the broker serializes), ``queued`` if it's waiting,
     else ``interrupted`` (footerless + untracked = orphaned by a restart). For a
-    live job, runtime counts up to now and wait is the time it spent queued."""
+    live job, runtime counts up to now and wait is the time it spent queued.
+
+    ``files`` parses exactly those logs instead of the newest ones (one job's record by id)."""
     import collections
 
     if not job_log_dir:
         return []
-    # Over-fetch, then sort by EXECUTION time below. The file name carries the queue time,
-    # and with a deep queue the order jobs were queued in is not the order they ran in — a
-    # job queued long ago may have started moments ago, and the reset it provoked runs
-    # between it and the next job. Taking the newest `limit` names would drop exactly those.
-    files = sorted(
-        (p for p in Path(job_log_dir).glob("*.log") if p.name != "server.log"),
-        key=lambda p: p.name,
-        reverse=True,
-    )[: max(limit * 4, 60)]
+    if files is None:
+        # Over-fetch, then sort by EXECUTION time below. The file name carries the queue time,
+        # and with a deep queue the order jobs were queued in is not the order they ran in — a
+        # job queued long ago may have started moments ago, and the reset it provoked runs
+        # between it and the next job. Taking the newest `limit` names would drop exactly those.
+        files = sorted(
+            (p for p in Path(job_log_dir).glob("*.log") if p.name != "server.log"),
+            key=lambda p: p.name,
+            reverse=True,
+        )[: max(limit * 4, 60)]
 
     # Snapshot the in-memory queue (id -> Job) — the source of truth for what is
     # actually running/queued right now, independent of the durable log footer.
@@ -12661,6 +12764,53 @@ def _recent_jobs(limit: int = 20) -> list[dict]:
     ran.sort(key=_exec_key, reverse=True)
     pending.sort(key=lambda r: r.get("queued_at") or "")
     return (pending + ran)[:limit]
+
+
+# What a job reads as when its log has no footer and no broker tracks it: the broker that ran it
+# went away (a restart, a reboot) before it could record how the job ended (spec 01 I71).
+JOB_LOST_CAUSE = "lost: the broker restarted while the job ran; its final status was never recorded"
+
+
+def _job_record(job_id: str) -> Optional[dict]:
+    """One job's durable record, read from its own log by id, or None when no log answers to it.
+
+    The in-memory table is emptied by a restart and purged after JOB_RETENTION_SEC; the log is
+    not. Read through _recent_jobs, so a footerless log is classified exactly as the recent list
+    classifies it (running, queued, abandoned, interrupted with the journal's cause), and one the
+    journal cannot explain says it was lost, never "not found"."""
+    path = find_job_log(job_log_dir, job_id)
+    if path is None:
+        return None
+    rec = next((r for r in _recent_jobs(files=[path]) if r.get("job_id") == job_id), None)
+    if rec is not None and rec.get("status") == "interrupted" and not rec.get("cause"):
+        rec["cause"] = JOB_LOST_CAUSE
+    return rec
+
+
+def _job_status_from_record(job_id: str, r: dict) -> dict:
+    """A job-status answer built from a durable record (_job_record)."""
+    res = {
+        "job_id": job_id,
+        "owner": r.get("owner", "?"),
+        "status": r.get("status", "?"),
+        "command": r.get("command", "?"),
+        "exit_code": r.get("exit_code"),
+        "log_file": r.get("log_file"),
+    }
+    try:
+        res["exit_code"] = int(res["exit_code"]) if res["exit_code"] not in (None, "None") else None
+    except (TypeError, ValueError):
+        pass
+    for key in ("started_at", "finished_at", "signal", "cause"):
+        if r.get(key):
+            res[key] = r[key]
+    for key, out in (("runtime", "runtime_sec"), ("wait", "wait_sec")):
+        if r.get(key):
+            try:
+                res[out] = float(str(r[key]).rstrip("s"))
+            except ValueError:
+                pass
+    return res
 
 
 async def cleanup_finished_jobs():
@@ -13793,6 +13943,9 @@ export {JOB_TAG_ENV}={job_tag}
 {job.command}
 """
 
+            # Spec 03 I91: per-chip AER and link counts at job start (read-only sysfs, never a lost chip).
+            await _pcie_job_start(job_id)
+
             # Create process in new session (os.setsid) so all child processes share the same
             # process group ID. This enables reliable cleanup of nested processes via killpg()
             # in the finally block, preventing orphaned child processes from holding device locks.
@@ -14521,6 +14674,8 @@ export {JOB_TAG_ENV}={job_tag}
                 # gates every later arrival: the runner is single-threaded, so a job
                 # that queues during the check waits for it — and any reset it
                 # triggers — before it starts.
+                # Spec 03 I91: the same counts at job end; the post-job check reads them back.
+                await _pcie_job_end(job_id)
                 if job.verification:
                     try:
                         await _settle_verification_job(job)
@@ -16219,25 +16374,9 @@ def create_mcp_server() -> MCPServer:
     def _get_job_status(job_id: str) -> dict:
         """Get job status (shared by REST API and MCP tool)."""
         if job_id not in jobs:
-            for r in _recent_jobs(60):
-                if r.get("job_id") == job_id:
-                    res = {
-                        "job_id": job_id,
-                        "owner": r.get("owner", "?"),
-                        "status": r.get("status", "?"),
-                        "command": r.get("command", "?"),
-                        "exit_code": r.get("exit_code"),
-                        "log_file": r.get("log_file"),
-                    }
-                    if r.get("runtime"):
-                        try:
-                            res["runtime_sec"] = float(str(r["runtime"]).rstrip("s"))
-                        except ValueError:
-                            pass
-                    if r.get("cause"):
-                        res["cause"] = r["cause"]
-                    return res
-            return {"error": "Job not found"}
+            # Gone from memory (a restart, or the retention purge): its log still answers (01 I71).
+            rec = _job_record(job_id)
+            return _job_status_from_record(job_id, rec) if rec else {"error": "Job not found"}
 
         job = jobs[job_id]
         result = {
@@ -16289,24 +16428,26 @@ def create_mcp_server() -> MCPServer:
 
     def _get_job_logs(job_id: str, tail: int = 100) -> dict:
         """Get job logs (shared by REST API and MCP tool)."""
-        if job_id not in jobs:
-            return {"error": "Job not found"}
-
-        job = jobs[job_id]
         # The REST route passes `tail` through raw: clamp it here, as the tool's schema does.
         try:
             tail = max(1, min(int(tail), MAX_LOG_TAIL_LINES))
         except (TypeError, ValueError):
             tail = 100
-        content = ""
-        if job.log_file and os.path.exists(job.log_file):
-            with open(job.log_file, "r") as f:
-                lines = f.readlines()
-                content = "".join(lines[-tail:])
+        if job_id in jobs:
+            log_file = jobs[job_id].log_file
+        else:
+            # Gone from memory (a restart, or the retention purge): its log is still on disk (01 I71).
+            path = find_job_log(job_log_dir, job_id)
+            if path is None:
+                return {"error": "Job not found"}
+            log_file = str(path)
+        # Read from the end, bad bytes replaced: a job log can be gigabytes, carry binary output,
+        # or end mid-character where a write was cut short.
+        content = read_log_tail(log_file, tail) if log_file else ""
 
         return {
             "job_id": job_id,
-            "log_file": job.log_file,
+            "log_file": log_file,
             "content": content,
         }
 
@@ -16524,6 +16665,13 @@ def create_mcp_server() -> MCPServer:
         _persist_queued_job(job)
         await _enqueue_job(job)
         _update_queue_depth_metric()
+        # A new log just landed: keep the dir within its count and size bounds (01 I71). Never the
+        # log of a job this broker still tracks. Best effort, off the loop.
+        try:
+            await asyncio.to_thread(prune_job_logs, job_log_dir, frozenset(jobs) | frozenset(readopted_scopes))
+        except Exception as e:  # noqa: BLE001 - housekeeping only; the job is queued regardless
+            if logger:
+                logger.warning(f"  -> job log retention skipped: {e}")
 
         # Ensure job runner is started (may be first job via REST API before MCP session)
         global job_runner_task
@@ -16732,7 +16880,10 @@ def create_mcp_server() -> MCPServer:
             if logger:
                 logger.info(f"  -> status={job.status.value}, exit_code={job.exit_code}")
         elif logger:
-            logger.warning("  -> ERROR: Job not found")
+            if "error" in result:
+                logger.warning("  -> ERROR: Job not found")
+            else:
+                logger.info(f"  -> from its log: status={result.get('status')}, exit_code={result.get('exit_code')}")
 
         return result
 
@@ -16752,9 +16903,20 @@ def create_mcp_server() -> MCPServer:
             output_lines: Number of lines to include in final result (default: 20)
         """
         if job_id not in jobs:
-            if logger:
-                logger.warning("  -> ERROR: Job not found")
-            return {"error": "Job not found"}
+            # Gone from memory: a job from before a restart, or one purged after it ended. It is not
+            # waited on again, its final record is the answer (01 I71). Not in memory means it
+            # is no longer queued or running here, whatever its log says.
+            rec = await asyncio.to_thread(_job_record, job_id)
+            if rec is None:
+                if logger:
+                    logger.warning("  -> ERROR: Job not found")
+                return {"error": "Job not found"}
+            result = _job_status_from_record(job_id, rec)
+            if output_lines > 0 and rec.get("log_file"):
+                tail = await asyncio.to_thread(_tail_lines, rec["log_file"], output_lines)
+                if tail:
+                    result["output_tail"] = tail
+            return result
 
         job = jobs[job_id]
         poll_interval = 2.0  # seconds
