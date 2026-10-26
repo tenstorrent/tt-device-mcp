@@ -37,7 +37,9 @@ class _JobProc:
 
 
 def _holders(r, *pids):
-    r["scan"] = HolderScan(holders=[DeviceHolder(pid=p, uid=1001, scoped=p in (JOB_CHILD, NEWCOMER)) for p in pids], complete=True)
+    r["scan"] = HolderScan(
+        holders=[DeviceHolder(pid=p, uid=1001, scoped=p in (JOB_CHILD, NEWCOMER)) for p in pids], complete=True
+    )
 
 
 def _arm(r, monkeypatch, holder):

@@ -1479,9 +1479,7 @@ class GalaxyRecovery(Recovery):
         others = dataclasses.replace(scan, holders=[h for h in scan.holders if int(h.pid) not in leftovers])
         # A job the broker killed for recovery and whose process is stuck is the leftover's own
         # victim, not a running job: it would hold the rung for as long as the host lives (I77).
-        blocker = self._tenant_blocker(
-            others, force=True, job_running=self.deps.live_job_running, foreign_yields=True
-        )
+        blocker = self._tenant_blocker(others, force=True, job_running=self.deps.live_job_running, foreign_yields=True)
         if blocker is not None:
             return "held", self._describe_blocker(blocker)
         return None

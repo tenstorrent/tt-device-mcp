@@ -9,7 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.test_classac_power_cycle_direct import EXPECTED, _beats_without, _gate, _off, rig  # noqa: F401 - the fixture
+from tests import test_classac_power_cycle_direct as _direct
+from tests.test_classac_power_cycle_direct import EXPECTED, _beats_without, _gate, _off
 from tests.test_pre_reset_holder_scan import READER, _Box
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
@@ -17,6 +18,7 @@ from tt_device_mcp.health.recovery import galaxy
 
 FOREIGN = SimpleNamespace(pid=4242, uid=1000, scoped=False)  # a host process outside every broker scope
 JOB_HOLDER = SimpleNamespace(pid=4343, uid=1000, scoped=True)  # a broker job's own process
+rig = _direct.rig  # the class A/C rig fixture, shared
 
 
 def _holders(rig, monkeypatch, *holders):

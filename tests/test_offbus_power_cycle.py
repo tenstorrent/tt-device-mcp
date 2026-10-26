@@ -183,7 +183,6 @@ async def test_a_tenant_or_an_unreadable_scan_holds(monkeypatch, tmp_path, clear
     assert rec["fires"] == [] and opc.load_state() == {}
 
 
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "scan",
@@ -201,6 +200,7 @@ async def test_a_foreign_holder_or_an_unreadable_scan_never_holds(monkeypatch, t
     _ladder_ran(hold_since)
     assert await _pass(hold_since) is True
     assert len(rec["fires"]) == 1
+
 
 @pytest.mark.asyncio
 async def test_a_reset_in_its_own_scope_holds(monkeypatch, tmp_path, clear_job_state):

@@ -703,7 +703,9 @@ async def test_a_tenant_the_holder_scan_finds_bounds_the_hold_and_the_ladder_run
     monkeypatch.setattr(
         srv,
         "enumerate_device_holders",
-        lambda: HolderScan(holders=[DeviceHolder(pid=4303, uid=1002, scoped=True)] if tenant["on"] else [], complete=True),
+        lambda: HolderScan(
+            holders=[DeviceHolder(pid=4303, uid=1002, scoped=True)] if tenant["on"] else [], complete=True
+        ),
     )
     monkeypatch.setattr(galaxy, "is_tenant", lambda h: True)
     monkeypatch.setattr(galaxy, "discount_broker_internal", lambda scan: scan)
@@ -1395,7 +1397,9 @@ async def test_a_live_tenant_at_the_bound_is_paged_once_and_the_ladder_runs_when
     monkeypatch.setattr(
         srv,
         "enumerate_device_holders",
-        lambda: HolderScan(holders=[DeviceHolder(pid=5151, uid=1002, scoped=True)] if tenant["on"] else [], complete=True),
+        lambda: HolderScan(
+            holders=[DeviceHolder(pid=5151, uid=1002, scoped=True)] if tenant["on"] else [], complete=True
+        ),
     )
     monkeypatch.setattr(galaxy, "is_tenant", lambda h: True)
     monkeypatch.setattr(galaxy, "discount_broker_internal", lambda scan: scan)
