@@ -2692,6 +2692,15 @@ each rung fires only when the gentler one failed or cannot apply.
   gives up at its driver wait (about 263 s); the full check still runs and decides, and its failure
   requests the power cycle as before, later by at most the step's 380 s (about 275 s seen-based).
 
+  **Known gap (accepted).** Under the I97 deadline (hold start plus 585 s) and the I100 repeat deadline
+  (repeat start plus 300 s), the step always skips after a tt-smi driver-wait give-up: a give-up
+  measured about 133 s on a 32-chip galaxy, so the age plus the step's 570 s is past the deadline. With
+  less than about 190 s left, no full check runs and the broker requests the power cycle at once,
+  journaling `deadline_sec`. The climb's own mesh-reset rung has no I102 step; only the last-chance
+  sweep, which runs before every power cycle, has it. The goal-10 bound wins: on these paths the broker
+  power-cycles without the late-chip retry, and a chip that would have come back late may cost a cycle.
+  The full check with fabric (all cabled links) still gates every release and every hold lift.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
