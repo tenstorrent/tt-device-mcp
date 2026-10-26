@@ -27,6 +27,7 @@ from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 from tt_device_mcp.fsm import ServerFsm, ServerState
 from tt_device_mcp.health import chip_state
 from tt_device_mcp.health import evidence as health
+from tt_device_mcp.health import monitor as monitor_mod
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.core import HealthState, Verdict
 from tt_device_mcp.health.evidence import health_event
@@ -6356,28 +6357,94 @@ def test_aiclk_left_busy_names_only_chips_above_the_idle_clock(monkeypatch):
     assert srv._aiclk_left_busy(800) == {}
 
 
-def test_a_job_that_left_chips_busy_is_recorded(monkeypatch, tmp_path):
-    """03 B-post-job clock check: one event and one job-log line, naming the job and the clock."""
-    monkeypatch.setattr(srv, "chip_snapshot", lambda: {"0": {"tt_aiclk": 1350}, "1": {"tt_aiclk": 1350}})
+def _clock_note(monkeypatch, tmp_path, after_gate, fabric_detail=None, at_end=None, gate_since=None):
+    """Run the post-job clock note once with ``after_gate`` as the post-gate sysfs read and, when
+    ``fabric_detail`` is given, a fabric pass that returned during the gate. Returns the events
+    and the job log's text."""
+    m = srv.health_monitor
+    monkeypatch.setattr(m, "_fabric_verdict", {})
+    monkeypatch.setattr(m, "_fabric_outcome", (0.0, ""))
+    monkeypatch.setattr(m, "last_fabric_ok", None)
+    gate_started = srv.time.monotonic() if gate_since is None else gate_since
+    if fabric_detail is not None:
+        m._note_fabric_verdict(*fabric_detail)
+    monkeypatch.setattr(srv, "chip_snapshot", lambda: {i: {"tt_aiclk": v} for i, v in after_gate.items()})
     events = []
     patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
     log = tmp_path / "905.log"
     log.write_text("")
     job = srv.Job(id="905", owner="tenant", workspace="/tmp", command="true", queued_at="t")
     job.status = srv.JobStatus.FAILED
-    srv._note_aiclk_after_job(job, log)
+    srv._note_aiclk_after_job(job, log, at_end=at_end, gate_since=gate_started)
+    return events, log.read_text()
+
+
+BUSY2 = {"0": 1350, "1": 1350}
+KILLED = (None, f"{monitor_mod.FABRIC_KILLED_BY_ISOLATION} (70s, exit -9): chip 1 off the bus; no verdict")
+
+
+def test_a_job_that_left_chips_busy_is_recorded(monkeypatch, tmp_path):
+    """03 B-post-job clock check (a): a chip already busy at the job's end is the job's. One event and
+    one job-log line name the job, the clock and the read at job end, whatever the gate ran."""
+    events, text = _clock_note(monkeypatch, tmp_path, BUSY2, fabric_detail=KILLED, at_end=dict(BUSY2))
     assert events == [
         (
             "aiclk_busy_after_job",
-            {"job": "905", "status": "failed", "chips": 2, "max_mhz": 1350, "ceiling_mhz": srv.IDLE_AICLK_MAX_MHZ},
+            {
+                "job": "905",
+                "status": "failed",
+                "chips": 2,
+                "max_mhz": 1350,
+                "ceiling_mhz": srv.IDLE_AICLK_MAX_MHZ,
+                "at_job_end": "busy",
+                "cause": "job",
+                "gate_fabric": "killed",
+            },
         )
     ]
-    assert "still at the busy AI clock" in log.read_text()
+    assert "still at the busy AI clock" in text and "2 chip(s) busy at job end" in text
+    assert "the job did not close the device" in text
 
-    events.clear()
-    monkeypatch.setattr(srv, "chip_snapshot", lambda: {"0": {"tt_aiclk": 800}})
-    srv._note_aiclk_after_job(job, log)
-    assert events == [], "an idle clock is not news"
+
+def test_a_busy_clock_the_gates_killed_fabric_pass_left_is_not_the_jobs(monkeypatch, tmp_path):
+    """03 B-post-job clock check (b): every chip idle at the job's end, then the gate's fabric pass
+    opened the mesh and dead-chip isolation killed it (I82). The busy clock after the gate is that
+    pass's, never the job's."""
+    events, text = _clock_note(monkeypatch, tmp_path, BUSY2, fabric_detail=KILLED, at_end={})
+    assert [(k, f["at_job_end"], f["cause"], f["gate_fabric"]) for k, f in events] == [
+        ("aiclk_busy_after_job", "idle", "gate_fabric_check", "killed")
+    ]
+    assert "the gate's fabric check (killed mid-run) raised it" in text
+    assert "no chip was above the idle clock when the job ended" in text
+    assert "the job did not close the device" not in text
+
+
+def test_an_idle_job_end_and_an_idle_clock_after_the_gate_is_not_news(monkeypatch, tmp_path):
+    """03 B-post-job clock check (c): idle at the job's end, the gate's fabric pass passed and the
+    clocks are back at idle: nothing to record."""
+    events, text = _clock_note(
+        monkeypatch, tmp_path, {"0": 800}, fabric_detail=(True, "fabric links healthy (50s)"), at_end={}
+    )
+    assert events == [] and text == ""
+
+
+@pytest.mark.parametrize(
+    "at_end, fabric_detail, gate_since, want",
+    [
+        ({}, None, None, ("idle", "post_job_gate", "none", "a gate step raised it")),
+        ({}, KILLED, 1e18, ("idle", "post_job_gate", "none", "a gate step raised it")),
+        (None, KILLED, None, ("not_read", "unknown", "killed", "not read at job end, so the job or the gate's")),
+    ],
+    ids=["idle-no-fabric-pass", "idle-fabric-pass-before-the-gate", "not-read-at-job-end"],
+)
+def test_the_busy_clock_is_blamed_on_the_job_only_when_read_busy_at_its_end(
+    monkeypatch, tmp_path, at_end, fabric_detail, gate_since, want
+):
+    """03 B-post-job clock check: a fabric pass that returned before this gate started is not the
+    gate's; a job whose clock was not read at its end is not blamed either way."""
+    events, text = _clock_note(monkeypatch, tmp_path, BUSY2, fabric_detail, at_end=at_end, gate_since=gate_since)
+    assert [(f["at_job_end"], f["cause"], f["gate_fabric"]) for _, f in events] == [want[:3]]
+    assert want[3] in text and "the job did not close the device" not in text
 
 
 @pytest.mark.asyncio

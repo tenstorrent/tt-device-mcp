@@ -353,6 +353,8 @@ class HealthMonitor:
         # The last fabric check's verdict as every hold-lift and release event carries it (spec 03 I78):
         # see fabric_verdict(). Empty until a check runs.
         self._fabric_verdict: dict = {}
+        # (monotonic end, outcome) of the last fabric pass that returned: see fabric_outcome_since().
+        self._fabric_outcome: tuple[float, str] = (0.0, "")
         self.last_fabric_output: str = ""
         # When the run that produced last_fabric_output started (local naive datetime), None until
         # one runs. An incident bundle keeps that output only when this pass produced it (spec 03 I57).
@@ -1143,6 +1145,15 @@ class HealthMonitor:
             "_marker": fabric.find_topology_marker(text) or "",
             "_at": time.monotonic(),
         }
+        killed = (detail or "").startswith(FABRIC_KILLED_BY_ISOLATION)
+        self._fabric_outcome = (time.monotonic(), "killed" if killed else self._fabric_verdict["result"])
+
+    def fabric_outcome_since(self, since: float) -> str:
+        """How the last fabric pass that returned at or after ``since`` (monotonic) ended: "pass",
+        "fail", "skipped" (no verdict) or "killed" (dead-chip isolation stopped it, I82); "" when
+        none returned since. A record for attribution only (spec 03 B-post-job clock check)."""
+        at, outcome = self._fabric_outcome
+        return outcome if outcome and at >= since else ""
 
     def fabric_verdict(self) -> dict:
         """The last fabric verdict, for the detail of every hold-lift and release event (spec 03 I78):
