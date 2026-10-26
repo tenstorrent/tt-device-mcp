@@ -269,17 +269,22 @@ async def test_both_backends_rescan_only_once_the_settle_is_over(monkeypatch, tm
 GAVE_UP = "Didn't find all 32 chips in /dev/tenstorrent after 100 seconds, giving up\n"
 
 
-def _arm_sbr(monkeypatch, sysfs: FakeSysfs, *, heals: bool, started=None, hold_sec: float = 0.0) -> list:
-    """Give the process the SBR capability. Each SBR is recorded as (chip, rescans so far); ``heals``:
-    the next rescan brings the chip back. ``started`` (a threading.Event) is set as the write begins,
-    which then takes ``hold_sec``. The fabric and AICLK debts it notes are recorded, not kept."""
+def _arm_sbr(
+    monkeypatch, sysfs: FakeSysfs, *, heals: bool, started=None, hold_sec: float = 0.0, bdfs: dict | None = None
+) -> list:
+    """Give the process the SBR capability. Each SBR is recorded as (chip, rescans so far), and the
+    startup address it was handed in ``bdfs``; ``heals``: the next rescan brings the chip back.
+    ``started`` (a threading.Event) is set as the write begins, which then takes ``hold_sec``. The
+    fabric and AICLK debts it notes are recorded, not kept."""
     sbrs: list = []
 
-    def reset_removed_chip(idx):
+    def reset_removed_chip(idx, bdf=None):
         if started is not None:
             started.set()
         time.sleep(hold_sec)
         sbrs.append((idx, sysfs.rescans))
+        if bdfs is not None:
+            bdfs[idx] = bdf
         if heals:
             sysfs.back_after = sysfs.rescans + 1
         return True
@@ -315,6 +320,51 @@ async def test_an_sbr_follows_the_rescans_that_left_a_chip_out_in_the_driver_wai
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pci_map", ["mapped", "unmapped", "no_map", "map_raises"])
+async def test_the_driver_wait_sbr_hands_each_chip_its_startup_address(monkeypatch, pci_map):
+    """Spec 04 I101: the SBR gets the chip's address from the startup map, so a chip with no removal
+    record can still reach its bridge through the banked baseline. No map, no entry, or a map that
+    raises: the SBR is still tried, with no address, as before."""
+    isolated, sysfs, events, seen, bdfs = {"24"}, FakeSysfs(back_after=10_000), [], {}, {}
+    mechanism = _mechanism(monkeypatch, isolated, sysfs, events)
+    sbrs = _arm_sbr(monkeypatch, sysfs, heals=True, bdfs=bdfs)
+    if pci_map == "mapped":
+        mechanism.chip_pci_map = lambda: {"7": "0000:07:00.0", "24": "0000:81:00.0"}
+    elif pci_map == "unmapped":
+        mechanism.chip_pci_map = lambda: {"7": "0000:07:00.0"}
+    elif pci_map == "map_raises":
+        mechanism.chip_pci_map = lambda: 1 / 0
+    fired: list = []
+    mechanism.sbr_fired_hook = fired.extend
+    _fake_glx_reset(mechanism, sysfs, isolated, [SETTLE], seen, wait_sec=0.5)
+
+    rc, _ = await mechanism.reset_with_quiesce(MESH_RESET, lambda _m: None)
+
+    assert sbrs == [("24", recovery_base.DRIVER_WAIT_SBR_AFTER_TRIES)]
+    assert bdfs == {"24": "0000:81:00.0" if pci_map == "mapped" else None}
+    assert fired == ["24"] and rc == 0
+
+
+@pytest.mark.asyncio
+async def test_a_chip_with_no_bridge_is_not_reported_fired(monkeypatch):
+    """Spec 04 I101 keeps the no_bridge outcome for a chip with no saved mapping: the SBR returns None,
+    the I98 record gets nothing, and the rescans run to their tries."""
+    isolated, sysfs, events, seen = {"24"}, FakeSysfs(back_after=10_000), [], {}
+    mechanism = _mechanism(monkeypatch, isolated, sysfs, events)
+    _arm_sbr(monkeypatch, sysfs, heals=False)
+    monkeypatch.setattr(bridge_reset, "reset_removed_chip", lambda idx, bdf=None: None)
+    mechanism.chip_pci_map = lambda: {}
+    fired: list = []
+    mechanism.sbr_fired_hook = fired.extend
+    _fake_glx_reset(mechanism, sysfs, isolated, [SETTLE], seen, wait_sec=0.5)
+
+    rc, _ = await mechanism.reset_with_quiesce(MESH_RESET, lambda _m: None)
+
+    assert rc == 1 and fired == []
+    assert seen["rescans_at_wait_end"] == recovery_base.DRIVER_WAIT_RESCAN_TRIES
+
+
+@pytest.mark.asyncio
 async def test_a_reset_that_ends_during_the_driver_wait_sbr_takes_no_more_rescans_in_it(monkeypatch):
     """tt-smi exits while the SBR's write is in flight: the write finishes (the cleanup waits for it),
     the loop rescans no more, and the one rescan after the reset follows."""
@@ -342,7 +392,7 @@ async def test_a_reset_that_ends_during_the_driver_wait_sbr_takes_no_more_rescan
 async def test_no_sbr_in_the_driver_wait_without_the_capability(monkeypatch):
     isolated, sysfs, events, seen = {"6"}, FakeSysfs(back_after=10_000), [], {}
     mechanism = _mechanism(monkeypatch, isolated, sysfs, events)
-    monkeypatch.setattr(bridge_reset, "reset_removed_chip", lambda idx: pytest.fail("SBR without setpci"))
+    monkeypatch.setattr(bridge_reset, "reset_removed_chip", lambda idx, bdf=None: pytest.fail("SBR without setpci"))
     _fake_glx_reset(mechanism, sysfs, isolated, [SETTLE], seen, wait_sec=0.5)
 
     rc, _ = await mechanism.reset_with_quiesce(MESH_RESET, lambda _m: None)

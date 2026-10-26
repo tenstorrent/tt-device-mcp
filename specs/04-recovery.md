@@ -2578,6 +2578,21 @@ each rung fires only when the gentler one failed or cannot apply.
   (I28) still refuses the whole sweep and holds for the operator (I22). Remaining risk: a second mesh
   reset whose tray re-power hangs the host; the I25 latch records it.
 
+- **I101 — The SBR of a chip with no usable removal record finds its bridge in the banked link
+  baseline.** Seen on a Galaxy: in a last-chance sweep's mesh reset, tt-smi's driver wait asked for
+  the SBR (I97 b) of a chip that sysfs no longer listed. An earlier SBR in the hold had brought it
+  back, which dropped its removal record, and it then left the bus again. The SBR found no bridge
+  (`bridge_reset_failed`, `no_bridge`) although the banked link baseline named its root port. Now
+  `reset_removed_chip(idx, bdf)` takes the chip's startup address (the driver-wait SBR passes it from
+  the startup map). When the removal record has no usable bridge, it reads the port the banked link
+  baseline (`pcie_link_baseline.json`) stores for that address. That port gets the recorded bridge's
+  proof: still enumerated, its secondary bus is the chip's bus, and nothing is enumerated on that bus.
+  A port that fails the proof, or a malformed entry, fires nothing (`saved_topology_bridge_refused`).
+  A port that passes it gets the SBR (`saved_topology_bridge`). A usable removal record still wins. A
+  chip with no address, no banked link or no baseline keeps `no_bridge` as before, so a chip spent on
+  `no_bridge` still withholds the I69 rescan. The full check with fabric still decides every lift
+  (I32, I94).
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -3208,3 +3223,8 @@ sees a silent fabric pass.
 | I100 below the bound, a sweep whose repeat of the failed mesh reset can no longer end before the I97 deadline holds for the bound: no SBR and no power cycle on that pass | `tests/test_below_floor_offbus_ladder.py::test_the_mesh_reset_before_the_host_rung_starts_only_when_it_ends_before_the_deadline` |
 | I100 an outage hold refuses the whole sweep: nothing lifts and no power cycle is requested; the device stays held for the operator | `tests/test_below_floor_offbus_ladder.py::test_an_outage_hold_refuses_the_sweep_and_holds_for_the_operator` |
 | I100 the sweep never skips a chip's SBR as spent and repeats the failed mesh reset | `tests/test_sbr_record_per_hold.py::test_a_chip_the_gate_reset_is_not_reset_again_by_the_escalation_or_the_sweep` |
+| I101 a chip whose removal record was dropped and that left the bus again gets its SBR through the port its banked link names, with no rescan of its own | `tests/test_removed_chip_rescan.py::test_a_chip_whose_record_was_dropped_gets_its_sbr_through_the_banked_port` |
+| I101 a chip with no startup address, no banked link or no baseline keeps `no_bridge` and fires nothing | `tests/test_removed_chip_rescan.py::test_a_chip_with_no_saved_mapping_keeps_no_bridge`, `tests/test_mesh_reset_readd.py::test_a_chip_with_no_bridge_is_not_reported_fired` |
+| I101 a banked port that is gone, renumbered, feeds an occupied bus or is malformed is refused | `tests/test_removed_chip_rescan.py::test_a_stale_banked_port_is_refused` |
+| I101 a usable removal record wins over the banked port | `tests/test_removed_chip_rescan.py::test_a_usable_record_still_wins_over_the_banked_port` |
+| I101 the driver-wait SBR hands each chip its address from the broker's live startup map; no map still tries the SBR without one | `tests/test_mesh_reset_readd.py::test_the_driver_wait_sbr_hands_each_chip_its_startup_address`, `tests/test_removed_chip_rescan.py::test_the_broker_hands_the_driver_wait_sbr_its_live_startup_map` |

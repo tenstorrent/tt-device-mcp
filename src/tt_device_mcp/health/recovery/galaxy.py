@@ -982,6 +982,7 @@ class GalaxyRecovery(Recovery):
     def __init__(self, monitor, mechanism, deps) -> None:
         super().__init__(monitor, mechanism, deps)
         mechanism.sbr_fired_hook = lambda chips: self._note_sbr_fired(chips)
+        mechanism.chip_pci_map = lambda: self.deps.device_pci_map()
 
     def tenant_holds(self) -> bool:
         """The forced ladders' own tenant check, alone: a running broker job or a readable tenant fd."""

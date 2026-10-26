@@ -579,6 +579,10 @@ class RecoveryMechanism:
     # Spec 04 I98: called with the chips a bridge write reached outside the SBR rung (the driver-wait
     # SBR), so the Galaxy ladder's per-hold SBR record counts them. Set by GalaxyRecovery.
     sbr_fired_hook: Optional[Callable[[list], None]] = None
+    # Spec 04 I101: the broker's startup chip-index-to-PCI-address map, so the driver-wait SBR can
+    # name the bridge of a chip with no removal record from the banked link baseline. Set by
+    # GalaxyRecovery.
+    chip_pci_map: Optional[Callable[[], dict]] = None
 
     def __init__(
         self,
@@ -1795,8 +1799,9 @@ class RecoveryMechanism:
     async def _driver_wait_sbr(self, still, state: dict, log) -> bool:
         """Spec 04 I97: DRIVER_WAIT_SBR_AFTER_TRIES rescans in tt-smi's driver wait have not brought
         isolated chip(s) ``still`` back. Fire one Secondary Bus Reset through each one's recorded
-        bridge (no rescan: the next rescan of the loop adds them, I69), then wait for the link to
-        retrain. Once per reset. Nothing fires without the SBR capability, after the reset ended, or
+        bridge, or for a chip with no usable record the bridge the banked link baseline names for its
+        startup address (I101). No rescan: the next rescan of the loop adds them (I69). Then wait for
+        the link to retrain. Once per reset. Nothing fires without the SBR capability, after the reset ended, or
         for a chip with no usable bridge. True when at least one SBR fired. Never raises: the rescans
         and the full check still decide."""
         if state.get("sbr_done") or state.get("disarmed"):
@@ -1814,6 +1819,10 @@ class RecoveryMechanism:
         if not bridge_reset_enabled():
             log(f"chip(s) {chips} still missing in tt-smi's driver wait; no SBR capability here")
             return False
+        try:
+            pci_map = (self.chip_pci_map() if self.chip_pci_map is not None else None) or {}
+        except Exception:  # noqa: BLE001 - no map only loses the I101 fallback; the record path still runs
+            pci_map = {}
         log(
             f"chip(s) {chips} still missing after {DRIVER_WAIT_SBR_AFTER_TRIES} rescans in tt-smi's driver wait: SBR of each one's bridge"
         )
@@ -1828,6 +1837,7 @@ class RecoveryMechanism:
                     f"bridge reset of isolated chip {idx} in the driver wait",
                     reset_removed_chip,
                     idx,
+                    pci_map.get(str(idx)),
                     timeout=bridge_reset_call_timeout(),
                 )
             except (PciWedged, OSError, asyncio.TimeoutError) as e:
