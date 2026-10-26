@@ -164,7 +164,16 @@ async def _gate():
         # Opted in, the stuck-hold ladder's own bridge rung SBRs it first; the sweep SBRs it again.
         (
             True,
-            ["sbr ['31']", "rescan", "mesh reset", "full check", "sbr ['31']", "mesh reset", "full check", "power cycle"],
+            [
+                "sbr ['31']",
+                "rescan",
+                "mesh reset",
+                "full check",
+                "sbr ['31']",
+                "mesh reset",
+                "full check",
+                "power cycle",
+            ],
         ),
     ],
 )
@@ -331,9 +340,13 @@ async def test_a_remove_blocked_in_the_kernel_still_lets_the_bound_reach_the_pow
     # bound's own ladder then skips the refused rescan and ends in the power cycle too, after its sweep
     # repeats the failed mesh reset and its full check.
     assert order[0] == "power cycle", "the PCI-wedged latch requested the power cycle at once"
-    assert order[1:] == ["mesh reset", "full check", "mesh reset", "full check", "power cycle"], (
-        "the rescan never started a second write"
-    )
+    assert order[1:] == [
+        "mesh reset",
+        "full check",
+        "mesh reset",
+        "full check",
+        "power cycle",
+    ], "the rescan never started a second write"
     assert srv.PCI_WRITER.latched, "the blocked remove latched PCI-wedged"
     assert "pci_rescan_timeout" not in events, "one PCI timeout per ladder: the refused rescan did not wait"
 

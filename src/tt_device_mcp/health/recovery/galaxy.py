@@ -845,7 +845,9 @@ def _mesh_reset_before_host_rung_needs_sec() -> float:
     gives up at its driver wait, or the reset, the settle and the check."""
     return max(
         MESH_RESET_BEFORE_HOST_RUNG_GAVE_UP_SEC,
-        MESH_RESET_BEFORE_HOST_RUNG_SEC + MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC + MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC,
+        MESH_RESET_BEFORE_HOST_RUNG_SEC
+        + MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC
+        + MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC,
     )
 
 
