@@ -189,6 +189,69 @@ def test_a_reset_steps_own_aer_is_excused_then_a_real_burst_still_stops(rig, mon
     assert log[0] == ("stop", FABRIC)
 
 
+@pytest.mark.parametrize("owner", ["reset_in_flight", "scope_seen"])
+def test_a_step_that_ended_with_no_reader_running_still_excuses_the_post_reset_check(rig, monkeypatch, owner):
+    """A reset almost never overlaps a check reader: the watch must see the step on its idle ticks,
+    or the post-reset check that starts inside POST_STEP_AER_QUIET_SEC is stopped on the reset's
+    own trailing AER and the healed device's hold goes on to a rung it does not need."""
+    w, clock, log, feed = rig
+    target = srv.recovery_mechanism if owner == "reset_in_flight" else srv.sampler
+    monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", None)
+    monkeypatch.setattr(target, owner, True)
+    assert w.poll_once() is None, "the step runs with no reader"
+    clock.t += 1
+    monkeypatch.setattr(target, owner, False)
+    assert w.poll_once() is None, "the step ended, still no reader"
+    clock.t += 1
+    monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", _Reader(FABRIC))
+    feed(_sig(0), _sig(9), _sig(9 + AER_STOP_COUNT), _sig(9 + AER_STOP_COUNT), _sig(9 + AER_STOP_COUNT))
+    assert w.poll_once() is None
+    for _ in range(3):
+        clock.t += 1
+        assert w.poll_once() is None, "the reset's trailing AER inside the quiet window"
+    assert not log, log
+    clock.t += 1
+    assert w.poll_once() is None
+    feed(_sig(9 + 2 * AER_STOP_COUNT))
+    clock.t += 1
+    assert w.poll_once(), "past the quiet window a burst stops the check again"
+    assert log[0] == ("stop", FABRIC)
+
+
+def test_a_burst_split_over_two_polls_at_the_real_cadence_stops(rig):
+    """The thread polls every LINK_WATCH_SEC plus the poll's own time, so the read two polls back
+    is just over AER_STOP_WINDOW_SEC old: it must still be the baseline."""
+    w, clock, log, feed = rig
+    step = telemetry.LINK_WATCH_SEC + 0.02
+    feed(_sig(0), _sig(2), _sig(4))
+    assert w.poll_once() is None
+    clock.t += step
+    assert w.poll_once() is None, "+2 alone is below the count"
+    clock.t += step
+    assert w.poll_once(), f"+2 then +2 within {2 * step:g} s"
+    assert log[0] == ("stop", FABRIC)
+
+
+def test_a_rise_spread_past_the_window_at_the_real_cadence_never_stops(rig):
+    w, clock, log, feed = rig
+    step = telemetry.LINK_WATCH_SEC + 0.02
+    feed(*(_sig(n) for n in range(8)))
+    for _ in range(8):
+        assert w.poll_once() is None, "+1 a poll is 2 in two polls"
+        clock.t += step
+    w._reads.clear()
+    feed(_sig(0), _sig(2), _sig(2), _sig(4))
+    for _ in range(4):
+        assert w.poll_once() is None, "+2, a still poll, +2: 4 over three polls"
+        clock.t += step
+    w._reads.clear()
+    feed(_sig(0), _sig(AER_STOP_COUNT))
+    assert w.poll_once() is None
+    clock.t += 3 * telemetry.LINK_WATCH_SEC
+    assert w.poll_once() is None, "a stalled poll: 4 over 3 s"
+    assert not log, log
+
+
 def test_a_slow_rise_another_path_or_one_below_the_count_never_stops(rig):
     w, clock, log, feed = rig
     # The calibrated count (telemetry's basis comment): benign ports post at most 2 in 2 s.

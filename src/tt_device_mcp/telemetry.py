@@ -63,6 +63,10 @@ POST_STEP_AER_QUIET_SEC = 5.0
 # that run is stopped too, and a later full pass decides (a stop is never a fail of the links).
 AER_STOP_COUNT = 4
 AER_STOP_WINDOW_SEC = 2.0
+# The watch polls every LINK_WATCH_SEC plus the poll's own time, so the read two polls back is just
+# over AER_STOP_WINDOW_SEC old. Half a poll of slack keeps it as the baseline; the read three polls
+# back (at least 3 s old) is always out, so a rise spread over three polls never stops a check.
+AER_STOP_WINDOW_SLACK_SEC = LINK_WATCH_SEC / 2
 
 # Spec 03 I83's cut after a failed POST_RESET: all PCI removes together get at most this long (a
 # remove behind a hung endpoint can block in the kernel for good; nobody is killed then), and the
@@ -1100,11 +1104,13 @@ class CheckAerWatch:
     so a watch on the loop would wait on the I/O the storm slows. Every LINK_WATCH_SEC, while any of
     the broker's own readers (the fabric pass, the full check's tt-smi snapshot, the eth self-test,
     the aiclk ceiling) runs, it reads link_signals (sysfs only, no device open) and keeps the reads
-    of the last AER_STOP_WINDOW_SEC. A rise of AER_STOP_COUNT or more on one function on any chip's
+    of the last AER_STOP_WINDOW_SEC (plus AER_STOP_WINDOW_SLACK_SEC for the polls' own time). A rise of AER_STOP_COUNT or more on one function on any chip's
     path calls ``deps.stop_check_readers_on_aer``, which signals the readers' process groups before
     any journal or log write; the event is queued after the stop. While a reset or recovery step
     owns the chips (I66), and for POST_STEP_AER_QUIET_SEC after, a rise only moves the baseline: the
-    step's own errors are expected. Never raises out of its thread."""
+    step's own errors are expected. Step activity is tracked on every tick, a reader running or not:
+    a reset almost never overlaps a check reader, and the post-reset check starts inside the quiet
+    window. Never raises out of its thread."""
 
     def __init__(self, deps: "RecoveryDeps", mechanism: "RecoveryMechanism", sampler: "TelemetrySampler") -> None:
         self._deps = deps
@@ -1144,7 +1150,7 @@ class CheckAerWatch:
     def burst(self, sig: dict, now: float) -> Optional[str]:
         """Fold one link_signals read in: the burst on a chip's path it completes, as a reason, or None."""
         aer = sig.get("aer") or {}
-        while self._reads and now - self._reads[0][0] > AER_STOP_WINDOW_SEC:
+        while self._reads and now - self._reads[0][0] > AER_STOP_WINDOW_SEC + AER_STOP_WINDOW_SLACK_SEC:
             self._reads.popleft()
         paths = sig.get("paths") or {}
         hits = {}
@@ -1165,6 +1171,8 @@ class CheckAerWatch:
         readers = getattr(self._deps, "broker_check_readers", None)
         stop = getattr(self._deps, "stop_check_readers_on_aer", None)
         read = getattr(self._deps, "link_signals", None)
+        # Every tick notes a step, a reader running or not: no sysfs read is needed for that.
+        self._excused(self._clock())
         if readers is None or stop is None or read is None or not readers():
             self._reads.clear()
             return None
