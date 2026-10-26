@@ -8294,6 +8294,12 @@ async def device_health_gate(
                     _log, off_bus, expected, regressed=reset_regressed or episode_regressed, context=f"gate/{phase}"
                 )
             metrics.stage_fired("power_cycle", "blocked")
+        elif stage == STAGE_POWER_CYCLE and (pending := recovery_mechanism.host_action_pending()) is not None:
+            # Spec 04 I37/I65: the rung above already requested the host action (a class A/C drop's
+            # direct power cycle). Asking the governor again would count that same cycle against the
+            # backstop and deny, page and arm a retry over a cycle already under way. Each real cycle
+            # is counted once; the boot that follows runs the full check, fabric included.
+            _log(f"{pending[0]} already requested {int(pending[1])}s ago — not asking for another")
         elif stage == STAGE_POWER_CYCLE:
             action = _HOST_ESCALATION_ACTION[stage]
             # The broker's own probes and the holders it killed for a dead chip are not tenants (I59).
