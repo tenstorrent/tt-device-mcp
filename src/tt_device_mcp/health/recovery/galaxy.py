@@ -14,6 +14,7 @@ import logging
 import math
 import os
 import signal
+import sys
 import time
 from collections.abc import Mapping
 from datetime import datetime
@@ -71,6 +72,7 @@ from tt_device_mcp.health.recovery.base import (
     reenumerate_withheld,
     refuse_mesh_reset,
 )
+from tt_device_mcp.health.recovery import present_reinit
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
 from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook
 
@@ -855,6 +857,21 @@ def _late_chips_needs_sec() -> float:
     """Spec 04 I102: the time the late-chip step and the caller's settle and full check need, from the
     step's start. Under an I97 deadline the step starts only when this much is left."""
     return LATE_CHIP_STEP_SEC + MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC + MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC
+
+
+# Spec 04 I104: POST_RESET and board re-init on the chips present after tt-smi gave up at its driver
+# wait. The same ioctl and UMD discovery tt-smi runs after its wait (a few seconds on a Galaxy: its
+# whole reset with a 30 s settle ends in 32-35 s). The wait for it ends this long after its start; under
+# an I97 deadline sooner, so the settle, the full check and the tail of the reset path (the rescan and
+# its 3 s settle) still end by it. A wait shorter than the floor skips the step: it adds no time then.
+PRESENT_REINIT_SEC = 30
+PRESENT_REINIT_MIN_SEC = 10
+PRESENT_REINIT_TAIL_SEC = 5
+
+
+def _present_reinit_argv() -> list[str]:
+    """The I104 step's command: this package's re-init module under the broker's own interpreter."""
+    return [sys.executable, "-I", "-m", "tt_device_mcp.health.recovery.present_reinit"]
 
 
 def _mesh_reset_before_host_rung_deadline_sec() -> float:
@@ -2400,6 +2417,7 @@ class GalaxyRecovery(Recovery):
                 health_event("reset_refused", context="reset_sweep", argv=argv, detail=out)
             elif late_chips:
                 await self._late_chips_mesh_reset(argv, expected, log, late_chips_deadline)
+                await self._present_chips_reinit(expected, log, late_chips_deadline)
         except Exception as exc:  # noqa: BLE001 - the host rung above must fire even if a reset blew up
             log(f"the back-to-back reset sweep raised {exc!r} — continuing to the host rung")
             health_event("last_chance_reset_sweep_error", error=repr(exc))
@@ -2483,6 +2501,84 @@ class GalaxyRecovery(Recovery):
             rc=mech.last_reset_rc,
             driver_wait_gave_up=mech.last_reset_driver_wait_failed,
         )
+
+    async def _present_chips_reinit(self, expected: int, log, deadline: Optional[float]) -> None:
+        """Spec 04 I104: the last mesh reset's tray re-power ran, but tt-smi gave up at its driver wait
+        because a chip never came back, so the chips that did come back got no POST_RESET and no board
+        re-init. Those two steps run on the chips present (:mod:`present_reinit`, through the broker's
+        reset path: quiesce, holder scan, scope), and the reset path's one bounded rescan follows, for a
+        chip that comes back late. Readers are stopped first. Lifts nothing: the caller's full check with
+        fabric over every cabled link decides, and its failure leads to the power cycle with no added
+        wait. Never raises.
+
+        The wait for the step, the readers' stop included, ends PRESENT_REINIT_SEC after its start, sooner
+        under the I97 ``deadline`` (a hold age) so the settle and the full check still fit; with less than
+        PRESENT_REINIT_MIN_SEC to give it, it does not run and stops nothing."""
+        mech = self.mechanism
+        if not (mech.last_reset_driver_wait_failed and mech.last_reset_tray_repower):
+            return
+
+        def skip(reason: str, **fields) -> None:
+            log(f"no POST_RESET and re-init on the chips present: {reason} — the full check decides")
+            health_event("present_chips_reinit", fired=False, reason=reason, **fields)
+
+        if mech.last_reset_rescan_withheld:
+            return skip("the rescan after the reset was withheld (I69)")
+        try:
+            present = await asyncio.to_thread(present_reinit.present_ids)
+        except Exception as exc:  # noqa: BLE001 - a failed listing is no chip to re-init
+            return skip(f"could not list the chips present ({exc!r})")
+        if not present:
+            return skip("no chip is present")
+        wait = float(PRESENT_REINIT_SEC)
+        if deadline is not None:
+            age = _hold_age_sec(self.deps.device_hold_episode_since() or "")
+            if age is None:
+                return skip("the hold age is unknown")
+            wait = min(
+                wait,
+                deadline
+                - age
+                - MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC
+                - MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC
+                - PRESENT_REINIT_TAIL_SEC,
+            )
+            if wait < PRESENT_REINIT_MIN_SEC:
+                return skip(
+                    f"it and the full check after it could not end by the {deadline:.0f}s deadline",
+                    deadline_sec=round(deadline, 1),
+                )
+        wait_until = time.monotonic() + wait  # the readers' stop counts against it
+        try:
+            stopped = await self.monitor.stop_check_readers(
+                "POST_RESET and re-init on the chips present", MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC
+            )
+        except Exception as exc:  # noqa: BLE001 - the reset path quiesces its own pollers
+            log(f"could not stop the check readers before the re-init of the chips present: {exc!r}")
+            stopped = []
+        log(
+            f"tt-smi gave up at its driver wait after the tray re-power with {len(present)}/{expected} chip(s) "
+            f"present — POST_RESET and board re-init on those, then one rescan (readers stopped: {len(stopped)})"
+        )
+        health_event(
+            "present_chips_reinit",
+            fired=True,
+            present=len(present),
+            expected=expected,
+            wait_sec=round(wait, 1),
+            stopped_pids=stopped,
+        )
+        try:
+            result = await mech.reset_with_quiesce(_present_reinit_argv(), log, wait_until=wait_until)
+            rc = result[0] if isinstance(result, tuple) else None
+            eps = await asyncio.to_thread(pcie_guard.tt_endpoints)
+        except Exception as exc:  # noqa: BLE001 - the caller's check decides either way
+            log(f"POST_RESET and re-init on the chips present raised {exc!r} — the full check decides")
+            health_event("present_chips_reinit_done", rc=None, error=repr(exc))
+            return
+        on_bus = len(eps) if eps is not None else 0
+        log(f"POST_RESET and re-init on the chips present ended rc {rc}; {on_bus}/{expected} chip(s) on the bus")
+        health_event("present_chips_reinit_done", rc=rc, on_bus=on_bus, expected=expected)
 
     async def _settle_and_verify_before_host_rung(self, *args, **kwargs):
         """The last-chance sweep right before a power cycle (spec 04 I58): run with foreign holders
