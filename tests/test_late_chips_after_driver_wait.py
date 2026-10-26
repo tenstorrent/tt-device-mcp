@@ -358,3 +358,61 @@ async def test_a_failed_rescan_ends_the_step(monkeypatch, tmp_path, clear_job_st
     await srv.galaxy_recovery._late_chips_mesh_reset(["tt-smi", "-glx_reset"], 32, lambda m: None, None)
     assert order == ["mesh reset", "rescan"]
     assert _step(events)[0]["fired"] is False and "did not complete" in _step(events)[0]["reason"]
+
+
+def _second_reset_outlives_its_wait(monkeypatch, order, scope="tt-device-reset-2.scope"):
+    """The second mesh reset's wait ends at its bound (rc None) with its scope still cycling (as
+    base.py leaves it: never killed). Records every heartbeat read and every scope_active() answer."""
+    mech = srv.recovery_mechanism
+    state = {"cycling": False}
+    first = mech.reset_with_quiesce
+
+    async def mesh(argv, log, *a, **k):
+        rc, out = await first(argv, log, *a, **k)
+        if k.get("wait_until") is not None:  # the I102 step's reset
+            state["cycling"] = True
+            mech.last_reset_rc, mech.last_reset_driver_wait_failed = None, False
+            return None, "reset never finished after 365s"
+        return rc, out
+
+    monkeypatch.setattr(mech, "reset_with_quiesce", mesh)
+    monkeypatch.setattr(mech, "scope_active", lambda: scope if state["cycling"] else None)
+    beats = srv.read_heartbeats
+
+    def read():
+        if state["cycling"]:
+            order.append("chip read")
+        return beats()
+
+    monkeypatch.setattr(srv, "read_heartbeats", read)
+    return state
+
+
+@pytest.mark.asyncio
+async def test_a_second_reset_still_cycling_at_its_bound_gets_no_check_and_the_power_cycle(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """The second mesh reset outlives the step's wait_until and its scope still runs: no settle, no full
+    check and no chip read over it (each would map chips it may have off the bus). The verify counts as
+    failed: nothing lifts, the hold stays, and the broker's own power cycle is requested."""
+    order, events, counters = _late(monkeypatch, tmp_path, back=2, verdicts=[False, True])
+    _second_reset_outlives_its_wait(monkeypatch, order)
+    assert await _bound_ladder() == OUTCOME_TERMINAL
+    assert _after_sweep_mesh(order) == ["mesh reset", "rescan", "readers stopped", "mesh reset", "power cycle"]
+    skipped = [k for n, k in events if n == "sweep_verify_skipped"]
+    assert len(skipped) == 1 and skipped[0]["reason"] == "reset_scope_active"
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "nothing lifts"
+
+
+@pytest.mark.asyncio
+async def test_with_the_scope_ended_the_normal_settle_and_full_check_run(monkeypatch, tmp_path, clear_job_state):
+    """The same give-up, but no scope is left running when the wait ends: the settle and the full check
+    with fabric run as usual, and their pass lifts the hold."""
+    order, events, counters = _late(monkeypatch, tmp_path, back=2, verdicts=[False, True])
+    state = _second_reset_outlives_its_wait(monkeypatch, order)
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    await _bound_ladder()
+    assert state["cycling"], "the second reset's wait ended at its bound"
+    assert _after_sweep_mesh(order)[-1] == "full check" and "power cycle" not in order
+    assert not [n for n, _k in events if n == "sweep_verify_skipped"]
+    assert counters["dirty_cleared"] == 1

@@ -2757,6 +2757,8 @@ class GalaxyRecovery(Recovery):
         floor = _galaxy_reset_min_dead_chips(expected)
         if floor is None:
             return False
+        if await asyncio.to_thread(self.mechanism.scope_active):
+            return False  # no chip read and no SBR over a reset still cycling: the power cycle decides
         try:
             beats = await asyncio.to_thread(self.deps.read_heartbeats)
         except Exception as exc:  # noqa: BLE001 - no read, no SBR target: the power cycle decides
@@ -2795,7 +2797,21 @@ class GalaxyRecovery(Recovery):
         self, expected: int, log, gate_phase: str, settle: int, *, context: str, fabric_77_unverified: bool
     ) -> tuple:
         """One settle and one full verify (fabric included) after sweep rungs; ends the off-bus reset
-        intent. A fabric 77 after an UNKNOWN reset reads as unhealthy (spec 04 I29)."""
+        intent. A fabric 77 after an UNKNOWN reset reads as unhealthy (spec 04 I29).
+
+        A reset still cycling in its own scope (a wait that ended at its bound, I102, or one adopted)
+        gets no settle and no verify: the full check would map chips that reset is taking off the bus.
+        The verify counts as failed (the hold stays, nothing lifts) and the caller goes on as after a
+        failed check."""
+        scope = await asyncio.to_thread(self.mechanism.scope_active)
+        if scope:
+            pcie_guard.end_offbus_reset()
+            log(
+                f"no settle and no full check: the reset is still cycling in its own scope ({scope}) — "
+                "the device stays held"
+            )
+            health_event("sweep_verify_skipped", context=context or gate_phase, reason="reset_scope_active", scope=scope)
+            return False, {"skipped": "reset_scope_active", "scope": scope}
         if settle:
             log(f"settling {settle}s for re-enumeration, then one verify before the host rung")
         try:
@@ -3618,7 +3634,10 @@ class GalaxyRecovery(Recovery):
     async def _host_rung_cause_now(self, expected: int, prefix: str, fallback: str) -> str:
         """The power cycle's reason from the bus as it reads now, after every rung before it (spec 04
         I97): the chips off the bus and the chips ARC-not-ready, never a count read before the sweep.
-        ``fallback`` when the heartbeats cannot be read."""
+        ``fallback`` when the heartbeats cannot be read, or must not be: a reset still cycling in its
+        own scope (each heartbeat is a PCIe read of a chip it may have off the bus)."""
+        if await asyncio.to_thread(self.mechanism.scope_active):
+            return f"{prefix}: the reset is still cycling in its own scope after the reset ladder"
         try:
             beats = await asyncio.to_thread(self.deps.read_heartbeats)
         except Exception:  # noqa: BLE001 - the reason text must never stop the power cycle
