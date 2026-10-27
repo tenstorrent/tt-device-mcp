@@ -140,7 +140,8 @@ def test_the_fallback_unit_stays_out_of_the_shutdown_and_survives_its_killall(os
     assert os_first["req"].read_text().splitlines()[2] == str(pc.HOOK_TRY_TIMEOUT_MAX_SEC)
 
 
-def _run_fallback(tmp_path, bound, cmd, timeout=5):
+def _run_fallback(tmp_path, bound, cmd, timeout=5, sync=None):
+    """Start the fallback chain for real; ``sync``, when given, is a shell body run as its ``sync``."""
     pidf = tmp_path / "fallback.pid"
     # The fallback runs the installed hook's IPMI preparation: never the host's, a stub here.
     prep = tmp_path / "prepare-ipmi"
@@ -162,6 +163,12 @@ def _run_fallback(tmp_path, bound, cmd, timeout=5):
         *cmd,
     ]
     env = {"PATH": "/usr/bin:/bin", "TT_DEVICE_MCP_POWER_CYCLE_REASON": REASON}
+    if sync is not None:
+        stubs = tmp_path / "fallback-bin"
+        stubs.mkdir()
+        (stubs / "sync").write_text(f"#!/bin/sh\n{sync}\n")
+        (stubs / "sync").chmod(0o755)
+        env["PATH"] = f"{stubs}:{env['PATH']}"
     return pidf, subprocess.Popen(argv, env=env)
 
 
@@ -425,6 +432,9 @@ def escalation(os_first, monkeypatch, tmp_path):
     mech = srv.recovery_mechanism
     monkeypatch.setattr(mech, "host_action_requested", None)
     monkeypatch.setattr(mech, "_power_cycle_not_launched_paged", None)
+    # The process-wide mechanism keeps the I72 miss page's throttle: a page an earlier test on this
+    # worker sent would silence this test's page for an hour.
+    monkeypatch.setattr(mech, "_power_cycle_miss_paged", 0.0)
     monkeypatch.setattr(mech, "_device_hold_episode_since", lambda: "held-since-1")
     pages = []
     monkeypatch.setattr(alert, "send_alert", lambda ev: pages.append(ev) or 0)
@@ -1284,6 +1294,13 @@ def _gone(pid):
         return True
 
 
+def _argv(pid):
+    try:
+        return _cmdline(pid)
+    except OSError:
+        return []
+
+
 def _children(pid):
     out = subprocess.run(["ps", "-o", "pid=", "--ppid", str(pid)], capture_output=True, text=True).stdout
     return [int(p) for p in out.split()]
@@ -1297,18 +1314,27 @@ def test_hook_stops_the_fallback_and_its_children_before_any_wait(hook, tmp_path
     A SIGKILL is delivered at once but the kernel tears the process down after kill(2) returns, so a
     single look can still see a killed process: the stub waits up to 5 s for the processes to go,
     while the hook is held in the RAID wait, so only what the hook did before that wait can end them
-    (none of them exits on its own within 60 s)."""
-    pidf, proc = _run_fallback(tmp_path, 0 if fired else 300, ["/bin/sleep", "60"], timeout=60)
+    (none of them exits on its own within 60 s).
+    The fallback's `sync &` is a stand-in that outlives the cycle's start: the host's sync may sit
+    uninterruptible in a flush for many seconds, where no SIGKILL ends it, and could never cut power."""
+    started = [[b"/bin/sleep", b"59"], [b"/bin/sleep", b"60"]]  # the sync stand-in, the cycle command
+    pidf, proc = _run_fallback(
+        tmp_path, 0 if fired else 300, ["/bin/sleep", "60"], timeout=60, sync="exec /bin/sleep 59"
+    )
     kids = []
     try:
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             if pidf.exists() and pidf.read_text().strip():
                 kids = _children(proc.pid)
-                if not fired or (kids and _cmdline(proc.pid)[0] == pc.FALLBACK_FIRE_ARGV0.encode()):
+                running = [_argv(k)[:2] for k in kids if not _gone(k)]
+                if not fired or (
+                    _argv(proc.pid)[:1] == [pc.FALLBACK_FIRE_ARGV0.encode()] and all(c in running for c in started)
+                ):
                     break
             time.sleep(0.05)
-        assert not fired or kids, "the fallback's cycle command never started"
+        else:
+            raise AssertionError("the fallback's cycle command or its sync never started")
         hook["pid_file"].write_text(pidf.read_text())
         watched = " ".join(str(p) for p in [proc.pid, *kids])
         mdadm = hook["stubs"] / "mdadm"

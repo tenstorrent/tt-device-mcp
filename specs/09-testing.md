@@ -179,7 +179,9 @@ gets through anyway.
   this pytest process, its descendant, nor a process carrying its per-process spawn token
   (inherited by every child, so one that left the session or was re-parented still counts) is
   refused with `PermissionError`, nothing is delivered, and the test fails naming the pids.
-  Signal 0 and a pid that does not exist pass through. No marker lifts it. A test of a kill
+  Signal 0, a pid that does not exist (or is reaped during the check) and a process that has
+  exited or is exiting (every thread a zombie or in do_exit, which a signal cannot reach; once its
+  mm is dropped and it is re-parented it shows neither ancestry nor token) pass through. No marker lifts it. A test of a kill
   path stubs the scan that names its targets (`enumerate_device_holders`, `job_processes`) or
   targets its own children; `device_holders.DEVICE_DIR` stays sealed for the same reason (I1).
   A live process's environ reads empty while it execs, so the guard reads an empty one again for
@@ -499,6 +501,9 @@ own claims that are pinned:
 | I9 (the dead-chip holder kill cannot reach a host process) | `tests/test_signal_guard.py::test_the_dead_chip_holder_kill_cannot_reach_a_host_process` |
 | I9 (a test's own child stays signalable after it left the session or was re-parented) | `tests/test_signal_guard.py::test_a_child_the_test_spawned_can_be_signalled_even_after_it_left_the_session` |
 | I9 (a pid that does not exist is passed through) | `tests/test_signal_guard.py::test_a_pid_that_does_not_exist_is_passed_through` |
+| I9 (a re-parented member that already exited does not fail a group sweep) | `tests/test_signal_guard.py::test_a_group_sweep_over_a_member_that_already_exited_and_was_re_parented_passes` |
+| I9 (a live foreign process stays refused beside an exited one, or after its main thread exited) | `tests/test_signal_guard.py::test_a_live_foreign_member_beside_an_exited_one_is_still_refused`, `tests/test_signal_guard.py::test_a_foreign_process_whose_main_thread_exited_is_still_refused` |
+| I9 (a re-parented member killed mid-exit, or reaped during the check, does not fail a group sweep; one live thread keeps a foreign process refused) | `tests/test_signal_guard.py::test_a_group_member_killed_mid_exit_after_its_parent_was_reaped_passes`, `tests/test_signal_guard.py::test_a_foreign_process_with_one_live_thread_beside_an_exiting_one_is_still_refused` |
 | I8 (the gate reads real `/dev`, never the sandboxed attribute) | `tests/test_device_marker.py::test_the_device_gate_reads_the_real_dev_dir_not_the_sandboxed_one` |
 | I8 (no chips, or no dir, means no device) | `tests/test_device_marker.py::test_no_chips_means_no_device`, `::test_an_absent_dev_dir_means_no_device` |
 | I8 (the marker is registered, so `-m device` selects it) | `tests/test_device_marker.py::test_the_device_marker_is_registered` |

@@ -21,7 +21,8 @@ import time
 import pytest
 
 import tests.conftest as guard_mod
-from tests.conftest import _spawned_by_this_run
+from tests import conftest
+from tests.conftest import _SPAWN_TOKEN_ENV, _carries_spawn_token, _real_kill, _spawned_by_this_run
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 
@@ -101,6 +102,17 @@ def test_a_child_the_test_spawned_can_be_signalled_even_after_it_left_the_sessio
         parent.stdin.close()
 
 
+# A session leader that keeps one exited child unreaped (a zombie in its group), then waits on stdin.
+_LEADER_WITH_EXITED_CHILD = (
+    "import os, sys\n"
+    "pid = os.fork()\n"
+    "if not pid:\n"
+    "    os._exit(0)\n"
+    "print(pid, flush=True)\n"
+    "sys.stdin.read()\n"
+)
+
+
 _FORK = (
     "import os, sys\n"
     "pid = os.fork()\n"
@@ -109,6 +121,165 @@ _FORK = (
     "    os._exit(0)\n"
     "sys.stdin.read()\n"
 )
+
+
+def _zombie_of(leader: subprocess.Popen) -> int:
+    pid = int(leader.stdout.readline())
+    for _ in range(200):
+        with open(f"/proc/{pid}/stat") as f:
+            if f.read().rsplit(")", 1)[1].split()[0] == "Z":
+                return pid
+        time.sleep(0.01)
+    raise AssertionError(f"pid {pid} never exited")
+
+
+def _no_token_env() -> dict:
+    return {k: v for k, v in os.environ.items() if k != _SPAWN_TOKEN_ENV}
+
+
+def test_a_group_sweep_over_a_member_that_already_exited_and_was_re_parented_passes(signal_guard, monkeypatch):
+    """The race behind a preempted job's flaky teardown: SIGKILL ends the job's shell and its
+    `sleep`; the shell is reaped first, its exited child is re-parented to init (ppid no longer
+    ours) and, a zombie, shows an empty /proc environ (no token). The survivor reap's group sweep
+    then met that zombie. A signal reaches nothing in it, so it is not a foreign process."""
+    leader = subprocess.Popen(
+        [sys.executable, "-c", _LEADER_WITH_EXITED_CHILD],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        zombie = _zombie_of(leader)
+        assert not _carries_spawn_token(zombie), "a zombie keeps no environ"
+        # The re-parent to init cuts the ppid walk; only the token is left to prove ownership.
+        monkeypatch.setattr(signal_guard, "owned", _carries_spawn_token)
+        os.killpg(leader.pid, signal.SIGKILL)
+        assert leader.wait(timeout=10) == -signal.SIGKILL
+        assert not signal_guard.refused, signal_guard.refused
+    finally:
+        if leader.poll() is None:
+            _real_kill(leader.pid, signal.SIGKILL)
+            leader.wait(timeout=10)
+
+
+def test_a_live_foreign_member_beside_an_exited_one_is_still_refused(signal_guard, monkeypatch):
+    leader = subprocess.Popen(
+        [sys.executable, "-c", _LEADER_WITH_EXITED_CHILD],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+        env=_no_token_env(),
+    )
+    try:
+        zombie = _zombie_of(leader)
+        monkeypatch.setattr(signal_guard, "owned", _carries_spawn_token)
+        with pytest.raises(PermissionError):
+            os.killpg(leader.pid, signal.SIGKILL)
+        time.sleep(0.2)
+        assert leader.poll() is None, "a refused signal was delivered"
+        assert len(signal_guard.refused) == 1 and f"[{leader.pid}]" in signal_guard.refused[0], signal_guard.refused
+        assert str(zombie) not in signal_guard.refused[0]
+    finally:
+        signal_guard.refused.clear()
+        _end(leader)
+
+
+def test_a_foreign_process_whose_main_thread_exited_is_still_refused(signal_guard, monkeypatch):
+    """Its leader reads 'Z' while another thread runs: a signal would reach that thread."""
+    code = (
+        "import ctypes, sys, threading\n"
+        "threading.Thread(target=sys.stdin.read).start()\n"
+        "ctypes.CDLL(None).pthread_exit(None)\n"
+    )
+    decoy = subprocess.Popen(
+        [sys.executable, "-c", code], stdin=subprocess.PIPE, start_new_session=True, env=_no_token_env()
+    )
+    try:
+        for _ in range(200):
+            with open(f"/proc/{decoy.pid}/stat") as f:
+                if f.read().rsplit(")", 1)[1].split()[0] == "Z":
+                    break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("the decoy's main thread never exited")
+        monkeypatch.setattr(signal_guard, "owned", _carries_spawn_token)
+        for send in (lambda: os.kill(decoy.pid, signal.SIGKILL), lambda: os.killpg(decoy.pid, signal.SIGKILL)):
+            with pytest.raises(PermissionError):
+                send()
+        time.sleep(0.2)
+        assert decoy.poll() is None, "a refused signal was delivered"
+        assert len(signal_guard.refused) == 2, signal_guard.refused
+    finally:
+        signal_guard.refused.clear()
+        _end(decoy)
+
+
+def _exiting_view(real, exiting_tids=None):
+    """A /proc thread reader that shows the given threads (default: all) the way the kernel does
+    between do_exit's exit_signals and exit_notify: still running, PF_EXITING set."""
+
+    def read(pid, tid):
+        fields = real(pid, tid)
+        if fields is not None and (exiting_tids is None or tid in exiting_tids):
+            fields = ["R"] + fields[1:6] + [str(int(fields[6]) | conftest._PF_EXITING)] + fields[7:]
+        return fields
+
+    return read
+
+
+@pytest.mark.parametrize("view", ["exiting", "reaped"])
+def test_a_group_member_killed_mid_exit_after_its_parent_was_reaped_passes(signal_guard, monkeypatch, view):
+    """The race behind a live-scope preemption's flaky teardown: the scope's SIGKILL ends the
+    job's shell and its `sleep` together and the group's SIGKILL follows at once. The shell has
+    exited (its `sleep` re-parented to init, ppid no longer ours) while the `sleep` is still in
+    do_exit with its mm dropped (empty environ, no token) and not yet a zombie, or init reaps it
+    during the guard's reads. A signal reaches nothing in either, so it is not a foreign process.
+    The decoy stands in for that `sleep`: no token, not ours by ancestry, live until the reader
+    shows it dying."""
+    decoy = _stdin_child(start_new_session=True, env=_no_token_env())
+    try:
+        monkeypatch.setattr(signal_guard, "owned", _carries_spawn_token)
+        with pytest.raises(PermissionError):
+            os.killpg(decoy.pid, signal.SIGKILL)
+        assert len(signal_guard.refused) == 1, "the decoy must read as foreign while it lives"
+        signal_guard.refused.clear()
+        reader = _exiting_view(conftest._thread_stat_fields) if view == "exiting" else (lambda pid, tid: None)
+        monkeypatch.setattr(conftest, "_thread_stat_fields", reader)
+        os.killpg(decoy.pid, signal.SIGKILL)
+        assert not signal_guard.refused, signal_guard.refused
+        assert decoy.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        if decoy.poll() is None:
+            _end(decoy)
+
+
+def test_a_foreign_process_with_one_live_thread_beside_an_exiting_one_is_still_refused(signal_guard, monkeypatch):
+    """Only a process all of whose threads are exiting is passed: one live thread takes a signal."""
+    code = "import sys, threading\nthreading.Thread(target=sys.stdin.read).start()\n"
+    decoy = subprocess.Popen(
+        [sys.executable, "-c", code], stdin=subprocess.PIPE, start_new_session=True, env=_no_token_env()
+    )
+    try:
+        for _ in range(200):
+            if len(os.listdir(f"/proc/{decoy.pid}/task")) == 2:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("the decoy never started its second thread")
+        monkeypatch.setattr(signal_guard, "owned", _carries_spawn_token)
+        leader_exiting = _exiting_view(conftest._thread_stat_fields, {str(decoy.pid)})
+        monkeypatch.setattr(conftest, "_thread_stat_fields", leader_exiting)
+        for send in (lambda: os.kill(decoy.pid, signal.SIGKILL), lambda: os.killpg(decoy.pid, signal.SIGKILL)):
+            with pytest.raises(PermissionError):
+                send()
+        time.sleep(0.2)
+        assert decoy.poll() is None, "a refused signal was delivered"
+        assert len(signal_guard.refused) == 2, signal_guard.refused
+    finally:
+        signal_guard.refused.clear()
+        _end(decoy)
 
 
 def _orphan(env=None) -> tuple:

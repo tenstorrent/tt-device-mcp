@@ -228,6 +228,39 @@ def _spawned_by_this_run(pid: int) -> bool:
     return _carries_spawn_token(pid)
 
 
+# include/linux/sched.h: do_exit sets it on each thread before it drops the mm (empty environ).
+_PF_EXITING = 0x4
+
+
+def _thread_stat_fields(pid: int, tid: str) -> "list[str] | None":
+    try:
+        with open(f"/proc/{pid}/task/{tid}/stat") as f:
+            data = f.read()
+    except OSError:
+        return None
+    return data[data.rindex(")") + 2 :].split()
+
+
+def _exited(pid: int) -> bool:
+    """pid has exited or is exiting (no thread of it can act on a signal any more), or is gone.
+    Once do_exit drops a process's mm its /proc environ is empty and, once its parent exits
+    first, its ppid is init, so it no longer reads as this run's; a SIGKILL to a killed job's
+    group can meet its `sleep` there, mid-exit (PF_EXITING) or a zombie, and init can reap it
+    during these reads. A leader that left its live threads behind also reads 'Z', so every
+    thread counts, listed again after the reads: only a live thread makes a new one."""
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+        for tid in tids:
+            fields = _thread_stat_fields(pid, tid)
+            if fields is not None and fields[0] not in ("Z", "X") and not int(fields[6]) & _PF_EXITING:
+                return False
+        return bool(tids) and set(os.listdir(f"/proc/{pid}/task")) <= set(tids)
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError, IndexError):
+        return False
+
+
 def _group_members(pgid: int) -> list:
     members = []
     for name in os.listdir("/proc"):
@@ -249,8 +282,13 @@ class _SignalGuard:
 
     def _foreign(self, pids: list) -> list:
         """The pids that exist and are not this run's. A process (or an ancestor) that exits during
-        the ppid walk breaks it, so a miss is read again; one that is gone by then is skipped."""
-        return [p for p in pids if not self.owned(p) and os.path.exists(f"/proc/{p}") and not self.owned(p)]
+        the ppid walk breaks it, so a miss is read again; one that is gone, exiting or exited by
+        then is skipped."""
+        return [
+            p
+            for p in pids
+            if not self.owned(p) and os.path.exists(f"/proc/{p}") and not self.owned(p) and not _exited(p)
+        ]
 
     def _refuse(self, what: str, sig: int, members: list):
         self.refused.append(f"{what}(signal {int(sig)}) reaches pid(s) {members[:8]} this test did not spawn")
