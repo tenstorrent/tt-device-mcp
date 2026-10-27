@@ -169,7 +169,10 @@ def _run_fallback(tmp_path, bound, cmd, timeout=5, sync=None):
         (stubs / "sync").write_text(f"#!/bin/sh\n{sync}\n")
         (stubs / "sync").chmod(0o755)
         env["PATH"] = f"{stubs}:{env['PATH']}"
-    return pidf, subprocess.Popen(argv, env=env)
+    # Its own session, as systemd-run gives the real fallback's unit. In pytest's process group, the
+    # `sync &` child stays there when `timeout` takes a group of its own; the hook then SIGSTOPs it and
+    # kills `timeout`, and the kernel SIGHUPs that orphaned group with a stopped member: the test run.
+    return pidf, subprocess.Popen(argv, env=env, start_new_session=True)
 
 
 def _cmdline(pid):

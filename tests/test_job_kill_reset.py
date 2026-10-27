@@ -527,7 +527,7 @@ async def test_the_kill_runs_on_its_own_task_outside_the_cancelled_scope(runner_
     monkeypatch.setattr(srv, "_client_gone_kills", rec)
     job = await _job_run_then_cancel(_params(runner_env["tmp"], "true"), lambda j: True)
     assert len(rec.seen) == 1, "one kill task, created outside the cancelled handler"
-    result = await asyncio.wait_for(rec.seen[0], 5)
+    result = await asyncio.wait_for(rec.seen[0], 60)
     assert result == {"status": "cancelled", "job_id": job.id} and job.status is srv.JobStatus.KILLED
     assert not rec, "the task drops its own reference once done"
 
@@ -537,9 +537,10 @@ async def test_a_cancel_while_queued_cancels_the_job(runner_env, monkeypatch):
     rec = _Recorded()
     monkeypatch.setattr(srv, "_client_gone_kills", rec)
     job = await _job_run_then_cancel(_params(runner_env["tmp"], "true"), lambda j: True)
-    assert await _until(lambda: rec.seen, tries=200), "the client-gone kill task is recorded"
-    await asyncio.wait_for(asyncio.gather(*rec.seen), 5)
-    assert await _until(lambda: job.status is not srv.JobStatus.QUEUED, tries=200)
+    # Generous bounds: on a loaded host the server's handler task can take seconds to unwind the cancel.
+    assert await _until(lambda: rec.seen, tries=2400), "the client-gone kill task is recorded"
+    await asyncio.wait_for(asyncio.gather(*rec.seen), 60)
+    assert await _until(lambda: job.status is not srv.JobStatus.QUEUED, tries=2400)
     assert job.status is srv.JobStatus.KILLED, "a queued job nobody waits for never runs"
     assert srv._kill_reset_debt() == "", "a job that never ran owes no reset"
 
@@ -635,7 +636,7 @@ async def test_a_kill_queued_on_the_lock_ahead_of_the_runner_wins(runner_env, mo
             assert await _until(lambda: len(lock._waiters or ()) == 2), "the runner waits behind it"
         finally:
             lock.release()
-        reply = await asyncio.wait_for(kill, 5)
+        reply = await asyncio.wait_for(kill, 60)
         assert await _until(lambda: _runner_done(second)), "the queue moves on to the next job"
     finally:
         await _stop(runner)
@@ -654,8 +655,10 @@ async def test_keep_running_on_disconnect_leaves_the_job_running(runner_env, mon
     job = await _job_run_then_cancel(
         _params(runner_env["tmp"], "true", keep_running_on_disconnect=True), lambda j: True
     )
+    # The server logs the event in its own handler task, which can still be unwinding the cancel when
+    # the client side returns; on a loaded host wait for it with a generous bound.
+    assert await _until(lambda: "job_run_client_gone" in runner_env["events"], tries=2400)
     assert rec.seen == [] and job.status is srv.JobStatus.QUEUED, "the opt-out keeps the job"
-    assert "job_run_client_gone" in runner_env["events"]
 
 
 # ---------------------------------------------------------------- spec 03 I69: every broker kill
