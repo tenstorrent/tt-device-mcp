@@ -70,12 +70,16 @@ def rig(monkeypatch):
     monkeypatch.setattr(evidence, "_append_durable", lambda path, rec, mx: log.append(("io", rec["kind"])))
     patch_health_event(monkeypatch, lambda kind, **f: log.append(("event", kind)))
     reads = []
+    # The watch reads on every tick (spec 03 I96); a tick with nothing fed re-reads the last counters.
+    last = [_sig(0)]
 
     def feed(*sigs):
         reads.extend(sigs)
 
     def link_signals():
-        return reads.pop(0)
+        if reads:
+            last[0] = reads.pop(0)
+        return last[0]
 
     monkeypatch.setattr(srv, "link_signals", link_signals)
     return w, clock, log, feed
