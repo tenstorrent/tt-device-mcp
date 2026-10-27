@@ -12,6 +12,7 @@ import logging
 import os
 import signal
 import subprocess
+import threading
 from pathlib import Path
 
 import httpx2
@@ -475,22 +476,12 @@ class _Recorded(set):
 
 async def _job_run_then_cancel(params: dict, wait_for):
     """Drive tt_device_job_run over a real MCP session, cancel the call once ``wait_for(job)`` holds,
-    then close the session (the disconnect).
-
-    The cancel also waits for the handler's first log line, sent from inside its cancel path's
-    ``try``: the job is in ``srv.jobs`` while ``_queue_job`` still awaits its log pruning thread,
-    and a cancel there (a slow thread on a loaded host) lands before that ``try``, so nothing
-    kills the job."""
+    then close the session (the disconnect)."""
     from mcp.client import Client
 
-    waiting = asyncio.Event()
-
-    async def logged(_params):
-        waiting.set()
-
-    async with Client(srv.create_mcp_server(), logging_callback=logged, log_level="info") as client:
+    async with Client(srv.create_mcp_server()) as client:
         call = asyncio.create_task(client.call_tool("tt_device_job_run", {"params": params}))
-        assert await _until(lambda: waiting.is_set() and len(srv.jobs) == 1 and wait_for(next(iter(srv.jobs.values()))))
+        assert await _until(lambda: len(srv.jobs) == 1 and wait_for(next(iter(srv.jobs.values()))))
         call.cancel()
         await asyncio.gather(call, return_exceptions=True)
     return next(iter(srv.jobs.values()))
@@ -551,6 +542,49 @@ async def test_a_cancel_while_queued_cancels_the_job(runner_env, monkeypatch):
     assert await _until(lambda: job.status is not srv.JobStatus.QUEUED, tries=200)
     assert job.status is srv.JobStatus.KILLED, "a queued job nobody waits for never runs"
     assert srv._kill_reset_debt() == "", "a job that never ran owes no reset"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keep", [False, True], ids=["kill", "keep-running"])
+async def test_a_cancel_while_the_log_prune_runs_still_kills_the_job(runner_env, monkeypatch, keep):
+    """Spec 01 I66: ``_queue_job`` registers the job, then awaits its log pruning thread. A cancel in
+    that await (a slow thread on a loaded host) lands before the handler has a job id: the job must
+    still leave QUEUED, through a kill on its own task, with ``job_run_client_gone`` logged. With
+    ``keep_running_on_disconnect`` the job stays queued and the event is still logged."""
+    rec = _Recorded()
+    monkeypatch.setattr(srv, "_client_gone_kills", rec)
+    pruning, release = threading.Event(), threading.Event()
+
+    def slow_prune(*a, **k):
+        pruning.set()
+        release.wait(60)
+
+    monkeypatch.setattr(srv, "prune_job_logs", slow_prune)
+    from mcp.client import Client
+
+    try:
+        async with Client(srv.create_mcp_server()) as client:
+            call = asyncio.create_task(
+                client.call_tool(
+                    "tt_device_job_run", {"params": _params(runner_env["tmp"], "true", keep_running_on_disconnect=keep)}
+                )
+            )
+            assert await _until(pruning.is_set, tries=2400), "the prune thread started"
+            assert len(srv.jobs) == 1, "the job is registered before the prune"
+            call.cancel()
+            await asyncio.gather(call, return_exceptions=True)
+    finally:
+        release.set()
+    job = next(iter(srv.jobs.values()))
+    if keep:
+        assert await _until(lambda: "job_run_client_gone" in runner_env["events"], tries=2400)
+        assert not rec.seen and job.status is srv.JobStatus.QUEUED, "kept: no kill"
+        return
+    assert await _until(lambda: rec.seen, tries=2400), "a kill task was started for the job"
+    assert len(rec.seen) == 1
+    assert await asyncio.wait_for(rec.seen[0], 60) == {"status": "cancelled", "job_id": job.id}
+    assert job.status is srv.JobStatus.KILLED, "the job left QUEUED"
+    assert "job_run_client_gone" in runner_env["events"]
 
 
 class _Statuses(srv.Job):
