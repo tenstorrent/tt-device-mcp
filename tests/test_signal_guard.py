@@ -19,6 +19,7 @@ import time
 
 import pytest
 
+from tests import conftest
 from tests.conftest import _SPAWN_TOKEN_ENV, _carries_spawn_token, _real_kill, _spawned_by_this_run
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
@@ -192,6 +193,72 @@ def test_a_foreign_process_whose_main_thread_exited_is_still_refused(signal_guar
         else:
             raise AssertionError("the decoy's main thread never exited")
         monkeypatch.setattr(signal_guard, "owned", _carries_spawn_token)
+        for send in (lambda: os.kill(decoy.pid, signal.SIGKILL), lambda: os.killpg(decoy.pid, signal.SIGKILL)):
+            with pytest.raises(PermissionError):
+                send()
+        time.sleep(0.2)
+        assert decoy.poll() is None, "a refused signal was delivered"
+        assert len(signal_guard.refused) == 2, signal_guard.refused
+    finally:
+        signal_guard.refused.clear()
+        _end(decoy)
+
+
+def _exiting_view(real, exiting_tids=None):
+    """A /proc thread reader that shows the given threads (default: all) the way the kernel does
+    between do_exit's exit_signals and exit_notify: still running, PF_EXITING set."""
+
+    def read(pid, tid):
+        fields = real(pid, tid)
+        if fields is not None and (exiting_tids is None or tid in exiting_tids):
+            fields = ["R"] + fields[1:6] + [str(int(fields[6]) | conftest._PF_EXITING)] + fields[7:]
+        return fields
+
+    return read
+
+
+@pytest.mark.parametrize("view", ["exiting", "reaped"])
+def test_a_group_member_killed_mid_exit_after_its_parent_was_reaped_passes(signal_guard, monkeypatch, view):
+    """The race behind a live-scope preemption's flaky teardown: the scope's SIGKILL ends the
+    job's shell and its `sleep` together and the group's SIGKILL follows at once. The shell has
+    exited (its `sleep` re-parented to init, ppid no longer ours) while the `sleep` is still in
+    do_exit with its mm dropped (empty environ, no token) and not yet a zombie, or init reaps it
+    during the guard's reads. A signal reaches nothing in either, so it is not a foreign process.
+    The decoy stands in for that `sleep`: no token, not ours by ancestry, live until the reader
+    shows it dying."""
+    decoy = _stdin_child(start_new_session=True, env=_no_token_env())
+    try:
+        monkeypatch.setattr(signal_guard, "owned", _carries_spawn_token)
+        with pytest.raises(PermissionError):
+            os.killpg(decoy.pid, signal.SIGKILL)
+        assert len(signal_guard.refused) == 1, "the decoy must read as foreign while it lives"
+        signal_guard.refused.clear()
+        reader = _exiting_view(conftest._thread_stat_fields) if view == "exiting" else (lambda pid, tid: None)
+        monkeypatch.setattr(conftest, "_thread_stat_fields", reader)
+        os.killpg(decoy.pid, signal.SIGKILL)
+        assert not signal_guard.refused, signal_guard.refused
+        assert decoy.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        if decoy.poll() is None:
+            _end(decoy)
+
+
+def test_a_foreign_process_with_one_live_thread_beside_an_exiting_one_is_still_refused(signal_guard, monkeypatch):
+    """Only a process all of whose threads are exiting is passed: one live thread takes a signal."""
+    code = "import sys, threading\nthreading.Thread(target=sys.stdin.read).start()\n"
+    decoy = subprocess.Popen(
+        [sys.executable, "-c", code], stdin=subprocess.PIPE, start_new_session=True, env=_no_token_env()
+    )
+    try:
+        for _ in range(200):
+            if len(os.listdir(f"/proc/{decoy.pid}/task")) == 2:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("the decoy never started its second thread")
+        monkeypatch.setattr(signal_guard, "owned", _carries_spawn_token)
+        leader_exiting = _exiting_view(conftest._thread_stat_fields, {str(decoy.pid)})
+        monkeypatch.setattr(conftest, "_thread_stat_fields", leader_exiting)
         for send in (lambda: os.kill(decoy.pid, signal.SIGKILL), lambda: os.killpg(decoy.pid, signal.SIGKILL)):
             with pytest.raises(PermissionError):
                 send()
