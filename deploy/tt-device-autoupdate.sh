@@ -574,7 +574,7 @@ EOF
                 drain_why="post-job gate still running ${GATE_CAP}s after the preemption"
                 return 1
             fi
-        elif op_in_flight && [ "$running" -eq 0 ]; then
+        elif [ "$running" -eq 0 ] && op_in_flight; then   # the job count first: it costs no process
             if [ -z "$op_since" ]; then
                 op_since="$w_now"
                 echo "autoupdate: $1: a device op is in flight after $(( w_now - w_start ))s with no job running; it is waited out under the hold for at most ${OP_CAP}s" >&2
