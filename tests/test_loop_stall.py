@@ -203,7 +203,9 @@ async def test_a_timed_out_read_never_counts_the_hold_fabric_only(status_rig, mo
 
 
 @pytest.mark.asyncio
-async def test_a_timed_out_read_never_lifts_a_hold(status_rig, monkeypatch, broker_root, enum_arc, events):
+async def test_a_timed_out_read_never_lifts_a_hold(
+    status_rig, monkeypatch, broker_root, enum_arc, events  # noqa: F811
+):
     """An operator fabric check passed, but the chip read behind the lift does not come back in
     time: the hold stays (spec 03 I4, I87)."""
     _fabric_only_hold(monkeypatch)
@@ -218,7 +220,7 @@ async def test_a_timed_out_read_never_lifts_a_hold(status_rig, monkeypatch, brok
 
 @pytest.mark.asyncio
 async def test_a_readable_device_still_lifts_through_the_offloop_read(
-    status_rig, monkeypatch, broker_root, enum_arc, events
+    status_rig, monkeypatch, broker_root, enum_arc, events  # noqa: F811
 ):
     """The same lift with the chips answering: the off-loop read changes where it runs, not what
     it decides."""
