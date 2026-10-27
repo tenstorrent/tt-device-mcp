@@ -2574,7 +2574,12 @@ class GalaxyRecovery(Recovery):
             eps = await asyncio.to_thread(pcie_guard.tt_endpoints)
         except Exception as exc:  # noqa: BLE001 - the caller's check decides either way
             log(f"POST_RESET and re-init on the chips present raised {exc!r} — the full check decides")
-            health_event("present_chips_reinit_done", rc=None, error=repr(exc))
+            try:
+                eps = await asyncio.to_thread(pcie_guard.tt_endpoints)
+            except Exception:  # noqa: BLE001 - the count is only journalled
+                eps = None
+            on_bus = len(eps) if eps is not None else None
+            health_event("present_chips_reinit_done", rc=None, error=repr(exc), on_bus=on_bus, expected=expected)
             return
         on_bus = len(eps) if eps is not None else 0
         log(f"POST_RESET and re-init on the chips present ended rc {rc}; {on_bus}/{expected} chip(s) on the bus")

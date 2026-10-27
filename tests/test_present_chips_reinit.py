@@ -101,6 +101,114 @@ async def test_no_reinit_without_the_repower_or_when_the_rescan_was_withheld(
     assert counters["dirty_cleared"] == 0
 
 
+def _reinit_ends(monkeypatch, order, *, raises=False, scope="tt-device-reset-3.scope"):
+    """The I104 step's reset path ends badly: its wait ends at its bound (rc None) with its scope still
+    cycling, as base.py leaves it, or (``raises``) the call raises. Any other reset runs as the rig's."""
+    mech = srv.recovery_mechanism
+    state = {"cycling": False}
+    first = mech.reset_with_quiesce
+
+    async def reset(argv, log, *a, **k):
+        rc, out = await first(argv, log, *a, **k)
+        if argv == galaxy._present_reinit_argv():
+            if raises:
+                raise RuntimeError("the re-init blew up")
+            state["cycling"] = True
+            return None, ""
+        return rc, out
+
+    monkeypatch.setattr(mech, "reset_with_quiesce", reset)
+    monkeypatch.setattr(mech, "scope_active", lambda: scope if state["cycling"] else None)
+    return state
+
+
+@pytest.mark.asyncio
+async def test_a_reinit_still_cycling_at_its_bound_gets_no_check_and_the_power_cycle(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """The re-init's wait ends at its bound (rc None) with its scope still cycling: no settle and no full
+    check over it. The verify counts as failed, nothing lifts, and the power cycle follows in the same
+    pass. The step's end is journalled with rc None and the chips on the bus."""
+    order, events, counters = _late(monkeypatch, tmp_path, back=1, reinit_back=True, verdicts=[False, True])
+    state = _reinit_ends(monkeypatch, order)
+    assert await _bound_ladder() == OUTCOME_TERMINAL
+    assert state["cycling"]
+    assert _after_sweep_mesh(order)[-2:] == ["present reinit", "power cycle"]
+    skipped = [k for n, k in events if n == "sweep_verify_skipped"]
+    assert len(skipped) == 1 and skipped[0]["reason"] == "reset_scope_active"
+    assert _done(events) == [{"rc": None, "on_bus": 32, "expected": 32}]
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "nothing lifts"
+
+
+@pytest.mark.asyncio
+async def test_a_reinit_that_raises_still_gets_the_full_check_and_the_power_cycle(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """The re-init raises: the step journals the error with the chips on the bus and returns; the full
+    check with fabric still runs and decides. It fails, nothing lifts, and the power cycle follows."""
+    order, events, counters = _late(monkeypatch, tmp_path, back=1)
+    _reinit_ends(monkeypatch, order, raises=True)
+    assert await _bound_ladder() == OUTCOME_TERMINAL
+    assert _after_sweep_mesh(order)[-3:] == ["present reinit", "full check", "power cycle"]
+    done = _done(events)
+    assert len(done) == 1 and done[0]["rc"] is None and "blew up" in done[0]["error"]
+    assert (done[0]["on_bus"], done[0]["expected"]) == (31, 32)
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "nothing lifts"
+
+
+@pytest.mark.asyncio
+async def test_a_raise_with_the_bus_unreadable_journals_no_chip_count(monkeypatch, tmp_path, clear_job_state):
+    """The re-init raises and the bus cannot be read after it: the step still ends without raising, with
+    on_bus None (not a count it did not read), and lifts nothing."""
+    order, events, counters = _late(monkeypatch, tmp_path, back=1)
+    _reinit_ends(monkeypatch, order, raises=True)
+    mech, log = srv.recovery_mechanism, lambda m: None
+    await mech.reset_with_quiesce(GLX, log)
+
+    def unreadable():
+        raise OSError("sysfs gone")
+
+    monkeypatch.setattr(galaxy.pcie_guard, "tt_endpoints", unreadable)
+    await srv.galaxy_recovery._present_chips_reinit(32, log, None)
+    assert order == ["mesh reset", "readers stopped", "present reinit"]
+    assert _done(events)[0]["on_bus"] is None and _done(events)[0]["rc"] is None
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
+
+
+def _no_listing():
+    raise OSError("no /dev/tenstorrent")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "present, age_known, reason",
+    [
+        (_no_listing, True, "could not list the chips present"),
+        (lambda: [], True, "no chip is present"),
+        (None, False, "the hold age is unknown"),
+    ],
+    ids=["listing-failed", "no-chip", "age-unknown"],
+)
+async def test_the_skip_branches_stop_nothing_and_run_nothing(
+    monkeypatch, tmp_path, clear_job_state, present, age_known, reason
+):
+    """A failed listing, no chip present, or an unknown hold age under a deadline: the step is journalled
+    as not fired, stops no reader and runs no re-init; the full check decides as before."""
+    order, events, counters = _late(monkeypatch, tmp_path, back=1)
+    mech, log = srv.recovery_mechanism, lambda m: None
+    await mech.reset_with_quiesce(GLX, log)
+    if present is not None:
+        monkeypatch.setattr(galaxy.present_reinit, "present_ids", present)
+    if not age_known:
+        monkeypatch.setattr(galaxy, "_hold_age_sec", lambda since: None)
+    await srv.galaxy_recovery._present_chips_reinit(32, log, None if age_known else 585.0)
+    assert order == ["mesh reset"], "no reader stop, no re-init"
+    step = _reinit(events)
+    assert len(step) == 1 and step[0]["fired"] is False and step[0]["reason"].startswith(reason)
+    assert _done(events) == []
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
+
+
 @pytest.mark.asyncio
 async def test_no_reinit_after_a_mesh_reset_that_ended_clean(monkeypatch, tmp_path, clear_job_state):
     """Both chips back late: the I102 second mesh reset ends clean, so its own POST_RESET and re-init
