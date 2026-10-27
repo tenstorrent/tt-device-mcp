@@ -14,6 +14,7 @@ import pytest
 
 from tests.test_arc_not_ready import _bdf, _fake_sysfs
 from tt_device_mcp import server as srv
+from tt_device_mcp.health import chip_state
 from tt_device_mcp.health import evidence as health
 from tt_device_mcp.health.core import Verdict
 from tt_device_mcp.health.monitors import heartbeat, pci
@@ -106,3 +107,63 @@ def test_unreadable_counter_does_not_latch_the_detector_off(unreadable_24):
 def test_liveness_reason_names_unreadable_chips(unreadable_24, monkeypatch):
     monkeypatch.setattr(srv, "heartbeat_supported", lambda *a: True)
     assert srv._device_liveness_reason() == "24 chip(s) in sysfs, heartbeat unreadable on 24"
+
+
+# --- heartbeat-fence: the class A reads skip a chip the broker fenced (spec 03 I97)
+
+
+def _reads(monkeypatch):
+    """Every heartbeat read that went to a chip, by index."""
+    seen = []
+    real = heartbeat._read_beat
+
+    def read_beat(node):
+        seen.append(node.name.rsplit("!", 1)[-1])
+        return real(node)
+
+    monkeypatch.setattr(heartbeat, "_read_beat", read_beat)
+    return seen
+
+
+def _block(how, idx):
+    if how == "fenced":
+        chip_state.fence([idx], "test")
+    else:
+        chip_state.mark_lost([idx], "test")
+    assert chip_state.read_blocked(idx)
+
+
+@pytest.mark.parametrize("how", ["fenced", "lost"])
+def test_the_class_a_read_never_reads_a_fenced_chip(unreadable_24, monkeypatch, how):
+    """A chip the broker fenced (or marked lost) is not read by the class A decision read: a read of a
+    dead chip's attribute stalls its PCI remove. It counts as reading all-ones, off the bus: never an
+    on-bus survivor, never healthy."""
+    _block(how, "3")
+    seen = _reads(monkeypatch)
+    out = heartbeat.unreadable_on_bus_chips(ON_BUS)
+    assert "3" not in seen, f"the fenced chip was read: {seen}"
+    assert out == {str(i) for i in ON_BUS} - {"3"}
+    assert "3" in heartbeat.offbus_chip_ids({}, 32), "the fenced chip counts off the bus"
+
+
+def test_the_broker_s_own_reset_step_still_reads_a_fenced_chip(unreadable_24, monkeypatch):
+    """The fence gates the pollers, not the broker's own reset step: its reads are ungated."""
+    _block("fenced", "3")
+    seen = _reads(monkeypatch)
+    chip_state.set_recovering("op:reset", True)
+    try:
+        assert heartbeat.unreadable_on_bus_chips(ON_BUS) == {str(i) for i in ON_BUS}
+        assert "3" in seen
+    finally:
+        chip_state.set_recovering("op:reset", False)
+
+
+@pytest.mark.parametrize("how", ["fenced", "lost"])
+def test_the_absence_reason_never_reads_a_fenced_chip_nor_counts_it_answering(monkeypatch, tmp_path, how):
+    """Only chip 0 answers and it is fenced: the probe is not read and does not report the counter
+    working (a fenced chip is never counted healthy)."""
+    _fake_sysfs(monkeypatch, tmp_path, eio=range(1, 32))
+    _block(how, "0")
+    seen = _reads(monkeypatch)
+    assert heartbeat.heartbeat_absence_reason() == "attr_unreadable"
+    assert "0" not in seen, f"the fenced chip was read: {seen}"

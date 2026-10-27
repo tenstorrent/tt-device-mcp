@@ -13,18 +13,24 @@ while the chip is still attached (I92). No device is touched and no process is s
 the remove and every signal are stubbed.
 """
 
+import asyncio
+import signal
+import subprocess
 import threading
 import time
+import types
 
 import pytest
 
+from tests.conftest import REAL_RUN_SNAPSHOT
 from tests.test_aer_check_stop import _sig
 from tests.test_aer_stop_contain import _held, _rows, _sample, _stop_row, watch  # noqa: F401 - the fixture
 from tests.test_deadchip_detach_before_kill import FABRIC, valve  # noqa: F401 - the fixture
 from tt_device_mcp import server as srv
 from tt_device_mcp import telemetry
 from tt_device_mcp.health import ALL_ONES, chip_state
-from tt_device_mcp.health.monitors import pci
+from tt_device_mcp.health import monitor as monitor_mod
+from tt_device_mcp.health.monitors import pci, subproc
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 
 # One stalled PCIe read of a dead chip's attribute; a snapshot's eleven of them (eight attributes,
@@ -503,3 +509,164 @@ def test_the_pre_reset_scan_still_detaches_a_fenced_chip_a_real_read_finds_dead(
     chip_state._fenced["13"]["read"] = time.monotonic()
     monkeypatch.setattr(chip_state, "is_lost", lambda idx: str(idx) == "13")
     assert pre_reset_scan._offbus_bound_chips() == ["13"]
+
+
+# --- reader-timeout-fence: a stopped reader's own timeout never kills it while its chip is attached
+
+
+HUNG = 6161
+
+
+class _Hung:
+    """A probe that never answers, so its own timeout path runs."""
+
+    def __init__(self, pid):
+        self.pid, self.returncode, self.stdout = pid, None, None
+
+    async def communicate(self):
+        await asyncio.Event().wait()
+
+    async def wait(self):
+        return self.returncode
+
+
+async def _probe_timeout(monkeypatch):
+    """run_probe on a hung reader with a 50 ms timeout; returns (seconds to the kill, held at it)."""
+
+    async def spawn(*a, **k):
+        return _Hung(HUNG)
+
+    monkeypatch.setattr(subproc.asyncio, "create_subprocess_exec", spawn)
+    kills = []
+
+    async def terminate(pid):
+        kills.append((pid, chip_state.reader_held(pid), time.monotonic()))
+
+    t0 = time.monotonic()
+    rc, _ = await subproc.run_probe(["probe"], timeout_sec=0.05, track=lambda p: None, stream=False, env={}, terminate=terminate)
+    assert rc is None and len(kills) == 1 and kills[0][0] == HUNG, kills
+    return kills[0][2] - t0, kills[0][1]
+
+
+async def test_a_held_reader_s_own_timeout_kills_it_only_once_the_watch_released_it(monkeypatch):
+    """Spec 03 I92: the AER watch stopped this reader while a chip it may read is attached. Its own
+    timeout fires at 50 ms; the kill (which closes its fds, and the close reaches the chip) waits for
+    the watch's release after the remove."""
+    chip_state.hold_readers([HUNG], time.monotonic() + 30)
+    asyncio.get_running_loop().call_later(0.5, chip_state.release_readers, [HUNG])
+    took, held = await _probe_timeout(monkeypatch)
+    assert not held and took >= 0.5, f"killed at {took:.2f}s while still held"
+    assert took < 0.5 + 1.0
+    assert not _rows("check_reader_hold_expired")
+
+
+async def test_a_held_reader_is_killed_at_its_hold_s_bound_when_no_release_comes(monkeypatch):
+    """A watch that never settles (its thread died) never leaves a reader alive past the hold's bound:
+    the kill runs then, and the expired hold is journaled."""
+    chip_state.hold_readers([HUNG], time.monotonic() + 0.4)
+    took, held = await _probe_timeout(monkeypatch)
+    assert not held and 0.4 <= took < 0.4 + 1.0, took
+    assert _rows("check_reader_hold_expired")[-1]["pid"] == HUNG
+    assert not chip_state.reader_held(HUNG)
+
+
+async def test_a_broker_reset_step_never_waits_on_a_held_reader(monkeypatch):
+    """The goal-10 ladder and the power-cycle request own the chips: a reader killed on their path is
+    killed at once, never held for the stop's bound."""
+    chip_state.hold_readers([HUNG], time.monotonic() + 30)
+    chip_state.set_recovering("op:reset", True)
+    try:
+        took, _ = await _probe_timeout(monkeypatch)
+    finally:
+        chip_state.set_recovering("op:reset", False)
+    assert took < 1.0, took
+    assert not _rows("check_reader_hold_expired")
+
+
+def test_an_unheld_reader_is_killed_on_its_own_timeout_as_before():
+    t0 = time.monotonic()
+    chip_state.wait_reader_release(HUNG)
+    assert time.monotonic() - t0 < 0.05
+
+
+class _HungPopen:
+    def __init__(self, *a, **k):
+        self.pid, self.returncode, self.calls = HUNG, None, 0
+
+    def communicate(self, timeout=None):
+        self.calls += 1
+        if self.calls == 1:
+            raise subprocess.TimeoutExpired("tt-smi", timeout)
+        return "", ""
+
+
+def test_the_snapshot_s_own_timeout_kill_waits_for_the_release(monkeypatch):
+    # The monitor's own subprocess module only: other code in the process keeps the real Popen.
+    fake = types.ModuleType("subprocess")
+    fake.__dict__.update(vars(subprocess))
+    fake.Popen = _HungPopen
+    monkeypatch.setattr(monitor_mod, "subprocess", fake)
+    monkeypatch.setattr(monitor_mod.HealthMonitor, "_run_snapshot", REAL_RUN_SNAPSHOT, raising=False)
+    sent = []
+    monkeypatch.setattr(monitor_mod.os, "killpg", lambda pid, sig: sent.append((pid, sig, chip_state.reader_held(pid))))
+    chip_state.hold_readers([HUNG], time.monotonic() + 30)
+    threading.Timer(0.3, chip_state.release_readers, args=([HUNG],)).start()
+    t0 = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        srv.health_monitor._run_snapshot(["tt-smi"], 0.01)
+    assert sent == [(HUNG, signal.SIGKILL, False)] and time.monotonic() - t0 >= 0.3, sent
+
+
+async def test_the_check_deadline_s_sigkill_of_a_held_reader_waits_for_the_release(monkeypatch):
+    hm = srv.health_monitor
+    monkeypatch.setattr(hm, "fabric_check_proc", _Proc(HUNG))
+    monkeypatch.setattr(hm, "snapshot_proc", None, raising=False)
+    monkeypatch.setattr(monitor_mod.CEILING, "proc", None)
+    monkeypatch.setattr(hm, "note_fabric_check_killed", lambda reason: None)
+    monkeypatch.setattr(monitor_mod, "_group_alive", lambda pid: True)
+    sent = []
+    monkeypatch.setattr(monitor_mod.os, "killpg", lambda pid, sig: sent.append((sig, chip_state.reader_held(pid))))
+    chip_state.hold_readers([HUNG], time.monotonic() + 30)
+    asyncio.get_running_loop().call_later(0.3, chip_state.release_readers, [HUNG])
+    await hm.stop_check_readers("check deadline", 0.0)
+    # SIGTERM stays pending on a stopped group (no fd closes); only the SIGKILL waits.
+    assert sent == [(signal.SIGTERM, True), (signal.SIGKILL, False)], sent
+
+
+def _cap(w, monkeypatch):
+    acted = None
+    for _ in range(int(telemetry.PENDING_STOP_CAP_SEC / telemetry.LINK_WATCH_SEC) + 1):
+        acted = _poll(w, monkeypatch, _sig(14))
+        if acted:
+            return acted
+    return acted
+
+
+def test_a_pending_stop_holds_its_readers_through_the_remove_and_then_releases_them(watch, monkeypatch):  # noqa: F811
+    w, log, _detach_ok, burst = watch
+    at_remove = []
+    remove = srv.isolate_chip
+    monkeypatch.setattr(srv, "isolate_chip", lambda idx: at_remove.append(chip_state.reader_held(FABRIC)) or remove(idx))
+    assert burst()
+    _stopped_only(log)
+    assert chip_state.reader_held(FABRIC), "the stopped reader's own timeout must not kill it now"
+    left = chip_state._held[FABRIC] - time.monotonic()
+    # Bounded, and past the cap's remove: the watch acts first.
+    assert telemetry.PENDING_STOP_CAP_SEC + telemetry.DETACH_TIMEOUT_SEC < left <= telemetry.READER_HOLD_SEC
+    assert _cap(w, monkeypatch)
+    assert at_remove == [True], "held while the chip was still attached"
+    assert FABRIC not in chip_state._held and ("kill", FABRIC) in log
+    _held()
+
+
+@pytest.mark.parametrize("settled", ["answering", "reset step"])
+def test_a_pending_stop_settled_without_a_remove_releases_its_readers(watch, monkeypatch, settled):  # noqa: F811
+    w, log, _detach_ok, burst = watch
+    assert burst()
+    assert chip_state.reader_held(FABRIC)
+    if settled == "answering":
+        assert w.answer()
+    else:
+        monkeypatch.setattr(srv.recovery_mechanism, "reset_in_flight", True)
+        assert _poll(w, monkeypatch, _sig(14)) is None
+    assert w.pending_stop is None and FABRIC not in chip_state._held
