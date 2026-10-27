@@ -15,10 +15,12 @@ findings INTO the FSM through the injected dirty-mark.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import os
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
@@ -67,6 +69,11 @@ AER_STOP_WINDOW_SEC = 2.0
 # over AER_STOP_WINDOW_SEC old. Half a poll of slack keeps it as the baseline; the read three polls
 # back (at least 3 s old) is always out, so a rise spread over three polls never stops a check.
 AER_STOP_WINDOW_SLACK_SEC = LINK_WATCH_SEC / 2
+# Spec 03 I95: how long the AER watch waits, after its stop, for the stop record's fsync. The
+# record is what shows the stop if the host is lost after it; a storm has stalled one fsync for 12 s
+# and another for 48 s, so the wait is bounded and only the watch thread waits (the signals are
+# already sent and the event loop never waits on it).
+AER_STOP_JOURNAL_WAIT_SEC = 15.0
 
 # Spec 03 I83's cut after a failed POST_RESET: all PCI removes together get at most this long (a
 # remove behind a hung endpoint can block in the kernel for good; nobody is killed then), and the
@@ -235,9 +242,15 @@ class TelemetrySampler:
         # The hung chips a stop was last deferred for (an all-ones chip not yet detached), journalled once.
         self.pollers_deferred_for: frozenset = frozenset()
         self.prev_beats: dict = {}
-        # Every chip reading all-ones on the sample the valve runs for (spec 03 I84): one of them it
-        # does not remove keeps the holders alive. Set only while check_for_dead_chips calls it.
-        self.sample_all_ones: Optional[list] = None
+        # Spec 03 I84/I94: every chip any valve run in flight, or the latest sample, read all-ones. One
+        # not removed keeps every holder alive. Each run adds its own set and takes only that one
+        # away, so no run clears or replaces another's.
+        self.valve_runs: list = []
+        self.last_sample_all_ones: list = []
+        # Chips a valve run is removing now, and chips the valve removed (counted only while they
+        # are still isolated: a rescan that brings one back takes it out of isolated_chips).
+        self.valve_detaching: set = set()
+        self.valve_removed: set = set()
         # Consecutive samples with NO chip nodes in sysfs — every chip off the bus, or the
         # driver wedged. chip_sample() omits an off-bus chip, so an all-gone drop reads as an
         # empty sample the all-ones blackout above never sees. Debounced like that blackout: a
@@ -270,6 +283,11 @@ class TelemetrySampler:
         self.aer_at: dict = {}
         self._aer_rose_chips: list = []
         self._step_seen_at: Optional[float] = None
+        # The event loop the sampler runs on: the AER watch thread hands it the containment of an
+        # all-ones burst chip (spec 03 I94), since the PCI remove is bound to this loop.
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        # The latest containment handed to that loop, so it can be awaited.
+        self.aer_containment: Optional["concurrent.futures.Future"] = None
 
     def tick(self) -> None:
         self.last_tick = time.monotonic()
@@ -282,6 +300,7 @@ class TelemetrySampler:
 
     def start(self) -> None:
         if self.task is None or self.task.done():
+            self.loop = asyncio.get_running_loop()
             self.task = asyncio.create_task(self.run())
 
     def mark_job_window(self) -> None:
@@ -661,6 +680,7 @@ class TelemetrySampler:
         """
         log = self._deps.logger()
         dead = sorted((i for i, v in sample.items() if v and v[0] == ALL_ONES), key=int)
+        self.last_sample_all_ones = dead
         if not self._mechanism.reset_in_flight:
             await self.stop_pollers_for_hung(sample, dead)
         if sample and not dead:
@@ -812,11 +832,19 @@ class TelemetrySampler:
             if pending:
                 chip_state.reprobe_due(pending)
         if confirmed:
-            self.sample_all_ones = dead
-            try:
+            with self._valve_run(dead):
                 await self.isolate_dead_chips(confirmed)
-            finally:
-                self.sample_all_ones = None
+
+    @contextmanager
+    def _valve_run(self, all_ones):
+        """Count ``all_ones`` in every valve run's kill decision while this run is in flight (spec 03
+        I94). Removes only this run's own entry."""
+        run = frozenset(all_ones)
+        self.valve_runs.append(run)
+        try:
+            yield
+        finally:
+            self.valve_runs.remove(run)
 
     @staticmethod
     def _nodes(ids) -> dict:
@@ -891,17 +919,72 @@ class TelemetrySampler:
         I84). A reset that took the chips meanwhile quiesces them itself."""
         if self._mechanism.reset_in_flight or await asyncio.to_thread(self._mechanism.scope_active):
             return
-        self.pollers_stopped_for = frozenset(self.sample_all_ones or attached)
+        self.pollers_stopped_for = frozenset(set(attached).union(*self.valve_runs))
         self._deps.health_event("pollers_quiesced_detach_failed", chips=attached, detached=removed, host_at_risk=True)
         await self._deps.set_device_pollers(False, lambda m: log.info(f"DEAD-CHIP {m}") if log else None)
         if self._deps.owe_device_pollers is not None:
             self._deps.owe_device_pollers(reason)
 
+    def aer_stop_offbus(self, chips) -> tuple:
+        """Spec 03 I94: which of an AER burst's ``chips`` the latest sample read all-ones, and every
+        chip that sample read all-ones. From the ring only, so no device or config-space read; safe
+        on the AER watch thread. A sample older than FAST_WINDOW_SEC proves nothing, and all-ones on
+        every chip is the blackout check_for_dead_chips never isolates: both give no chips."""
+        try:
+            last = self.ring[-1]
+        except IndexError:
+            return [], []
+        sample = last.get("chips") or {}
+        if time.time() - last.get("ts", 0) > FAST_WINDOW_SEC:
+            return [], []
+        ones = sorted((i for i, v in sample.items() if v and v[0] == ALL_ONES), key=int)
+        if not ones or len(ones) == len(sample):
+            return [], []
+        return sorted((str(c) for c in chips if str(c) in ones), key=int), ones
+
+    def contain_from_thread(self, chips: list, all_ones: list, reason: str) -> bool:
+        """Hand the containment of ``chips`` to the sampler's loop (spec 03 I94). For the AER watch
+        thread: the PCI remove can only run on that loop. False when there is no running loop to take
+        it; the caller then leaves the readers stopped and the sampler's own valve decides."""
+        loop = self.loop
+        if loop is None or loop.is_closed() or not loop.is_running():
+            return False
+        try:
+            self.aer_containment = asyncio.run_coroutine_threadsafe(
+                self.contain_after_aer_stop(chips, all_ones, reason), loop
+            )
+        except RuntimeError:
+            return False
+        return True
+
+    async def contain_after_aer_stop(self, chips: list, all_ones: list, reason: str) -> None:
+        """Spec 03 I94: contain the chips an AER stop found reading all-ones, through the dead-chip
+        valve (I84: freeze, PCI remove, then the kill), before any reader of them is killed. The
+        stop left the broker's readers SIGSTOPped, unkilled, for this. The chips are lost first, so
+        no poll reads them again. A reset that has taken the chips since the stop refuses it: the
+        reset's own fence owns them. Every path keeps the device held; none lifts a hold."""
+        log = self._deps.logger()
+        fresh = [i for i in chips if i not in self._deps.isolated_chips()]
+        if not fresh:
+            return
+        why = f"chip(s) {','.join(fresh)} read all-ones under an AER burst ({reason})"
+        if self._mechanism.reset_in_flight or await asyncio.to_thread(self._mechanism.scope_active):
+            self._deps.health_event("check_aer_contain_refused", chips=fresh, reason="reset_in_flight", burst=reason)
+            if log:
+                log.error(f"AER WATCH containment refused, a reset owns the chips — {why}; holding the device")
+            self._deps.mark_device_dirty(why, why="heartbeat")
+            return
+        chip_state.mark_lost(fresh, "all-ones under an AER burst", self._nodes(fresh))
+        self._deps.health_event("check_aer_contain", chips=fresh, all_ones=all_ones, burst=reason)
+        with self._valve_run(all_ones):
+            await self.isolate_dead_chips(fresh)
+
     async def isolate_dead_chips(self, dead: list) -> None:
         """Cut chips that have left the PCIe bus out of the kernel, immediately.
 
-        Every other chip that read all-ones on the same sample (``sample_all_ones``) and is not
-        removed here keeps every holder alive (spec 03 I84).
+        Every other chip that any valve run in flight or the latest sample read all-ones
+        (``valve_runs``, ``last_sample_all_ones``) and that is not removed keeps every holder alive
+        (spec 03 I84, I94).
 
         This does NOT take the device lock, and that is deliberate. Every other device
         operation waits its turn because two of them at once is dangerous; this one cannot
@@ -922,6 +1005,7 @@ class TelemetrySampler:
         if not fresh:
             return
         isolated_chips.update(fresh)
+        self.valve_removed.difference_update(fresh)
 
         if PCI_WRITER.latched:
             # Spec 04 I76: a PCI write is blocked in the kernel. A remove would only queue behind it on
@@ -965,7 +1049,12 @@ class TelemetrySampler:
         # driver's device detached, and tt-kmd's fd-close path sends the chip a power-state message
         # unless it is: killing a holder of a chip still attached makes the kernel itself reach the
         # off-bus chip. A stopped poller closes its fd the same way, so it waits for the detach too.
-        removed, stuck = await self._detach_chips(fresh)
+        self.valve_detaching.update(fresh)
+        try:
+            removed, stuck = await self._detach_chips(fresh)
+        finally:
+            self.valve_detaching.difference_update(fresh)
+        self.valve_removed.update(removed)
         if stuck:
             # A dead chip that could not be removed is still on the bus and still
             # MMIO-reachable — the host is NOT out of danger, whatever the removed ones did.
@@ -992,8 +1081,12 @@ class TelemetrySampler:
         # holder could still read the dead BAR through it; these processes are already lost — the
         # chip under them is gone — and a dead job is a far better outcome than a lost host.
         reason = f"chip(s) {','.join(fresh)} left the PCIe bus"
-        others = [i for i in (self.sample_all_ones or dead) if i not in removed]
-        untried = [i for i in others if i not in isolated_chips]
+        # Read after the remove's await: another run may have started or ended meanwhile (I94).
+        seen = set(dead).union(*self.valve_runs, self.last_sample_all_ones)
+        gone = set(removed) | (self.valve_removed & isolated_chips)
+        others = sorted((i for i in seen if i not in gone), key=int)
+        # One another run is still removing counts as untried: that run kills after its own remove.
+        untried = [i for i in others if i not in isolated_chips or i in self.valve_detaching]
         refused = await self._kill_refusal(stuck, others, untried)
         killed: list = []
         if refused:
@@ -1110,7 +1203,10 @@ class CheckAerWatch:
     owns the chips (I66), and for POST_STEP_AER_QUIET_SEC after, a rise only moves the baseline: the
     step's own errors are expected. Step activity is tracked on every tick, a reader running or not:
     a reset almost never overlaps a check reader, and the post-reset check starts inside the quiet
-    window. Never raises out of its thread."""
+    window. A burst chip the sampler's latest sample read all-ones is off the bus: the readers are
+    stopped but not killed, and the dead-chip valve on the sampler's loop removes the chip before
+    it kills them (I94). The stop record is fsynced before poll_once returns, within
+    AER_STOP_JOURNAL_WAIT_SEC (I95). Never raises out of its thread."""
 
     def __init__(self, deps: "RecoveryDeps", mechanism: "RecoveryMechanism", sampler: "TelemetrySampler") -> None:
         self._deps = deps
@@ -1123,6 +1219,8 @@ class CheckAerWatch:
         self._halt = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self.last_stop: str = ""
+        # The chips on whose path the last burst rose, for the stop's containment (I94).
+        self.last_chips: list = []
 
     def start(self) -> None:
         if self.thread is None or not self.thread.is_alive():
@@ -1163,6 +1261,7 @@ class CheckAerWatch:
         if not hits:
             return None
         chips = sorted((c for c, path in paths.items() if set(path or ()) & set(hits)), key=int)
+        self.last_chips = chips
         rose = ", ".join(f"{b} +{n}" for b, n in hits.items())
         return f"AER burst on chip(s) {', '.join(chips)} ({rose} in {AER_STOP_WINDOW_SEC:g}s)"
 
@@ -1186,16 +1285,37 @@ class CheckAerWatch:
         reason = self.burst(sig or {}, now)
         if reason is None:
             return None
-        # Signal first: no journal, log or fsync stands between the burst and the stop.
-        stopped = stop(reason)
+        # Signal first: no journal, log or fsync stands between the burst and the stop. A burst chip
+        # the latest sample read all-ones is off the bus: its readers are stopped, not killed, and
+        # the valve on the sampler's loop removes it before the kill (I94). The pick reads only the
+        # ring, no device.
+        chips = list(self.last_chips)
+        offbus, all_ones = self._sampler.aer_stop_offbus(chips)
+        stopped = stop(reason, kill=not offbus)
         self._reads.clear()
         self.last_stop = reason
-        write = getattr(self._deps, "health_event_detached", None) or self._deps.health_event
+        contained = offbus if offbus and self._sampler.contain_from_thread(offbus, all_ones, reason) else []
+        fields = {"reason": reason, "chips": chips, "stopped": stopped, "offbus": offbus, "contained": contained}
+        # The record is on disk before the stop returns (I95), bounded: a host lost right after the
+        # stop still shows it.
+        flushed = False
         try:
-            write("check_aer_stop", reason=reason, stopped=stopped)
+            flush = getattr(self._deps, "health_event_flushed", None)
+            if flush is not None:
+                flushed = flush("check_aer_stop", AER_STOP_JOURNAL_WAIT_SEC, **fields)
+            else:
+                self._deps.health_event("check_aer_stop", **fields)
+                flushed = True
         except Exception:  # noqa: BLE001 - the journal must not stop the watch
             pass
         log = self._deps.logger()
         if log:
-            log.error(f"AER WATCH {reason} during the broker's own check — stopped {stopped}; no verdict, hold kept")
+            then = (
+                f"containing all-ones chip(s) {contained} before any kill"
+                if contained
+                else f"all-ones chip(s) {offbus} left stopped, no loop to contain them" if offbus else "no verdict"
+            )
+            log.error(f"AER WATCH {reason} during the broker's own check — stopped {stopped}; {then}, hold kept")
+            if not flushed:
+                log.error(f"AER WATCH stop record not on disk within {AER_STOP_JOURNAL_WAIT_SEC:g}s")
         return reason

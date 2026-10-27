@@ -194,6 +194,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     health_dir,
     health_event,
     health_event_detached,
+    health_event_flushed,
     heartbeat_supported,
     heartbeat_verdict,
     hold_report,
@@ -1246,8 +1247,9 @@ _recovery_deps = RecoveryDeps(
     kill_device_holders=lambda reason: _kill_device_holders(reason),
     freeze_device_readers=lambda reason: _freeze_device_readers(reason),
     broker_check_readers=lambda: _broker_device_readers(),
-    stop_check_readers_on_aer=lambda reason: _stop_check_readers_on_aer(reason),
+    stop_check_readers_on_aer=lambda reason, kill=True: _stop_check_readers_on_aer(reason, kill),
     health_event_detached=lambda kind, **f: health_event_detached(kind, **f),
+    health_event_flushed=lambda kind, timeout, **f: health_event_flushed(kind, timeout, **f),
     wait_device_released=lambda pids: wait_device_released(pids, HOLDER_RELEASE_WAIT_SEC),
     note_stuck_holders=lambda chips, killed, bdfs: _note_dead_chip_stuck_holders(chips, killed, bdfs),
     stuck_holder_pids=lambda: {f.pid for f in _dead_chip_stuck_leftovers()},
@@ -6364,14 +6366,15 @@ def _freeze_device_readers(reason: str) -> list:
     return stopped
 
 
-def _stop_check_readers_on_aer(reason: str) -> list:
+def _stop_check_readers_on_aer(reason: str, kill: bool = True) -> list:
     """Spec 03 I92: end the broker's own check readers on an AER burst on a chip's path. Called from
     the AER watch thread, never the event loop: SIGSTOP every reader's process group first, so no
     further read reaches the chips, then mark each run killed (no verdict, a full pass owed, I82),
     then SIGKILL the groups. Nothing that can block on I/O comes before either signal: the mark's
     journal of the owed pass goes through the detached writer. A kill closes the reader's fds, and the
-    driver's close path still messages each chip it had open (I84): an in-kernel read the broker
-    cannot stop. Returns the readers signalled. Never raises."""
+    driver's close path still messages each chip it had open (I84). With ``kill`` False (a burst
+    chip reads all-ones, I94) the groups stay stopped: the dead-chip valve kills them only after
+    the chip's PCI remove. Returns the readers signalled. Never raises."""
     stopped = []
     for proc, who in _broker_device_readers():
         try:
@@ -6384,7 +6387,7 @@ def _stop_check_readers_on_aer(reason: str) -> list:
             _note_reader_killed(who, reason, health_event_detached)
         except Exception:  # noqa: BLE001 - the kill below must still run
             pass
-    for proc, _who in stopped:
+    for proc, _who in stopped if kill else ():
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, OSError):

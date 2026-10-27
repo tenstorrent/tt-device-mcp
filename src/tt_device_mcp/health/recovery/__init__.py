@@ -322,11 +322,14 @@ class RecoveryDeps:
     freeze_device_readers: Optional[Callable[[str], list]] = None
     # Spec 03 I92: the broker's own check readers still running (server._broker_device_readers), and
     # the AER watch's stop for them: SIGSTOP then SIGKILL their groups, no verdict, from the watch
-    # thread with no I/O before the signals (server._stop_check_readers_on_aer). None: no watch.
+    # thread with no I/O before the signals (server._stop_check_readers_on_aer); ``kill=False``
+    # leaves them stopped for the dead-chip valve (I94). None: no watch.
     broker_check_readers: Optional[Callable[[], list]] = None
-    stop_check_readers_on_aer: Optional[Callable[[str], list]] = None
+    stop_check_readers_on_aer: Optional[Callable[..., list]] = None
     # A journal append the journal's own writer thread fsyncs, so the caller never waits on it.
     health_event_detached: Optional[Callable[..., None]] = None
+    # Spec 03 I95: queue one record for the journal's writer and wait, bounded, for its fsync.
+    health_event_flushed: Optional[Callable[..., bool]] = None
     # Bounded wait for the pids it killed to drop out of the holder scan; returns those still
     # listed (spec 03 I19, the shared spec 01 I67 helper).
     wait_device_released: Optional[Callable[[list], Awaitable[set]]] = None

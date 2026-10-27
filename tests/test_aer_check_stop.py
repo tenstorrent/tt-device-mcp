@@ -14,6 +14,7 @@ step's own errors (I66) are excused. No device is touched and no process is spaw
 import signal
 import threading
 import time
+from collections import deque
 
 import pytest
 
@@ -55,6 +56,8 @@ def rig(monkeypatch):
     w._clock = clock
     monkeypatch.setattr(srv.recovery_mechanism, "reset_in_flight", False)
     monkeypatch.setattr(srv.sampler, "scope_seen", False)
+    # No sample read a chip all-ones: the plain I92 stop, no containment (I94).
+    monkeypatch.setattr(srv.sampler, "ring", deque(maxlen=8))
     monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", _Reader(FABRIC))
     monkeypatch.setattr(srv.health_monitor, "snapshot_proc", None, raising=False)
     monkeypatch.setattr(srv, "eth_selftest_proc", None, raising=False)
@@ -286,7 +289,7 @@ def test_no_reader_running_means_no_read(rig, monkeypatch):
 
 def test_a_journal_stalled_in_fsync_delays_neither_signal(monkeypatch):
     """The storm this guards stalled the journal's fsync for tens of seconds: the stop and the kill
-    must not wait on it, nor must the watch thread."""
+    must not wait on it, and the watch thread waits for the stop record only up to its bound (I95)."""
     clock = _Clock()
     w = CheckAerWatch(srv._recovery_deps, srv.recovery_mechanism, srv.sampler)
     w._clock = clock
@@ -298,6 +301,8 @@ def test_a_journal_stalled_in_fsync_delays_neither_signal(monkeypatch):
     monkeypatch.setattr(srv.CEILING, "proc", None)
     monkeypatch.setattr(srv, "logger", None)
     monkeypatch.setattr(FABRIC_DEBT, "owed", "")
+    monkeypatch.setattr(srv.sampler, "ring", deque(maxlen=8))
+    monkeypatch.setattr(telemetry, "AER_STOP_JOURNAL_WAIT_SEC", 0.2)
     stalled, release, signals = threading.Event(), threading.Event(), []
 
     def fsync_stall(path, rec, mx):
@@ -315,7 +320,7 @@ def test_a_journal_stalled_in_fsync_delays_neither_signal(monkeypatch):
         start = time.monotonic()
         t.start()
         t.join(5)
-        assert not t.is_alive(), "the watch thread waited on the journal"
+        assert not t.is_alive(), "the watch thread's wait on the journal is bounded"
         assert signals == [signal.SIGSTOP, signal.SIGKILL] and time.monotonic() - start < 5, signals
         assert stalled.wait(5), "the journal writer took the records after the stop"
         assert FABRIC_DEBT.owed, "the no-verdict mark does not wait on the journal either"
