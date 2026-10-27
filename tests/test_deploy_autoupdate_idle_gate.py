@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.deploy_helpers import LAP_STAND_INS
+
 # Fork-heavy deploy-script laps: one xdist worker runs them all (pyproject: --dist loadgroup).
 pytestmark = pytest.mark.xdist_group("forks")
 
@@ -135,7 +137,7 @@ systemctl() {{
         restart*) on_restart; seen restart ;;
     esac
 }}
-{stand_ins}
+{LAP_STAND_INS}{stand_ins}
 """
     tail = 'echo "autoupdate: applying"\n' if install is None else 'echo "$remote_sha" > "$STATE"\n'
     script = prelude + gate + tail + "systemctl restart tt-device-broker\n"

@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.deploy_helpers import LAP_STAND_INS
 from tt_device_mcp import server as srv
 from tt_device_mcp.constants import FABRIC_CHECK_TIMEOUT_SEC
 from tt_device_mcp.fsm import ServerFsm
@@ -71,7 +72,7 @@ systemctl() {{
 }}
 curl() {{ printf '%s' '{quoted_health}'; }}
 logger() {{ :; }}
-"""
+{LAP_STAND_INS}"""
     env = {"PATH": "/usr/bin:/bin", "TTDEV_LOG_DIR": str(tmp_path / "logs")}
     if interval is not None:
         env["TTDEV_MIN_APPLY_INTERVAL_SEC"] = str(interval)
