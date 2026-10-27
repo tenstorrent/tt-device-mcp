@@ -13,6 +13,7 @@ import os
 import signal
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import httpx2
@@ -240,7 +241,47 @@ def runner_env(monkeypatch, tmp_path, clear_job_state):
     monkeypatch.setattr(srv, "job_runner_task", _HeldRunner())
     events = []
     monkeypatch.setattr(srv, "health_event", lambda name, *a, **k: events.append(name))
-    return {"tmp": tmp_path, "events": events}
+    groups = _record_job_groups(monkeypatch)
+    yield {"tmp": tmp_path, "events": events}
+    _kill_left_groups(groups)
+
+
+def _record_job_groups(monkeypatch) -> list[int]:
+    """Every job the runner spawns here, by its process group (pid == pgid). A test that cancels
+    its runner leaves the job running for re-adoption, as a broker shutdown does; teardown kills it.
+    The job starts with SIGINT at its default, as under the broker's service manager, even when
+    this run inherited SIGINT ignored (a non-interactive ``cmd &``): an ignored SIGINT reaches the
+    job, its ``trap ... INT`` cannot fire, and the reaper's SIGINT step never ends it."""
+    groups = []
+    real = asyncio.create_subprocess_shell
+
+    def _setsid_default_int():
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.setsid()
+
+    async def spawn(cmd, *a, preexec_fn=None, **kw):
+        own_group = preexec_fn is os.setsid
+        proc = await real(cmd, *a, preexec_fn=_setsid_default_int if own_group else preexec_fn, **kw)
+        if own_group:
+            groups.append(proc.pid)
+        return proc
+
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_shell", spawn)
+    return groups
+
+
+def _kill_left_groups(groups: list[int]) -> None:
+    """SIGKILL each recorded job group with a live member and wait (bounded) until it is gone."""
+    for pgid in groups:
+        if _pgid_members(pgid):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    for _ in range(100):
+        if not any(_pgid_members(g) for g in groups):
+            return
+        time.sleep(0.02)
 
 
 def test_a_host_job_scope_with_the_tests_job_id_is_not_the_tests_job(runner_env, monkeypatch):
