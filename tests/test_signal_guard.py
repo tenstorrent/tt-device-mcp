@@ -11,6 +11,7 @@ unstubbed on a device host SIGKILLed real jobs holding the real device, so the a
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import signal
 import subprocess
@@ -19,6 +20,7 @@ import time
 
 import pytest
 
+import tests.conftest as guard_mod
 from tests.conftest import _spawned_by_this_run
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
@@ -96,6 +98,76 @@ def test_a_child_the_test_spawned_can_be_signalled_even_after_it_left_the_sessio
     try:
         assert _spawned_by_this_run(grandchild)
     finally:
+        parent.stdin.close()
+
+
+_FORK = (
+    "import os, sys\n"
+    "pid = os.fork()\n"
+    "if pid:\n"
+    "    print(pid, flush=True)\n"
+    "    os._exit(0)\n"
+    "sys.stdin.read()\n"
+)
+
+
+def _orphan(env=None) -> tuple:
+    """A grandchild whose parent has exited: re-parented away from this process, so only the
+    token can show it is this run's. It exits once the returned parent's stdin closes."""
+    parent = subprocess.Popen(
+        [sys.executable, "-c", _FORK], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env
+    )
+    grandchild = int(parent.stdout.readline())
+    parent.wait(timeout=10)
+    return parent, grandchild
+
+
+def _environ_reads_empty(monkeypatch, pid: int, times: int) -> list:
+    """pid's environ reads empty the first ``times`` reads (forever with -1), as mid-exec."""
+    reads = []
+
+    def fake_open(path, *a, **kw):
+        if path == f"/proc/{pid}/environ":
+            reads.append(path)
+            if times < 0 or len(reads) <= times:
+                return io.BytesIO(b"")
+        return open(path, *a, **kw)
+
+    monkeypatch.setattr(guard_mod, "open", fake_open, raising=False)
+    return reads
+
+
+def test_an_own_orphan_whose_environ_reads_empty_mid_exec_can_be_signalled(signal_guard, monkeypatch):
+    """A setsid child exec'ing its command with its shell gone: ppid is init and its environ reads
+    empty until the new image is set up. The guard reads it again and finds the token."""
+    parent, orphan = _orphan()
+    try:
+        reads = _environ_reads_empty(monkeypatch, orphan, 3)
+        os.kill(orphan, signal.SIGKILL)
+        assert not signal_guard.refused
+        assert len(reads) == 4, reads
+    finally:
+        parent.stdin.close()
+
+
+def test_a_foreign_process_whose_environ_reads_empty_is_still_refused(signal_guard, monkeypatch):
+    """The re-read never makes a foreign process ours: once its environ reads, it has no token;
+    one that never reads is refused at the bound."""
+    env = {k: v for k, v in os.environ.items() if k != guard_mod._SPAWN_TOKEN_ENV}
+    parent, decoy = _orphan(env)
+    try:
+        assert not _spawned_by_this_run(decoy)
+        monkeypatch.setattr(guard_mod, "_TOKEN_REREAD_SEC", 0.1)
+        for times in (3, -1):
+            _environ_reads_empty(monkeypatch, decoy, times)
+            with pytest.raises(PermissionError):
+                os.kill(decoy, signal.SIGKILL)
+        time.sleep(0.2)
+        with open(f"/proc/{decoy}/stat") as f:
+            assert f.read().rsplit(")", 1)[1].split()[0] != "Z", "a refused signal was delivered"
+        assert len(signal_guard.refused) == 2, signal_guard.refused
+    finally:
+        signal_guard.refused.clear()
         parent.stdin.close()
 
 
