@@ -1860,7 +1860,9 @@ class CheckAerWatch:
     def _release(self, readers) -> None:
         """The stop that held ``readers`` is settled; a reader a stop still pending holds stays held."""
         keep = {r.get("pid") for r in (self.pending_stop or {}).get("readers") or () if isinstance(r, dict)}
-        chip_state.release_readers([r.get("pid") for r in readers or () if isinstance(r, dict) and r.get("pid") not in keep])
+        chip_state.release_readers(
+            [r.get("pid") for r in readers or () if isinstance(r, dict) and r.get("pid") not in keep]
+        )
 
     def _answered_since(self, chips: list, since: float) -> set:
         """The ``chips`` some sample newer than ``since`` read answering (neither all-ones nor None)."""

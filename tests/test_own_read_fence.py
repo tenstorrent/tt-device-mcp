@@ -543,7 +543,9 @@ async def _probe_timeout(monkeypatch):
         kills.append((pid, chip_state.reader_held(pid), time.monotonic()))
 
     t0 = time.monotonic()
-    rc, _ = await subproc.run_probe(["probe"], timeout_sec=0.05, track=lambda p: None, stream=False, env={}, terminate=terminate)
+    rc, _ = await subproc.run_probe(
+        ["probe"], timeout_sec=0.05, track=lambda p: None, stream=False, env={}, terminate=terminate
+    )
     assert rc is None and len(kills) == 1 and kills[0][0] == HUNG, kills
     return kills[0][2] - t0, kills[0][1]
 
@@ -646,7 +648,9 @@ def test_a_pending_stop_holds_its_readers_through_the_remove_and_then_releases_t
     w, log, _detach_ok, burst = watch
     at_remove = []
     remove = srv.isolate_chip
-    monkeypatch.setattr(srv, "isolate_chip", lambda idx: at_remove.append(chip_state.reader_held(FABRIC)) or remove(idx))
+    monkeypatch.setattr(
+        srv, "isolate_chip", lambda idx: at_remove.append(chip_state.reader_held(FABRIC)) or remove(idx)
+    )
     assert burst()
     _stopped_only(log)
     assert chip_state.reader_held(FABRIC), "the stopped reader's own timeout must not kill it now"
