@@ -490,9 +490,7 @@ async def _job_run_then_cancel(params: dict, wait_for):
 
     async with Client(srv.create_mcp_server(), logging_callback=logged, log_level="info") as client:
         call = asyncio.create_task(client.call_tool("tt_device_job_run", {"params": params}))
-        assert await _until(
-            lambda: waiting.is_set() and len(srv.jobs) == 1 and wait_for(next(iter(srv.jobs.values())))
-        )
+        assert await _until(lambda: waiting.is_set() and len(srv.jobs) == 1 and wait_for(next(iter(srv.jobs.values()))))
         call.cancel()
         await asyncio.gather(call, return_exceptions=True)
     return next(iter(srv.jobs.values()))
