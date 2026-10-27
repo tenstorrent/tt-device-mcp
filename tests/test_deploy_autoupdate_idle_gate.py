@@ -13,6 +13,7 @@ which is a half-reset mesh and a chassis power cycle.
 """
 
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -88,8 +89,13 @@ def _gate(
     assert gate.count("UPTIME=/proc/uptime\n") == 1
     gate = gate.replace("UPTIME=/proc/uptime\n", f"UPTIME={uptime}\n")
     # No real /proc holders, and no scan of the host's processes on every poll of a long drain.
+    # nullglob for this one expansion only: an empty stand-in /proc has nothing to scan, as an empty
+    # /proc would (not its unmatched pattern). Every other glob in the cut runs as in production.
     assert gate.count("for p in /proc/[0-9]*; do") == 1
-    gate = gate.replace("for p in /proc/[0-9]*; do", f"for p in {tmp_path}/proc/[0-9]*; do")
+    gate = gate.replace(
+        "for p in /proc/[0-9]*; do",
+        f'shopt -s nullglob; procs=({tmp_path}/proc/[0-9]*); shopt -u nullglob; for p in "${{procs[@]}}"; do',
+    )
     enter = "" if job_age is None else str((_UPTIME - job_age) * 1_000_000)
     trace = tmp_path / "trace"
     logs = tmp_path / "logs"
@@ -99,10 +105,8 @@ def _gate(
     root = tmp_path / "root"
     root.mkdir()
     # The stand-ins read their files with the read builtin, never $(cat ...): a lap polls every 5 s
-    # for up to the job cap, and each fork on a poll is hundreds per test. nullglob: an empty
-    # stand-in /proc has nothing to scan, as an empty /proc would (not its unmatched pattern).
+    # for up to the job cap, and each fork on a poll is hundreds per test.
     prelude = f"""set -u
-shopt -s nullglob
 ROOT={root}; remote_sha=abc123; INHIBIT={tmp_path / "device-op.lock"}; STATE={root / "installed.sha"}
 on_restart() {{ :; }}
 seen() {{ local h; if [ -e "$HOLD" ]; then read -r h < "$HOLD"; echo "$1 held $h" >> {trace}; else echo "$1 free" >> {trace}; fi; }}
@@ -183,6 +187,18 @@ def test_an_idle_box_applies_and_keeps_the_hold_until_the_restart(tmp_path):
     text = _SCRIPT.read_text()
     apply = text[text.index('echo "autoupdate: applying') : text.index("systemctl restart tt-device-broker")]
     assert "$HOLD" not in apply
+
+
+def test_the_cut_runs_with_the_production_glob_options(tmp_path):
+    # A test-only shell option over the real cut hides regressions in its globs (an unguarded
+    # queued/*.json loop counts its unmatched pattern as a job under bash's defaults, not under
+    # nullglob), so the simulation leaves bash's glob options as production has them.
+    # Read before the cut (the prelude's options) and after it (what it leaves behind).
+    show = "shopt nullglob failglob dotglob extglob >&2"
+    done, _, _ = _gate(tmp_path, stand_ins=show, install=show)
+    assert done.returncode == 0, done.stderr
+    for opt in ("nullglob", "failglob", "dotglob", "extglob"):
+        assert len(re.findall(rf"^{opt}\s+off$", done.stderr, re.M)) == 2, done.stderr
 
 
 # --- spec 08 I20/I24: a busy box drains at once, and applies at the job boundary -------------------
