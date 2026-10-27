@@ -8101,9 +8101,13 @@ async def device_health_gate(
         # every chip off the bus while it runs) and must not have a second reset started under it —
         # the concurrent-reset hazard this module exists to prevent. The router turns a live scope
         # into DEFER: skip the surgical rung and the floor, adopt that reset and verify its result.
+        # Spec 04 I105: chips on the bus whose ARC is not ready (I24) are counted apart, neither off
+        # the bus nor frozen, so the router can send a present mesh of them to the mesh reset at once.
+        not_ready = await asyncio.to_thread(arc_not_ready_chips, beats)
         ev = replace(
             ev,
-            off_bus=_offbus_count(beats, expected),
+            off_bus=_offbus_count(beats, expected, not_ready),
+            arc_not_ready=len(not_ready),
             sbr_candidates=len(isolated_chips),
             scope_active=bool(await asyncio.to_thread(recovery_mechanism.scope_active)),
         )
@@ -8170,9 +8174,11 @@ async def device_health_gate(
             # re-read — our own rescan cannot open a foreign reset scope, and the reset left below
             # carries its own scope guard (it adopts the scope).
             beats = await asyncio.to_thread(_decision_heartbeats)
+            not_ready = await asyncio.to_thread(arc_not_ready_chips, beats)
             ev = replace(
                 ev,
-                off_bus=_offbus_count(beats, expected),
+                off_bus=_offbus_count(beats, expected, not_ready),
+                arc_not_ready=len(not_ready),
                 last_action=STAGE_BRIDGE_RESET,
                 last_action_recovered=False,
             )
@@ -8215,7 +8221,8 @@ async def device_health_gate(
             # The idle relift lifts this hold read-only, so it may lift ONLY when enum+ARC+sysfs
             # can see the fault clear. A chip that physically left the bus (off_bus>=1) returns
             # visibly to those reads, so they suffice. But off_bus==0 means nothing left the bus —
-            # the hold is a fabric/eth wedge, every chip present and ARC-ticking, which the relift's
+            # the hold is a fabric/eth wedge, every chip present and ARC-ticking (a present chip whose
+            # ARC is not ready takes the mesh reset instead, spec 04 I105), which the relift's
             # enum+ARC pass is blind to (it never runs the traffic probe); so is a runtime-reported
             # fault on a present mesh. It must wait for an advancing eth heartbeat to lift, never
             # enum+ARC alone, or the relift admits the next tenant onto the still-wedged mesh. A drop
@@ -8268,6 +8275,14 @@ async def device_health_gate(
             return
 
         _log("device needs reset — " + "; ".join(reasons))
+        if stage == STAGE_SMI_RESET and ev.off_bus == 0 and ev.arc_not_ready:
+            # Spec 04 I105: on the bus but ARC not ready waits for the post-reset init only the mesh
+            # reset runs; it never self-heals, so it is not held below the floor for the 10-min bound.
+            _log(
+                f"{ev.arc_not_ready}/{expected} chip(s) on the bus with ARC not ready, none off the "
+                f"bus — the mesh reset now (POST_RESET, board re-init), then the full check"
+            )
+            health_event("arc_not_ready_mesh_reset", phase=phase, chips=ev.arc_not_ready, expected=expected)
         if ev.dispatch_reset_due and stage == STAGE_SMI_RESET:
             _log(
                 f"dispatch failed on a green fabric with all {expected} chips present — one "

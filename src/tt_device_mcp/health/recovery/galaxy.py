@@ -507,6 +507,7 @@ def _route(
     dispatch_reset_due: bool = False,
     eth_timeout_reset_due: bool = False,
     kill_reset_due: bool = False,
+    arc_not_ready: int = 0,
 ) -> str:
     """The single gentlest-first recovery rung justified by the current degradation — THE escalation
     policy, reached through :class:`GalaxyRecovery`'s ``next_stage``, which folds the host-rung
@@ -569,6 +570,13 @@ def _route(
       (spec 03 I55). ``eth_timeout_reset_due`` takes the same rung: a clean post-job eth read timed
       out with no verdict on a present mesh (spec 03 I61), and so does ``kill_reset_due``: a job the
       broker stopped mid-run, by its timeout or a requested kill (spec 03 I69).
+    * ``arc_not_ready > 0`` with nothing off the bus -> ``STAGE_SMI_RESET`` (spec 04 I105): every
+      chip is on the bus and at least one reads ENODATA on a bound, link-up endpoint (I24), so the
+      driver is waiting for the post-reset init only the mesh reset (POST_RESET, board re-init)
+      runs. It does not self-heal, there is no chip off the bus for the reset to invert, and the
+      10-min bound's ladder would run the same reset later, so holding below the floor only adds
+      time. One chip is enough: no narrower rung re-inits an ARC on a Galaxy (the bridge rung gives
+      no POST_RESET, I94).
     * below the galaxy floor with nothing to surgically reset -> ``BELOW_FLOOR``: not a rung. The
       gate classifies the drop — a whole tray off the bus goes straight to the bounded power cycle
       (spec 04 I37), anything else holds for the 10-min bound's full ladder (I76) — because a
@@ -613,6 +621,8 @@ def _route(
     if sbr_candidates > 0 and last_action != STAGE_BRIDGE_RESET:
         return STAGE_BRIDGE_RESET
     if (dispatch_reset_due or eth_timeout_reset_due or kill_reset_due) and off_bus == 0 and frozen_chips == 0:
+        return STAGE_SMI_RESET
+    if arc_not_ready > 0 and off_bus == 0:
         return STAGE_SMI_RESET
     if galaxy_floor is not None and off_bus + frozen_chips < galaxy_floor:
         return BELOW_FLOOR
@@ -1103,6 +1113,7 @@ class GalaxyRecovery(Recovery):
             dispatch_reset_due=ev.dispatch_reset_due,
             eth_timeout_reset_due=ev.eth_timeout_reset_due,
             kill_reset_due=ev.kill_reset_due,
+            arc_not_ready=ev.arc_not_ready,
         )
 
     def _hold_after_cycle_launch_failure(self, log, cause: str) -> None:

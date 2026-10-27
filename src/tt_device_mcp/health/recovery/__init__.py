@@ -191,6 +191,10 @@ class Evidence:
     # This hold episode's galaxy reset already REGRESSED the off-bus count (spec 04 I31): a failed
     # reset on it is warm-reboot-futile even when this pass's own count did not grow.
     episode_reset_regressed: bool = False
+    # Chips on the bus whose ARC is not ready (ENODATA on a bound, link-up endpoint, spec 04 I24):
+    # counted neither off the bus nor frozen. On a present mesh they take the mesh reset at once
+    # (spec 04 I105), never the below-floor hold.
+    arc_not_ready: int = 0
 
 
 @dataclass
