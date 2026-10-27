@@ -21,6 +21,7 @@ import pytest
 
 from tests.conftest import fsm_healthy
 from tests.test_arc_not_ready import _fake_sysfs, _live_health
+from tests.test_verification_jobs import _finished, _job, broker_root, enum_arc, events  # noqa: F401
 from tt_device_mcp import loop_watch
 from tt_device_mcp import server as srv
 
@@ -35,6 +36,7 @@ def status_rig(monkeypatch, tmp_path, clear_job_state):
     monkeypatch.setattr(srv, "isolated_chips", set())
     monkeypatch.setattr(srv, "_status_read", None)
     monkeypatch.setattr(srv, "_status_read_last", None)
+    monkeypatch.setattr(srv, "_decision_read", None)
     real = srv.read_heartbeats
     rig = {"gate": threading.Event(), "reads": 0, "threads": set()}
     rig["gate"].set()
@@ -84,6 +86,7 @@ async def test_health_answers_within_a_second_while_the_chip_read_hangs(status_r
     assert payload["expected_chips"] == 32
     assert ticks >= 5, "the loop did not run while the chips were read"
     assert threading.get_ident() not in status_rig["threads"], "a status read ran on the loop thread"
+    status_rig["gate"].set()
 
 
 @pytest.mark.asyncio
@@ -131,6 +134,125 @@ def test_the_status_routes_build_their_payload_off_the_loop_read():
                     if f.id in ("_health_payload", "_get_queue_status"):
                         bare.append(f"{node.name}:{call.lineno}")
     assert bare == [], f"status built with a read on the loop: {bare}"
+
+
+# ---------------------------------------------------------------- decision reads
+
+
+def _fabric_only_hold(monkeypatch):
+    """A fabric_unverified hold with nothing dirty and no fault: liveness alone decides the lift."""
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
+    srv.fsm.on_fault(srv.FABRIC_RELIFT_WHY, detail="gate/post-job: fabric unverified", dirty=False)
+    assert srv._fabric_hold_shape("")
+
+
+@pytest.mark.asyncio
+async def test_admission_reads_the_chips_off_the_loop(status_rig, monkeypatch):
+    """A tenant's admission reads the chips fresh, in a worker thread: the loop keeps running while
+    a slow chip answers, and the verdict is the fresh one."""
+
+    async def clean(_log):
+        return None
+
+    monkeypatch.setattr(srv, "_ensure_device_clean_for_next_job", clean)
+    status_rig["gate"].clear()
+    asyncio.get_running_loop().call_later(0.8, status_rig["gate"].set)
+    reason, ticks = await _ticks_while(srv._await_device_free_for_tenant(None))
+    assert reason == ""
+    assert status_rig["reads"] == 1
+    assert ticks >= 10, "the loop did not run while admission read the chips"
+    assert threading.get_ident() not in status_rig["threads"], "a decision read ran on the loop thread"
+
+
+@pytest.mark.asyncio
+async def test_a_decision_read_that_times_out_refuses(status_rig, monkeypatch):
+    """A read not back by the deadline counts as no chip readable: a refusal, never a pass."""
+    assert await srv._device_degraded_for_decision_live() == ""
+    monkeypatch.setattr(srv, "DECISION_CHIP_READ_TIMEOUT_SEC", 0.3)
+    status_rig["gate"].clear()
+    reason, ticks = await _ticks_while(srv._device_degraded_for_decision_live())
+    assert "heartbeat unreadable" in reason
+    assert ticks >= 3
+    status_rig["gate"].set()
+
+
+@pytest.mark.asyncio
+async def test_a_hung_decision_read_never_piles_up_threads(status_rig, monkeypatch):
+    """Later decisions wait on the read in flight rather than start one thread each."""
+    monkeypatch.setattr(srv, "DECISION_CHIP_READ_TIMEOUT_SEC", 0.2)
+    status_rig["gate"].clear()
+    first = await srv._device_degraded_for_decision_live()
+    second = await srv._device_degraded_for_decision_live()
+    assert first and second
+    assert status_rig["reads"] == 1
+    status_rig["gate"].set()
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_read_never_counts_the_hold_fabric_only(status_rig, monkeypatch):
+    """The fabric-only test behind every lift reads liveness off the loop; a read that times out
+    leaves the hold as it is."""
+    _fabric_only_hold(monkeypatch)
+    assert await srv._fabric_hold_only_live()
+    monkeypatch.setattr(srv, "DECISION_CHIP_READ_TIMEOUT_SEC", 0.3)
+    status_rig["gate"].clear()
+    assert not await srv._fabric_hold_only_live()
+    assert srv.fsm.state is not srv.ServerState.HEALTHY
+    status_rig["gate"].set()
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_read_never_lifts_a_hold(
+    status_rig, monkeypatch, broker_root, enum_arc, events  # noqa: F811
+):
+    """An operator fabric check passed, but the chip read behind the lift does not come back in
+    time: the hold stays (spec 03 I4, I87)."""
+    _fabric_only_hold(monkeypatch)
+    monkeypatch.setattr(srv, "DECISION_CHIP_READ_TIMEOUT_SEC", 0.3)
+    status_rig["gate"].clear()
+    job = _finished(_job("601", f"{broker_root}/fabric-check.sh", peer_uid=0))
+    assert not await srv._settle_verification_job(job)
+    assert srv.fsm.state is not srv.ServerState.HEALTHY
+    assert not [k for k, _ in events if k == "verification_lifted_hold"]
+    status_rig["gate"].set()
+
+
+@pytest.mark.asyncio
+async def test_a_readable_device_still_lifts_through_the_offloop_read(
+    status_rig, monkeypatch, broker_root, enum_arc, events  # noqa: F811
+):
+    """The same lift with the chips answering: the off-loop read changes where it runs, not what
+    it decides."""
+    _fabric_only_hold(monkeypatch)
+    job = _finished(_job("602", f"{broker_root}/fabric-check.sh", peer_uid=0))
+    assert await srv._settle_verification_job(job)
+    assert srv.fsm.state is srv.ServerState.HEALTHY
+    assert threading.get_ident() not in status_rig["threads"]
+
+
+def test_no_async_path_reads_the_chips_on_the_loop_for_a_decision():
+    """Coroutines take their decision through the live helpers, and recent_jobs builds under the
+    status read, never with a bare read on the loop."""
+    tree = ast.parse(Path(srv.__file__).read_text())
+    allowed = {"_device_degraded_for_decision_live", "_fabric_hold_only_live"}
+    bare = []
+
+    def calls(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+                yield child
+            yield from calls(child)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef) or node.name in allowed:
+            continue
+        for call in calls(node):
+            if call.func.id in ("_device_degraded_for_decision", "_fabric_hold_only", "_recent_jobs"):
+                bare.append(f"{node.name}:{call.lineno}:{call.func.id}")
+    assert bare == [], f"a coroutine reads the chips on the loop: {bare}"
 
 
 # ---------------------------------------------------------------- the stall watchdog
