@@ -9,6 +9,7 @@ Only the bounded boot / post-power-cycle cooldown may hold longer, and the cycle
 No latch, no-reset class or cooldown stops it. No test reaches a real reset or power cycle."""
 
 import asyncio
+import json
 import time
 from datetime import datetime, timedelta
 
@@ -25,6 +26,7 @@ from tt_device_mcp.health.core import HealthState
 from tt_device_mcp.health.monitors import fabric
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import OUTCOME_RECOVERED, OUTCOME_TERMINAL, galaxy
+from tt_device_mcp.health.recovery.stages import power_cycle
 from tt_device_mcp.job_reap import ReapedLeftover
 from tt_device_mcp.pre_reset_scan import PreResetScan
 
@@ -107,6 +109,28 @@ async def test_every_hold_kind_runs_the_ladder_at_the_bound_then_the_host_rung(m
     assert "hold_deadline_forced_escalation" in events
     assert events.count("host_rung") == 1, "a ladder that did not heal goes on to the host rung"
     assert events.index("hold_deadline_forced_escalation") < events.index("host_rung")
+
+
+@pytest.mark.asyncio
+async def test_the_ladder_at_the_bound_marks_a_cycle_possible_before_it_runs(monkeypatch, clear_job_state):
+    """Spec 04 I88: other users of the box are warned before the ladder that can end in a power cycle."""
+    why, detail, output, beats, _ladder = _KINDS["generic"]
+    _escalations, _alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why=why, detail=detail, fabric_output=output, beats=beats, age_min=BOUND / 60 + 0.05
+    )
+    monkeypatch.setattr(power_cycle, "_marker_context", lambda: ("present_mesh", {}, ""))
+    seen = []
+
+    async def failed_ladder(kind, indices, expected, log, **_):
+        with open(power_cycle.PENDING_MARKER_PATH) as fh:
+            seen.append(json.load(fh))
+        return OUTCOME_TERMINAL
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", failed_ladder)
+    await srv._force_escalate_stuck_hold()
+    assert [m["state"] for m in seen] == ["possible"], "the marker is there when the ladder starts"
+    assert seen[0]["reason"].startswith("recovery ladder at hold age ")
+    assert events.count("host_rung") == 1, "the marker changes nothing in the escalation"
 
 
 @pytest.mark.asyncio
