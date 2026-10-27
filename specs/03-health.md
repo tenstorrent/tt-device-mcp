@@ -1831,6 +1831,12 @@ cooldown (spec 04 I65) holds longer.
   too (a later full pass decides); and that ending the reads ends the storm is a model, not yet
   shown on a device.
 
+  Hold rule: the readers the watch stopped are held (`chip_state.hold_readers`); their own timeout
+  kills wait for the watch's release after the remove, at most `READER_HOLD_SEC`, and never wait
+  during a broker reset step. Tests:
+  `tests/test_own_read_fence.py::test_a_held_reader_s_own_timeout_kills_it_only_once_the_watch_released_it`,
+  `::test_a_held_reader_is_killed_at_its_hold_s_bound_when_no_release_comes`,
+  `::test_a_broker_reset_step_never_waits_on_a_held_reader`.
 - **I94 — An AER stop on an all-ones or off-bus burst chip contains it through the dead-chip valve
   before any reader is killed.** When the I92 watch stops the check readers, it picks the burst's
   chips (those on whose path the counts rose) that the sampler's latest ring sample read all-ones
@@ -1949,11 +1955,12 @@ cooldown (spec 04 I65) holds longer.
   (`_decision_heartbeats`, probes due) during the reset that owns the chips; `returned_chips`
   runs after a reset or rescan step, which ends the fences, and a false all-ones there only keeps
   a chip out; the liveness verdict's second heartbeat read only fails the check (no detach acts
-  on it); the in-flight read after a failed POST_RESET (I83) runs after the reset step. Known gaps:
-  the heartbeat monitor's class A decision reads (`heartbeat.unreadable_on_bus_chips`,
-  `heartbeat.heartbeat_absence_reason`) are not fenced; a stopped check reader's own subprocess
-  timeout can still SIGKILL it while a pending chip is attached (I92); in-kernel tt-kmd reads
-  already in flight cannot be fenced.
+  on it); the in-flight read after a failed POST_RESET (I83) runs after the reset step. The heartbeat
+  monitor's class A decision reads (`heartbeat.unreadable_on_bus_chips`,
+  `heartbeat.heartbeat_absence_reason`) skip a fenced chip, which counts as off the bus and never as
+  answering. Known gaps: in-kernel tt-kmd reads already in flight cannot be fenced; a remove that
+  failed (kill refused, I84) releases the held readers, and a dead watch thread ends in the kill at
+  `READER_HOLD_SEC` with `check_reader_hold_expired` journaled.
 
 ## Interfaces
 
