@@ -34,18 +34,20 @@ def _simulate(tmp_path, moves, *, until, quiet=None, start=T0, skip=False):
     more lap found it current, it stops: with the head at rest every later lap is that same exit.
     `skip`: after a lap that defers and says when it applies, the next lap run is the first one at
     or past that time or the next move, whichever comes first; the laps between are the same deferral.
-    With coalescing on, the lone-push and burst tests run every lap, and so check that a deferral
-    applies when it says."""
+    A lap reached at the time a deferral named, with no move since, must not defer for that reason
+    again. The lone-push test runs every lap, and so checks that a deferral applies when it says."""
     root = tmp_path / "root"
     root.mkdir(exist_ok=True)
     (root / "installed.sha").write_text("s0\n")
     (root / "last-apply").write_text(f"{start - 4 * 3600}\n")
-    restarts, seen, settled = [], {}, False
+    restarts, seen, settled, owed = [], {}, False, None
     now = start
     while now <= until:
         sha = f"s{sum(m <= now for m in moves)}"
         seen.setdefault(sha, now)
         done, lines, _ = _lap(tmp_path, now=now, sha=sha, quiet=quiet)
+        if owed and owed[0] == now:
+            assert owed[1] not in done.stderr, f"{now}: deferred past the time it named: {done.stderr}"
         restarts = [(int(t), s) for t, s in (x.split() for x in lines)]
         if settled:
             assert not done.stderr and not (root / "pending-head").exists(), done.stderr
@@ -53,9 +55,12 @@ def _simulate(tmp_path, moves, *, until, quiet=None, start=T0, skip=False):
         settled = now >= max(moves) and (root / "installed.sha").read_text().split() == [sha]
         then = now + LAP
         said = re.search(r"applies in (\d+)s", done.stderr) if skip else None
+        owed = None
         if said:
-            on_lap = [_on_lap(now + int(said.group(1)), start)] + [_on_lap(m, start) for m in moves if m > now]
-            then = max(then, min(on_lap))
+            due = _on_lap(now + int(said.group(1)), start)
+            then = max(then, min([due] + [_on_lap(m, start) for m in moves if m > now]))
+            if then == due and not any(now < m <= due for m in moves):
+                owed = (due, "coalescing: head" if "coalescing: head" in done.stderr else "rate-limited:")
         now = then
     return restarts, seen
 
@@ -75,7 +80,7 @@ def test_the_defaults_are_code_defaults():
 def test_a_push_every_5_min_for_150_min_is_at_most_3_restarts(tmp_path):
     moves = [T0 + m * 60 for m in range(0, 151, 5)]
     end = moves[-1] + QUIET + BOUND
-    restarts, _ = _simulate(tmp_path, moves, until=end)
+    restarts, _ = _simulate(tmp_path, moves, until=end, skip=True)
     assert len(restarts) <= 3, restarts
     assert restarts[-1][1] == f"s{len(moves)}", "the last push of the burst applies"
     assert restarts[-1][0] <= moves[-1] + QUIET + LAP, "once the burst ends, its last sha waits only the quiet"

@@ -98,13 +98,23 @@ def test_an_interval_of_0_turns_the_rate_limit_off(tmp_path):
 
 def test_a_push_burst_under_the_default_is_paced_to_one_restart_per_interval(tmp_path):
     # Nine pushes over about two hours, a lap a minute, no interval configured: one restart per
-    # 1800 s at most, each onto the newest sha, and the last push still applies.
+    # 1800 s at most, each onto the newest sha, and the last push still applies. A rate-limited lap
+    # says when the sha applies; the laps up to then or the next push are that same deferral, so
+    # the next lap run is the first one at or past either, and it must not be rate-limited again.
     t0 = 1_700_000_000
     pushes = [t0 + m * 60 for m in (0, 8, 15, 31, 47, 60, 79, 95, 128)]
-    sha = None
-    for now in range(t0, pushes[-1] + 1800 + 120, 60):
+    sha, now, owed = None, t0, None
+    while now < pushes[-1] + 1800 + 120:
         sha = f"s{sum(p <= now for p in pushes)}"
-        _, restarts, _ = _lap(tmp_path, now=now, sha=sha)
+        done, restarts, _ = _lap(tmp_path, now=now, sha=sha)
+        assert not (owed == now and "rate-limited" in done.stderr), (now, done.stderr)
+        then, owed = now + 60, None
+        said = re.search(r"rate-limited: .* applies in (\d+)s", done.stderr)
+        if said:
+            due = t0 + -(-(now + int(said.group(1)) - t0) // 60) * 60
+            then = max(then, min([due] + [t0 + -(-(p - t0) // 60) * 60 for p in pushes if p > now]))
+            owed = due if then == due and not any(now < p <= due for p in pushes) else None
+        now = then
     assert restarts[-1].endswith(f" {sha}"), restarts
     # The first push applies at once; the rest wait out the interval: 6 restarts, not 9.
     assert len(restarts) <= 1 + -(-(pushes[-1] - t0) // 1800) == 6, restarts

@@ -322,9 +322,9 @@ def test_old_defer_settings_do_not_turn_the_drain_off(tmp_path):
         case = tmp_path / name
         case.mkdir()
         env = old if name == "long" else ({} if max_defer is None else {"TTDEV_MAX_DEFER_SEC": max_defer})
-        done, trace, _ = _drain(case, running=40, queue=1, scope=True, env=env)
+        done, trace, _ = _drain(case, running=10, queue=1, scope=True, env=env)
         assert done.returncode == 0, done.stderr
-        assert "drained after 190s" in done.stderr, f"{name}: {done.stderr}"
+        assert "drained after 40s" in done.stderr, f"{name}: {done.stderr}"
         assert "job cut by restart" not in trace and "dispatch" not in trace, f"{name}: {trace}"
         assert trace[-1].startswith("restart held "), f"{name}: {trace}"
 
@@ -864,7 +864,7 @@ def test_a_preemptable_job_past_its_limit_is_drained_by_the_hold(tmp_path):
 def test_a_preemptable_job_before_its_limit_keeps_the_hold_until_the_limit_and_the_preemption(tmp_path):
     stub, end = _preemptable(limit_left=300, ends_after=370)
     done, trace, hold = _drain(
-        tmp_path, running=10_000, queue=0, scope=True, job_age=1500, stand_ins=stub, on_sleep=end
+        tmp_path, running=10_000, queue=0, scope=True, job_age=1500, stand_ins=stub, on_sleep=end, jump=(10, 290)
     )
     assert done.returncode == 0, done.stderr
     assert "(bound 400s:" in done.stderr and "drained after 370s" in done.stderr, done.stderr
@@ -925,7 +925,7 @@ def test_a_preempted_job_whose_post_job_gate_runs_long_still_applies_under_the_s
     """The hold preempted the job; its post-job gate (op lock live, a broker child) runs to 300 s,
     past limit + 70 + 30 s. The lap keeps the hold through it and applies at the job boundary, never
     letting go of dispatch in between (a standby resubmitted then would be killed on every lap)."""
-    done, trace, hold = _preempted_then_gate(tmp_path, gate_ends=300, seen_by=seen_by)
+    done, trace, hold = _preempted_then_gate(tmp_path, gate_ends=300, seen_by=seen_by, jump=(75, 290))
     assert done.returncode == 0, done.stderr
     assert "the preemptable job 990 ended after 70s" in done.stderr, done.stderr
     assert "drained after 300s" in done.stderr, done.stderr
