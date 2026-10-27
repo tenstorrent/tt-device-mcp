@@ -147,46 +147,47 @@ def _descendants(pid: int) -> "list[str]":
 # A whole pytest process: on a loaded host it can outlast the suite's 120 s per-test bound, which
 # would cut it off with no word from the child. Its own bound fires first and shows the child's output.
 @pytest.mark.timeout(300)
-def test_the_leaking_pairs_pass_with_the_leaking_test_first():
+def test_the_leaking_pairs_pass_with_the_leaking_test_first(tmp_path):
     """The order that failed before the reset covered these globals: each pair's first test runs first,
     in one process, and both pass."""
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [str(REPO / "src"), os.environ.get("PYTHONPATH")])))
     # A child that hangs dumps every thread's stack on SIGABRT, so the failure names what held it.
     env["PYTHONFAULTHANDLER"] = "1"
-    child = subprocess.Popen(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", "-p", "no:xdist", "-p", "no:cacheprovider"]
-        + ["--no-device-tests", "-rA", "--durations=5", *LEAKING_PAIRS],
-        cwd=REPO,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_CORE, (0, 0)),
-    )
+    # Its output goes to files and the wait is on the child itself, not on its pipes: a process left
+    # under it cannot hold the wait open. Its stdin is not this worker's (xdist talks over it), and its
+    # temp dirs go under this test's own, away from the run's numbered basetemp dirs.
+    out_path, err_path = tmp_path / "child.out", tmp_path / "child.err"
+    with open(out_path, "w") as out_f, open(err_path, "w") as err_f:
+        child = subprocess.Popen(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", "-p", "no:xdist", "-p", "no:cacheprovider"]
+            + ["--no-device-tests", "-rA", "--durations=5", f"--basetemp={tmp_path / 'child-tmp'}", *LEAKING_PAIRS],
+            cwd=REPO,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=out_f,
+            stderr=err_f,
+            text=True,
+            preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_CORE, (0, 0)),
+        )
     try:
-        out, err = child.communicate(timeout=240)
+        child.wait(timeout=240)
     except subprocess.TimeoutExpired:
-        exited, below = child.poll() is not None, _descendants(child.pid)
-        if not exited:
-            os.kill(child.pid, signal.SIGABRT)
+        below = _descendants(child.pid)
+        os.kill(child.pid, signal.SIGABRT)
         try:
-            out, err = child.communicate(timeout=30)
-        except subprocess.TimeoutExpired:  # a process under it still holds the pipes
-            for line in below:
-                try:
-                    os.kill(int(line.split()[0]), signal.SIGKILL)
-                except OSError:
-                    pass
+            child.wait(timeout=30)
+        except subprocess.TimeoutExpired:
             child.kill()
-            out, err = child.communicate(timeout=30)
+            child.wait(timeout=30)
         pytest.fail(
-            f"the child pytest ran over 240 s (exited by then: {exited}; processes under it: {below}); "
-            f"its output:\n{out[-3000:]}\n{err[-6000:]}"
+            f"the child pytest ran over 240 s (processes under it: {below}); "
+            f"its output:\n{out_path.read_text()[-3000:]}\n{err_path.read_text()[-6000:]}"
         )
     finally:
         if child.poll() is None:
             child.kill()
             child.wait()
+    out = out_path.read_text()
     passed = [line.split(" ", 1)[1] for line in out.splitlines() if line.startswith("PASSED ")]
     assert child.returncode == 0 and passed == LEAKING_PAIRS, out[-3000:]
 
