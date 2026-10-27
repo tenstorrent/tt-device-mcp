@@ -917,7 +917,9 @@ pgrep() {{ seen pgrep; [ -e $M/gate ] && echo 778; return 0; }}
         f" touch $M/gate; echo {os.getpid()} post_job_gate > {lock}; fi;"
         f" if [ $t -ge {gate_ends} ]; then rm -f $M/gate {lock}; fi;"
     )
-    return _drain(tmp_path, running=10_000, queue=0, scope=True, job_age=1600, stand_ins=stub, on_sleep=on_sleep, jump=jump)
+    return _drain(
+        tmp_path, running=10_000, queue=0, scope=True, job_age=1600, stand_ins=stub, on_sleep=on_sleep, jump=jump
+    )
 
 
 @pytest.mark.parametrize("seen_by", ["health", "scope"])
