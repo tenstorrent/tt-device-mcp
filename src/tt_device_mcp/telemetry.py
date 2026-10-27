@@ -75,11 +75,13 @@ AER_STOP_WINDOW_SLACK_SEC = LINK_WATCH_SEC / 2
 # already sent and the event loop never waits on it).
 AER_STOP_JOURNAL_WAIT_SEC = 15.0
 # Spec 03 I92: the longest an AER stop stays pending (readers SIGSTOPped, a burst chip attached, no
-# proof either way), on the watch's clock from the stop. The burst arms the fast cadence (I79), so
-# this is three samples: one that reads a chip all-ones contains it, one that reads every chip
-# answering ends the readers. With neither by then, the chips still attached are contained (stop,
-# PCI remove, then the kill, I96): no kill without the remove, and no stop left to the readers' own
-# timeouts (180 s and more for a fabric run). Faster per-class paths are unchanged.
+# proof either way), on the watch's clock from the stop. Within a storm's first FAST_MAX_SEC the
+# burst keeps the fast cadence (I79), so this is three samples: one that reads a chip all-ones
+# contains it, one that reads every chip answering ends the readers; past it a sample may not come
+# in time. With neither by then, the chips still attached that no newer sample read answering are
+# contained (stop, PCI remove, then the kill, I96): no kill without the remove, never a chip that
+# answered, and no stop left to the readers' own timeouts (180 s and more for a fabric run).
+# Faster per-class paths are unchanged.
 PENDING_STOP_CAP_SEC = 3 * FAST_SAMPLE_SEC
 
 # Spec 03 I83's cut after a failed POST_RESET: all PCI removes together get at most this long (a
@@ -1835,13 +1837,24 @@ class CheckAerWatch:
             "check_aer_stop_cleared", reason=pend.get("reason", ""), chips=pend.get("chips") or [], why=why
         )
 
+    def _answered_since(self, chips: list, since: float) -> set:
+        """The ``chips`` some sample newer than ``since`` read answering (neither all-ones nor None)."""
+        seen = set()
+        for row in list(self._sampler.ring):
+            if row.get("ts", 0) <= since:
+                continue
+            sample = row.get("chips") or {}
+            seen.update(c for c in chips if (sample.get(c) or [ALL_ONES])[0] not in (ALL_ONES, None))
+        return seen
+
     def _resolve_pending(self, nodes: set, read_at: float, now: float) -> Optional[str]:
         """Spec 03 I92: settle readers an earlier stop left SIGSTOPped. Chips proven off the bus by the
         latest sample are contained (stop, remove, then the kill). Once none of the stopped readers
         still runs, the stop is dropped: no reader started after it is ever signalled for it. Once no
         burst chip is attached, or a sample newer than the stop reads every one of them answering, the
         stopped readers still running are killed. At PENDING_STOP_CAP_SEC with neither proof, the
-        chips still attached are contained (the kill after their remove). Returns the reason when it
+        chips still attached that no sample newer than the stop read answering are contained (the
+        kill after their remove); a chip that answered is never removed. Returns the reason when it
         acted."""
         pend = self.pending_stop or {}
         chips = list(pend.get("chips") or [])
@@ -1875,12 +1888,18 @@ class CheckAerWatch:
         if attached and not answering:
             if now - pend.get("at", now) < PENDING_STOP_CAP_SEC:
                 return None
-            # No proof either way within the bound: the remove comes before any kill (I96).
-            self.pending_stop = None
-            why = f"{pend.get('reason', '')}: chip(s) {', '.join(attached)} unproven after {PENDING_STOP_CAP_SEC:g}s"
-            row = self._sampler.contain_on_thread(attached, attached, why, trigger_at=read_at, readers=alive)
-            self.last_contained = row
-            return why
+            # No proof either way within the bound, chip by chip: a chip that answered in a sample
+            # newer than the stop is never removed (a burst on a shared port lists its siblings too).
+            answered = self._answered_since(attached, pend.get("since", 0))
+            unproven = [c for c in attached if c not in answered]
+            if unproven:
+                # The remove comes before any kill (I96).
+                self.pending_stop = None
+                why = f"{pend.get('reason', '')}: chip(s) {', '.join(unproven)} unproven after {PENDING_STOP_CAP_SEC:g}s"
+                row = self._sampler.contain_on_thread(unproven, unproven, why, trigger_at=read_at, readers=alive)
+                self.last_contained = row
+                return why
+            answering = True
         self.pending_stop = None
         why = f"{pend.get('reason', '')}: chip(s) {'answering' if attached else 'detached'}"
         kill = getattr(self._deps, "kill_stopped_check_readers", None)

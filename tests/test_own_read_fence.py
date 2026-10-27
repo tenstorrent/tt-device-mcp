@@ -389,6 +389,81 @@ def test_a_pending_stop_with_no_proof_ends_in_containment_within_its_cap(watch, 
     _held()
 
 
+def _shared_port(v):
+    """Chips 13 and 14 under one root port: a burst there lists both (I94's path match)."""
+    return {
+        "chips": ["13", "14"],
+        "aer": {"0000:00:01.1": v},
+        "paths": {"13": ["0000:01:00.0", "0000:00:01.1"], "14": ["0000:02:00.0", "0000:00:01.1"]},
+    }
+
+
+def _cap_poll(w, monkeypatch, log, rows):
+    """Poll past the cap with one fresh ring row per poll from ``rows`` (the last repeats)."""
+    acted = None
+    for i in range(int(telemetry.PENDING_STOP_CAP_SEC / telemetry.LINK_WATCH_SEC) + 1):
+        srv.sampler.ring.append({"ts": time.time() + 1, "chips": rows[min(i, len(rows) - 1)]})
+        acted = _poll(w, monkeypatch, _shared_port(14))
+        if acted:
+            break
+        _stopped_only(log)
+    return acted
+
+
+def _shared_burst(w, monkeypatch, log):
+    assert _poll(w, monkeypatch, _shared_port(0)) is None
+    assert _poll(w, monkeypatch, _shared_port(14))
+    _stopped_only(log)
+    assert w.pending_stop["chips"] == ["13", "14"]
+
+
+def test_the_cap_removes_only_the_unproven_chip_never_its_answering_sibling(watch, monkeypatch):  # noqa: F811
+    """A burst on a shared root port lists both chips; 13's heartbeat is not ready, 14 answers in
+    every fresh sample. At the cap only 13 is contained (remove before the kill, I96): 14 is never
+    removed, so a one-chip event does not become a multi-chip off-bus. The hold stays (I78)."""
+    w, log, _detach_ok, _burst = watch
+    _shared_burst(w, monkeypatch, log)
+    acted = _cap_poll(w, monkeypatch, log, [{"13": [None], "14": [100]}])
+    assert acted and acted.endswith(f"chip(s) 13 unproven after {telemetry.PENDING_STOP_CAP_SEC:g}s"), acted
+    assert ("detach", "14") not in log, f"an answering chip is never removed: {log}"
+    detach = log.index(("detach", "13"))
+    kills = [i for i, e in enumerate(log) if e[0] == "kill"]
+    assert kills and detach < min(kills) and ("kill", FABRIC) in log, f"the remove before any kill: {log}"
+    assert _rows("chip_contained")[-1]["chips"] == ["13"]
+    assert chip_state.is_lost("13") and not chip_state.is_lost("14")
+    assert w.pending_stop is None and FABRIC_DEBT.owed
+    _held()
+
+
+@pytest.mark.parametrize("later", ["not ready", "missing"])
+def test_a_chip_that_answered_after_the_stop_is_never_removed_at_the_cap(watch, monkeypatch, later):  # noqa: F811
+    """Chip 14 answered in one sample newer than the stop, then read not ready or was left out of
+    the samples: at the cap it is not removed; chip 13, never answering, is."""
+    w, log, _detach_ok, _burst = watch
+    _shared_burst(w, monkeypatch, log)
+    after = {"13": [None], "14": [None]} if later == "not ready" else {"13": [None]}
+    acted = _cap_poll(w, monkeypatch, log, [{"13": [None], "14": [100]}, after])
+    assert acted and "unproven" in acted, acted
+    assert ("detach", "14") not in log and ("detach", "13") in log, log
+    assert _rows("chip_contained")[-1]["chips"] == ["13"]
+    assert not chip_state.is_lost("14")
+    _held()
+
+
+def test_at_the_cap_chips_that_each_answered_are_killed_for_not_removed(watch, monkeypatch):  # noqa: F811
+    """Each pending chip answered in some sample newer than the stop, never both in the same one:
+    at the cap nobody is removed and the stopped readers are killed (the chips answered)."""
+    w, log, _detach_ok, _burst = watch
+    _shared_burst(w, monkeypatch, log)
+    acted = _cap_poll(w, monkeypatch, log, [{"13": [100], "14": [None]}, {"13": [None], "14": [100]}])
+    assert acted and "answering" in acted, acted
+    assert not [e for e in log if e[0] == "detach"], log
+    assert ("kill", FABRIC) in log
+    assert _rows("check_aer_stop_kill") and not _rows("chip_contained")
+    # The stopped run is a failed check: it owes a full pass with fabric (I82, I78).
+    assert w.pending_stop is None and FABRIC_DEBT.owed
+
+
 def test_the_pending_stop_cap_is_three_fast_samples():
     """Three fast samples after the stop: a chip that answers or reads all-ones shows it by then."""
     assert telemetry.PENDING_STOP_CAP_SEC == 3 * telemetry.FAST_SAMPLE_SEC
