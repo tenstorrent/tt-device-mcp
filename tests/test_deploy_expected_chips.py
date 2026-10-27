@@ -96,6 +96,27 @@ def test_the_count_never_follows_how_many_chips_answered(tmp_path, present):
     assert _derive(tmp_path, boards=["tt-galaxy-bh"] * present) == (0, "32\tboard type tt-galaxy-bh")
 
 
+def test_the_board_vote_starts_no_process_per_chip(tmp_path):
+    """Every chip's board type is normalised by shell builtins: 32 chips start no tr or sed, only
+    the one DMI read does (head | tr)."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "calls"
+    for tool in ("tr", "sed", "head"):
+        (bin_dir / tool).write_text(f'#!/bin/sh\necho {tool} >> {calls}\nexec /usr/bin/{tool} "$@"\n')
+        (bin_dir / tool).chmod(0o755)
+    dmi_file = tmp_path / "product_name"
+    dmi_file.write_text("Tenstorrent Galaxy\n")
+    env = {
+        "PATH": f"{bin_dir}:{_PATH}",
+        "TTDEV_DMI_PRODUCT_FILE": str(dmi_file),
+        "TTDEV_BOARD_TYPES": "\n".join(["tt-galaxy-bh L", " TT-GALAXY-BH R "] * 16),
+    }
+    r = subprocess.run(["bash", str(_DERIVE)], env=env, capture_output=True, text=True, timeout=30)
+    assert (r.returncode, r.stdout.strip()) == (0, "32\tboard type tt-galaxy-bh"), r.stderr
+    assert sorted(calls.read_text().split()) == ["head", "tr"]
+
+
 def test_the_dmi_product_decides_when_no_chip_answers(tmp_path):
     # Every chip off the bus at install: tt-smi gives nothing, the host firmware still knows.
     rc, out = _derive(tmp_path, boards=[], dmi="Galaxy Blackhole 6U Server")

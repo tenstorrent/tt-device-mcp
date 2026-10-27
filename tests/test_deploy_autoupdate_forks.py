@@ -23,9 +23,10 @@ from tests.test_deploy_autoupdate_rate_limit import _lap
 
 # Forks the script itself starts, measured with stand-in commands (each a $(...) subshell; on a box
 # an external command, one fork each): 5 a poll and 7 a lap, where they were 13 and 19 before the
-# shell read the clock and matched /health itself.
+# shell read the clock and matched /health itself. A lap that finds its sha already installed, the
+# lap of nearly every minute, starts none.
 _POLL_FORKS = 5
-_LAP_FORKS = 8
+_LAP_FORKS = 7
 
 
 def _strace_works():
@@ -89,6 +90,48 @@ def test_a_lap_forks_a_bounded_number_of_processes(tmp_path, forks):
     done, restarts, _ = _lap(tmp_path, now=10_000, sha="s1", quiet=None)
     assert done.returncode == 0 and restarts == [], done.stderr
     assert forks() <= _LAP_FORKS
+
+
+@needs_strace
+def test_an_already_current_lap_starts_no_process(tmp_path, forks):
+    """No coalescing record: the lap exits with no process. A record, or a dangling link left in its
+    place, is still removed."""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "installed.sha").write_text("s1\n")
+    done, restarts, _ = _lap(tmp_path, now=10_000, sha="s1", quiet=None)
+    assert done.returncode == 0 and restarts == [] and not done.stderr, done.stderr
+    assert forks() == 0
+    record = root / "pending-head"
+    for make in (lambda: record.write_text("9000 s1 9000\n"), lambda: record.symlink_to(root / "gone")):
+        make()
+        done, restarts, _ = _lap(tmp_path, now=10_000, sha="s1", quiet=None)
+        assert done.returncode == 0 and restarts == [], done.stderr
+        assert not record.exists() and not record.is_symlink(), "the record of an applied sha outlived it"
+
+
+def test_a_coalescing_record_is_rewritten_only_when_it_changes(tmp_path):
+    """A lap that would write the record's exact bytes leaves the file as it is; a new head, or a
+    record that is a link, is written whole as before."""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "installed.sha").write_text("s0\n")
+    (root / "last-apply").write_text("1000\n")
+    record = root / "pending-head"
+    _lap(tmp_path, now=10_000, sha="s1", quiet=None)
+    assert record.read_text() == "10000 s1 10000\n"
+    inode = record.stat().st_ino
+    _lap(tmp_path, now=10_060, sha="s1", quiet=None)
+    assert record.read_text() == "10000 s1 10000\n" and record.stat().st_ino == inode
+    _lap(tmp_path, now=10_120, sha="s2", quiet=None)
+    assert record.read_text() == "10000 s2 10120\n" and record.stat().st_ino != inode
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_text(record.read_text())
+    record.unlink()
+    record.symlink_to(elsewhere)
+    _lap(tmp_path, now=10_180, sha="s2", quiet=None)
+    assert not record.is_symlink() and record.read_text() == "10000 s2 10120\n"
+    assert not list(root.glob("pending-head.*")), "a temp record was left behind"
 
 
 def test_a_drain_on_the_real_clock(tmp_path):

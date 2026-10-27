@@ -23,18 +23,22 @@ set -uo pipefail
 
 GALAXY_CHIPS=32
 
-norm() {
-    # Case-folded, trimmed, without the " L"/" R" suffix tt-smi puts on its per-chip copy.
-    local b
-    b="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-    case "$b" in *" l" | *" r") b="${b%??}" ;; esac
-    printf '%s' "$b" | sed -e 's/[[:space:]]*$//'
+norm() {  # <var> <text>
+    # Case-folded (ASCII letters only, as tr does), trimmed, without the " L"/" R" suffix tt-smi
+    # puts on its per-chip copy, into the variable named $1. Shell builtins only: it runs once per
+    # chip, and a tr|sed pipeline per call cost several processes each.
+    local n_b="${2,,[ABCDEFGHIJKLMNOPQRSTUVWXYZ]}"
+    n_b="${n_b#"${n_b%%[![:space:]]*}"}"
+    n_b="${n_b%"${n_b##*[![:space:]]}"}"
+    case "$n_b" in *" l" | *" r") n_b="${n_b%??}" ;; esac
+    n_b="${n_b%"${n_b##*[![:space:]]}"}"
+    printf -v "$1" '%s' "$n_b"
 }
 
 # Board-type vote: galaxy boards make the whole system (4 trays x 8 chips, Wormhole or Blackhole).
-board_vote="" board_name="" board_why=""
+board_vote="" board_name="" board_why="" b=""
 while IFS= read -r raw; do
-    b="$(norm "$raw")"
+    norm b "$raw"
     case "$b" in
         "" | n/a) continue ;;
         *galaxy*) v=galaxy ;;
@@ -50,10 +54,11 @@ while IFS= read -r raw; do
 done <<< "${TTDEV_BOARD_TYPES:-}"
 
 dmi_file="${TTDEV_DMI_PRODUCT_FILE:-/sys/class/dmi/id/product_name}"
-dmi=""
+dmi="" dmi_norm=""
 [ -r "$dmi_file" ] && dmi="$(head -c 200 "$dmi_file" 2>/dev/null | tr -d '\n')"
 dmi_vote=""
-case "$(norm "$dmi")" in *galaxy*) dmi_vote=galaxy ;; esac
+norm dmi_norm "$dmi"
+case "$dmi_norm" in *galaxy*) dmi_vote=galaxy ;; esac
 
 reset_vote=""
 [ "${TTDEV_RESET_MODE:-}" = galaxy ] && reset_vote=galaxy
