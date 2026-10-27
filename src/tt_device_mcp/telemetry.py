@@ -110,6 +110,10 @@ INFLIGHT_KILL_TIMEOUT_SEC = 30.0
 # runs in a worker thread so the sampler never stalls on it, and a remove still running at the bound
 # counts as not detached (no kill, the hold stays). Only that case waits this long.
 DETACH_TIMEOUT_SEC = 15.0
+# Spec 03 I92: how long a reader an AER stop left SIGSTOPped is held from its own timeout's SIGKILL
+# (chip_state.hold_readers): the pending stop's cap, two watch ticks, then the containment's removes.
+# The watch releases it sooner once the stop is settled, and a broker reset step at once.
+READER_HOLD_SEC = PENDING_STOP_CAP_SEC + 2 * LINK_WATCH_SEC + DETACH_TIMEOUT_SEC
 
 
 @dataclass(frozen=True)
@@ -1728,11 +1732,14 @@ class CheckAerWatch:
         vanished = self._vanished(nodes)
         known = (self._nodes or set()) | nodes
         self._nodes = nodes
+        vanished_pend: list = []
         if self.pending_stop is not None:
             if vanished:
                 # A chip node that vanished is contained below (I96), its kill after the remove; a
-                # pending stop left on other chips still attached resolves on a later poll.
+                # pending stop left on other chips still attached resolves on a later poll. Its readers
+                # stay held until that containment is done.
                 if set(self.pending_stop.get("chips") or ()) <= set(vanished):
+                    vanished_pend = list(self.pending_stop.get("readers") or [])
                     self.pending_stop = None
             else:
                 done = self._resolve_pending(nodes, read_at, now)
@@ -1755,15 +1762,20 @@ class CheckAerWatch:
         if dead and not blackout:
             # Contained here, on this thread (I96): stop, remove, kill, hold, record.
             stopped = stop(trigger, kill=False) if checking else None
-            row = self._sampler.contain_on_thread(
-                sorted(dead, key=int),
-                sorted(set(all_ones) | dead, key=int),
-                trigger,
-                trigger_at=read_at,
-                vanished=tuple(vanished),
-                readers=stopped,
-                pci=pci,
-            )
+            self._hold(stopped)
+            try:
+                row = self._sampler.contain_on_thread(
+                    sorted(dead, key=int),
+                    sorted(set(all_ones) | dead, key=int),
+                    trigger,
+                    trigger_at=read_at,
+                    vanished=tuple(vanished),
+                    readers=stopped,
+                    pci=pci,
+                )
+            finally:
+                self._release(stopped)
+                self._release(vanished_pend)
             self.last_contained = row
             stopped = stopped if stopped is not None else (row or {}).get("readers_stopped") or []
             contained = (row or {}).get("chips") or []
@@ -1783,6 +1795,7 @@ class CheckAerWatch:
                     "at": now,
                     "readers": stopped,
                 }
+                self._hold(stopped)
             contained = []
         else:
             # Idle or a tenant's job, no dead chip: nothing to stop; I79 on the sampler arms the fast
@@ -1833,9 +1846,21 @@ class CheckAerWatch:
     def _drop_pending(self, why: str) -> None:
         """Forget a pending stop without signalling anyone, with a ``check_aer_stop_cleared`` record."""
         pend, self.pending_stop = self.pending_stop or {}, None
+        self._release(pend.get("readers"))
         self._journal_flushed(
             "check_aer_stop_cleared", reason=pend.get("reason", ""), chips=pend.get("chips") or [], why=why
         )
+
+    @staticmethod
+    def _hold(readers) -> None:
+        """Keep the readers a stop left SIGSTOPped from their own timeout's SIGKILL (I92)."""
+        pids = [r.get("pid") for r in readers or () if isinstance(r, dict)]
+        chip_state.hold_readers(pids, time.monotonic() + READER_HOLD_SEC)
+
+    def _release(self, readers) -> None:
+        """The stop that held ``readers`` is settled; a reader a stop still pending holds stays held."""
+        keep = {r.get("pid") for r in (self.pending_stop or {}).get("readers") or () if isinstance(r, dict)}
+        chip_state.release_readers([r.get("pid") for r in readers or () if isinstance(r, dict) and r.get("pid") not in keep])
 
     def _answered_since(self, chips: list, since: float) -> set:
         """The ``chips`` some sample newer than ``since`` read answering (neither all-ones nor None)."""
@@ -1861,13 +1886,16 @@ class CheckAerWatch:
         offbus, all_ones = self._sampler.aer_stop_offbus(chips)
         if offbus:
             self.pending_stop = None
-            row = self._sampler.contain_on_thread(
-                offbus,
-                sorted(set(all_ones) | set(offbus), key=int),
-                pend.get("reason", ""),
-                trigger_at=read_at,
-                readers=pend.get("readers") or [],
-            )
+            try:
+                row = self._sampler.contain_on_thread(
+                    offbus,
+                    sorted(set(all_ones) | set(offbus), key=int),
+                    pend.get("reason", ""),
+                    trigger_at=read_at,
+                    readers=pend.get("readers") or [],
+                )
+            finally:
+                self._release(pend.get("readers"))
             self.last_contained = row
             return pend.get("reason")
         alive = self._pending_alive(pend)
@@ -1898,7 +1926,10 @@ class CheckAerWatch:
                 why = (
                     f"{pend.get('reason', '')}: chip(s) {', '.join(unproven)} unproven after {PENDING_STOP_CAP_SEC:g}s"
                 )
-                row = self._sampler.contain_on_thread(unproven, unproven, why, trigger_at=read_at, readers=alive)
+                try:
+                    row = self._sampler.contain_on_thread(unproven, unproven, why, trigger_at=read_at, readers=alive)
+                finally:
+                    self._release(pend.get("readers"))
                 self.last_contained = row
                 return why
             answering = True
@@ -1906,5 +1937,6 @@ class CheckAerWatch:
         why = f"{pend.get('reason', '')}: chip(s) {'answering' if attached else 'detached'}"
         kill = getattr(self._deps, "kill_stopped_check_readers", None)
         killed = kill(alive) if kill is not None else []
+        self._release(pend.get("readers"))
         self._journal_flushed("check_aer_stop_kill", reason=why, chips=chips, stopped=killed)
         return why

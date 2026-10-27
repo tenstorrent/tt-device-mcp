@@ -4473,6 +4473,7 @@ async def selftest_eth_heartbeat() -> str:
             # The OUTER budget, not the probe's own: a read this slow cannot be told apart from a
             # frozen core at gate time, and the gate would HOLD the box on it.
             if proc is not None:
+                await chip_state.await_reader_release(proc.pid)  # held by an AER stop (spec 03 I92)
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except (ProcessLookupError, OSError):

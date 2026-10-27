@@ -26,6 +26,10 @@ confirmed a chip lost, nothing of the broker's keeps reading it on a poll clock 
   remove (the kernel's remove waits for every in-flight sysfs read). A fenced chip is read again
   only under the probe rules of :func:`may_read` (a decision read, the sampler's confirm read), and
   the fence clears when a real read answers, its node is re-created or a broker reset step ends.
+* ``held readers`` — the broker's own check readers an AER stop left SIGSTOPped while a chip it
+  may still read is attached (spec 03 I92/I96). Their own timeout does not SIGKILL them (a kill
+  closes their fds, and the driver's close path reaches the chip, I84) until the watch releases
+  them or the hold's deadline passes (:func:`wait_reader_release`).
 * ``recovering`` — a broker reset or recovery step is running on the chips (resets are mesh- or
   tray-wide, so it covers every chip). The pollers (telemetry sampler, /health) read nothing then;
   only the step's own reads run, ungated, exactly as before.
@@ -36,6 +40,7 @@ The state is published to :func:`state_path` (JSON, rewritten atomically on ever
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import threading
@@ -80,6 +85,10 @@ _fenced: dict[str, dict] = {}
 # idx -> [first wall ts, last wall ts, kind]: the earliest sign a chip was dying (an AER burst on its
 # path, an all-ones read), for the containment record's first_evidence_ts (spec 03 I96).
 _evidence: dict[str, list] = {}
+# pid -> monotonic deadline: readers an AER stop left SIGSTOPped (spec 03 I92), see hold_readers.
+_held: dict[int, float] = {}
+# How often a reader's timeout path looks again whether its hold ended.
+HOLD_POLL_SEC = 0.1
 # Evidence older than this before the next sign starts a new episode.
 EVIDENCE_GAP_SEC = 60.0
 _grace_until = 0.0
@@ -121,6 +130,7 @@ def reset() -> None:
         _lost.clear()
         _fenced.clear()
         _evidence.clear()
+        _held.clear()
         _recovering.clear()
         _grace_until = 0.0
         _last_written = None
@@ -367,6 +377,62 @@ def first_evidence(ids: Iterable) -> tuple:
             if ev is not None and (best[0] is None or ev[0] < best[0]):
                 best = (ev[0], ev[2])
     return best
+
+
+# --- held readers ----------------------------------------------------------------------------
+
+
+def hold_readers(pids: Iterable, until: float) -> None:
+    """Spec 03 I92: the AER watch left these broker check readers (process group ids) SIGSTOPped
+    while a chip they may read is still attached. Until :func:`release_readers` or the monotonic
+    ``until`` (the watch's stated bound), their own timeout path waits instead of SIGKILLing them."""
+    with _lock:
+        for pid in pids:
+            if isinstance(pid, int):
+                _held[pid] = max(_held.get(pid, 0.0), float(until))
+
+
+def release_readers(pids: Optional[Iterable] = None) -> None:
+    """The watch settled the stop (detached, contained, answering, the readers gone, or a reset step
+    owns the chips): ``pids``, or every held reader, may be killed again."""
+    with _lock:
+        if pids is None:
+            _held.clear()
+        for pid in pids or ():
+            _held.pop(pid, None)
+
+
+def reader_held(pid) -> bool:
+    """Whether ``pid``'s timeout kill must wait now: held, before its deadline, and no broker reset
+    step running (the step owns the chips and ends their readers itself, so it never waits on this)."""
+    with _lock:
+        until = _held.get(pid)
+        return until is not None and time.monotonic() < until and not op_running()
+
+
+def _hold_over(pid, waited: float) -> bool:
+    if reader_held(pid):
+        return False
+    with _lock:
+        expired = _held.pop(pid, None) is not None and not op_running()
+    if expired:
+        _event("check_reader_hold_expired", pid=pid, waited_s=round(waited, 3))
+    return True
+
+
+def wait_reader_release(pid) -> None:
+    """Block until ``pid`` is no longer held (:func:`reader_held`), at most to its hold's deadline.
+    For a reader's own timeout path, right before its SIGKILL; a hold that expires is journaled."""
+    t0 = time.monotonic()
+    while not _hold_over(pid, time.monotonic() - t0):
+        time.sleep(HOLD_POLL_SEC)
+
+
+async def await_reader_release(pid) -> None:
+    """:func:`wait_reader_release` for the event loop."""
+    t0 = time.monotonic()
+    while not _hold_over(pid, time.monotonic() - t0):
+        await asyncio.sleep(HOLD_POLL_SEC)
 
 
 def may_read(idx, node: Path, *, probe: bool = False) -> bool:
