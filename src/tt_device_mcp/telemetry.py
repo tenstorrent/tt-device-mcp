@@ -1895,7 +1895,9 @@ class CheckAerWatch:
             if unproven:
                 # The remove comes before any kill (I96).
                 self.pending_stop = None
-                why = f"{pend.get('reason', '')}: chip(s) {', '.join(unproven)} unproven after {PENDING_STOP_CAP_SEC:g}s"
+                why = (
+                    f"{pend.get('reason', '')}: chip(s) {', '.join(unproven)} unproven after {PENDING_STOP_CAP_SEC:g}s"
+                )
                 row = self._sampler.contain_on_thread(unproven, unproven, why, trigger_at=read_at, readers=alive)
                 self.last_contained = row
                 return why
