@@ -92,7 +92,8 @@ def _run_wrapper(tmp_path, validator_output: str, rc: int, **extra_env):
     out = tmp_path / "validator-output.txt"
     out.write_text(validator_output)
     fake = tmp_path / "run_cluster_validation"
-    fake.write_text(f"#!/bin/sh\ncat '{out}'\nexit {rc}\n")
+    # Prints the output file byte for byte with builtins only (no cat fork per call).
+    fake.write_text(f"#!/bin/bash\nIFS= read -r -d '' o < '{out}'; printf '%s' \"$o\"\nexit {rc}\n")
     fake.chmod(0o755)
     env = {
         "PATH": "/usr/local/bin:/usr/bin:/bin",
@@ -266,10 +267,11 @@ def _run_wrapper_topology(tmp_path, rerun_output: str, rerun_rc: int):
     calls = tmp_path / "calls"
     fake = tmp_path / "run_cluster_validation"
     fake.write_text(
-        "#!/bin/sh\n"
+        "#!/bin/bash\n"
         f"echo \"$*\" >> '{calls}'\n"
-        f"case \"$*\" in *cabling*) cat '{tmp_path / 'mismatch.txt'}'; exit 134 ;; esac\n"
-        f"cat '{tmp_path / 'rerun.txt'}'\nexit {rerun_rc}\n"
+        f"case \"$*\" in *cabling*)\n"
+        f"    IFS= read -r -d '' o < '{tmp_path / 'mismatch.txt'}'; printf '%s' \"$o\"; exit 134 ;;\nesac\n"
+        f"IFS= read -r -d '' o < '{tmp_path / 'rerun.txt'}'; printf '%s' \"$o\"\nexit {rerun_rc}\n"
     )
     fake.chmod(0o755)
     env = {
