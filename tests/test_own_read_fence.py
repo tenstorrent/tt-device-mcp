@@ -24,8 +24,8 @@ from tests.test_deadchip_detach_before_kill import FABRIC, valve  # noqa: F401 -
 from tt_device_mcp import server as srv
 from tt_device_mcp import telemetry
 from tt_device_mcp.health import ALL_ONES, chip_state
-from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.monitors import pci
+from tt_device_mcp.health.post_reset import FABRIC_DEBT
 
 # One stalled PCIe read of a dead chip's attribute; a snapshot's eleven of them (eight attributes,
 # three link fields) outlast the remove budget, as a snapshot of a dead chip did on a real drop.
