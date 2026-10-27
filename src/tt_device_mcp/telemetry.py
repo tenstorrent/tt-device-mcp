@@ -213,6 +213,19 @@ def snapshot(fsm, monitor, mechanism, stats, *, queue_depth: int = 0, isolated_c
     return BrokerTelemetry(**snap)
 
 
+def _first_evidence(chips: list, trigger_ts: float, remove_ts: float) -> dict:
+    """The containment record's first-evidence fields (spec 03 I96): the earlier of the first AER burst
+    on the chips' paths and the first all-ones read of them, never later than the trigger."""
+    ts, kind = chip_state.first_evidence(chips)
+    if ts is None or ts > trigger_ts:
+        ts, kind = trigger_ts, "trigger"
+    return {
+        "first_evidence_ts": round(ts, 3),
+        "first_evidence": kind,
+        "first_evidence_to_remove_s": round(remove_ts - ts, 3),
+    }
+
+
 class TelemetrySampler:
     """Samples every chip's volatile state, forever — and is the tripwire for a dead chip.
 
@@ -807,6 +820,12 @@ class TelemetrySampler:
             return
 
         self.bad_since.pop("gone", None)
+        chip_state.note_evidence(dead, "all_ones")
+        if not (len(dead) == len(sample) and len(sample) > 1):
+            # A chip read all-ones is fenced from this sample on (I97): no snapshot or heartbeat poll
+            # of the broker's reads it again until a probe read, a reset step or a new node. A
+            # whole-mesh blackout is not fenced: one such sample is a re-init blip until a second.
+            chip_state.fence(dead, "read all-ones", self._nodes(dead))
         if len(dead) == len(sample) and len(sample) > 1:
             # Every chip at once is the driver, the bus, or a reset — not 32 simultaneous chip
             # failures — so it never isolates. It must not dirty the device on one sample
@@ -1065,6 +1084,9 @@ class TelemetrySampler:
             self._to_loop(self._hold_after_refusal(why))
             self._journal_now("check_aer_contain_refused", **row)
             return row
+        # 0. Fence, before the first step: no read of the broker's own (a snapshot mid-chip, a
+        # heartbeat poll) reaches the chips again, so none holds up their PCI remove (I97).
+        chip_state.fence(fresh, f"containment ({reason})", self._nodes(fresh))
         try:
             # 1. Stop, before anything that can block: no further read reaches the chips and no fd
             # closes while they are attached (I84). Budget: WATCH_STOP_BUDGET_SEC from the trigger.
@@ -1160,6 +1182,7 @@ class TelemetrySampler:
             )
         )
         row = {
+            "path": "watch",
             "chips": fresh,
             "trigger": reason,
             "vanished": [i for i in fresh if i in vanished],
@@ -1169,6 +1192,7 @@ class TelemetrySampler:
             "trigger_to_sigstop_s": round(t_stop - t0, 3),
             "trigger_to_remove_s": round(t_remove - t0, 3),
             "trigger_to_kill_s": round(t_kill - t0, 3),
+            **_first_evidence(fresh, wall0, wall0 + (t_remove - t0)),
             "removed": not stuck,
             "removed_chips": removed,
             "stuck": stuck,
@@ -1289,6 +1313,8 @@ class TelemetrySampler:
         destroys every other tenant's work as well.
         """
         log = self._deps.logger()
+        t0 = time.monotonic()
+        wall0 = time.time()
         isolated_chips = self._deps.isolated_chips()
         with self.claim:
             fresh = [i for i in dead if i not in isolated_chips]
@@ -1296,6 +1322,8 @@ class TelemetrySampler:
                 return
             isolated_chips.update(fresh)
         self.valve_removed.difference_update(fresh)
+        # Fenced before anything else (I97): none of the broker's own reads holds up the remove.
+        chip_state.fence(fresh, "isolating", self._nodes(fresh))
 
         if PCI_WRITER.latched:
             # Spec 04 I76: a PCI write is blocked in the kernel. A remove would only queue behind it on
@@ -1318,6 +1346,7 @@ class TelemetrySampler:
         # first, before the remove's up to DETACH_TIMEOUT_SEC: a SIGSTOP issues no further read and
         # closes no fd, so it is safe while the chip is still attached; the kill below still ends them.
         freeze = getattr(self._deps, "freeze_device_readers", None)
+        stopped: list = []
         if freeze is not None:
             try:
                 stopped = freeze(f"chip(s) {','.join(fresh)} fell off the PCIe bus")
@@ -1325,6 +1354,7 @@ class TelemetrySampler:
                 stopped = []
             if stopped:
                 self._deps.health_event("device_readers_stopped", chips=fresh, readers=stopped)
+        t_stop = time.monotonic()
 
         if log:
             log.error(
@@ -1346,6 +1376,7 @@ class TelemetrySampler:
             removed, stuck = await self._detach_chips(fresh)
         finally:
             self.valve_detaching.difference_update(fresh)
+        t_remove = time.monotonic()
         self.valve_removed.update(removed)
         if stuck:
             # A dead chip that could not be removed is still on the bus and still
@@ -1406,6 +1437,29 @@ class TelemetrySampler:
             # starts them.
             if self._deps.owe_device_pollers is not None:
                 self._deps.owe_device_pollers(reason)
+        t_kill = time.monotonic()
+        # The same containment record as the watch's (spec 03 I96), from the sampler's path.
+        self._deps.health_event(
+            "chip_contained",
+            path="sampler",
+            chips=fresh,
+            trigger="all-ones sample",
+            trigger_ts=round(wall0, 3),
+            sigstop_ts=round(wall0 + (t_stop - t0), 3),
+            remove_ts=round(wall0 + (t_remove - t0), 3),
+            trigger_to_sigstop_s=round(t_stop - t0, 3),
+            trigger_to_remove_s=round(t_remove - t0, 3),
+            trigger_to_kill_s=round(t_kill - t0, 3),
+            **_first_evidence(fresh, wall0, wall0 + (t_remove - t0)),
+            removed=not stuck,
+            removed_chips=removed,
+            stuck=stuck,
+            readers_stopped=stopped,
+            killed=len(killed),
+            kill_refused=refused,
+            pci_wedged=PCI_WRITER.latched,
+            pci=pci,
+        )
 
         # Held from here, before any wait (spec 03 I19): the release wait below must not leave the
         # device admissible while a killed holder still sits in the driver.
@@ -1523,6 +1577,9 @@ class CheckAerWatch:
         self.last_stop: str = ""
         # The chips on whose path the last burst rose, for the stop's containment (I94).
         self.last_chips: list = []
+        # Readers an I92 stop left SIGSTOPped, not killed, while a burst chip was still attached:
+        # {"chips", "reason", "since" (wall), "readers"}; resolved by a later poll (I92).
+        self.pending_stop: Optional[dict] = None
         # The latest containment record (I96).
         self.last_contained: Optional[dict] = None
         # The confirm reads, one each per trigger chip (I96); replaced in tests.
@@ -1584,16 +1641,21 @@ class CheckAerWatch:
             self._reads.popleft()
         paths = sig.get("paths") or {}
         hits = {}
+        first = now
         for bdf in sorted({b for path in paths.values() for b in (path or ())}):
             v = aer.get(bdf)
             base = next((r[bdf] for _, r in self._reads if r.get(bdf) is not None), None)
             if v is not None and base is not None and v - base >= AER_STOP_COUNT:
                 hits[bdf] = v - base
+                # The first read in the window that counted the rise: the burst's first evidence.
+                rose = next((t for t, r in self._reads if (r.get(bdf) or base) > base), now)
+                first = min(first, rose)
         self._reads.append((now, aer))
         if not hits:
             return None
         chips = sorted((c for c, path in paths.items() if set(path or ()) & set(hits)), key=int)
         self.last_chips = chips
+        chip_state.note_evidence(chips, "aer_burst", time.time() - (now - first))
         rose = ", ".join(f"{b} +{n}" for b, n in hits.items())
         return f"AER burst on chip(s) {', '.join(chips)} ({rose} in {AER_STOP_WINDOW_SEC:g}s)"
 
@@ -1642,6 +1704,10 @@ class CheckAerWatch:
         vanished = self._vanished(nodes)
         known = (self._nodes or set()) | nodes
         self._nodes = nodes
+        if self.pending_stop is not None:
+            done = self._resolve_pending(nodes, read_at)
+            if done is not None:
+                return done
         reason = self.burst(sig, now)
         # A vanished chip's path is read from before it went (its sysfs link is gone with it).
         pci = {c: (self._paths.get(c) or [None])[0] for c in vanished}
@@ -1673,8 +1739,14 @@ class CheckAerWatch:
             contained = (row or {}).get("chips") or []
         elif checking and reason:
             # No dead chip (or the blackout the gate takes to the power cycle): the broker's own check
-            # readers only, SIGSTOP then SIGKILL (I92); no tenant is touched.
-            stopped = stop(reason, kill=not offbus)
+            # readers only (I92); no tenant is touched. SIGSTOP, and SIGKILL only once no burst chip is
+            # attached: a killed reader's fd close makes the driver reach a chip that may be off the bus
+            # (I84). Without that proof the readers stay stopped until a later poll shows the chips
+            # detached, proven off the bus (contained) or answering again.
+            attached = self._attached(chips, nodes)
+            stopped = stop(reason, kill=not offbus and not attached)
+            if attached and not offbus:
+                self.pending_stop = {"chips": attached, "reason": reason, "since": time.time(), "readers": stopped}
             contained = []
         else:
             # Idle or a tenant's job, no dead chip: nothing to stop; I79 on the sampler arms the fast
@@ -1703,3 +1775,52 @@ class CheckAerWatch:
 
     def _journal_flushed(self, kind: str, **fields) -> bool:
         return self._sampler._journal_now(kind, **fields)
+
+    def _attached(self, chips: list, nodes: set) -> list:
+        """Of ``chips``, those still attached: a node in the driver the broker did not remove."""
+        try:
+            isolated = set(self._deps.isolated_chips())
+        except Exception:  # noqa: BLE001
+            isolated = set()
+        removed = self._sampler.valve_removed
+        return sorted((str(c) for c in chips if str(c) in nodes and str(c) not in isolated | removed), key=int)
+
+    def _resolve_pending(self, nodes: set, read_at: float) -> Optional[str]:
+        """Spec 03 I92: settle readers an earlier stop left SIGSTOPped. Chips proven off the bus by the
+        latest sample are contained (stop, remove, then the kill); once no burst chip is attached, or a
+        sample newer than the stop reads every one of them answering, the stopped readers are killed.
+        Otherwise they stay stopped: the hold and its bounded recovery decide. Returns the reason when
+        it acted."""
+        pend = self.pending_stop or {}
+        chips = list(pend.get("chips") or [])
+        stop = getattr(self._deps, "stop_check_readers_on_aer", None)
+        offbus, all_ones = self._sampler.aer_stop_offbus(chips)
+        if offbus:
+            self.pending_stop = None
+            row = self._sampler.contain_on_thread(
+                offbus,
+                sorted(set(all_ones) | set(offbus), key=int),
+                pend.get("reason", ""),
+                trigger_at=read_at,
+                readers=pend.get("readers") or [],
+            )
+            self.last_contained = row
+            return pend.get("reason")
+        attached = self._attached(chips, nodes)
+        answering = False
+        if attached:
+            try:
+                last = self._sampler.ring[-1]
+            except IndexError:
+                last = {}
+            sample = last.get("chips") or {}
+            answering = last.get("ts", 0) > pend.get("since", 0) and all(
+                (sample.get(c) or [ALL_ONES])[0] not in (ALL_ONES, None) for c in attached
+            )
+        if attached and not answering:
+            return None
+        self.pending_stop = None
+        why = f"{pend.get('reason', '')}: chip(s) {'answering' if attached else 'detached'}"
+        killed = stop(why, kill=True) if stop is not None else []
+        self._journal_flushed("check_aer_stop_kill", reason=why, chips=chips, stopped=killed)
+        return why

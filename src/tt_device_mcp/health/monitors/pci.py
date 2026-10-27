@@ -74,6 +74,11 @@ def _sum_aer(path: Path) -> Optional[int]:
     return total
 
 
+def _read_attr(path: Path) -> str:
+    """One sysfs attribute read. For a chip's telemetry and link config this is a PCIe read of the chip."""
+    return path.read_text()
+
+
 def chip_snapshot() -> dict:
     """Everything the host knows about the chips. The telemetry attributes and link config are
     PCIe reads of each chip, so a chip confirmed lost is listed without them (spec 03 I66).
@@ -99,14 +104,17 @@ def chip_snapshot() -> dict:
         if not idx.isdigit():
             continue
         rec: dict = {}
-        # A chip confirmed lost is not read (spec 03 I66): its attributes and its link config are
-        # PCIe reads that would stall on it. The AER counters below are kernel memory and stay.
-        lost = chip_state.is_lost(idx) and not chip_state.op_running()
-        if lost:
-            rec["lost"] = True
-        for attr in () if lost else _CHIP_ATTRS:
+        # A chip confirmed lost or fenced is not read (spec 03 I66/I97): its attributes and its link
+        # config are PCIe reads that would stall on it and hold up its PCI remove. The fence is checked
+        # before EACH read, so a containment that starts mid-chip stops the next one. The AER counters
+        # below are kernel memory and stay.
+        lost = chip_state.read_blocked(idx)
+        for attr in _CHIP_ATTRS:
+            if lost or chip_state.read_blocked(idx):
+                lost = True
+                break
             try:
-                val = (ent / attr).read_text().strip()
+                val = _read_attr(ent / attr).strip()
             except OSError:
                 continue
             rec[attr] = int(val) if val.isdigit() else val
@@ -115,16 +123,15 @@ def chip_snapshot() -> dict:
             pci = (ent / "device").resolve()
             rec["pci"] = pci.name
             for f, key in (
-                ()
-                if lost
-                else (
-                    ("current_link_width", "link_width"),
-                    ("max_link_width", "link_width_max"),
-                    ("current_link_speed", "link_speed"),
-                )
+                ("current_link_width", "link_width"),
+                ("max_link_width", "link_width_max"),
+                ("current_link_speed", "link_speed"),
             ):
+                if lost or chip_state.read_blocked(idx):
+                    lost = True
+                    break
                 try:
-                    rec[key] = (pci / f).read_text().strip()
+                    rec[key] = _read_attr(pci / f).strip()
                 except OSError:
                     pass
             for f, key in (
@@ -137,6 +144,8 @@ def chip_snapshot() -> dict:
                     rec[key] = _sum_aer(p)
         except OSError:
             pass
+        if lost:
+            rec["lost"] = True
         chips[idx] = rec
     return chips
 
@@ -217,15 +226,23 @@ def chip_sample() -> dict:
             continue
         row = []
         lost = chip_state.is_lost(idx)
+        # A fenced chip (read all-ones, not yet confirmed) is read like a lost one, under the probe
+        # rules: the sampler's next read is the confirm read, heartbeat only (spec 03 I97).
+        fenced = not lost and chip_state.is_fenced(idx)
         attrs = _VOLATILE
-        if lost and not chip_state.may_read(idx, ent):
+        if (lost or fenced) and not chip_state.may_read(idx, ent, probe=fenced):
             attrs = ()
             row = [chip_state.ALL_ONES, None, None, None]
-        elif lost and chip_state.is_lost(idx):
+        elif (lost and chip_state.is_lost(idx)) or (fenced and chip_state.is_fenced(idx)):
             attrs = _VOLATILE[:1]
-        for attr in attrs:
+        for n, attr in enumerate(attrs):
+            # Fenced mid-row by a containment: stop reading the chip.
+            if attrs is _VOLATILE and chip_state.read_blocked(idx):
+                row.extend([chip_state.ALL_ONES] if n == 0 else [])
+                row.extend([None] * (len(_VOLATILE) - len(row)))
+                break
             try:
-                v = (ent / attr).read_text().strip()
+                v = _read_attr(ent / attr).strip()
                 row.append(int(v) if v.isdigit() else v)
             except OSError:
                 row.append(None)

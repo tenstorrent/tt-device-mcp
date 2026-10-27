@@ -104,7 +104,7 @@ def snapshot(suspect=()) -> dict:
         rec["aer"] = _aer(dev)
         with _lock:
             dead = bdf in _dead_links
-        if ep.chip is not None and chip_state.is_lost(ep.chip):
+        if ep.chip is not None and (chip_state.is_lost(ep.chip) or chip_state.is_fenced(ep.chip)):
             rec["link_skipped"] = "lost"
         elif str(cid) in suspect:
             rec["link_skipped"] = "all_ones"

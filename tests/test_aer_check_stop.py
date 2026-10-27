@@ -92,6 +92,13 @@ def _burst(w, clock, feed, rise=14):
     return w.poll_once()
 
 
+def _answer(w, clock, chips=("13", "14")):
+    """Spec 03 I92: a sample after the stop reads every burst chip answering; the next poll kills."""
+    srv.sampler.ring.append({"ts": time.time() + 1, "chips": {c: [100] for c in chips}})
+    clock.t += 1
+    return w.poll_once()
+
+
 @pytest.mark.parametrize("who, pid", [("fabric_check_proc", FABRIC), ("snapshot_proc", SNAPSHOT), ("eth", ETH)])
 def test_a_burst_stops_every_reader_before_any_write_and_owes_a_full_pass(rig, monkeypatch, who, pid):
     w, clock, log, feed = rig
@@ -104,7 +111,10 @@ def test_a_burst_stops_every_reader_before_any_write_and_owes_a_full_pass(rig, m
     reason = _burst(w, clock, feed)
     assert reason and "chip(s) 13" in reason and "0000:00:01.1 +14" in reason, reason
     assert log[0] == ("stop", pid), f"the first thing after the burst is the SIGSTOP: {log}"
-    assert log.index(("stop", pid)) < log.index(("kill", pid)) < log.index(("event", "check_aer_stop"))
+    assert ("kill", pid) not in log, f"no SIGKILL while burst chip 13 is attached without proof: {log}"
+    assert log.index(("stop", pid)) < log.index(("event", "check_aer_stop"))
+    assert _answer(w, clock)
+    assert log.index(("event", "check_aer_stop")) < log.index(("kill", pid))
     assert not [e for e in log if e[0] == "io"], f"no synchronous journal append on the watch path: {log}"
     if who != "eth":
         assert FABRIC_DEBT.owed and "AER burst" in FABRIC_DEBT.owed, "no verdict: a full pass is owed"
@@ -137,6 +147,8 @@ def aer_fab(fab, monkeypatch, rig):
     async def check(argv, env, **kw):
         m.fabric_check_proc = _Reader(FABRIC)
         stopped = _burst(w, clock, feed)
+        assert ("kill", FABRIC) not in log, "stopped, not killed, while the burst chip is attached"
+        assert _answer(w, clock), "the chips answer after the stop: then the kill"
         m.fabric_check_proc = None
         assert stopped, "the burst stops the run"
         return state["rc"], state["text"]
@@ -343,7 +355,7 @@ def test_a_journal_stalled_in_fsync_delays_neither_signal(monkeypatch):
         t.start()
         t.join(5)
         assert not t.is_alive(), "the watch thread's wait on the journal is bounded"
-        assert signals == [signal.SIGSTOP, signal.SIGKILL] and time.monotonic() - start < 5, signals
+        assert signals == [signal.SIGSTOP] and time.monotonic() - start < 5, signals
         assert stalled.wait(5), "the journal writer took the records after the stop"
         assert FABRIC_DEBT.owed, "the no-verdict mark does not wait on the journal either"
     finally:
@@ -361,6 +373,8 @@ def test_the_watch_runs_on_its_own_thread_and_stops(rig, monkeypatch):
     w, _clock, log, feed = rig
     monkeypatch.setattr(telemetry, "LINK_WATCH_SEC", 0.01)
     w._clock = time.monotonic
+    # A sample newer than the stop reads the burst chips answering: the kill follows the stop (I92).
+    srv.sampler.ring.append({"ts": time.time() + 60, "chips": {"13": [100], "14": [100]}})
     feed(*[_sig(0)] * 2 + [_sig(40)] * 200)
     w.start()
     try:

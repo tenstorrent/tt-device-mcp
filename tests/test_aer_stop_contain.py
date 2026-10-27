@@ -60,6 +60,14 @@ def watch(valve, monkeypatch):  # noqa: F811
         clock.t += 1
         return w.poll_once()
 
+    def answer():
+        """Spec 03 I92: a sample after the stop reads every burst chip answering; the next poll kills."""
+        _sample(age=-1.0)
+        reads.append(_sig(14))
+        clock.t += 1
+        return w.poll_once()
+
+    w.answer = answer
     return w, log, detach_ok, burst
 
 
@@ -120,10 +128,12 @@ async def test_an_all_ones_burst_chip_is_removed_before_any_reader_is_killed(wat
     "case",
     ["no sample", "every chip answers", "another chip all-ones", "blackout", "stale sample"],
 )
-def test_with_no_all_ones_burst_chip_the_stop_kills_at_once_as_before(watch, case):
-    """No contained chip: today's I92 stop, SIGSTOP then SIGKILL, no remove. A blackout (every chip
-    all-ones, the class A/C fault) is never contained here: its direct power cycle path stands."""
-    _w, log, _detach_ok, burst = watch
+def test_with_no_all_ones_burst_chip_the_stop_kills_only_once_the_chips_answer(watch, case):
+    """No contained chip: the I92 stop, SIGSTOP, no remove. The burst chip is still attached, so no
+    SIGKILL until a sample after the stop reads it answering (a killed reader's fd close would reach
+    it). A blackout (every chip all-ones, the class A/C fault) is never contained here: its direct
+    power cycle path stands."""
+    w, log, _detach_ok, burst = watch
     if case == "every chip answers":
         _sample()
     elif case == "another chip all-ones":
@@ -133,7 +143,11 @@ def test_with_no_all_ones_burst_chip_the_stop_kills_at_once_as_before(watch, cas
     elif case == "stale sample":
         _sample("13", age=telemetry.FAST_WINDOW_SEC + 5)
     assert burst()
-    assert log == [("stop", FABRIC), ("kill", FABRIC)], log
+    assert log == [("stop", FABRIC)], f"no SIGKILL while burst chip 13 is attached without proof: {log}"
+    assert w.pending_stop and w.pending_stop["chips"] == ["13"]
+    assert w.answer(), "a sample after the stop reads the chips answering"
+    assert log == [("stop", FABRIC), ("stop", FABRIC), ("kill", FABRIC)], log
+    assert w.pending_stop is None and _rows("check_aer_stop_kill")
     assert srv.sampler.aer_containment is None and not _rows("check_aer_contain")
     assert not _rows("chip_contained")
     row = _stop_row()
@@ -344,7 +358,7 @@ def test_a_failed_journal_write_is_not_reported_on_disk(watch, monkeypatch, faul
     monkeypatch.setattr(srv, "logger", _Log())
     assert evidence.health_event_flushed("probe", 5) is False
     assert burst()
-    assert log == [("stop", FABRIC), ("kill", FABRIC)], log
+    assert log == [("stop", FABRIC)], log
     assert any("stop record not on disk" in m for m in lines), lines
     assert FABRIC_DEBT.owed, "the stopped run is still no verdict"
 
@@ -389,7 +403,7 @@ def test_a_journal_stalled_in_fsync_bounds_the_wait_and_delays_neither_signal(wa
         t.start()
         t.join(10)
         assert not t.is_alive(), "the watch thread's wait is bounded"
-        assert log == [("stop", FABRIC), ("kill", FABRIC)], log
+        assert log == [("stop", FABRIC)], log
         assert time.monotonic() - start < 10
         assert stalled.wait(5), "the journal writer took the records after the stop"
         assert FABRIC_DEBT.owed, "the no-verdict mark does not wait on the journal"
