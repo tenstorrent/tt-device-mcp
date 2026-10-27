@@ -1082,6 +1082,132 @@ async def test_a_still_waiting_job_is_restored_beside_a_finished_one(monkeypatch
     assert srv.get_job_queue().empty()
 
 
+def _persist_in_boot(monkeypatch, boot_id, job_id, *, owner="tenant", peer_uid=None, preemptable=False, minute=0):
+    """Persist a queued job (spec and a header-only log) as the broker of host boot ``boot_id``."""
+    monkeypatch.setattr(srv, "_current_boot_id", lambda: boot_id)
+    log = Path(srv.job_log_dir) / f"2026-10-26_0720{minute:02d}_{job_id}.log"
+    log.write_text(f"JOB ID:      {job_id}\nOWNER:       {owner}\nCOMMAND:     echo hi\n\n[Waiting to start...]\n")
+    srv._persist_queued_job(
+        srv.Job(
+            id=job_id,
+            owner=owner,
+            workspace="/w",
+            command="echo hi",
+            queued_at=datetime(2026, 10, 26, 7, 20 + minute).isoformat(),
+            peer_uid=peer_uid,
+            preemptable=preemptable,
+            log_file=str(log),
+        )
+    )
+    return log
+
+
+@pytest.mark.asyncio
+async def test_a_job_queued_before_the_host_rebooted_is_expired_not_requeued(monkeypatch, tmp_path, clear_job_state):
+    """A host power-off or reboot takes every client with it: the submitter, a waiter streaming the
+    log, an MCP session. A spec it left must not run for nobody a day later. It is expired, not run
+    and not failed: its log says why and ends STATUS: expired, status answers it from the log, the
+    spec is set aside (``.expired``), and the restart logs and journals it."""
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    log = _persist_in_boot(monkeypatch, "boot-a", "218")
+    spec_dir = tmp_path / srv.QUEUED_SPEC_DIR
+    assert json.loads((spec_dir / "218.json").read_text())["boot_id"] == "boot-a"
+
+    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-b")
+    await _restart_and_restore()
+
+    assert srv.jobs == {}, "a job whose client went down with the host was requeued"
+    assert srv.get_job_queue().empty()
+    assert not (spec_dir / "218.json").exists()
+    assert (spec_dir / "218.expired").exists(), "the expired job's spec vanished instead of being set aside"
+    text = log.read_text()
+    assert srv.EXPIRED_QUEUED_MARKER in text and "the host rebooted" in text
+    assert "STATUS:      expired" in text and "[Started at" not in text
+    rec = srv._job_record("218")
+    assert rec["status"] == "expired" and "the host rebooted" in rec["cause"]
+    status = srv._job_status_from_record("218", rec)
+    assert status["status"] == "expired" and status["exit_code"] is None
+    kinds = [k for k, _ in events]
+    assert "queue_restore_expired" in kinds
+    assert dict(events)["queue_restored"]["expired"] == 1
+
+
+@pytest.mark.asyncio
+async def test_live_clients_keep_their_order_and_only_the_previous_boots_jobs_expire(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """A restart within one boot (an update, a crash) leaves its clients alive and polling, so their
+    jobs keep their place, cooperative preemptable ones from a service account included. Jobs left
+    from before a reboot expire around them without moving them."""
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    _persist_in_boot(monkeypatch, "boot-a", "218", minute=0)
+    _persist_in_boot(monkeypatch, "boot-b", "300", minute=1)
+    _persist_in_boot(monkeypatch, "boot-a", "220", minute=2)
+    _persist_in_boot(monkeypatch, "boot-b", "301", owner="ltx-host", peer_uid=997, preemptable=True, minute=3)
+    _persist_in_boot(monkeypatch, "boot-b", "302", minute=4)
+
+    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-b")
+    await _restart_and_restore()
+
+    q = srv.get_job_queue()
+    assert [q.get_nowait() for _ in range(3)] == ["300", "301", "302"]
+    assert q.empty()
+    assert sorted(srv.jobs) == ["300", "301", "302"]
+    assert all(j.status is srv.JobStatus.QUEUED for j in srv.jobs.values())
+    assert srv.jobs["301"].preemptable and srv.jobs["301"].peer_uid == 997
+    spec_dir = tmp_path / srv.QUEUED_SPEC_DIR
+    assert sorted(p.name for p in spec_dir.iterdir()) == [
+        "218.expired",
+        "220.expired",
+        "300.json",
+        "301.json",
+        "302.json",
+    ]
+
+
+@pytest.mark.parametrize("boots", [("", "boot-b"), ("boot-a", "")], ids=["spec-without-boot-id", "boot-id-unreadable"])
+@pytest.mark.asyncio
+async def test_a_restore_that_cannot_tell_the_boot_keeps_the_job(monkeypatch, tmp_path, clear_job_state, boots):
+    """A spec written before the boot was recorded, or a host whose boot id cannot be read, gives
+    no evidence that the client is gone: the job keeps its place, as before."""
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    _persist_in_boot(monkeypatch, boots[0], "218")
+    monkeypatch.setattr(srv, "_current_boot_id", lambda: boots[1])
+
+    await _restart_and_restore()
+
+    assert sorted(srv.jobs) == ["218"]
+    assert srv.get_job_queue().get_nowait() == "218"
+
+
+@pytest.mark.asyncio
+async def test_expiry_lifts_no_hold_and_settles_no_owed_check(monkeypatch, tmp_path, clear_job_state):
+    """Expiring a job is queue bookkeeping only. A hold open at the restart stays exactly as it was,
+    nothing clears the dirty mark, and the full check with fabric still owed before the next
+    dispatch stays owed: the job that is kept still goes through it."""
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    monkeypatch.setattr(FABRIC_DEBT, "owed", "startup")
+    fsm_dirty(srv, "startup: device unverified")
+
+    def _no_release(*a, **k):
+        raise AssertionError("restoring the queue tried to release the device")
+
+    monkeypatch.setattr(srv, "_clear_device_dirty", _no_release)
+    _persist_in_boot(monkeypatch, "boot-a", "218")
+    _persist_in_boot(monkeypatch, "boot-b", "300", minute=1)
+    before = dataclasses.asdict(srv.fsm.record)
+
+    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-b")
+    await _restart_and_restore()
+
+    assert dataclasses.asdict(srv.fsm.record) == before
+    assert srv.fsm.state is not ServerState.HEALTHY
+    assert FABRIC_DEBT.owed == "startup"
+    assert srv.jobs["300"].status is srv.JobStatus.QUEUED and srv.jobs["300"].started_at is None
+
+
 @pytest.mark.parametrize("door", ["degraded", "privsep"])
 @pytest.mark.asyncio
 async def test_a_refused_job_whose_spec_survived_is_not_revived_by_a_restart(
