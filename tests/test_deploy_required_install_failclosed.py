@@ -25,9 +25,14 @@ _INSTALLER = _DEPLOY / "install-tt-device-broker.sh"
 _AUTOUPDATE = _DEPLOY / "tt-device-autoupdate.sh"
 
 
+def _install_stmts(script: Path, dest: str) -> list[str]:
+    """Every `install -m 0755` statement that stages into `dest`."""
+    return [s for s in _statements(script) if "install -m 0755" in s and dest in s]
+
+
 def _install_stmt(script: Path, dest: str) -> str:
     """The single `install -m 0755` statement that stages into `dest`."""
-    hits = [s for s in _statements(script) if "install -m 0755" in s and dest in s]
+    hits = _install_stmts(script, dest)
     assert len(hits) == 1, f"expected exactly one install of {dest} in {script.name}, got {hits}"
     return hits[0]
 
@@ -63,7 +68,6 @@ def test_autoupdate_required_stages_fail_closed():
     for dest in (
         '"$ROOT/reconcile.sh"',
         '"$ROOT/client-setup.sh"',
-        '"$ROOT/autoupdate.sh"',
         '"$ROOT/fabric-check.sh"',
         '"$ROOT/eth-heartbeat-probe.py"',
         '"$ROOT/aiclk-ceiling.py"',
@@ -71,6 +75,13 @@ def test_autoupdate_required_stages_fail_closed():
         stmt = _install_stmt(_AUTOUPDATE, dest)
         assert "|| true" not in stmt
         assert "exit 1" in stmt, f"a failed stage of {dest} must exit non-zero"
+    # The updater itself stages twice: in the full apply and in the no-restart apply
+    # (spec 08 I29). Each copy is required, so each one fails closed.
+    stmts = _install_stmts(_AUTOUPDATE, '"$ROOT/autoupdate.sh"')
+    assert len(stmts) == 2, f"expected the full-apply and the no-restart stage of autoupdate.sh, got {stmts}"
+    for stmt in stmts:
+        assert "|| true" not in stmt
+        assert "exit 1" in stmt, 'a failed stage of "$ROOT/autoupdate.sh" must exit non-zero'
 
 
 def test_autoupdate_staged_sources_exist_in_deploy():

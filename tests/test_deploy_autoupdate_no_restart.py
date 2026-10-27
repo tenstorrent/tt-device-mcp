@@ -65,6 +65,7 @@ _BASE = {
     "src/tt_device_mcp/server.py": "x = 1\n",
     "src/tt_device_mcp/health/gate.py": "g = 1\n",
     "deploy/apply-host-config.sh": "#!/bin/sh\n",
+    "deploy/tt-device-autoupdate.sh": "#!/bin/sh\n# v1\n",
     "deploy/tt-device-fabric-check.sh": "#!/bin/sh\n",
     "deploy/fabric-validator.pin": "PIN=1\n",
     "specs/08-deployment.md": "spec\n",
@@ -234,6 +235,9 @@ def test_a_mixed_update_restarts(box):
         "deploy/fabric-validator.pin",  # validator pin
         "deploy/tt-device-broker.service",  # systemd unit, new file
         "pyproject.toml",  # dependencies
+        "requirements.txt",  # dependencies
+        "deploy/tt-device-reconcile.sh",  # a sibling staged script reconcile runs
+        "deploy/tt-device-autoupdate.sh.new",  # not the updater: the match is exact
         "install.sh",  # unknown top-level file
     ],
 )
@@ -245,6 +249,106 @@ def test_an_update_touching_anything_the_broker_uses_restarts(box, path):
     assert _restarts(lines) == [f"restart {new}"], lines
     assert "host-config" in " ".join(lines)
     assert [e["kind"] for e in events] == ["autoupdate_apply"]
+
+
+_UPDATER = "deploy/tt-device-autoupdate.sh"
+# Stages for real, so the test can read what landed in $ROOT.
+_REAL_INSTALL = 'install() { command install "$@" && log "stage $3"; }'
+
+
+def test_an_updater_only_update_stages_the_new_updater_and_does_not_restart(box):
+    """No broker process reads the updater: the reconcile timer runs its staged copy. So a change
+    to it is staged, before installed.sha moves, and the broker is not restarted."""
+    new = _push(box, {_UPDATER: "#!/bin/sh\n# v2\n"})
+    done, lines, events = _lap(box, new, stand_ins=_REAL_INSTALL)
+    assert done.returncode == 0, done.stderr
+    assert _restarts(lines) == [], lines
+    # Only the updater is staged, and it is staged while installed.sha still names the old sha.
+    assert lines == [f"sleep {box['installed']}", f"stage {box['clone']}/{_UPDATER} {box['installed']}"], lines
+    assert (box["tmp"] / "root" / "autoupdate.sh").read_text() == "#!/bin/sh\n# v2\n"
+    assert _installed(box) == new == _head(box)
+    assert "broker not restarted; staged the new autoupdate.sh" in done.stderr, done.stderr
+    assert not (box["tmp"] / "root" / "last-apply").exists(), "a no-restart apply moved the rate limit"
+    (logged,) = (box["tmp"] / "logs" / "autoupdate.log").read_text().splitlines()
+    assert "decision=applied" in logged and "no restart" in logged and "staged the new autoupdate.sh" in logged
+    (ev,) = events
+    assert ev["kind"] == "autoupdate_applied_no_restart" and ev["changed_paths"] == [_UPDATER]
+    done, lines, events = _lap(box, new)
+    assert done.returncode == 0 and lines == [] and len(events) == 1, (done.stderr, lines)
+
+
+def test_an_updater_and_tests_update_does_not_restart(box):
+    """The shape of a fork-light updater release: the script and its tests, nothing else."""
+    new = _push(box, {_UPDATER: "#!/bin/sh\n# v2\n", "tests/test_x.py": "def test(): assert 2\n"})
+    done, lines, events = _lap(box, new)
+    assert done.returncode == 0, done.stderr
+    assert _restarts(lines) == [] and "pip" not in lines, lines
+    assert [x for x in lines if x.startswith("stage")] == [f"stage {box['clone']}/{_UPDATER} {box['installed']}"]
+    assert _installed(box) == new
+    (ev,) = events
+    assert sorted(ev["changed_paths"]) == sorted([_UPDATER, "tests/test_x.py"])
+
+
+def test_a_docs_only_update_stages_nothing(box):
+    new = _push(box, {"docs/guide.md": "g\n"})
+    done, lines, _ = _lap(box, new)
+    assert done.returncode == 0, done.stderr
+    assert lines == [f"sleep {box['installed']}"], lines
+    assert "staged" not in done.stderr and _installed(box) == new
+
+
+def test_a_failed_updater_stage_leaves_installed_sha_and_the_next_lap_restarts(box):
+    new = _push(box, {_UPDATER: "#!/bin/sh\n# v2\n"})
+    done, lines, events = _lap(box, new, stand_ins="install() { return 1; }")
+    assert done.returncode == 1, done.stderr
+    assert "staging autoupdate.sh failed" in done.stderr, done.stderr
+    assert _restarts(lines) == [] and events == [], lines
+    assert _installed(box) == box["installed"] and _head(box) == new
+    assert "decision=failed" in (box["tmp"] / "logs" / "autoupdate.log").read_text()
+    # The clone is now ahead of installed.sha: the next lap takes the full apply and restart.
+    done, lines, events = _lap(box, new)
+    assert done.returncode == 0, done.stderr
+    assert "restart needed: the clone is at" in done.stderr, done.stderr
+    assert _restarts(lines) == [f"restart {new}"] and _installed(box) == new
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/tt_device_mcp/server.py",  # broker module
+        "deploy/apply-host-config.sh",  # host config
+        "deploy/tt-device-broker.service",  # systemd unit
+        "deploy/fabric-validator.pin",  # validator
+        "pyproject.toml",  # packaging
+    ],
+)
+def test_an_updater_change_with_anything_the_broker_uses_restarts(box, path):
+    new = _push(box, {_UPDATER: "#!/bin/sh\n# v2\n", path: "changed\n"})
+    done, lines, events = _lap(box, new)
+    assert done.returncode == 0, done.stderr
+    assert f"restart needed: changes {path}" in done.stderr, done.stderr
+    assert _restarts(lines) == [f"restart {new}"], lines
+    assert "pip" in lines and f"stage {box['clone']}/{_UPDATER} {box['installed']}" in lines, lines
+    assert _installed(box) == new
+    assert [e["kind"] for e in events] == ["autoupdate_apply"]
+
+
+def test_an_updater_change_with_an_unknown_installed_sha_restarts(box):
+    new = _push(box, {_UPDATER: "#!/bin/sh\n# v2\n"})
+    (box["tmp"] / "root" / "installed.sha").write_text("")
+    done, lines, _ = _lap(box, new)
+    assert done.returncode == 0, done.stderr
+    assert "restart needed: installed sha '' is not a commit" in done.stderr, done.stderr
+    assert _restarts(lines) == [f"restart {new}"], lines
+
+
+def test_an_updater_change_whose_diff_fails_restarts(box):
+    new = _push(box, {_UPDATER: "#!/bin/sh\n# v2\n"})
+    fail_diff = 'git() { case " $* " in *" diff "*) return 128 ;; esac; command git "$@"; }'
+    done, lines, _ = _lap(box, new, stand_ins=fail_diff)
+    assert done.returncode == 0, done.stderr
+    assert "restart needed: cannot diff" in done.stderr, done.stderr
+    assert _restarts(lines) == [f"restart {new}"], lines
 
 
 def test_a_diff_that_cannot_be_computed_restarts(box):
@@ -316,9 +420,10 @@ def test_the_idle_gate_still_drains_before_a_no_restart_apply(box):
 
 def test_the_allowlist_is_the_one_the_spec_names():
     text = _SCRIPT.read_text()
-    assert "docs/*|tests/*|.github/*|*.md) ;;" in text
+    allow = "docs/*|tests/*|.github/*|*.md|deploy/tt-device-autoupdate.sh) ;;"
+    assert allow in text
     i = text.index("src/*) echo")
-    assert i < text.index("docs/*|tests/*|.github/*|*.md) ;;"), "src/ must be refused before *.md matches"
+    assert i < text.index(allow), "src/ must be refused before *.md matches"
 
 
 def test_a_no_restart_apply_clears_the_recovery_deferral_clock(box):
