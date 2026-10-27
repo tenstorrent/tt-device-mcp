@@ -18391,6 +18391,29 @@ async def _watchdog_heartbeat() -> None:
         await asyncio.sleep(interval)
 
 
+def _report_dead_chip_watch(watch) -> bool:
+    """Spec 03 I96: one startup line and one journal row saying the dead-chip watch is ARMED, so a
+    check after an install reads it from the logs; a WARNING line and row when it is not. Reports
+    only: the watch, its detection and its containment are untouched. Never raises."""
+    try:
+        ok, info = watch.armed()
+        if ok:
+            if logger:
+                logger.info(
+                    f"I96 dead-chip watch ARMED: {info['chips']} chips, interval {info['interval_sec']:g}s "
+                    f"(config confirm {'on' if info['config_confirm'] else 'off'}, "
+                    f"DLLLA {'on' if info['dllla'] else 'off'})"
+                )
+            health_event_detached("dead_chip_watch_armed", **info)
+        else:
+            if logger:
+                logger.warning(f"I96 dead-chip watch NOT ARMED: {info}")
+            health_event_detached("dead_chip_watch_not_armed", reason=str(info)[:200])
+        return bool(ok)
+    except Exception:  # noqa: BLE001 - a report must never stop the broker's start
+        return False
+
+
 async def run_transports(mcp: MCPServer, port: int, socket_path: str | None, serve_http: bool = True):
     """Run the unix-socket and/or HTTP (TCP) transports over the same ASGI app.
 
@@ -18478,6 +18501,7 @@ async def run_transports(mcp: MCPServer, port: int, socket_path: str | None, ser
     sampler.start()
     # Spec 03 I92: its own thread, so an event loop stalled on I/O never delays a stop.
     fsm.aer_watch.start()
+    await asyncio.to_thread(_report_dead_chip_watch, fsm.aer_watch)
 
     socket_server = None
     if socket_path:
