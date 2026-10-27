@@ -7,6 +7,8 @@ behind, so no test's result depends on the order it runs in or on the xdist work
 from __future__ import annotations
 
 import os
+import resource
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -119,28 +121,75 @@ def test_a_real_device_holder_on_the_host_is_not_a_holder_in_a_test(monkeypatch)
     assert srv._tenant_holder_reason() == ""
 
 
+def _descendants(pid: int) -> "list[str]":
+    """Every live process under ``pid`` (any of its threads' children) as 'pid comm'."""
+    todo, found = [pid], []
+    while todo:
+        p = todo.pop()
+        try:
+            tids = os.listdir(f"/proc/{p}/task")
+        except OSError:
+            continue
+        for tid in tids:
+            try:
+                kids = [int(k) for k in Path(f"/proc/{p}/task/{tid}/children").read_text().split()]
+            except OSError:
+                continue
+            for k in kids:
+                try:
+                    found.append(f"{k} {Path(f'/proc/{k}/comm').read_text().strip()}")
+                except OSError:
+                    continue
+                todo.append(k)
+    return found
+
+
 # A whole pytest process: on a loaded host it can outlast the suite's 120 s per-test bound, which
 # would cut it off with no word from the child. Its own bound fires first and shows the child's output.
 @pytest.mark.timeout(300)
-def test_the_leaking_pairs_pass_with_the_leaking_test_first():
+def test_the_leaking_pairs_pass_with_the_leaking_test_first(tmp_path):
     """The order that failed before the reset covered these globals: each pair's first test runs first,
     in one process, and both pass."""
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [str(REPO / "src"), os.environ.get("PYTHONPATH")])))
-    try:
-        run = subprocess.run(
+    # A child that hangs dumps every thread's stack on SIGABRT, so the failure names what held it.
+    env["PYTHONFAULTHANDLER"] = "1"
+    # Its output goes to files and the wait is on the child itself, not on its pipes: a process left
+    # under it cannot hold the wait open. Its stdin is not this worker's (xdist talks over it), and its
+    # temp dirs go under this test's own, away from the run's numbered basetemp dirs.
+    out_path, err_path = tmp_path / "child.out", tmp_path / "child.err"
+    with open(out_path, "w") as out_f, open(err_path, "w") as err_f:
+        child = subprocess.Popen(
             [sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", "-p", "no:xdist", "-p", "no:cacheprovider"]
-            + ["--no-device-tests", "-rA", "--durations=5", *LEAKING_PAIRS],
+            + ["--no-device-tests", "-rA", "--durations=5", f"--basetemp={tmp_path / 'child-tmp'}", *LEAKING_PAIRS],
             cwd=REPO,
             env=env,
-            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            stdout=out_f,
+            stderr=err_f,
             text=True,
-            timeout=240,
+            preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_CORE, (0, 0)),
         )
-    except subprocess.TimeoutExpired as e:
-        out, err = (x.decode(errors="replace") if isinstance(x, bytes) else x or "" for x in (e.stdout, e.stderr))
-        pytest.fail(f"the child pytest ran over 240 s; its output:\n{out[-3000:]}\n{err[-2000:]}")
-    passed = [line.split(" ", 1)[1] for line in run.stdout.splitlines() if line.startswith("PASSED ")]
-    assert run.returncode == 0 and passed == LEAKING_PAIRS, run.stdout[-3000:]
+    try:
+        child.wait(timeout=240)
+    except subprocess.TimeoutExpired:
+        below = _descendants(child.pid)
+        os.kill(child.pid, signal.SIGABRT)
+        try:
+            child.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=30)
+        pytest.fail(
+            f"the child pytest ran over 240 s (processes under it: {below}); "
+            f"its output:\n{out_path.read_text()[-3000:]}\n{err_path.read_text()[-6000:]}"
+        )
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+    out = out_path.read_text()
+    passed = [line.split(" ", 1)[1] for line in out.splitlines() if line.startswith("PASSED ")]
+    assert child.returncode == 0 and passed == LEAKING_PAIRS, out[-3000:]
 
 
 def test_the_isolation_dirs_go_in_one_session_dir(isolation_tmp_root, tmp_path_factory):
