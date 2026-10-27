@@ -217,8 +217,10 @@ def _first_evidence(chips: list, trigger_ts: float, remove_ts: float) -> dict:
     """The containment record's first-evidence fields (spec 03 I96): the earlier of the first AER burst
     on the chips' paths and the first all-ones read of them, never later than the trigger."""
     ts, kind = chip_state.first_evidence(chips)
-    if ts is None or ts > trigger_ts:
+    if ts is None or ts > trigger_ts + 1.0:
         ts, kind = trigger_ts, "trigger"
+    # A sign noted by the trigger's own read is stamped a moment after it: it is the trigger's time.
+    ts = min(ts, trigger_ts)
     return {
         "first_evidence_ts": round(ts, 3),
         "first_evidence": kind,
@@ -1705,9 +1707,15 @@ class CheckAerWatch:
         known = (self._nodes or set()) | nodes
         self._nodes = nodes
         if self.pending_stop is not None:
-            done = self._resolve_pending(nodes, read_at)
-            if done is not None:
-                return done
+            if vanished:
+                # A chip node that vanished is contained below (I96), its kill after the remove; a
+                # pending stop left on other chips still attached resolves on a later poll.
+                if set(self.pending_stop.get("chips") or ()) <= set(vanished):
+                    self.pending_stop = None
+            else:
+                done = self._resolve_pending(nodes, read_at)
+                if done is not None:
+                    return done
         reason = self.burst(sig, now)
         # A vanished chip's path is read from before it went (its sysfs link is gone with it).
         pci = {c: (self._paths.get(c) or [None])[0] for c in vanished}
