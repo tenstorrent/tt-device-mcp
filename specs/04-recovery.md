@@ -2748,6 +2748,46 @@ each rung fires only when the gentler one failed or cannot apply.
   /proc or not; in a pre-cycle run a gap with no /proc entry still refuses its reset. Neither holds
   the bound's ladder from running on, the sweep, or the cycle.
 
+- **I104 — A driver-wait give-up after the tray re-power gets POST_RESET and board re-init on the
+  chips present before the full check.** When a chip never comes back after a mesh reset's tray
+  re-power, tt-smi's driver wait (every chip of the mesh, 100 s) gives up, and the chips that did come
+  back get no POST_RESET and no board re-init; they stay ARC-not-ready, so the full check before the
+  power cycle could only fail, and the ladder in front of the cycle was not complete. tt-smi has no
+  command for those two steps alone and no option for a reduced chip set. So in the reset sweep, after
+  the I102 step (which runs only when every chip is back), whenever the last mesh reset gave up at its
+  driver wait after the tray re-power, its rescan was not withheld (I69) and at least one chip has a
+  device node, the broker runs `python -m tt_device_mcp.health.recovery.present_reinit` through
+  `reset_with_quiesce` (quiesce, holder scan, scope; it is not a mesh reset, so the give-up flags of
+  the last mesh reset stay). It issues the POST_RESET reset ioctl on every chip present at once (the
+  kernel driver's per-device restore and hardware init), then the same local UMD topology discovery
+  tt-smi runs after its own wait. A failed POST_RESET on any chip fails the step without the re-init.
+  The reset path's one bounded rescan (the PCI writer's bound, then its 3 s settle) follows, so a chip
+  that comes back late is enumerated before the check. The broker's readers are stopped first. The
+  step lifts nothing: the caller's full check with fabric over every cabled link decides (fewer links
+  than the cabling expects is a fail). A pass lifts the hold; a fail, a re-init that failed, or a check
+  that cannot end by the deadline leads to the power cycle with no added wait. A re-init whose wait
+  ends with its scope still cycling gets no settle and no check (the verify counts as failed); one that
+  raises is journalled with the chips then on the bus (none counted if the bus cannot be read), and the
+  check still runs. The class A/C direct
+  power cycle, the class A cooldown sweep (no late-chip steps), I65, I70, I76, the ladder at the
+  10-min bound and I102 are unchanged.
+
+  Bound: the wait for the step, the readers' stop included, ends `PRESENT_REINIT_SEC` (30 s) after
+  its start. Under an I97 deadline it ends sooner, so the step's tail (`PRESENT_REINIT_TAIL_SEC`,
+  5 s), the settle and the full check's allowance (190 s) still end by the deadline. With less than
+  `PRESENT_REINIT_MIN_SEC` (10 s) to give it, the step does not run and stops nothing. Cost: tt-smi's
+  whole mesh reset that ends with rc 0 takes 32-35 s including its 30 s settle, so the ioctl and the
+  re-init take a few seconds; with the rescan and its settle the step adds about 5-10 s, at most about
+  35 s plus the rescan's worst case. On the replayed class B1 hold (one chip off the bus; the sweep's
+  repeat gave up at a hold age of about 374 s against the 585 s deadline) the step gets 16 s and the
+  full check keeps its allowance; the power cycle comes at most about 16 s later, and the release at
+  about 13.6 min, inside the 15 min B1 budget. A chip back on that rescan whose check passes is
+  released at about 9 min with no power cycle. Known gap: no evidence yet that a chip which missed the
+  driver wait comes back by this rescan; in the replayed holds it stayed off the bus until the power
+  cycle. The step's value there is that the chips present are re-inited, so the ladder before the
+  cycle is complete. The climb's own mesh-reset rung has no I104 step; only the sweep before every
+  power cycle has it.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -3422,4 +3462,12 @@ sees a silent fabric pass.
 | I103 a pre-cycle reset runs past a gap /proc shows outside every broker scope (`gaps_passed`); a scoped or protected, stuck or unseen gap still refuses; outside a pre-cycle run a visible gap still refuses | `tests/test_foreign_holder_power_cycle.py::test_a_pre_cycle_reset_runs_past_a_visible_gap_but_not_an_unseen_scoped_or_stuck_one`, `::test_a_visible_gap_still_refuses_outside_a_pre_cycle_run` |
 | I103 an unreadable scan at the bound still lets the ladder and sweep resets run, then the cycle; outside a pre-cycle run it refuses and the sweep runs | `tests/test_foreign_holder_power_cycle.py::test_an_unreadable_scan_at_the_bound_runs_the_ladder_and_sweep_resets_then_the_cycle`, `::test_an_unreadable_scan_outside_a_pre_cycle_run_still_refuses_and_the_sweep_runs` |
 | I103 every power-cycle road (automatic, off-bus gated) journals `power_cycle_foreign_holders` for a foreign holder and not a scoped one; a holder read that hangs or raises never holds the cycle | `tests/test_foreign_holder_power_cycle.py::test_every_power_cycle_road_journals_the_foreign_holder_and_not_a_scoped_one`, `::test_a_holder_read_that_hangs_or_raises_never_holds_the_cycle` |
+| I104 one chip stays out: the chips present get POST_RESET and re-init, the full check with fabric fails, nothing lifts, the power cycle follows | `tests/test_present_chips_reinit.py::test_one_chip_stays_out_the_rest_are_reinited_the_check_fails_and_the_broker_cycles`, `tests/test_late_chips_after_driver_wait.py::test_one_chip_still_out_goes_to_the_check_and_the_power_cycle_with_no_wait` |
+| I104 the chip back on the rescan after the re-init: only a just-passed full check with fabric lifts the hold; no power cycle | `tests/test_present_chips_reinit.py::test_the_chip_back_after_the_reinit_passes_the_check_and_no_power_cycle` |
+| I104 a failed check (a short fabric included) or a failed re-init keeps the hold and power-cycles; the step itself lifts nothing | `tests/test_present_chips_reinit.py::test_a_failed_check_after_the_reinit_keeps_the_hold_and_cycles`, `tests/test_present_chips_reinit.py::test_the_step_itself_lifts_nothing` |
+| I104 no step without the tray re-power, with a withheld rescan, or after a mesh reset that ended clean; a second give-up gets it before its check | `tests/test_present_chips_reinit.py::test_no_reinit_without_the_repower_or_when_the_rescan_was_withheld`, `tests/test_present_chips_reinit.py::test_no_reinit_after_a_mesh_reset_that_ended_clean`, `tests/test_late_chips_after_driver_wait.py::test_a_second_give_up_on_the_plain_sweep_is_checked_and_power_cycles_within_the_step_bound` |
+| I104 under an I97 deadline the wait is cut so the check still fits; below 10 s the step does not run; the replayed hold gives it 16 s | `tests/test_present_chips_reinit.py::test_under_an_i97_deadline_the_reinit_runs_only_when_the_check_still_fits` |
+| I104 a re-init still cycling at its bound (rc None) gets no settle and no check, lifts nothing and power-cycles; one that raises is journalled with on_bus (None when unreadable), the full check still runs and fails, the power cycle follows | `tests/test_present_chips_reinit.py::test_a_reinit_still_cycling_at_its_bound_gets_no_check_and_the_power_cycle`, `tests/test_present_chips_reinit.py::test_a_reinit_that_raises_still_gets_the_full_check_and_the_power_cycle`, `tests/test_present_chips_reinit.py::test_a_raise_with_the_bus_unreadable_journals_no_chip_count` |
+| I104 a failed listing, no chip present or an unknown hold age under a deadline: the step does not fire, stops no reader and runs no re-init | `tests/test_present_chips_reinit.py::test_the_skip_branches_stop_nothing_and_run_nothing` |
+| I104 the module: POST_RESET on every present chip, then the UMD re-init; a failed POST_RESET skips the re-init and fails; the argv is not a mesh reset | `tests/test_present_chips_reinit.py::test_post_reset_on_every_present_chip_then_the_reinit`, `tests/test_present_chips_reinit.py::test_a_failed_post_reset_fails_the_step_and_skips_the_reinit`, `tests/test_present_chips_reinit.py::test_a_failed_reinit_or_no_chip_fails_the_step`, `tests/test_present_chips_reinit.py::test_the_reinit_argv_is_the_module_under_the_broker_interpreter` |
 | I102 with I103: the late-chip second mesh reset runs in the pre-cycle sweep, so its pre-reset scan clears a holder outside every broker scope and runs (at the 10-min bound, on the I97 path, and in the sweep outside the bound); its wait still ends at the step's start plus `LATE_CHIP_STEP_SEC`; a failed full check keeps the hold and the cycle journals the holder; a holder in a broker job's scope or the running job's own process still refuses it, nothing lifts and the hold goes on to the cycle | `tests/test_late_chips_after_driver_wait.py::test_the_late_chip_second_reset_clears_a_foreign_holder_and_keeps_its_bound`, `::test_a_job_holder_still_refuses_the_late_chip_second_reset_and_the_hold_goes_on_to_the_cycle` |
