@@ -536,7 +536,9 @@ async def test_a_cancel_while_queued_cancels_the_job(runner_env, monkeypatch):
     rec = _Recorded()
     monkeypatch.setattr(srv, "_client_gone_kills", rec)
     job = await _job_run_then_cancel(_params(runner_env["tmp"], "true"), lambda j: True)
-    await asyncio.gather(*rec.seen)
+    assert await _until(lambda: rec.seen, tries=200), "the client-gone kill task is recorded"
+    await asyncio.wait_for(asyncio.gather(*rec.seen), 5)
+    assert await _until(lambda: job.status is not srv.JobStatus.QUEUED, tries=200)
     assert job.status is srv.JobStatus.KILLED, "a queued job nobody waits for never runs"
     assert srv._kill_reset_debt() == "", "a job that never ran owes no reset"
 
