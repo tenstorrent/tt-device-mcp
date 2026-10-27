@@ -731,6 +731,11 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
         ("_hold_bound_episode", ""),
         ("_hold_bound_ladder_age", None),
         ("_hold_bound_ladder_recovered", False),
+        # Why the last host-rung request skipped the ladder: left set, a later test's request at the same
+        # (empty) episode would name a prior test's skip instead of its own cause.
+        ("_hold_bound_skip", ""),
+        ("_hold_bound_early", False),
+        ("_hold_bound_granted_age", None),
         ("_hold_bound_cycle_age", None),
         ("_hold_bound_check_failed_age", None),
         ("_hold_bound_unarmed_paged", ""),
@@ -742,6 +747,7 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
         ("_kill_refused_pids", {}),
         ("_kill_refused_job_pid", None),
         ("_kill_refused_since", ""),
+        ("_pci_wedged_asked", None),
     ):
         monkeypatch.setattr(srv, name, value, raising=False)
     monkeypatch.setattr(srv, "post_job_gate_pending", False, raising=False)

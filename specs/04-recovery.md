@@ -2905,6 +2905,18 @@ defaults, a lift only on a passing full check) and otherwise holds; the I76 boun
 ladder at 10 min.
 The power cycle honours the same tenant guard and the cooldown/boot-loop denials on every path.
 
+**Class B0: a dead chip the watch contained.** A chip that spec 03 I96's always-on watch contained
+(every user stopped, the chip PCI-removed and lost, the holders killed only after the remove) is
+class B0. It is held from the containment on and takes the partial off-bus path unchanged: the gate
+rungs (PCI rescan, SBR per its defaults), the mesh reset, the full ladder at the I76 10-min bound
+and right before every power cycle, then the power cycle; only a just-passed full check with fabric
+on all cabled links lifts it (spec 03 I78). Nothing here changes a rung, its order or its waits, and
+I97's deadline is unchanged. A containment whose remove failed or timed out has latched PCI-wedged
+and goes to the power cycle the latch asks for. A watch trigger that finds every chip dead is not
+B0: it stays class A or C (I37). Budgets, counted from the watch's trigger: healed by the rescan,
+2.5 min; by the first mesh reset, 6 min; by a second mesh reset, 10 min; through the power cycle,
+15 min, with the I65 cooldown exception as for any partial drop.
+
 **The tray-down prelude (I19).** Every caller of the ladder (`escalate()`: the gate, the idle
 relift, the hold-deadline watchdog) passes through `_tray_down_latch` first, which latches
 `TRAY_DOWN` or `PARTIAL` at the first sighting (journalled as `tray_down_latched`, with whether a
