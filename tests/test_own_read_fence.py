@@ -19,11 +19,12 @@ import time
 import pytest
 
 from tests.test_aer_check_stop import _sig
-from tests.test_aer_stop_contain import _rows, _sample, _stop_row, watch  # noqa: F401 - the fixture
+from tests.test_aer_stop_contain import _held, _rows, _sample, _stop_row, watch  # noqa: F401 - the fixture
 from tests.test_deadchip_detach_before_kill import FABRIC, valve  # noqa: F401 - the fixture
 from tt_device_mcp import server as srv
 from tt_device_mcp import telemetry
-from tt_device_mcp.health import chip_state
+from tt_device_mcp.health import ALL_ONES, chip_state
+from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.monitors import pci
 
 # One stalled PCIe read of a dead chip's attribute; a snapshot's eleven of them (eight attributes,
@@ -289,3 +290,141 @@ def test_a_failed_fence_never_stops_the_containment(watch, monkeypatch):  # noqa
     assert kills and detach < min(kills), log
     assert _rows("chip_contained")[-1]["removed"] is True
     assert chip_state.is_lost("13"), "the chip is still marked lost, so no poll reads it"
+
+
+# A reader the broker starts after an AER stop: a later post-reset or post-job check.
+LATER = 5151
+
+
+class _Proc:
+    def __init__(self, pid):
+        self.pid, self.returncode = pid, None
+
+
+def _signalled(log, pid):
+    return [e for e in log if e[0] in ("stop", "kill") and e[1] == pid]
+
+
+@pytest.mark.parametrize("then", ["answering", "detached"])
+def test_a_pending_stop_never_signals_a_reader_started_after_its_readers_ended(watch, monkeypatch, then):  # noqa: F811
+    """The stopped fabric run ended (its own timeout) and a new check runs: the old stop is dropped,
+    and the new run is never stopped or killed when the burst chip answers or is removed (I92)."""
+    w, log, _detach_ok, burst = watch
+    assert burst()
+    _stopped_only(log)
+    srv.health_monitor.fabric_check_proc.returncode = -9
+    monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", _Proc(LATER))
+    if then == "answering":
+        _sample(age=-1.0)
+        _poll(w, monkeypatch, _sig(14))
+    else:
+        srv.isolated_chips.add("13")
+        _poll(w, monkeypatch, dict(_sig(14), chips=["14"]))
+    assert not _signalled(log, LATER), f"a reader started after the stop was signalled: {log}"
+    assert w.pending_stop is None
+    assert _rows("check_aer_stop_cleared")[-1]["why"] == "the stopped readers ended"
+    assert FABRIC_DEBT.owed, "the stopped run is still no verdict: a full pass is owed"
+
+
+def test_a_pending_stop_kills_only_the_readers_it_stopped(watch, monkeypatch):  # noqa: F811
+    w, log, _detach_ok, burst = watch
+    assert burst()
+    _stopped_only(log)
+    monkeypatch.setattr(srv.health_monitor, "snapshot_proc", _Proc(LATER), raising=False)
+    assert w.answer()
+    assert log[-1] == ("kill", FABRIC) and not _signalled(log, LATER), log
+    assert _rows("check_aer_stop_kill")[-1]["stopped"] == [{"pid": FABRIC, "user": "[broker]fabric-check"}]
+
+
+@pytest.mark.parametrize("step", ["reset_in_flight", "scope_seen"])
+def test_a_reset_step_drops_a_pending_stop_and_its_check_is_never_killed_for_it(watch, monkeypatch, step):  # noqa: F811
+    w, log, _detach_ok, burst = watch
+    assert burst()
+    _stopped_only(log)
+    owner = srv.recovery_mechanism if step == "reset_in_flight" else srv.sampler
+    monkeypatch.setattr(owner, step, True)
+    assert _poll(w, monkeypatch, _sig(14)) is None
+    assert w.pending_stop is None, "the reset step owns the chips and ends their readers itself"
+    assert _rows("check_aer_stop_cleared")[-1]["why"].startswith("a reset or recovery step")
+    monkeypatch.setattr(owner, step, False)
+    # The post-reset full check runs, with the stopped run's pid still listed.
+    monkeypatch.setattr(srv.health_monitor, "snapshot_proc", _Proc(LATER), raising=False)
+    w._clock.t += telemetry.POST_STEP_AER_QUIET_SEC + 1
+    _sample(age=-1.0)
+    for _ in range(int(telemetry.PENDING_STOP_CAP_SEC) + 2):
+        assert _poll(w, monkeypatch, _sig(14)) is None
+    assert not [e for e in log if e[0] == "kill"] and not _signalled(log, LATER), log
+
+
+@pytest.mark.parametrize("seen", ["no sample", "ARC not ready", "sample from before the stop"])
+def test_a_pending_stop_with_no_proof_ends_in_containment_within_its_cap(watch, monkeypatch, seen):  # noqa: F811
+    """Chips that neither answer nor read all-ones: the stop does not wait for the readers' own
+    timeouts. At PENDING_STOP_CAP_SEC the still-attached chip is contained, the remove before any
+    kill (I96), and the hold stays on its bounded recovery: only a full pass with fabric lifts it."""
+    w, log, _detach_ok, burst = watch
+    if seen == "sample from before the stop":
+        _sample(age=1.0)
+    assert burst()
+    _stopped_only(log)
+    at = w.pending_stop["at"]
+    acted = None
+    for _ in range(int(telemetry.PENDING_STOP_CAP_SEC / telemetry.LINK_WATCH_SEC) + 1):
+        if seen == "ARC not ready":
+            srv.sampler.ring.append({"ts": time.time() + 1, "chips": {"13": [None], "14": [100]}})
+        acted = _poll(w, monkeypatch, _sig(14))
+        if acted:
+            break
+        _stopped_only(log)
+        assert w.pending_stop, "stopped, not killed, before the cap"
+    took = w._clock.t - at
+    assert acted and "unproven" in acted, acted
+    assert telemetry.PENDING_STOP_CAP_SEC <= took <= telemetry.PENDING_STOP_CAP_SEC + telemetry.LINK_WATCH_SEC
+    detach = log.index(("detach", "13"))
+    kills = [i for i, e in enumerate(log) if e[0] == "kill"]
+    assert kills and detach < min(kills) and ("kill", FABRIC) in log, f"the remove before any kill: {log}"
+    assert ("detach", "14") not in log
+    assert _rows("chip_contained")[-1]["chips"] == ["13"]
+    assert w.pending_stop is None and chip_state.is_lost("13")
+    assert FABRIC_DEBT.owed
+    _held()
+
+
+def test_the_pending_stop_cap_is_three_fast_samples():
+    """Three fast samples after the stop: a chip that answers or reads all-ones shows it by then."""
+    assert telemetry.PENDING_STOP_CAP_SEC == 3 * telemetry.FAST_SAMPLE_SEC
+
+
+def _beat(idx, value):
+    node = pci.SYSFS_CLASS_DIR / f"tenstorrent!{idx}"
+    node.mkdir(exist_ok=True)
+    (node / "tt_heartbeat").write_text(f"{value}\n")
+
+
+@pytest.mark.parametrize("age", [0.0, chip_state.PROBE_MIN_SEC + 1])
+def test_the_pre_reset_scan_never_detaches_a_chip_fenced_on_one_sample(monkeypatch, age):
+    """One all-ones sample fences a chip (maybe a blip). The pre-reset scan's off-bus read is a
+    decision: it reads the chip for real when due, and never detaches it on the all-ones the fence
+    reports without a read (I97)."""
+    from tt_device_mcp import pre_reset_scan
+
+    _beat("13", 100)
+    _beat("14", 101)
+    chip_state.fence(["13"], "read all-ones")
+    chip_state._fenced["13"]["read"] -= age
+    assert pre_reset_scan._offbus_bound_chips() == []
+    if age:
+        assert not chip_state.is_fenced("13"), "the real read answered: the fence ends"
+
+
+def test_the_pre_reset_scan_still_detaches_a_fenced_chip_a_real_read_finds_dead(monkeypatch):
+    from tt_device_mcp import pre_reset_scan
+
+    _beat("13", ALL_ONES)
+    _beat("14", 101)
+    chip_state.fence(["13"], "read all-ones")
+    chip_state._fenced["13"]["read"] -= chip_state.PROBE_MIN_SEC + 1
+    assert pre_reset_scan._offbus_bound_chips() == ["13"]
+    # A chip marked lost (two strikes or a containment) still counts with no new read.
+    chip_state._fenced["13"]["read"] = time.monotonic()
+    monkeypatch.setattr(chip_state, "is_lost", lambda idx: str(idx) == "13")
+    assert pre_reset_scan._offbus_bound_chips() == ["13"]

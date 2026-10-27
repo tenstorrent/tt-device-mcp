@@ -215,10 +215,17 @@ class PreResetScan:
 
 def _offbus_bound_chips() -> list:
     """Chips still bound to the driver whose ARC heartbeat reads all-ones: off the bus, not detached.
-    A chip the broker already marked lost is not read again (spec 03 I66); it reports all-ones."""
+    A decision read (spec 03 I66, I97): a chip the broker marked lost or fenced is read for real when
+    its re-read is due. A lost chip whose re-read is not due counts as all-ones, as it was read; a
+    chip only fenced (one all-ones sample, maybe a blip) and not read here is never detached on the
+    all-ones it reports without a read."""
+    from tt_device_mcp.health import chip_state
     from tt_device_mcp.health.monitors.heartbeat import dead_chips, read_heartbeats
 
-    return dead_chips(read_heartbeats())
+    chip_state.reprobe_due()
+    unread: set = set()
+    dead = dead_chips(read_heartbeats(probe_lost=True, unread=unread))
+    return [c for c in dead if c not in unread or chip_state.is_lost(c)]
 
 
 def _detach_chip(idx: str) -> bool:

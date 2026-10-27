@@ -74,6 +74,13 @@ AER_STOP_WINDOW_SLACK_SEC = LINK_WATCH_SEC / 2
 # and another for 48 s, so the wait is bounded and only the watch thread waits (the signals are
 # already sent and the event loop never waits on it).
 AER_STOP_JOURNAL_WAIT_SEC = 15.0
+# Spec 03 I92: the longest an AER stop stays pending (readers SIGSTOPped, a burst chip attached, no
+# proof either way), on the watch's clock from the stop. The burst arms the fast cadence (I79), so
+# this is three samples: one that reads a chip all-ones contains it, one that reads every chip
+# answering ends the readers. With neither by then, the chips still attached are contained (stop,
+# PCI remove, then the kill, I96): no kill without the remove, and no stop left to the readers' own
+# timeouts (180 s and more for a fabric run). Faster per-class paths are unchanged.
+PENDING_STOP_CAP_SEC = 3 * FAST_SAMPLE_SEC
 
 # Spec 03 I83's cut after a failed POST_RESET: all PCI removes together get at most this long (a
 # remove behind a hung endpoint can block in the kernel for good; nobody is killed then), and the
@@ -1588,7 +1595,8 @@ class CheckAerWatch:
         # The chips on whose path the last burst rose, for the stop's containment (I94).
         self.last_chips: list = []
         # Readers an I92 stop left SIGSTOPped, not killed, while a burst chip was still attached:
-        # {"chips", "reason", "since" (wall), "readers"}; resolved by a later poll (I92).
+        # {"chips", "reason", "since" (wall), "at" (watch clock), "readers"}; resolved by a later poll
+        # within PENDING_STOP_CAP_SEC, or dropped once its readers are gone or a reset step starts (I92).
         self.pending_stop: Optional[dict] = None
         # The latest containment record (I96).
         self.last_contained: Optional[dict] = None
@@ -1705,6 +1713,10 @@ class CheckAerWatch:
         now = self._clock()
         nodes = {str(c) for c in sig.get("chips") or ()}
         if self._excused(now):
+            if self.pending_stop is not None:
+                # A reset or recovery step owns the chips: it ends their readers itself. The stop's
+                # pids are not kept past it, so no later check run is ever killed for it (I92).
+                self._drop_pending("a reset or recovery step owns the chips")
             # The step's own errors and node churn: the read after it is the baseline (I66).
             self._reads.clear()
             self._reads.append((now, sig.get("aer") or {}))
@@ -1721,7 +1733,7 @@ class CheckAerWatch:
                 if set(self.pending_stop.get("chips") or ()) <= set(vanished):
                     self.pending_stop = None
             else:
-                done = self._resolve_pending(nodes, read_at)
+                done = self._resolve_pending(nodes, read_at, now)
                 if done is not None:
                     return done
         reason = self.burst(sig, now)
@@ -1762,7 +1774,13 @@ class CheckAerWatch:
             attached = self._attached(chips, nodes)
             stopped = stop(reason, kill=not offbus and not attached)
             if attached and not offbus:
-                self.pending_stop = {"chips": attached, "reason": reason, "since": time.time(), "readers": stopped}
+                self.pending_stop = {
+                    "chips": attached,
+                    "reason": reason,
+                    "since": time.time(),
+                    "at": now,
+                    "readers": stopped,
+                }
             contained = []
         else:
             # Idle or a tenant's job, no dead chip: nothing to stop; I79 on the sampler arms the fast
@@ -1801,15 +1819,32 @@ class CheckAerWatch:
         removed = self._sampler.valve_removed
         return sorted((str(c) for c in chips if str(c) in nodes and str(c) not in isolated | removed), key=int)
 
-    def _resolve_pending(self, nodes: set, read_at: float) -> Optional[str]:
+    def _pending_alive(self, pend: dict) -> list:
+        """Of the readers ``pend``'s stop left stopped, those still running (same pid and role)."""
+        readers_fn = getattr(self._deps, "broker_check_readers", None)
+        try:
+            running = {(proc.pid, who) for proc, who in (readers_fn() if readers_fn is not None else ())}
+        except Exception:  # noqa: BLE001 - unknown: keep the stop
+            return list(pend.get("readers") or [])
+        return [r for r in pend.get("readers") or [] if (r.get("pid"), r.get("user")) in running]
+
+    def _drop_pending(self, why: str) -> None:
+        """Forget a pending stop without signalling anyone, with a ``check_aer_stop_cleared`` record."""
+        pend, self.pending_stop = self.pending_stop or {}, None
+        self._journal_flushed(
+            "check_aer_stop_cleared", reason=pend.get("reason", ""), chips=pend.get("chips") or [], why=why
+        )
+
+    def _resolve_pending(self, nodes: set, read_at: float, now: float) -> Optional[str]:
         """Spec 03 I92: settle readers an earlier stop left SIGSTOPped. Chips proven off the bus by the
-        latest sample are contained (stop, remove, then the kill); once no burst chip is attached, or a
-        sample newer than the stop reads every one of them answering, the stopped readers are killed.
-        Otherwise they stay stopped: the hold and its bounded recovery decide. Returns the reason when
-        it acted."""
+        latest sample are contained (stop, remove, then the kill). Once none of the stopped readers
+        still runs, the stop is dropped: no reader started after it is ever signalled for it. Once no
+        burst chip is attached, or a sample newer than the stop reads every one of them answering, the
+        stopped readers still running are killed. At PENDING_STOP_CAP_SEC with neither proof, the
+        chips still attached are contained (the kill after their remove). Returns the reason when it
+        acted."""
         pend = self.pending_stop or {}
         chips = list(pend.get("chips") or [])
-        stop = getattr(self._deps, "stop_check_readers_on_aer", None)
         offbus, all_ones = self._sampler.aer_stop_offbus(chips)
         if offbus:
             self.pending_stop = None
@@ -1822,6 +1857,10 @@ class CheckAerWatch:
             )
             self.last_contained = row
             return pend.get("reason")
+        alive = self._pending_alive(pend)
+        if not alive:
+            self._drop_pending("the stopped readers ended")
+            return None
         attached = self._attached(chips, nodes)
         answering = False
         if attached:
@@ -1834,9 +1873,17 @@ class CheckAerWatch:
                 (sample.get(c) or [ALL_ONES])[0] not in (ALL_ONES, None) for c in attached
             )
         if attached and not answering:
-            return None
+            if now - pend.get("at", now) < PENDING_STOP_CAP_SEC:
+                return None
+            # No proof either way within the bound: the remove comes before any kill (I96).
+            self.pending_stop = None
+            why = f"{pend.get('reason', '')}: chip(s) {', '.join(attached)} unproven after {PENDING_STOP_CAP_SEC:g}s"
+            row = self._sampler.contain_on_thread(attached, attached, why, trigger_at=read_at, readers=alive)
+            self.last_contained = row
+            return why
         self.pending_stop = None
         why = f"{pend.get('reason', '')}: chip(s) {'answering' if attached else 'detached'}"
-        killed = stop(why, kill=True) if stop is not None else []
+        kill = getattr(self._deps, "kill_stopped_check_readers", None)
+        killed = kill(alive) if kill is not None else []
         self._journal_flushed("check_aer_stop_kill", reason=why, chips=chips, stopped=killed)
         return why

@@ -146,7 +146,8 @@ def test_with_no_all_ones_burst_chip_the_stop_kills_only_once_the_chips_answer(w
     assert log == [("stop", FABRIC)], f"no SIGKILL while burst chip 13 is attached without proof: {log}"
     assert w.pending_stop and w.pending_stop["chips"] == ["13"]
     assert w.answer(), "a sample after the stop reads the chips answering"
-    assert log == [("stop", FABRIC), ("stop", FABRIC), ("kill", FABRIC)], log
+    # The kill reaches only the reader the stop stopped, without a second stop (I92).
+    assert log == [("stop", FABRIC), ("kill", FABRIC)], log
     assert w.pending_stop is None and _rows("check_aer_stop_kill")
     assert srv.sampler.aer_containment is None and not _rows("check_aer_contain")
     assert not _rows("chip_contained")

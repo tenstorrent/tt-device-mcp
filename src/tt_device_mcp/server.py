@@ -1249,6 +1249,7 @@ _recovery_deps = RecoveryDeps(
     freeze_device_readers=lambda reason: _freeze_device_readers(reason),
     broker_check_readers=lambda: _broker_device_readers(),
     stop_check_readers_on_aer=lambda reason, kill=True: _stop_check_readers_on_aer(reason, kill),
+    kill_stopped_check_readers=lambda stopped: _kill_stopped_check_readers(stopped),
     stop_device_users=lambda reason: _stop_device_users(reason),
     signal_device_holders=lambda reason, stopped=(): _signal_device_holders(
         reason, tuple(stopped), health_event_detached
@@ -6414,6 +6415,24 @@ def _stop_check_readers_on_aer(reason: str, kill: bool = True) -> list:
         except (ProcessLookupError, OSError):
             pass
     return [{"pid": proc.pid, "user": who} for proc, who in stopped]
+
+
+def _kill_stopped_check_readers(stopped: list) -> list:
+    """Spec 03 I92: SIGKILL the readers an earlier AER stop left stopped (``stopped``, as that stop
+    returned them), only those still running. A reader started after the stop (a later post-reset or
+    post-job check) is never in ``stopped`` and is never signalled. Returns the readers killed. Never
+    raises."""
+    want = {(r.get("pid"), r.get("user")) for r in stopped or () if isinstance(r, dict)}
+    killed = []
+    for proc, who in _broker_device_readers():
+        if (proc.pid, who) not in want:
+            continue
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            continue
+        killed.append({"pid": proc.pid, "user": who})
+    return killed
 
 
 def _stop_device_users(reason: str) -> list:

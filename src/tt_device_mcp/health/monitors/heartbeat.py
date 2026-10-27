@@ -37,7 +37,9 @@ from tt_device_mcp.health.monitors.pci import chip_pci_bdf
 HEARTBEAT_SETTLE_SEC = 0.5
 
 
-def read_heartbeats(*, probe_lost: bool = False, only: Optional[frozenset] = None) -> dict[str, int]:
+def read_heartbeats(
+    *, probe_lost: bool = False, only: Optional[frozenset] = None, unread: Optional[set] = None
+) -> dict[str, int]:
     """Per-chip ARC heartbeat counters, keyed by device index.
 
     Each attribute read is a PCIe read of the chip (the KMD reads the counter from the chip's
@@ -45,7 +47,8 @@ def read_heartbeats(*, probe_lost: bool = False, only: Optional[frozenset] = Non
     allows it (spec 03 I66); it reports ALL_ONES, what its last real read said. ``probe_lost`` is for
     a health check's decision read: each lost chip is read for real once, so a chip that answers
     again is judged on its answer, not on the mark. ``only``, when given, limits the read to those
-    chips (spec 03 I83: the chips that just failed POST_RESET, and no other).
+    chips (spec 03 I83: the chips that just failed POST_RESET, and no other). ``unread``, when given,
+    gets every chip reported ALL_ONES without a read (lost or fenced, its re-read not due).
 
     A chip whose attribute is missing or unreadable is omitted rather than zeroed,
     so the caller sees it as an absent chip (a real fault) and not as a chip whose
@@ -63,6 +66,8 @@ def read_heartbeats(*, probe_lost: bool = False, only: Optional[frozenset] = Non
             continue
         if not chip_state.may_read(idx, ent, probe=probe_lost):
             beats[idx] = ALL_ONES
+            if unread is not None:
+                unread.add(idx)
             continue
         try:
             beats[idx] = int(_read_beat(ent))
