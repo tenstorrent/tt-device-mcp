@@ -1270,13 +1270,14 @@ async def test_a_full_check_still_running_at_the_deadline_fails_and_power_cycles
     monkeypatch.setattr(galaxy, "MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC", 0.4)
     ceiling = galaxy._stuck_hold_ceiling_sec()
     deadline = galaxy._mesh_reset_before_host_rung_deadline_sec()
-    clock, cycled_at, readers, started = _clock(monkeypatch), [], [], []
+    clock, cycled_at, readers, started, left_set = _clock(monkeypatch), [], [], [], []
     mech, m = srv.recovery_mechanism, srv.galaxy_recovery.monitor
     left = 1.5
 
     async def mesh(argv, log, *a, **k):
         order.append("mesh reset")
         clock.shift += deadline - left - galaxy._hold_age_sec(srv.device_hold_episode_since)
+        left_set.append(time.monotonic())  # the deadline is now `left` s away; the check starts later
         return 0, ""
 
     async def verify(expected, log, run_fabric=True, **k):
@@ -1306,10 +1307,11 @@ async def test_a_full_check_still_running_at_the_deadline_fails_and_power_cycles
     assert (
         counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
     ), "a check cut at the deadline lifts nothing"
-    took = cycled_at[0][1] - started[0]
+    took = cycled_at[0][1] - left_set[0]
     rc = await asyncio.wait_for(readers[0].wait(), 3)
     assert rc == -signal.SIGKILL, "the reader that ignored SIGTERM got SIGKILL after the grace"
-    assert left + 0.6 <= took <= left + 0.6 + 0.4 + 0.5, f"power cycle {took:.2f}s after the check began"
+    assert started and started[0] < left_set[0] + left, "the check began before the deadline"
+    assert left + 0.6 <= took <= left + 0.6 + 0.4 + 0.5, f"power cycle {took:.2f}s after the deadline was {left}s away"
     assert cycled_at[0][0] <= ceiling + 0.5, f"power cycle requested at {cycled_at[0][0]:.1f}s of hold"
     cut = [k for n, k in events if n == "whole_mesh_reset_before_host_rung_unverified"]
     assert len(cut) == 1 and cut[0]["reason"] == "deadline" and cut[0]["stopped_pids"] == [readers[0].pid]

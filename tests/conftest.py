@@ -8,6 +8,7 @@ import errno
 import fnmatch
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -219,6 +220,23 @@ def _group_members(pgid: int) -> list:
     return members
 
 
+def _already_doomed(pid: int) -> bool:
+    """pid is a zombie, is exiting, or has SIGKILL pending: no signal can change its fate. Under
+    load a job SIGKILLed by its scope can still be in /proc after its group leader was reaped,
+    re-parented and with its environ already torn down, so neither the walk nor the token finds it."""
+    fields = _proc_stat_fields(pid)
+    if fields is None:
+        return True
+    if fields[0] in ("Z", "X", "x") or int(fields[6]) & 0x4:  # PF_EXITING
+        return True
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            masks = dict(line.split(":", 1) for line in f if line.startswith(("SigPnd:", "ShdPnd:")))
+    except OSError:
+        return True
+    return any(int(v, 16) & (1 << (signal.SIGKILL - 1)) for v in masks.values())
+
+
 class _SignalGuard:
     """Refuses (EPERM, nothing delivered) a signal aimed at a process this run did not spawn, and
     records it so the test fails. Signal 0 delivers nothing and passes; so does a pid that does not
@@ -230,8 +248,9 @@ class _SignalGuard:
 
     def _foreign(self, pids: list) -> list:
         """The pids that exist and are not this run's. A process (or an ancestor) that exits during
-        the ppid walk breaks it, so a miss is read again; one that is gone by then is skipped."""
-        return [p for p in pids if not self.owned(p) and os.path.exists(f"/proc/{p}") and not self.owned(p)]
+        the ppid walk breaks it, so a miss is read again; one that is gone or already doomed by then
+        is skipped."""
+        return [p for p in pids if not self.owned(p) and not _already_doomed(p) and not self.owned(p)]
 
     def _refuse(self, what: str, sig: int, members: list):
         self.refused.append(f"{what}(signal {int(sig)}) reaches pid(s) {members[:8]} this test did not spawn")

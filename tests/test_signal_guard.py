@@ -19,7 +19,7 @@ import time
 
 import pytest
 
-from tests.conftest import _spawned_by_this_run
+from tests.conftest import _proc_stat_fields, _spawned_by_this_run
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 
@@ -97,6 +97,44 @@ def test_a_child_the_test_spawned_can_be_signalled_even_after_it_left_the_sessio
         assert _spawned_by_this_run(grandchild)
     finally:
         parent.stdin.close()
+
+
+def test_a_foreign_process_already_dead_passes_and_a_live_one_in_its_group_is_still_refused(
+    signal_guard, monkeypatch
+):
+    """A process past saving (a zombie, exiting, or with SIGKILL pending) cannot be harmed by a
+    signal, so it is not refused even when neither the walk nor the token finds it: the scope's
+    SIGKILL can leave such a job child in /proc, re-parented, when the broker's backstop killpg
+    follows. A live foreign process in that group is still refused and gets nothing."""
+    # The parent forks a child that exits at once and is never reaped (a zombie), then waits on stdin.
+    zombie_maker = "import os, sys\nz = os.fork()\nif not z:\n    os._exit(0)\nprint(z, flush=True)\nsys.stdin.read()\n"
+    parent = subprocess.Popen(
+        [sys.executable, "-c", zombie_maker],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    zombie = int(parent.stdout.readline())
+    try:
+        deadline = time.monotonic() + 30
+        while _proc_stat_fields(zombie)[0] != "Z" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert _proc_stat_fields(zombie)[0] == "Z"
+        # Both stand in for host processes the walk and the token miss.
+        monkeypatch.setattr(signal_guard, "owned", lambda pid: pid not in (parent.pid, zombie))
+        os.kill(zombie, signal.SIGKILL)
+        assert not signal_guard.refused, signal_guard.refused
+        for send in (lambda: os.kill(parent.pid, signal.SIGTERM), lambda: os.killpg(parent.pid, signal.SIGKILL)):
+            with pytest.raises(PermissionError):
+                send()
+        assert len(signal_guard.refused) == 2 and all(str(parent.pid) in r for r in signal_guard.refused)
+        assert all(f" {zombie}" not in r and f"[{zombie}" not in r for r in signal_guard.refused)
+        time.sleep(0.2)
+        assert parent.poll() is None, "a refused signal was delivered"
+    finally:
+        signal_guard.refused.clear()  # this test's refusals are the assertion, not a failure
+        _end(parent)
 
 
 def test_a_pid_that_does_not_exist_is_passed_through(signal_guard):
