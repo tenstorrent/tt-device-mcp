@@ -2788,6 +2788,43 @@ each rung fires only when the gentler one failed or cannot apply.
   cycle is complete. The climb's own mesh-reset rung has no I104 step; only the sweep before every
   power cycle has it.
 
+- **I105 — A present mesh with chips whose ARC is not ready takes the mesh reset at once.** When every
+  chip is on the bus (`off_bus` 0) and at least one is ARC-not-ready (ENODATA on a bound, link-up
+  endpoint, I24), the router (`_route`, on `Evidence.arc_not_ready`) sends the gate straight to the
+  mesh reset (`STAGE_SMI_RESET`: `tt-smi -glx_reset`, with its POST_RESET and board re-init and the
+  I11 retry for chips it leaves ARC-not-ready), not to the below-floor hold. Before this rule such
+  chips counted neither off the bus nor frozen, so a whole mesh of them read 0 against the floor of
+  16 and was held, read-only, until the I76 ladder at 10 min ran the same reset. Measured: a job
+  ended rc 6, all 32 chips on the bus, every ARC not ready, none off the bus; the gate held below the
+  floor, the idle relift could not lift it, the bound's ladder reset at 602 s, the reset healed in
+  35 s, and the release came 13.3 min after the gate's verdict.
+
+  Threshold: one ARC-not-ready chip with nothing off the bus. The kernel driver answers ENODATA until
+  the chip gets its hardware init, and nothing in the broker's hold path gives it one, so the chip
+  does not self-heal. The floor exists because a mesh reset over a few chips that left the bus can
+  invert the mesh (I8); with every chip on the bus there is nothing to invert. No narrower path is
+  proven: the bridge rung needs a chip off the bus and gives no POST_RESET (I94), and the I104
+  present-chip re-init is measured only after a tray re-power, never on this class. A chip off the
+  bus beside ARC-not-ready ones keeps the off-bus routing (bridge rung, floor, I37/I73). A frozen
+  ARC (a heartbeat that stalls between two reads) is not this class and keeps the floor. A fabric or
+  eth wedge with every ARC ticking keeps today's path: the frozen-eth hold (`WAIT`), or the
+  below-floor hold for the I76 ladder. The guards before the rule are unchanged: the frozen-eth hold,
+  the cooling hold, a live reset scope (`DEFER`) and the bridge rung come first; the tenant guard (I7,
+  03 I13) and the outage hold (03 I55) still refuse the reset itself.
+
+  What follows is unchanged. The reset's own full check with fabric over every cabled link (I32,
+  03 I78; fewer links than the cabling expects is a fail) decides the release. A failed check keeps the
+  hold: the router does not hand the reset back after it failed, and the I76 ladder at 10 min, then
+  the full ladder with the last-chance sweep before the power cycle (I100), still run. Class A/C drops
+  keep their direct power cycle (I37, I73). The gate journals `arc_not_ready_mesh_reset` with the chip
+  count.
+
+  Time to recover:
+
+  | Fault class | Before I105 | After I105 | Budget |
+  |---|---|---|---|
+  | Present mesh, ARC not ready, none off the bus | 13.3 min measured (held to the 10-min bound, then one reset and the full check) | about 3.5-5 min: the gate's verdict, one mesh reset (35 s measured, 32-35 s with rc 0), the full check with fabric | 6 min; 15 min when the reset fails and the I76 ladder and host rung follow |
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -3482,4 +3519,8 @@ sees a silent fabric pass.
 | I104 a re-init still cycling at its bound (rc None) gets no settle and no check, lifts nothing and power-cycles; one that raises is journalled with on_bus (None when unreadable), the full check still runs and fails, the power cycle follows | `tests/test_present_chips_reinit.py::test_a_reinit_still_cycling_at_its_bound_gets_no_check_and_the_power_cycle`, `tests/test_present_chips_reinit.py::test_a_reinit_that_raises_still_gets_the_full_check_and_the_power_cycle`, `tests/test_present_chips_reinit.py::test_a_raise_with_the_bus_unreadable_journals_no_chip_count` |
 | I104 a failed listing, no chip present or an unknown hold age under a deadline: the step does not fire, stops no reader and runs no re-init | `tests/test_present_chips_reinit.py::test_the_skip_branches_stop_nothing_and_run_nothing` |
 | I104 the module: POST_RESET on every present chip, then the UMD re-init; a failed POST_RESET skips the re-init and fails; the argv is not a mesh reset | `tests/test_present_chips_reinit.py::test_post_reset_on_every_present_chip_then_the_reinit`, `tests/test_present_chips_reinit.py::test_a_failed_post_reset_fails_the_step_and_skips_the_reinit`, `tests/test_present_chips_reinit.py::test_a_failed_reinit_or_no_chip_fails_the_step`, `tests/test_present_chips_reinit.py::test_the_reinit_argv_is_the_module_under_the_broker_interpreter` |
+| I105 a present mesh with ARC-not-ready chips (all 32, or one) and none off the bus routes to the mesh reset, not the floor | `tests/test_arc_not_ready_ladder.py::test_a_present_mesh_with_arc_not_ready_routes_to_the_mesh_reset_not_the_floor` |
+| I105 the gate resets a present ARC-not-ready mesh on its first pass, journals it and takes no below-floor hold | `tests/test_arc_not_ready_ladder.py::test_the_gate_resets_a_present_arc_not_ready_mesh_on_its_first_pass` |
+| I105 a failed full check after that reset keeps the hold, releases nothing, the router does not repeat the reset, and the I76 ladder and host rung still fire at 10 min | `tests/test_arc_not_ready_ladder.py::test_a_failed_check_after_that_reset_keeps_the_hold_and_the_bound_still_fires`, `tests/test_arc_not_ready_ladder.py::test_arc_not_ready_after_a_failed_mesh_reset_does_not_loop_the_reset` |
+| I105 a wedge with every ARC ticking (frozen or not) still holds below the floor with no reset; a chip off the bus keeps the off-bus routing; the frozen-eth hold, a live scope and the bridge rung still come first | `tests/test_arc_not_ready_ladder.py::test_a_wedge_with_every_arc_ticking_still_holds_below_the_floor`, `tests/test_arc_not_ready_ladder.py::test_the_gate_still_holds_a_fabric_wedge_with_every_arc_ticking`, `tests/test_arc_not_ready_ladder.py::test_arc_not_ready_with_a_chip_off_the_bus_keeps_the_off_bus_routing`, `tests/test_arc_not_ready_ladder.py::test_arc_not_ready_keeps_the_guards_before_it` |
 | I102 with I103: the late-chip second mesh reset runs in the pre-cycle sweep, so its pre-reset scan clears a holder outside every broker scope and runs (at the 10-min bound, on the I97 path, and in the sweep outside the bound); its wait still ends at the step's start plus `LATE_CHIP_STEP_SEC`; a failed full check keeps the hold and the cycle journals the holder; a holder in a broker job's scope or the running job's own process still refuses it, nothing lifts and the hold goes on to the cycle | `tests/test_late_chips_after_driver_wait.py::test_the_late_chip_second_reset_clears_a_foreign_holder_and_keeps_its_bound`, `::test_a_job_holder_still_refuses_the_late_chip_second_reset_and_the_hold_goes_on_to_the_cycle` |
