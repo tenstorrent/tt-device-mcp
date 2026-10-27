@@ -1022,15 +1022,16 @@ async def test_the_i97_reset_keeps_its_deadline_and_a_refusal_power_cycles_but_t
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reset_sec, gives_up", [(60, False), (GAVE_UP, True)], ids=["in-budget", "gives-up-again"])
-async def test_a_deadline_crossed_during_the_sweep_sbr_still_runs_the_repeated_mesh_reset(
+async def test_a_deadline_crossed_during_the_sweep_sbr_still_runs_the_repeated_mesh_reset_and_its_check(
     monkeypatch, tmp_path, clear_job_state, reset_sec, gives_up
 ):
     """The sweep starts 5 s before the latest hold age the I97 deadline allows the repeat, and its SBR
     takes 20 s. The repeated mesh reset still runs, with a deadline from its own start: a skipped repeat
     is never read as one that ran and failed, so no power cycle is requested without it. Its full check
-    runs when the reset left the check's allowance; nothing lifts on a failed check, and the power cycle
-    is requested within the repeat's start plus the reset's and check's 300 s, the kill grace and the
-    reap."""
+    runs when the reset left the check's allowance, and after a give-up at the driver wait too (I106:
+    the deadline moves on by GAVE_UP_TAIL_SEC). Nothing lifts on a failed check, and the power cycle is
+    requested within the repeat's start plus the reset's and check's 300 s (and the give-up tail), the
+    kill grace and the reap."""
     deadline = galaxy._mesh_reset_before_host_rung_deadline_sec()
     order, events, counters, reasons = _b1_sweep(
         monkeypatch, tmp_path, verdicts=[False, False], held_sec=deadline - NEEDS - 5
@@ -1059,13 +1060,13 @@ async def test_a_deadline_crossed_during_the_sweep_sbr_still_runs_the_repeated_m
     monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
     await gr.escalate("offbus-forced", [GONE], 32, lambda m: None)
     sbr = f"sbr ['{GONE}']"
-    checked = [] if gives_up else ["full check"]
-    assert order[order.index(sbr) :] == [sbr, "full check", "mesh reset"] + checked + ["power cycle"]
+    assert order[order.index(sbr) :] == [sbr, "full check", "mesh reset", "full check", "power cycle"]
     fired = _i97(events)
     assert [k["fired"] for k in fired] == [True] and fired[0]["repeat"] is True
     start = fired[0]["hold_age_sec"]
     assert start > deadline - NEEDS, "the SBR carried the hold past the latest start the I97 deadline allows"
     allowance = NEEDS + galaxy.MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC + galaxy.MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC
+    allowance += galaxy.GAVE_UP_TAIL_SEC if gives_up else 0
     assert len(cycled_at) == 1 and cycled_at[0] <= start + allowance, f"power cycle requested at {cycled_at[0]:.0f}s"
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "a failed check keeps the hold"
 
@@ -1204,18 +1205,19 @@ async def test_the_gates_i58_skip_reaches_the_power_cycle_only_through_the_sweep
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "reset_sec, gives_up, checked",
-    [(35, False, True), (150, False, False), (315, False, False), (GAVE_UP, True, False)],
+    [(35, False, True), (150, False, False), (315, False, False), (GAVE_UP, True, True)],
     ids=["in-budget", "runs-long", "runs-past-the-deadline", "gives-up-again"],
 )
-async def test_the_power_cycle_after_the_mesh_reset_before_the_host_rung_is_requested_by_the_bound(
+async def test_the_power_cycle_after_the_mesh_reset_before_the_host_rung_is_requested_by_its_bound(
     monkeypatch, tmp_path, clear_job_state, reset_sec, gives_up, checked
 ):
     """The reset starts at the latest hold age the deadline allows. In its budget, the full check runs
     and its failure requests the power cycle. A reset that runs long leaves less than the check's
     allowance before the deadline, one that runs past the deadline leaves none (a reset is never
-    killed mid-run, I4), and one whose tt-smi gave up at its driver wait again left the chips
-    ARC-not-ready: no check, the hold stays, the power cycle at once. Either way the power cycle is
-    requested by the 600 s bound, never after it."""
+    killed mid-run, I4): no check, the hold stays, the power cycle at once, by the 600 s bound. One
+    whose tt-smi gave up at its driver wait again gets GAVE_UP_TAIL_SEC more (I106): the full check
+    with fabric runs and decides, and its failure requests the power cycle by the repeat's start plus
+    its allowance, that tail, the kill grace and the reap."""
     ceiling = galaxy._stuck_hold_ceiling_sec()
     deadline = galaxy._mesh_reset_before_host_rung_deadline_sec()
     order, events, counters, reasons = _b1_sweep(
@@ -1243,8 +1245,12 @@ async def test_the_power_cycle_after_the_mesh_reset_before_the_host_rung_is_requ
         "power cycle"
     ]
     assert [k["fired"] for k in _i97(events)] == [True]
+    if gives_up:
+        bound = NEEDS + galaxy.GAVE_UP_TAIL_SEC
+        bound += galaxy.MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC + galaxy.MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC
+        ceiling = _i97(events)[0]["hold_age_sec"] + bound
     assert len(cycled_at) == 1 and cycled_at[0] <= ceiling, f"power cycle requested at {cycled_at[0]:.0f}s"
-    assert counters["dirty_cleared"] == 0
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
     if not checked:
         skipped = [k for n, k in events if n == "whole_mesh_reset_before_host_rung_unverified"]
         assert len(skipped) == 1 and ("gave up" in skipped[0]["reason"]) is gives_up
