@@ -254,13 +254,16 @@ def arm(episode: str) -> None:
         health_event("offbus_gated_hold", phase="grace", held_since=episode, grace_sec=grace_sec())
 
 
-def note_whole_tray_down(episode: str, detail: str, now: Optional[datetime] = None) -> None:
+def note_whole_tray_down(episode: str, detail: str, now: Optional[datetime] = None, chips=()) -> None:
     """A whole UBB tray is off the bus in this episode's below-floor drop: no tray re-power and no mesh
-    reset is tried for it, so the ladder counts as run and the command fires with no grace (idempotent)."""
+    reset is tried for it, so the ladder counts as run and the command fires with no grace (idempotent).
+    ``chips``, the drop's off-bus ids, are kept while the note stands (:func:`whole_tray_chips`)."""
     if not episode:
         return
     _track(episode)
     _pending["ladder_ran"] = True
+    if chips:
+        _pending["whole_tray_chips"] = frozenset(str(c) for c in chips)
     if _pending.get("whole_tray_at") is None:
         _pending["whole_tray_at"] = now or datetime.now()
         _pending["whole_tray_detail"] = detail[-200:]
@@ -284,6 +287,7 @@ def clear_whole_tray_down(episode: str, detail: str, fault_class: str = "") -> N
     if not episode or _pending.get("episode") != episode or _pending.get("whole_tray_at") is None:
         return
     _pending["whole_tray_at"] = None
+    _pending["whole_tray_chips"] = frozenset()
     _pending["whole_tray_detail"] = ""
     _pending["whole_tray_deferred"] = True
     health_event(
@@ -312,6 +316,36 @@ def whole_tray_down_age_sec(episode: str, now: Optional[datetime] = None) -> Opt
 
 def whole_tray_detail(episode: str) -> str:
     return _pending.get("whole_tray_detail", "") if _pending.get("episode") == episode else ""
+
+
+def whole_tray_chips(episode: str) -> frozenset:
+    """The off-bus chip ids this episode's whole-tray note was given, while the note stands; empty
+    otherwise. The cycle names them (spec 04 I88): the note can send the hold to the cycle on its first
+    gate pass, before the gate keeps the hold's off-bus set."""
+    if not episode or _pending.get("episode") != episode or _pending.get("whole_tray_at") is None:
+        return frozenset()
+    return _pending.get("whole_tray_chips") or frozenset()
+
+
+# Spec 04 I88: the class and off-bus chip ids of a power cycle requested straight from a hold's pass
+# (I37's direct cycle), set only while that request runs: it can come on the hold's first pass, before
+# the gate keeps the hold's off-bus set. Memory only.
+_DIRECT_CYCLE: contextvars.ContextVar = contextvars.ContextVar("tt_device_mcp_direct_cycle", default=None)
+
+
+@contextlib.contextmanager
+def direct_cycle(fault_class: str, chips):
+    """Scope a direct power cycle's request: :func:`direct_cycle_now` gives its class and chips."""
+    token = _DIRECT_CYCLE.set((fault_class, frozenset(str(c) for c in chips)))
+    try:
+        yield
+    finally:
+        _DIRECT_CYCLE.reset(token)
+
+
+def direct_cycle_now() -> Optional[tuple]:
+    """(fault class, chip ids) of the direct power cycle being requested, or None."""
+    return _DIRECT_CYCLE.get()
 
 
 def note_ladder_ran(episode: str) -> None:

@@ -20,15 +20,19 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.conftest import patch_health_event
+from tests.conftest import GALAXY_BUS_IDS, patch_health_event
+from tests.test_classac_power_cycle_direct import EXPECTED, _beats_without, _gate, _off, rig  # noqa: F401 - the fixture
+from tests.test_offbus_power_cycle import _below_floor_episode, _gate_below_floor, _spy_gated_power_cycle
 from tt_device_mcp import alert
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.recovery import base as recovery_base
+from tt_device_mcp.health.recovery import galaxy
 from tt_device_mcp.health.recovery import offbus_power_cycle as opc
 from tt_device_mcp.health.recovery.offbus_power_cycle import fire_command as _real_fire_command  # before the tripwire
 from tt_device_mcp.health.recovery.stages import power_cycle as pc
 
 _real_installed_shutdown_hook = pc.installed_shutdown_hook  # before conftest stubs it
+_real_auto_power_cycle_host = srv._auto_power_cycle_host  # before a rig stubs it
 
 REPO = Path(__file__).resolve().parent.parent
 HOOK = REPO / "deploy" / "tt-device-mcp-power-cycle.shutdown"
@@ -786,6 +790,83 @@ async def test_the_escalation_marks_the_cycle_possible_then_requested(escalation
     # The I27 configured command can still cycle the host: the marker still warns.
     monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", "ipmitool chassis power cycle")
     assert srv._power_cycle_marker_context() == ("partial_offbus", {"0": "0000:01:00.0"}, "2026-01-01T00:00:00")
+
+
+def _broker_context(escalation, monkeypatch) -> list:
+    """The broker's own trigger journal and marker provider (memory only), every chip's PCI address in
+    ``device_pci_map``, no chip isolated and the hold's off-bus set not filled yet (the gate fills it
+    only after its first pass returns). Returns every marker write as (state, class, chips)."""
+    monkeypatch.setattr(escalation["mech"], "power_cycle_journal", srv._journal_power_cycle_foreign_holders)
+    monkeypatch.setattr(srv, "_foreign_holder_rows", lambda: [])
+    monkeypatch.setattr(srv, "device_pci_map", {str(i): bdf for i, bdf in enumerate(GALAXY_BUS_IDS)})
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.setattr(srv, "_offbus_hold_chips", set())
+    monkeypatch.setattr(pc, "_logger", _Journal(escalation["calls"]))
+    pc.set_pending_marker_context(srv._power_cycle_marker_context)
+    written, write = [], pc.write_pending_marker
+
+    def record(state, reason, fault_class="", chips=None, hold_since="", lead_sec=0.0):
+        written.append((state, fault_class, dict(chips or {})))
+        return write(state, reason, fault_class, chips, hold_since, lead_sec)
+
+    monkeypatch.setattr(pc, "write_pending_marker", record)
+    return written
+
+
+def _assert_cycle_names(escalation, written, states, fault_class, off):
+    """Every marker write, the marker left behind and the trigger line name ``fault_class`` and the
+    chips ``off`` with their addresses from ``device_pci_map``."""
+    chips = {str(c): GALAXY_BUS_IDS[c] for c in off}
+    assert [w[0] for w in written] == states
+    assert all(w[1:] == (fault_class, chips) for w in written), written
+    m = _marker()
+    assert (m["state"], m["fault_class"]) == ("requested", fault_class)
+    assert m["chips"] == [{"index": c, "bdf": GALAXY_BUS_IDS[c]} for c in sorted(off)]
+    (line,) = [c[1][0] for c in escalation["calls"] if c[0] == "journal"]
+    named = ", ".join(f"{c} ({GALAXY_BUS_IDS[c]})" for c in sorted(off))
+    assert f"class={fault_class} chips=[{named}] reason=" in line
+
+
+@pytest.mark.asyncio
+async def test_a_whole_tray_the_gate_sends_to_the_cycle_is_marked_and_journaled_as_whole_tray(
+    escalation, monkeypatch, tmp_path, clear_job_state, galaxy_trays
+):
+    """A whole tray (0-7) off on the hold's first below-floor gate pass, with only the I27 command set:
+    the whole-tray note sends it to the cycle before the gate fills the hold's off-bus set, and no chip
+    is isolated. Both 'possible' markers, the 'requested' one and the trigger line still read class
+    whole_tray with the tray's chips and addresses, from the note (memory only)."""
+    _below_floor_episode(monkeypatch, tmp_path, cmd=" ".join(CYCLE))
+    monkeypatch.setattr(galaxy, "_pci_rescan", lambda: None)  # the tray-down prelude's rescan
+    monkeypatch.setattr(opc, "fire_command", _real_fire_command)
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: False)
+    written = _broker_context(escalation, monkeypatch)
+    calls = _spy_gated_power_cycle(monkeypatch)
+    off = set(range(8))
+    await _gate_below_floor(off)
+    assert calls == [8], "the gate's BELOW_FLOOR branch sent it straight to the power cycle"
+    assert _steps(escalation) == ["preflight", "journal", "systemd-run", "reboot"]
+    assert not srv.isolated_chips and not srv._offbus_hold_chips
+    _assert_cycle_names(escalation, written, ["possible", "possible", "requested"], "whole_tray", off)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault_class, phase", [("whole_tray", "post-job"), ("all_off", "startup")])
+async def test_a_drop_its_class_sends_straight_to_the_cycle_is_marked_and_journaled_with_it(
+    escalation, rig, monkeypatch, fault_class, phase  # noqa: F811 - the imported fixture
+):
+    """Spec 04 I37's direct cycle with the auto power cycle on: class A (tray 1 off) at a post-job
+    pass, class C (every chip off, a mesh reset already failed) at the startup gate. It fires on the
+    hold's first pass, before the gate fills the hold's off-bus set: the markers and the trigger line
+    read the class and the chips that cycle was decided on."""
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", _real_auto_power_cycle_host)
+    written = _broker_context(escalation, monkeypatch)
+    off = set(range(EXPECTED)) if fault_class == "all_off" else _off(rig["map"], {1: 8})
+    rig["beats"] = _beats_without(off)
+    rig["g"].mechanism.mesh_reset_failed_since_release = fault_class == "all_off"
+    assert await _gate(rig, galaxy.STAGE_SMI_RESET, phase=phase) == galaxy.OUTCOME_WAITING
+    assert "glx_reset" not in rig["order"], "no mesh reset first"
+    assert _steps(escalation) == ["preflight", "journal", "systemd-run", "reboot"]
+    _assert_cycle_names(escalation, written, ["possible", "requested"], fault_class, off)
 
 
 @pytest.mark.asyncio

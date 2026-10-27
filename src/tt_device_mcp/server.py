@@ -7335,8 +7335,13 @@ def _foreign_holder_rows() -> list:
 def _power_cycle_context() -> tuple:
     """Spec 04 I88: (fault class, {off-bus chip index: PCI address or None}, hold start) for the cycle's
     journal line and pending marker. From memory only: no chip is read, since a chip off the bus must
-    not be touched again."""
-    chips = sorted(_offbus_one_shot_chips(), key=str)
+    not be touched again. A cycle sent on a hold's first pass comes before the gate keeps the hold's
+    off-bus set: I37's direct cycle names the class and chips it was requested for, and a standing I27
+    whole-tray note its chips, as class ``whole_tray``."""
+    direct = offbus_power_cycle.direct_cycle_now()
+    noted = offbus_power_cycle.whole_tray_chips(device_hold_episode_since)
+    known = {str(c) for c in _offbus_one_shot_chips()} | noted | (direct[1] if direct else frozenset())
+    chips = sorted(known, key=str)
     banked = galaxy_recovery._chip_buses_now() if galaxy_recovery is not None else {}
     bdfs = {
         str(c): device_pci_map.get(str(c)) or banked.get(c) or banked.get(str(c)) or banked.get(int(c))
@@ -7345,9 +7350,9 @@ def _power_cycle_context() -> tuple:
     }
     expected = health_monitor.expected(0) if health_monitor is not None else 0
     tray_map = galaxy_recovery._tray_map_now() if galaxy_recovery is not None else None
-    whole = bool(_whole_trays_off({int(c) for c in bdfs}, expected, tray_map)) if bdfs else False
+    whole = bool(noted) or (bool(_whole_trays_off({int(c) for c in bdfs}, expected, tray_map)) if bdfs else False)
     fault_class = _offbus_fault_class(len(bdfs), expected, whole) if bdfs else "present_mesh"
-    return fault_class, bdfs, device_hold_episode_since
+    return (direct[0] if direct else fault_class), bdfs, device_hold_episode_since
 
 
 def _power_cycle_marker_context() -> Optional[tuple]:

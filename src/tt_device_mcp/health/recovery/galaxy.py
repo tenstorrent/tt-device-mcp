@@ -1462,7 +1462,9 @@ class GalaxyRecovery(Recovery):
             host_at_risk=True,
         )
         log(f"{what}: no further reset heals this class — power-cycling the host now (spec 04 I37)")
-        await self.deps.auto_power_cycle_host(log, f"{what}; no further reset heals this class")
+        named = _offbus_fault_class(off_bus, expected, whole=fault_class == FAULT_CLASS_WHOLE_TRAY)
+        with offbus_power_cycle.direct_cycle(named, offbus_chips):  # what the cycle names (I88)
+            await self.deps.auto_power_cycle_host(log, f"{what}; no further reset heals this class")
         return True
 
     async def leftover_host_rung(self, leftover_pids, expected: int, log, *, what: str) -> tuple[str, str]:
@@ -4536,6 +4538,6 @@ class GalaxyRecovery(Recovery):
             host_at_risk=True,
         )
         offbus_power_cycle.note_whole_tray_down(
-            self.deps.device_hold_episode_since(), f"trays {whole}, {off_bus}/{expected} off the bus"
+            self.deps.device_hold_episode_since(), f"trays {whole}, {off_bus}/{expected} off the bus", chips=offbus_ids
         )
         return True
