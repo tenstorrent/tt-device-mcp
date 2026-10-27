@@ -65,8 +65,8 @@ MAX_EVENTS_BYTES = 32 * 1024 * 1024
 MAX_CHIPS_BYTES = 256 * 1024 * 1024
 
 
-def _append_durable(path: Path, rec: dict, max_bytes: int) -> None:
-    """Append one JSON record and fsync it.
+def _append_durable(path: Path, rec: dict, max_bytes: int) -> bool:
+    """Append one JSON record and fsync it. True only once the fsync returned (spec 03 I95).
 
     fsync per record is the entire contract: the events worth having are the ones
     written moments before the machine dies. Never raises — a journal that cannot be
@@ -85,7 +85,8 @@ def _append_durable(path: Path, rec: dict, max_bytes: int) -> None:
             f.flush()
             os.fsync(f.fileno())
     except (OSError, ValueError, TypeError):
-        pass
+        return False
+    return True
 
 
 def health_event(kind: str, **fields) -> None:
@@ -103,15 +104,27 @@ _detached_writer: Optional[threading.Thread] = None
 _detached_lock = threading.Lock()
 
 
+class _Flush:
+    """One waiter's record: set once the writer is done with it, ``ok`` only if its fsync returned."""
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.ok = False
+
+
 def _drain_detached() -> None:
     while True:
-        path, rec, max_bytes = _detached.get()
-        _append_durable(path, rec, max_bytes)
+        path, rec, max_bytes, done = _detached.get()
+        ok = False
+        try:
+            ok = _append_durable(path, rec, max_bytes)
+        finally:
+            if done is not None:
+                done.ok = ok is True
+                done.event.set()
 
 
-def health_event_detached(kind: str, **fields) -> None:
-    """Queue one decision for the journal's writer thread and return at once. The record carries the
-    time of this call, not of the write. Never raises."""
+def _queue_detached(kind: str, fields: dict, done: Optional[_Flush]) -> bool:
     global _detached_writer
     rec = {"ts": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "kind": kind}
     rec.update(fields)
@@ -120,9 +133,28 @@ def health_event_detached(kind: str, **fields) -> None:
             if _detached_writer is None or not _detached_writer.is_alive():
                 _detached_writer = threading.Thread(target=_drain_detached, name="health-journal", daemon=True)
                 _detached_writer.start()
-        _detached.put((HEALTH_DIR / EVENTS_FILE, rec, MAX_EVENTS_BYTES))
+        _detached.put((HEALTH_DIR / EVENTS_FILE, rec, MAX_EVENTS_BYTES, done))
     except RuntimeError:
-        pass
+        return False
+    return True
+
+
+def health_event_detached(kind: str, **fields) -> None:
+    """Queue one decision for the journal's writer thread and return at once. The record carries the
+    time of this call, not of the write. Never raises."""
+    _queue_detached(kind, fields, None)
+
+
+def health_event_flushed(kind: str, timeout: float, **fields) -> bool:
+    """Queue one decision for the journal's writer thread, then wait up to ``timeout`` for its fsync.
+    Records queued before it are written first, so a True return means they are on disk too. False
+    when the bound passed first (the record stays queued), the writer could not start, or the
+    write or its fsync failed. Spec 03 I95: the AER watch's stop record, which a host lost after the stop must still show. Never
+    raises. Never call it on the event loop: it blocks for up to ``timeout``."""
+    done = _Flush()
+    if not _queue_detached(kind, fields, done):
+        return False
+    return done.event.wait(timeout) and done.ok
 
 
 def read_health_events(since_ts: float | None = None, kinds: "set[str] | None" = None) -> list[dict]:

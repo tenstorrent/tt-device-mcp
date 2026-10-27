@@ -762,6 +762,11 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     monkeypatch.setattr(srv.sampler, "pollers_deferred_for", frozenset(), raising=False)
     monkeypatch.setattr(srv.sampler, "prev_beats", {}, raising=False)
     monkeypatch.setattr(srv.sampler, "scope_seen", False, raising=False)
+    # The valve runs in flight and the chips they read all-ones or removed (spec 03 I94).
+    monkeypatch.setattr(srv.sampler, "valve_runs", [], raising=False)
+    monkeypatch.setattr(srv.sampler, "last_sample_all_ones", [], raising=False)
+    monkeypatch.setattr(srv.sampler, "valve_detaching", set(), raising=False)
+    monkeypatch.setattr(srv.sampler, "valve_removed", set(), raising=False)
     monkeypatch.setattr(srv, "_last_dispatch_recheck_at", None, raising=False)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
     # A link drop an eth test measured on the singleton would turn the next test's 77 hold into a fault.
@@ -1223,6 +1228,7 @@ def patch_health_event(monkeypatch, fn) -> None:
     envelope and the tray rung's disable, which the walk reaches), and ``base`` (the outage hold)."""
     monkeypatch.setattr(srv, "health_event", fn)
     monkeypatch.setattr(srv, "health_event_detached", fn)
+    monkeypatch.setattr(srv, "health_event_flushed", lambda kind, timeout, **f: fn(kind, **f) or True)
     monkeypatch.setattr(recovery_pkg, "health_event", fn)
     monkeypatch.setattr(recovery_galaxy, "health_event", fn)
     monkeypatch.setattr(pcie_guard, "health_event", fn)

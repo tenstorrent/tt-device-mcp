@@ -49,7 +49,10 @@ def valve(monkeypatch):
         ("prev_beats", {}),
         ("pollers_stopped_for", frozenset()),
         ("pollers_deferred_for", frozenset()),
-        ("sample_all_ones", None),
+        ("valve_runs", []),
+        ("last_sample_all_ones", []),
+        ("valve_detaching", set()),
+        ("valve_removed", set()),
     ):
         monkeypatch.setattr(srv.sampler, name, fresh)
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")

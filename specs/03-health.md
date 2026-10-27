@@ -1753,9 +1753,12 @@ cooldown (spec 04 I65) holds longer.
   `AER_STOP_WINDOW_SLACK_SEC` (half a poll) older than 2 s, because each poll also takes its own
   time: the read two polls back stays the baseline, so 4 split over two polls stops the readers,
   and the read three polls back (3 s or more) never does. The stop itself: SIGSTOP each group, mark each run no
-  verdict, then SIGKILL each group (`server._stop_check_readers_on_aer`). No journal, log or fsync
-  comes before either signal: the no-verdict mark's journal append and the `check_aer_stop` event
-  go through the journal's own writer thread (`health_event_detached`), and the log line follows.
+  verdict, then SIGKILL each group (`server._stop_check_readers_on_aer`), unless the sampler's
+  latest sample read a burst chip all-ones: then the groups stay stopped and unkilled, and the
+  dead-chip valve removes that chip before it kills them (I94). No journal, log or fsync comes
+  before either signal: the no-verdict mark's journal append goes through the journal's own writer
+  thread (`health_event_detached`), and the `check_aer_stop` record is written after the signals
+  and fsynced before the stop returns, bounded (I95); the log line follows.
   The run is a failed check: a fabric run is marked killed (I82; `FABRIC_DEBT` owed, the last
   pass's vouching dropped), a snapshot fails with no verdict, an eth self-test arms nothing. The
   hold stays and its bounded recovery follows unchanged (the full ladder at 10 min, then the power
@@ -1769,9 +1772,47 @@ cooldown (spec 04 I65) holds longer.
   (in `telemetry.py`): storms that went on to a chip drop or a host lockup posted 9-14 records on
   one function in their first flush, while outside a storm no function counted more than 2 in 2 s.
   Known gaps: in-kernel tt-kmd reads cannot be stopped, including the driver's close path after the
-  SIGKILL (I84); about one passing check in 300 met a benign storm of the same shape and is stopped
+  SIGKILL (I84) for a chip that was not read all-ones when the burst came (the latest sample is up
+  to one cadence old) or whose containment was refused (I94); about one passing check in 300 met a benign storm of the same shape and is stopped
   too (a later full pass decides); and that ending the reads ends the storm is a model, not yet
   shown on a device.
+
+- **I94 — An AER stop on an all-ones or off-bus burst chip contains it through the dead-chip valve
+  before any reader is killed.** When the I92 watch stops the check readers, it picks the burst's
+  chips (those on whose path the counts rose) that the sampler's latest ring sample read all-ones
+  (`TelemetrySampler.aer_stop_offbus`; the ring only, no device or config-space read). A sample
+  older than `FAST_WINDOW_SEC` (30 s) picks none, and so does all-ones on every chip, the blackout
+  that keeps its direct power cycle (I19, I65). With a pick, the readers' groups get SIGSTOP and
+  no SIGKILL, and the watch hands `TelemetrySampler.contain_after_aer_stop` to the sampler's event
+  loop, where the PCI remove runs: it marks the chips lost (no poll reads them again), journals
+  `check_aer_contain`, and runs I84's valve on them (freeze, PCI remove, then the kill, hold). The
+  containment and the sampler's own valve runs share that loop and may overlap: each run adds its
+  all-ones chips to `TelemetrySampler.valve_runs` and takes away only its own entry, so no run
+  clears or replaces another's. A run decides its kill after its remove, on every chip that a run in
+  flight or the latest sample read all-ones and that the valve has not removed: one another run is
+  still removing refuses the kill as `chip_not_detached` (that run kills after its own remove), one
+  whose remove failed refuses it as `detach_failed`. A
+  SIGKILL before the remove would close the readers' fds and the driver's close path would message
+  the off-bus chip; after it nothing does. A chip already isolated is contained once. Containment
+  can be refused, and each refusal keeps every reader stopped or unkilled as the valve leaves it,
+  keeps the hold, journals why and leaves the device to the bounded recovery: a reset in flight or
+  its scope active since the stop (`check_aer_contain_refused`, `reset_in_flight`; the reset's own
+  fence owns the chips); the PCI-wedged latch (I83, `chip_isolation_skipped`); a remove that failed
+  or timed out, or holders that would not die (I84, `chip_dead_kill_refused`); and no running loop
+  to take it (the stop row's `contained` is empty, the readers stay stopped and the sampler's own
+  valve decides). None of them, and no contained chip, lifts a hold or releases the device: the
+  stopped run is no verdict (I82, `FABRIC_DEBT` owed), the hold runs the full ladder at 10 min and
+  then the power cycle (spec 04 I76), and only a just-passed full check with fabric on all cabled
+  links lifts it (I78). No reset is chosen here, and I92's burst threshold is unchanged.
+- **I95 — The AER stop record is fsynced before the stop returns.** The `check_aer_stop` row
+  (`reason`, `chips`, `stopped`, `offbus`, `contained`) goes to the journal's writer thread after
+  both signals and the watch thread waits for its fsync (`health_event_flushed`), at most
+  `AER_STOP_JOURNAL_WAIT_SEC` (15 s; a storm has stalled one fsync 12 s and another 48 s), so a host
+  lost right after a stop still shows it. Records queued before it are written first. Only the watch
+  thread waits: the signals are already sent and the event loop never waits on it. The wait reports
+  the row on disk only once its fsync returned: past the bound the row stays queued, and a write or
+  fsync that failed (the writer never raises) is not a flush; either way the watch logs that the
+  stop record is not on disk, and nothing else changes (signals, `FABRIC_DEBT` owed, the hold).
 
 ## Interfaces
 
@@ -2499,6 +2540,8 @@ refuses.
 | I88 | `tests/test_health_tenant_job_degraded.py::test_a_running_jobs_own_off_bus_reading_is_not_a_hold`, `tests/test_health_tenant_job_degraded.py::test_a_chip_still_off_when_the_job_ends_opens_the_hold_and_only_a_full_check_lifts_it`, `tests/test_health_tenant_job_degraded.py::test_an_open_hold_episode_still_reads_held_while_a_job_runs`, `tests/test_health_tenant_job_degraded.py::test_an_in_memory_verdict_under_a_running_job_still_reads_held` |
 | I91 | `tests/test_pcie_aer_telemetry.py::test_snapshot_reads_both_ends_and_names_bdf_root_port_and_tray`, `tests/test_pcie_aer_telemetry.py::test_delta_lists_only_chips_with_errors_or_a_link_change`, `tests/test_pcie_aer_telemetry.py::test_delta_names_a_chip_that_left_the_bus_and_reads_nothing_of_it`, `tests/test_pcie_aer_telemetry.py::test_a_lost_chip_s_own_link_is_never_read`, `tests/test_pcie_aer_telemetry.py::test_a_chip_the_sampler_read_all_ones_is_not_read`, `tests/test_pcie_aer_telemetry.py::test_the_broker_s_snapshot_never_reads_the_link_of_a_chip_the_sampler_read_all_ones`, `tests/test_pcie_aer_telemetry.py::test_no_chip_link_is_read_while_a_reset_step_owns_the_chips`, `tests/test_pcie_aer_telemetry.py::test_an_all_ones_link_read_is_not_repeated_in_the_same_job_cycle`, `tests/test_pcie_aer_telemetry.py::test_no_write_and_no_config_space_read`, `tests/test_pcie_aer_telemetry.py::test_job_start_end_and_the_check_each_write_one_event_into_the_gate_record`, `tests/test_pcie_aer_telemetry.py::test_the_runner_snapshots_before_and_after_the_job_command_and_the_check_reads_them`, `tests/test_pcie_aer_telemetry.py::test_a_stalled_snapshot_is_left_out_after_its_bound`, `tests/test_pcie_aer_telemetry.py::test_the_gate_decides_the_same_with_or_without_the_telemetry` |
 | I92 | `tests/test_aer_check_stop.py::test_a_burst_stops_every_reader_before_any_write_and_owes_a_full_pass`, `tests/test_aer_check_stop.py::test_the_stop_keeps_the_hold_and_the_earlier_pass_no_longer_vouches`, `tests/test_aer_check_stop.py::test_a_stopped_fabric_run_is_no_verdict`, `tests/test_aer_check_stop.py::test_a_burst_during_the_full_check_gate_fails_it_into_the_bounded_recovery`, `tests/test_aer_check_stop.py::test_a_reset_steps_own_aer_is_excused_then_a_real_burst_still_stops`, `tests/test_aer_check_stop.py::test_a_step_that_ended_with_no_reader_running_still_excuses_the_post_reset_check`, `tests/test_aer_check_stop.py::test_a_burst_split_over_two_polls_at_the_real_cadence_stops`, `tests/test_aer_check_stop.py::test_a_rise_spread_past_the_window_at_the_real_cadence_never_stops`, `tests/test_aer_check_stop.py::test_a_slow_rise_another_path_or_one_below_the_count_never_stops`, `tests/test_aer_check_stop.py::test_no_reader_running_means_no_read`, `tests/test_aer_check_stop.py::test_a_journal_stalled_in_fsync_delays_neither_signal`, `tests/test_aer_check_stop.py::test_boot_builds_the_watch_beside_the_sampler`, `tests/test_aer_check_stop.py::test_the_watch_runs_on_its_own_thread_and_stops` |
+| I94 | `tests/test_aer_stop_contain.py::test_an_all_ones_burst_chip_is_removed_before_any_reader_is_killed`, `tests/test_aer_stop_contain.py::test_with_no_all_ones_burst_chip_the_stop_kills_at_once_as_before`, `tests/test_aer_stop_contain.py::test_with_no_loop_to_contain_the_readers_stay_stopped_and_unkilled`, `tests/test_aer_stop_contain.py::test_a_failed_remove_kills_nobody_and_keeps_the_hold`, `tests/test_aer_stop_contain.py::test_a_pci_wedged_latch_skips_the_remove_and_keeps_the_hold`, `tests/test_aer_stop_contain.py::test_a_reset_that_took_the_chips_since_the_stop_refuses_and_keeps_the_hold`, `tests/test_aer_stop_contain.py::test_a_contained_chip_is_contained_once`, `tests/test_aer_stop_contain.py::test_the_contained_hold_runs_the_full_ladder_at_the_bound_then_the_host_rung`, `tests/test_aer_stop_contain.py::test_the_contained_hold_fails_the_full_check_gate_into_the_bounded_recovery`, `tests/test_aer_stop_contain.py::test_overlapping_valve_runs_kill_nobody_before_every_all_ones_chip_is_removed` |
+| I95 | `tests/test_aer_stop_contain.py::test_the_stop_record_is_on_disk_when_the_process_dies_right_after_the_stop`, `tests/test_aer_stop_contain.py::test_a_journal_stalled_in_fsync_bounds_the_wait_and_delays_neither_signal`, `tests/test_aer_stop_contain.py::test_a_failed_journal_write_is_not_reported_on_disk` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
