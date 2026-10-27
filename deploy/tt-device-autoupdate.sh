@@ -653,7 +653,10 @@ trap au_exit EXIT
 # its reset may have left the venv or a staged script newer than the running broker), or a broker
 # that is not healthy (I21's reasons; the restart may be its fix) restarts as before. Nothing here
 # moves the rate limit or the gates above: this runs after them, and leaves last-apply alone.
-NO_RESTART_PATHS='docs/** tests/** .github/** *.md (outside src/)'
+# This script is on the list too: no broker process reads it (the reconcile timer runs the staged
+# copy, and the broker never runs either), so a change to it is staged below and runs from the
+# next lap on. The sibling deploy scripts are not: the broker, its checks or reconcile run them.
+NO_RESTART_PATHS='docs/** tests/** .github/** *.md (outside src/) deploy/tt-device-autoupdate.sh'
 # Prints why this apply needs the restart, or nothing when it does not.
 restart_needed() {
     local p head paths la age now
@@ -668,7 +671,7 @@ restart_needed() {
         [ -n "$p" ] || continue
         case "$p" in
             src/*) echo "changes $p"; return ;;   # package data: never by extension
-            docs/*|tests/*|.github/*|*.md) ;;
+            docs/*|tests/*|.github/*|*.md|deploy/tt-device-autoupdate.sh) ;;
             *) echo "changes $p"; return ;;
         esac
     done <<< "$paths"
@@ -695,13 +698,23 @@ git -C "$clone" reset --hard -q "$remote_sha" \
     || { echo "autoupdate: reset failed" >&2; exit 1; }
 
 if [ -z "$why_restart" ]; then
-    # Nothing to install or stage: the venv, the staged scripts and the host config already match
-    # the new tree, which is now the one on disk.
+    # Nothing to install: the venv, the other staged scripts and the host config already match
+    # the new tree, which is now the one on disk. A new copy of this script is staged before
+    # installed.sha moves, as the full apply stages it (fail-closed): a failed copy leaves
+    # installed.sha on the old sha with the clone ahead of it, so the next lap takes the full
+    # apply and restart.
+    staged=""
+    case $'\n'"$changed_paths"$'\n' in
+        *$'\n'deploy/tt-device-autoupdate.sh$'\n'*)
+            install -m 0755 "$clone/deploy/tt-device-autoupdate.sh" "$ROOT/autoupdate.sh" \
+                || { echo "autoupdate: staging autoupdate.sh failed (required); not marking current" >&2; exit 1; }
+            staged="; staged the new autoupdate.sh for the next lap" ;;
+    esac
     printf '%s\n' "$remote_sha" > "$STATE"
     # I23: the deferral clock belongs to an update not yet applied; a later one starts its own.
     rm -f "$RECOVERY_PENDING" 2>/dev/null || true
     rm -f "$ROOT/pending-head" 2>/dev/null || true   # I21 coalescing: so does the bound
-    echo "autoupdate: ${installed_sha:0:9} -> ${remote_sha:0:9} changes only ${NO_RESTART_PATHS}; tree and installed.sha moved, broker not restarted" >&2
+    echo "autoupdate: ${installed_sha:0:9} -> ${remote_sha:0:9} changes only ${NO_RESTART_PATHS}; tree and installed.sha moved, broker not restarted${staged}" >&2
     EVENTS="${TT_DEVICE_MCP_HEALTH_DIR:-/var/lib/tt-device-broker/health}/health_events.jsonl"
     now="$(date +%s.%N)"
     paths_json="$(printf '%s\n' "$changed_paths" | sed -e '/^$/d' -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/.*/"&"/' | paste -sd, -)"
@@ -709,7 +722,7 @@ if [ -z "$why_restart" ]; then
         "$now" "$(date -u -d "@${now%.*}" +%Y-%m-%dT%H:%M:%SZ)" "$installed_sha" "$remote_sha" "$idle" "$drained_s" "$paths_json" \
         >> "$EVENTS" 2>/dev/null \
         || echo "autoupdate: warning: could not append autoupdate_applied_no_restart to $EVENTS" >&2
-    au_log applied "no restart: changes only ${NO_RESTART_PATHS}"
+    au_log applied "no restart: changes only ${NO_RESTART_PATHS}${staged}"
     exit 0
 fi
 echo "autoupdate: restart needed: $why_restart" >&2
