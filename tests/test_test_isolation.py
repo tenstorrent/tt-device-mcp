@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from tests.conftest import _reset_server_state
 from tt_device_mcp import device_holders as dh
 from tt_device_mcp import server as srv
@@ -117,19 +119,26 @@ def test_a_real_device_holder_on_the_host_is_not_a_holder_in_a_test(monkeypatch)
     assert srv._tenant_holder_reason() == ""
 
 
+# A whole pytest process: on a loaded host it can outlast the suite's 120 s per-test bound, which
+# would cut it off with no word from the child. Its own bound fires first and shows the child's output.
+@pytest.mark.timeout(300)
 def test_the_leaking_pairs_pass_with_the_leaking_test_first():
     """The order that failed before the reset covered these globals: each pair's first test runs first,
     in one process, and both pass."""
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [str(REPO / "src"), os.environ.get("PYTHONPATH")])))
-    run = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", "-p", "no:xdist", "-p", "no:cacheprovider"]
-        + ["--no-device-tests", "-rA", *LEAKING_PAIRS],
-        cwd=REPO,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=240,
-    )
+    try:
+        run = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", "-p", "no:xdist", "-p", "no:cacheprovider"]
+            + ["--no-device-tests", "-rA", "--durations=5", *LEAKING_PAIRS],
+            cwd=REPO,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=240,
+        )
+    except subprocess.TimeoutExpired as e:
+        out, err = (x.decode(errors="replace") if isinstance(x, bytes) else x or "" for x in (e.stdout, e.stderr))
+        pytest.fail(f"the child pytest ran over 240 s; its output:\n{out[-3000:]}\n{err[-2000:]}")
     passed = [line.split(" ", 1)[1] for line in run.stdout.splitlines() if line.startswith("PASSED ")]
     assert run.returncode == 0 and passed == LEAKING_PAIRS, run.stdout[-3000:]
 
