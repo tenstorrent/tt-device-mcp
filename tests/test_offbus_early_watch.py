@@ -259,7 +259,9 @@ async def test_a_blip_shorter_than_the_confirm_bound_is_not_confirmed(watch, mon
     bad = {"0": LIVE, "13": DEAD, "31": LIVE}
     healthy = {"0": LIVE, "13": LIVE, "31": LIVE}
 
-    for sample in (bad, bad, healthy, {}, {}, healthy):
+    for n, sample in enumerate((bad, bad, healthy, {}, {}, healthy)):
+        # The answering chips' heartbeats tick between samples, as a live ARC's does (~10 Hz).
+        sample = {i: [v[0] + n, *v[1:]] if v is LIVE else v for i, v in sample.items()}
         await s.check_for_dead_chips(sample)
         clock.t += telemetry.FAST_SAMPLE_SEC
 

@@ -88,9 +88,10 @@ def _reads_of(sysfs, idx):
 # --- the gate on a lost chip ---------------------------------------------------------------------
 
 
-def test_a_lost_chip_is_not_read_again_within_the_reprobe_window(sysfs, clock):
-    """Once lost, read_heartbeats and chip_sample report the chip all-ones without a read, until its
-    backstop re-read is due; then exactly one read, and the window starts again."""
+def test_a_lost_chip_is_never_read_on_the_poll_clock(sysfs, clock):
+    """Once lost, read_heartbeats and chip_sample report the chip all-ones without a read, however long
+    the poll clock runs (no periodic backstop: the chip is still attached). A decision read reads it
+    once; the pollers stay off it afterwards."""
     sysfs["node"](2, ALL_ONES)
     chip_state.mark_lost(["2"], "test", {"2": sysfs["dir"] / "tenstorrent!2"})
     sysfs["reads"].clear()
@@ -98,18 +99,19 @@ def test_a_lost_chip_is_not_read_again_within_the_reprobe_window(sysfs, clock):
     for _ in range(3):
         assert heartbeat.read_heartbeats()["2"] == ALL_ONES
         assert pci.chip_sample()["2"][:4] == [ALL_ONES, None, None, None]
-        clock.now += chip_state.LOST_REPROBE_SEC / 4
+        clock.now += 3600.0
     assert _reads_of(sysfs, 2) == [], "read a lost chip on the poll clock"
     assert _reads_of(sysfs, 1), "the healthy chips are still read"
     snap = pci.chip_snapshot()
     assert snap["2"].get("lost") is True
     assert _reads_of(sysfs, 2) == [], "the incident snapshot read a lost chip"
 
-    clock.now += chip_state.LOST_REPROBE_SEC
+    chip_state.reprobe_due(["2"])
     assert pci.chip_sample()["2"][0] == ALL_ONES
-    assert _reads_of(sysfs, 2) == ["tt_heartbeat"], "the due re-read is the heartbeat alone, once"
+    assert _reads_of(sysfs, 2) == ["tt_heartbeat"], "the decision re-read is the heartbeat alone, once"
+    clock.now += 3600.0
     assert heartbeat.read_heartbeats()["2"] == ALL_ONES
-    assert _reads_of(sysfs, 2) == ["tt_heartbeat"], "the next re-read waits a full window again"
+    assert _reads_of(sysfs, 2) == ["tt_heartbeat"], "the poll clock resumed reading it"
     assert chip_state.is_lost("2")
 
 
@@ -131,10 +133,10 @@ def test_a_re_created_node_is_read_at_once_and_a_valid_read_clears_lost(sysfs, c
     assert any(k == "chip_lost_cleared" and f["chip"] == "3" and f["why"] == "sysfs node re-created" for k, f in events)
     assert json.loads(chip_state.state_path().read_text())["lost"] == []
 
-    # Same node, the backstop re-read finds it answering: that clears it too.
+    # Same node, a decision re-read finds it answering: that clears it too.
     chip_state.mark_lost(["1"], "test", {"1": sysfs["dir"] / "tenstorrent!1"})
-    clock.now += chip_state.LOST_REPROBE_SEC
-    assert heartbeat.read_heartbeats()["1"] == 100
+    clock.now += chip_state.PROBE_MIN_SEC
+    assert heartbeat.read_heartbeats(probe_lost=True)["1"] == 100
     assert not chip_state.is_lost("1")
     assert any(k == "chip_lost_cleared" and f["why"] == "answering again" for k, f in events)
 
@@ -453,7 +455,7 @@ def test_a_check_reads_a_still_lost_chip_once_and_judges_it_on_that_read(sysfs, 
     assert verdict is Verdict.UNHEALTHY and ev["dead"] == ["2"], detail
     assert _reads_of(sysfs, 2) == ["tt_heartbeat"], "one real read per check"
     assert chip_state.is_lost("2")
-    clock.now += chip_state.LOST_REPROBE_SEC / 2
+    clock.now += 3600.0
     heartbeat.read_heartbeats()
     assert _reads_of(sysfs, 2) == ["tt_heartbeat"], "the check restarted the reprobe clock"
 

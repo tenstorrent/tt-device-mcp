@@ -96,6 +96,12 @@ def device_verdict(health: Optional[dict]) -> Optional[str]:
         return f"broker FSM is {health.get('fsm_state')!r} ({health.get('fsm_why') or '?'})"
     if health.get("device_degraded"):
         return f"broker recovery in flight ({health.get('device_degraded')})"
+    # Spec 03 I66: a poller restarted now would map a chip lost and still attached (an older driver
+    # keeps a removed chip's mapping too), or read chips a reset step owns.
+    if health.get("lost_chips"):
+        return f"broker reports chip(s) {','.join(map(str, health['lost_chips']))} lost"
+    if health.get("recovering") or health.get("reset_in_flight"):
+        return "broker reset step in flight"
     return None
 
 

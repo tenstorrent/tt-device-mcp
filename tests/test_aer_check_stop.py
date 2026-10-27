@@ -70,12 +70,16 @@ def rig(monkeypatch):
     monkeypatch.setattr(evidence, "_append_durable", lambda path, rec, mx: log.append(("io", rec["kind"])))
     patch_health_event(monkeypatch, lambda kind, **f: log.append(("event", kind)))
     reads = []
+    # The watch reads on every tick (spec 03 I96); a tick with nothing fed re-reads the last counters.
+    last = [_sig(0)]
 
     def feed(*sigs):
         reads.extend(sigs)
 
     def link_signals():
-        return reads.pop(0)
+        if reads:
+            last[0] = reads.pop(0)
+        return last[0]
 
     monkeypatch.setattr(srv, "link_signals", link_signals)
     return w, clock, log, feed
@@ -276,15 +280,33 @@ def test_a_slow_rise_another_path_or_one_below_the_count_never_stops(rig):
     assert not log, log
 
 
-def test_no_reader_running_means_no_read(rig, monkeypatch):
-    w, _clock, log, _feed = rig
+def test_an_idle_watch_reads_only_kernel_memory_and_signals_nobody(rig, monkeypatch):
+    """Always on (03 I96): with no check reader running the watch still reads I79's counters and the
+    node list every tick, but nothing that reaches a chip: no config-space read unless
+    WATCH_CONFIG_CONFIRM, no DLLLA read unless WATCH_DLLLA. A burst with every chip answering stops
+    nobody (no broker reader runs, and a tenant is never touched for it)."""
+    w, clock, log, feed = rig
     monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", None)
-    monkeypatch.setattr(srv, "link_signals", lambda: pytest.fail("read with no check running"))
-    assert w.poll_once() is None and not log
+    config = []
+    w.config_vendor_id = lambda bdf: config.append(("vendor", bdf)) or 0x1E52
+    w.link_active = lambda bdf: config.append(("dllla", bdf)) or True
+    reads = []
+    real = srv.link_signals
+    monkeypatch.setattr(srv, "link_signals", lambda: reads.append(1) or real())
+    assert w.poll_once() is None and reads, "the watch reads whether or not a check runs"
+    assert _burst(w, clock, feed) is None
+    assert not log and not config, f"idle reads touch only AER counters and the node list: {log} {config}"
     done = _Reader(FABRIC)
     done.returncode = 0
     monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", done)
-    assert w.poll_once() is None and not log, "a finished reader is not signalled"
+    clock.t += 5
+    assert _burst(w, clock, feed, rise=30) is None and not log, "a finished reader is not signalled"
+    # Behind its constant, a trigger takes one config read of the burst chip, never of another.
+    monkeypatch.setattr(telemetry, "WATCH_CONFIG_CONFIRM", True)
+    clock.t += 5
+    assert _burst(w, clock, feed, rise=50) is None
+    assert config == [("vendor", PATHS["13"][0])], config
+    assert not log
 
 
 def test_a_journal_stalled_in_fsync_delays_neither_signal(monkeypatch):

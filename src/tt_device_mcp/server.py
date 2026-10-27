@@ -1248,6 +1248,11 @@ _recovery_deps = RecoveryDeps(
     freeze_device_readers=lambda reason: _freeze_device_readers(reason),
     broker_check_readers=lambda: _broker_device_readers(),
     stop_check_readers_on_aer=lambda reason, kill=True: _stop_check_readers_on_aer(reason, kill),
+    stop_device_users=lambda reason: _stop_device_users(reason),
+    signal_device_holders=lambda reason, stopped=(): _signal_device_holders(
+        reason, tuple(stopped), health_event_detached
+    ),
+    record_holders_killed=lambda reason, killed, survivors: _record_holders_killed(reason, killed, survivors),
     health_event_detached=lambda kind, **f: health_event_detached(kind, **f),
     health_event_flushed=lambda kind, timeout, **f: health_event_flushed(kind, timeout, **f),
     wait_device_released=lambda pids: wait_device_released(pids, HOLDER_RELEASE_WAIT_SEC),
@@ -6395,24 +6400,65 @@ def _stop_check_readers_on_aer(reason: str, kill: bool = True) -> list:
     return [{"pid": proc.pid, "user": who} for proc, who in stopped]
 
 
-async def _kill_device_holders(reason: str) -> list:
-    """SIGKILL every process holding the device, because their mappings outlive the endpoint.
+def _stop_device_users(reason: str) -> list:
+    """Spec 03 I96: SIGSTOP every user of the device the dead-chip watch is about to cut off, before
+    its PCI remove: the running job's process groups (its leader's and every group its scope holds),
+    then every other process the holder scan finds with the device open (a telemetry server outside
+    the broker, a stray tool). A stop issues no further read and closes no fd, so the driver never
+    reaches the still-attached chip (I84), and a stopped reader never runs again: the SIGKILL after
+    the remove ends it without resuming it, and a remove that fails leaves it stopped for the power
+    cycle. That matters on a driver that leaves user BAR mappings in place on remove. From the watch
+    thread: no event loop, only /proc reads before the signals. Never the broker itself. Returns
+    ``[{"pgid": n} | {"pid": n, "user": u}]``, the stopped. Never raises."""
+    own = os.getpgrp()
+    groups = set()
+    proc, job_id = current_process, current_job_id
+    if proc is not None and getattr(proc, "returncode", None) is None:
+        try:
+            groups.add(os.getpgid(proc.pid))
+        except OSError:
+            pass
+        try:
+            members = job_processes(proc.pid, job_scope_unit(job_id) if job_id else None)
+        except Exception:  # noqa: BLE001 - the leader's group is still stopped
+            members = {}
+        groups |= {info.pgid for info in members.values() if info.pgid}
+    stopped: list = []
+    for pgid in sorted(groups - {own, 0, 1}):
+        try:
+            os.killpg(pgid, signal.SIGSTOP)
+            stopped.append({"pgid": pgid})
+        except (ProcessLookupError, OSError):
+            continue
+    try:
+        holders = enumerate_device_holders().holders
+    except Exception:  # noqa: BLE001 - the groups above are stopped; the kill rescans
+        holders = []
+    for h in holders:
+        if h.pid in (os.getpid(), 0, 1):
+            continue
+        try:
+            os.kill(h.pid, signal.SIGSTOP)
+            stopped.append({"pid": h.pid, "user": h.username})
+        except (ProcessLookupError, PermissionError, OSError):
+            continue
+    if stopped and logger:
+        logger.error(f"DEAD-CHIP stopped the device's users {stopped} before the remove — {reason}")
+    return stopped
 
-    This is the one place the broker kills a foreign user's process without asking, and the
-    reason is that the alternative is worse for that same user: a chip has left the bus, and
-    anything still touching it — through a mapping the kernel cannot revoke — will stall a CPU
-    core and reboot the machine, taking every tenant's work with it. Their job is already dead;
-    only the host is still saveable.
 
-    SIGKILL, not SIGTERM: a process wedged on a non-completing MMIO read is not going to run a
-    signal handler. Never raises.
-    """
+def _signal_device_holders(reason: str, stopped: tuple = (), journal: Optional[Callable[..., None]] = None) -> tuple:
+    """SIGKILL every process holding the device, the broker's own readers, the job and ``stopped``
+    (:func:`_stop_device_users`'s groups and pids, spec 03 I96). Blocking (/proc reads), no event loop: the watch thread calls it
+    directly, :func:`_kill_device_holders` from a worker thread. ``journal`` replaces the synchronous
+    append of a killed check's owed pass (the watch passes the detached writer). Returns
+    ``(killed, survivors)``. Never raises."""
     killed = []
     survivors = []
     try:
-        scan = await asyncio.to_thread(enumerate_device_holders)
+        scan = enumerate_device_holders()
     except Exception:  # noqa: BLE001 - never let the scan block the rescue
-        return killed
+        return killed, survivors
     for h in scan.holders:
         if h.pid == os.getpid():
             continue  # the broker never signals itself (spec 03 I84)
@@ -6452,7 +6498,7 @@ async def _kill_device_holders(reason: str) -> list:
             # pids named here (spec 04 I77). Read after the signal, so the kill waits on no /proc
             # walk; a member that already exited held nothing.
             try:
-                group = await asyncio.to_thread(job_processes, proc.pid)
+                group = job_processes(proc.pid)
             except Exception:  # noqa: BLE001 - an unreadable /proc leaves the leader named
                 group = {}
             named = {k["pid"] for k in killed}
@@ -6463,9 +6509,31 @@ async def _kill_device_holders(reason: str) -> list:
             # Its -9 is ours, not the fabric's: no verdict, a full pass owed (spec 03 I82). Marked
             # even when killpg raised (the group already gone): conservative on purpose, as a pass
             # that races a dead chip proves nothing either.
-            health_monitor.note_fabric_check_killed(reason)
+            health_monitor.note_fabric_check_killed(reason, journal)
         elif signalled:
-            _note_reader_killed(who, reason)  # the snapshot's or eth self-test's -9 is ours too (I86)
+            _note_reader_killed(who, reason, journal)  # the snapshot's or eth self-test's -9 is ours too (I86)
+    # What the watch stopped (spec 03 I96) and the scans above did not reach: a stopped member left
+    # alive would sit stopped until its job's timeout.
+    named = {k["pid"] for k in killed}
+    for s in stopped:
+        pid = s.get("pgid") or s.get("pid")
+        if not pid or pid in named or pid in (os.getpid(), os.getpgrp(), 0, 1):
+            continue
+        try:
+            if "pgid" in s:
+                os.killpg(pid, signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGKILL)
+            killed.append({"pid": pid, "user": s.get("user") or "[broker]job"})
+        except ProcessLookupError:
+            continue
+        except (PermissionError, OSError) as e:
+            survivors.append({"pid": pid, "user": s.get("user") or "[broker]job", "error": str(e)})
+    return killed, survivors
+
+
+def _record_holders_killed(reason: str, killed: list, survivors: list) -> None:
+    """The log, journal and job record of a dead-chip kill, on the event loop."""
     if logger:
         logger.error(
             f"DEAD-CHIP killed {len(killed)} device holder(s) — {reason}. Their "
@@ -6500,6 +6568,26 @@ async def _kill_device_holders(reason: str) -> list:
         # wedged the device (a boot loop) — restore + scope reconciliation drop it on the way back up.
         _mark_job_device_fault_failed(victim, f"device recovery kill: {reason}")
     _note_tenant_gate_verdict(f"device recovery: chip(s) left PCIe bus ({reason})")
+
+
+async def _kill_device_holders(reason: str) -> list:
+    """SIGKILL every process holding the device, because their mappings outlive the endpoint.
+
+    This is the one place the broker kills a foreign user's process without asking, and the
+    reason is that the alternative is worse for that same user: a chip has left the bus, and
+    anything still touching it — through a mapping the kernel cannot revoke — will stall a CPU
+    core and reboot the machine, taking every tenant's work with it. Their job is already dead;
+    only the host is still saveable.
+
+    SIGKILL, not SIGTERM: a process wedged on a non-completing MMIO read is not going to run a
+    signal handler. The signals go from a worker thread (:func:`_signal_device_holders`, which the
+    dead-chip watch thread also calls). Never raises.
+    """
+    try:
+        killed, survivors = await asyncio.to_thread(_signal_device_holders, reason)
+    except Exception:  # noqa: BLE001 - never let the scan block the rescue
+        return []
+    _record_holders_killed(reason, killed, survivors)
     return killed
 
 

@@ -330,6 +330,15 @@ class RecoveryDeps:
     # leaves them stopped for the dead-chip valve (I94). None: no watch.
     broker_check_readers: Optional[Callable[[], list]] = None
     stop_check_readers_on_aer: Optional[Callable[..., list]] = None
+    # Spec 03 I96: the dead-chip watch thread's containment. ``stop_device_users`` SIGSTOPs the
+    # running job's process groups (its leader's and its scope's) and every other device holder, and
+    # returns them; ``signal_device_holders(reason, stopped)`` SIGKILLs every device holder, the
+    # broker's readers, the job and ``stopped``, with no event loop, and returns ``(killed, survivors)``;
+    # ``record_holders_killed(reason, killed, survivors)`` is the journal and job bookkeeping of that
+    # kill, run on the loop. None: the watch only stops the broker's readers (I92).
+    stop_device_users: Optional[Callable[[str], list]] = None
+    signal_device_holders: Optional[Callable[..., tuple]] = None
+    record_holders_killed: Optional[Callable[[str, list, list], None]] = None
     # A journal append the journal's own writer thread fsyncs, so the caller never waits on it.
     health_event_detached: Optional[Callable[..., None]] = None
     # Spec 03 I95: queue one record for the journal's writer and wait, bounded, for its fsync.

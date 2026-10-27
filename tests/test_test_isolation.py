@@ -33,6 +33,9 @@ LEAKING_PAIRS = [
     # chip_state's configured present/expected chip sources.
     "tests/test_chip_state.py::test_the_published_state_is_atomic_and_names_every_expected_chip",
     "tests/test_chip_state.py::test_a_re_created_node_is_read_at_once_and_a_valid_read_clears_lost",
+    # The I76 bound's ladder-skip reason: a refused kill's skip named the next test's PCI-wedged request.
+    "tests/test_deadchip_refused_bound.py::test_a_refused_holder_gets_the_power_cycle_at_the_bound[tenant]",
+    "tests/test_pci_wedged_latch.py::test_the_wedged_power_cycle_request_names_the_wedge_not_a_failed_ladder",
 ]
 
 # Every global the reset owns, with the value a fresh broker process starts with.
@@ -93,6 +96,16 @@ def test_the_per_test_reset_clears_every_hold_bound_and_escalation_global(monkey
     assert m._class_a_ladder_anchor is None
     chip_state.reset()
     assert (chip_state._present, chip_state._expected) == (chip_state._sysfs_indices, chip_state._no_baseline)
+
+
+def test_the_autouse_reset_covers_every_hold_bound_record(monkeypatch):
+    """The bound's per-episode records that _reset_for_testing does not own are reset by the autouse
+    fixture's monkeypatch. _hold_bound_sync keeps them while the episode stamp stays the same, and tests
+    share one (none, or a fixed one), so one it misses reaches the next test on the same worker."""
+    reset = {name for obj, name, _old in monkeypatch._setattr if obj is srv} | set(FRESH)
+    records = {n for n in vars(srv) if n.startswith("_hold_bound_") and not callable(getattr(srv, n))}
+    records |= {"_pci_wedged_asked", "_kill_refused_pids", "_kill_refused_job_pid", "_kill_refused_since"}
+    assert records - reset == set()
 
 
 class _HostHoldsTheRealDevice:

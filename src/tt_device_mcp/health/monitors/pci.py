@@ -317,6 +317,39 @@ def link_signals() -> dict:
     return {"chips": chips, "aer": aer, "paths": paths}
 
 
+def config_vendor_id(bdf: str) -> Optional[int]:
+    """The vendor ID in ``bdf``'s config space, one 2-byte config read (spec 03 I96), or None when
+    unreadable. 0xFFFF is the all-ones a function off the bus answers. Unlike :func:`link_signals`
+    this read reaches the device, so only the dead-chip watch takes it, once per trigger, and only
+    behind its own constant."""
+    try:
+        with open(f"/sys/bus/pci/devices/{bdf}/config", "rb", buffering=0) as f:
+            raw = f.read(2)
+    except OSError:
+        return None
+    return int.from_bytes(raw, "little") if len(raw) == 2 else None
+
+
+def link_active(bdf: str) -> Optional[bool]:
+    """Data Link Layer Link Active (PCIe Link Status bit 13) of the port ``bdf``, or None when it
+    cannot be read (spec 03 I96). Meant for a chip's root port, never the chip: config reads of the
+    port's own capability list."""
+    try:
+        with open(f"/sys/bus/pci/devices/{bdf}/config", "rb", buffering=0) as f:
+            cfg = f.read(256)
+    except OSError:
+        return None
+    if len(cfg) < 64 or not cfg[0x06] & 0x10:  # no capability list
+        return None
+    pos, seen = cfg[0x34] & 0xFC, set()
+    while pos and pos + 0x14 <= len(cfg) and pos not in seen:
+        seen.add(pos)
+        if cfg[pos] == 0x10:  # PCI Express capability
+            return bool(int.from_bytes(cfg[pos + 0x12 : pos + 0x14], "little") & 0x2000)
+        pos = cfg[pos + 1] & 0xFC
+    return None
+
+
 def chip_pci_bdf(idx: str) -> Optional[str]:
     """The PCI address behind a chip index, e.g. '0000:46:00.0'."""
     try:

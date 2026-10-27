@@ -192,6 +192,13 @@ class AiclkCeiling:
         mhz = ceiling_mhz()
         if mhz is None or self.disarmed:
             return None, "not armed", {}
+        from tt_device_mcp.health import chip_state
+
+        # Spec 03 I66: the helper opens every chip; a chip lost and still attached keeps it from
+        # running (outside this broker's own reset step). Not verified, so ``owed`` stays set.
+        lost = chip_state.unreadable_lost()
+        if lost:
+            return False, f"not run: chip(s) {','.join(lost)} lost and still attached", {"lost_chips": lost}
         argv = build_argv(mhz)
         env = {**os.environ, ENV_MHZ: str(mhz)}
         t0 = _now()

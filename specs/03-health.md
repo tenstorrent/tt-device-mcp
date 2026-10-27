@@ -961,16 +961,29 @@ cooldown (spec 04 I65) holds longer.
   the sampler reads it all-ones on two consecutive samples (marked before it is isolated); a gated
   read of a lost chip returns all-ones without touching it, what its last real read said, so every
   count and rung decides as before. A lost chip is read again only when (a) its sysfs node was
-  re-created (rescan, external tray re-power, hotplug), (b) in the 120 s grace after a broker reset or
-  recovery step ends, at most once a second, so the post-reset verify reads the chip for real, or
-  (c) as a backstop once per `TT_DEVICE_MCP_LOST_REPROBE_SEC` (default 30 s, floor 5), or (d) by a
-  decision read, which is not a poll: the gate's heartbeat verdict (between-jobs gate, dispatch
+  re-created (rescan, external tray re-power, hotplug; a node the mark found none for counts once it
+  appears), (b) in the 120 s grace after a broker reset or recovery step ends, at most once a second,
+  so the post-reset verify reads the chip for real, or (c) by a decision read, which is not a poll: the gate's heartbeat verdict (between-jobs gate, dispatch
   recheck, idle relift, post-reset verify), the per-host reset gate's off-bus count, the gate's rung
   counts and reboot decision, the DOWN off-bus recheck, the hold-deadline escalation, the recovery
   ladder's reads, and the tenant verdict of job admission, `tt_device_exec` and a Slurm step. A
   decision read reads a lost chip whose last real read is at least 1 s old, so no hold, rung or
-  refusal rests on a value nobody read, and back-to-back decisions read a dead chip once. Status and
-  `/health` stay gated. A read that is not all-ones clears *lost*. While a reset step owns the chips (`reset_in_flight`, or a reset
+  refusal rests on a value nobody read, and back-to-back decisions read a dead chip once. No poll
+  clock makes a lost chip due: the sampler, status and `/health` never read it, however long it
+  stays attached. A read that is not all-ones clears *lost*. A chip whose PCI remove failed, timed
+  out or was skipped (PCI-wedged, I84) is *sealed* (`chip_lost_sealed`): it is still attached, so no
+  decision read reaches it either, only (a) and (b), and the hold it leaves heals it. A removed chip
+  is not sealed. Readers that map every chip do not run while a chip is lost and still attached
+  (outside this broker's own reset step): the eth heartbeat body is `skipped`, never a pass (the
+  heartbeat check already fails on that chip); the aiclk ceiling helper is `not run` and stays owed;
+  the health probe's device and idle verdicts stand back, as they do while a reset step owns the
+  chips. A present chip that hangs (its heartbeat frozen, config space still answering) gets no PCI
+  remove: tt-kmd's remove runs its MMIO cleanup on any chip whose vendor ID reads, the access a hung
+  endpoint never completes. Its heartbeat frozen on two samples in a row holds the device instead
+  (`chip_hung_held`, `removed: false`, hold why `heartbeat`), once per episode; the hold's ladder
+  heals it, and only a full check with fabric on every cabled link lifts it (I78). A whole-mesh
+  stall (the re-init blip), a reset step or a reset scope still cycling the chips does not count.
+  The sampler still reads a hung chip's heartbeat: that read is the detector. While a reset step owns the chips (`reset_in_flight`, or a reset
   scope still cycling them after the broker stopped waiting) every chip is *recovering*: the
   sampler skips its sample, `/health` serves the last live picture and reads nothing, and only the
   step's own reads run, ungated. The I83 cut is one of those step reads: after a mesh reset whose
@@ -1783,10 +1796,11 @@ cooldown (spec 04 I65) holds longer.
   (`TelemetrySampler.aer_stop_offbus`; the ring only, no device or config-space read). A sample
   older than `FAST_WINDOW_SEC` (30 s) picks none, and so does all-ones on every chip, the blackout
   that keeps its direct power cycle (I19, I65). With a pick, the readers' groups get SIGSTOP and
-  no SIGKILL, and the watch hands `TelemetrySampler.contain_after_aer_stop` to the sampler's event
-  loop, where the PCI remove runs: it marks the chips lost (no poll reads them again), journals
-  `check_aer_contain`, and runs I84's valve on them (freeze, PCI remove, then the kill, hold). The
-  containment and the sampler's own valve runs share that loop and may overlap: each run adds its
+  no SIGKILL, and the watch thread contains the chips itself, with no event loop
+  (`TelemetrySampler.contain_on_thread`, I96): it stops every other user of the device, marks the
+  chips lost (no poll reads them again), PCI-removes them through the one PCI writer, then runs
+  I84's kill and hands the hold to the loop, and journals `chip_contained`. The
+  containment and the sampler's own valve runs may overlap: each run adds its
   all-ones chips to `TelemetrySampler.valve_runs` and takes away only its own entry, so no run
   clears or replaces another's. A run decides its kill after its remove, on every chip that a run in
   flight or the latest sample read all-ones and that the valve has not removed: one another run is
@@ -1798,9 +1812,10 @@ cooldown (spec 04 I65) holds longer.
   keeps the hold, journals why and leaves the device to the bounded recovery: a reset in flight or
   its scope active since the stop (`check_aer_contain_refused`, `reset_in_flight`; the reset's own
   fence owns the chips); the PCI-wedged latch (I83, `chip_isolation_skipped`); a remove that failed
-  or timed out, or holders that would not die (I84, `chip_dead_kill_refused`); and no running loop
-  to take it (the stop row's `contained` is empty, the readers stay stopped and the sampler's own
-  valve decides). None of them, and no contained chip, lifts a hold or releases the device: the
+  or timed out (the PCI-wedged latch, which asks for the power cycle, I96), or holders that would
+  not die (I84, `chip_dead_kill_refused`). A stopped event loop refuses nothing: the remove runs on
+  the watch thread and the hold reaches the loop when it runs again, while admission, which runs on
+  that loop, admits nobody. None of them, and no contained chip, lifts a hold or releases the device: the
   stopped run is no verdict (I82, `FABRIC_DEBT` owed), the hold runs the full ladder at 10 min and
   then the power cycle (spec 04 I76), and only a just-passed full check with fabric on all cabled
   links lifts it (I78). No reset is chosen here, and I92's burst threshold is unchanged.
@@ -1813,6 +1828,44 @@ cooldown (spec 04 I65) holds longer.
   the row on disk only once its fsync returned: past the bound the row stays queued, and a write or
   fsync that failed (the writer never raises) is not a flush; either way the watch logs that the
   stop record is not on disk, and nothing else changes (signals, `FABRIC_DEBT` owed, the hold).
+- **I96 — An always-on watch contains a dead chip on its own thread before anything reads it
+  again.** A chip that drops off PCIe or stops answering must never become a host machine check
+  through a later read of it. `telemetry.CheckAerWatch` runs on its own thread every
+  `LINK_WATCH_SEC`, whatever runs (idle, a tenant's job, the broker's own check), never on the event
+  loop, and reads kernel memory only (`link_signals()`: the AER counters on every chip's path and
+  the KMD node list; no device open). A trigger is a KMD node that vanished outside any reset (a
+  chip the broker removed or marked lost is not one), or an AER burst (I92's threshold) on the path
+  of a chip the sampler's latest sample read all-ones (I94's ring rule). Two config-space confirms,
+  the chip's vendor ID reading `0xFFFF` and its root port's DLLLA reading 0, sit behind
+  `WATCH_CONFIG_CONFIRM` and `WATCH_DLLLA`, off until a device run shows them safe on a dying link.
+  The dead chips are contained right there (`TelemetrySampler.contain_on_thread`), in this order:
+  SIGSTOP the broker's check readers, the running job's process groups and every other holder of
+  the device; mark the chips lost (no poll reads them again); PCI-remove each through the one PCI
+  writer, all of them within `DETACH_TIMEOUT_SEC` (15 s; a vanished chip is already gone); then
+  I84's kill, only once every chip any run or the latest sample read all-ones is detached; the hold,
+  the pollers and the incident go to the event loop. A remove that fails or times out latches
+  PCI-wedged (I83), which asks for the power cycle (spec 04 I76), and kills nobody: the stopped
+  holders stay stopped, so no fd closes and no driver close path reaches the chip while it is
+  attached. A reset or recovery step that owns the chips (I66) refuses the containment
+  (`check_aer_contain_refused`, `reset_in_flight`) and keeps the hold, and for
+  `POST_STEP_AER_QUIET_SEC` after a step a read only moves the baselines. Every chip dead is the
+  blackout of classes A and C (spec 04 I37): the watch journals `chip_watch_trigger` and leaves it
+  to the sampler and the gate, which take it to the direct power cycle. A burst with no dead chip
+  touches no tenant: during the broker's own check it stops only the check readers (I92); idle or
+  under a job it does nothing more than I79's fast cadence. Budget, from the trigger read: every
+  user SIGSTOPped within `WATCH_STOP_BUDGET_SEC` (1 s); the remove done within
+  `WATCH_REMOVE_BUDGET_SEC` (5 s) typically and `DETACH_TIMEOUT_SEC` after the stop at most. The
+  `chip_contained` record (`chips`, `trigger`, `vanished`, `trigger_ts`, `sigstop_ts`, `remove_ts`,
+  `trigger_to_sigstop_s`, `trigger_to_remove_s`, `trigger_to_kill_s`, `removed`, `removed_chips`,
+  `stuck`, `readers_stopped`, `users_stopped`, `killed`, `kill_refused`, `pci_wedged`, `pci`) is
+  fsynced before the containment returns, bounded as in I95; the times are on one monotonic clock
+  stamped at the trigger read. No containment lifts a hold or releases the device: the contained
+  chip stays held (spec 04 class B0), the hold runs the full ladder at 10 min and then the power
+  cycle (spec 04 I76), and only a just-passed full check with fabric on all cabled links lifts it
+  (I78). Known gaps: the latest sample can be up to one cadence old, so a burst on a chip not yet
+  read all-ones stops only the check readers; in-kernel tt-kmd reads already in flight cannot be
+  stopped; and a remove that beats the first machine check is a budget taken from the storms seen,
+  not yet shown on a device.
 
 ## Interfaces
 
@@ -2467,7 +2520,7 @@ refuses.
 | I63 (no host rung, no further rung, no release over a shutdown-killed post-reset verify) | `tests/test_check_interrupted_by_shutdown.py::test_post_reset_verify_killed_by_shutdown_requests_no_host_rung_and_releases_nothing` |
 | I63 (a timeout kill and a signal outside a shutdown fail as before) | `tests/test_check_interrupted_by_shutdown.py::test_a_timeout_kill_keeps_the_old_failure_even_during_shutdown`, `tests/test_check_interrupted_by_shutdown.py::test_a_signal_outside_shutdown_keeps_the_old_failure`, `tests/test_check_interrupted_by_shutdown.py::test_fabric_signal_and_timeout_outside_shutdown_still_fail`, `tests/test_check_interrupted_by_shutdown.py::test_a_clean_or_failing_exit_never_asks` |
 | I63 (shutdown detection: systemd state, shutdown target jobs, own unit deactivating, the broker's stop signal) | `tests/test_check_interrupted_by_shutdown.py::test_shutdown_in_progress_reads_systemd`, `tests/test_check_interrupted_by_shutdown.py::test_the_broker_stop_signal_counts_without_systemd` |
-| I66 (a lost chip is not re-read within the reprobe window; a re-created node is read at once; a valid read clears lost) | `tests/test_chip_state.py::test_a_lost_chip_is_not_read_again_within_the_reprobe_window`, `tests/test_chip_state.py::test_a_re_created_node_is_read_at_once_and_a_valid_read_clears_lost`, `tests/test_chip_state.py::test_a_single_blip_is_not_marked_lost_but_two_samples_are` |
+| I66 (a lost chip is never read on the poll clock; a re-created node is read at once; a valid read clears lost) | `tests/test_chip_state.py::test_a_lost_chip_is_never_read_on_the_poll_clock`, `tests/test_chip_state.py::test_a_re_created_node_is_read_at_once_and_a_valid_read_clears_lost`, `tests/test_chip_state.py::test_a_single_blip_is_not_marked_lost_but_two_samples_are` |
 | I66 (no poller read while a reset step owns the chips; /health reads nothing then) | `tests/test_chip_state.py::test_the_sampler_reads_no_chip_while_a_reset_owns_them`, `tests/test_chip_state.py::test_health_reports_per_chip_state_and_reads_nothing_while_recovering` |
 | I66 (pollers stop on the first hung sample, not on a mesh blip or reset; not restored after a failed reset, owed to the next HEALTHY) | `tests/test_chip_state.py::test_the_first_hung_sample_stops_the_pollers`, `tests/test_deadchip_detach_before_kill.py::test_the_first_all_ones_sample_leaves_the_poller_stop_to_the_detach`, `tests/test_deadchip_detach_before_kill.py::test_a_stalled_chip_beside_an_all_ones_chip_does_not_stop_the_pollers`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_or_timed_out_detach_stops_the_pollers_once_and_kills_nobody`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_remove_beside_an_untried_chip_stops_the_pollers_on_the_next_sample`, `tests/test_deadchip_detach_before_kill.py::test_a_failed_remove_under_a_live_reset_leaves_the_poller_stop_to_the_reset`, `tests/test_chip_state.py::test_a_whole_mesh_blip_or_a_reset_does_not_stop_the_pollers`, `tests/test_chip_state.py::test_a_failed_reset_leaves_the_pollers_stopped`, `tests/test_device_safety.py::test_a_step_that_did_not_complete_owes_the_pollers_even_on_a_healthy_fsm` |
 | I66 (post-reset grace reads lost chips for real; the full check, fabric included, still runs) | `tests/test_chip_state.py::test_the_post_reset_grace_reads_lost_chips_for_real`, `tests/test_chip_state.py::test_the_post_reset_health_check_runs_fabric_on_chips_marked_lost` |
@@ -2475,6 +2528,9 @@ refuses.
 | I66 (every decision read reads a lost chip for real, a dead one at most once a second; polls stay gated) | `tests/test_chip_state.py::test_a_decision_read_judges_a_lost_chip_on_a_real_read_and_reads_a_dead_one_once`, `tests/test_chip_state.py::test_the_recovery_ladder_reads_lost_chips_for_real`, `tests/test_chip_state.py::test_admission_and_exec_probe_a_lost_chip_status_does_not`, `tests/test_chip_state.py::test_the_down_offbus_recheck_does_not_hold_on_a_lost_chip_that_is_back`, `tests/test_chip_state.py::test_the_hold_deadline_escalation_does_not_count_a_lost_chip_that_is_back`, `tests/test_chip_state.py::test_each_tenant_decision_takes_the_probing_verdict` |
 | I66 (stale state: a reset step or sweep that raises or is cancelled clears recovering and opens the grace; a fresh broker publishes clean state at boot) | `tests/test_chip_state.py::test_a_reset_step_that_raises_or_is_cancelled_clears_recovering`, `::test_the_galaxy_reset_sweep_clears_recovering_on_every_exit`, `::test_a_fresh_broker_publishes_clean_state_over_a_stale_file` |
 | I66 (published state: atomic, every expected chip, path follows the device-op lock) | `tests/test_chip_state.py::test_the_published_state_is_atomic_and_names_every_expected_chip`, `tests/test_chip_state.py::test_the_default_path_follows_the_device_op_lock` |
+| I66 (zero sysfs reads of a lost, still-attached chip by each reader: the sampler over an hour, `/health`, the probe, the eth body, the aiclk ceiling; no poll clock makes it due, a decision read reads it once) | `tests/test_reader_audit.py::test_the_sampler_reads_a_lost_attached_chip_zero_times_in_an_hour`, `tests/test_reader_audit.py::test_health_reads_no_lost_chip_and_the_probe_stands_back_on_it`, `tests/test_reader_audit.py::test_the_eth_reader_is_not_built_while_a_lost_chip_is_attached`, `tests/test_reader_audit.py::test_the_aiclk_ceiling_helper_does_not_run_on_a_lost_attached_chip`, `tests/test_reader_audit.py::test_no_clock_makes_a_lost_chip_due_only_a_decision_read_does_once` |
+| I66 (a failed, timed-out or skipped remove seals the chip; a sealed chip is read only in the grace or on a new node; a removed chip is not sealed) | `tests/test_reader_audit.py::test_a_remove_that_failed_timed_out_or_was_skipped_seals_the_chip`, `tests/test_reader_audit.py::test_a_sealed_chip_is_read_by_no_decision_only_by_the_grace_or_a_new_node`, `tests/test_reader_audit.py::test_a_node_the_mark_found_none_for_is_read_once_it_appears`, `tests/test_reader_audit.py::test_a_removed_chip_is_not_sealed` |
+| I66 (a hung present chip is held once and never removed; no hold under a reset or a whole-mesh stall; the hold lifts only on a full check with every cabled link) | `tests/test_reader_audit.py::test_a_hung_present_chip_is_held_once_and_never_removed`, `tests/test_reader_audit.py::test_no_hung_chip_hold_under_a_reset_or_a_whole_mesh_stall`, `tests/test_reader_audit.py::test_a_hung_chip_hold_lifts_only_on_a_full_check_with_every_cabled_link` |
 | I65 (a release wakes a held job at once; a wake while still held never dispatches; wakes cannot spin the gate) | `tests/test_tenant_hold_wake.py::test_startup_release_dispatches_a_held_job_within_a_second`, `tests/test_tenant_hold_wake.py::test_a_wake_while_still_held_does_not_dispatch`, `tests/test_tenant_hold_wake.py::test_a_release_from_another_thread_wakes_the_hold` |
 | I55/I61 (a rung fired from a clean exit opens the hold episode first; a failed post-reset check never releases) | `tests/test_dispatch_failure_reset.py::test_a_clean_exit_dispatch_failure_whose_reset_fails_stays_held`, `tests/test_eth_timeout_reset.py::test_the_door_is_shut_while_the_reset_is_unproven` |
 | I61 (a timed-out eth read on a present mesh: no pre-reset fabric pass, one reset, incident first) | `tests/test_eth_timeout_reset.py::test_a_timed_out_eth_read_resets_once_with_no_pre_reset_fabric_pass`, `tests/test_eth_timeout_reset.py::test_the_incident_is_captured_with_the_eth_reason_before_the_reset`, `tests/test_eth_timeout_reset.py::test_the_probe_pass_skips_the_fabric_pass_only_when_asked` |
@@ -2539,9 +2595,10 @@ refuses.
 | I87 | `tests/test_loop_stall.py::test_health_answers_within_a_second_while_the_chip_read_hangs`, `tests/test_loop_stall.py::test_the_first_read_waits_in_its_thread_not_on_the_loop`, `tests/test_loop_stall.py::test_concurrent_status_calls_share_one_read`, `tests/test_loop_stall.py::test_no_status_read_while_a_reset_step_owns_the_chips`, `tests/test_loop_stall.py::test_the_status_routes_build_their_payload_off_the_loop_read`, `tests/test_loop_stall.py::test_a_blocked_loop_is_logged_with_the_call_that_blocks_it`, `tests/test_loop_stall.py::test_a_free_loop_logs_nothing` |
 | I88 | `tests/test_health_tenant_job_degraded.py::test_a_running_jobs_own_off_bus_reading_is_not_a_hold`, `tests/test_health_tenant_job_degraded.py::test_a_chip_still_off_when_the_job_ends_opens_the_hold_and_only_a_full_check_lifts_it`, `tests/test_health_tenant_job_degraded.py::test_an_open_hold_episode_still_reads_held_while_a_job_runs`, `tests/test_health_tenant_job_degraded.py::test_an_in_memory_verdict_under_a_running_job_still_reads_held` |
 | I91 | `tests/test_pcie_aer_telemetry.py::test_snapshot_reads_both_ends_and_names_bdf_root_port_and_tray`, `tests/test_pcie_aer_telemetry.py::test_delta_lists_only_chips_with_errors_or_a_link_change`, `tests/test_pcie_aer_telemetry.py::test_delta_names_a_chip_that_left_the_bus_and_reads_nothing_of_it`, `tests/test_pcie_aer_telemetry.py::test_a_lost_chip_s_own_link_is_never_read`, `tests/test_pcie_aer_telemetry.py::test_a_chip_the_sampler_read_all_ones_is_not_read`, `tests/test_pcie_aer_telemetry.py::test_the_broker_s_snapshot_never_reads_the_link_of_a_chip_the_sampler_read_all_ones`, `tests/test_pcie_aer_telemetry.py::test_no_chip_link_is_read_while_a_reset_step_owns_the_chips`, `tests/test_pcie_aer_telemetry.py::test_an_all_ones_link_read_is_not_repeated_in_the_same_job_cycle`, `tests/test_pcie_aer_telemetry.py::test_no_write_and_no_config_space_read`, `tests/test_pcie_aer_telemetry.py::test_job_start_end_and_the_check_each_write_one_event_into_the_gate_record`, `tests/test_pcie_aer_telemetry.py::test_the_runner_snapshots_before_and_after_the_job_command_and_the_check_reads_them`, `tests/test_pcie_aer_telemetry.py::test_a_stalled_snapshot_is_left_out_after_its_bound`, `tests/test_pcie_aer_telemetry.py::test_the_gate_decides_the_same_with_or_without_the_telemetry` |
-| I92 | `tests/test_aer_check_stop.py::test_a_burst_stops_every_reader_before_any_write_and_owes_a_full_pass`, `tests/test_aer_check_stop.py::test_the_stop_keeps_the_hold_and_the_earlier_pass_no_longer_vouches`, `tests/test_aer_check_stop.py::test_a_stopped_fabric_run_is_no_verdict`, `tests/test_aer_check_stop.py::test_a_burst_during_the_full_check_gate_fails_it_into_the_bounded_recovery`, `tests/test_aer_check_stop.py::test_a_reset_steps_own_aer_is_excused_then_a_real_burst_still_stops`, `tests/test_aer_check_stop.py::test_a_step_that_ended_with_no_reader_running_still_excuses_the_post_reset_check`, `tests/test_aer_check_stop.py::test_a_burst_split_over_two_polls_at_the_real_cadence_stops`, `tests/test_aer_check_stop.py::test_a_rise_spread_past_the_window_at_the_real_cadence_never_stops`, `tests/test_aer_check_stop.py::test_a_slow_rise_another_path_or_one_below_the_count_never_stops`, `tests/test_aer_check_stop.py::test_no_reader_running_means_no_read`, `tests/test_aer_check_stop.py::test_a_journal_stalled_in_fsync_delays_neither_signal`, `tests/test_aer_check_stop.py::test_boot_builds_the_watch_beside_the_sampler`, `tests/test_aer_check_stop.py::test_the_watch_runs_on_its_own_thread_and_stops` |
-| I94 | `tests/test_aer_stop_contain.py::test_an_all_ones_burst_chip_is_removed_before_any_reader_is_killed`, `tests/test_aer_stop_contain.py::test_with_no_all_ones_burst_chip_the_stop_kills_at_once_as_before`, `tests/test_aer_stop_contain.py::test_with_no_loop_to_contain_the_readers_stay_stopped_and_unkilled`, `tests/test_aer_stop_contain.py::test_a_failed_remove_kills_nobody_and_keeps_the_hold`, `tests/test_aer_stop_contain.py::test_a_pci_wedged_latch_skips_the_remove_and_keeps_the_hold`, `tests/test_aer_stop_contain.py::test_a_reset_that_took_the_chips_since_the_stop_refuses_and_keeps_the_hold`, `tests/test_aer_stop_contain.py::test_a_contained_chip_is_contained_once`, `tests/test_aer_stop_contain.py::test_the_contained_hold_runs_the_full_ladder_at_the_bound_then_the_host_rung`, `tests/test_aer_stop_contain.py::test_the_contained_hold_fails_the_full_check_gate_into_the_bounded_recovery`, `tests/test_aer_stop_contain.py::test_overlapping_valve_runs_kill_nobody_before_every_all_ones_chip_is_removed` |
+| I92 | `tests/test_aer_check_stop.py::test_a_burst_stops_every_reader_before_any_write_and_owes_a_full_pass`, `tests/test_aer_check_stop.py::test_the_stop_keeps_the_hold_and_the_earlier_pass_no_longer_vouches`, `tests/test_aer_check_stop.py::test_a_stopped_fabric_run_is_no_verdict`, `tests/test_aer_check_stop.py::test_a_burst_during_the_full_check_gate_fails_it_into_the_bounded_recovery`, `tests/test_aer_check_stop.py::test_a_reset_steps_own_aer_is_excused_then_a_real_burst_still_stops`, `tests/test_aer_check_stop.py::test_a_step_that_ended_with_no_reader_running_still_excuses_the_post_reset_check`, `tests/test_aer_check_stop.py::test_a_burst_split_over_two_polls_at_the_real_cadence_stops`, `tests/test_aer_check_stop.py::test_a_rise_spread_past_the_window_at_the_real_cadence_never_stops`, `tests/test_aer_check_stop.py::test_a_slow_rise_another_path_or_one_below_the_count_never_stops`, `tests/test_aer_check_stop.py::test_an_idle_watch_reads_only_kernel_memory_and_signals_nobody`, `tests/test_aer_check_stop.py::test_a_journal_stalled_in_fsync_delays_neither_signal`, `tests/test_aer_check_stop.py::test_boot_builds_the_watch_beside_the_sampler`, `tests/test_aer_check_stop.py::test_the_watch_runs_on_its_own_thread_and_stops` |
+| I94 | `tests/test_aer_stop_contain.py::test_an_all_ones_burst_chip_is_removed_before_any_reader_is_killed`, `tests/test_aer_stop_contain.py::test_with_no_all_ones_burst_chip_the_stop_kills_at_once_as_before`, `tests/test_aer_stop_contain.py::test_with_no_loop_the_watch_thread_still_removes_before_any_kill`, `tests/test_aer_stop_contain.py::test_a_failed_remove_kills_nobody_and_keeps_the_hold`, `tests/test_aer_stop_contain.py::test_a_pci_wedged_latch_skips_the_remove_and_keeps_the_hold`, `tests/test_aer_stop_contain.py::test_a_reset_that_took_the_chips_since_the_stop_refuses_and_keeps_the_hold`, `tests/test_aer_stop_contain.py::test_a_contained_chip_is_contained_once`, `tests/test_aer_stop_contain.py::test_the_contained_hold_runs_the_full_ladder_at_the_bound_then_the_host_rung`, `tests/test_aer_stop_contain.py::test_the_contained_hold_fails_the_full_check_gate_into_the_bounded_recovery`, `tests/test_aer_stop_contain.py::test_overlapping_valve_runs_kill_nobody_before_every_all_ones_chip_is_removed` |
 | I95 | `tests/test_aer_stop_contain.py::test_the_stop_record_is_on_disk_when_the_process_dies_right_after_the_stop`, `tests/test_aer_stop_contain.py::test_a_journal_stalled_in_fsync_bounds_the_wait_and_delays_neither_signal`, `tests/test_aer_stop_contain.py::test_a_failed_journal_write_is_not_reported_on_disk` |
+| I96 | `tests/test_dead_chip_watch.py::test_an_idle_drop_is_contained_by_the_watch_with_no_check_running`, `tests/test_dead_chip_watch.py::test_an_idle_all_ones_burst_is_contained_by_the_watch`, `tests/test_dead_chip_watch.py::test_a_drop_during_a_tenant_job_stops_the_job_before_the_remove_and_kills_it_after`, `tests/test_dead_chip_watch.py::test_a_drop_during_each_broker_check_stops_its_reader_before_the_remove`, `tests/test_dead_chip_watch.py::test_a_blocked_event_loop_does_not_delay_the_containment`, `tests/test_dead_chip_watch.py::test_a_benign_burst_kills_no_tenant`, `tests/test_dead_chip_watch.py::test_aer_and_node_churn_inside_a_reset_are_excused`, `tests/test_dead_chip_watch.py::test_a_blackout_keeps_the_class_a_c_path`, `tests/test_dead_chip_watch.py::test_a_foreign_holder_is_stopped_before_the_remove_and_killed_only_after_it`, `tests/test_dead_chip_watch.py::test_a_failed_remove_leaves_the_foreign_holder_stopped`, `tests/test_dead_chip_watch.py::test_the_chip_contained_row_carries_its_fields_and_latencies_within_budget`, `tests/test_dead_chip_watch.py::test_the_contained_hold_lifts_only_on_a_just_passed_full_check_with_fabric`, `tests/test_aer_stop_contain.py::test_with_no_loop_the_watch_thread_still_removes_before_any_kill` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
