@@ -218,13 +218,17 @@ def test_the_cut_runs_with_the_production_glob_options(tmp_path):
 _T0 = 1_700_000_000
 
 
-def _broker(tmp_path, *, running, queue, job_ticks=3, on_sleep="", scope=False):
+def _broker(tmp_path, *, running, queue, job_ticks=3, on_sleep="", scope=False, jump=None):
+    """`jump=(a, b)`: a sleep that ends past a s and short of b s ends at b s instead. A long bound
+    then costs a dozen polls, not hundreds, and its exact time in the log still shows any early
+    let-go."""
     m = tmp_path / "model"
     m.mkdir()
     (m / "running").write_text(str(running))
     (m / "queue").write_text(str(queue))
     (m / "t").write_text("0")
     trace = tmp_path / "trace"
+    leap = f"if [ $v -gt {jump[0]} ] && [ $v -lt {jump[1]} ]; then v={jump[1]}; fi; " if jump else ""
     child = "" if scope else '[ "$r" -gt 0 ] && echo 777'
     scopes = (
         '\njob_scopes() { local r; read -r r < $M/running; [ "$r" -gt 0 ] && echo "ttdev-job-428.scope loaded active running"; }'
@@ -252,13 +256,15 @@ on_restart() {{
     if [ "$r" -gt 0 ]; then echo "job cut by restart" >> {trace}; fi
 }}
 au_now() {{ local v; read -r v < $M/t; printf -v "$1" %s $(( {_T0} + v )); }}
-sleep() {{ local v; seen "sleep $*"; read -r v < $M/t; echo $(( v + ${{1%.*}} )) > $M/t; {on_sleep} }}
+sleep() {{ local v; seen "sleep $*"; read -r v < $M/t; v=$(( v + ${{1%.*}} )); {leap}echo $v > $M/t; {on_sleep} }}
 """
 
 
-def _drain(tmp_path, *, running, queue, job_ticks=3, on_sleep="", scope=False, env=None, **kw):
+def _drain(tmp_path, *, running, queue, job_ticks=3, on_sleep="", scope=False, env=None, jump=None, **kw):
     """The gate against the model broker; its queued jobs are persisted specs too."""
-    stand_ins = _broker(tmp_path, running=running, queue=queue, job_ticks=job_ticks, on_sleep=on_sleep, scope=scope)
+    stand_ins = _broker(
+        tmp_path, running=running, queue=queue, job_ticks=job_ticks, on_sleep=on_sleep, scope=scope, jump=jump
+    )
     env = {"TTDEV_HOLD_SETTLE_SEC": "0", **(env or {})}
     return _gate(tmp_path, stand_ins=stand_ins + kw.pop("stand_ins", ""), queued=queue, env=env, **kw)
 
@@ -384,7 +390,7 @@ def test_a_job_past_its_cap_never_gets_a_restart(tmp_path):
     # No readable start counts as just started: the whole cap, from the drain's start.
     fresh = tmp_path / "fresh"
     fresh.mkdir()
-    done, trace, hold = _drain(fresh, running=10_000, queue=1, scope=True)
+    done, trace, hold = _drain(fresh, running=10_000, queue=1, scope=True, jump=(0, 1500))
     _no_restart(done, trace, hold)
     assert "past the job cap (1560s) after 1560s" in done.stderr, done.stderr
     assert _polls_held(trace), "the drain let go of dispatch before the cap"
@@ -392,7 +398,9 @@ def test_a_job_past_its_cap_never_gets_a_restart(tmp_path):
     # A broker child past the cap (no scope: a per-user broker's job) holds it the same way.
     child = tmp_path / "child"
     child.mkdir()
-    _no_restart(*_drain(child, running=10_000, queue=1))
+    done, trace, hold = _drain(child, running=10_000, queue=1, jump=(0, 1500))
+    _no_restart(done, trace, hold)
+    assert "past the job cap (1560s) after 1560s" in done.stderr, done.stderr
 
     # Once the job has ended, the next lap finds the box idle and applies.
     after = tmp_path / "after"
@@ -402,7 +410,7 @@ def test_a_job_past_its_cap_never_gets_a_restart(tmp_path):
     assert trace[-1].startswith("restart held ") and "dispatch" not in trace, trace
 
 
-def _holder(tmp_path, cgroup):
+def _holder(tmp_path, cgroup, jump=(0, 1500)):
     """One device holder (uid 1000) in `cgroup`, and no broker child or listed job scope."""
     proc = tmp_path / "proc" / "4321"
     proc.mkdir(parents=True)
@@ -411,7 +419,7 @@ def _holder(tmp_path, cgroup):
 ls() { [ "$2" = "%s/fd" ] && echo "lrwx------ 1 u u 64 Oct 21 13:00 3 -> /dev/tenstorrent/0"; return 0; }
 stat() { echo 1000; }
 """ % proc
-    return _drain(tmp_path, running=0, queue=1, stand_ins=stand_ins)
+    return _drain(tmp_path, running=0, queue=1, stand_ins=stand_ins, jump=jump)
 
 
 def test_a_re_adopted_job_never_gets_a_restart(tmp_path):
@@ -593,7 +601,7 @@ def test_a_device_op_at_the_restart_point_blocks_the_restart(tmp_path):
     assert not (tmp_path / "root" / "installed.sha").exists(), "a restart that did not run was marked current"
 
 
-def _never_ending_op(tmp_path, *, lock, install=True, running=0, job_age=None):
+def _never_ending_op(tmp_path, *, lock, install=True, running=0, job_age=None, jump=None):
     """A device op that never ends: the broker's own (a live-pid device-op lock) when `lock`, else
     only a ttdev-reset scope systemd keeps listing. `install`: it shows at the restart point."""
     inhibit = tmp_path / "device-op.lock"
@@ -604,8 +612,10 @@ def _never_ending_op(tmp_path, *, lock, install=True, running=0, job_age=None):
     if not install:
         if lock:
             inhibit.write_text(f"{os.getpid()} tt_device_reset\n")
-        return _drain(tmp_path, running=running, queue=1, stand_ins=stand_ins, scope=True, job_age=job_age)
-    return _drain(tmp_path, running=0, queue=0, stand_ins=stand_ins, scope=True, job_age=job_age, install=start)
+        return _drain(tmp_path, running=running, queue=1, stand_ins=stand_ins, scope=True, job_age=job_age, jump=jump)
+    return _drain(
+        tmp_path, running=0, queue=0, stand_ins=stand_ins, scope=True, job_age=job_age, install=start, jump=jump
+    )
 
 
 def _lap_seconds(tmp_path):
@@ -625,7 +635,7 @@ def test_an_op_that_never_ends_at_the_restart_point_is_never_restarted_over(tmp_
     for name, lock in (("lock", True), ("scope", False)):
         d = tmp_path / name
         d.mkdir()
-        done, trace, hold = _never_ending_op(d, lock=lock)
+        done, trace, hold = _never_ending_op(d, lock=lock, jump=(0, 600))
         assert done.returncode == 0, (name, done.stderr)
         assert "never restarted over (I7)" in done.stderr, (name, done.stderr)
         assert "not restarting, not marking current" in done.stderr, (name, done.stderr)
@@ -647,7 +657,7 @@ def test_an_op_with_no_job_holds_dispatch_for_op_cap_not_the_job_cap(tmp_path):
     ):
         d = tmp_path / name
         d.mkdir()
-        done, trace, hold = _never_ending_op(d, **kw)
+        done, trace, hold = _never_ending_op(d, **kw, jump=(0, 600))
         assert done.returncode == 0, (name, done.stderr)
         assert _lap_seconds(d) == 660, (name, _lap_seconds(d), done.stderr)
         assert not any(t.startswith("restart") for t in trace), (name, trace)
@@ -881,13 +891,15 @@ def test_a_limit_too_far_off_for_the_job_cap_is_never_held_through(tmp_path, lim
 
 def test_a_limit_that_just_fits_the_job_cap_is_held_through(tmp_path):
     stub, end = _preemptable(limit_left=1460, ends_after=1530)
-    done, trace, hold = _drain(tmp_path, running=10_000, queue=0, scope=True, job_age=10, stand_ins=stub, on_sleep=end)
+    done, trace, hold = _drain(
+        tmp_path, running=10_000, queue=0, scope=True, job_age=10, stand_ins=stub, on_sleep=end, jump=(0, 1400)
+    )
     assert done.returncode == 0, done.stderr
     assert "(bound 1560s:" in done.stderr and "drained after 1530s" in done.stderr, done.stderr
     assert _polls_held(trace) and trace[-1].startswith("restart held "), trace
 
 
-def _preempted_then_gate(tmp_path, *, gate_ends, seen_by):
+def _preempted_then_gate(tmp_path, *, gate_ends, seen_by, jump=None):
     """The only running job, past its limit, is preempted 70 s in; then the broker's post-job gate
     (a kill reset, the full check) runs as its child under the device-op lock until `gate_ends`.
     `seen_by`: how the drain can tell the job ended, its scope or /health."""
@@ -905,7 +917,7 @@ pgrep() {{ seen pgrep; [ -e $M/gate ] && echo 778; return 0; }}
         f" touch $M/gate; echo {os.getpid()} post_job_gate > {lock}; fi;"
         f" if [ $t -ge {gate_ends} ]; then rm -f $M/gate {lock}; fi;"
     )
-    return _drain(tmp_path, running=10_000, queue=0, scope=True, job_age=1600, stand_ins=stub, on_sleep=on_sleep)
+    return _drain(tmp_path, running=10_000, queue=0, scope=True, job_age=1600, stand_ins=stub, on_sleep=on_sleep, jump=jump)
 
 
 @pytest.mark.parametrize("seen_by", ["health", "scope"])
@@ -923,7 +935,7 @@ def test_a_preempted_job_whose_post_job_gate_runs_long_still_applies_under_the_s
 
 
 def test_a_post_job_gate_that_never_ends_lets_go_at_the_gate_cap(tmp_path):
-    done, trace, hold = _preempted_then_gate(tmp_path, gate_ends=10**9, seen_by="health")
+    done, trace, hold = _preempted_then_gate(tmp_path, gate_ends=10**9, seen_by="health", jump=(75, 950))
     assert done.returncode == 0, done.stderr
     assert "post-job gate is still running 936s after the preempted job ended" in done.stderr, done.stderr
     assert 70 + 936 <= _lap_seconds(tmp_path) < 70 + 936 + 5, done.stderr  # 5 s polls

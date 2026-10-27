@@ -28,17 +28,22 @@ T0 = 1_700_000_000
 def _simulate(tmp_path, moves, *, until, quiet=None, start=T0):
     """Laps every 60 s from `start` to `until` while the branch head moves at the times in `moves`
     (sha `s<n>` after the n-th move). The box applied `s0` long before. Returns the restarts as
-    (time, sha) and, for every sha, when it was first seen."""
+    (time, sha) and, for every sha, when it was first seen. Once the last sha is installed and one
+    more lap found it current, it stops: with the head at rest every later lap is that same exit."""
     root = tmp_path / "root"
     root.mkdir(exist_ok=True)
     (root / "installed.sha").write_text("s0\n")
     (root / "last-apply").write_text(f"{start - 4 * 3600}\n")
-    restarts, seen = [], {}
+    restarts, seen, settled = [], {}, False
     for now in range(start, until + 1, LAP):
         sha = f"s{sum(m <= now for m in moves)}"
         seen.setdefault(sha, now)
-        _, lines, _ = _lap(tmp_path, now=now, sha=sha, quiet=quiet)
+        done, lines, _ = _lap(tmp_path, now=now, sha=sha, quiet=quiet)
         restarts = [(int(t), s) for t, s in (x.split() for x in lines)]
+        if settled:
+            assert not done.stderr and not (root / "pending-head").exists(), done.stderr
+            break
+        settled = now >= max(moves) and (root / "installed.sha").read_text().split() == [sha]
     return restarts, seen
 
 
