@@ -425,6 +425,9 @@ def escalation(os_first, monkeypatch, tmp_path):
     mech = srv.recovery_mechanism
     monkeypatch.setattr(mech, "host_action_requested", None)
     monkeypatch.setattr(mech, "_power_cycle_not_launched_paged", None)
+    # The process-wide mechanism keeps the I72 miss page's throttle: a page an earlier test on this
+    # worker sent would silence this test's page for an hour.
+    monkeypatch.setattr(mech, "_power_cycle_miss_paged", 0.0)
     monkeypatch.setattr(mech, "_device_hold_episode_since", lambda: "held-since-1")
     pages = []
     monkeypatch.setattr(alert, "send_alert", lambda ev: pages.append(ev) or 0)
