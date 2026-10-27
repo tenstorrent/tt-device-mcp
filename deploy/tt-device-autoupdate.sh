@@ -93,6 +93,11 @@ remote_sha="$(git -C "$CLONE" rev-parse --verify -q "refs/remotes/origin/$BR" ||
 # drain reads it on every 5 s poll). Every time a lap decides on comes from here, so it is the one
 # seam a test replaces; defined after the config is sourced, so nothing on a box can.
 au_now() { printf -v "$1" '%(%s)T' -1; }
+# A command's stdout, less its trailing newlines, into the variable named $1, and its exit status:
+# `au_cap v cmd args` is `v="$(cmd args)"`, the same one process for a command. The second seam a
+# test replaces: its stand-ins for systemd, pgrep and curl are shell functions, and a drain asks them
+# several times on every 5 s poll; captured without a subshell, they cost the suite no process.
+au_cap() { local _au_o _au_rc=0; _au_o="$("${@:2}")" || _au_rc=$?; printf -v "$1" '%s' "$_au_o"; return "$_au_rc"; }
 # Epoch seconds $2 as local time, the way the decision log writes it, into the variable named $1.
 au_time() { printf -v "$1" '%(%Y-%m-%dT%H:%M:%S%z)T' "$2"; }
 
@@ -123,7 +128,7 @@ au_log() {  # <decision> <reason>
     logger -t tt-device-autoupdate -- "$line" 2>/dev/null || true
     {
         [ -d "${AU_LOG%/*}" ] || mkdir -p "${AU_LOG%/*}"
-        size=$(stat -c %s "$AU_LOG" 2>/dev/null) || size=0
+        au_cap size stat -c %s "$AU_LOG" 2>/dev/null || size=0
         if [ "$size" -ge 1048576 ]; then
             mv -f "$AU_LOG" "$AU_LOG.1"
         fi
@@ -163,16 +168,16 @@ STARTUP_BOUND=600
 broker_broken() {
     local st n base h age="${1:-0}" re rest
     broken=""
-    st="$(systemctl is-active tt-device-broker 2>/dev/null)"
+    au_cap st systemctl is-active tt-device-broker 2>/dev/null
     if [ "$st" != active ]; then broken="is ${st:-unknown}, not active"; return; fi
-    n="$(systemctl show tt-device-broker -p NRestarts --value 2>/dev/null)"
+    au_cap n systemctl show tt-device-broker -p NRestarts --value 2>/dev/null
     base=""; { read -r base < "$LAST_APPLY_NRESTARTS"; } 2>/dev/null || true
     case "$n" in ''|*[!0-9]*) n=0 ;; esac
     case "$base" in ''|*[!0-9]*) base=0 ;; esac
     if [ $(( 10#$n )) -gt $(( 10#$base )) ]; then
         broken="restarted itself since the last apply (NRestarts $(( 10#$base )) -> $(( 10#$n )))"; return
     fi
-    h="$(curl -s --max-time 5 --unix-socket /run/tt-device-broker/broker.sock http://localhost/health 2>/dev/null)"
+    au_cap h curl -s --max-time 5 --unix-socket /run/tt-device-broker/broker.sock http://localhost/health 2>/dev/null
     if [ -z "$h" ]; then broken="does not answer /health"; return; fi
     # The shell's own ERE matching, where a `printf | grep -E` per question cost two processes. None
     # of these patterns can match across a newline, so the whole answer reads as grep reads its lines.
@@ -287,7 +292,7 @@ if [ -f "$INHIBIT" ]; then
 fi
 # A reset outlives the broker by design (it runs in its own scope), so the lock file
 # above can be absent while a reset is still in flight. Ask systemd, not the broker.
-if reset_units="$(systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-reset-*' 2>/dev/null)"
+if au_cap reset_units systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-reset-*' 2>/dev/null
         [[ $reset_units == *ttdev-reset-* ]]; then
     echo "autoupdate: a device reset scope is still running; deferring" >&2
     au_log deferred "device reset scope running; apply_by=when the reset ends (bounded)"
@@ -339,10 +344,11 @@ print(int(h.get("preempt_job_id") == sys.argv[1]))' "$1" 2>/dev/null
 }
 # Succeeds (and names why in $recovery_why) while the update should wait for the recovery.
 recovery_gate() {
-    local held="" state="" age="" now since="" sha="" waited apply_by
+    local held="" state="" age="" now since="" sha="" waited apply_by out
     recovery_why=""
+    au_cap out broker_hold
     read -r held state age <<EOF
-$(broker_hold)
+$out
 EOF
     case "${held:-0}:${state:-}" in
         1:*|*:recovering|*:down) ;;
@@ -438,18 +444,19 @@ GATE_CAP=936
 UPTIME=/proc/uptime
 count_busy() {
     local mp p uu q out cg l
-    mp="$(systemctl show tt-device-broker -p MainPID --value 2>/dev/null)"
+    au_cap mp systemctl show tt-device-broker -p MainPID --value 2>/dev/null
     # A stopped broker reads MainPID 0, and `pgrep -P 0` lists init and kthreadd: count no kids.
     kids=0
     if [ "${mp:-0}" -gt 0 ] 2>/dev/null; then
         # One pid a line, counted as `wc -l` counts them, without the pipe.
-        out="$(pgrep -P "$mp" 2>/dev/null)"; l="${out//[!$'\n']/}"
+        au_cap out pgrep -P "$mp" 2>/dev/null; l="${out//[!$'\n']/}"
         [ -z "$out" ] || kids=$(( ${#l} + 1 ))
     fi
     holders=0; jobholders=0
     for p in /proc/[0-9]*; do
-        if [[ $(ls -l "$p/fd" 2>/dev/null) == *tenstorrent* ]]; then
-            uu=$(stat -c %u "$p" 2>/dev/null)
+        au_cap out ls -l "$p/fd" 2>/dev/null
+        if [[ $out == *tenstorrent* ]]; then
+            au_cap uu stat -c %u "$p" 2>/dev/null
             if [ "${uu:-0}" -ge 1000 ]; then
                 holders=$((holders+1))
                 # A process cannot leave its job's scope cgroup: a holder in one is a broker job's,
@@ -461,7 +468,7 @@ count_busy() {
     done
     # A re-adopted job is no child of this broker, and a queued job is about to be one: a job
     # scope still running and a persisted queued spec both count as busy.
-    out="$(systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-job-*' 2>/dev/null)"
+    au_cap out systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-job-*' 2>/dev/null
     scopes=0   # the lines naming a job scope, as `grep -c` counts them
     while IFS= read -r l; do [[ $l == *ttdev-job-* ]] && scopes=$((scopes+1)); done <<< "$out"
     queued=0
@@ -477,12 +484,12 @@ youngest_job_age() {
     j_age=""
     { IFS= read -r up < "$UPTIME"; } 2>/dev/null; up="${up%% *}"; up="${up%.*}"
     # Every unit name in the list, as `grep -o` picks them out of each line.
-    out="$(systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-job-*' 2>/dev/null)"
+    au_cap out systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-job-*' 2>/dev/null
     while IFS= read -r l; do
         while [[ $l =~ $re ]]; do units="$units ${BASH_REMATCH[0]}"; l="${l#*"${BASH_REMATCH[0]}"}"; done
     done <<< "$out"
     for u in $units; do
-        t="$(systemctl show "$u" -p ActiveEnterTimestampMonotonic --value 2>/dev/null)"
+        au_cap t systemctl show "$u" -p ActiveEnterTimestampMonotonic --value 2>/dev/null
         if [ -n "$up" ] && [ "${t:-0}" -gt 0 ] 2>/dev/null; then a=$(( up - t / 1000000 )); else a=0; fi
         { [ -z "$j_age" ] || [ "$a" -lt "$j_age" ]; } && j_age="$a"
     done
@@ -502,19 +509,22 @@ op_lock_live() {
 }
 reset_scope_listed() {
     local out
-    out="$(systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-reset-*' 2>/dev/null)"
+    au_cap out systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-reset-*' 2>/dev/null
     [[ $out == *ttdev-reset-* ]]
 }
 op_in_flight() { op_lock_live || reset_scope_listed; }
-job_scope_listed() {
-    systemctl list-units --type=scope --state=running --no-legend --no-pager "ttdev-job-$1.scope" 2>/dev/null \
-        | grep -q "ttdev-job-$1\.scope"
+job_scope_listed() {  # the unit named in a listed line, as `| grep -q` found it, with no grep
+    local out
+    au_cap out systemctl list-units --type=scope --state=running --no-legend --no-pager "ttdev-job-$1.scope" 2>/dev/null
+    [[ $out == *"ttdev-job-$1.scope"* ]]
 }
 # Whether the preemptable job the drain holds for has ended: its scope, listed when the wait began,
 # is gone, or /health answers without naming it. No answer and no scope to read: not known to.
 preempt_job_ended() {
     if [ "$p_scope" = 1 ] && ! job_scope_listed "$p_job"; then return 0; fi
-    [ "$(broker_names_preempt_job "$p_job")" = 0 ]
+    local out
+    au_cap out broker_names_preempt_job "$p_job"
+    [ "$out" = 0 ]
 }
 # Wait, under the dispatch hold, for the job boundary: nothing running and no device op in flight.
 # Returns 0 there, 0 when the broker is down and runs no op of its own (a down broker protects no
@@ -528,15 +538,16 @@ preempt_job_ended() {
 # that cannot apply), and once it has ended the broker's post-job gate holds the wait for at most
 # GATE_CAP, then 1. $1 names the wait in the log; a return of 1 names why in $drain_why.
 wait_job_boundary() {
-    local w_start w_now w_bound w_why op_since="" p_running="" p_job="" p_left="" p_scope=0 p_end=""
+    local w_start w_now w_bound w_why p_out st op_since="" p_running="" p_job="" p_left="" p_scope=0 p_end=""
     drain_why=""
     youngest_job_age
     w_bound=$(( JOB_CAP - j_age )); [ "$w_bound" -gt 0 ] || w_bound=0
     w_why="job cap ${JOB_CAP}s, youngest job ${j_age}s in"
     # Spec 01 I20, spec 08 I20: the only running job is preemptable, so the hold preempts it once
     # past its limit; keep the hold that long.
+    au_cap p_out broker_preempt
     read -r p_running p_job p_left <<EOF
-$(broker_preempt)
+$p_out
 EOF
     if [ "${p_running:-0}" = 1 ] && [ -n "${p_job:-}" ] && [ "${p_left:--1}" -ge 0 ] 2>/dev/null; then
         if [ $(( p_left + PREEMPT_TAIL )) -gt "$JOB_CAP" ]; then
@@ -565,7 +576,8 @@ EOF
         fi
         au_now w_now
         if ! op_lock_live; then
-            case "$(systemctl is-active tt-device-broker 2>/dev/null)" in
+            au_cap st systemctl is-active tt-device-broker 2>/dev/null
+            case "$st" in
                 active|activating|deactivating|reloading) ;;
                 *)  echo "autoupdate: $1: the broker is down after $(( w_now - w_start ))s; applying (the restart starts it, and its startup waits out any reset scope before the queue opens)" >&2
                     return 0 ;;
@@ -716,10 +728,18 @@ if [ -z "$why_restart" ]; then
     rm -f "$ROOT/pending-head" 2>/dev/null || true   # I21 coalescing: so does the bound
     echo "autoupdate: ${installed_sha:0:9} -> ${remote_sha:0:9} changes only ${NO_RESTART_PATHS}; tree and installed.sha moved, broker not restarted${staged}" >&2
     EVENTS="${TT_DEVICE_MCP_HEALTH_DIR:-/var/lib/tt-device-broker/health}/health_events.jsonl"
-    now="$(date +%s.%N)"
-    paths_json="$(printf '%s\n' "$changed_paths" | sed -e '/^$/d' -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/.*/"&"/' | paste -sd, -)"
+    au_cap now date +%s.%N
+    au_cap iso date -u -d "@${now%.*}" +%Y-%m-%dT%H:%M:%SZ
+    # Each non-empty line, \ and " escaped, quoted and joined by commas: what
+    # `sed -e '/^$/d' -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/.*/"&"/' | paste -sd, -` printed, in the shell.
+    paths_json=""; bs='\'; dq='"'   # quoted replacements: bash 5.2's patsub_replacement leaves them as is
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        path="${path//"$bs"/"$bs$bs"}"; path="${path//"$dq"/"$bs$dq"}"
+        paths_json="${paths_json:+$paths_json,}\"$path\""
+    done <<< "$changed_paths"
     printf '{"ts": %s, "iso": "%s", "kind": "autoupdate_applied_no_restart", "from_sha": "%s", "to_sha": "%s", "idle": %s, "drained_s": %s, "changed_paths": [%s]}\n' \
-        "$now" "$(date -u -d "@${now%.*}" +%Y-%m-%dT%H:%M:%SZ)" "$installed_sha" "$remote_sha" "$idle" "$drained_s" "$paths_json" \
+        "$now" "$iso" "$installed_sha" "$remote_sha" "$idle" "$drained_s" "$paths_json" \
         >> "$EVENTS" 2>/dev/null \
         || echo "autoupdate: warning: could not append autoupdate_applied_no_restart to $EVENTS" >&2
     au_log applied "no restart: changes only ${NO_RESTART_PATHS}${staged}"
@@ -851,8 +871,9 @@ fi
 # (TT_DEVICE_MCP_HEALTH_DIR, else root's default). A single O_APPEND write of one short line, by
 # root like the broker; a failed write only warns, the apply is already done.
 EVENTS="${TT_DEVICE_MCP_HEALTH_DIR:-/var/lib/tt-device-broker/health}/health_events.jsonl"
-now="$(date +%s.%N)"
+au_cap now date +%s.%N
+au_cap iso date -u -d "@${now%.*}" +%Y-%m-%dT%H:%M:%SZ
 printf '{"ts": %s, "iso": "%s", "kind": "autoupdate_apply", "from_sha": "%s", "to_sha": "%s", "idle": %s, "drained_s": %s, "restart_rc": %s}\n' \
-    "$now" "$(date -u -d "@${now%.*}" +%Y-%m-%dT%H:%M:%SZ)" "$installed_sha" "$remote_sha" "$idle" "$drained_s" "$restart_rc" \
+    "$now" "$iso" "$installed_sha" "$remote_sha" "$idle" "$drained_s" "$restart_rc" \
     >> "$EVENTS" 2>/dev/null \
     || echo "autoupdate: warning: could not append autoupdate_apply to $EVENTS" >&2

@@ -765,7 +765,7 @@ def _apply_event(tmp_path, health_dir, idle="true", drained_s=0, restart_rc=0):
         f"set -u\ninstalled_sha=old111; remote_sha=new222; src_desc=test; idle={idle}; drained_s={drained_s}\n"
         f"LAST_APPLY_NRESTARTS={tmp_path}/last-apply.nrestarts\n"
         f"RECOVERY_PENDING={tmp_path}/recovery.defer\nau_log() {{ :; }}\n"
-        f"systemctl() {{ return {restart_rc}; }}\n" + block
+        f"systemctl() {{ return {restart_rc}; }}\n" + _clock(text) + block
     )
     env = {"PATH": "/usr/bin:/bin", "TT_DEVICE_MCP_HEALTH_DIR": str(health_dir)}
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=30)
