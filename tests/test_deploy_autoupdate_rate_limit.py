@@ -22,6 +22,9 @@ from tt_device_mcp import server as srv
 from tt_device_mcp.constants import FABRIC_CHECK_TIMEOUT_SEC
 from tt_device_mcp.fsm import ServerFsm
 
+# Fork-heavy deploy-script laps: one xdist worker runs them all (pyproject: --dist loadgroup).
+pytestmark = pytest.mark.xdist_group("forks")
+
 _SCRIPT = Path(__file__).resolve().parent.parent / "deploy" / "tt-device-autoupdate.sh"
 
 

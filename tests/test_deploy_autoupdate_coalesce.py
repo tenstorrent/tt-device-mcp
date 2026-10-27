@@ -23,6 +23,9 @@ from tests.test_restart_drain import _restart_with_a_held_job
 from tests.test_startup_fabric_hugepages import _shortfalls, _startup, _systemctl  # noqa: F401 - fixtures
 from tt_device_mcp.fsm import ServerState
 
+# Fork-heavy deploy-script laps: one xdist worker runs them all (pyproject: --dist loadgroup).
+pytestmark = pytest.mark.xdist_group("forks")
+
 QUIET, BOUND, INTERVAL, LAP = 600, 3600, 1800, 60
 T0 = 1_700_000_000
 

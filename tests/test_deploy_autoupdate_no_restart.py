@@ -21,6 +21,9 @@ from pathlib import Path
 
 import pytest
 
+# Fork-heavy deploy-script laps: one xdist worker runs them all (pyproject: --dist loadgroup).
+pytestmark = pytest.mark.xdist_group("forks")
+
 _SCRIPT = Path(__file__).resolve().parent.parent / "deploy" / "tt-device-autoupdate.sh"
 _HEALTHY = '{"status":"ok","held":false,"fsm_state":"healthy","fsm_why":null}'
 _HELD = '{"status":"ok","held":true,"held_reason":"fabric check failed","fsm_state":"recovering","fsm_why":"x"}'
