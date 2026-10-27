@@ -47,12 +47,12 @@ def _lap(
     tmp_path, *, now, sha, interval=None, quiet=0, active="active", nrestarts="0", health=_HEALTHY, stand_ins=True
 ):
     """One lap at fake time `now` that has just resolved `sha`: the already-current check, burst
-    coalescing and the rate limit, then (as if every gate passed) the tail that marks the sha
-    current and restarts. `active`, `nrestarts` and `health` are what systemd and the broker's
-    /health report. `quiet` is TTDEV_APPLY_QUIET_SEC: 0 (coalescing off) for the rate-limit tests
-    here, None for the script's default (tests/test_deploy_autoupdate_coalesce.py). `now=None`: the
-    lap reads the real clock, through the script's own seam. `stand_ins=False`: the real mv and rm,
-for the tests that pin the rename itself or count the script's own processes."""
+        coalescing and the rate limit, then (as if every gate passed) the tail that marks the sha
+        current and restarts. `active`, `nrestarts` and `health` are what systemd and the broker's
+        /health report. `quiet` is TTDEV_APPLY_QUIET_SEC: 0 (coalescing off) for the rate-limit tests
+        here, None for the script's default (tests/test_deploy_autoupdate_coalesce.py). `now=None`: the
+        lap reads the real clock, through the script's own seam. `stand_ins=False`: the real mv and rm,
+    for the tests that pin the rename itself or count the script's own processes."""
     quoted_health = health.replace("'", "'\\''")  # a /health body may carry single quotes
     text = _SCRIPT.read_text()
     head = _cut(text, "# Read as $(cat) would", "INHIBIT=/run/")

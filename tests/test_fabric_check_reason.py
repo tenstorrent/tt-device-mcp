@@ -269,7 +269,7 @@ def _run_wrapper_topology(tmp_path, rerun_output: str, rerun_rc: int):
     fake.write_text(
         "#!/bin/bash\n"
         f"echo \"$*\" >> '{calls}'\n"
-        f"case \"$*\" in *cabling*)\n"
+        f'case "$*" in *cabling*)\n'
         f"    IFS= read -r -d '' o < '{tmp_path / 'mismatch.txt'}'; printf '%s' \"$o\"; exit 134 ;;\nesac\n"
         f"IFS= read -r -d '' o < '{tmp_path / 'rerun.txt'}'; printf '%s' \"$o\"\nexit {rerun_rc}\n"
     )
