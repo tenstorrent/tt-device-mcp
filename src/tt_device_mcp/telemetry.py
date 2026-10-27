@@ -1522,10 +1522,10 @@ class CheckAerWatch:
         # The latest containment record (I96).
         self.last_contained: Optional[dict] = None
         # The confirm reads, one each per trigger chip (I96); replaced in tests.
-        from tt_device_mcp.health.monitors import pci
+        from tt_device_mcp.health import config_vendor_id, link_active
 
-        self.config_vendor_id = pci.config_vendor_id
-        self.link_active = pci.link_active
+        self.config_vendor_id = config_vendor_id
+        self.link_active = link_active
 
     def start(self) -> None:
         if self.thread is None or not self.thread.is_alive():
