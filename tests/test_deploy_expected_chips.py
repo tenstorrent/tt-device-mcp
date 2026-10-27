@@ -24,6 +24,9 @@ from tt_device_mcp.health.evidence import health_dir
 from tt_device_mcp.health.monitors import pci
 from tt_device_mcp.health.monitors.heartbeat import heartbeat_verdict
 
+# Fork-heavy deploy-script laps: one xdist worker runs them all (conftest: --dist loadgroup).
+pytestmark = pytest.mark.xdist_group("forks")
+
 _REPO = Path(__file__).resolve().parent.parent
 _DERIVE = _REPO / "deploy" / "tt-device-expected-chips.sh"
 _APPLY = _REPO / "deploy" / "apply-host-config.sh"

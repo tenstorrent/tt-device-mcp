@@ -15,7 +15,12 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 from tests.deploy_helpers import _statements
+
+# Fork-heavy deploy-script laps: one xdist worker runs them all (conftest: --dist loadgroup).
+pytestmark = pytest.mark.xdist_group("forks")
 
 _REPO = Path(__file__).resolve().parent.parent
 _INSTALLER = _REPO / "deploy" / "install-tt-device-broker.sh"

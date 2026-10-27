@@ -18,9 +18,13 @@ from pathlib import Path
 
 import pytest
 
+from tests.deploy_helpers import LAP_STAND_INS
 from tt_device_mcp import server as srv
 from tt_device_mcp.constants import FABRIC_CHECK_TIMEOUT_SEC
 from tt_device_mcp.fsm import ServerFsm
+
+# Fork-heavy deploy-script laps: one xdist worker runs them all (conftest: --dist loadgroup).
+pytestmark = pytest.mark.xdist_group("forks")
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "deploy" / "tt-device-autoupdate.sh"
 
@@ -39,13 +43,16 @@ def _cut(text, start, end):
 _HEALTHY = '{"status":"ok","held":false,"fsm_state":"healthy","fsm_why":null}'
 
 
-def _lap(tmp_path, *, now, sha, interval=None, quiet=0, active="active", nrestarts="0", health=_HEALTHY):
+def _lap(
+    tmp_path, *, now, sha, interval=None, quiet=0, active="active", nrestarts="0", health=_HEALTHY, stand_ins=True
+):
     """One lap at fake time `now` that has just resolved `sha`: the already-current check, burst
-    coalescing and the rate limit, then (as if every gate passed) the tail that marks the sha
-    current and restarts. `active`, `nrestarts` and `health` are what systemd and the broker's
-    /health report. `quiet` is TTDEV_APPLY_QUIET_SEC: 0 (coalescing off) for the rate-limit tests
-    here, None for the script's default (tests/test_deploy_autoupdate_coalesce.py). `now=None`: the
-    lap reads the real clock, through the script's own seam."""
+        coalescing and the rate limit, then (as if every gate passed) the tail that marks the sha
+        current and restarts. `active`, `nrestarts` and `health` are what systemd and the broker's
+        /health report. `quiet` is TTDEV_APPLY_QUIET_SEC: 0 (coalescing off) for the rate-limit tests
+        here, None for the script's default (tests/test_deploy_autoupdate_coalesce.py). `now=None`: the
+        lap reads the real clock, through the script's own seam. `stand_ins=False`: the real mv and rm,
+    for the tests that pin the rename itself or count the script's own processes."""
     quoted_health = health.replace("'", "'\\''")  # a /health body may carry single quotes
     text = _SCRIPT.read_text()
     head = _cut(text, "# Read as $(cat) would", "INHIBIT=/run/")
@@ -68,7 +75,7 @@ systemctl() {{
 }}
 curl() {{ printf '%s' '{quoted_health}'; }}
 logger() {{ :; }}
-"""
+{LAP_STAND_INS if stand_ins else ""}"""
     env = {"PATH": "/usr/bin:/bin", "TTDEV_LOG_DIR": str(tmp_path / "logs")}
     if interval is not None:
         env["TTDEV_MIN_APPLY_INTERVAL_SEC"] = str(interval)

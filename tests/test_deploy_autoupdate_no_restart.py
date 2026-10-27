@@ -21,6 +21,11 @@ from pathlib import Path
 
 import pytest
 
+from tests.deploy_helpers import LAP_STAND_INS
+
+# Fork-heavy deploy-script laps: one xdist worker runs them all (conftest: --dist loadgroup).
+pytestmark = pytest.mark.xdist_group("forks")
+
 _SCRIPT = Path(__file__).resolve().parent.parent / "deploy" / "tt-device-autoupdate.sh"
 _HEALTHY = '{"status":"ok","held":false,"fsm_state":"healthy","fsm_why":null}'
 _HELD = '{"status":"ok","held":true,"held_reason":"fabric check failed","fsm_state":"recovering","fsm_why":"x"}'
@@ -31,6 +36,12 @@ _GIT_ENV = {
     "GIT_AUTHOR_EMAIL": "t@example.com",
     "GIT_COMMITTER_NAME": "t",
     "GIT_COMMITTER_EMAIL": "t@example.com",
+    # No background `git maintenance run --auto` after each fixture commit: a fork per commit.
+    "GIT_CONFIG_COUNT": "2",
+    "GIT_CONFIG_KEY_0": "maintenance.auto",
+    "GIT_CONFIG_VALUE_0": "false",
+    "GIT_CONFIG_KEY_1": "gc.auto",
+    "GIT_CONFIG_VALUE_1": "0",
 }
 
 
@@ -115,7 +126,16 @@ def _lap(box, sha, *, now=10_000, health=_HEALTHY, job_polls=0, stand_ins=""):
 ROOT={root}; CLONE={root}/src; clone={root}/src; STATE={root}/installed.sha; VENV={tmp}/venv
 BR=main; src_desc=test; TT_DEVICE_MCP_HEALTH_DIR={root}
 remote_sha={sha}
-log() {{ echo "$* $(cat "$STATE")" >> {trace}; }}
+log() {{  # "$* $(cat "$STATE")", read without a fork
+    local _s=""
+    if [ -f "$STATE" ] && [ -r "$STATE" ]; then
+        IFS= read -r -d '' _s < "$STATE"
+        while [[ $_s == *$'\n' ]]; do _s=${{_s%$'\n'}}; done
+    else
+        _s=$(cat "$STATE")
+    fi
+    echo "$* $_s" >> {trace}
+}}
 date() {{ echo {now}; }}
 {_clock(text)}au_now() {{ printf -v "$1" %s {now}; }}
 chmod() {{ :; }}
@@ -124,7 +144,11 @@ pgrep() {{ :; }}
 install() {{ log "stage $3"; }}
 bash() {{ log "host-config"; }}
 sleep() {{ log "sleep"; echo x >> {polls}; }}
-job_running() {{ [ "$(cat {polls} 2>/dev/null | wc -l)" -lt {job_polls} ]; }}
+job_running() {{  # fewer than {job_polls} lines in {polls}, counted without cat | wc
+    local _n=0 _l
+    if [ -f {polls} ]; then while IFS= read -r _l; do _n=$((_n + 1)); done < {polls}; fi
+    [ "$_n" -lt {job_polls} ]
+}}
 systemctl() {{
     case "$*" in
         restart*) log restart ;;
@@ -136,7 +160,7 @@ systemctl() {{
     esac
 }}
 curl() {{ printf '%s' '{health}'; }}
-{stand_ins}
+{LAP_STAND_INS}{stand_ins}
 """
     run_env = {
         **_GIT_ENV,
