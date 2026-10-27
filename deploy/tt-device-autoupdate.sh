@@ -100,7 +100,11 @@ au_time() { printf -v "$1" '%(%Y-%m-%dT%H:%M:%S%z)T' "$2"; }
 installed_sha=""; { IFS= read -r -d '' installed_sha < "$STATE"; } 2>/dev/null
 while [ "${installed_sha%$'\n'}" != "$installed_sha" ]; do installed_sha="${installed_sha%$'\n'}"; done
 # Already current. A coalescing record (I21, below) belongs to an unapplied sha: with none left, it goes.
-if [ "$installed_sha" = "$remote_sha" ]; then rm -f "$ROOT/pending-head" 2>/dev/null; exit 0; fi
+# Tested first: the rm is the only process an idle lap would start.
+if [ "$installed_sha" = "$remote_sha" ]; then
+    if [ -e "$ROOT/pending-head" ] || [ -L "$ROOT/pending-head" ]; then rm -f "$ROOT/pending-head" 2>/dev/null; fi
+    exit 0
+fi
 
 echo "autoupdate: $BR ${installed_sha:0:9} -> ${remote_sha:0:9} via $src_desc" >&2
 
@@ -216,14 +220,18 @@ APPLY_BOUND="${TTDEV_APPLY_BOUND_SEC:-3600}"
 if [ "$APPLY_QUIET" -gt 0 ] 2>/dev/null; then
     [ "$APPLY_BOUND" -gt 0 ] 2>/dev/null || APPLY_BOUND=3600
     au_now now
-    p_first=""; p_sha=""; p_seen=""
+    p_first=""; p_sha=""; p_seen=""; p_raw=""
     { read -r p_first p_sha p_seen < "$PENDING_HEAD"; } 2>/dev/null || true
+    { IFS= read -r -d '' p_raw < "$PENDING_HEAD"; } 2>/dev/null
     case "$p_first" in ''|*[!0-9]*) p_first=$now ;; *) p_first=$(( 10#$p_first )) ;; esac
     case "$p_seen" in ''|*[!0-9]*) p_seen=$now ;; *) p_seen=$(( 10#$p_seen )) ;; esac
     [ "$p_first" -le "$now" ] || p_first=$now
     [ "$p_seen" -le "$now" ] || p_seen=$now
     [ "$p_sha" = "$remote_sha" ] || p_seen=$now
-    { echo "$p_first $remote_sha $p_seen" > "$PENDING_HEAD.$$" && mv -f "$PENDING_HEAD.$$" "$PENDING_HEAD"; } 2>/dev/null || true
+    # A record that already holds these exact bytes, as a plain file, is left as it is: no mv.
+    if [ "$p_raw" != "$p_first $remote_sha $p_seen"$'\n' ] || [ -L "$PENDING_HEAD" ] || [ ! -f "$PENDING_HEAD" ]; then
+        { echo "$p_first $remote_sha $p_seen" > "$PENDING_HEAD.$$" && mv -f "$PENDING_HEAD.$$" "$PENDING_HEAD"; } 2>/dev/null || true
+    fi
     quiet_left=$(( p_seen + APPLY_QUIET - now ))
     bound_left=$(( p_first + APPLY_BOUND - now ))
     if [ "$quiet_left" -gt 0 ] && [ "$bound_left" -gt 0 ]; then
