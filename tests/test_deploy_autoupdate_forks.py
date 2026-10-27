@@ -95,7 +95,7 @@ def test_a_drain_on_the_real_clock(tmp_path):
     """No stand-in clock: the script's own au_now times the drain and stamps the dispatch hold."""
     once = tmp_path / "once"
     # One poll sees a broker child (a job), the next sees none.
-    pgrep = f'\npgrep() {{ seen pgrep; [ -e {once} ] && return 0; : > {once}; echo 777; }}\n'
+    pgrep = f"\npgrep() {{ seen pgrep; [ -e {once} ] && return 0; : > {once}; echo 777; }}\n"
     t0 = int(time.time())
     done, trace, _ = _gate(tmp_path, stand_ins=pgrep, env={"TTDEV_HOLD_SETTLE_SEC": "0"})
     t1 = int(time.time())
