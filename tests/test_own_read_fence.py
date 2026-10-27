@@ -109,7 +109,9 @@ def test_a_snapshot_mid_chip_stops_at_its_next_read_and_the_remove_is_in_budget(
     row, reads, out = _snapshot_during_containment(monkeypatch, log, fenced=True)
     assert row["removed"] is True and row["stuck"] == [], row
     assert row["trigger_to_remove_s"] <= telemetry.WATCH_REMOVE_BUDGET_SEC, row
-    assert row["trigger_to_remove_s"] <= READ_STALL_SEC + QUIET_SEC + 0.5, f"only the read in flight was waited for: {row}"
+    assert (
+        row["trigger_to_remove_s"] <= READ_STALL_SEC + QUIET_SEC + 0.5
+    ), f"only the read in flight was waited for: {row}"
     assert reads.done["13"] == 1, f"no read of chip 13 after the fence: {reads.done}"
     assert out["13"].get("lost") is True, out
     print(f"fenced trigger_to_remove_s={row['trigger_to_remove_s']}")
@@ -225,7 +227,9 @@ def _stopped_only(log):
     assert log and all(e == ("stop", FABRIC) for e in log), f"no SIGKILL while chip 13 is attached: {log}"
 
 
-def test_a_burst_with_no_proof_keeps_the_readers_stopped_until_the_broker_removed_the_chip(watch, monkeypatch):  # noqa: F811
+def test_a_burst_with_no_proof_keeps_the_readers_stopped_until_the_broker_removed_the_chip(
+    watch, monkeypatch  # noqa: F811
+):
     w, log, _detach_ok, burst = watch
     assert burst()
     _stopped_only(log)
