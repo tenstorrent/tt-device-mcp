@@ -1113,7 +1113,9 @@ class TelemetrySampler:
                             ok = False
                     if not ok:
                         # The chip stays attached and off the bus: only the power cycle recovers it.
-                        PCI_WRITER.latch(f"isolate dead chip {idx}: remove failed", self.loop, context="dead-chip watch")
+                        PCI_WRITER.latch(
+                            f"isolate dead chip {idx}: remove failed", self.loop, context="dead-chip watch"
+                        )
                         stuck = list(to_remove[n:])
                         break
                     removed.append(idx)
@@ -1187,7 +1189,9 @@ class TelemetrySampler:
                     if not stuck
                     else f"remove of {stuck} failed, PCI-wedged, power cycle requested"
                 )
-                + f"; killed {len(killed)}" + (f", kill refused ({refused})" if refused else "") + "; hold kept"
+                + f"; killed {len(killed)}"
+                + (f", kill refused ({refused})" if refused else "")
+                + "; hold kept"
             )
             if not flushed:
                 log.error(f"DEAD-CHIP WATCH record not on disk within {AER_STOP_JOURNAL_WAIT_SEC:g}s")
@@ -1578,9 +1582,7 @@ class CheckAerWatch:
             isolated = set(self._deps.isolated_chips())
         except Exception:  # noqa: BLE001
             isolated = set()
-        return sorted(
-            (c for c in self._nodes - nodes if c not in isolated and not chip_state.is_lost(c)), key=int
-        )
+        return sorted((c for c in self._nodes - nodes if c not in isolated and not chip_state.is_lost(c)), key=int)
 
     def _confirmed(self, chips: list) -> list:
         """The trigger chips the opt-in config reads prove off the bus (I96): one vendor-ID read of the
@@ -1655,7 +1657,9 @@ class CheckAerWatch:
             # Idle or a tenant's job, no dead chip: nothing to stop; I79 on the sampler arms the fast
             # cadence on the same counters.
             if vanished or blackout:
-                self._journal_flushed("chip_watch_trigger", trigger=trigger, chips=sorted(dead or vanished, key=int), blackout=blackout)
+                self._journal_flushed(
+                    "chip_watch_trigger", trigger=trigger, chips=sorted(dead or vanished, key=int), blackout=blackout
+                )
             self._reads.clear()
             return None
         self._reads.clear()

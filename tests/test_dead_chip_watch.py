@@ -63,7 +63,9 @@ def _job(monkeypatch):
     monkeypatch.setattr(srv, "current_job_id", None)
     monkeypatch.setattr(srv.os, "getpgid", lambda pid: pid)
     monkeypatch.setattr(
-        srv, "job_processes", lambda *a, **k: {JOB: SimpleNamespace(pgid=JOB), JOB_CHILD: SimpleNamespace(pgid=JOB_CHILD)}
+        srv,
+        "job_processes",
+        lambda *a, **k: {JOB: SimpleNamespace(pgid=JOB), JOB_CHILD: SimpleNamespace(pgid=JOB_CHILD)},
     )
 
 
@@ -99,7 +101,7 @@ def _contained():
 # --- drops, idle and busy ---------------------------------------------------------------------
 
 
-def test_an_idle_drop_is_contained_by_the_watch_with_no_check_running(watch, monkeypatch):
+def test_an_idle_drop_is_contained_by_the_watch_with_no_check_running(watch, monkeypatch):  # noqa: F811
     """A node that vanishes with no job and no check is contained: the holder stopped, then killed;
     the vanished chip needs no remove (it is already gone)."""
     w, log, _detach_ok, _burst = watch
@@ -114,7 +116,7 @@ def test_an_idle_drop_is_contained_by_the_watch_with_no_check_running(watch, mon
     _held()
 
 
-def test_an_idle_all_ones_burst_is_contained_by_the_watch(watch, monkeypatch):
+def test_an_idle_all_ones_burst_is_contained_by_the_watch(watch, monkeypatch):  # noqa: F811
     _w, log, _detach_ok, burst = watch
     _idle(monkeypatch)
     _sample("13")
@@ -124,7 +126,9 @@ def test_an_idle_all_ones_burst_is_contained_by_the_watch(watch, monkeypatch):
     _held()
 
 
-def test_a_drop_during_a_tenant_job_stops_the_job_before_the_remove_and_kills_it_after(watch, monkeypatch):
+def test_a_drop_during_a_tenant_job_stops_the_job_before_the_remove_and_kills_it_after(
+    watch, monkeypatch  # noqa: F811
+):
     _w, log, _detach_ok, burst = watch
     _idle(monkeypatch)
     _job(monkeypatch)
@@ -138,7 +142,7 @@ def test_a_drop_during_a_tenant_job_stops_the_job_before_the_remove_and_kills_it
 
 
 @pytest.mark.parametrize("check", ["fabric", "snapshot", "eth_selftest", "aiclk_ceiling"])
-def test_a_drop_during_each_broker_check_stops_its_reader_before_the_remove(watch, monkeypatch, check):
+def test_a_drop_during_each_broker_check_stops_its_reader_before_the_remove(watch, monkeypatch, check):  # noqa: F811
     _w, log, _detach_ok, burst = watch
     reader = 7100
     _idle(monkeypatch)
@@ -161,7 +165,7 @@ def test_a_drop_during_each_broker_check_stops_its_reader_before_the_remove(watc
     _held()
 
 
-def test_a_blocked_event_loop_does_not_delay_the_containment(watch):
+def test_a_blocked_event_loop_does_not_delay_the_containment(watch):  # noqa: F811
     """The loop blocked for up to 60 s: the watch thread still stops, removes and kills within the
     budget; the loop's half (the hold, the pollers) runs once the loop is back."""
     _w, log, _detach_ok, burst = watch
@@ -200,7 +204,9 @@ def test_a_blocked_event_loop_does_not_delay_the_containment(watch):
 
 
 @pytest.mark.asyncio
-async def test_a_remove_that_times_out_latches_pci_wedged_and_asks_for_the_power_cycle(watch, monkeypatch):
+async def test_a_remove_that_times_out_latches_pci_wedged_and_asks_for_the_power_cycle(
+    watch, monkeypatch  # noqa: F811
+):
     _w, log, _detach_ok, burst = watch
     stuck = threading.Event()
     monkeypatch.setattr(srv, "isolate_chip", lambda idx: log.append(("detach", idx)) or stuck.wait(30))
@@ -242,7 +248,7 @@ async def test_a_remove_that_times_out_latches_pci_wedged_and_asks_for_the_power
 
 
 @pytest.mark.parametrize("busy", ["idle", "tenant job"])
-def test_a_benign_burst_kills_no_tenant(watch, monkeypatch, busy):
+def test_a_benign_burst_kills_no_tenant(watch, monkeypatch, busy):  # noqa: F811
     """An AER burst with every chip still answering, no check running: nobody is stopped or killed;
     the sampler's fast cadence (I79) watches the same counters."""
     w, log, _detach_ok, burst = watch
@@ -258,7 +264,7 @@ def test_a_benign_burst_kills_no_tenant(watch, monkeypatch, busy):
 
 @pytest.mark.parametrize("step", ["reset_in_flight", "scope_seen", "recovering"])
 @pytest.mark.parametrize("fault", ["burst", "vanish"])
-def test_aer_and_node_churn_inside_a_reset_are_excused(watch, monkeypatch, step, fault):
+def test_aer_and_node_churn_inside_a_reset_are_excused(watch, monkeypatch, step, fault):  # noqa: F811
     w, log, _detach_ok, burst = watch
     if step == "reset_in_flight":
         monkeypatch.setattr(srv.recovery_mechanism, "reset_in_flight", True)
@@ -274,7 +280,7 @@ def test_aer_and_node_churn_inside_a_reset_are_excused(watch, monkeypatch, step,
 
 
 @pytest.mark.parametrize("fault", ["every node vanished", "every chip all-ones"])
-def test_a_blackout_keeps_the_class_a_c_path(watch, monkeypatch, fault):
+def test_a_blackout_keeps_the_class_a_c_path(watch, monkeypatch, fault):  # noqa: F811
     """A whole-tray or all-chips-off drop (classes A/C) is not contained here: no remove, no kill;
     its direct power cycle (spec 04) stands."""
     w, log, _detach_ok, burst = watch
@@ -293,7 +299,7 @@ def test_a_blackout_keeps_the_class_a_c_path(watch, monkeypatch, fault):
 # --- foreign holders --------------------------------------------------------------------------
 
 
-def test_a_foreign_holder_is_stopped_before_the_remove_and_killed_only_after_it(watch, monkeypatch):
+def test_a_foreign_holder_is_stopped_before_the_remove_and_killed_only_after_it(watch, monkeypatch):  # noqa: F811
     _w, log, _detach_ok, burst = watch
     _idle(monkeypatch)
     _sample("13")
@@ -302,7 +308,7 @@ def test_a_foreign_holder_is_stopped_before_the_remove_and_killed_only_after_it(
     assert [u for u in _contained()["users_stopped"] if u.get("pid") == TENANT], "the holder is named as stopped"
 
 
-def test_a_failed_remove_leaves_the_foreign_holder_stopped(watch, monkeypatch):
+def test_a_failed_remove_leaves_the_foreign_holder_stopped(watch, monkeypatch):  # noqa: F811
     """The remove failed: the chip stays attached, so nothing is killed and nothing resumed; the
     holder stays stopped for the power cycle the latch asks for."""
     _w, log, detach_ok, burst = watch
@@ -322,7 +328,7 @@ def test_a_failed_remove_leaves_the_foreign_holder_stopped(watch, monkeypatch):
 # --- the record -------------------------------------------------------------------------------
 
 
-def test_the_chip_contained_row_carries_its_fields_and_latencies_within_budget(watch, monkeypatch):
+def test_the_chip_contained_row_carries_its_fields_and_latencies_within_budget(watch, monkeypatch):  # noqa: F811
     _w, _log, _detach_ok, burst = watch
     _sample("13")
     assert burst()
@@ -351,7 +357,9 @@ LIFTS = {
 
 @pytest.mark.parametrize("verdict", ["pass", "fail", "missing", "pass before the drop"])
 @pytest.mark.parametrize("path", sorted(LIFTS))
-def test_the_contained_hold_lifts_only_on_a_just_passed_full_check_with_fabric(watch, monkeypatch, path, verdict):
+def test_the_contained_hold_lifts_only_on_a_just_passed_full_check_with_fabric(
+    watch, monkeypatch, path, verdict  # noqa: F811
+):
     """03 I78 on every lift path out of a containment's hold: a fabric check that failed, found fewer
     links than the cabling expects, or passed before the drop keeps the hold."""
     _w, _log, _detach_ok, burst = watch

@@ -22,9 +22,8 @@ from tests.test_chip_state import _reads_of, _ticking, clock, sysfs  # noqa: F40
 from tests.test_deadchip_detach_before_kill import valve  # noqa: F401  (fixture)
 from tests.test_hold_lift_full_check import FABRIC, VERDICTS, _hold_marks
 from tests.test_post_reset_gate import mesh  # noqa: F401  (fixture)
-from tt_device_mcp import health_probe
+from tt_device_mcp import health_probe, telemetry
 from tt_device_mcp import server as srv
-from tt_device_mcp import telemetry
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import aiclk_ceiling as ac
 from tt_device_mcp.health import chip_state, read_health_events
@@ -74,7 +73,9 @@ def test_the_sampler_reads_a_lost_attached_chip_zero_times_in_an_hour(sysfs, clo
 # --- /health and the health probe that restarts the pollers ----------------------------------------
 
 
-def test_health_reads_no_lost_chip_and_the_probe_stands_back_on_it(sysfs, clock, monkeypatch, clear_job_state):  # noqa: F811
+def test_health_reads_no_lost_chip_and_the_probe_stands_back_on_it(
+    sysfs, clock, monkeypatch, clear_job_state  # noqa: F811
+):
     monkeypatch.setattr(srv, "heartbeat_supported", lambda *a: True)
     monkeypatch.setattr(srv.health_monitor, "expected", lambda present: N)
     monkeypatch.setattr(srv.health_monitor, "_health_check_enabled", lambda: True)
@@ -215,7 +216,9 @@ def test_a_node_the_mark_found_none_for_is_read_once_it_appears(sysfs, clock):  
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ["failed", "timed out", "skipped, PCI-wedged"])
-async def test_a_remove_that_failed_timed_out_or_was_skipped_seals_the_chip(valve, sysfs, clock, monkeypatch, fault):  # noqa: F811
+async def test_a_remove_that_failed_timed_out_or_was_skipped_seals_the_chip(
+    valve, sysfs, clock, monkeypatch, fault  # noqa: F811
+):
     log, detach_ok = valve
     release = threading.Event()
     if fault == "failed":

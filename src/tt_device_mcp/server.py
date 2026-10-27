@@ -1249,7 +1249,9 @@ _recovery_deps = RecoveryDeps(
     broker_check_readers=lambda: _broker_device_readers(),
     stop_check_readers_on_aer=lambda reason, kill=True: _stop_check_readers_on_aer(reason, kill),
     stop_device_users=lambda reason: _stop_device_users(reason),
-    signal_device_holders=lambda reason, stopped=(): _signal_device_holders(reason, tuple(stopped), health_event_detached),
+    signal_device_holders=lambda reason, stopped=(): _signal_device_holders(
+        reason, tuple(stopped), health_event_detached
+    ),
     record_holders_killed=lambda reason, killed, survivors: _record_holders_killed(reason, killed, survivors),
     health_event_detached=lambda kind, **f: health_event_detached(kind, **f),
     health_event_flushed=lambda kind, timeout, **f: health_event_flushed(kind, timeout, **f),
