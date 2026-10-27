@@ -688,12 +688,16 @@ def test_post_step_audits_a_reclaim_with_mixed_outcomes(monkeypatch, clear_job_s
         # A fixed identity for every pid: without this, an unpatched read_starttime falls
         # through to the real /proc/<pid>/stat, and whether 100/200 exist as real processes on
         # the host running the suite (they do, as kernel threads, on a developer box; they do
-        # not in a container) decides whether this reclaim signals anyone at all.
+        # not in a container) decides whether this reclaim signals anyone at all. Same for the
+        # process group: in a fresh pid namespace pid 100 can be a thread of the suite's own group,
+        # which the reclaim rightly skips as itself, so every pid gets its own group here.
         return real_reclaim(
             grace_sec=0,
             kill=lambda pid, sig: None,
             sleep=lambda _: None,
             rescan=lambda: scans.pop(0),
+            getpid=lambda: 1,
+            getpgid=lambda pid: pid,
             read_starttime=lambda pid: "fixed",
         )
 
