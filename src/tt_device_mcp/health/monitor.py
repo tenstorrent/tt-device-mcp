@@ -32,6 +32,7 @@ from tt_device_mcp.constants import (
     FABRIC_CHECK_TIMEOUT_SEC,
 )
 from tt_device_mcp.device_holders import note_broker_internal
+from tt_device_mcp.health import chip_state
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.core import HealthState, Observation, Verdict
 from tt_device_mcp.health.evidence import capture_incident, health_dir, health_event
@@ -1698,6 +1699,12 @@ class HealthMonitor:
         return ok, detail
 
     async def _verify_eth_heartbeat_body(self, timeout_sec: float) -> tuple[Optional[bool], str]:
+        # Spec 03 I66: the reader maps every chip, so a chip lost and still attached keeps it from
+        # running at all (outside this broker's own reset step). Learned nothing, never a pass: the
+        # heartbeat check already fails on that chip.
+        lost = await asyncio.to_thread(chip_state.unreadable_lost)
+        if lost:
+            return None, f"skipped (chip(s) {','.join(lost)} lost and still attached: no eth read of the mesh)"
         override = self._eth_heartbeat_cmd()
         # build() can shell out up to three candidate pythons (health.monitors.eth.resolve_python)
         # on a cache miss once armed — off the event loop, or a health gate stalls the job queue,

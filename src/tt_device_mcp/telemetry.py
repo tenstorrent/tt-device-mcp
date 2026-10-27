@@ -258,6 +258,9 @@ class TelemetrySampler:
         # The hung chips a stop was last deferred for (an all-ones chip not yet detached), journalled once.
         self.pollers_deferred_for: frozenset = frozenset()
         self.prev_beats: dict = {}
+        # Spec 03 I66: consecutive frozen-heartbeat samples per present chip, and the chips already held.
+        self.stall_strikes: dict = {}
+        self.hung_held: frozenset = frozenset()
         # Spec 03 I84/I94: every chip any valve run in flight, or the latest sample, read all-ones. One
         # not removed keeps every holder alive. Each run adds its own set and takes only that one
         # away, so no run clears or replaces another's.
@@ -628,6 +631,7 @@ class TelemetrySampler:
             if v and isinstance(v[0], int) and v[0] != ALL_ONES and self.prev_beats.get(i) == v[0]
         ]
         self.prev_beats = {i: v[0] for i, v in sample.items() if v and isinstance(v[0], int)}
+        self._hold_for_hung(stalled, len(sample))
         hung = frozenset(dead) | frozenset(stalled)
         if not hung or len(hung) >= len(sample):
             if not hung:
@@ -659,6 +663,32 @@ class TelemetrySampler:
             "pollers_quiesced_hung_chip", all_ones=sorted(dead, key=int), stalled=sorted(stalled, key=int)
         )
         await self._deps.set_device_pollers(False, lambda m: log.info(f"HUNG-CHIP {m}") if log else None)
+
+    def _hold_for_hung(self, stalled: list, total: int) -> None:
+        """Spec 03 I66: a hung chip that is still present (its heartbeat frozen, config space still
+        answering) gets no PCI remove: tt-kmd's remove runs its MMIO cleanup on any chip whose vendor
+        ID reads, the very access a hung endpoint never completes. Its heartbeat frozen on two
+        samples in a row holds the device instead, and the hold's ladder heals it (only a full check
+        with fabric lifts it, I78). The pollers already stopped at the first frozen sample. Every chip
+        at once is the re-init blip, and a reset step's own stall is excused, as for the pollers."""
+        self.stall_strikes = {i: self.stall_strikes.get(i, 0) + 1 for i in stalled}
+        self.hung_held = frozenset(i for i in self.hung_held if i in self.stall_strikes)
+        if not stalled or len(stalled) >= total:
+            return
+        if self._mechanism.reset_in_flight or self.scope_seen or chip_state.recovering():
+            return
+        fresh = sorted((i for i, n in self.stall_strikes.items() if n >= 2 and i not in self.hung_held), key=int)
+        if not fresh:
+            return
+        self.hung_held |= frozenset(fresh)
+        self._deps.health_event("chip_hung_held", chips=fresh, removed=False)
+        log = self._deps.logger()
+        if log:
+            log.error(
+                f"HUNG CHIP(S) {fresh}: heartbeat frozen on two samples, still on the PCIe bus; holding "
+                f"the device for the reset ladder (no PCI remove: the driver's remove would touch the chip)"
+            )
+        self._deps.mark_device_dirty(f"chip(s) {','.join(fresh)} heartbeat frozen", why="heartbeat")
 
     def _remove_failed(self, chips) -> list:
         """The chips of ``chips`` the dead-chip valve already tried to remove and could not (spec 03
@@ -1177,8 +1207,10 @@ class TelemetrySampler:
         log = self._deps.logger()
         if skipped:
             self._deps.health_event("chip_isolation_skipped", chips=stuck, reason=PCI_WRITER.reason, host_at_risk=True)
+            chip_state.seal(stuck, "isolation skipped, PCI-wedged")
         elif stuck:
             self._deps.health_event("chip_isolation_incomplete", stuck=stuck, removed=removed, host_at_risk=True)
+            chip_state.seal(stuck, "PCI remove failed")
         self._deps.health_event("chip_isolated", chips=removed)
         if refused:
             self._deps.health_event(
@@ -1273,6 +1305,8 @@ class TelemetrySampler:
                     f"holding the device for the power cycle"
                 )
             self._deps.health_event("chip_isolation_skipped", chips=fresh, reason=PCI_WRITER.reason, host_at_risk=True)
+            # Spec 03 I66: still attached, so no decision read reaches it either; the power cycle heals it.
+            chip_state.seal(fresh, "isolation skipped, PCI-wedged")
             self._deps.mark_device_dirty(f"chip(s) {','.join(fresh)} fell off the PCIe bus", why="heartbeat")
             return
 
@@ -1322,6 +1356,9 @@ class TelemetrySampler:
                     f"a core stall that reboots it. Removed only {removed}."
                 )
             self._deps.health_event("chip_isolation_incomplete", stuck=stuck, removed=removed, host_at_risk=True)
+            # Spec 03 I66: nothing reads a chip whose remove failed again, not even a decision read; the
+            # hold's ladder (or the power cycle a timed-out remove latched) is its recovery.
+            chip_state.seal(stuck, "PCI remove failed")
         elif log:
             log.error(
                 f"DEAD CHIP(S) {removed} removed from the kernel — the host is out of "

@@ -14,8 +14,11 @@ confirmed a chip lost, nothing of the broker's keeps reading it on a poll clock 
   a real read. A lost chip is read again only when (a) its sysfs node was re-created (a remove and
   rescan, an external tray re-power or a hotplug: a new node is a new endpoint, so the read is safe to try),
   (b) a broker reset or recovery step on it has just ended (one read per :data:`GRACE_REPROBE_SEC`
-  for :data:`GRACE_SEC`, so the post-reset health check reads the chip for real), or (c) as a
-  backstop, once per :data:`LOST_REPROBE_SEC`. A real read that is not all-ones clears ``lost``.
+  for :data:`GRACE_SEC`, so the post-reset health check reads the chip for real), or (c) by a decision
+  read (:func:`reprobe_due`), only while its PCI remove is still to come. No poll clock re-reads a
+  lost chip that is still attached, and once its remove failed or was skipped (:func:`seal`) only
+  (a) and (b) read it: that chip goes to the hold's bounded recovery, never to a re-read loop. A real
+  read that is not all-ones clears ``lost``.
 * ``recovering`` — a broker reset or recovery step is running on the chips (resets are mesh- or
   tray-wide, so it covers every chip). The pollers (telemetry sampler, /health) read nothing then;
   only the step's own reads run, ungated, exactly as before.
@@ -47,9 +50,10 @@ def _env_float(name: str, default: float, floor: float) -> float:
         return default
 
 
-# Backstop re-read of a lost chip whose node never changed: a chip that came back on its own without
-# being re-enumerated. Three sampler periods; it bounds how late such a return is seen.
-LOST_REPROBE_SEC = _env_float("TT_DEVICE_MCP_LOST_REPROBE_SEC", 30.0, 5.0)
+# No poll clock re-reads a lost chip whose node never changed (spec 03 I66): it is still attached, and
+# each read is a BAR read of a chip that left the bus. Only a decision read (reprobe_due), a reset
+# step's grace or a re-created node reads it.
+NEVER = float("inf")
 # After a reset or recovery step ends, the chips it touched are read again at most once per
 # GRACE_REPROBE_SEC for GRACE_SEC: covers the post-reset health check and the ladder's verify.
 GRACE_SEC = 120.0
@@ -191,8 +195,9 @@ def mark_lost(ids: Iterable, reason: str, nodes: Optional[dict] = None) -> list:
                 "since": datetime.now().isoformat(timespec="seconds"),
                 "reason": reason,
                 "node": node_identity(node) if node is not None else None,
-                "next": now + LOST_REPROBE_SEC,
+                "next": NEVER,
                 "read": now,
+                "sealed": False,
             }
             fresh.append(idx)
     if fresh:
@@ -211,6 +216,40 @@ def clear_lost(idx, why: str) -> bool:
     return True
 
 
+def seal(ids: Iterable, why: str) -> list:
+    """Lost chips whose PCI remove failed, timed out or was skipped (PCI-wedged): still attached and
+    MMIO-reachable. No decision read reads them again; only a re-created node or a broker reset step
+    and its grace does (spec 03 I66). Returns the newly sealed ones."""
+    fresh = []
+    with _lock:
+        for i in ids:
+            rec = _lost.get(str(i))
+            if rec is not None and not rec.get("sealed"):
+                rec["sealed"] = True
+                fresh.append(str(i))
+    if fresh:
+        _event("chip_lost_sealed", chips=fresh, why=why)
+    return fresh
+
+
+def unreadable_lost() -> list:
+    """Lost chips a reader that opens the whole device (the aiclk-ceiling helper, the eth-heartbeat
+    probe) must not reach now: still attached (the node is the one marked), outside this broker's
+    own reset step and its grace. Node identity is a stat, no chip read."""
+    with _lock:
+        if op_running() or time.monotonic() < _grace_until:
+            return []
+        marked = {k: v.get("node") for k, v in _lost.items()}
+    from tt_device_mcp.health.monitors import pci
+
+    out = []
+    for idx, ident in marked.items():
+        now_ident = node_identity(pci.SYSFS_CLASS_DIR / f"tenstorrent!{idx}")
+        if now_ident is not None and (ident is None or now_ident == ident):
+            out.append(idx)
+    return sorted(out, key=int)
+
+
 def lost_chips() -> list:
     with _lock:
         return sorted(_lost, key=int)
@@ -225,8 +264,10 @@ def may_read(idx, node: Path, *, probe: bool = False) -> bool:
     """Whether a broker read of chip ``idx`` (sysfs node ``node``) may go to the chip now. True for a
     chip not marked lost, and for every read while this broker's own reset step runs. For a lost chip:
     True once its node was re-created (and the mark is cleared), or when a re-read is due (one per
-    :data:`LOST_REPROBE_SEC`, one per :data:`GRACE_REPROBE_SEC` right after a reset step); False
-    otherwise, and the caller reports the chip as all-ones without reading it.
+    :data:`GRACE_REPROBE_SEC` right after a reset step, or one a decision read asked for while the
+    chip's remove is still to come); False otherwise, and the caller reports the chip as all-ones
+    without reading it. No poll clock makes a re-read due, and a sealed chip (:func:`seal`) is read
+    only in the grace.
 
     ``probe`` is a decision read (see :func:`reprobe_due`), not a poll: the re-read is due once the
     last real read is :data:`PROBE_MIN_SEC` old, so a chip that answers again on the same node is seen
@@ -240,15 +281,19 @@ def may_read(idx, node: Path, *, probe: bool = False) -> bool:
         if op_running():
             return True
         ident = node_identity(node)
-        if ident is not None and rec["node"] is not None and ident != rec["node"]:
+        # A node where the mark found none is a re-created one too (removed, then rescanned).
+        if ident is not None and ident != rec["node"]:
             renewed = True
         else:
             renewed = False
             now = time.monotonic()
+            grace = now < _grace_until
+            if rec.get("sealed") and not grace:
+                return False
             due = min(rec["next"], rec["read"] + PROBE_MIN_SEC) if probe else rec["next"]
             if now < due:
                 return False
-            rec["next"] = now + (GRACE_REPROBE_SEC if now < _grace_until else LOST_REPROBE_SEC)
+            rec["next"] = now + GRACE_REPROBE_SEC if grace else NEVER
             rec["read"] = now
             if rec["node"] is None:
                 rec["node"] = ident
