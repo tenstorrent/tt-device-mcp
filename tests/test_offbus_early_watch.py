@@ -229,6 +229,60 @@ async def test_an_armed_watch_confirms_a_whole_mesh_drop_after_the_confirm_bound
     assert srv.fsm.state is not ServerState.HEALTHY
 
 
+@pytest.mark.asyncio
+async def test_a_lone_chip_s_first_all_ones_read_arms_the_watch_and_confirms_at_the_bound(watch):
+    """Class B1 with only correctable AER on its path (nothing arms the watch): the chip's own first
+    all-ones read arms the fast cadence, so the next sample comes FAST_SAMPLE_SEC later and the chip
+    is isolated once it has read dead for FAST_CONFIRM_SEC, not a whole SAMPLE_INTERVAL_SEC on."""
+    s, clock, isolated, events = watch
+    bad = {"0": DEAD, "13": LIVE, "31": LIVE}
+    assert not s.fast_active()
+
+    await s.check_for_dead_chips(bad)  # t=0: strike 1, on the regular cadence
+    assert s.fast_active(), "the first all-ones read arms the fast cadence"
+    assert [f["reason"] for k, f in events if k == "offbus_watch_armed"] == ["chip(s) 0 read all-ones"]
+    clock.t += telemetry.FAST_SAMPLE_SEC
+    await s.check_for_dead_chips(bad)  # t=2: two samples, the bound not yet
+    assert isolated == [], "two fast samples 2 s apart are not the debounce"
+    assert chip_state.is_lost("0")
+    clock.t += telemetry.FAST_SAMPLE_SEC
+    await s.check_for_dead_chips(bad)  # t=4: lasted the bound
+    assert isolated == ["0"], "contained at FAST_CONFIRM_SEC, not SAMPLE_INTERVAL_SEC"
+    assert _kinds(events).count("offbus_watch_armed") == 1, "a chip already struck arms nothing again"
+
+
+@pytest.mark.asyncio
+async def test_a_lone_chip_that_answers_again_after_its_first_all_ones_read_is_not_confirmed(watch):
+    """The arm decides nothing: a chip that reads all-ones once and answers on the next fast sample
+    is a blip, never isolated and never marked lost."""
+    s, clock, isolated, _ = watch
+    await s.check_for_dead_chips({"0": DEAD, "13": LIVE, "31": LIVE})
+    for n in range(1, 4):
+        clock.t += telemetry.FAST_SAMPLE_SEC
+        live = [LIVE[0] + n, *LIVE[1:]]
+        await s.check_for_dead_chips({"0": live, "13": live, "31": live})
+    assert isolated == [] and not chip_state.is_lost("0")
+    assert srv.fsm.state is ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["blackout", "recovering"])
+async def test_a_first_all_ones_read_arms_nothing_on_a_blackout_or_under_a_recovery_step(watch, case):
+    """Every chip at once is the re-init blip the blackout check proves on the regular cadence, and a
+    recovery step that owns the chips takes them off the bus by design (I66): neither arms the watch."""
+    s, _, _, events = watch
+    if case == "recovering":
+        chip_state.set_recovering("op:reset", True)
+        sample = {"0": DEAD, "13": LIVE, "31": LIVE}
+    else:
+        sample = {"0": DEAD, "13": DEAD, "31": DEAD}
+    try:
+        await s.check_for_dead_chips(sample)
+    finally:
+        chip_state.set_recovering("op:reset", False)
+    assert not s.fast_active() and "offbus_watch_armed" not in _kinds(events)
+
+
 # --- debounce ----------------------------------------------------------------------------------
 
 

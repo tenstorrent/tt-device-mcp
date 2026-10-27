@@ -21,6 +21,7 @@ import threading
 
 import pytest
 
+from tests.conftest import step_sampler_clock
 from tt_device_mcp import server as srv
 from tt_device_mcp import telemetry
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
@@ -82,6 +83,7 @@ def valve(monkeypatch):
         return []
 
     monkeypatch.setattr(srv, "_set_device_pollers", pollers)
+    step_sampler_clock(monkeypatch)
     return log, detach_ok
 
 
