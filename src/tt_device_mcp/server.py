@@ -7351,8 +7351,10 @@ def _power_cycle_context() -> tuple:
 
 
 def _power_cycle_marker_context() -> Optional[tuple]:
-    """The pending marker's context; None when the broker cannot power-cycle, so no 'possible' is written."""
-    return _power_cycle_context() if _auto_power_cycle_enabled() else None
+    """The pending marker's context; None when no power cycle can follow (neither the auto power cycle
+    nor a configured I27 command), so no 'possible' is written."""
+    armed = _auto_power_cycle_enabled() or offbus_power_cycle.power_cycle_argv() is not None
+    return _power_cycle_context() if armed else None
 
 
 def _note_power_cycle_trigger(reason: str) -> None:

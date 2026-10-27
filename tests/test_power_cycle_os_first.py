@@ -754,8 +754,8 @@ async def test_the_escalation_journals_class_chips_and_hold_before_the_unit(esca
 @pytest.mark.asyncio
 async def test_the_escalation_marks_the_cycle_possible_then_requested(escalation, monkeypatch):
     """The broker's own cycle: 'possible' when the escalation names its trigger, 'requested' as the
-    unit starts, both from the broker's provider (memory only); with the auto power cycle off the
-    provider writes no 'possible'."""
+    unit starts, both from the broker's provider (memory only); with neither the auto power cycle nor
+    a configured command the provider writes no 'possible'."""
     monkeypatch.setattr(escalation["mech"], "power_cycle_journal", srv._journal_power_cycle_foreign_holders)
     monkeypatch.setattr(srv, "_foreign_holder_rows", lambda: [])
     monkeypatch.setattr(srv, "_offbus_one_shot_chips", lambda: {"0"})
@@ -781,7 +781,11 @@ async def test_the_escalation_marks_the_cycle_possible_then_requested(escalation
     )
     assert srv._power_cycle_marker_context() == ("partial_offbus", {"0": "0000:01:00.0"}, "2026-01-01T00:00:00")
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: False)
+    monkeypatch.delenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", raising=False)
     assert srv._power_cycle_marker_context() is None
+    # The I27 configured command can still cycle the host: the marker still warns.
+    monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", "ipmitool chassis power cycle")
+    assert srv._power_cycle_marker_context() == ("partial_offbus", {"0": "0000:01:00.0"}, "2026-01-01T00:00:00")
 
 
 @pytest.mark.asyncio
