@@ -188,12 +188,31 @@ def _proc_stat_fields(pid: int) -> "list[str] | None":
     return data[data.rindex(")") + 2 :].split()
 
 
+# A live process's environ reads empty while it execs: the new image's environment is not set up
+# yet. A setsid child that is exec'ing its command, with its shell gone, then shows neither ancestry
+# nor token (seen under load in a PID namespace). Such a read is taken again, for at most this long.
+_TOKEN_REREAD_SEC = 2.0
+_PF_KTHREAD = 0x00200000
+
+
 def _carries_spawn_token(pid: int) -> bool:
-    try:
-        with open(f"/proc/{pid}/environ", "rb") as f:
-            return f"{_SPAWN_TOKEN_ENV}={_SPAWN_TOKEN}".encode() in f.read().split(b"\0")
-    except OSError:
-        return False
+    """pid's environ holds this run's token. An empty read of a live user process cannot tell and
+    is read again until the bound; one still empty then, a zombie or a kernel thread is not ours."""
+    deadline = time.monotonic() + _TOKEN_REREAD_SEC
+    while True:
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                raw = f.read()
+        except OSError:
+            return False
+        if raw:
+            return f"{_SPAWN_TOKEN_ENV}={_SPAWN_TOKEN}".encode() in raw.split(b"\0")
+        fields = _proc_stat_fields(pid)
+        if fields is None or fields[0] in ("Z", "X") or int(fields[6]) & _PF_KTHREAD:
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.005)
 
 
 def _spawned_by_this_run(pid: int) -> bool:
