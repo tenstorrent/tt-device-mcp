@@ -247,6 +247,53 @@ def _one_line(reason: str) -> str:
     return " ".join(str(reason).split())[:300]
 
 
+# Spec 04 I88. What asked for the cycle, journaled just before the fallback unit starts: the broker's
+# escalation notes it (note_power_cycle_trigger) and fire_os_first takes it once. A note older than any
+# pre-cycle hook could take is from an escalation that never fired and is not used.
+_trigger: dict = {}
+TRIGGER_MAX_AGE_SEC = PRE_POWER_CYCLE_HOOK_TIMEOUT_MAX_SEC + 600.0
+
+
+def note_power_cycle_trigger(reason: str, fault_class: str = "", chips: Optional[dict] = None, hold: str = "") -> None:
+    """Record why the next cycle fires: the escalation's reason (the auto_recovery row's text), the
+    fault class, ``{chip index: PCI address or None}`` and the hold episode."""
+    _trigger.clear()
+    _trigger.update(reason=reason, fault_class=fault_class, chips=dict(chips or {}), hold=hold, at=time.monotonic())
+
+
+def power_cycle_trigger_text(reason: str) -> str:
+    """One line naming the cycle's trigger; the passed reason alone when no fresh note is there."""
+    t = dict(_trigger)
+    _trigger.clear()
+    if not t or time.monotonic() - t.get("at", 0.0) > TRIGGER_MAX_AGE_SEC:
+        t = {}
+    chips = sorted((t.get("chips") or {}).items(), key=lambda i: (len(str(i[0])), str(i[0])))
+    named = ", ".join(f"{c} ({bdf or 'address unknown'})" for c, bdf in chips)
+    parts = [
+        f"class={t.get('fault_class') or 'unknown'}",
+        f"chips=[{named}]",
+        f"reason={_one_line(t.get('reason') or reason)}",
+    ]
+    if t.get("hold"):
+        parts.append(f"hold={t['hold']}")
+    return " ".join(" ".join(parts).split())[:900]
+
+
+def _journal_trigger(reason: str, unit: str) -> str:
+    """Journal the trigger under the broker before the fallback unit starts; the returned text goes
+    in the unit's description. Best effort: never raises, never delays the cycle."""
+    try:
+        text = power_cycle_trigger_text(reason)
+        _logger.warning("POWER CYCLE TRIGGER (unit %s): %s", unit, text)
+        return text
+    except Exception as exc:  # noqa: BLE001 - logging only; never holds the cycle
+        try:
+            _logger.error("POWER CYCLE TRIGGER: could not journal it (%r); cycling anyway", exc)
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
+
 def fallback_pid_file() -> str:
     """Where the fallback records its pid for the hook: beside the request, so both share /run."""
     base = REQUEST_FILE[: -len(".request")] if REQUEST_FILE.endswith(".request") else REQUEST_FILE
@@ -259,18 +306,21 @@ def request_text(argv: list, reason: str, now: float, timeout: float = DEFAULT_P
     return "\n".join([str(int(now)), _one_line(reason), str(hook_try_timeout_sec(timeout)), *argv]) + "\n"
 
 
-def fallback_argv(argv: list, bound: int, unit: str, *, reason: str = "", timeout: float = STEP_TIMEOUT_SEC) -> list:
+def fallback_argv(
+    argv: list, bound: int, unit: str, *, reason: str = "", timeout: float = STEP_TIMEOUT_SEC, trigger: str = ""
+) -> list:
     """The transient unit that cycles a hung shutdown. DefaultDependencies=no keeps it out of the
     shutdown transaction, and its '@' argv[0] keeps it alive through systemd-shutdown's killall, so it
     bounds every stage up to the hook, which stops it by its recorded pid and fires instead. The cycle
-    command gets the reason in ``TT_DEVICE_MCP_POWER_CYCLE_REASON`` and runs under ``timeout``."""
+    command gets the reason in ``TT_DEVICE_MCP_POWER_CYCLE_REASON`` and runs under ``timeout``; the
+    ``trigger`` line goes in the unit's description, so the unit's own journal says why."""
     return [
         "systemd-run",
         f"--unit={unit}",
         "--collect",
         "--property=DefaultDependencies=no",
         f"--setenv=TT_DEVICE_MCP_POWER_CYCLE_REASON={_one_line(reason)}",
-        "--description=tt-device-mcp: power-cycle a hung shutdown (spec 04 I88)",
+        "--description=tt-device-mcp: power-cycle a hung shutdown (spec 04 I88)" + (f": {trigger}" if trigger else ""),
         "/bin/bash",
         "-c",
         FALLBACK_LAUNCH_SH,
@@ -596,7 +646,8 @@ def fire_os_first(argv: list, reason: str, timeout: float = DEFAULT_POWER_CYCLE_
         except OSError as e:
             why = f"could not write {REQUEST_FILE}: {e}"
     if not why:
-        rc, out = _run_step(fallback_argv(argv, bound, unit, reason=reason, timeout=timeout))
+        trigger = _journal_trigger(reason, unit)
+        rc, out = _run_step(fallback_argv(argv, bound, unit, reason=reason, timeout=timeout, trigger=trigger))
         if rc == 0:
             started = True
         else:

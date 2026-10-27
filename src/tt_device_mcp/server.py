@@ -7325,10 +7325,37 @@ def _foreign_holder_rows() -> list:
     return _log_foreign_holder_identities("power cycle:", pids) if pids else []
 
 
+def _note_power_cycle_trigger(reason: str) -> None:
+    """Spec 04 I88: hand the cycle what asked for it (class, off-bus chips with their PCI addresses,
+    hold episode), journaled just before its unit starts. From memory only: no chip is read, since a
+    chip off the bus must not be touched again. Never raises."""
+    try:
+        from tt_device_mcp.health.recovery.galaxy import _offbus_fault_class, _whole_trays_off
+        from tt_device_mcp.health.recovery.stages.power_cycle import note_power_cycle_trigger
+
+        chips = sorted(_offbus_one_shot_chips(), key=str)
+        banked = galaxy_recovery._chip_buses_now() if galaxy_recovery is not None else {}
+        bdfs = {
+            str(c): device_pci_map.get(str(c)) or banked.get(c) or banked.get(str(c)) or banked.get(int(c))
+            for c in chips
+            if str(c).isdigit()
+        }
+        expected = health_monitor.expected(0) if health_monitor is not None else 0
+        tray_map = galaxy_recovery._tray_map_now() if galaxy_recovery is not None else None
+        whole = bool(_whole_trays_off({int(c) for c in bdfs}, expected, tray_map)) if bdfs else False
+        fault_class = _offbus_fault_class(len(bdfs), expected, whole) if bdfs else "present_mesh"
+        note_power_cycle_trigger(reason, fault_class, bdfs, device_hold_episode_since)
+    except Exception as e:  # noqa: BLE001 - logging only; never holds the cycle
+        if logger:
+            logger.warning(f"power cycle: trigger unread: {e!r}")
+
+
 async def _journal_power_cycle_foreign_holders(reason: str) -> None:
     """Spec 04 I103: a foreign holder never defers the power cycle, so name it in the journal with the
     cycle (``power_cycle_foreign_holders``, the holder-identity fields). Bounded by
-    POWER_CYCLE_HOLDER_LOG_SEC and never raises: the cycle fires whatever this read finds."""
+    POWER_CYCLE_HOLDER_LOG_SEC and never raises: the cycle fires whatever this read finds. It first
+    notes the cycle's trigger (I88, :func:`_note_power_cycle_trigger`)."""
+    _note_power_cycle_trigger(reason)
     try:
         rows = await aio.wait_for(asyncio.to_thread(_foreign_holder_rows), POWER_CYCLE_HOLDER_LOG_SEC)
     except Exception as e:  # noqa: BLE001 - logging only; never holds the cycle
