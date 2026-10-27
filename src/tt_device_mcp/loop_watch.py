@@ -34,7 +34,7 @@ _state: dict = {"loop": None, "thread": None, "task": None, "tick": 0.0, "loop_t
 _stack_reported: Optional[float] = None  # tick value of the stall whose stack was already logged
 
 
-def loop_stack(thread_id: int, depth: int = 6) -> str:
+def loop_stack(thread_id: int, depth: int = 10) -> str:
     """The innermost ``depth`` frames of a thread, innermost first, as ``file:line func`` items."""
     frame = sys._current_frames().get(thread_id)
     if frame is None:

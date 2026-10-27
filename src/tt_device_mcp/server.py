@@ -46,7 +46,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import yaml
 from mcp.server.mcpserver import Context, MCPServer
@@ -4873,14 +4873,24 @@ def _fabric_hold_only(own_op: str = "") -> bool:
     the runtime named no fault, and no chip is off the bus right now. That is the one hold an
     operator verification job may pass, and the one its fabric pass may lift: every other hold
     names a fault that a check run on the device cannot clear."""
+    return _fabric_hold_shape(own_op) and not _device_liveness_reason()
+
+
+def _fabric_hold_shape(own_op: str = "") -> bool:
+    """_fabric_hold_only without its live probe: the in-memory half."""
     return (
         device_op_active in ("", own_op)
         and fsm.state in (ServerState.RECOVERING, ServerState.DOWN)
         and fsm.record.why == FABRIC_RELIFT_WHY
         and not fsm.record.dirty
         and not device_fault_reported
-        and not _device_liveness_reason()
     )
+
+
+async def _fabric_hold_only_live(own_op: str = "") -> bool:
+    """_fabric_hold_only with its live probe read off the event loop (spec 03 I87). A read that
+    times out reads as no chip readable, so the hold is not fabric-only and nothing passes it."""
+    return _fabric_hold_shape(own_op) and await _with_decision_beats(lambda: _fabric_hold_only(own_op))
 
 
 # The episode (its ``since``) of a 77-only hold that owes the startup fabric pass it never got: the
@@ -8571,15 +8581,17 @@ def _device_unavailable_for_tenant() -> str:
     return ""
 
 
-def _slurm_step_verdict(*, require_free: bool) -> dict:
+def _slurm_step_verdict(*, require_free: bool, reason: Optional[str] = None) -> dict:
     """The externally-driven step's answer: is the mesh fit, and (``require_free``) is it free?
 
     Fit is the FSM's own verdict plus one live sysfs sample, reusing the two predicates the
     queue's own admission reads — an external driver and a queued job must never get different
     answers about the same device. Free is the reset gate's tenant rule: a holder `is_tenant`
-    counts, or a scan too blind to rule one out (04 I7 fails closed).
+    counts, or a scan too blind to rule one out (04 I7 fails closed). ``reason``: the fit verdict an
+    async caller already read off the loop (_device_degraded_for_decision_live).
     """
-    reason = _device_degraded_for_decision()
+    if reason is None:
+        reason = _device_degraded_for_decision()
     scan = enumerate_device_holders()
     foreign = [h for h in scan.holders if is_tenant(h)]
     holders = [{"pid": h.pid, "uid": h.uid, "username": h.username} for h in foreign]
@@ -8665,15 +8677,67 @@ async def _status_beats_now() -> tuple[dict, Optional[float]]:
 
 async def _status_view(build: Callable[[], dict]) -> dict:
     """``build()`` on the loop with this call's heartbeats read off it (spec 03 I87)."""
-    beats, stale = await _status_beats_now()
-    token = _status_beats.set(beats)
-    try:
-        payload = build()
-    finally:
-        _status_beats.reset(token)
+    payload, stale = await _with_status_beats(build)
     if stale is not None:
         payload["chip_read_stale_sec"] = stale
     return payload
+
+
+async def _with_status_beats(build: Callable[[], Any]) -> tuple[Any, Optional[float]]:
+    """``(build(), stale_age_sec)``: ``build()`` on the loop with a status read taken off it (I87)."""
+    beats, stale = await _status_beats_now()
+    token = _status_beats.set(beats)
+    try:
+        return build(), stale
+    finally:
+        _status_beats.reset(token)
+
+
+# Spec 03 I87: a decision read (admission, exec, a Slurm step, a held job's poll) is a fresh read,
+# never a cached one, but it runs in a worker thread too, one at a time: 32 chips slow to answer
+# blocked the loop for 3-10 s per decision. A read not back within DECISION_CHIP_READ_TIMEOUT_SEC
+# answers as no chip readable, which refuses the tenant and lifts nothing.
+DECISION_CHIP_READ_TIMEOUT_SEC = 30.0
+_decision_read: Optional[tuple] = None  # (loop, future) of the decision read in flight
+
+
+async def _decision_chip_read() -> dict:
+    """One fresh heartbeat read for a decision, in a worker thread. Waits for a decision read still
+    in flight before it starts its own, so a hung chip never piles up threads. ``{}`` (no chip
+    readable) once DECISION_CHIP_READ_TIMEOUT_SEC has passed."""
+    global _decision_read
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + DECISION_CHIP_READ_TIMEOUT_SEC
+    started = time.monotonic()
+    while _decision_read is not None and _decision_read[0] is loop and not _decision_read[1].done():
+        done, _ = await asyncio.wait({_decision_read[1]}, timeout=max(0.0, deadline - loop.time()))
+        if not done:
+            break
+    else:
+        fut = asyncio.ensure_future(asyncio.to_thread(read_heartbeats))
+        _decision_read = (loop, fut)
+        done, _ = await asyncio.wait({fut}, timeout=max(0.0, deadline - loop.time()))
+        if done:
+            return fut.result()
+    if logger:
+        logger.warning(
+            f"HEALTH decision heartbeat read not back after {time.monotonic() - started:.1f}s: "
+            "no chip counts as readable"
+        )
+    return {}
+
+
+async def _with_decision_beats(decide: Callable[[], Any]) -> Any:
+    """``decide()`` on the loop with a fresh heartbeat read taken off it (spec 03 I87). Nothing is
+    read where ``decide`` would read nothing: no detector, or a reset step owns the chips (I66)."""
+    if not heartbeat_supported() or chip_state.recovering():
+        return decide()
+    beats = await _decision_chip_read()
+    token = _status_beats.set(beats)
+    try:
+        return decide()
+    finally:
+        _status_beats.reset(token)
 
 
 def _startup_pci_map() -> dict:
@@ -8795,6 +8859,15 @@ def _device_degraded_for_decision() -> str:
     not refused as off the bus on an all-ones nobody read. Status and /health stay gated (03 I66)."""
     chip_state.reprobe_due()
     return _device_degraded_for_tenant()
+
+
+async def _device_degraded_for_decision_live() -> str:
+    """_device_degraded_for_decision with its live probe read off the event loop (spec 03 I87). No
+    read where the in-memory verdict already refuses, as before."""
+    if _device_unavailable_for_tenant():
+        return _device_degraded_for_decision()
+    chip_state.reprobe_due()  # before the read the worker thread takes
+    return await _with_decision_beats(_device_degraded_for_decision)
 
 
 def _device_hold_state(now: Optional[datetime] = None) -> Optional[tuple[str, str]]:
@@ -11184,7 +11257,7 @@ async def _await_device_free_for_tenant(job_log_file: Optional[Path]) -> str:
     # `break`, not a bare `return ""` — such a chip leaves fsm HEALTHY, and a read of the
     # 0xFFFFFFFF it now returns can stall the host CPU that issues it, so the job must
     # never be dispatched.
-    return _device_degraded_for_decision()
+    return await _device_degraded_for_decision_live()
 
 
 LEFTOVER_REBOOT_HINT = (
@@ -12237,7 +12310,7 @@ async def _hold_loop(
     while reason:
         if job.status == JobStatus.KILLED:
             return reason  # released by a cancel, not by recovery — the device stays held
-        if _fabric_hold_only():
+        if await _fabric_hold_only_live():
             if job.verification:
                 # The hold narrowed to fabric-only while this verification job waited (spec 01 I21).
                 _pass_hold_for_verification(job, job_log_file, reason)
@@ -13842,7 +13915,7 @@ async def _settle_verification_job(job: "Job") -> bool:
     argv = _verification_argv(job.command)
     if not argv or len(argv) != 1 or VERIFICATION_CHECKS.get(os.path.basename(argv[0])) != "fabric":
         return False
-    if not _fabric_hold_only():
+    if not await _fabric_hold_only_live():
         return False
     broker_env = {k: v for k, v in os.environ.items() if k.startswith("TTDEV_")}
     job_env = _job_ttdev_env(job)
@@ -13885,10 +13958,12 @@ async def _settle_verification_job(job: "Job") -> bool:
         # during the await.
         if not healthy:
             return _not_lifted("the enum+ARC read is not healthy")
+        # The live probe is read off the loop (03 I87); nothing awaits between the checks below and
+        # the lift, so the reset check after it still sees any reset that ran during the read.
+        if not await _fabric_hold_only_live(own_op=VERIFICATION_LIFT_OP):
+            return _not_lifted("the hold is no longer fabric-only")
         if _reset_since_start():
             return _not_lifted("a reset ran since the check started")
-        if not _fabric_hold_only(own_op=VERIFICATION_LIFT_OP):
-            return _not_lifted("the hold is no longer fabric-only")
         # No reset since the pass started, so it settles the post-reset fabric debt a broker start or
         # a reset left (04 I32) as the monitor's own pass would; without that the release is refused.
         if health_monitor is not None:
@@ -14046,7 +14121,7 @@ async def _job_runner_loop():
 
         # An operator verification job passes a fabric_unverified hold and no other (spec 01 I21):
         # the hold stays latched, since the device is not proven fit until the check passes.
-        if job.verification and blocked_reason and _fabric_hold_only():
+        if job.verification and blocked_reason and await _fabric_hold_only_live():
             _pass_hold_for_verification(job, job_log_file, blocked_reason)
             blocked_reason = ""
         else:
@@ -16691,7 +16766,8 @@ def create_mcp_server() -> MCPServer:
     async def api_recent_jobs(request: Request) -> JSONResponse:
         """REST API: the last N jobs (owner, command, runtime, status, ...)."""
         data = await _json_body(request)
-        return JSONResponse({"jobs": _recent_jobs(int(data.get("limit", 20)))})
+        recent, _ = await _with_status_beats(lambda: _recent_jobs(int(data.get("limit", 20))))
+        return JSONResponse({"jobs": recent})
 
     # ============== MCP Tools ==============
 
@@ -17517,7 +17593,7 @@ def create_mcp_server() -> MCPServer:
         # gates on rather than the op/dirty flags alone. Exec is a short synchronous call — a
         # reset+fabric pass can hold the device for twelve minutes — so it refuses and says why
         # rather than blocking the caller behind it.
-        blocked = _device_degraded_for_decision()
+        blocked = await _device_degraded_for_decision_live()
         if blocked:
             if logger:
                 logger.warning(f"  -> ERROR: device not free: {blocked}")
@@ -17667,7 +17743,8 @@ def create_mcp_server() -> MCPServer:
         """The last N jobs run through the broker (default 20), newest first, with
         owner, command, runtime, status, and exit code. Reads persisted job logs,
         so it covers finished jobs even after they leave the in-memory queue."""
-        return {"jobs": _recent_jobs(limit)}
+        recent, _ = await _with_status_beats(lambda: _recent_jobs(limit))
+        return {"jobs": recent}
 
     @mcp.tool(
         name="tt_device_queue_status",
@@ -17851,7 +17928,7 @@ def create_mcp_server() -> MCPServer:
                     "fsm_why": fsm.record.why,
                 }
 
-            verdict = _slurm_step_verdict(require_free=True)
+            verdict = _slurm_step_verdict(require_free=True, reason=await _device_degraded_for_decision_live())
             verdict["status"] = "ok" if verdict["ok"] else "unfit"
             return verdict
         finally:
@@ -17990,7 +18067,7 @@ def create_mcp_server() -> MCPServer:
                     "survivors": survivors,
                 }
 
-            verdict = _slurm_step_verdict(require_free=False)
+            verdict = _slurm_step_verdict(require_free=False, reason=await _device_degraded_for_decision_live())
             verdict["status"] = "ok" if verdict["ok"] else "unfit"
             verdict["recovered"] = was_degraded and verdict["ok"]
             verdict["reclaimed"], verdict["survivors"] = reclaimed, survivors
