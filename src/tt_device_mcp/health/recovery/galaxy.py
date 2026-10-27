@@ -74,7 +74,7 @@ from tt_device_mcp.health.recovery.base import (
     refuse_mesh_reset,
 )
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
-from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook
+from tt_device_mcp.health.recovery.stages.power_cycle import note_cycle_possible, run_pre_power_cycle_hook
 
 _logger = logging.getLogger("tt-device-mcp")
 
@@ -2600,6 +2600,7 @@ class GalaxyRecovery(Recovery):
         """The last-chance sweep right before a power cycle (spec 04 I58): run with foreign holders
         yielding (spec 04 I103), so a holder outside every broker scope is cleared like a reader
         and never holds the sweep or the cycle after it. See :meth:`_settle_and_verify_body`."""
+        note_cycle_possible("last-chance ladder before the power cycle")  # spec 04 I88 pending marker
         with pre_reset_scan.foreign_holders_yield():
             return await self._settle_and_verify_body(*args, **kwargs)
 
@@ -3412,6 +3413,7 @@ class GalaxyRecovery(Recovery):
             log(
                 f"{off_bus}/{expected} chip(s) off the bus fill whole trays — no reset first; straight to the power cycle"
             )
+            note_cycle_possible(f"{off_bus}/{expected} chip(s) off the bus fill whole trays")
             return ""
         standback = await asyncio.to_thread(offbus_power_cycle.standback_reason, require_manual_check=False)
         if standback:

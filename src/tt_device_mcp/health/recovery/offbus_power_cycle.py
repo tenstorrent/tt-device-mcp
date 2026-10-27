@@ -272,6 +272,9 @@ def note_whole_tray_down(episode: str, detail: str, now: Optional[datetime] = No
             fault_class="whole_tray",
             hold_age_sec=episode_age_sec(episode, now),
         )
+        from tt_device_mcp.health.recovery.stages.power_cycle import note_cycle_possible
+
+        note_cycle_possible(f"whole tray off the bus: {detail[-200:]}")  # spec 04 I88 pending marker
 
 
 def clear_whole_tray_down(episode: str, detail: str, fault_class: str = "") -> None:
