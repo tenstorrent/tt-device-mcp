@@ -761,6 +761,8 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     monkeypatch.setattr(srv.sampler, "pollers_stopped_for", frozenset(), raising=False)
     monkeypatch.setattr(srv.sampler, "pollers_deferred_for", frozenset(), raising=False)
     monkeypatch.setattr(srv.sampler, "prev_beats", {}, raising=False)
+    monkeypatch.setattr(srv.sampler, "stall_strikes", {}, raising=False)
+    monkeypatch.setattr(srv.sampler, "hung_held", frozenset(), raising=False)
     monkeypatch.setattr(srv.sampler, "scope_seen", False, raising=False)
     # The valve runs in flight and the chips they read all-ones or removed (spec 03 I94).
     monkeypatch.setattr(srv.sampler, "valve_runs", [], raising=False)
