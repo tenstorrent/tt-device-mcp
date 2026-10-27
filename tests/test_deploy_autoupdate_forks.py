@@ -73,7 +73,7 @@ def test_a_drain_poll_forks_a_bounded_number_of_processes(tmp_path, forks):
     for ticks in (2, 12):
         sub = tmp_path / str(ticks)
         sub.mkdir()
-        done, trace, _ = _drain(sub, running=ticks, queue=0)
+        done, trace, _ = _drain(sub, running=ticks, queue=0, lap_stand_ins=False)
         assert done.returncode == 0, done.stderr
         polled[ticks] = sum(t.startswith("pgrep ") for t in trace)  # one count of the broker's children a poll
         counts[ticks] = forks()
@@ -90,7 +90,7 @@ def test_a_lap_forks_a_bounded_number_of_processes(tmp_path, forks):
     root.mkdir()
     (root / "installed.sha").write_text("s0\n")
     (root / "last-apply").write_text("9990\n")
-    done, restarts, _ = _lap(tmp_path, now=10_000, sha="s1", quiet=None)
+    done, restarts, _ = _lap(tmp_path, now=10_000, sha="s1", quiet=None, stand_ins=False)
     assert done.returncode == 0 and restarts == [], done.stderr
     assert forks() <= _LAP_FORKS
 
@@ -102,13 +102,13 @@ def test_an_already_current_lap_starts_no_process(tmp_path, forks):
     root = tmp_path / "root"
     root.mkdir()
     (root / "installed.sha").write_text("s1\n")
-    done, restarts, _ = _lap(tmp_path, now=10_000, sha="s1", quiet=None)
+    done, restarts, _ = _lap(tmp_path, now=10_000, sha="s1", quiet=None, stand_ins=False)
     assert done.returncode == 0 and restarts == [] and not done.stderr, done.stderr
     assert forks() == 0
     record = root / "pending-head"
     for make in (lambda: record.write_text("9000 s1 9000\n"), lambda: record.symlink_to(root / "gone")):
         make()
-        done, restarts, _ = _lap(tmp_path, now=10_000, sha="s1", quiet=None)
+        done, restarts, _ = _lap(tmp_path, now=10_000, sha="s1", quiet=None, stand_ins=False)
         assert done.returncode == 0 and restarts == [], done.stderr
         assert not record.exists() and not record.is_symlink(), "the record of an applied sha outlived it"
 
@@ -121,18 +121,18 @@ def test_a_coalescing_record_is_rewritten_only_when_it_changes(tmp_path):
     (root / "installed.sha").write_text("s0\n")
     (root / "last-apply").write_text("1000\n")
     record = root / "pending-head"
-    _lap(tmp_path, now=10_000, sha="s1", quiet=None)
+    _lap(tmp_path, now=10_000, sha="s1", quiet=None, stand_ins=False)
     assert record.read_text() == "10000 s1 10000\n"
     inode = record.stat().st_ino
-    _lap(tmp_path, now=10_060, sha="s1", quiet=None)
+    _lap(tmp_path, now=10_060, sha="s1", quiet=None, stand_ins=False)
     assert record.read_text() == "10000 s1 10000\n" and record.stat().st_ino == inode
-    _lap(tmp_path, now=10_120, sha="s2", quiet=None)
+    _lap(tmp_path, now=10_120, sha="s2", quiet=None, stand_ins=False)
     assert record.read_text() == "10000 s2 10120\n" and record.stat().st_ino != inode
     elsewhere = tmp_path / "elsewhere"
     elsewhere.write_text(record.read_text())
     record.unlink()
     record.symlink_to(elsewhere)
-    _lap(tmp_path, now=10_180, sha="s2", quiet=None)
+    _lap(tmp_path, now=10_180, sha="s2", quiet=None, stand_ins=False)
     assert not record.is_symlink() and record.read_text() == "10000 s2 10120\n"
     assert not list(root.glob("pending-head.*")), "a temp record was left behind"
 
@@ -143,7 +143,7 @@ def test_a_drain_on_the_real_clock(tmp_path):
     # One poll sees a broker child (a job), the next sees none.
     pgrep = f"\npgrep() {{ seen pgrep; [ -e {once} ] && return 0; : > {once}; echo 777; }}\n"
     t0 = int(time.time())
-    done, trace, _ = _gate(tmp_path, stand_ins=pgrep, env={"TTDEV_HOLD_SETTLE_SEC": "0"})
+    done, trace, _ = _gate(tmp_path, stand_ins=pgrep, lap_stand_ins=False, env={"TTDEV_HOLD_SETTLE_SEC": "0"})
     t1 = int(time.time())
     assert done.returncode == 0, done.stderr
     m = re.search(r"drained after (\d+)s", done.stderr)
@@ -163,7 +163,7 @@ def test_a_lap_on_the_real_clock(tmp_path):
     last = int(time.time()) - 60
     (root / "last-apply").write_text(f"{last}\n")
     t0 = int(time.time())
-    done, restarts, _ = _lap(tmp_path, now=None, sha="s1")
+    done, restarts, _ = _lap(tmp_path, now=None, sha="s1", stand_ins=False)
     t1 = int(time.time())
     assert restarts == [], done.stderr
     line = (tmp_path / "logs" / "autoupdate.log").read_text().splitlines()[-1]

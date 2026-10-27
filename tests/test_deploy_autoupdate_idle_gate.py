@@ -72,6 +72,7 @@ def _gate(
     scopes="",
     queued=0,
     stand_ins="",
+    lap_stand_ins=True,
     env=None,
     hold_dir=True,
     main_pid=4242,
@@ -81,7 +82,8 @@ def _gate(
 ):
     """`install`: also run the last look before the restart (spec 08 I24), with this shell text
     standing in for the install between the gate and it; the restart then follows the STATE write.
-    `job_age`: seconds a running job scope has run, from systemd's start record (None: unreadable)."""
+    `job_age`: seconds a running job scope has run, from systemd's start record (None: unreadable).
+    `lap_stand_ins=False`: the real mv and rm, for the tests that count the script's own processes."""
     text = _SCRIPT.read_text()
     start = text.index("# Dispatch hold (spec 08 I18")
     end = text.index('echo "autoupdate: applying', start)
@@ -137,7 +139,7 @@ systemctl() {{
         restart*) on_restart; seen restart ;;
     esac
 }}
-{LAP_STAND_INS}{stand_ins}
+{LAP_STAND_INS if lap_stand_ins else ""}{stand_ins}
 """
     tail = 'echo "autoupdate: applying"\n' if install is None else 'echo "$remote_sha" > "$STATE"\n'
     script = prelude + gate + tail + "systemctl restart tt-device-broker\n"

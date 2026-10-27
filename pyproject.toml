@@ -25,8 +25,6 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-timeout>=2.1.0",
-    # --dist loadgroup below; loadgroup arrived in 2.5.
-    "pytest-xdist>=2.5.0",
 ]
 
 [project.scripts]
@@ -49,9 +47,6 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 # A hung test fails in minutes with its stacks printed, instead of holding CI for hours.
 timeout = 120
-# Under -n, the short fork-heavy deploy-script tests (marked xdist_group("forks")) share one worker,
-# so they no longer start their shell processes on every worker at once. No effect without -n.
-addopts = "--dist loadgroup"
 
 [tool.black]
 line-length = 120

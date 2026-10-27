@@ -341,6 +341,13 @@ def pytest_configure(config):
         "markers",
         "device: needs real Tenstorrent hardware; skipped without /dev/tenstorrent (spec 09 I8)",
     )
+    config.addinivalue_line("markers", "xdist_group(name): under -n, tests of one group run on one worker")
+    # Under -n, the short fork-heavy deploy-script tests (marked xdist_group("forks")) share one
+    # worker, so they no longer start their shell processes on every worker at once. Set here, not in
+    # addopts: a run without xdist (-p no:xdist) would refuse --dist. An explicit --dist is kept.
+    passed = list(config.invocation_params.args) + os.environ.get("PYTEST_ADDOPTS", "").split()
+    if getattr(config.option, "dist", None) == "load" and not any(a.startswith("--dist") for a in passed):
+        config.option.dist = "loadgroup"
 
 
 # The real /dev/tenstorrent, hardcoded here rather than read from srv.TT_DEV_DIR, because the
