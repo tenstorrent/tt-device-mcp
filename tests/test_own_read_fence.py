@@ -153,7 +153,7 @@ def test_a_fence_set_mid_snapshot_stops_the_next_attribute_read(monkeypatch, at)
     assert done["14"] == READS_PER_CHIP and "lost" not in out["14"], "the fence is per chip"
 
 
-def test_a_fence_ends_with_a_broker_reset_step_and_a_fresh_node(monkeypatch):
+def test_a_fence_ends_with_the_broker_s_own_reset_step(monkeypatch):
     _node("13")
     monkeypatch.setattr(pci, "_read_attr", lambda path: "100")
     chip_state.fence(["13"], "test")
@@ -269,3 +269,19 @@ def test_a_burst_chip_read_all_ones_after_the_stop_is_removed_before_the_kill(wa
     assert kills and detach < min(kills), f"the remove before any kill: {log}"
     assert _rows("chip_contained")[-1]["chips"] == ["13"]
     assert _stop_row()["offbus"] == [] and w.pending_stop is None
+
+
+def test_a_failed_fence_never_stops_the_containment(watch, monkeypatch):  # noqa: F811
+    _w, log, _detach_ok, burst = watch
+
+    def broken(*a, **k):
+        raise RuntimeError("fence failed")
+
+    monkeypatch.setattr(chip_state, "fence", broken)
+    _sample("13")
+    assert burst()
+    detach = log.index(("detach", "13"))
+    kills = [i for i, e in enumerate(log) if e[0] == "kill"]
+    assert kills and detach < min(kills), log
+    assert _rows("chip_contained")[-1]["removed"] is True
+    assert chip_state.is_lost("13"), "the chip is still marked lost, so no poll reads it"

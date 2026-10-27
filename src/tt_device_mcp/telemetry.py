@@ -827,7 +827,7 @@ class TelemetrySampler:
             # A chip read all-ones is fenced from this sample on (I97): no snapshot or heartbeat poll
             # of the broker's reads it again until a probe read, a reset step or a new node. A
             # whole-mesh blackout is not fenced: one such sample is a re-init blip until a second.
-            chip_state.fence(dead, "read all-ones", self._nodes(dead))
+            self._fence(dead, "read all-ones")
         if len(dead) == len(sample) and len(sample) > 1:
             # Every chip at once is the driver, the bus, or a reset — not 32 simultaneous chip
             # failures — so it never isolates. It must not dirty the device on one sample
@@ -919,6 +919,14 @@ class TelemetrySampler:
     @staticmethod
     def _nodes(ids) -> dict:
         return chip_state.chip_nodes(ids)
+
+    @classmethod
+    def _fence(cls, ids, reason: str) -> None:
+        """Spec 03 I97: fence ``ids``; a failure to fence never stops the containment or the sample."""
+        try:
+            chip_state.fence(ids, reason, cls._nodes(ids))
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _check_short_count(self, present: int, expected: int, log) -> None:
         """Fewer chip nodes than the baseline on two consecutive samples -> dirty (spec 03 I31).
@@ -1088,7 +1096,7 @@ class TelemetrySampler:
             return row
         # 0. Fence, before the first step: no read of the broker's own (a snapshot mid-chip, a
         # heartbeat poll) reaches the chips again, so none holds up their PCI remove (I97).
-        chip_state.fence(fresh, f"containment ({reason})", self._nodes(fresh))
+        self._fence(fresh, f"containment ({reason})")
         try:
             # 1. Stop, before anything that can block: no further read reaches the chips and no fd
             # closes while they are attached (I84). Budget: WATCH_STOP_BUDGET_SEC from the trigger.
@@ -1325,7 +1333,7 @@ class TelemetrySampler:
             isolated_chips.update(fresh)
         self.valve_removed.difference_update(fresh)
         # Fenced before anything else (I97): none of the broker's own reads holds up the remove.
-        chip_state.fence(fresh, "isolating", self._nodes(fresh))
+        self._fence(fresh, "isolating")
 
         if PCI_WRITER.latched:
             # Spec 04 I76: a PCI write is blocked in the kernel. A remove would only queue behind it on
