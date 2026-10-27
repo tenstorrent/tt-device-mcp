@@ -891,6 +891,18 @@ def _mesh_reset_before_host_rung_deadline_sec() -> float:
     return _stuck_hold_ceiling_sec() - MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC - MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC
 
 
+# Spec 04 I106: what a mesh reset that gave up at its driver wait still runs before the power cycle: the
+# I102 late-chip rescan, the I104 re-init of the chips present with its tail, the settle and the full
+# check's allowance. The sweep's repeated mesh reset adds it to its deadline when its reset gave up.
+GAVE_UP_TAIL_SEC = (
+    LATE_CHIP_RESCAN_SEC
+    + PRESENT_REINIT_SEC
+    + PRESENT_REINIT_TAIL_SEC
+    + MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC
+    + MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC
+)
+
+
 def _mesh_reset_before_host_rung_needs_sec() -> float:
     """Spec 04 I97: the hold time the reset and its full check need before the deadline: a reset that
     gives up at its driver wait, or the reset, the settle and the check."""
@@ -2427,6 +2439,7 @@ class GalaxyRecovery(Recovery):
                 # to the host rung as before; the refusal is journalled as itself, not as a reset.
                 health_event("reset_refused", context="reset_sweep", argv=argv, detail=out)
             elif late_chips:
+                self._mesh_reset_gave_up = bool(self.mechanism.last_reset_driver_wait_failed)
                 await self._late_chips_mesh_reset(argv, expected, log, late_chips_deadline)
                 await self._present_chips_reinit(expected, log, late_chips_deadline)
         except Exception as exc:  # noqa: BLE001 - the host rung above must fire even if a reset blew up
@@ -2447,9 +2460,10 @@ class GalaxyRecovery(Recovery):
         still missing ends the step at once. Never raises.
 
         Bounded from its own start: the wait for the second reset ends LATE_CHIP_STEP_SEC after it (the
-        reset is not killed). ``deadline``: the I97 deadline, a hold age. The step is not taken when it,
-        the settle and the full check (:func:`_late_chips_needs_sec`) would not end by it; it then adds
-        no time."""
+        reset is not killed). ``deadline``: the I97 deadline, a hold age. The rescan is not taken when it,
+        the re-init of the chips present and the full check (``GAVE_UP_TAIL_SEC``) would not end by it;
+        the second reset is not taken when it, the settle and the full check (:func:`_late_chips_needs_sec`
+        less the rescan) would not (spec 04 I106). A step not taken adds no time."""
         mech = self.mechanism
         if not (mech.last_reset_driver_wait_failed and mech.last_reset_tray_repower):
             return
@@ -2464,8 +2478,10 @@ class GalaxyRecovery(Recovery):
         if mech.last_reset_rescan_withheld:
             return skip("the rescan after the reset was withheld (I69)")
         if deadline is not None:
+            # I106: the rescan runs whenever it, the re-init of the chips present and the full check fit;
+            # the second reset only when it and the check do (below).
             age = _hold_age_sec(hold_since)
-            if age is None or age + _late_chips_needs_sec() > deadline:
+            if age is None or age + GAVE_UP_TAIL_SEC > deadline:
                 return skip(
                     f"it and the full check after it could not end by the {deadline:.0f}s deadline",
                     deadline_sec=round(deadline, 1),
@@ -2489,6 +2505,16 @@ class GalaxyRecovery(Recovery):
                 isolated=sorted(isolated or [], key=int),
                 removed=sorted(removed or [], key=int),
             )
+        if deadline is not None:
+            age = _hold_age_sec(hold_since)
+            if age is None or age + _late_chips_needs_sec() - LATE_CHIP_RESCAN_SEC > deadline:
+                return skip(
+                    f"every chip is back, but a second mesh reset and the full check after it could not end "
+                    f"by the {deadline:.0f}s deadline; the re-init of the chips present runs instead",
+                    deadline_sec=round(deadline, 1),
+                    on_bus=on_bus,
+                    expected=expected,
+                )
         self._late_chips_reset_spent = hold_since
         reason = "a second mesh reset re-inits the chips that came back after tt-smi's driver wait"
         try:
@@ -3789,6 +3815,8 @@ class GalaxyRecovery(Recovery):
     _whole_mesh_reset_spent: Optional[str] = None
     # The hold episode whose spec 04 I102 late-chip mesh reset has run: once per episode.
     _late_chips_reset_spent: Optional[str] = None
+    # Spec 04 I106: the last sweep mesh reset gave up at tt-smi's driver wait.
+    _mesh_reset_gave_up: bool = False
 
     async def _whole_mesh_reset_before_host_rung(
         self, expected: int, log, phase: str, evidence, *, repeat: bool = False, fabric_77_unverified: bool = False
@@ -3809,11 +3837,13 @@ class GalaxyRecovery(Recovery):
         I38, I100). It runs whatever the bus reads and whether or not this episode's I97 reset ran (the
         sweep's own record spends it, I87). Its deadline is the I97 one or, when that is too close, the
         hold's age at its start plus the reset's and check's allowance: it never waits for the 10-min
-        bound. A tenant, a reset cycling in its scope or a refused reset returns None (it did not run).
+        bound. When its reset gives up at the driver wait, the late-chip rescan, the re-init of the chips
+        present and the full check get ``GAVE_UP_TAIL_SEC`` more (I106), so none is cut for time. A
+        tenant, a reset cycling in its scope or a refused reset returns None (it did not run).
 
         After the reset, the full check runs only when the check's allowance is still left before the
         deadline; otherwise the caller power-cycles at once. The I102 late-chip step after a reset that
-        gave up at its driver wait is taken only when it and the check end by the deadline. A check still running at the deadline is failed: its readers are stopped, the hold stays
+        gave up at its driver wait rescans when the re-init and the check end by the deadline (I106). A check still running at the deadline is failed: its readers are stopped, the hold stays
         and the caller power-cycles; a result it gives after that is ignored."""
         argv = self.reset_argv(list(range(expected)))
         hold_since = self.deps.device_hold_episode_since() or ""
@@ -3881,12 +3911,20 @@ class GalaxyRecovery(Recovery):
             deadline_sec=round(deadline, 1),
             repeat=repeat,
         )
-        if not await self._issue_all_resets_back_to_back([], expected, log, do_sbr=False, late_chips_deadline=deadline):
+        # I106: on the repeat, a reset that gives up at its driver wait gets the late-chip rescan, the
+        # re-init of the chips present and the full check on top of its own deadline.
+        tail_deadline = deadline + GAVE_UP_TAIL_SEC if repeat else deadline
+        self._mesh_reset_gave_up = False
+        if not await self._issue_all_resets_back_to_back(
+            [], expected, log, do_sbr=False, late_chips_deadline=tail_deadline
+        ):
             if repeat:
                 log("the repeated mesh reset before the host rung was refused — it did not run")
                 return None
             log("the mesh reset before the host rung was refused — the power cycle decides")
             return False
+        if self._mesh_reset_gave_up:
+            deadline = tail_deadline
         left = deadline - (_hold_age_sec(hold_since) or age)
         no_check = ""
         if left < MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC + MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC:

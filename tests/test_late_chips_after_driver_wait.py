@@ -10,9 +10,10 @@ PCI writer's bound, no settle). Every expected chip back on the bus: the broker'
 more mesh reset runs, then the caller's full check with fabric decides. A chip still missing: the full
 check, then the power cycle, with no wait added. A reset that did not run (no re-power) gets none of it.
 The step is bounded from its own start (LATE_CHIP_STEP_SEC until the wait for its reset ends). Under an
-I97 deadline it is taken only when it, the settle and the full check end by that deadline; otherwise it
-adds no time. Only a just-passed full check lifts the hold. No test reaches a real reset, rescan or
-power cycle."""
+I97 deadline the rescan runs only when it, the re-init of the chips present and the full check end by
+that deadline, the second reset only when it, the settle and the check do; otherwise it adds no time.
+On the I100 repeat a reset that gave up gets GAVE_UP_TAIL_SEC more (I106). Only a just-passed full
+check lifts the hold. No test reaches a real reset, rescan or power cycle."""
 
 import functools
 import time
@@ -48,6 +49,7 @@ def _late(
     second_gives_up=False,
     reinit_back=False,
     reinit_rc=0,
+    held_sec=None,
 ):
     """The 10-min bound on a 32-chip mesh holding with chip 31 off the bus. The sweep's mesh reset is a
     glx_reset whose tt-smi gave up at its driver wait with chips 30 and 31 out (after the tray re-power
@@ -58,8 +60,10 @@ def _late(
     ``counters["waits"]`` holds each mesh reset's ``wait_until`` (None when not given) and
     ``counters["rescanned_at"]`` the monotonic time of each rescan. The I104 re-init of the chips present
     (``present reinit`` in ``order``) ends with ``reinit_rc``; when ``reinit_back`` the reset path's rescan
-    after it finds the missing chips back. Its waits are in ``counters["reinit_waits"]``."""
-    order, _names, counters = _rig(monkeypatch, tmp_path, verdicts=verdicts)
+    after it finds the missing chips back. Its waits are in ``counters["reinit_waits"]``. ``held_sec``: the hold's age when the ladder starts
+    (the rig's 21 min when None)."""
+    held = {} if held_sec is None else {"held_min": held_sec / 60}
+    order, _names, counters = _rig(monkeypatch, tmp_path, verdicts=verdicts, **held)
     if not i97:
         monkeypatch.setattr(srv.galaxy_recovery, "_repeat_runs_under_deadline", lambda expected: False)
     clock = _clock(monkeypatch) if gives_up_sec else None
@@ -226,45 +230,62 @@ async def test_the_second_mesh_reset_runs_once_per_hold(monkeypatch, tmp_path, c
 
 
 @pytest.mark.asyncio
-async def test_under_an_i97_deadline_the_step_runs_only_when_it_and_the_check_end_by_it(
+async def test_under_an_i97_deadline_the_rescan_runs_when_the_reinit_and_check_fit_the_reset_when_it_does(
     monkeypatch, tmp_path, clear_job_state
 ):
     """The step's bound: the rescan, the readers' grace, the BMC preflight, the wait for a dying holder
     and a reset that gives up (380 s), then the settle and the full check's allowance (570 s in all).
-    A deadline short of that stops the step before its rescan, with no time added; one with room runs
-    it, its reset's wait ending by the step's start plus 380 s."""
+    I106 splits the gate. A deadline short of the rescan, the re-init of the chips present and the check
+    (GAVE_UP_TAIL_SEC, 255 s) stops the step before its rescan, with no time added. One with room for
+    those but not for the second reset runs the rescan only and leaves the chips to the re-init. One with
+    room for all runs it in full, its reset's wait ending by the step's start plus 380 s."""
     assert galaxy.LATE_CHIP_STEP_SEC == 30 + 10 + 10 + 30 + 300 == 380
+    assert galaxy.GAVE_UP_TAIL_SEC == 30 + 30 + 5 + 10 + 180 == 255
     order, events, counters = _late(monkeypatch, tmp_path, back=2)
     needs = galaxy._late_chips_needs_sec()  # the rig sets the settle to 0
     assert needs == 380 + galaxy.MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC + 180
     gr, mech, log = srv.galaxy_recovery, srv.recovery_mechanism, lambda m: None
     await mech.reset_with_quiesce(["tt-smi", "-glx_reset"], log)
     age = galaxy._hold_age_sec(srv.device_hold_episode_since)
-    await gr._late_chips_mesh_reset(["tt-smi", "-glx_reset"], 32, log, age + needs - 5)
+    short = age + galaxy.GAVE_UP_TAIL_SEC - 5
+    await gr._late_chips_mesh_reset(["tt-smi", "-glx_reset"], 32, log, short)
     assert order == ["mesh reset"], "no rescan, no reader stop, no reset"
-    deadline = round(age + needs - 5)
     assert _step(events) == [
         {
             "fired": False,
-            "reason": f"it and the full check after it could not end by the {deadline}s deadline",
-            "deadline_sec": pytest.approx(age + needs - 5, abs=0.1),
+            "reason": f"it and the full check after it could not end by the {round(short)}s deadline",
+            "deadline_sec": pytest.approx(short, abs=0.1),
         }
     ]
+    rescan_only = age + needs - galaxy.LATE_CHIP_RESCAN_SEC - 5
+    assert age + galaxy.GAVE_UP_TAIL_SEC < rescan_only
+    await gr._late_chips_mesh_reset(["tt-smi", "-glx_reset"], 32, log, rescan_only)
+    assert order == ["mesh reset", "rescan"], "the rescan, then no reader stop and no second reset"
+    assert _step(events)[1] == {
+        "fired": False,
+        "reason": f"every chip is back, but a second mesh reset and the full check after it could not end by "
+        f"the {round(rescan_only)}s deadline; the re-init of the chips present runs instead",
+        "deadline_sec": pytest.approx(rescan_only, abs=0.1),
+        "on_bus": 32,
+        "expected": 32,
+    }
     await gr._late_chips_mesh_reset(["tt-smi", "-glx_reset"], 32, log, age + needs + 60)
-    assert order == ["mesh reset", "rescan", "readers stopped", "mesh reset"]
-    assert _step(events)[1]["fired"] is True
-    started, wait_until = counters["rescanned_at"][0], counters["waits"][1]
+    assert order == ["mesh reset", "rescan", "rescan", "readers stopped", "mesh reset"]
+    assert _step(events)[2]["fired"] is True
+    started, wait_until = counters["rescanned_at"][1], counters["waits"][1]
     assert started < wait_until <= started + galaxy.LATE_CHIP_STEP_SEC
 
 
 @pytest.mark.asyncio
-async def test_on_the_i100_repeat_the_step_is_not_taken_and_the_power_cycle_keeps_its_bound(
+async def test_on_the_i100_repeat_a_give_up_gets_the_rescan_the_reinit_and_the_check_before_the_cycle(
     monkeypatch, tmp_path, clear_job_state
 ):
     """The sweep's repeated mesh reset runs as the I97 one (I100) under a deadline of its start plus
-    300 s. Its tt-smi gives up at the driver wait after 263 s with both chips back: about 37 s are left,
-    short of the step and its check, so the step stops before its rescan. No check (it could not end by
-    the deadline): the hold stays and the power cycle is requested within the repeat's bound."""
+    300 s. Its tt-smi gives up at the driver wait after 263 s with both chips back. I106: the give-up
+    moves that deadline on by GAVE_UP_TAIL_SEC, so the rescan runs; a second mesh reset no longer fits,
+    so the chips present get their POST_RESET and re-init (I104) instead, and the full check with fabric
+    decides. It fails: the hold stays and the power cycle is requested by the repeat's start plus its
+    allowance, the tail, the kill grace and the reap."""
     order, events, counters = _late(monkeypatch, tmp_path, back=2, i97=True, gives_up_sec=263)
     cycled_at = []
 
@@ -274,34 +295,47 @@ async def test_on_the_i100_repeat_the_step_is_not_taken_and_the_power_cycle_keep
 
     monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
     assert await _bound_ladder() == OUTCOME_TERMINAL
-    assert _after_sweep_mesh(order) == ["mesh reset", "power cycle"]
+    tail = ["mesh reset", "rescan", "readers stopped", "present reinit", "full check", "power cycle"]
+    assert _after_sweep_mesh(order) == tail
     fired = _i97(events)
     assert [(k["fired"], k["repeat"]) for k in fired] == [(True, True)]
     step = _step(events)
-    assert len(step) == 1 and step[0]["fired"] is False and "deadline" in step[0]["reason"]
-    assert step[0]["deadline_sec"] == fired[0]["deadline_sec"], "the I97 deadline, unchanged"
+    assert (
+        len(step) == 1
+        and step[0]["fired"] is False
+        and "re-init of the chips present runs instead" in step[0]["reason"]
+    )
+    assert step[0]["deadline_sec"] == pytest.approx(fired[0]["deadline_sec"] + galaxy.GAVE_UP_TAIL_SEC, abs=0.1)
+    assert [k["fired"] for n, k in events if n == "present_chips_reinit"] == [True]
     unverified = [k for n, k in events if n == "whole_mesh_reset_before_host_rung_unverified"]
-    assert len(unverified) == 1 and "gave up" in unverified[0]["reason"] and "deadline" in unverified[0]["reason"]
-    bound = NEEDS + galaxy.MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC + galaxy.MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC
+    assert len(unverified) == 1 and "reason" not in unverified[0], "the check ran and failed, not cut for time"
+    bound = NEEDS + galaxy.GAVE_UP_TAIL_SEC
+    bound += galaxy.MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC + galaxy.MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC
     assert len(cycled_at) == 1 and cycled_at[0] <= fired[0]["hold_age_sec"] + bound
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
 
 
 @pytest.mark.asyncio
-async def test_on_the_i97_path_the_step_is_not_taken_and_the_power_cycle_comes_by_the_bound(
+async def test_on_the_i97_path_a_give_up_gets_the_rescan_the_reinit_and_the_check_then_the_cycle_by_the_bound(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """Class B1: the SBR has every chip back, the check fails on ARC-not-ready chips, and the I97 mesh
-    reset starts at the latest hold age its deadline allows. Its tt-smi gives up at the driver wait
-    after 263 s with the trays re-powered: the step would end past the deadline, so it stops before
-    its rescan. No check, the hold stays, and the power cycle is requested by the 10-min bound."""
+    """Class B1: the SBR has every chip back, the check fails on ARC-not-ready chips, and the sweep's
+    repeated mesh reset starts at the latest hold age the I97 deadline allows. Its tt-smi gives up at
+    the driver wait after 263 s with the trays re-powered and chip 31 out again. I106: the rescan, the
+    POST_RESET and re-init of the chips present and the full check with fabric still run, in that
+    order. The check fails, the hold stays, and the power cycle is requested by the repeat's start plus
+    its allowance, the give-up tail, the kill grace and the reap."""
     deadline = galaxy._mesh_reset_before_host_rung_deadline_sec()
     order, events, counters, _reasons = _b1_sweep(
         monkeypatch, tmp_path, verdicts=[False, False], held_sec=deadline - NEEDS - 10
     )
     clock, cycled_at, mech = _clock(monkeypatch), [], srv.recovery_mechanism
+    monkeypatch.setattr(galaxy.present_reinit, "present_ids", lambda: list(range(31)))
 
     async def mesh(argv, log, *a, **k):
+        if argv == galaxy._present_reinit_argv():
+            order.append("present reinit")
+            return 0, ""
         order.append("mesh reset")
         clock.shift += 263
         for name, value in (
@@ -320,12 +354,16 @@ async def test_on_the_i97_path_the_step_is_not_taken_and_the_power_cycle_comes_b
     monkeypatch.setattr(mech, "reset_with_quiesce", mesh)
     monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
     await srv.galaxy_recovery.escalate("offbus-forced", [GONE], 32, lambda m: None)
-    assert order[order.index("mesh reset") :] == ["mesh reset", "power cycle"], "no rescan, no check"
-    assert [k["fired"] for k in _i97(events)] == [True]
+    assert order[order.index("mesh reset") :] == ["mesh reset", "rescan", "present reinit", "full check", "power cycle"]
+    fired = _i97(events)
+    assert [(k["fired"], k["repeat"]) for k in fired] == [(True, True)]
     step = _step(events)
-    assert len(step) == 1 and step[0]["fired"] is False and step[0]["deadline_sec"] == round(deadline, 1)
-    assert len(cycled_at) == 1 and cycled_at[0] <= galaxy._stuck_hold_ceiling_sec()
-    assert counters["dirty_cleared"] == 0
+    assert len(step) == 1 and step[0]["fired"] is False and "deadline" not in step[0]["reason"]
+    assert [k["fired"] for n, k in events if n == "present_chips_reinit"] == [True]
+    bound = NEEDS + galaxy.GAVE_UP_TAIL_SEC
+    bound += galaxy.MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC + galaxy.MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC
+    assert len(cycled_at) == 1 and cycled_at[0] <= fired[0]["hold_age_sec"] + bound
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
 
 
 @pytest.mark.asyncio
@@ -568,3 +606,57 @@ async def test_a_job_holder_still_refuses_the_late_chip_second_reset_and_the_hol
     assert order[-1] == "power cycle"
     assert box.sent == {}, "a job's process is never signalled"
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "nothing lifts"
+
+
+def _replay(monkeypatch, tmp_path, **kw):
+    """The replayed Galaxy hold: chip 31 off the bus, the climb's sweep repeats the failed mesh reset at a
+    hold age of about 459 s (under a deadline of its start plus 300 s, the I97 one being too close), and
+    its tt-smi gives up at the driver wait after 133 s with chip 30 back on the rescan and chip 31 still
+    out. Before I106 the broker requested the power cycle at about 592 s with no rescan, no re-init and
+    no check. Returns (order, events, counters, cycled_at)."""
+    order, events, counters = _late(monkeypatch, tmp_path, back=1, i97=True, gives_up_sec=133, held_sec=459, **kw)
+    cycled_at = []
+
+    async def power_cycle(log, reason):
+        order.append("power cycle")
+        cycled_at.append(galaxy._hold_age_sec(srv.device_hold_episode_since))
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    return order, events, counters, cycled_at
+
+
+@pytest.mark.asyncio
+async def test_the_replayed_give_up_gets_the_rescan_the_reinit_and_the_check_before_the_power_cycle(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """I106 on the replayed hold: after the repeated mesh reset gives up, the late-chip rescan, the
+    POST_RESET and re-init of the 31 chips present and the full check with fabric run, in that order.
+    Chip 31 stays out, the check fails: nothing lifts and the power cycle is requested within the
+    repeat's start plus its allowance, the give-up tail, the kill grace and the reap."""
+    order, events, counters, cycled_at = _replay(monkeypatch, tmp_path)
+    assert await srv.galaxy_recovery.escalate("offbus-forced", [GONE], 32, lambda m: None) == OUTCOME_TERMINAL
+    tail = ["mesh reset", "rescan", "readers stopped", "present reinit", "full check", "power cycle"]
+    assert _after_sweep_mesh(order) == tail
+    fired = _i97(events)
+    assert [(k["fired"], k["repeat"]) for k in fired] == [(True, True)]
+    assert 455 <= fired[0]["hold_age_sec"] <= 470, "the repeat starts at the replayed hold age"
+    step = _step(events)
+    assert len(step) == 1 and step[0]["fired"] is False and (step[0]["on_bus"], step[0]["expected"]) == (31, 32)
+    assert [k["fired"] for n, k in events if n == "present_chips_reinit"] == [True]
+    bound = NEEDS + galaxy.GAVE_UP_TAIL_SEC
+    bound += galaxy.MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC + galaxy.MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC
+    assert len(cycled_at) == 1 and cycled_at[0] <= fired[0]["hold_age_sec"] + bound
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "a failed check lifts nothing"
+
+
+@pytest.mark.asyncio
+async def test_the_replayed_give_up_lifts_with_no_power_cycle_when_the_late_chip_returns_and_the_check_passes(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """The same hold, but chip 31 is back on the reset path's rescan after the re-init of the chips
+    present: the full check with fabric passes and lifts the hold, once. No power cycle."""
+    order, events, counters, cycled_at = _replay(monkeypatch, tmp_path, reinit_back=True, verdicts=[False, True])
+    await srv.galaxy_recovery.escalate("offbus-forced", [GONE], 32, lambda m: None)
+    assert _after_sweep_mesh(order) == ["mesh reset", "rescan", "readers stopped", "present reinit", "full check"]
+    assert "power cycle" not in order and cycled_at == []
+    assert counters["dirty_cleared"] == 1, "lifted once, on the just-passed full check with fabric"
