@@ -165,6 +165,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     _fire_power_cycle,
     _galaxy_reset_min_dead_chips,
     _normalized_board,
+    _offbus_fault_class,
     _offbus_hold_ceiling_sec,
     _power_cycle_direct_class,
     _present_mesh_reset_grace_sec,
@@ -172,6 +173,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     _run_pre_power_cycle_hook,
     _stuck_hold_ceiling_sec,
     _ubb_bus_id_tables,
+    _whole_trays_off,
     aer_totals,
     append_trace,
     arc_not_ready_chips,
@@ -185,6 +187,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     chip_snapshot,
     chip_snapshot_event,
     chip_state,
+    clear_pending_marker,
     dead_chips,
     enodata_presence,
     eth,
@@ -207,6 +210,8 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     mark_boot,
     mesh_reset_hold_reason,
     note_broker_stopping,
+    note_cycle_possible,
+    note_power_cycle_trigger,
     offbus_chip_ids,
     offbus_count,
     offbus_power_cycle,
@@ -218,6 +223,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     read_health_events,
     read_heartbeats,
     refuse_mesh_reset,
+    set_pending_marker_context,
     sysfs_chip_ids,
     version_floor_warnings,
 )
@@ -226,11 +232,6 @@ from tt_device_mcp.health import (
 )
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
-)
-from tt_device_mcp.health.recovery.stages.power_cycle import (
-    clear_pending_marker,
-    note_cycle_possible,
-    set_pending_marker_context,
 )
 from tt_device_mcp.holder_identity import describe_identity, read_holder_identities
 from tt_device_mcp.job_log_store import exit_signal, find_job_log, prune_job_logs, read_log_tail
@@ -7335,8 +7336,6 @@ def _power_cycle_context() -> tuple:
     """Spec 04 I88: (fault class, {off-bus chip index: PCI address or None}, hold start) for the cycle's
     journal line and pending marker. From memory only: no chip is read, since a chip off the bus must
     not be touched again."""
-    from tt_device_mcp.health.recovery.galaxy import _offbus_fault_class, _whole_trays_off
-
     chips = sorted(_offbus_one_shot_chips(), key=str)
     banked = galaxy_recovery._chip_buses_now() if galaxy_recovery is not None else {}
     bdfs = {
@@ -7360,8 +7359,6 @@ def _note_power_cycle_trigger(reason: str) -> None:
     """Spec 04 I88: hand the cycle what asked for it, journaled just before its unit starts, and mark
     the cycle 'possible' in the pending marker. Never raises."""
     try:
-        from tt_device_mcp.health.recovery.stages.power_cycle import note_power_cycle_trigger
-
         fault_class, bdfs, hold = _power_cycle_context()
         note_power_cycle_trigger(reason, fault_class, bdfs, hold)
         note_cycle_possible(reason)

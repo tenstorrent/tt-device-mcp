@@ -294,7 +294,6 @@ def _journal_trigger(reason: str, unit: str) -> str:
         return ""
 
 
-
 # Spec 04 I88: a machine-readable warning for other users of a shared box that a power cycle may come.
 # Written atomically (tmp file, fsync, rename), best effort: a failed write is logged and recovery goes
 # on unchanged. Nothing waits on it and nothing reads it back.
@@ -329,6 +328,7 @@ def write_pending_marker(
     lead_sec: float = 0.0,
 ) -> bool:
     """Write the pending-cycle marker; False (logged) when it could not. Never raises."""
+    tmp = ""
     try:
         now = time.time()
         rows = sorted((chips or {}).items(), key=lambda i: (len(str(i[0])), str(i[0])))
@@ -344,8 +344,8 @@ def write_pending_marker(
         }
         path = PENDING_MARKER_PATH
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = f"{path}.{os.getpid()}.tmp"
-        with open(tmp, "w") as fh:
+        fd, tmp = tempfile.mkstemp(prefix=".power-cycle-pending.", suffix=".tmp", dir=os.path.dirname(path))
+        with os.fdopen(fd, "w") as fh:
             fh.write(json.dumps(row, sort_keys=True) + "\n")
             fh.flush()
             os.fsync(fh.fileno())
@@ -353,6 +353,11 @@ def write_pending_marker(
         os.replace(tmp, path)
         return True
     except Exception as exc:  # noqa: BLE001 - advisory only; recovery never depends on it
+        try:
+            if tmp:
+                os.unlink(tmp)
+        except OSError:
+            pass
         try:
             _logger.warning("power-cycle pending marker (%s) not written: %r; recovery goes on", state, exc)
         except Exception:  # noqa: BLE001
@@ -362,9 +367,10 @@ def write_pending_marker(
 
 def note_cycle_possible(reason: str, lead_sec: float = 0.0) -> None:
     """A hold entered a path that can end in a power cycle: mark it 'possible'. Skipped when the
-    broker cannot power-cycle. Never raises."""
+    broker cannot power-cycle, and outside a broker (no provider set): only the broker removes the
+    marker when its hold lifts. Never raises."""
     try:
-        ctx = _marker_context() if _marker_context is not None else ("", {}, "")
+        ctx = _marker_context() if _marker_context is not None else None
         if ctx is not None:
             fault_class, chips, hold_since = ctx
             write_pending_marker("possible", reason, fault_class, chips, hold_since, lead_sec)
@@ -381,7 +387,9 @@ def _mark_cycle_requested(reason: str) -> None:
         t = dict(_trigger)
         if not t or time.monotonic() - t.get("at", 0.0) > TRIGGER_MAX_AGE_SEC:
             t = {}
-        write_pending_marker("requested", t.get("reason") or reason, t.get("fault_class", ""), t.get("chips"), t.get("hold", ""))
+        write_pending_marker(
+            "requested", t.get("reason") or reason, t.get("fault_class", ""), t.get("chips"), t.get("hold", "")
+        )
     except Exception:  # noqa: BLE001
         pass
 
@@ -397,6 +405,7 @@ def clear_pending_marker() -> None:
             _logger.warning("power-cycle pending marker not removed: %r", exc)
         except Exception:  # noqa: BLE001
             pass
+
 
 def fallback_pid_file() -> str:
     """Where the fallback records its pid for the hook: beside the request, so both share /run."""
