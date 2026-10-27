@@ -387,9 +387,9 @@ async def test_a_waiter_that_leaves_after_the_kill_started_does_not_stop_it(monk
     runner = asyncio.create_task(srv.job_runner())
     try:
         await _until_running(job)
-        for _ in range(100):
-            if sent:
-                break
+        # The first signal is due about 2 s in (1 s limit + 1 s grace); a loaded host runs late.
+        deadline = time.monotonic() + 15
+        while not sent and time.monotonic() < deadline:
             await asyncio.sleep(0.02)
         assert sent, "never killed"
         waiter.status = srv.JobStatus.KILLED

@@ -179,9 +179,13 @@ gets through anyway.
   this pytest process, its descendant, nor a process carrying its per-process spawn token
   (inherited by every child, so one that left the session or was re-parented still counts) is
   refused with `PermissionError`, nothing is delivered, and the test fails naming the pids.
-  Signal 0 and a pid that does not exist pass through. No marker lifts it. A test of a kill
+  Signal 0, a pid that does not exist (or is reaped during the check) and a process that has
+  exited or is exiting (every thread a zombie or in do_exit, which a signal cannot reach; once its
+  mm is dropped and it is re-parented it shows neither ancestry nor token) pass through. No marker lifts it. A test of a kill
   path stubs the scan that names its targets (`enumerate_device_holders`, `job_processes`) or
   targets its own children; `device_holders.DEVICE_DIR` stays sealed for the same reason (I1).
+  A live process's environ reads empty while it execs, so the guard reads an empty one again for
+  a bounded time; one still empty then, or a zombie's or kernel thread's, carries no token.
 - **I10** — No test reaches the host's own broker job and exec units (`ttdev-job-*`,
   `ttdev-exec-*`), marker or not. On a broker host the live broker runs each job in a
   `ttdev-job-<id>.scope`, and a test's job can share its id: a kill test read that live scope as
@@ -493,9 +497,13 @@ own claims that are pinned:
 | I7 (the per-test reset clears every job, hold, hold-bound and escalation global) | `tests/test_test_isolation.py::test_the_per_test_reset_clears_every_hold_bound_and_escalation_global` |
 | I7 (the pairs that leaked state pass with the leaking test first: `tests/test_hold_bound.py::test_a_stuck_hold_event_past_the_bound_never_reads_escalated_false` then `::test_a_latched_i42_hold_still_escalates_and_its_latch_is_lifted`; `tests/test_power_cycle_ac_needed.py::test_the_hold_bound_is_the_one_trigger_of_the_class_a_ladder` then `::test_the_full_ladder_runs_at_the_10_min_hold_bound_then_the_cycle`; `tests/test_chip_state.py::test_the_published_state_is_atomic_and_names_every_expected_chip` then `::test_a_re_created_node_is_read_at_once_and_a_valid_read_clears_lost`) | `tests/test_test_isolation.py::test_the_leaking_pairs_pass_with_the_leaking_test_first` |
 | I9 (a signal to a process the test did not spawn is refused, delivers nothing, fails the test) | `tests/test_signal_guard.py::test_a_signal_to_a_process_the_test_did_not_spawn_is_refused_and_delivers_nothing` |
+| I9 (an empty environ read mid-exec is read again: the test's own orphan passes, a foreign process stays refused) | `tests/test_signal_guard.py::test_an_own_orphan_whose_environ_reads_empty_mid_exec_can_be_signalled`, `tests/test_signal_guard.py::test_a_foreign_process_whose_environ_reads_empty_is_still_refused` |
 | I9 (the dead-chip holder kill cannot reach a host process) | `tests/test_signal_guard.py::test_the_dead_chip_holder_kill_cannot_reach_a_host_process` |
 | I9 (a test's own child stays signalable after it left the session or was re-parented) | `tests/test_signal_guard.py::test_a_child_the_test_spawned_can_be_signalled_even_after_it_left_the_session` |
 | I9 (a pid that does not exist is passed through) | `tests/test_signal_guard.py::test_a_pid_that_does_not_exist_is_passed_through` |
+| I9 (a re-parented member that already exited does not fail a group sweep) | `tests/test_signal_guard.py::test_a_group_sweep_over_a_member_that_already_exited_and_was_re_parented_passes` |
+| I9 (a live foreign process stays refused beside an exited one, or after its main thread exited) | `tests/test_signal_guard.py::test_a_live_foreign_member_beside_an_exited_one_is_still_refused`, `tests/test_signal_guard.py::test_a_foreign_process_whose_main_thread_exited_is_still_refused` |
+| I9 (a re-parented member killed mid-exit, or reaped during the check, does not fail a group sweep; one live thread keeps a foreign process refused) | `tests/test_signal_guard.py::test_a_group_member_killed_mid_exit_after_its_parent_was_reaped_passes`, `tests/test_signal_guard.py::test_a_foreign_process_with_one_live_thread_beside_an_exiting_one_is_still_refused` |
 | I8 (the gate reads real `/dev`, never the sandboxed attribute) | `tests/test_device_marker.py::test_the_device_gate_reads_the_real_dev_dir_not_the_sandboxed_one` |
 | I8 (no chips, or no dir, means no device) | `tests/test_device_marker.py::test_no_chips_means_no_device`, `::test_an_absent_dev_dir_means_no_device` |
 | I8 (the marker is registered, so `-m device` selects it) | `tests/test_device_marker.py::test_the_device_marker_is_registered` |

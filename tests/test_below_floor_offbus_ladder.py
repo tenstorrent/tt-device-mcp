@@ -1277,13 +1277,13 @@ async def test_a_full_check_still_running_at_the_deadline_fails_and_power_cycles
     async def mesh(argv, log, *a, **k):
         order.append("mesh reset")
         clock.shift += deadline - left - galaxy._hold_age_sec(srv.device_hold_episode_since)
+        started.append(time.monotonic())  # the deadline is `left` from here, not from the check's start
         return 0, ""
 
     async def verify(expected, log, run_fabric=True, **k):
         order.append("full check")
         if "mesh reset" not in order:
             return False, {"snapshot": {"ok": False}, "fabric": {"ok": False}}
-        started.append(time.monotonic())
         proc = await asyncio.create_subprocess_exec(sys.executable, "-c", _SLOW_FABRIC, start_new_session=True)
         readers.append(proc)
         m.fabric_check_proc = proc
@@ -1309,7 +1309,7 @@ async def test_a_full_check_still_running_at_the_deadline_fails_and_power_cycles
     took = cycled_at[0][1] - started[0]
     rc = await asyncio.wait_for(readers[0].wait(), 3)
     assert rc == -signal.SIGKILL, "the reader that ignored SIGTERM got SIGKILL after the grace"
-    assert left + 0.6 <= took <= left + 0.6 + 0.4 + 0.5, f"power cycle {took:.2f}s after the check began"
+    assert left + 0.6 <= took <= left + 0.6 + 0.4 + 0.5, f"power cycle {took:.2f}s after the deadline was set"
     assert cycled_at[0][0] <= ceiling + 0.5, f"power cycle requested at {cycled_at[0][0]:.1f}s of hold"
     cut = [k for n, k in events if n == "whole_mesh_reset_before_host_rung_unverified"]
     assert len(cut) == 1 and cut[0]["reason"] == "deadline" and cut[0]["stopped_pids"] == [readers[0].pid]

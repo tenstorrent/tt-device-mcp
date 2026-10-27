@@ -475,12 +475,22 @@ class _Recorded(set):
 
 async def _job_run_then_cancel(params: dict, wait_for):
     """Drive tt_device_job_run over a real MCP session, cancel the call once ``wait_for(job)`` holds,
-    then close the session (the disconnect)."""
+    then close the session (the disconnect).
+
+    The cancel also waits for the handler's first log line, sent from inside its cancel path's
+    ``try``: the job is in ``srv.jobs`` while ``_queue_job`` still awaits its log pruning thread,
+    and a cancel there (a slow thread on a loaded host) lands before that ``try``, so nothing
+    kills the job."""
     from mcp.client import Client
 
-    async with Client(srv.create_mcp_server()) as client:
+    waiting = asyncio.Event()
+
+    async def logged(_params):
+        waiting.set()
+
+    async with Client(srv.create_mcp_server(), logging_callback=logged, log_level="info") as client:
         call = asyncio.create_task(client.call_tool("tt_device_job_run", {"params": params}))
-        assert await _until(lambda: len(srv.jobs) == 1 and wait_for(next(iter(srv.jobs.values()))))
+        assert await _until(lambda: waiting.is_set() and len(srv.jobs) == 1 and wait_for(next(iter(srv.jobs.values()))))
         call.cancel()
         await asyncio.gather(call, return_exceptions=True)
     return next(iter(srv.jobs.values()))
@@ -610,8 +620,9 @@ async def test_keep_running_on_disconnect_leaves_the_job_running(runner_env, mon
     job = await _job_run_then_cancel(
         _params(runner_env["tmp"], "true", keep_running_on_disconnect=True), lambda j: True
     )
+    # The session's close cancels the server's handler after the client's scope has exited.
+    assert await _until(lambda: "job_run_client_gone" in runner_env["events"], tries=200)
     assert rec.seen == [] and job.status is srv.JobStatus.QUEUED, "the opt-out keeps the job"
-    assert "job_run_client_gone" in runner_env["events"]
 
 
 # ---------------------------------------------------------------- spec 03 I69: every broker kill

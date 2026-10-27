@@ -188,12 +188,31 @@ def _proc_stat_fields(pid: int) -> "list[str] | None":
     return data[data.rindex(")") + 2 :].split()
 
 
+# A live process's environ reads empty while it execs: the new image's environment is not set up
+# yet. A setsid child that is exec'ing its command, with its shell gone, then shows neither ancestry
+# nor token (seen under load in a PID namespace). Such a read is taken again, for at most this long.
+_TOKEN_REREAD_SEC = 2.0
+_PF_KTHREAD = 0x00200000
+
+
 def _carries_spawn_token(pid: int) -> bool:
-    try:
-        with open(f"/proc/{pid}/environ", "rb") as f:
-            return f"{_SPAWN_TOKEN_ENV}={_SPAWN_TOKEN}".encode() in f.read().split(b"\0")
-    except OSError:
-        return False
+    """pid's environ holds this run's token. An empty read of a live user process cannot tell and
+    is read again until the bound; one still empty then, a zombie or a kernel thread is not ours."""
+    deadline = time.monotonic() + _TOKEN_REREAD_SEC
+    while True:
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                raw = f.read()
+        except OSError:
+            return False
+        if raw:
+            return f"{_SPAWN_TOKEN_ENV}={_SPAWN_TOKEN}".encode() in raw.split(b"\0")
+        fields = _proc_stat_fields(pid)
+        if fields is None or fields[0] in ("Z", "X") or int(fields[6]) & _PF_KTHREAD:
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.005)
 
 
 def _spawned_by_this_run(pid: int) -> bool:
@@ -207,6 +226,39 @@ def _spawned_by_this_run(pid: int) -> bool:
             break
         cur = int(fields[1])
     return _carries_spawn_token(pid)
+
+
+# include/linux/sched.h: do_exit sets it on each thread before it drops the mm (empty environ).
+_PF_EXITING = 0x4
+
+
+def _thread_stat_fields(pid: int, tid: str) -> "list[str] | None":
+    try:
+        with open(f"/proc/{pid}/task/{tid}/stat") as f:
+            data = f.read()
+    except OSError:
+        return None
+    return data[data.rindex(")") + 2 :].split()
+
+
+def _exited(pid: int) -> bool:
+    """pid has exited or is exiting (no thread of it can act on a signal any more), or is gone.
+    Once do_exit drops a process's mm its /proc environ is empty and, once its parent exits
+    first, its ppid is init, so it no longer reads as this run's; a SIGKILL to a killed job's
+    group can meet its `sleep` there, mid-exit (PF_EXITING) or a zombie, and init can reap it
+    during these reads. A leader that left its live threads behind also reads 'Z', so every
+    thread counts, listed again after the reads: only a live thread makes a new one."""
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+        for tid in tids:
+            fields = _thread_stat_fields(pid, tid)
+            if fields is not None and fields[0] not in ("Z", "X") and not int(fields[6]) & _PF_EXITING:
+                return False
+        return bool(tids) and set(os.listdir(f"/proc/{pid}/task")) <= set(tids)
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError, IndexError):
+        return False
 
 
 def _group_members(pgid: int) -> list:
@@ -230,8 +282,13 @@ class _SignalGuard:
 
     def _foreign(self, pids: list) -> list:
         """The pids that exist and are not this run's. A process (or an ancestor) that exits during
-        the ppid walk breaks it, so a miss is read again; one that is gone by then is skipped."""
-        return [p for p in pids if not self.owned(p) and os.path.exists(f"/proc/{p}") and not self.owned(p)]
+        the ppid walk breaks it, so a miss is read again; one that is gone, exiting or exited by
+        then is skipped."""
+        return [
+            p
+            for p in pids
+            if not self.owned(p) and os.path.exists(f"/proc/{p}") and not self.owned(p) and not _exited(p)
+        ]
 
     def _refuse(self, what: str, sig: int, members: list):
         self.refused.append(f"{what}(signal {int(sig)}) reaches pid(s) {members[:8]} this test did not spawn")
