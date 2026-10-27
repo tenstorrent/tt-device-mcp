@@ -140,7 +140,7 @@ def test_the_fallback_unit_stays_out_of_the_shutdown_and_survives_its_killall(os
     assert os_first["req"].read_text().splitlines()[2] == str(pc.HOOK_TRY_TIMEOUT_MAX_SEC)
 
 
-def _run_fallback(tmp_path, bound, cmd, timeout=5):
+def _run_fallback(tmp_path, bound, cmd, timeout=5, path="/usr/bin:/bin"):
     pidf = tmp_path / "fallback.pid"
     # The fallback runs the installed hook's IPMI preparation: never the host's, a stub here.
     prep = tmp_path / "prepare-ipmi"
@@ -161,7 +161,7 @@ def _run_fallback(tmp_path, bound, cmd, timeout=5):
         str(timeout),
         *cmd,
     ]
-    env = {"PATH": "/usr/bin:/bin", "TT_DEVICE_MCP_POWER_CYCLE_REASON": REASON}
+    env = {"PATH": path, "TT_DEVICE_MCP_POWER_CYCLE_REASON": REASON}
     return pidf, subprocess.Popen(argv, env=env)
 
 
@@ -1297,18 +1297,37 @@ def test_hook_stops_the_fallback_and_its_children_before_any_wait(hook, tmp_path
     A SIGKILL is delivered at once but the kernel tears the process down after kill(2) returns, so a
     single look can still see a killed process: the stub waits up to 5 s for the processes to go,
     while the hook is held in the RAID wait, so only what the hook did before that wait can end them
-    (none of them exits on its own within 60 s)."""
-    pidf, proc = _run_fallback(tmp_path, 0 if fired else 300, ["/bin/sleep", "60"], timeout=60)
+    (none of them exits on its own within 60 s). The fallback's flush is a stub that hangs until
+    killed: a real sync on a host busy writing sleeps in the kernel, where no signal ends it until the
+    writeback does, and it cannot cut power."""
+    bin_dir = tmp_path / "fallback-bin"
+    bin_dir.mkdir()
+    (bin_dir / "sync").write_text("#!/bin/sh\nexec /bin/sleep 61\n")
+    (bin_dir / "sync").chmod(0o755)
+    pidf, proc = _run_fallback(
+        tmp_path, 0 if fired else 300, ["/bin/sleep", "60"], timeout=60, path=f"{bin_dir}:/usr/bin:/bin"
+    )
+    want = {(b"/bin/sleep", b"60"), (b"/bin/sleep", b"61")}
+    seen = set()
     kids = []
     try:
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             if pidf.exists() and pidf.read_text().strip():
-                kids = _children(proc.pid)
-                if not fired or (kids and _cmdline(proc.pid)[0] == pc.FALLBACK_FIRE_ARGV0.encode()):
+                if not fired:
                     break
+                if _cmdline(proc.pid)[0] == pc.FALLBACK_FIRE_ARGV0.encode():
+                    kids = _children(proc.pid)
+                    seen = set()
+                    for k in kids:
+                        try:
+                            seen.add(tuple(_cmdline(k)[:2]))
+                        except FileNotFoundError:
+                            pass
+                    if want <= seen:
+                        break
             time.sleep(0.05)
-        assert not fired or kids, "the fallback's cycle command never started"
+        assert not fired or want <= seen, "the fallback's flush and cycle command never both ran"
         hook["pid_file"].write_text(pidf.read_text())
         watched = " ".join(str(p) for p in [proc.pid, *kids])
         mdadm = hook["stubs"] / "mdadm"
