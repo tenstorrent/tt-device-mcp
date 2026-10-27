@@ -1602,6 +1602,9 @@ class CheckAerWatch:
         if read is None:
             return None
         sig = read() or {}
+        # The trigger read's time for the latency budget, on the clock contain_on_thread measures with;
+        # ``now`` is the burst window's clock.
+        read_at = time.monotonic()
         now = self._clock()
         nodes = {str(c) for c in sig.get("chips") or ()}
         if self._excused(now):
@@ -1635,7 +1638,7 @@ class CheckAerWatch:
                 sorted(dead, key=int),
                 sorted(set(all_ones) | dead, key=int),
                 trigger,
-                trigger_at=now,
+                trigger_at=read_at,
                 vanished=tuple(vanished),
                 readers=stopped,
                 pci=pci,

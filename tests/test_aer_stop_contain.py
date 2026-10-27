@@ -108,7 +108,7 @@ async def test_an_all_ones_burst_chip_is_removed_before_any_reader_is_killed(wat
     assert ("detach", "14") not in log, "only the all-ones burst chip is removed"
     row = _stop_row()
     assert row["offbus"] == ["13"] and row["contained"] == ["13"] and row["stopped"], row
-    assert _rows("check_aer_contain")[-1]["chips"] == ["13"]
+    assert _rows("chip_contained")[-1]["chips"] == ["13"]
     assert [r["chips"] for r in _rows("chip_isolated")] == [["13"]]
     assert chip_state.is_lost("13"), "no poll reads the chip again"
     assert "13" in srv.isolated_chips
@@ -135,19 +135,28 @@ def test_with_no_all_ones_burst_chip_the_stop_kills_at_once_as_before(watch, cas
     assert burst()
     assert log == [("stop", FABRIC), ("kill", FABRIC)], log
     assert srv.sampler.aer_containment is None and not _rows("check_aer_contain")
+    assert not _rows("chip_contained")
     row = _stop_row()
     assert row["offbus"] == [] and row["contained"] == []
     assert FABRIC_DEBT.owed
 
 
-def test_with_no_loop_to_contain_the_readers_stay_stopped_and_unkilled(watch):
+def test_with_no_loop_the_watch_thread_still_removes_before_any_kill(watch):
+    """No running event loop (stalled, or gone): the watch thread contains the chip itself (03 I96),
+    every stop before the remove and every kill after it."""
     _w, log, _detach_ok, burst = watch
     _sample("13")
     assert burst()
-    assert log == [("stop", FABRIC)], f"no kill of a reader of an attached all-ones chip: {log}"
+    stops = [i for i, e in enumerate(log) if e[0] == "stop"]
+    detach = log.index(("detach", "13"))
+    kills = [i for i, e in enumerate(log) if e[0] == "kill"]
+    assert stops and kills and max(stops) < detach < min(kills), f"stop, then remove, then kill: {log}"
+    assert ("kill", FABRIC) in log and ("kill", TENANT) in log
     row = _stop_row()
-    assert row["offbus"] == ["13"] and row["contained"] == []
+    assert row["offbus"] == ["13"] and row["contained"] == ["13"]
+    assert _rows("chip_contained")[-1]["removed"] is True
     assert FABRIC_DEBT.owed
+    _held()
 
 
 @pytest.mark.asyncio
@@ -195,7 +204,7 @@ async def test_a_contained_chip_is_contained_once(watch):
     await _contain(burst)
     n = len(log)
     await srv.sampler.contain_after_aer_stop(["13"], ["13"], "again")
-    assert len(log) == n and len(_rows("check_aer_contain")) == 1
+    assert len(log) == n and len(_rows("chip_contained")) == 1
 
 
 @pytest.mark.asyncio
