@@ -19,7 +19,7 @@ import pytest
 
 from tests.deploy_helpers import _statements
 
-# Fork-heavy deploy-script laps: one xdist worker runs them all (pyproject: --dist loadgroup).
+# Fork-heavy deploy-script laps: one xdist worker runs them all (conftest: --dist loadgroup).
 pytestmark = pytest.mark.xdist_group("forks")
 
 _REPO = Path(__file__).resolve().parent.parent

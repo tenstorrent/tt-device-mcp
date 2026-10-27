@@ -21,7 +21,7 @@ import pytest
 from tests.test_deploy_autoupdate_idle_gate import _drain, _gate
 from tests.test_deploy_autoupdate_rate_limit import _lap
 
-# Fork-heavy deploy-script laps: one xdist worker runs them all (pyproject: --dist loadgroup).
+# Fork-heavy deploy-script laps: one xdist worker runs them all (conftest: --dist loadgroup).
 pytestmark = pytest.mark.xdist_group("forks")
 
 # Forks the script itself starts, measured with stand-in commands (each a $(...) subshell; on a box
@@ -177,3 +177,12 @@ def test_a_lap_on_the_real_clock(tmp_path):
     assert epoch(m.group(2)) == last + 1800, line
     assert re.match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4} decision=deferred ", line), line
     assert t0 <= epoch(line.split()[0]) <= t1, line
+
+
+def test_this_file_runs_on_the_forks_worker_under_loadgroup(request):
+    """Under -n with no explicit --dist, the suite runs loadgroup and the worker tags this test with
+    its group, so the controller keeps every "forks" test on one worker."""
+    passed = list(request.config.invocation_params.args)
+    if not hasattr(request.config, "workerinput") or any(a.startswith("--dist") for a in passed):
+        return
+    assert request.node.nodeid.endswith("@forks"), request.node.nodeid

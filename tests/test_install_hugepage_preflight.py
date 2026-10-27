@@ -22,7 +22,7 @@ from tests.test_fabric_check_reason import _pci_with_pool, _run_wrapper
 from tt_device_mcp.constants import FABRIC_CHECK_CANNOT_CHECK_RC
 from tt_device_mcp.health.monitors import hostpci, pci
 
-# Fork-heavy deploy-script laps: one xdist worker runs them all (pyproject: --dist loadgroup).
+# Fork-heavy deploy-script laps: one xdist worker runs them all (conftest: --dist loadgroup).
 pytestmark = pytest.mark.xdist_group("forks")
 
 _INSTALLER = Path(__file__).resolve().parent.parent / "deploy" / "install-tt-device-broker.sh"

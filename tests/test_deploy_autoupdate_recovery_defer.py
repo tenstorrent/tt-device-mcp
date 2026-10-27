@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-# Fork-heavy deploy-script laps: one xdist worker runs them all (pyproject: --dist loadgroup).
+# Fork-heavy deploy-script laps: one xdist worker runs them all (conftest: --dist loadgroup).
 pytestmark = pytest.mark.xdist_group("forks")
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "deploy" / "tt-device-autoupdate.sh"

@@ -21,7 +21,7 @@ import pytest
 
 from tt_device_mcp import cli, constants
 
-# Fork-heavy deploy-script laps: one xdist worker runs them all (pyproject: --dist loadgroup).
+# Fork-heavy deploy-script laps: one xdist worker runs them all (conftest: --dist loadgroup).
 pytestmark = pytest.mark.xdist_group("forks")
 
 _ROOT = Path(__file__).resolve().parent.parent

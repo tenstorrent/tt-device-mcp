@@ -348,6 +348,15 @@ def pytest_configure(config):
     passed = list(config.invocation_params.args) + os.environ.get("PYTEST_ADDOPTS", "").split()
     if getattr(config.option, "dist", None) == "load" and not any(a.startswith("--dist") for a in passed):
         config.option.dist = "loadgroup"
+    # A worker re-reads the command line, so it never sees the switch above and would not tag its
+    # tests with their group: without the tag the controller schedules each test on its own.
+    if getattr(config, "workerinput", {}).get("loadgroup"):
+        config.option.loadgroup = True
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_configure_node(node):
+    node.workerinput["loadgroup"] = node.config.getvalue("dist") == "loadgroup"
 
 
 # The real /dev/tenstorrent, hardcoded here rather than read from srv.TT_DEV_DIR, because the

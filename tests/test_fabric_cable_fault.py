@@ -16,7 +16,7 @@ from tt_device_mcp.health import monitor as monitor_mod
 from tt_device_mcp.health.monitor import HealthMonitor
 from tt_device_mcp.health.monitors import fabric
 
-# Fork-heavy deploy-script laps: one xdist worker runs them all (pyproject: --dist loadgroup).
+# Fork-heavy deploy-script laps: one xdist worker runs them all (conftest: --dist loadgroup).
 pytestmark = pytest.mark.xdist_group("forks")
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "deploy" / "tt-device-fabric-check.sh"

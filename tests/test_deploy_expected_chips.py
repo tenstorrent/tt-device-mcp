@@ -24,7 +24,7 @@ from tt_device_mcp.health.evidence import health_dir
 from tt_device_mcp.health.monitors import pci
 from tt_device_mcp.health.monitors.heartbeat import heartbeat_verdict
 
-# Fork-heavy deploy-script laps: one xdist worker runs them all (pyproject: --dist loadgroup).
+# Fork-heavy deploy-script laps: one xdist worker runs them all (conftest: --dist loadgroup).
 pytestmark = pytest.mark.xdist_group("forks")
 
 _REPO = Path(__file__).resolve().parent.parent
