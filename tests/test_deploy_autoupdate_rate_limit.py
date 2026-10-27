@@ -211,7 +211,7 @@ def test_a_broken_broker_applies_a_new_sha_inside_the_interval(tmp_path, state):
     _lap(tmp_path, now=10_000, sha="a1", interval=3600)
     done, restarts, _ = _lap(tmp_path, now=10_060, sha="b2", interval=3600, **_BROKEN[state])
     assert restarts == ["10000 a1", "10060 b2"], done.stderr
-    assert "rate limit skipped: the broker" in done.stderr and "b2 applies now" in done.stderr, done.stderr
+    assert "rate limit skipped: the broker" in done.stderr and "b2 goes on to the next gates" in done.stderr, done.stderr
 
 
 @pytest.mark.parametrize("state", sorted(_BROKEN))
@@ -220,7 +220,7 @@ def test_a_broken_broker_applies_at_once_under_the_default_interval(tmp_path, st
     _lap(tmp_path, now=10_000, sha="a1")
     done, restarts, _ = _lap(tmp_path, now=10_060, sha="b2", **_BROKEN[state])
     assert restarts == ["10000 a1", "10060 b2"], done.stderr
-    assert "rate limit skipped: the broker" in done.stderr and "b2 applies now" in done.stderr, done.stderr
+    assert "rate limit skipped: the broker" in done.stderr and "b2 goes on to the next gates" in done.stderr, done.stderr
 
 
 @pytest.mark.parametrize(
@@ -294,7 +294,7 @@ def test_a_startup_check_past_its_bound_or_held_applies_at_once(tmp_path, monkey
     t = 10_001 + _startup_bound() if case == "past-the-bound" else 10_060
     done, restarts, _ = _lap(tmp_path, now=t, sha="b2", interval=3600, health=health)
     assert restarts == ["10000 a1", f"{t} b2"], done.stderr
-    assert "rate limit skipped: the broker" in done.stderr and "b2 applies now" in done.stderr, done.stderr
+    assert "rate limit skipped: the broker" in done.stderr and "b2 goes on to the next gates" in done.stderr, done.stderr
     # The same under the default interval, which is longer than the bound.
     assert _startup_bound() < 1800
     (tmp_path / "default").mkdir()
@@ -321,3 +321,9 @@ def test_a_missing_stamp_is_silent_and_a_leading_zero_stamp_is_decimal(tmp_path)
     done, restarts, _ = _lap(tmp_path, now=1000, sha="b2", interval=3600)
     assert "last apply 100s ago" in done.stderr, done.stderr
     assert restarts == ["1000 a1"]
+
+
+def test_the_rate_limit_skip_line_does_not_claim_an_apply():
+    # Later gates (a device op in flight) can still defer the sha, so the skip line must not say it applies.
+    line = next(x for x in _SCRIPT.read_text().splitlines() if "rate limit skipped" in x and "echo" in x)
+    assert "goes on to the next gates" in line and "applies" not in line and "applied" not in line
