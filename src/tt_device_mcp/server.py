@@ -847,6 +847,7 @@ class JobStatus(Enum):
     HUNG = "hung"
     KILLED = "killed"
     PREEMPTED = "preempted"  # a preemptable job stopped because another job was waiting
+    EXPIRED = "expired"  # a persisted queued job whose client went down with the host; never ran (spec 01 I6)
 
 
 @dataclass
@@ -3164,6 +3165,11 @@ def write_job_log_footer(job_log_file: Path, job: Job):
 
 # The line a queued job's log gets when it is cancelled before it started (spec 01 I69).
 CANCELLED_QUEUED_MARKER = "[CANCELLED before it started]"
+
+
+# The line a persisted queued job's log gets when a restart expires it instead of requeueing it
+# (spec 01 I6): its client went down with the host, so nobody is left to read its result.
+EXPIRED_QUEUED_MARKER = "[EXPIRED before it started]"
 
 
 def write_cancelled_job_log_footer(job_log_file: Path, job: Job, requested_by: str) -> None:
@@ -12914,6 +12920,10 @@ def _recent_jobs(limit: int = 20, files: Optional[list[Path]] = None) -> list[di
                 rec["cancelled_queued"] = True
                 rec["cause"] = f"{line.strip()}: it never ran"
                 break
+            if not started_at and line.startswith(EXPIRED_QUEUED_MARKER):
+                rec["cancelled_queued"] = True  # left the queue unrun, like a cancel
+                rec["cause"] = line[len(EXPIRED_QUEUED_MARKER) :].strip() or "expired: it never ran"
+                break
             marker = next((m for m in (RECOVERY_KILL_MARKER, RESET_KILL_MARKER) if m in line), None)
             if marker:
                 rec["recovery_killed"] = "reset" if marker == RESET_KILL_MARKER else "recovery"
@@ -15120,6 +15130,8 @@ def _persist_queued_job(job: "Job") -> None:
                     "preemptable": job.preemptable,
                     "hung_silence_sec": job.hung_silence_sec,
                     "log_file": job.log_file,
+                    # The host boot it was queued in: a restart in another boot expires it (I6).
+                    "boot_id": _current_boot_id(),
                 }
             )
         )
@@ -15262,13 +15274,58 @@ def _restore_order_key(job: "Job") -> tuple:
     return (at is None, at or 0.0, num, str(job.id))
 
 
+def _queued_client_gone(spec: dict) -> Optional[str]:
+    """Why a persisted queued job has no client left, or None if one may still wait on it.
+
+    Every submitter reaches this broker from its own host (the unix socket, or HTTP on localhost),
+    so a host that went down since the job was queued took the submitter, any waiter streaming
+    its log and any MCP session with it: the job would run for nobody, hours later, on whatever the
+    device looks like now. A restart within the same boot (an update, a crash) leaves clients
+    alive, and they keep polling across it, so those jobs keep their place. A spec with no boot id
+    (written before it was recorded) or an unreadable id cannot tell, and is kept."""
+    queued_boot = str(spec.get("boot_id") or "")
+    this_boot = _current_boot_id()
+    if not queued_boot or not this_boot or queued_boot == this_boot:
+        return None
+    return "the host rebooted since it was queued, so its client is gone"
+
+
+def _expire_restored_job(p: Path, job: "Job", reason: str) -> None:
+    """Record a persisted queued job as expired, not run and not failed: a marker and a footer
+    with STATUS: expired in its log (so job status and the recent list answer it), the spec set
+    aside (``.expired``), a log line and a health event. Touches no device, hold or gate state."""
+    job.status = JobStatus.EXPIRED
+    job.finished_at = datetime.now().isoformat()
+    job.error = f"expired before it started: {reason}"
+    if job.log_file:
+        try:
+            with open(job.log_file, "a") as f:
+                f.write(
+                    f"\n{EXPIRED_QUEUED_MARKER} {reason}\n"
+                    "The broker did not dispatch this job; the device was not touched. Submit it "
+                    "again if it is still wanted.\n"
+                )
+            write_job_log_footer(Path(job.log_file), job)
+        except OSError:
+            pass
+    try:
+        p.rename(p.with_suffix(".expired"))
+    except OSError:
+        pass
+    if logger:
+        logger.warning(f"QUEUE-RESTORE expired job_id={job.id} owner={job.owner}, not requeued: {reason}")
+    health_event("queue_restore_expired", job_id=job.id, owner=job.owner, queued_at=job.queued_at, reason=reason)
+
+
 async def _restore_queued_jobs() -> None:
     """Put jobs that were still waiting when the last broker died back on the queue.
 
     Only specs we can actually read are restored: a spec that will not parse is moved aside,
     never guessed at and never silently dropped. A spec whose job log already carries the
     FINISHED footer is moved aside too (``.finished``): the job is over, and a spec that outlived
-    it must not run it again. Ordered by queue time, then numeric job id, so a restart preserves
+    it must not run it again. A spec queued in an earlier host boot is expired (``.expired``,
+    STATUS: expired in its log): its client went down with the host (``_queued_client_gone``).
+    Ordered by queue time, then numeric job id, so a restart preserves
     the order tenants queued in across the 999 -> 000 id wrap; an operator verification job goes
     back to the head (spec 01 I6, I21).
     """
@@ -15277,8 +15334,8 @@ async def _restore_queued_jobs() -> None:
     d = Path(job_log_dir) / QUEUED_SPEC_DIR
     if not d.is_dir():
         return
-    restored, broken, dropped, finished = 0, 0, 0, 0
-    readable: list[tuple[Path, "Job"]] = []
+    restored, broken, dropped, finished, expired = 0, 0, 0, 0, 0
+    readable: list[tuple[Path, "Job", dict]] = []
     for p in d.glob("*.json"):
         try:
             spec = json.loads(p.read_text())
@@ -15305,11 +15362,11 @@ async def _restore_queued_jobs() -> None:
             except OSError:
                 pass
             continue
-        readable.append((p, job))
+        readable.append((p, job, spec))
     # Queue time, then job id as a number: the filename order sorted 000 (the id after 999 wraps)
     # ahead of 998 and 999, so the newest job ran first. Verification jobs go to the head anyway.
     readable.sort(key=lambda pj: _restore_order_key(pj[1]))
-    for p, job in readable:
+    for p, job, spec in readable:
         if job.id in jobs:
             continue  # already known (a re-adopted run) — the scope owns it, not the spec
         if _job_log_records_finish(job.log_file):
@@ -15333,20 +15390,28 @@ async def _restore_queued_jobs() -> None:
                 logger.warning(f"QUEUE-RESTORE dropping job_id={job.id} (killed by device recovery): {fault_reason}")
             health_event("queue_restore_skipped_device_fault", job_id=job.id, reason=fault_reason)
             continue
+        gone = _queued_client_gone(spec)
+        if gone:
+            _expire_restored_job(p, job, gone)
+            expired += 1
+            continue
         job.verification = operator_verification_kind(job.command, job.peer_uid)
         jobs[job.id] = job
         await _enqueue_job(job)
         _update_queue_depth_metric()
         restored += 1
-    if (restored or broken or dropped or finished) and logger:
+    if (restored or broken or dropped or finished or expired) and logger:
         logger.info(
             f"QUEUE-RESTORE requeued {restored} job(s) that outlived the last broker"
             + (f"; {broken} spec(s) unreadable and set aside" if broken else "")
             + (f"; {dropped} job(s) dropped (killed by device recovery)" if dropped else "")
             + (f"; {finished} spec(s) of already-finished jobs set aside" if finished else "")
+            + (f"; {expired} job(s) expired (queued before the host went down)" if expired else "")
         )
-    if restored or broken or dropped or finished:
-        health_event("queue_restored", restored=restored, unreadable=broken, dropped=dropped, finished=finished)
+    if restored or broken or dropped or finished or expired:
+        health_event(
+            "queue_restored", restored=restored, unreadable=broken, dropped=dropped, finished=finished, expired=expired
+        )
 
 
 # Spec 05 I9: the opt-in lock's flip. Seconds between looks at the node modes.
