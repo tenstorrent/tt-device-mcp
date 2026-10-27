@@ -46,6 +46,8 @@ def _late(
     i97=False,
     gives_up_sec=0,
     second_gives_up=False,
+    reinit_back=False,
+    reinit_rc=0,
 ):
     """The 10-min bound on a 32-chip mesh holding with chip 31 off the bus. The sweep's mesh reset is a
     glx_reset whose tt-smi gave up at its driver wait with chips 30 and 31 out (after the tray re-power
@@ -54,7 +56,9 @@ def _late(
     I97 one under its deadline (I100); otherwise as a plain sweep reset. ``gives_up_sec``: how far the
     first reset moves galaxy's clock. Returns (order, events, counters): events are (name, fields);
     ``counters["waits"]`` holds each mesh reset's ``wait_until`` (None when not given) and
-    ``counters["rescanned_at"]`` the monotonic time of each rescan."""
+    ``counters["rescanned_at"]`` the monotonic time of each rescan. The I104 re-init of the chips present
+    (``present reinit`` in ``order``) ends with ``reinit_rc``; when ``reinit_back`` the reset path's rescan
+    after it finds the missing chips back. Its waits are in ``counters["reinit_waits"]``."""
     order, _names, counters = _rig(monkeypatch, tmp_path, verdicts=verdicts)
     if not i97:
         monkeypatch.setattr(srv.galaxy_recovery, "_repeat_runs_under_deadline", lambda expected: False)
@@ -67,9 +71,16 @@ def _late(
     )
     mech = srv.recovery_mechanism
     meshes = []
-    counters["waits"], counters["rescanned_at"] = [], []
+    counters["waits"], counters["rescanned_at"], counters["reinit_waits"] = [], [], []
+    monkeypatch.setattr(galaxy.present_reinit, "present_ids", lambda: sorted(int(c) for c in bus["beats"]))
 
     async def mesh(argv, log, *a, **k):
+        if argv == galaxy._present_reinit_argv():  # not a mesh reset: the give-up flags stay as they were
+            order.append("present reinit")
+            counters["reinit_waits"].append(k.get("wait_until"))
+            if reinit_back:
+                bus["beats"] = dict(ALL)
+            return reinit_rc, ""
         order.append("mesh reset")
         meshes.append(argv)
         counters["waits"].append(k.get("wait_until"))
@@ -146,8 +157,9 @@ async def test_a_failed_full_check_after_the_second_mesh_reset_keeps_the_hold_an
 async def test_one_chip_still_out_goes_to_the_check_and_the_power_cycle_with_no_wait(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """Only chip 30 is back after the rescan: no second mesh reset and no settle. The full check runs
-    and its failure requests the power cycle in the same pass."""
+    """Only chip 30 is back after the rescan: no second mesh reset and no settle of the step's own. The
+    chips present get POST_RESET and board re-init (I104), the full check runs, and its failure
+    requests the power cycle in the same pass."""
     order, events, counters = _late(monkeypatch, tmp_path, back=1)
     sleeps = []
     real_sleep = galaxy.asyncio.sleep
@@ -158,10 +170,11 @@ async def test_one_chip_still_out_goes_to_the_check_and_the_power_cycle_with_no_
 
     monkeypatch.setattr(galaxy.asyncio, "sleep", sleep)
     assert await _bound_ladder() == OUTCOME_TERMINAL
-    assert _after_sweep_mesh(order) == ["mesh reset", "rescan", "full check", "power cycle"]
-    late_rescan = len(order) - len(_after_sweep_mesh(order)) + 2  # order's length once it ran
-    after = [sec for at, sec in sleeps if at == late_rescan]
-    assert after == [galaxy._settle_before_host_rung_sec()], "the sweep's own settle only: the step adds no wait"
+    tail = ["mesh reset", "rescan", "readers stopped", "present reinit", "full check", "power cycle"]
+    assert _after_sweep_mesh(order) == tail
+    reinit_at = len(order) - len(tail) + 4  # order's length once the re-init ran
+    after = [sec for at, sec in sleeps if at == reinit_at]
+    assert after == [galaxy._settle_before_host_rung_sec()], "the sweep's own settle only: the steps add no wait"
     step = _step(events)
     assert len(step) == 1 and step[0]["fired"] is False and (step[0]["on_bus"], step[0]["expected"]) == (31, 32)
     assert counters["dirty_cleared"] == 0
@@ -338,12 +351,13 @@ async def test_a_second_give_up_on_the_plain_sweep_is_checked_and_power_cycles_w
     monkeypatch, tmp_path, clear_job_state
 ):
     """Both chips are back, the second mesh reset runs and gives up at its driver wait too: the full
-    check still runs (it decides), fails, nothing lifts and the power cycle is requested. The wait for
-    that reset ended by the step's start plus LATE_CHIP_STEP_SEC; the sweep's own reset had no such
-    bound."""
+    check still runs (it decides) after the I104 re-init of the chips present, fails, nothing lifts and
+    the power cycle is requested. The wait for that reset ended by the step's start plus
+    LATE_CHIP_STEP_SEC; the sweep's own reset had no such bound."""
     order, events, counters = _late(monkeypatch, tmp_path, back=2, second_gives_up=True)
     assert await _bound_ladder() == OUTCOME_TERMINAL
-    tail = ["mesh reset", "rescan", "readers stopped", "mesh reset", "full check", "power cycle"]
+    tail = ["mesh reset", "rescan", "readers stopped", "mesh reset", "readers stopped", "present reinit"]
+    tail += ["full check", "power cycle"]
     assert _after_sweep_mesh(order) == tail
     assert ("late_chips_mesh_reset_done", {"rc": 1, "driver_wait_gave_up": True}) in events
     waits, started = counters["waits"], counters["rescanned_at"][-1]  # the step's rescan, not the ladder's
