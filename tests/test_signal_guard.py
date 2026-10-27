@@ -100,9 +100,7 @@ def test_a_child_the_test_spawned_can_be_signalled_even_after_it_left_the_sessio
         parent.stdin.close()
 
 
-def test_a_foreign_process_already_dead_passes_and_a_live_one_in_its_group_is_still_refused(
-    signal_guard, monkeypatch
-):
+def test_a_foreign_process_already_dead_passes_and_a_live_one_in_its_group_is_still_refused(signal_guard, monkeypatch):
     """A process past saving (a zombie, exiting, or with SIGKILL pending) cannot be harmed by a
     signal, so it is not refused even when neither the walk nor the token finds it: the scope's
     SIGKILL can leave such a job child in /proc, re-parented, when the broker's backstop killpg
