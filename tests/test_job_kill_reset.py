@@ -610,8 +610,9 @@ async def test_keep_running_on_disconnect_leaves_the_job_running(runner_env, mon
     job = await _job_run_then_cancel(
         _params(runner_env["tmp"], "true", keep_running_on_disconnect=True), lambda j: True
     )
+    # The session's close cancels the server's handler after the client's scope has exited.
+    assert await _until(lambda: "job_run_client_gone" in runner_env["events"], tries=200)
     assert rec.seen == [] and job.status is srv.JobStatus.QUEUED, "the opt-out keeps the job"
-    assert "job_run_client_gone" in runner_env["events"]
 
 
 # ---------------------------------------------------------------- spec 03 I69: every broker kill
