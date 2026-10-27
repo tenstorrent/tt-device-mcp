@@ -1179,14 +1179,19 @@ async def test_a_tick_before_the_grace_does_not_push_the_reset_past_it(monkeypat
     grace = galaxy_mod._present_mesh_reset_grace_sec()
     interval = srv.SELFHEAL_RELIFT_INTERVAL_SEC
     assert grace <= interval, "the case this guards: a not-due tick would push the rung a full interval"
-    _hold_77_crash(monkeypatch, tmp_path, drop=drop, since=(datetime.now() - timedelta(seconds=5)).isoformat())
+    # The grace ends grace - 5 s after this point: bracket it on the monotonic clock, so the time the
+    # setup and the tick take on a loaded host does not count against the due time.
+    before = srv.time.monotonic()
+    since = (datetime.now() - timedelta(seconds=5)).isoformat()
+    after = srv.time.monotonic()
+    _hold_77_crash(monkeypatch, tmp_path, drop=drop, since=since)
     resets, checks = _present_rung_chain(monkeypatch, {"ok": True, "detail": "fabric links healthy"})
     monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
 
     await srv._attempt_idle_relift()
     assert resets == [], "inside the grace the present rung is not due"
-    due_in = srv.last_relift_monotonic + interval - srv.time.monotonic()
-    assert grace - 5 - 2 <= due_in <= grace - 5 + 1, "the next relift is due at the grace end"
+    due_at = srv.last_relift_monotonic + interval
+    assert before + grace - 5 - 1 <= due_at <= after + grace - 5 + 1, "the next relift is due at the grace end"
 
     # The grace has passed: the hold is older and the relift clock moved on by the same amount.
     monkeypatch.setattr(srv, "device_hold_episode_since", (datetime.now() - timedelta(seconds=grace + 1)).isoformat())
