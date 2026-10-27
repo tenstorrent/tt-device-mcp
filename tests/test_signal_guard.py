@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -128,8 +129,9 @@ def test_a_foreign_process_already_dead_passes_and_a_live_one_in_its_group_is_st
         for send in (lambda: os.kill(parent.pid, signal.SIGTERM), lambda: os.killpg(parent.pid, signal.SIGKILL)):
             with pytest.raises(PermissionError):
                 send()
-        assert len(signal_guard.refused) == 2 and all(str(parent.pid) in r for r in signal_guard.refused)
-        assert all(f" {zombie}" not in r and f"[{zombie}" not in r for r in signal_guard.refused)
+        assert len(signal_guard.refused) == 2 and all(f"[{parent.pid}]" in r for r in signal_guard.refused)
+        reached = [re.search(r"reaches pid\(s\) \[([^\]]*)\]", r).group(1) for r in signal_guard.refused]
+        assert all(zombie not in {int(p) for p in pids.split(",")} for pids in reached), (zombie, signal_guard.refused)
         time.sleep(0.2)
         assert parent.poll() is None, "a refused signal was delivered"
     finally:
