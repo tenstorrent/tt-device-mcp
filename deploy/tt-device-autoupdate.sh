@@ -89,7 +89,16 @@ remote_sha="$(git -C "$CLONE" rev-parse --verify -q "refs/remotes/origin/$BR" ||
 [ -n "$remote_sha" ] \
     || { echo "autoupdate: $REPO has no branch $BR" >&2; exit 0; }
 
-installed_sha="$(cat "$STATE" 2>/dev/null || true)"
+# The clock: whole seconds since the epoch, into the variable named $1, by the shell itself (a
+# drain reads it on every 5 s poll). Every time a lap decides on comes from here, so it is the one
+# seam a test replaces; defined after the config is sourced, so nothing on a box can.
+au_now() { printf -v "$1" '%(%s)T' -1; }
+# Epoch seconds $2 as local time, the way the decision log writes it, into the variable named $1.
+au_time() { printf -v "$1" '%(%Y-%m-%dT%H:%M:%S%z)T' "$2"; }
+
+# Read as $(cat) would, without a process: the whole file, less its trailing newlines.
+installed_sha=""; { IFS= read -r -d '' installed_sha < "$STATE"; } 2>/dev/null
+while [ "${installed_sha%$'\n'}" != "$installed_sha" ]; do installed_sha="${installed_sha%$'\n'}"; done
 # Already current. A coalescing record (I21, below) belongs to an unapplied sha: with none left, it goes.
 if [ "$installed_sha" = "$remote_sha" ]; then rm -f "$ROOT/pending-head" 2>/dev/null; exit 0; fi
 
@@ -103,13 +112,15 @@ echo "autoupdate: $BR ${installed_sha:0:9} -> ${remote_sha:0:9} via $src_desc" >
 AU_LOG="${TTDEV_LOG_DIR:-/var/log/tt-device-broker}/autoupdate.log"
 au_logged=0
 au_log() {  # <decision> <reason>
-    local line
-    line="$(date '+%Y-%m-%dT%H:%M:%S%z') decision=$1 branch=$BR old=${installed_sha:-none} new=$remote_sha reason=$2"
+    local line t size
+    au_now t; au_time line "$t"
+    line="$line decision=$1 branch=$BR old=${installed_sha:-none} new=$remote_sha reason=$2"
     au_logged=1
     logger -t tt-device-autoupdate -- "$line" 2>/dev/null || true
     {
-        mkdir -p "${AU_LOG%/*}"
-        if [ "$(stat -c %s "$AU_LOG" 2>/dev/null || echo 0)" -ge 1048576 ]; then
+        [ -d "${AU_LOG%/*}" ] || mkdir -p "${AU_LOG%/*}"
+        size=$(stat -c %s "$AU_LOG" 2>/dev/null) || size=0
+        if [ "$size" -ge 1048576 ]; then
             mv -f "$AU_LOG" "$AU_LOG.1"
         fi
         echo "$line" >> "$AU_LOG"
@@ -146,31 +157,40 @@ STARTUP_BOUND=600
 # silent; or an FSM that is recovering/down or holds the device, unless that is the startup check
 # above, within STARTUP_BOUND, held for nothing but that check.
 broker_broken() {
-    local st n base h age="${1:-0}"
+    local st n base h age="${1:-0}" re rest
+    broken=""
     st="$(systemctl is-active tt-device-broker 2>/dev/null)"
-    if [ "$st" != active ]; then echo "is ${st:-unknown}, not active"; return; fi
+    if [ "$st" != active ]; then broken="is ${st:-unknown}, not active"; return; fi
     n="$(systemctl show tt-device-broker -p NRestarts --value 2>/dev/null)"
     base=""; { read -r base < "$LAST_APPLY_NRESTARTS"; } 2>/dev/null || true
     case "$n" in ''|*[!0-9]*) n=0 ;; esac
     case "$base" in ''|*[!0-9]*) base=0 ;; esac
     if [ $(( 10#$n )) -gt $(( 10#$base )) ]; then
-        echo "restarted itself since the last apply (NRestarts $(( 10#$base )) -> $(( 10#$n )))"; return
+        broken="restarted itself since the last apply (NRestarts $(( 10#$base )) -> $(( 10#$n )))"; return
     fi
     h="$(curl -s --max-time 5 --unix-socket /run/tt-device-broker/broker.sock http://localhost/health 2>/dev/null)"
-    if [ -z "$h" ]; then echo "does not answer /health"; return; fi
-    if printf '%s' "$h" | grep -Eq '"fsm_state": *"recovering"' \
-            && printf '%s' "$h" | grep -Eq '"fsm_why": *"startup_unverified"'; then
+    if [ -z "$h" ]; then broken="does not answer /health"; return; fi
+    # The shell's own ERE matching, where a `printf | grep -E` per question cost two processes. None
+    # of these patterns can match across a newline, so the whole answer reads as grep reads its lines.
+    local recovering='"fsm_state": *"recovering"' unverified='"fsm_why": *"startup_unverified"'
+    local held='"held": *true' booting='"held_reason": *"device unverified: ' bad='"fsm_state": *"(recovering|down)"'
+    if [[ $h =~ $recovering ]] && [[ $h =~ $unverified ]]; then
         if [ "$age" -gt "$STARTUP_BOUND" ]; then
-            echo "is still in its startup check ${age}s after the last apply (bound ${STARTUP_BOUND}s)"; return
+            broken="is still in its startup check ${age}s after the last apply (bound ${STARTUP_BOUND}s)"; return
         fi
-        if ! printf '%s' "$h" | grep -Eq '"held": *true' \
-                || printf '%s' "$h" | grep -Eq '"held_reason": *"device unverified: '; then
+        if ! [[ $h =~ $held ]] || [[ $h =~ $booting ]]; then
             return   # booting: the startup check is running
         fi
     fi
-    if printf '%s' "$h" | grep -Eq '"held": *true'; then echo "holds the device"; return; fi
-    if printf '%s' "$h" | grep -Eq '"fsm_state": *"(recovering|down)"'; then
-        echo "fails its health check (fsm $(printf '%s' "$h" | grep -Eo '"fsm_state": *"[a-z]*"' | grep -Eo '[a-z]*"$' | tr -d '"'))"
+    if [[ $h =~ $held ]]; then broken="holds the device"; return; fi
+    if [[ $h =~ $bad ]]; then
+        # Every state named, one per line, as `grep -Eo` lists them.
+        re='"fsm_state": *"([a-z]*)"'; rest="$h"; st=""
+        while [[ $rest =~ $re ]]; do
+            st="${st:+$st$'\n'}${BASH_REMATCH[1]}"
+            rest="${rest#*"${BASH_REMATCH[0]}"}"
+        done
+        broken="fails its health check (fsm $st)"
     fi
 }
 # Burst coalescing (spec 08 I21). The interval above paces restarts but not bursts: a branch that
@@ -195,7 +215,7 @@ APPLY_QUIET="${TTDEV_APPLY_QUIET_SEC:-600}"
 APPLY_BOUND="${TTDEV_APPLY_BOUND_SEC:-3600}"
 if [ "$APPLY_QUIET" -gt 0 ] 2>/dev/null; then
     [ "$APPLY_BOUND" -gt 0 ] 2>/dev/null || APPLY_BOUND=3600
-    now="$(date +%s)"
+    au_now now
     p_first=""; p_sha=""; p_seen=""
     { read -r p_first p_sha p_seen < "$PENDING_HEAD"; } 2>/dev/null || true
     case "$p_first" in ''|*[!0-9]*) p_first=$now ;; *) p_first=$(( 10#$p_first )) ;; esac
@@ -210,11 +230,12 @@ if [ "$APPLY_QUIET" -gt 0 ] 2>/dev/null; then
         la=""; { read -r la < "$LAST_APPLY"; } 2>/dev/null || true
         case "$la" in ''|*[!0-9]*) age=0 ;; *) age=$(( now - 10#$la )) ;; esac
         [ "$age" -ge 0 ] || age=0
-        broken="$(broker_broken "$age")"
+        broker_broken "$age"
         if [ -z "$broken" ]; then
             left=$quiet_left; [ "$bound_left" -lt "$left" ] && left=$bound_left
             echo "autoupdate: coalescing: head ${remote_sha:0:9} seen $(( now - p_seen ))s ago (quiet ${APPLY_QUIET}s), oldest unapplied $(( now - p_first ))s ago (bound ${APPLY_BOUND}s); applies in ${left}s if the branch stays put" >&2
-            au_log deferred "burst coalescing: head unchanged $(( now - p_seen ))s (quiet ${APPLY_QUIET}s), oldest unapplied $(( now - p_first ))s (bound ${APPLY_BOUND}s); apply_by=$(date -d "@$(( now + left ))" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || echo $(( now + left )))"
+            au_time apply_by $(( now + left ))
+            au_log deferred "burst coalescing: head unchanged $(( now - p_seen ))s (quiet ${APPLY_QUIET}s), oldest unapplied $(( now - p_first ))s (bound ${APPLY_BOUND}s); apply_by=$apply_by"
             exit 0
         fi
         echo "autoupdate: coalescing skipped: the broker $broken; ${remote_sha:0:9} goes on to the rate limit" >&2
@@ -223,15 +244,16 @@ fi
 
 if [ "$MIN_APPLY" -gt 0 ] 2>/dev/null; then
     last=""; { read -r last < "$LAST_APPLY"; } 2>/dev/null || true
-    now="$(date +%s)"
+    au_now now
     # A stamp that is not a number, or lies in the future (the clock stepped back), bars nothing.
     # Read base 10, so a hand-written leading zero is not taken for octal.
     case "$last" in ''|*[!0-9]*) last="" ;; *) last=$(( 10#$last )) ;; esac
     if [ -n "$last" ] && [ "$last" -le "$now" ] && [ $(( now - last )) -lt "$MIN_APPLY" ]; then
-        broken="$(broker_broken "$(( now - last ))")"
+        broker_broken "$(( now - last ))"
         if [ -z "$broken" ]; then
             echo "autoupdate: rate-limited: last apply $(( now - last ))s ago (min ${MIN_APPLY}s); ${remote_sha:0:9} applies in $(( last + MIN_APPLY - now ))s" >&2
-            au_log deferred "apply rate limit: last apply $(( now - last ))s ago (min ${MIN_APPLY}s); apply_by=$(date -d "@$(( last + MIN_APPLY ))" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || echo $(( last + MIN_APPLY )))"
+            au_time apply_by $(( last + MIN_APPLY ))
+            au_log deferred "apply rate limit: last apply $(( now - last ))s ago (min ${MIN_APPLY}s); apply_by=$apply_by"
             exit 0
         fi
         echo "autoupdate: rate limit skipped: the broker $broken; ${remote_sha:0:9} applies now (last apply $(( now - last ))s ago)" >&2
@@ -257,8 +279,8 @@ if [ -f "$INHIBIT" ]; then
 fi
 # A reset outlives the broker by design (it runs in its own scope), so the lock file
 # above can be absent while a reset is still in flight. Ask systemd, not the broker.
-if systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-reset-*' 2>/dev/null \
-        | grep -q 'ttdev-reset-'; then
+if reset_units="$(systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-reset-*' 2>/dev/null)"
+        [[ $reset_units == *ttdev-reset-* ]]; then
     echo "autoupdate: a device reset scope is still running; deferring" >&2
     au_log deferred "device reset scope running; apply_by=when the reset ends (bounded)"
     exit 0
@@ -309,7 +331,7 @@ print(int(h.get("preempt_job_id") == sys.argv[1]))' "$1" 2>/dev/null
 }
 # Succeeds (and names why in $recovery_why) while the update should wait for the recovery.
 recovery_gate() {
-    local held="" state="" age="" now since="" sha="" waited
+    local held="" state="" age="" now since="" sha="" waited apply_by
     recovery_why=""
     read -r held state age <<EOF
 $(broker_hold)
@@ -319,7 +341,7 @@ EOF
         *) return 1 ;;
     esac
     [ "$RECOVERY_DEFER" -gt 0 ] 2>/dev/null || return 1
-    now="$(date +%s)"
+    au_now now
     [ -f "$RECOVERY_PENDING" ] && read -r sha since < "$RECOVERY_PENDING" 2>/dev/null
     # Clocked from the FIRST deferral of a pending update: a newer commit does not restart it.
     [ -n "${since:-}" ] || since="$now"
@@ -330,7 +352,8 @@ EOF
     deadline=$(( since + RECOVERY_DEFER ))
     [ "${age:--1}" -ge 0 ] 2>/dev/null && [ $(( now - age + RECOVERY_DEFER )) -lt "$deadline" ] \
         && deadline=$(( now - age + RECOVERY_DEFER ))
-    recovery_why="fsm=$state held=$held hold_age=${age:--1}s waited=${waited}s bound=${RECOVERY_DEFER}s apply_by=$(date -d "@$deadline" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || echo "$deadline")"
+    au_time apply_by "$deadline"
+    recovery_why="fsm=$state held=$held hold_age=${age:--1}s waited=${waited}s bound=${RECOVERY_DEFER}s apply_by=$apply_by"
     [ "${age:--1}" -lt "$RECOVERY_DEFER" ] 2>/dev/null || return 1
     [ "$waited" -lt "$RECOVERY_DEFER" ] || return 1
     return 0
@@ -358,7 +381,8 @@ au_exit() {
 HOLD=/run/tt-device-broker/dispatch-hold
 hold_write() {
     [ -d "${HOLD%/*}" ] || return 0
-    { echo "$$ $(date +%s)" > "$HOLD.$$" && mv -f "$HOLD.$$" "$HOLD"; } 2>/dev/null || true
+    local t; au_now t
+    { echo "$$ $t" > "$HOLD.$$" && mv -f "$HOLD.$$" "$HOLD"; } 2>/dev/null || true
 }
 if [ -d "${HOLD%/*}" ]; then
     trap 'rm -f "$HOLD" "$HOLD.$$" 2>/dev/null || true' EXIT
@@ -405,27 +429,33 @@ OP_CAP=660
 GATE_CAP=936
 UPTIME=/proc/uptime
 count_busy() {
-    local mp p uu q
+    local mp p uu q out cg l
     mp="$(systemctl show tt-device-broker -p MainPID --value 2>/dev/null)"
     # A stopped broker reads MainPID 0, and `pgrep -P 0` lists init and kthreadd: count no kids.
     kids=0
-    [ "${mp:-0}" -gt 0 ] 2>/dev/null && kids="$(pgrep -P "$mp" 2>/dev/null | wc -l)"
+    if [ "${mp:-0}" -gt 0 ] 2>/dev/null; then
+        # One pid a line, counted as `wc -l` counts them, without the pipe.
+        out="$(pgrep -P "$mp" 2>/dev/null)"; l="${out//[!$'\n']/}"
+        [ -z "$out" ] || kids=$(( ${#l} + 1 ))
+    fi
     holders=0; jobholders=0
     for p in /proc/[0-9]*; do
-        if ls -l "$p/fd" 2>/dev/null | grep -q tenstorrent; then
+        if [[ $(ls -l "$p/fd" 2>/dev/null) == *tenstorrent* ]]; then
             uu=$(stat -c %u "$p" 2>/dev/null)
             if [ "${uu:-0}" -ge 1000 ]; then
                 holders=$((holders+1))
                 # A process cannot leave its job's scope cgroup: a holder in one is a broker job's,
                 # re-adopted ones included, even when the scope list below cannot be read.
-                grep -q 'ttdev-job-' "$p/cgroup" 2>/dev/null && jobholders=$((jobholders+1))
+                cg=""; { IFS= read -r -d '' cg < "$p/cgroup"; } 2>/dev/null
+                [[ $cg == *ttdev-job-* ]] && jobholders=$((jobholders+1))
             fi
         fi
     done
     # A re-adopted job is no child of this broker, and a queued job is about to be one: a job
     # scope still running and a persisted queued spec both count as busy.
-    scopes="$(systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-job-*' 2>/dev/null \
-        | grep -c 'ttdev-job-')"
+    out="$(systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-job-*' 2>/dev/null)"
+    scopes=0   # the lines naming a job scope, as `grep -c` counts them
+    while IFS= read -r l; do [[ $l == *ttdev-job-* ]] && scopes=$((scopes+1)); done <<< "$out"
     queued=0
     for q in "${TTDEV_LOG_DIR:-/var/log/tt-device-broker}"/queued/*.json; do
         [ -e "$q" ] && queued=$((queued+1))
@@ -435,11 +465,15 @@ count_busy() {
 # Seconds the youngest running job scope has run (j_age), from systemd's own record of its start:
 # a re-adopted job keeps its scope, so its age survives broker restarts. 0 when none can be read.
 youngest_job_age() {
-    local up u t a
+    local up="" u t a out l re='ttdev-job-[^ ]*\.scope' units=""
     j_age=""
-    up="$(cut -d' ' -f1 "$UPTIME" 2>/dev/null)"; up="${up%.*}"
-    for u in $(systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-job-*' 2>/dev/null \
-            | grep -o 'ttdev-job-[^ ]*\.scope'); do
+    { IFS= read -r up < "$UPTIME"; } 2>/dev/null; up="${up%% *}"; up="${up%.*}"
+    # Every unit name in the list, as `grep -o` picks them out of each line.
+    out="$(systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-job-*' 2>/dev/null)"
+    while IFS= read -r l; do
+        while [[ $l =~ $re ]]; do units="$units ${BASH_REMATCH[0]}"; l="${l#*"${BASH_REMATCH[0]}"}"; done
+    done <<< "$out"
+    for u in $units; do
         t="$(systemctl show "$u" -p ActiveEnterTimestampMonotonic --value 2>/dev/null)"
         if [ -n "$up" ] && [ "${t:-0}" -gt 0 ] 2>/dev/null; then a=$(( up - t / 1000000 )); else a=0; fi
         { [ -z "$j_age" ] || [ "$a" -lt "$j_age" ]; } && j_age="$a"
@@ -459,8 +493,9 @@ op_lock_live() {
     [ -n "${op_pid:-}" ] && kill -0 "$op_pid" 2>/dev/null
 }
 reset_scope_listed() {
-    systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-reset-*' 2>/dev/null \
-        | grep -q 'ttdev-reset-'
+    local out
+    out="$(systemctl list-units --type=scope --state=running --no-legend --no-pager 'ttdev-reset-*' 2>/dev/null)"
+    [[ $out == *ttdev-reset-* ]]
 }
 op_in_flight() { op_lock_live || reset_scope_listed; }
 job_scope_listed() {
@@ -510,16 +545,17 @@ EOF
     else
         p_job=""
     fi
-    w_start="$(date +%s)"
+    au_now w_start
     echo "autoupdate: $1: busy (children=$kids holders=$holders scopes=${scopes:-0} queued=$queued) -> draining: dispatch held, the running job finishes, then the update applies (bound ${w_bound}s: $w_why)" >&2
     while :; do
         count_busy
         running=$(( kids + holders + ${scopes:-0} ))
         if [ "$running" -eq 0 ] && ! op_in_flight; then
-            echo "autoupdate: $1: drained after $(( $(date +%s) - w_start ))s (queued=$queued wait for the new broker)" >&2
+            au_now w_now
+            echo "autoupdate: $1: drained after $(( w_now - w_start ))s (queued=$queued wait for the new broker)" >&2
             return 0
         fi
-        w_now="$(date +%s)"
+        au_now w_now
         if ! op_lock_live; then
             case "$(systemctl is-active tt-device-broker 2>/dev/null)" in
                 active|activating|deactivating|reloading) ;;
@@ -538,7 +574,7 @@ EOF
                 drain_why="post-job gate still running ${GATE_CAP}s after the preemption"
                 return 1
             fi
-        elif op_in_flight && [ "$running" -eq 0 ]; then
+        elif [ "$running" -eq 0 ] && op_in_flight; then   # the job count first: it costs no process
             if [ -z "$op_since" ]; then
                 op_since="$w_now"
                 echo "autoupdate: $1: a device op is in flight after $(( w_now - w_start ))s with no job running; it is waited out under the hold for at most ${OP_CAP}s" >&2
@@ -572,13 +608,13 @@ EOF
 idle=true; drained_s=0
 count_busy
 if [ "$busy" -ne 0 ]; then
-    idle=false; d_t0="$(date +%s)"
+    idle=false; au_now d_t0
     if ! wait_job_boundary drain; then
         rm -f "$HOLD" 2>/dev/null || true
         au_log deferred "${drain_why:-broker job or device op still running at the job cap (${JOB_CAP}s)}; dispatch released, the next lap retries"
         exit 0
     fi
-    drained_s=$(( $(date +%s) - d_t0 ))
+    au_now d_t1; drained_s=$(( d_t1 - d_t0 ))
     # The apply's own stretch, under the broker's overdue bound, starts now.
     hold_write
 fi
@@ -612,7 +648,7 @@ trap au_exit EXIT
 NO_RESTART_PATHS='docs/** tests/** .github/** *.md (outside src/)'
 # Prints why this apply needs the restart, or nothing when it does not.
 restart_needed() {
-    local p head paths la age
+    local p head paths la age now
     case "$installed_sha" in
         ''|*[!0-9a-f]*) echo "installed sha '${installed_sha}' is not a commit"; return ;;
     esac
@@ -629,10 +665,11 @@ restart_needed() {
         esac
     done <<< "$paths"
     la=""; { read -r la < "$LAST_APPLY"; } 2>/dev/null || true
-    case "$la" in ''|*[!0-9]*) age=0 ;; *) age=$(( $(date +%s) - 10#$la )) ;; esac
+    au_now now
+    case "$la" in ''|*[!0-9]*) age=0 ;; *) age=$(( now - 10#$la )) ;; esac
     [ "$age" -ge 0 ] || age=0
-    p="$(broker_broken "$age")"
-    [ -z "$p" ] || { echo "the broker $p"; return; }
+    broker_broken "$age"
+    [ -z "$broken" ] || { echo "the broker $broken"; return; }
 }
 # Decided before the reset below: restart_needed reads where the clone was left.
 why_restart="$(restart_needed)"
@@ -755,13 +792,13 @@ rm -f "$ROOT/pending.defer"
 hold_write
 count_busy
 if [ $(( kids + holders + ${scopes:-0} )) -ne 0 ] || op_in_flight; then
-    idle=false; d_t0="$(date +%s)"
+    idle=false; au_now d_t0
     if ! wait_job_boundary "restart point"; then
         echo "autoupdate: not restarting, not marking current" >&2
         au_log deferred "${drain_why:-broker job or device op still running at restart time (job cap ${JOB_CAP}s)}"
         exit 0
     fi
-    drained_s=$(( drained_s + $(date +%s) - d_t0 ))
+    au_now d_t1; drained_s=$(( drained_s + d_t1 - d_t0 ))
 fi
 # No recovery deferral from here on (spec 08 I23): the install has already changed the broker's
 # code, and an old broker left running on it is worse than a restart. A hold that began during the

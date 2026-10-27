@@ -26,6 +26,12 @@ _OLD = "1" * 40
 _NEW = "2" * 40
 
 
+def _clock(text):
+    """The script's clock seam (au_now, au_time) as it defines them: the lap reads the real clock."""
+    i = text.index("au_now() {")
+    return text[i : text.index("\n", text.index("au_time() {", i)) + 1]
+
+
 def _health(held=False, state="healthy", age=None):
     body = {"status": "degraded" if held else "ok", "held": held, "fsm_state": state}
     if age is not None:
@@ -71,7 +77,7 @@ BR=main; ROOT={root}; VENV={venv}; STATE={root}/installed.sha; src_desc=test
 installed_sha={_OLD}; remote_sha={_NEW}
 echo {_OLD} > "$STATE"
 HOLD={tmp_path}/dispatch-hold
-curl() {{
+{_clock(_SCRIPT.read_text())}curl() {{
     {"return 22" if curl_fails else ""}
     n=$(cat {calls}); n=$((n+1)); echo "$n" > {calls}
     total=$(wc -l < {answers})
@@ -364,7 +370,8 @@ def test_a_device_op_that_outlives_the_wait_is_never_restarted_over(tmp_path):
     stand_in = (
         "op_in_flight() { return 0; }\n"
         f'date() {{ if [ "$*" = "+%s" ]; then n=$(cat {clock}); echo $((n+100)) > {clock}; echo "$n"; '
-        'else command date "$@"; fi; }'
+        'else command date "$@"; fi; }\n'
+        f'au_now() {{ local n; read -r n < {clock}; echo $((n+100)) > {clock}; printf -v "$1" %s "$n"; }}'
     )
     done, trace, log = _apply(tmp_path, health=[_health()], stand_ins=stand_in)
     assert done.returncode == 0, done.stderr

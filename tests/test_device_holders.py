@@ -9,6 +9,12 @@ import pytest
 
 import tt_device_mcp.device_holders as dh
 
+# Stubbed scans use small made-up pids. The reclaim's self-exclusion reads the real process
+# group of each pid, so in a pid namespace (a sandboxed run) a made-up pid can be a real
+# process in this test's own group and be dropped as "self". Calls that do not test the
+# self-exclusion get an identity no stubbed pid can match.
+_NOT_SELF = {"getpid": lambda: -1, "getpgid": lambda pid: pid}
+
 
 class TestEnumerateDeviceHolders:
     def test_detects_self_holding_a_device_node(self, tmp_path, monkeypatch):
@@ -104,6 +110,7 @@ def test_reclaim_signals_only_tenant_holders():
     )
     signals = []
     res = reclaim_foreign_holders(
+        **_NOT_SELF,
         grace_sec=0,
         kill=lambda pid, sig: signals.append((pid, sig)),
         sleep=lambda _: None,
@@ -126,6 +133,7 @@ def test_reclaim_escalates_term_to_kill():
     signals = []
     scans = [stubborn, stubborn, HolderScan(holders=[], complete=True)]
     res = reclaim_foreign_holders(
+        **_NOT_SELF,
         grace_sec=0,
         kill=lambda pid, sig: signals.append((pid, sig)),
         sleep=lambda _: None,
@@ -144,6 +152,7 @@ def test_reclaim_reports_a_survivor_rather_than_claiming_success():
 
     stuck = HolderScan(holders=[DeviceHolder(pid=4242, uid=1001)], complete=True)
     res = reclaim_foreign_holders(
+        **_NOT_SELF,
         grace_sec=0,
         kill=lambda pid, sig: None,
         sleep=lambda _: None,
@@ -171,6 +180,7 @@ def test_reclaim_tolerates_a_process_that_already_exited():
         raise ProcessLookupError(pid)
 
     res = reclaim_foreign_holders(
+        **_NOT_SELF,
         grace_sec=0,
         kill=gone,
         sleep=lambda _: None,
@@ -199,6 +209,7 @@ def test_reclaim_does_not_report_a_permission_denied_pid_as_signalled():
         raise PermissionError(pid)
 
     res = reclaim_foreign_holders(
+        **_NOT_SELF,
         grace_sec=0,
         kill=denied,
         sleep=lambda _: None,
@@ -214,7 +225,11 @@ def test_reclaim_carries_the_rescan_completeness():
     from tt_device_mcp.device_holders import HolderScan, reclaim_foreign_holders
 
     res = reclaim_foreign_holders(
-        grace_sec=0, kill=lambda p, s: None, sleep=lambda _: None, rescan=lambda: HolderScan(holders=[], complete=False)
+        **_NOT_SELF,
+        grace_sec=0,
+        kill=lambda p, s: None,
+        sleep=lambda _: None,
+        rescan=lambda: HolderScan(holders=[], complete=False),
     )
     assert res.scan_complete is False, "reclaim reported a blind re-scan as complete"
 
@@ -240,6 +255,7 @@ def test_reclaim_never_retargets_onto_a_new_holder_that_appears_after_it_began()
     ]
     signals = []
     res = reclaim_foreign_holders(
+        **_NOT_SELF,
         grace_sec=0,
         kill=lambda pid, sig: signals.append((pid, sig)),
         sleep=lambda _: None,
@@ -306,6 +322,7 @@ def test_reclaim_reports_a_pid_that_died_to_an_earlier_round_as_signalled():
         HolderScan(holders=[newcomer], complete=True),  # final rescan
     ]
     res = reclaim_foreign_holders(
+        **_NOT_SELF,
         grace_sec=0,
         kill=lambda pid, sig: None,
         sleep=lambda _: None,
@@ -350,6 +367,7 @@ def test_reclaim_never_escalates_onto_a_pid_reused_by_an_unrelated_process():
 
     signals = []
     res = reclaim_foreign_holders(
+        **_NOT_SELF,
         grace_sec=1,  # truthy, so `sleep` (and thus the reuse) actually happens between rounds
         kill=lambda pid, sig: signals.append((pid, sig)),
         sleep=fake_sleep,
@@ -372,6 +390,7 @@ def test_reclaim_never_signals_a_target_whose_starttime_was_unreadable_at_select
     scan = HolderScan(holders=[unreadable], complete=True)
     signals = []
     res = reclaim_foreign_holders(
+        **_NOT_SELF,
         grace_sec=0,
         kill=lambda pid, sig: signals.append((pid, sig)),
         sleep=lambda _: None,
@@ -403,6 +422,7 @@ def test_reclaim_revalidates_identity_immediately_before_the_first_signal_too():
 
     signals = []
     reclaim_foreign_holders(
+        **_NOT_SELF,
         grace_sec=0,
         kill=lambda pid, sig: signals.append((pid, sig)),
         sleep=lambda _: None,
@@ -422,7 +442,7 @@ def test_reclaim_with_nothing_to_reclaim_does_not_rescan_again():
     scans = [HolderScan(holders=[], complete=False), HolderScan(holders=[], complete=True)]
 
     res = reclaim_foreign_holders(
-        grace_sec=0, kill=lambda p, s: None, sleep=lambda _: None, rescan=lambda: scans.pop(0)
+        **_NOT_SELF, grace_sec=0, kill=lambda p, s: None, sleep=lambda _: None, rescan=lambda: scans.pop(0)
     )
     assert res.scan_complete is False, "reclaim used a second rescan instead of the first scan's own completeness"
 

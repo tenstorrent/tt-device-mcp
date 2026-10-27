@@ -13,6 +13,7 @@ which is a half-reset mesh and a chassis power cycle.
 """
 
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -54,6 +55,12 @@ def test_an_in_flight_device_op_still_bars_the_update():
 _UPTIME = 100_000
 
 
+def _clock(text):
+    """The script's clock seam (au_now, au_time) as it defines them: the lap reads the real clock."""
+    i = text.index("au_now() {")
+    return text[i : text.index("\n", text.index("au_time() {", i)) + 1]
+
+
 def _gate(
     tmp_path,
     *,
@@ -88,8 +95,13 @@ def _gate(
     assert gate.count("UPTIME=/proc/uptime\n") == 1
     gate = gate.replace("UPTIME=/proc/uptime\n", f"UPTIME={uptime}\n")
     # No real /proc holders, and no scan of the host's processes on every poll of a long drain.
+    # nullglob for this one expansion only: an empty stand-in /proc has nothing to scan, as an empty
+    # /proc would (not its unmatched pattern). Every other glob in the cut runs as in production.
     assert gate.count("for p in /proc/[0-9]*; do") == 1
-    gate = gate.replace("for p in /proc/[0-9]*; do", f"for p in {tmp_path}/proc/[0-9]*; do")
+    gate = gate.replace(
+        "for p in /proc/[0-9]*; do",
+        f'shopt -s nullglob; procs=({tmp_path}/proc/[0-9]*); shopt -u nullglob; for p in "${{procs[@]}}"; do',
+    )
     enter = "" if job_age is None else str((_UPTIME - job_age) * 1_000_000)
     trace = tmp_path / "trace"
     logs = tmp_path / "logs"
@@ -98,10 +110,12 @@ def _gate(
         (logs / "queued" / f"{i}.json").write_text("{}")
     root = tmp_path / "root"
     root.mkdir()
+    # The stand-ins read their files with the read builtin, never $(cat ...): a lap polls every 5 s
+    # for up to the job cap, and each fork on a poll is hundreds per test.
     prelude = f"""set -u
 ROOT={root}; remote_sha=abc123; INHIBIT={tmp_path / "device-op.lock"}; STATE={root / "installed.sha"}
-on_restart() {{ :; }}
-seen() {{ if [ -e "$HOLD" ]; then echo "$1 held $(cat "$HOLD")" >> {trace}; else echo "$1 free" >> {trace}; fi; }}
+{_clock(text)}on_restart() {{ :; }}
+seen() {{ local h; if [ -e "$HOLD" ]; then read -r h < "$HOLD"; echo "$1 held $h" >> {trace}; else echo "$1 free" >> {trace}; fi; }}
 sleep() {{ seen "sleep $*"; }}
 pgrep() {{ seen pgrep; }}
 ls() {{ :; }}  # no real /proc holders
@@ -161,7 +175,7 @@ def test_a_queued_job_alone_applies_at_once_under_the_hold(tmp_path):
     Nothing here sleeps, so the lap's clock stands still while each poll takes over a second of
     real time: a slow or loaded host must not read as a drain. (On the real clock, a count that
     crossed a second boundary under a loaded full-suite run printed "drained after 1s".)"""
-    clock = "\ndate() { echo 1700000000; }\npgrep() { seen pgrep; command sleep 1.05; }\n"
+    clock = '\nau_now() { printf -v "$1" %s 1700000000; }\npgrep() { seen pgrep; command sleep 1.05; }\n'
     done, trace, hold = _gate(tmp_path, queued=1, stand_ins=clock)
     assert done.returncode == 0, done.stderr
     assert "queued=1" in done.stderr and "drained after 0s" in done.stderr, done.stderr
@@ -179,6 +193,18 @@ def test_an_idle_box_applies_and_keeps_the_hold_until_the_restart(tmp_path):
     text = _SCRIPT.read_text()
     apply = text[text.index('echo "autoupdate: applying') : text.index("systemctl restart tt-device-broker")]
     assert "$HOLD" not in apply
+
+
+def test_the_cut_runs_with_the_production_glob_options(tmp_path):
+    # A test-only shell option over the real cut hides regressions in its globs (an unguarded
+    # queued/*.json loop counts its unmatched pattern as a job under bash's defaults, not under
+    # nullglob), so the simulation leaves bash's glob options as production has them.
+    # Read before the cut (the prelude's options) and after it (what it leaves behind).
+    show = "shopt nullglob failglob dotglob extglob >&2"
+    done, _, _ = _gate(tmp_path, stand_ins=show, install=show)
+    assert done.returncode == 0, done.stderr
+    for opt in ("nullglob", "failglob", "dotglob", "extglob"):
+        assert len(re.findall(rf"^{opt}\s+off$", done.stderr, re.M)) == 2, done.stderr
 
 
 # --- spec 08 I20/I24: a busy box drains at once, and applies at the job boundary -------------------
@@ -201,7 +227,7 @@ def _broker(tmp_path, *, running, queue, job_ticks=3, on_sleep="", scope=False):
     trace = tmp_path / "trace"
     child = "" if scope else '[ "$r" -gt 0 ] && echo 777'
     scopes = (
-        '\njob_scopes() { [ "$(cat $M/running)" -gt 0 ] && echo "ttdev-job-428.scope loaded active running"; }'
+        '\njob_scopes() { local r; read -r r < $M/running; [ "$r" -gt 0 ] && echo "ttdev-job-428.scope loaded active running"; }'
         if scope
         else ""
     )
@@ -211,7 +237,7 @@ M={m}
 # again, as it does a second after a job ends.
 pgrep() {{
     seen pgrep
-    local r q; r=$(cat $M/running); q=$(cat $M/queue)
+    local r q; read -r r < $M/running; read -r q < $M/queue
     if [ "$r" -gt 0 ]; then r=$((r-1)); fi
     {child}
     if [ "$r" -eq 0 ] && [ "$q" -gt 0 ] && [ ! -e "$HOLD" ]; then
@@ -221,12 +247,12 @@ pgrep() {{
     return 0
 }}{scopes}
 on_restart() {{
-    local r q; r=$(cat $M/running); q=$(cat $M/queue)
+    local r q; read -r r < $M/running; read -r q < $M/queue
     if [ "$r" -eq 0 ] && [ "$q" -gt 0 ] && [ ! -e "$HOLD" ]; then echo dispatch >> {trace}; r=1; fi
     if [ "$r" -gt 0 ]; then echo "job cut by restart" >> {trace}; fi
 }}
-date() {{ echo $(( {_T0} + $(cat $M/t) )); }}
-sleep() {{ seen "sleep $*"; echo $(( $(cat $M/t) + ${{1%.*}} )) > $M/t; {on_sleep} }}
+au_now() {{ local v; read -r v < $M/t; printf -v "$1" %s $(( {_T0} + v )); }}
+sleep() {{ local v; seen "sleep $*"; read -r v < $M/t; echo $(( v + ${{1%.*}} )) > $M/t; {on_sleep} }}
 """
 
 
@@ -806,7 +832,7 @@ def _preemptable(limit_left, ends_after, running=1):
     """broker_preempt reports one running preemptable job `limit_left` s before its limit; the model
     job ends `ends_after` s into the drain (the broker's preemption)."""
     stub = f'\nbroker_preempt() {{ echo "{running} 990 {limit_left}"; }}\n'
-    end = f"[ $(cat $M/t) -ge {ends_after} ] && echo 0 > $M/running;"
+    end = f"read -r t < $M/t; [ $t -ge {ends_after} ] && echo 0 > $M/running;"
     return stub, end
 
 
@@ -843,7 +869,7 @@ def test_a_limit_too_far_off_for_the_job_cap_is_never_held_through(tmp_path, lim
     the limit, so the hold never preempts the job; the model broker SIGTERMs it only under a live
     hold a minute past its limit, as the broker does."""
     stub, _ = _preemptable(limit_left=limit_left, ends_after=10**9)
-    kill = f'[ -e "$HOLD" ] && [ $(cat $M/t) -ge {limit_left + 60} ] && echo "hold-driven kill" >> $M/kills;'
+    kill = f'read -r t < $M/t; [ -e "$HOLD" ] && [ $t -ge {limit_left + 60} ] && echo "hold-driven kill" >> $M/kills;'
     done, trace, hold = _drain(tmp_path, running=10_000, queue=0, scope=True, job_age=10, stand_ins=stub, on_sleep=kill)
     assert done.returncode == 0, done.stderr
     assert not (tmp_path / "model" / "kills").exists(), "the hold preempted a job on a lap that deferred"
@@ -867,15 +893,15 @@ def _preempted_then_gate(tmp_path, *, gate_ends, seen_by):
     `seen_by`: how the drain can tell the job ended, its scope or /health."""
     lock = tmp_path / "device-op.lock"
     unit = "990" if seen_by == "scope" else "428"
-    names = '[ "$(cat $M/running)" -gt 0 ] && echo 1 || echo 0' if seen_by == "health" else ":"
+    names = 'local r; read -r r < $M/running; [ "$r" -gt 0 ] && echo 1 || echo 0' if seen_by == "health" else ":"
     stub = f"""
 broker_preempt() {{ echo "1 990 0"; }}
 broker_names_preempt_job() {{ {names}; }}
-job_scopes() {{ [ "$(cat $M/running)" -gt 0 ] && echo "ttdev-job-{unit}.scope loaded active running"; }}
+job_scopes() {{ local r; read -r r < $M/running; [ "$r" -gt 0 ] && echo "ttdev-job-{unit}.scope loaded active running"; }}
 pgrep() {{ seen pgrep; [ -e $M/gate ] && echo 778; return 0; }}
 """
     on_sleep = (
-        f"t=$(cat $M/t); if [ $t -ge 70 ] && [ $(cat $M/running) -gt 0 ]; then echo 0 > $M/running;"
+        f"read -r t < $M/t; read -r r < $M/running; if [ $t -ge 70 ] && [ $r -gt 0 ]; then echo 0 > $M/running;"
         f" touch $M/gate; echo {os.getpid()} post_job_gate > {lock}; fi;"
         f" if [ $t -ge {gate_ends} ]; then rm -f $M/gate {lock}; fi;"
     )
