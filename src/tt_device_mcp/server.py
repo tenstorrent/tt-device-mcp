@@ -16747,8 +16747,12 @@ def create_mcp_server() -> MCPServer:
         timeout_sec: int = DEFAULT_TIMEOUT_SEC,
         preemptable: bool = False,
         hung_silence_sec: Optional[int] = None,
+        on_registered: Optional[Callable[["Job"], None]] = None,
     ) -> dict:
-        """Internal helper to queue a job."""
+        """Internal helper to queue a job.
+
+        ``on_registered`` is called with the job as soon as it is in ``jobs``, before any further
+        await: a caller cancelled after that point still knows its job (spec 01 I66)."""
         global job_counter
 
         identity_error = privsep_identity_error()
@@ -16882,6 +16886,8 @@ def create_mcp_server() -> MCPServer:
         if job.verification and logger:
             logger.info(f"  -> operator verification job ({job.verification}): queued at the head")
         jobs[job_id] = job
+        if on_registered is not None:
+            on_registered(job)
         _persist_queued_job(job)
         await _enqueue_job(job)
         _update_queue_depth_metric()
@@ -17014,22 +17020,26 @@ def create_mcp_server() -> MCPServer:
                 f"TOOL job_run: owner={submitting_owner()}, workspace={params.workspace}, command={params.command[:80]!r}, env={params.env}, timeout={params.timeout_sec}"
             )
 
-        result = await _queue_job(
-            params.workspace,
-            params.command,
-            params.env,
-            params.inherited_env,
-            params.timeout_sec,
-            params.no_timeout_except_on_contention,
-            params.hung_silence_sec,
-        )
-        if "error" in result:
-            return result
-
-        job_id = result["job_id"]
-        log_file = result.get("log_file", "")
-
+        # Spec 01 I66 holds from the moment the job is in `jobs`: _queue_job still awaits after
+        # that (its log pruning thread), and a cancel there must kill the job like any later one.
+        registered: list = []
         try:
+            result = await _queue_job(
+                params.workspace,
+                params.command,
+                params.env,
+                params.inherited_env,
+                params.timeout_sec,
+                params.no_timeout_except_on_contention,
+                params.hung_silence_sec,
+                on_registered=registered.append,
+            )
+            if "error" in result:
+                return result
+
+            job_id = result["job_id"]
+            log_file = result.get("log_file", "")
+
             # Report queue status prominently
             await ctx.info(f"Job {job_id}: {result.get('message', 'submitted')}")
             await ctx.info(f"Log file: {log_file}")
@@ -17041,8 +17051,9 @@ def create_mcp_server() -> MCPServer:
             # result, so the job is killed through tt_device_job_kill's own path. That path awaits
             # the terminate ladder, and any await in this cancelled scope is cancelled again, so the
             # kill runs on its own task (it inherits the caller's identity for the owner check).
-            job = jobs.get(job_id)
-            if job is not None and job.status in (JobStatus.RUNNING, JobStatus.QUEUED):
+            job = registered[0] if registered else None
+            if job is not None and jobs.get(job.id) is job and job.status in (JobStatus.RUNNING, JobStatus.QUEUED):
+                job_id = job.id
                 if params.keep_running_on_disconnect:
                     if logger:
                         logger.info(f"job_run {job_id}: client gone, job kept (keep_running_on_disconnect)")
