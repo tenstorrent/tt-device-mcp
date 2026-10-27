@@ -1540,6 +1540,29 @@ class CheckAerWatch:
     def stop(self) -> None:
         self._halt.set()
 
+    def armed(self) -> tuple:
+        """Spec 03 I96: whether the watch runs, for the broker's startup line. ``(True, fields)`` with
+        the chips one link_signals read sees (kernel memory only, as on every tick), else
+        ``(False, reason)``: no link_signals read here, a thread that is not running, or a read that
+        fails or lists no chip. Only reports: never starts, stops or changes the watch. Never raises."""
+        try:
+            read = getattr(self._deps, "link_signals", None)
+            if read is None:
+                return False, "no link_signals read on this broker (unsupported)"
+            if self.thread is None or not self.thread.is_alive():
+                return False, "its thread is not running"
+            chips = (read() or {}).get("chips") or ()
+            if not chips:
+                return False, "the driver lists no chip to watch"
+            return True, {
+                "chips": len(chips),
+                "interval_sec": LINK_WATCH_SEC,
+                "config_confirm": WATCH_CONFIG_CONFIRM,
+                "dllla": WATCH_DLLLA,
+            }
+        except Exception as exc:  # noqa: BLE001 - a report must never stop the broker's start
+            return False, f"its first read failed: {exc}"
+
     def _run(self) -> None:
         while not self._halt.wait(LINK_WATCH_SEC):
             try:
