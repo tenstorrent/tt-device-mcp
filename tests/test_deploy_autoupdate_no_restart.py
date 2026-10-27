@@ -34,6 +34,12 @@ _GIT_ENV = {
 }
 
 
+def _clock(text):
+    """The script's clock seam (au_now, au_time) as it defines them: the lap reads the real clock."""
+    i = text.index("au_now() {")
+    return text[i : text.index("\n", text.index("au_time() {", i)) + 1]
+
+
 def _git(repo, *args):
     env = {**_GIT_ENV, "HOME": str(repo.parent)}
     return subprocess.run(
@@ -96,7 +102,7 @@ def _lap(box, sha, *, now=10_000, health=_HEALTHY, job_polls=0, stand_ins=""):
     trace = tmp / "trace"
     polls = tmp / "polls"
     text = _SCRIPT.read_text()
-    body = text[text.index('installed_sha="$(cat "$STATE"') :]
+    body = text[text.index("# Read as $(cat) would") :]
     for old, new in (
         ("INHIBIT=/run/tt-device-broker/device-op.lock\n", f"INHIBIT={tmp / 'device-op.lock'}\n"),
         ("HOLD=/run/tt-device-broker/dispatch-hold\n", f"HOLD={tmp / 'run' / 'dispatch-hold'}\n"),
@@ -110,6 +116,7 @@ BR=main; src_desc=test; TT_DEVICE_MCP_HEALTH_DIR={root}
 remote_sha={sha}
 log() {{ echo "$* $(cat "$STATE")" >> {trace}; }}
 date() {{ echo {now}; }}
+{_clock(text)}au_now() {{ printf -v "$1" %s {now}; }}
 chmod() {{ :; }}
 ls() {{ :; }}
 pgrep() {{ :; }}

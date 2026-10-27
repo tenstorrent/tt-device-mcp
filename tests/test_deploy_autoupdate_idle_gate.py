@@ -55,6 +55,12 @@ def test_an_in_flight_device_op_still_bars_the_update():
 _UPTIME = 100_000
 
 
+def _clock(text):
+    """The script's clock seam (au_now, au_time) as it defines them: the lap reads the real clock."""
+    i = text.index("au_now() {")
+    return text[i : text.index("\n", text.index("au_time() {", i)) + 1]
+
+
 def _gate(
     tmp_path,
     *,
@@ -108,7 +114,7 @@ def _gate(
     # for up to the job cap, and each fork on a poll is hundreds per test.
     prelude = f"""set -u
 ROOT={root}; remote_sha=abc123; INHIBIT={tmp_path / "device-op.lock"}; STATE={root / "installed.sha"}
-on_restart() {{ :; }}
+{_clock(text)}on_restart() {{ :; }}
 seen() {{ local h; if [ -e "$HOLD" ]; then read -r h < "$HOLD"; echo "$1 held $h" >> {trace}; else echo "$1 free" >> {trace}; fi; }}
 sleep() {{ seen "sleep $*"; }}
 pgrep() {{ seen pgrep; }}
@@ -169,7 +175,7 @@ def test_a_queued_job_alone_applies_at_once_under_the_hold(tmp_path):
     Nothing here sleeps, so the lap's clock stands still while each poll takes over a second of
     real time: a slow or loaded host must not read as a drain. (On the real clock, a count that
     crossed a second boundary under a loaded full-suite run printed "drained after 1s".)"""
-    clock = "\ndate() { echo 1700000000; }\npgrep() { seen pgrep; command sleep 1.05; }\n"
+    clock = '\nau_now() { printf -v "$1" %s 1700000000; }\npgrep() { seen pgrep; command sleep 1.05; }\n'
     done, trace, hold = _gate(tmp_path, queued=1, stand_ins=clock)
     assert done.returncode == 0, done.stderr
     assert "queued=1" in done.stderr and "drained after 0s" in done.stderr, done.stderr
@@ -245,7 +251,7 @@ on_restart() {{
     if [ "$r" -eq 0 ] && [ "$q" -gt 0 ] && [ ! -e "$HOLD" ]; then echo dispatch >> {trace}; r=1; fi
     if [ "$r" -gt 0 ]; then echo "job cut by restart" >> {trace}; fi
 }}
-date() {{ local v; read -r v < $M/t; echo $(( {_T0} + v )); }}
+au_now() {{ local v; read -r v < $M/t; printf -v "$1" %s $(( {_T0} + v )); }}
 sleep() {{ local v; seen "sleep $*"; read -r v < $M/t; echo $(( v + ${{1%.*}} )) > $M/t; {on_sleep} }}
 """
 

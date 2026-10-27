@@ -25,6 +25,12 @@ from tt_device_mcp.fsm import ServerFsm
 _SCRIPT = Path(__file__).resolve().parent.parent / "deploy" / "tt-device-autoupdate.sh"
 
 
+def _clock(text):
+    """The script's clock seam (au_now, au_time) as it defines them: the lap reads the real clock."""
+    i = text.index("au_now() {")
+    return text[i : text.index("\n", text.index("au_time() {", i)) + 1]
+
+
 def _cut(text, start, end):
     i = text.index(start)
     return text[i : text.index(end, i)]
@@ -41,7 +47,7 @@ def _lap(tmp_path, *, now, sha, interval=None, quiet=0, active="active", nrestar
     here, None for the script's default (tests/test_deploy_autoupdate_coalesce.py)."""
     quoted_health = health.replace("'", "'\\''")  # a /health body may carry single quotes
     text = _SCRIPT.read_text()
-    head = _cut(text, 'installed_sha="$(cat "$STATE"', "INHIBIT=/run/")
+    head = _cut(text, "# Read as $(cat) would", "INHIBIT=/run/")
     tail = text[text.index('echo "$remote_sha" > "$STATE"') :]
     root = tmp_path / "root"
     root.mkdir(exist_ok=True)
@@ -51,6 +57,7 @@ ROOT={root}; STATE={root}/installed.sha; VENV={tmp_path}/venv; BR=main; src_desc
 idle=true; drained_s=0; TT_DEVICE_MCP_HEALTH_DIR={root}; RECOVERY_PENDING={root}/recovery.defer
 remote_sha={sha}
 date() {{ echo {now}; }}
+{_clock(text)}au_now() {{ printf -v "$1" %s {now}; }}
 chmod() {{ :; }}
 systemctl() {{
     case "$*" in
