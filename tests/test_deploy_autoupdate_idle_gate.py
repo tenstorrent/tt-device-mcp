@@ -98,10 +98,14 @@ def _gate(
         (logs / "queued" / f"{i}.json").write_text("{}")
     root = tmp_path / "root"
     root.mkdir()
+    # The stand-ins read their files with the read builtin, never $(cat ...): a lap polls every 5 s
+    # for up to the job cap, and each fork on a poll is hundreds per test. nullglob: an empty
+    # stand-in /proc has nothing to scan, as an empty /proc would (not its unmatched pattern).
     prelude = f"""set -u
+shopt -s nullglob
 ROOT={root}; remote_sha=abc123; INHIBIT={tmp_path / "device-op.lock"}; STATE={root / "installed.sha"}
 on_restart() {{ :; }}
-seen() {{ if [ -e "$HOLD" ]; then echo "$1 held $(cat "$HOLD")" >> {trace}; else echo "$1 free" >> {trace}; fi; }}
+seen() {{ local h; if [ -e "$HOLD" ]; then read -r h < "$HOLD"; echo "$1 held $h" >> {trace}; else echo "$1 free" >> {trace}; fi; }}
 sleep() {{ seen "sleep $*"; }}
 pgrep() {{ seen pgrep; }}
 ls() {{ :; }}  # no real /proc holders
@@ -201,7 +205,7 @@ def _broker(tmp_path, *, running, queue, job_ticks=3, on_sleep="", scope=False):
     trace = tmp_path / "trace"
     child = "" if scope else '[ "$r" -gt 0 ] && echo 777'
     scopes = (
-        '\njob_scopes() { [ "$(cat $M/running)" -gt 0 ] && echo "ttdev-job-428.scope loaded active running"; }'
+        '\njob_scopes() { local r; read -r r < $M/running; [ "$r" -gt 0 ] && echo "ttdev-job-428.scope loaded active running"; }'
         if scope
         else ""
     )
@@ -211,7 +215,7 @@ M={m}
 # again, as it does a second after a job ends.
 pgrep() {{
     seen pgrep
-    local r q; r=$(cat $M/running); q=$(cat $M/queue)
+    local r q; read -r r < $M/running; read -r q < $M/queue
     if [ "$r" -gt 0 ]; then r=$((r-1)); fi
     {child}
     if [ "$r" -eq 0 ] && [ "$q" -gt 0 ] && [ ! -e "$HOLD" ]; then
@@ -221,12 +225,12 @@ pgrep() {{
     return 0
 }}{scopes}
 on_restart() {{
-    local r q; r=$(cat $M/running); q=$(cat $M/queue)
+    local r q; read -r r < $M/running; read -r q < $M/queue
     if [ "$r" -eq 0 ] && [ "$q" -gt 0 ] && [ ! -e "$HOLD" ]; then echo dispatch >> {trace}; r=1; fi
     if [ "$r" -gt 0 ]; then echo "job cut by restart" >> {trace}; fi
 }}
-date() {{ echo $(( {_T0} + $(cat $M/t) )); }}
-sleep() {{ seen "sleep $*"; echo $(( $(cat $M/t) + ${{1%.*}} )) > $M/t; {on_sleep} }}
+date() {{ local v; read -r v < $M/t; echo $(( {_T0} + v )); }}
+sleep() {{ local v; seen "sleep $*"; read -r v < $M/t; echo $(( v + ${{1%.*}} )) > $M/t; {on_sleep} }}
 """
 
 
@@ -806,7 +810,7 @@ def _preemptable(limit_left, ends_after, running=1):
     """broker_preempt reports one running preemptable job `limit_left` s before its limit; the model
     job ends `ends_after` s into the drain (the broker's preemption)."""
     stub = f'\nbroker_preempt() {{ echo "{running} 990 {limit_left}"; }}\n'
-    end = f"[ $(cat $M/t) -ge {ends_after} ] && echo 0 > $M/running;"
+    end = f"read -r t < $M/t; [ $t -ge {ends_after} ] && echo 0 > $M/running;"
     return stub, end
 
 
@@ -843,7 +847,7 @@ def test_a_limit_too_far_off_for_the_job_cap_is_never_held_through(tmp_path, lim
     the limit, so the hold never preempts the job; the model broker SIGTERMs it only under a live
     hold a minute past its limit, as the broker does."""
     stub, _ = _preemptable(limit_left=limit_left, ends_after=10**9)
-    kill = f'[ -e "$HOLD" ] && [ $(cat $M/t) -ge {limit_left + 60} ] && echo "hold-driven kill" >> $M/kills;'
+    kill = f'read -r t < $M/t; [ -e "$HOLD" ] && [ $t -ge {limit_left + 60} ] && echo "hold-driven kill" >> $M/kills;'
     done, trace, hold = _drain(tmp_path, running=10_000, queue=0, scope=True, job_age=10, stand_ins=stub, on_sleep=kill)
     assert done.returncode == 0, done.stderr
     assert not (tmp_path / "model" / "kills").exists(), "the hold preempted a job on a lap that deferred"
@@ -867,15 +871,15 @@ def _preempted_then_gate(tmp_path, *, gate_ends, seen_by):
     `seen_by`: how the drain can tell the job ended, its scope or /health."""
     lock = tmp_path / "device-op.lock"
     unit = "990" if seen_by == "scope" else "428"
-    names = '[ "$(cat $M/running)" -gt 0 ] && echo 1 || echo 0' if seen_by == "health" else ":"
+    names = 'local r; read -r r < $M/running; [ "$r" -gt 0 ] && echo 1 || echo 0' if seen_by == "health" else ":"
     stub = f"""
 broker_preempt() {{ echo "1 990 0"; }}
 broker_names_preempt_job() {{ {names}; }}
-job_scopes() {{ [ "$(cat $M/running)" -gt 0 ] && echo "ttdev-job-{unit}.scope loaded active running"; }}
+job_scopes() {{ local r; read -r r < $M/running; [ "$r" -gt 0 ] && echo "ttdev-job-{unit}.scope loaded active running"; }}
 pgrep() {{ seen pgrep; [ -e $M/gate ] && echo 778; return 0; }}
 """
     on_sleep = (
-        f"t=$(cat $M/t); if [ $t -ge 70 ] && [ $(cat $M/running) -gt 0 ]; then echo 0 > $M/running;"
+        f"read -r t < $M/t; read -r r < $M/running; if [ $t -ge 70 ] && [ $r -gt 0 ]; then echo 0 > $M/running;"
         f" touch $M/gate; echo {os.getpid()} post_job_gate > {lock}; fi;"
         f" if [ $t -ge {gate_ends} ]; then rm -f $M/gate {lock}; fi;"
     )
