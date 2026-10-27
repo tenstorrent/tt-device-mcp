@@ -209,6 +209,24 @@ def _spawned_by_this_run(pid: int) -> bool:
     return _carries_spawn_token(pid)
 
 
+def _exited(pid: int) -> bool:
+    """pid has fully exited and only its zombie is left (no live thread): a signal reaches nothing.
+    A zombie's /proc environ is empty and, once its parent exits first, its ppid is init, so it
+    no longer reads as this run's; the survivor reap's group sweep after a killed job can still
+    meet one. A leader that left its live threads behind also reads 'Z', so every thread counts,
+    listed again after the reads: only a live thread makes a new one."""
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+        for tid in tids:
+            with open(f"/proc/{pid}/task/{tid}/stat") as f:
+                data = f.read()
+            if data[data.rindex(")") + 2 :].split()[0] not in ("Z", "X"):
+                return False
+        return bool(tids) and set(os.listdir(f"/proc/{pid}/task")) <= set(tids)
+    except (OSError, ValueError, IndexError):
+        return False
+
+
 def _group_members(pgid: int) -> list:
     members = []
     for name in os.listdir("/proc"):
@@ -230,8 +248,13 @@ class _SignalGuard:
 
     def _foreign(self, pids: list) -> list:
         """The pids that exist and are not this run's. A process (or an ancestor) that exits during
-        the ppid walk breaks it, so a miss is read again; one that is gone by then is skipped."""
-        return [p for p in pids if not self.owned(p) and os.path.exists(f"/proc/{p}") and not self.owned(p)]
+        the ppid walk breaks it, so a miss is read again; one that is gone or fully exited by then
+        is skipped."""
+        return [
+            p
+            for p in pids
+            if not self.owned(p) and os.path.exists(f"/proc/{p}") and not self.owned(p) and not _exited(p)
+        ]
 
     def _refuse(self, what: str, sig: int, members: list):
         self.refused.append(f"{what}(signal {int(sig)}) reaches pid(s) {members[:8]} this test did not spawn")
