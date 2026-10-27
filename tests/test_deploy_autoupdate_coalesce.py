@@ -11,6 +11,8 @@ it is one restart per bound at most, plus one onto the last sha once the burst e
 the script's own lines under a fake clock, one lap a minute, like the reconcile timer.
 """
 
+import re
+
 import pytest
 
 import tt_device_mcp.server as srv
@@ -25,17 +27,22 @@ QUIET, BOUND, INTERVAL, LAP = 600, 3600, 1800, 60
 T0 = 1_700_000_000
 
 
-def _simulate(tmp_path, moves, *, until, quiet=None, start=T0):
+def _simulate(tmp_path, moves, *, until, quiet=None, start=T0, skip=False):
     """Laps every 60 s from `start` to `until` while the branch head moves at the times in `moves`
     (sha `s<n>` after the n-th move). The box applied `s0` long before. Returns the restarts as
     (time, sha) and, for every sha, when it was first seen. Once the last sha is installed and one
-    more lap found it current, it stops: with the head at rest every later lap is that same exit."""
+    more lap found it current, it stops: with the head at rest every later lap is that same exit.
+    `skip`: after a lap that defers and says when it applies, the next lap run is the first one at
+    or past that time or the next move, whichever comes first; the laps between are the same deferral.
+    With coalescing on, the lone-push and burst tests run every lap, and so check that a deferral
+    applies when it says."""
     root = tmp_path / "root"
     root.mkdir(exist_ok=True)
     (root / "installed.sha").write_text("s0\n")
     (root / "last-apply").write_text(f"{start - 4 * 3600}\n")
     restarts, seen, settled = [], {}, False
-    for now in range(start, until + 1, LAP):
+    now = start
+    while now <= until:
         sha = f"s{sum(m <= now for m in moves)}"
         seen.setdefault(sha, now)
         done, lines, _ = _lap(tmp_path, now=now, sha=sha, quiet=quiet)
@@ -44,7 +51,18 @@ def _simulate(tmp_path, moves, *, until, quiet=None, start=T0):
             assert not done.stderr and not (root / "pending-head").exists(), done.stderr
             break
         settled = now >= max(moves) and (root / "installed.sha").read_text().split() == [sha]
+        then = now + LAP
+        said = re.search(r"applies in (\d+)s", done.stderr) if skip else None
+        if said:
+            on_lap = [_on_lap(now + int(said.group(1)), start)] + [_on_lap(m, start) for m in moves if m > now]
+            then = max(then, min(on_lap))
+        now = then
     return restarts, seen
+
+
+def _on_lap(t, start):
+    """The first lap at or past `t`."""
+    return start + -(-(t - start) // LAP) * LAP
 
 
 def test_the_defaults_are_code_defaults():
@@ -65,7 +83,7 @@ def test_a_push_every_5_min_for_150_min_is_at_most_3_restarts(tmp_path):
     assert all(b - a >= INTERVAL for a, b in zip(times, times[1:])), restarts
     # The same burst with coalescing off: one restart per interval, which is what it replaces.
     (tmp_path / "off").mkdir()
-    before, _ = _simulate(tmp_path / "off", moves, until=end, quiet=0)
+    before, _ = _simulate(tmp_path / "off", moves, until=end, quiet=0, skip=True)
     assert len(before) >= 5 > len(restarts), (before, restarts)
 
 
@@ -73,7 +91,7 @@ def test_a_lone_push_after_an_hour_of_quiet_waits_only_the_quiet_period(tmp_path
     moves = [T0 + 3600]
     restarts, _ = _simulate(tmp_path, moves, until=T0 + 3600 + 2 * QUIET)
     (tmp_path / "off").mkdir()
-    before, _ = _simulate(tmp_path / "off", moves, until=T0 + 3600 + 2 * QUIET, quiet=0)
+    before, _ = _simulate(tmp_path / "off", moves, until=T0 + 3600 + 2 * QUIET, quiet=0, skip=True)
     assert before == [(T0 + 3600, "s1")], before
     assert restarts == [(T0 + 3600 + QUIET, "s1")], restarts
 
@@ -89,7 +107,7 @@ def test_no_sha_waits_longer_than_the_bound_plus_a_lap(tmp_path, gaps_min):
         moves.append(t)
         t += g * 60
     end = moves[-1] + QUIET + BOUND
-    restarts, seen = _simulate(tmp_path, moves, until=end)
+    restarts, seen = _simulate(tmp_path, moves, until=end, skip=True)
     applied_at = {}
     for t_apply, sha in restarts:  # a sha is served by the first restart onto it or a newer one
         n = int(sha[1:])
