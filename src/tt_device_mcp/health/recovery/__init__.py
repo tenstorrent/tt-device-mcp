@@ -29,6 +29,7 @@ from tt_device_mcp import constants, metrics
 from tt_device_mcp.device_holders import HolderScan, is_tenant
 from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.evidence import health_event
+from tt_device_mcp.health.monitor import FABRIC_KILLED_BY_ISOLATION
 from tt_device_mcp.health.monitors import fabric, pci
 from tt_device_mcp.health.monitors.heartbeat import (
     arc_live_chips,
@@ -932,6 +933,31 @@ class Recovery(ABC):
         f = evidence.get("fabric")
         return f is not None and f.get("ok") is None
 
+    def _note_post_reset_pass(
+        self, healthy: Optional[bool], evidence: dict, isolated_before: set, log
+    ) -> Optional[bool]:
+        """Read one post-reset verify pass. A pass whose enum+ARC read every expected chip present records
+        that on the mechanism: a chip off the bus later dropped after this reset's own check, a new drop
+        and not a regression of it (spec 04 I31). A pass whose fabric reached no verdict because a chip
+        was lost under it (dead-chip isolation killed the check, spec 03 I82, or isolated a chip during
+        it) is a failed verify, never a 77 the eth-training wait could settle (spec 04 I84): returns False."""
+        if not healthy:
+            return healthy
+        self.mechanism.verified_present_reset_at = self.mechanism.last_reset_monotonic
+        if not self._fabric_ran_but_unverified(evidence):
+            return healthy
+        detail = str(evidence["fabric"].get("detail") or "")
+        lost = sorted(set(map(str, self.deps.isolated_chips())) - isolated_before, key=int)
+        if detail.startswith(FABRIC_KILLED_BY_ISOLATION):
+            why = "dead-chip isolation killed the fabric check"
+        elif lost:
+            why = f"chip(s) {lost} isolated off the bus during the fabric check"
+        else:
+            return healthy
+        log(f"post-reset fabric reached no verdict: {why} — a chip was lost, not an eth-training 77; the verify failed")
+        health_event("post_reset_verify_chip_lost", reason=why, chips=lost)
+        return False
+
     async def _verify_device_after_reset(self, expected: int, log) -> tuple[Optional[bool], dict, int]:
         """Verify a mesh after a reset, giving a post-reset fabric 77 time to settle before it is believed.
 
@@ -943,9 +969,12 @@ class Recovery(ABC):
         shape: enum+ARC read OK while every full-mesh job died on a down link), and never a failed reset
         either (a 77 measured nothing, so it must not arm the host rungs). Falsy, so a caller that only
         asks "recovered?" still reads no. A 77 from a validator that is not built yet (spec 03 I81) gets no
-        retry and no eth-training wait: it is the same UNKNOWN at once. Returns ``(healthy, evidence,
-        fabric_retries)``."""
+        retry and no eth-training wait: it is the same UNKNOWN at once. A pass whose fabric check a lost
+        chip ended (dead-chip isolation) is a failed verify at once, with no retry and no wait
+        (:meth:`_note_post_reset_pass`). Returns ``(healthy, evidence, fabric_retries)``."""
+        isolated_before = set(map(str, self.deps.isolated_chips()))
         healthy, evidence = await self._verify_device(expected, log)
+        healthy = self._note_post_reset_pass(healthy, evidence, isolated_before, log)
         retries = 0
         not_built = None
         while (
@@ -977,6 +1006,7 @@ class Recovery(ABC):
                 )
                 await asyncio.sleep(POST_RESET_FABRIC_RETRY_SLEEP_SEC)
             healthy, evidence = await self._verify_device(expected, log)
+            healthy = self._note_post_reset_pass(healthy, evidence, isolated_before, log)
         if healthy and expected > 1 and self._fabric_ran_but_unverified(evidence):
             log(
                 (

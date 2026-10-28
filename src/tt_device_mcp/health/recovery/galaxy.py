@@ -4336,7 +4336,13 @@ class GalaxyRecovery(Recovery):
         # the gate's own escalation so a regression climbs the same on the idle path as at a job boundary.
         # Detected BEFORE the ceiling deferral below so an early regression is latched for the episode:
         # no later pass of it fires the mesh reset again (spec 04 I31).
-        reset_regressed = expected > 1 and off_bus_before is not None and off_bus > off_bus_before
+        # A reset whose own check read every chip present did not regress it: the chip dropped later (I31).
+        reset_regressed = (
+            expected > 1
+            and off_bus_before is not None
+            and off_bus > off_bus_before
+            and not self.mechanism.last_reset_verified_present()
+        )
         if reset_regressed:
             self.mechanism.note_reset_regressed(hold_since)
             health_event(

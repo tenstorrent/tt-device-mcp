@@ -751,6 +751,10 @@ class RecoveryMechanism:
         # The last Galaxy mesh reset this process launched: {"episode", "started", "ended"} (monotonic
         # seconds). The last-chance sweep spaces the episode's second from it (spec 04 I93); None until one ran.
         self.last_mesh_reset_run: Optional[dict] = None
+        # The ``last_reset_monotonic`` of the last reset whose own post-reset check read every expected
+        # chip present (enum+ARC passed); None until one did. A chip off the bus after that check dropped
+        # later (under the fabric check): a new drop, not a regression of that reset (spec 04 I31).
+        self.verified_present_reset_at: Optional[float] = None
         # Monotonic time the last reset command this process launched returned (its check not included).
         self.last_reset_ended_monotonic: float = 0.0
         # Whether the last reset command EXITED non-zero (a real `reset_done rc=1`, not a timeout
@@ -839,6 +843,12 @@ class RecoveryMechanism:
         regression seen before any hold opened (a gate's first reset) latches the episode about to
         open; the release transition clears the latch either way."""
         self.regressed_reset_since = hold_since or "*"
+
+    def last_reset_verified_present(self) -> bool:
+        """True when the last reset's own post-reset check read every expected chip present: a chip off
+        the bus now dropped after that check, so it is a new drop, not a reset regression (spec 04 I31)."""
+        at = self.verified_present_reset_at
+        return at is not None and at == self.last_reset_monotonic
 
     def reset_regressed_in(self, hold_since: str) -> bool:
         """True when this hold episode's galaxy reset already regressed the mesh: another mesh

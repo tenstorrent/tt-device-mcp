@@ -712,6 +712,9 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     # The exit code of the last launched reset. Left set, a test whose stub reset never sets it would
     # record a failed reset in the boot's record (spec 04 I58) and skip the next test's reset.
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_rc", None, raising=False)
+    # The reset whose own check read every chip present (spec 04 I31). Left set, it would excuse the
+    # next test's regressing reset as a drop after a verified reset.
+    monkeypatch.setattr(srv.recovery_mechanism, "verified_present_reset_at", None, raising=False)
     for flag in ("last_reset_driver_wait_failed", "last_reset_tray_repower", "last_reset_rescan_withheld"):
         monkeypatch.setattr(srv.recovery_mechanism, flag, False, raising=False)
     # A host reboot/power cycle a test requested (with a stub fire) must not suppress the NEXT

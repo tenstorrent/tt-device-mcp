@@ -8527,8 +8527,15 @@ async def device_health_gate(
         stage = galaxy_recovery.next_stage(ev)
         # A reset that made the mesh WORSE off the bus (the incident's 8->32 inversion), or that
         # hard-exited leaving chips off it, goes to the power cycle; flagging it loudly is the gate's
-        # half of that verdict, and it names the drop in the fail-closed event below.
-        reset_regressed = expected > 1 and off_bus > off_bus_before and not reset_cycling
+        # half of that verdict, and it names the drop in the fail-closed event below. A reset whose own
+        # check read every chip present did not regress it: a chip off the bus now dropped after that
+        # check (under the fabric pass), a new drop the ladder's resets still get to heal (spec 04 I31).
+        reset_regressed = (
+            expected > 1
+            and off_bus > off_bus_before
+            and not reset_cycling
+            and not recovery_mechanism.last_reset_verified_present()
+        )
         if reset_regressed:
             recovery_mechanism.note_reset_regressed(device_hold_episode_since)
             health_event(
