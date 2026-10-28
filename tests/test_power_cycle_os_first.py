@@ -14,19 +14,25 @@ import json
 import os
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from tests.conftest import patch_health_event
+from tests.conftest import GALAXY_BUS_IDS, patch_health_event
+from tests.test_classac_power_cycle_direct import EXPECTED, _beats_without, _gate, _off, rig  # noqa: F401 - the fixture
+from tests.test_offbus_power_cycle import _below_floor_episode, _gate_below_floor, _spy_gated_power_cycle
 from tt_device_mcp import alert
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.recovery import base as recovery_base
+from tt_device_mcp.health.recovery import galaxy
 from tt_device_mcp.health.recovery import offbus_power_cycle as opc
 from tt_device_mcp.health.recovery.offbus_power_cycle import fire_command as _real_fire_command  # before the tripwire
 from tt_device_mcp.health.recovery.stages import power_cycle as pc
 
 _real_installed_shutdown_hook = pc.installed_shutdown_hook  # before conftest stubs it
+_real_auto_power_cycle_host = srv._auto_power_cycle_host  # before a rig stubs it
 
 REPO = Path(__file__).resolve().parent.parent
 HOOK = REPO / "deploy" / "tt-device-mcp-power-cycle.shutdown"
@@ -329,6 +335,270 @@ def test_an_unwritable_request_raises_not_launched(os_first, monkeypatch, tmp_pa
     assert _steps(os_first) == ["preflight"]
 
 
+class _Journal:
+    """Stands in for the stage's logger: each warning is a step, so its order against the unit shows."""
+
+    def __init__(self, calls, fail=False):
+        self.calls, self.fail, self.errors = calls, fail, []
+
+    def warning(self, msg, *args):
+        if not msg.startswith("POWER CYCLE TRIGGER"):
+            return
+        if self.fail:
+            raise OSError("journal gone")
+        self.calls.append(("journal", [msg % args], None, None))
+
+    def error(self, msg, *args):
+        self.errors.append(msg % args)
+
+
+TRIGGER_REASON = "idle escalation: 1/32 chip(s) off the bus after the reset ladder"
+
+
+def test_the_trigger_is_journaled_before_the_unit_starts_and_names_it(os_first, monkeypatch):
+    monkeypatch.setattr(pc, "_logger", _Journal(os_first["calls"]))
+    pc.note_power_cycle_trigger(TRIGGER_REASON, "partial_offbus", {"0": "0000:01:00.0"}, "2026-01-01T00:00:00")
+    assert pc.fire_os_first(CYCLE, "auto BMC power cycle") == "os_first"
+    assert _steps(os_first) == ["preflight", "journal", "systemd-run", "reboot"]
+    line = os_first["calls"][1][1][0]
+    unit = os_first["calls"][2][1][1].split("=", 1)[1]
+    want = f"class=partial_offbus chips=[0 (0000:01:00.0)] reason={TRIGGER_REASON} hold=2026-01-01T00:00:00"
+    assert line == f"POWER CYCLE TRIGGER (unit {unit}): {want}"
+    assert f"--description=tt-device-mcp: power-cycle a hung shutdown (spec 04 I88): {want}" in os_first["calls"][2][1]
+    # Taken once: the next cycle with no fresh note names only its own reason, as does a stale note.
+    os_first["calls"].clear()
+    assert pc.fire_os_first(CYCLE, REASON) == "os_first"
+    assert os_first["calls"][1][1][0].endswith(f"class=unknown chips=[] reason={REASON}")
+    os_first["calls"].clear()
+    pc.note_power_cycle_trigger(TRIGGER_REASON, "partial_offbus", {"3": None})
+    monkeypatch.setitem(pc._trigger, "at", time.monotonic() - pc.TRIGGER_MAX_AGE_SEC - 1)
+    pc.fire_os_first(CYCLE, REASON)
+    assert os_first["calls"][1][1][0].endswith(f"class=unknown chips=[] reason={REASON}")
+
+
+@pytest.mark.parametrize("broken", ["logger", "text"])
+def test_a_failing_trigger_journal_still_issues_the_cycle(os_first, monkeypatch, broken):
+    journal = _Journal(os_first["calls"], fail=broken == "logger")
+    monkeypatch.setattr(pc, "_logger", journal)
+    if broken == "text":
+        monkeypatch.setattr(pc, "power_cycle_trigger_text", lambda r: 1 / 0)
+    pc.note_power_cycle_trigger(TRIGGER_REASON, "partial_offbus", {"0": "0000:01:00.0"})
+    assert pc.fire_os_first(CYCLE, REASON) == "os_first"
+    assert _steps(os_first) == ["preflight", "systemd-run", "reboot"]
+    assert "--description=tt-device-mcp: power-cycle a hung shutdown (spec 04 I88)" in os_first["calls"][1][1]
+    assert len(journal.errors) == 1 and "cycling anyway" in journal.errors[0]
+
+
+class _Log:
+    """Stands in for the stage's logger and keeps every line, so a marker that was not written shows."""
+
+    def __init__(self):
+        self.lines = []
+
+    def warning(self, msg, *args):
+        self.lines.append(msg % args)
+
+    error = warning
+
+
+def _marker():
+    return json.loads(Path(pc.PENDING_MARKER_PATH).read_text())
+
+
+def _local(iso):
+    return datetime.fromisoformat(iso).astimezone().isoformat(timespec="seconds")
+
+
+MARKER_KEYS = {"version", "state", "fault_class", "chips", "reason", "hold_since", "earliest_cycle_at", "updated_at"}
+
+
+def test_a_possible_cycle_is_marked_for_other_users_with_every_field():
+    """Spec 04 I88: the broker's provider names the class, the chips (numeric order, address or "") and
+    the hold; the file is whole (atomic rename), world-readable, and leaves no temp file behind."""
+    pc.set_pending_marker_context(
+        lambda: ("partial_offbus", {"10": None, "0": "0000:01:00.0", "2": "0000:03:00.0"}, "2026-01-01T00:00:00")
+    )
+    before = int(time.time())
+    pc.note_cycle_possible("recovery ladder at hold age 600s")
+    m = _marker()
+    assert set(m) == MARKER_KEYS
+    assert (m["version"], m["state"], m["fault_class"], m["reason"], m["hold_since"]) == (
+        1,
+        "possible",
+        "partial_offbus",
+        "recovery ladder at hold age 600s",
+        _local("2026-01-01T00:00:00"),
+    )
+    assert m["chips"] == [
+        {"index": 0, "bdf": "0000:01:00.0"},
+        {"index": 2, "bdf": "0000:03:00.0"},
+        {"index": 10, "bdf": ""},
+    ]
+    for key in ("earliest_cycle_at", "updated_at"):
+        when = datetime.fromisoformat(m[key])
+        assert when.tzinfo is not None and when.timestamp() >= before
+    path = Path(pc.PENDING_MARKER_PATH)
+    assert path.stat().st_mode & 0o777 == 0o644
+    assert [p.name for p in path.parent.iterdir()] == [path.name]
+
+
+def test_clearing_removes_the_marker_and_a_second_clear_is_quiet(monkeypatch):
+    log = _Log()
+    monkeypatch.setattr(pc, "_logger", log)
+    pc.set_pending_marker_context(lambda: ("whole_tray", {}, ""))
+    pc.note_cycle_possible("whole tray off the bus")
+    assert (_marker()["chips"], _marker()["hold_since"]) == ([], "")
+    pc.clear_pending_marker()
+    assert not Path(pc.PENDING_MARKER_PATH).exists()
+    pc.clear_pending_marker()
+    assert log.lines == []
+
+
+@pytest.mark.parametrize(
+    "provider, logged",
+    [(None, 0), (lambda: None, 0), (lambda: 1 / 0, 1)],
+    ids=["outside-a-broker", "auto-power-cycle-off", "provider-fails"],
+)
+def test_no_possible_marker_when_no_cycle_can_follow(monkeypatch, provider, logged):
+    """No provider (not a broker, which alone removes the marker), a provider that says the broker
+    cannot power-cycle, or one that fails: nothing is written and nothing raises."""
+    log = _Log()
+    monkeypatch.setattr(pc, "_logger", log)
+    pc.set_pending_marker_context(provider)
+    pc.note_cycle_possible("recovery ladder at hold age 600s")
+    assert not Path(pc.PENDING_MARKER_PATH).exists()
+    assert len(log.lines) == logged
+
+
+def test_the_marker_reads_requested_when_the_unit_starts(os_first, monkeypatch):
+    """The fallback unit's start is the last step before the reboot: the marker already says
+    'requested' there, with the trigger's class, chips, reason and hold; with no fresh trigger note
+    it carries the cycle's own reason."""
+    seen, step = [], pc._run_step
+
+    def reading(argv, timeout=pc.STEP_TIMEOUT_SEC):
+        if _key(argv) == "systemd-run":
+            seen.append(_marker())
+        return step(argv, timeout)
+
+    monkeypatch.setattr(pc, "_run_step", reading)
+    pc.note_power_cycle_trigger(TRIGGER_REASON, "partial_offbus", {"0": "0000:01:00.0"}, "2026-01-01T00:00:00")
+    assert pc.fire_os_first(CYCLE, "auto BMC power cycle") == "os_first"
+    assert _steps(os_first) == ["preflight", "systemd-run", "reboot"]
+    assert [(m["state"], m["fault_class"], m["chips"], m["reason"], m["hold_since"]) for m in seen] == [
+        (
+            "requested",
+            "partial_offbus",
+            [{"index": 0, "bdf": "0000:01:00.0"}],
+            TRIGGER_REASON,
+            _local("2026-01-01T00:00:00"),
+        )
+    ]
+    seen.clear()
+    assert pc.fire_os_first(CYCLE, REASON) == "os_first"
+    assert [(m["state"], m["fault_class"], m["chips"], m["reason"]) for m in seen] == [
+        ("requested", "unknown", [], REASON)
+    ]
+
+
+def test_a_marker_that_cannot_be_written_never_holds_the_cycle(os_first, monkeypatch, tmp_path):
+    """Its directory is a regular file: every write returns False and is logged, the removal is logged,
+    and the cycle still starts its unit and reboots."""
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("")
+    monkeypatch.setattr(pc, "PENDING_MARKER_PATH", str(blocker / "power-cycle-pending.json"))
+    log = _Log()
+    monkeypatch.setattr(pc, "_logger", log)
+    pc.set_pending_marker_context(lambda: ("partial_offbus", {"0": "0000:01:00.0"}, ""))
+    assert pc.write_pending_marker("possible", "recovery ladder at hold age 600s") is False
+    pc.note_cycle_possible("recovery ladder at hold age 600s")
+    pc.note_power_cycle_trigger(TRIGGER_REASON, "partial_offbus", {"0": "0000:01:00.0"})
+    assert pc.fire_os_first(CYCLE, REASON) == "os_first"
+    assert _steps(os_first) == ["preflight", "systemd-run", "reboot"]
+    pc.clear_pending_marker()
+    failed = [line.split(":")[0] for line in log.lines if "pending marker" in line]
+    assert failed == [
+        "power-cycle pending marker (possible) not written",
+        "power-cycle pending marker (possible) not written",
+        "power-cycle pending marker (requested) not written",
+        "power-cycle pending marker not removed",
+    ]
+    assert blocker.read_text() == ""
+
+
+def test_a_write_that_fails_midway_leaves_no_temp_file(monkeypatch):
+    log = _Log()
+    monkeypatch.setattr(pc, "_logger", log)
+    monkeypatch.setattr(pc, "json", SimpleNamespace(dumps=lambda *a, **k: 1 / 0))
+    path = Path(pc.PENDING_MARKER_PATH)
+    assert pc.write_pending_marker("requested", REASON) is False
+    assert list(path.parent.iterdir()) == [] and len(log.lines) == 1
+
+
+def test_a_whole_tray_drop_marks_a_cycle_possible(monkeypatch):
+    monkeypatch.setattr(opc, "_pending", {})
+    monkeypatch.setattr(opc, "health_event", lambda *a, **k: None)
+    pc.set_pending_marker_context(lambda: ("whole_tray", {"8": "0000:41:00.0"}, "2026-01-01T00:00:00"))
+    opc.note_whole_tray_down("2026-01-01T00:00:00", "tray 2: 8/8 chip(s) off the bus")
+    m = _marker()
+    assert (m["state"], m["fault_class"], m["reason"]) == (
+        "possible",
+        "whole_tray",
+        "whole tray off the bus: tray 2: 8/8 chip(s) off the bus",
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_whole_tray_sent_straight_to_the_cycle_marks_it_possible(monkeypatch):
+    from tt_device_mcp.health.recovery import galaxy
+
+    monkeypatch.setattr(opc, "power_cycle_argv", lambda: CYCLE)
+    monkeypatch.setattr(opc, "partial_reset_due", lambda since: True)
+    monkeypatch.setattr(galaxy, "_hold_gate_liftable", lambda: True)
+    monkeypatch.setattr(galaxy, "offbus_count", lambda beats, expected: 8)
+    monkeypatch.setattr(galaxy, "_offbus_chip_ids", lambda beats, expected: list(range(8, 16)))
+    monkeypatch.setattr(galaxy, "_whole_tray_drop_trays", lambda chips, expected, trays: {1})
+    pc.set_pending_marker_context(lambda: ("whole_tray", {}, "2026-01-01T00:00:00"))
+    deps = SimpleNamespace(device_hold_episode_since=lambda: "2026-01-01T00:00:00", read_heartbeats=lambda: [])
+    fake = SimpleNamespace(deps=deps, _tray_map_now=lambda: None)
+    assert await galaxy.GalaxyRecovery._offbus_hold_lift(fake, 32, lambda line: None) == ""
+    assert (_marker()["state"], _marker()["reason"]) == ("possible", "8/32 chip(s) off the bus fill whole trays")
+
+
+@pytest.mark.asyncio
+async def test_the_last_chance_ladder_marks_a_cycle_possible_before_it_runs():
+    from tt_device_mcp.health.recovery.galaxy import GalaxyRecovery
+
+    pc.set_pending_marker_context(lambda: ("partial_offbus", {"0": "0000:01:00.0"}, ""))
+    seen = []
+
+    async def body(*args, **kwargs):
+        seen.append((_marker()["state"], args, kwargs))
+        return "settled"
+
+    fake = SimpleNamespace(_settle_and_verify_body=body)
+    assert await GalaxyRecovery._settle_and_verify_before_host_rung(fake, 1, log=None) == "settled"
+    assert seen == [("possible", (1,), {"log": None})]
+    assert _marker()["reason"] == "last-chance ladder before the power cycle"
+
+
+def test_the_hold_lifting_removes_the_marker(monkeypatch, clear_job_state, tmp_path):
+    """Spec 04 I88: the marker lives as long as the hold; a hold that stays keeps it."""
+    from tests.test_hold_escalation_status import _isolate_hold
+
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    _isolate_hold(monkeypatch)
+    monkeypatch.setattr(opc, "_pending", {})
+    srv._note_tenant_gate_verdict("device unverified: 1/32 chip(s) off the bus")
+    pc.set_pending_marker_context(lambda: ("partial_offbus", {"0": "0000:01:00.0"}, srv.device_hold_episode_since))
+    pc.note_cycle_possible("recovery ladder at hold age 600s")
+    assert _marker()["state"] == "possible"
+    srv._note_tenant_gate_verdict("device unverified: 1/32 chip(s) off the bus")
+    assert _marker()["state"] == "possible"
+    srv._note_tenant_gate_verdict("")
+    assert not Path(pc.PENDING_MARKER_PATH).exists()
+
+
 def test_a_fallback_unit_that_cannot_start_never_reboots(os_first):
     os_first["rc"]["systemd-run"] = 1
     assert "fallback unit did not start" in _not_launched(os_first)
@@ -454,6 +724,149 @@ async def test_the_escalation_is_unchanged_around_the_clean_path(escalation):
     assert [r["action"] for r in mech.read_auto_recovery_ledger()] == ["power-cycle"]
     assert mech.host_action_requested[0] == "power-cycle"
     assert _steps(escalation) == ["preflight", "systemd-run", "reboot"] and escalation["pages"] == []
+
+
+@pytest.mark.asyncio
+async def test_the_escalation_journals_class_chips_and_hold_before_the_unit(escalation, monkeypatch):
+    """The broker's own cycle names what asked for it from memory (no chip read): the off-bus chips with
+    their addresses, their fault class, the escalation's reason as the ledger has it, the hold."""
+    from types import SimpleNamespace
+
+    mech = escalation["mech"]
+    monkeypatch.setattr(mech, "power_cycle_journal", srv._journal_power_cycle_foreign_holders)
+    monkeypatch.setattr(srv, "_foreign_holder_rows", lambda: [])
+    monkeypatch.setattr(srv, "_offbus_one_shot_chips", lambda: {"0"})
+    monkeypatch.setattr(srv, "device_pci_map", {"0": "0000:01:00.0", "1": "0000:02:00.0"})
+    monkeypatch.setattr(srv, "health_monitor", SimpleNamespace(expected=lambda present: 32))
+    monkeypatch.setattr(srv, "galaxy_recovery", None)
+    monkeypatch.setattr(srv, "device_hold_episode_since", "2026-01-01T00:00:00")
+    monkeypatch.setattr(pc, "_logger", _Journal(escalation["calls"]))
+    assert await srv._auto_power_cycle_host(lambda _l: None, TRIGGER_REASON) is True
+    assert [r["reason"] for r in mech.read_auto_recovery_ledger()] == [TRIGGER_REASON]
+    assert _steps(escalation) == ["preflight", "journal", "systemd-run", "reboot"]
+    assert escalation["calls"][1][1][0].endswith(
+        f"class=partial_offbus chips=[0 (0000:01:00.0)] reason={TRIGGER_REASON} hold=2026-01-01T00:00:00"
+    )
+    # A trigger that cannot be read leaves the cycle as it was.
+    escalation["calls"].clear()
+    mech.retract_last_auto_recovery("power-cycle")
+    monkeypatch.setattr(srv, "_offbus_one_shot_chips", lambda: 1 / 0)
+    assert await srv._auto_power_cycle_host(lambda _l: None, TRIGGER_REASON) is True
+    assert _steps(escalation) == ["preflight", "journal", "systemd-run", "reboot"]
+
+
+@pytest.mark.asyncio
+async def test_the_escalation_marks_the_cycle_possible_then_requested(escalation, monkeypatch):
+    """The broker's own cycle: 'possible' when the escalation names its trigger, 'requested' as the
+    unit starts, both from the broker's provider (memory only); with neither the auto power cycle nor
+    a configured command the provider writes no 'possible'."""
+    monkeypatch.setattr(escalation["mech"], "power_cycle_journal", srv._journal_power_cycle_foreign_holders)
+    monkeypatch.setattr(srv, "_foreign_holder_rows", lambda: [])
+    monkeypatch.setattr(srv, "_offbus_one_shot_chips", lambda: {"0"})
+    monkeypatch.setattr(srv, "device_pci_map", {"0": "0000:01:00.0"})
+    monkeypatch.setattr(srv, "health_monitor", SimpleNamespace(expected=lambda present: 32))
+    monkeypatch.setattr(srv, "galaxy_recovery", None)
+    monkeypatch.setattr(srv, "device_hold_episode_since", "2026-01-01T00:00:00")
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    pc.set_pending_marker_context(srv._power_cycle_marker_context)
+    written, write = [], pc.write_pending_marker
+    monkeypatch.setattr(
+        pc, "write_pending_marker", lambda state, *a, **k: written.append(state) or write(state, *a, **k)
+    )
+    assert await srv._auto_power_cycle_host(lambda _l: None, TRIGGER_REASON) is True
+    assert written == ["possible", "requested"]
+    m = _marker()
+    assert (m["state"], m["fault_class"], m["chips"], m["reason"], m["hold_since"]) == (
+        "requested",
+        "partial_offbus",
+        [{"index": 0, "bdf": "0000:01:00.0"}],
+        TRIGGER_REASON,
+        _local("2026-01-01T00:00:00"),
+    )
+    assert srv._power_cycle_marker_context() == ("partial_offbus", {"0": "0000:01:00.0"}, "2026-01-01T00:00:00")
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: False)
+    monkeypatch.delenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", raising=False)
+    assert srv._power_cycle_marker_context() is None
+    # The I27 configured command can still cycle the host: the marker still warns.
+    monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", "ipmitool chassis power cycle")
+    assert srv._power_cycle_marker_context() == ("partial_offbus", {"0": "0000:01:00.0"}, "2026-01-01T00:00:00")
+
+
+def _broker_context(escalation, monkeypatch) -> list:
+    """The broker's own trigger journal and marker provider (memory only), every chip's PCI address in
+    ``device_pci_map``, no chip isolated and the hold's off-bus set not filled yet (the gate fills it
+    only after its first pass returns). Returns every marker write as (state, class, chips)."""
+    monkeypatch.setattr(escalation["mech"], "power_cycle_journal", srv._journal_power_cycle_foreign_holders)
+    monkeypatch.setattr(srv, "_foreign_holder_rows", lambda: [])
+    monkeypatch.setattr(srv, "device_pci_map", {str(i): bdf for i, bdf in enumerate(GALAXY_BUS_IDS)})
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.setattr(srv, "_offbus_hold_chips", set())
+    monkeypatch.setattr(pc, "_logger", _Journal(escalation["calls"]))
+    pc.set_pending_marker_context(srv._power_cycle_marker_context)
+    written, write = [], pc.write_pending_marker
+
+    def record(state, reason, fault_class="", chips=None, hold_since="", lead_sec=0.0):
+        written.append((state, fault_class, dict(chips or {})))
+        return write(state, reason, fault_class, chips, hold_since, lead_sec)
+
+    monkeypatch.setattr(pc, "write_pending_marker", record)
+    return written
+
+
+def _assert_cycle_names(escalation, written, states, fault_class, off):
+    """Every marker write, the marker left behind and the trigger line name ``fault_class`` and the
+    chips ``off`` with their addresses from ``device_pci_map``."""
+    chips = {str(c): GALAXY_BUS_IDS[c] for c in off}
+    assert [w[0] for w in written] == states
+    assert all(w[1:] == (fault_class, chips) for w in written), written
+    m = _marker()
+    assert (m["state"], m["fault_class"]) == ("requested", fault_class)
+    assert m["chips"] == [{"index": c, "bdf": GALAXY_BUS_IDS[c]} for c in sorted(off)]
+    (line,) = [c[1][0] for c in escalation["calls"] if c[0] == "journal"]
+    named = ", ".join(f"{c} ({GALAXY_BUS_IDS[c]})" for c in sorted(off))
+    assert f"class={fault_class} chips=[{named}] reason=" in line
+
+
+@pytest.mark.asyncio
+async def test_a_whole_tray_the_gate_sends_to_the_cycle_is_marked_and_journaled_as_whole_tray(
+    escalation, monkeypatch, tmp_path, clear_job_state, galaxy_trays
+):
+    """A whole tray (0-7) off on the hold's first below-floor gate pass, with only the I27 command set:
+    the whole-tray note sends it to the cycle before the gate fills the hold's off-bus set, and no chip
+    is isolated. Both 'possible' markers, the 'requested' one and the trigger line still read class
+    whole_tray with the tray's chips and addresses, from the note (memory only)."""
+    _below_floor_episode(monkeypatch, tmp_path, cmd=" ".join(CYCLE))
+    monkeypatch.setattr(galaxy, "_pci_rescan", lambda: None)  # the tray-down prelude's rescan
+    monkeypatch.setattr(opc, "fire_command", _real_fire_command)
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: False)
+    written = _broker_context(escalation, monkeypatch)
+    calls = _spy_gated_power_cycle(monkeypatch)
+    off = set(range(8))
+    await _gate_below_floor(off)
+    assert calls == [8], "the gate's BELOW_FLOOR branch sent it straight to the power cycle"
+    assert _steps(escalation) == ["preflight", "journal", "systemd-run", "reboot"]
+    assert not srv.isolated_chips and not srv._offbus_hold_chips
+    _assert_cycle_names(escalation, written, ["possible", "possible", "requested"], "whole_tray", off)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault_class, phase", [("whole_tray", "post-job"), ("all_off", "startup")])
+async def test_a_drop_its_class_sends_straight_to_the_cycle_is_marked_and_journaled_with_it(
+    escalation, rig, monkeypatch, fault_class, phase  # noqa: F811 - the imported fixture
+):
+    """Spec 04 I37's direct cycle with the auto power cycle on: class A (tray 1 off) at a post-job
+    pass, class C (every chip off, a mesh reset already failed) at the startup gate. It fires on the
+    hold's first pass, before the gate fills the hold's off-bus set: the markers and the trigger line
+    read the class and the chips that cycle was decided on."""
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", _real_auto_power_cycle_host)
+    written = _broker_context(escalation, monkeypatch)
+    off = set(range(EXPECTED)) if fault_class == "all_off" else _off(rig["map"], {1: 8})
+    rig["beats"] = _beats_without(off)
+    rig["g"].mechanism.mesh_reset_failed_since_release = fault_class == "all_off"
+    assert await _gate(rig, galaxy.STAGE_SMI_RESET, phase=phase) == galaxy.OUTCOME_WAITING
+    assert "glx_reset" not in rig["order"], "no mesh reset first"
+    assert _steps(escalation) == ["preflight", "journal", "systemd-run", "reboot"]
+    _assert_cycle_names(escalation, written, ["possible", "requested"], fault_class, off)
 
 
 @pytest.mark.asyncio

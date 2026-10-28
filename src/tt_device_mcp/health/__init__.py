@@ -157,12 +157,14 @@ from tt_device_mcp.health.recovery.galaxy import (
     _eth_freeze_holds,
     _galaxy_reset_min_dead_chips,
     _is_galaxy,
+    _offbus_fault_class,
     _offbus_hold_ceiling_sec,
     _power_cycle_direct_class,
     _present_mesh_reset_grace_sec,
     _reboot_min_dead_chips,
     _stuck_hold_ceiling_sec,
     _ubb_bus_id_tables,
+    _whole_trays_off,
 )
 from tt_device_mcp.health.recovery.pcie_guard import pcie_guard_at_start
 from tt_device_mcp.health.recovery.per_target import PerTargetRecovery
@@ -174,8 +176,17 @@ from tt_device_mcp.health.recovery.stages.bridge_reset import (
 
 # Isolated to its own module so every test can replace the one line that actually shells out to
 # the BMC (see the stage's own docstring); server.py's host-escalation ladder passes it straight
-# through as the `fire` callback, so it needs the name itself, not a wrapper around it.
-from tt_device_mcp.health.recovery.stages.power_cycle import _fire_power_cycle
+# through as the `fire` callback, so it needs the name itself, not a wrapper around it. Beside it,
+# spec 04 I88's trigger note and pending-cycle marker: server.py names what asked for a cycle from
+# memory (with the off-bus fault class the ladder itself uses, above), marks a cycle possible where its
+# own hold escalation can end in one, and removes the marker when its hold lifts.
+from tt_device_mcp.health.recovery.stages.power_cycle import (
+    _fire_power_cycle,
+    clear_pending_marker,
+    note_cycle_possible,
+    note_power_cycle_trigger,
+    set_pending_marker_context,
+)
 from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook as _run_pre_power_cycle_hook
 from tt_device_mcp.health.shutdown import note_broker_stopping
 
@@ -298,6 +309,13 @@ __all__ = [
     "gone_chip_bridge_reset_enabled",
     "_fire_power_cycle",
     "_run_pre_power_cycle_hook",
+    # what asked for a power cycle and the pending-cycle marker (spec 04 I88)
+    "_offbus_fault_class",
+    "_whole_trays_off",
+    "note_power_cycle_trigger",
+    "note_cycle_possible",
+    "clear_pending_marker",
+    "set_pending_marker_context",
     # the bounded off-bus hold (spec 04 I27): the gate's hold-deadline check asks it when the
     # grace has run out and records the forced pass it spawned for that episode
     "offbus_power_cycle",

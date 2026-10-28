@@ -224,6 +224,43 @@ poll those files should check the broker's published chip state first:
 - The same fields are on `/health` (`lost_chips`, `recovering`,
   `resetting_chips`).
 
+## Power-cycle warning for other users
+
+When the broker's resets cannot heal a chip, or a whole tray drops off the bus,
+its last step is a power cycle of the whole host. Before that can happen, the
+broker writes `/run/tt-device-broker/power-cycle-pending.json` (world-readable,
+replaced atomically), so other users of the box can save their work:
+
+```json
+{"version": 1, "state": "possible", "fault_class": "partial_offbus",
+ "chips": [{"index": 0, "bdf": "0000:01:00.0"}],
+ "reason": "last-chance ladder before the power cycle",
+ "hold_since": "2026-01-01T12:00:00-08:00",
+ "earliest_cycle_at": "2026-01-01T12:10:05-08:00",
+ "updated_at": "2026-01-01T12:10:05-08:00"}
+```
+
+- `state` is `possible` while the broker runs a step that can end in a power
+  cycle, and `requested` once it has asked for the cycle.
+- No file means no cycle is pending. The broker removes it when the device is
+  healthy again, systemd removes it when the broker stops, and `/run` is empty
+  after a reboot.
+- `fault_class` is what the broker saw: `whole_tray`, `all_off`,
+  `tray_partial`, `partial_offbus`, `present_mesh` (no chip off the bus) or
+  `unknown`. `chips` lists the chips off the bus; `bdf` is empty when the PCI
+  address is not known.
+- `earliest_cycle_at` is the time of the write: the cycle can follow at once.
+- The file is a warning only. The broker never waits on it. To drain work
+  before a cycle, use `TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK` (above).
+
+When the cycle starts, the broker logs why in one line, for example:
+
+```
+POWER CYCLE TRIGGER (unit tt-device-mcp-power-cycle-fallback-1767297005): class=partial_offbus chips=[0 (0000:01:00.0)] reason=idle escalation: 1/32 chip(s) off the bus after the reset ladder hold=2026-01-01T12:00:00
+```
+
+Find it with `journalctl -u tt-device-broker | grep 'POWER CYCLE TRIGGER'`.
+
 ## Slurm
 
 The health gate is also reachable from outside the queue, as two root-only REST

@@ -307,7 +307,7 @@ async def test_a_whole_tray_still_goes_to_the_power_cycle_hand_off(stuck, galaxy
     """The whole-tray hand-off re-powers nothing and is the rung that clears the holder: not fenced."""
     _note(stuck)
     noted = []
-    monkeypatch.setattr(offbus_power_cycle, "note_whole_tray_down", lambda ep, detail: noted.append(detail))
+    monkeypatch.setattr(offbus_power_cycle, "note_whole_tray_down", lambda ep, detail, **_: noted.append(detail))
     g = srv.galaxy_recovery
     monkeypatch.setattr(g.deps, "device_hold_episode_since", lambda: "ep-1")
     beats = {str(i): 100 for i in range(24)}

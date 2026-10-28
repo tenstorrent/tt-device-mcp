@@ -165,6 +165,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     _fire_power_cycle,
     _galaxy_reset_min_dead_chips,
     _normalized_board,
+    _offbus_fault_class,
     _offbus_hold_ceiling_sec,
     _power_cycle_direct_class,
     _present_mesh_reset_grace_sec,
@@ -172,6 +173,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     _run_pre_power_cycle_hook,
     _stuck_hold_ceiling_sec,
     _ubb_bus_id_tables,
+    _whole_trays_off,
     aer_totals,
     append_trace,
     arc_not_ready_chips,
@@ -185,6 +187,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     chip_snapshot,
     chip_snapshot_event,
     chip_state,
+    clear_pending_marker,
     dead_chips,
     enodata_presence,
     eth,
@@ -207,6 +210,8 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     mark_boot,
     mesh_reset_hold_reason,
     note_broker_stopping,
+    note_cycle_possible,
+    note_power_cycle_trigger,
     offbus_chip_ids,
     offbus_count,
     offbus_power_cycle,
@@ -218,6 +223,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     read_health_events,
     read_heartbeats,
     refuse_mesh_reset,
+    set_pending_marker_context,
     sysfs_chip_ids,
     version_floor_warnings,
 )
@@ -1356,6 +1362,7 @@ def boot_broker(*, probe_platform: bool = False) -> Optional[str]:
         PCI_WRITER.on_latch = _on_pci_wedged
         recovery_mechanism.pre_reset_scan = _pre_reset_holder_scan
         recovery_mechanism.power_cycle_journal = _journal_power_cycle_foreign_holders
+        set_pending_marker_context(_power_cycle_marker_context)
         recovery_mechanism.owe_device_pollers = lambda after: _owe_device_pollers(
             _pollers_unfit_reason() or f"{after} did not complete"
         )
@@ -7325,10 +7332,54 @@ def _foreign_holder_rows() -> list:
     return _log_foreign_holder_identities("power cycle:", pids) if pids else []
 
 
+def _power_cycle_context() -> tuple:
+    """Spec 04 I88: (fault class, {off-bus chip index: PCI address or None}, hold start) for the cycle's
+    journal line and pending marker. From memory only: no chip is read, since a chip off the bus must
+    not be touched again. A cycle sent on a hold's first pass comes before the gate keeps the hold's
+    off-bus set: I37's direct cycle names the class and chips it was requested for, and a standing I27
+    whole-tray note its chips, as class ``whole_tray``."""
+    direct = offbus_power_cycle.direct_cycle_now()
+    noted = offbus_power_cycle.whole_tray_chips(device_hold_episode_since)
+    known = {str(c) for c in _offbus_one_shot_chips()} | noted | (direct[1] if direct else frozenset())
+    chips = sorted(known, key=str)
+    banked = galaxy_recovery._chip_buses_now() if galaxy_recovery is not None else {}
+    bdfs = {
+        str(c): device_pci_map.get(str(c)) or banked.get(c) or banked.get(str(c)) or banked.get(int(c))
+        for c in chips
+        if str(c).isdigit()
+    }
+    expected = health_monitor.expected(0) if health_monitor is not None else 0
+    tray_map = galaxy_recovery._tray_map_now() if galaxy_recovery is not None else None
+    whole = bool(noted) or (bool(_whole_trays_off({int(c) for c in bdfs}, expected, tray_map)) if bdfs else False)
+    fault_class = _offbus_fault_class(len(bdfs), expected, whole) if bdfs else "present_mesh"
+    return (direct[0] if direct else fault_class), bdfs, device_hold_episode_since
+
+
+def _power_cycle_marker_context() -> Optional[tuple]:
+    """The pending marker's context; None when no power cycle can follow (neither the auto power cycle
+    nor a configured I27 command), so no 'possible' is written."""
+    armed = _auto_power_cycle_enabled() or offbus_power_cycle.power_cycle_argv() is not None
+    return _power_cycle_context() if armed else None
+
+
+def _note_power_cycle_trigger(reason: str) -> None:
+    """Spec 04 I88: hand the cycle what asked for it, journaled just before its unit starts, and mark
+    the cycle 'possible' in the pending marker. Never raises."""
+    try:
+        fault_class, bdfs, hold = _power_cycle_context()
+        note_power_cycle_trigger(reason, fault_class, bdfs, hold)
+        note_cycle_possible(reason)
+    except Exception as e:  # noqa: BLE001 - logging only; never holds the cycle
+        if logger:
+            logger.warning(f"power cycle: trigger unread: {e!r}")
+
+
 async def _journal_power_cycle_foreign_holders(reason: str) -> None:
     """Spec 04 I103: a foreign holder never defers the power cycle, so name it in the journal with the
     cycle (``power_cycle_foreign_holders``, the holder-identity fields). Bounded by
-    POWER_CYCLE_HOLDER_LOG_SEC and never raises: the cycle fires whatever this read finds."""
+    POWER_CYCLE_HOLDER_LOG_SEC and never raises: the cycle fires whatever this read finds. It first
+    notes the cycle's trigger (I88, :func:`_note_power_cycle_trigger`)."""
+    _note_power_cycle_trigger(reason)
     try:
         rows = await aio.wait_for(asyncio.to_thread(_foreign_holder_rows), POWER_CYCLE_HOLDER_LOG_SEC)
     except Exception as e:  # noqa: BLE001 - logging only; never holds the cycle
@@ -9589,6 +9640,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         if not _hold_episode_tenant:  # spec 04 I82: a tenant's hold time is not fault time
             _save_hold_carry(device_hold_episode_since, device_hold_episode_reason)
         device_hold_episode_since = ""
+        clear_pending_marker()  # spec 04 I88: the hold lifted, no cycle is pending
         # Spec 03 I80: a clock latched inside an op belongs to this episode; the next hold starts its own.
         device_held_since = ""
         _dispatch_reset_spent = False  # spec 03 I55: the next episode earns its own reset
@@ -9813,6 +9865,7 @@ async def _force_escalate_stuck_hold() -> None:
         # hold outlives every ceiling with no rung ever attempted.
         _void_fabric_ok("hold escalation")
         device_hold_tenant_deferred = False
+        note_cycle_possible(f"recovery ladder at hold age {int(held_age)}s (past {trigger})")
         outcome = await galaxy_recovery.escalate(
             "offbus-forced" if off_bus > 0 else "present-forced",
             indices,

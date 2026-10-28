@@ -247,6 +247,166 @@ def _one_line(reason: str) -> str:
     return " ".join(str(reason).split())[:300]
 
 
+# Spec 04 I88. What asked for the cycle, journaled just before the fallback unit starts: the broker's
+# escalation notes it (note_power_cycle_trigger) and fire_os_first takes it once. A note older than any
+# pre-cycle hook could take is from an escalation that never fired and is not used.
+_trigger: dict = {}
+TRIGGER_MAX_AGE_SEC = PRE_POWER_CYCLE_HOOK_TIMEOUT_MAX_SEC + 600.0
+
+
+def note_power_cycle_trigger(reason: str, fault_class: str = "", chips: Optional[dict] = None, hold: str = "") -> None:
+    """Record why the next cycle fires: the escalation's reason (the auto_recovery row's text), the
+    fault class, ``{chip index: PCI address or None}`` and the hold episode."""
+    _trigger.clear()
+    _trigger.update(reason=reason, fault_class=fault_class, chips=dict(chips or {}), hold=hold, at=time.monotonic())
+
+
+def power_cycle_trigger_text(reason: str) -> str:
+    """One line naming the cycle's trigger; the passed reason alone when no fresh note is there."""
+    t = dict(_trigger)
+    _trigger.clear()
+    if not t or time.monotonic() - t.get("at", 0.0) > TRIGGER_MAX_AGE_SEC:
+        t = {}
+    chips = sorted((t.get("chips") or {}).items(), key=lambda i: (len(str(i[0])), str(i[0])))
+    named = ", ".join(f"{c} ({bdf or 'address unknown'})" for c, bdf in chips)
+    parts = [
+        f"class={t.get('fault_class') or 'unknown'}",
+        f"chips=[{named}]",
+        f"reason={_one_line(t.get('reason') or reason)}",
+    ]
+    if t.get("hold"):
+        parts.append(f"hold={t['hold']}")
+    return " ".join(" ".join(parts).split())[:900]
+
+
+def _journal_trigger(reason: str, unit: str) -> str:
+    """Journal the trigger under the broker before the fallback unit starts; the returned text goes
+    in the unit's description. Best effort: never raises, never delays the cycle."""
+    try:
+        text = power_cycle_trigger_text(reason)
+        _logger.warning("POWER CYCLE TRIGGER (unit %s): %s", unit, text)
+        return text
+    except Exception as exc:  # noqa: BLE001 - logging only; never holds the cycle
+        try:
+            _logger.error("POWER CYCLE TRIGGER: could not journal it (%r); cycling anyway", exc)
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
+
+# Spec 04 I88: a machine-readable warning for other users of a shared box that a power cycle may come.
+# Written atomically (tmp file, fsync, rename), best effort: a failed write is logged and recovery goes
+# on unchanged. Nothing waits on it and nothing reads it back.
+PENDING_MARKER_PATH = "/run/tt-device-broker/power-cycle-pending.json"
+PENDING_MARKER_VERSION = 1
+# The broker's provider of (fault class, {chip index: PCI address or None}, hold start), or None when
+# no power cycle can follow (the auto power cycle is off). Set once at boot; from memory only.
+_marker_context: Optional[Callable[[], Optional[tuple]]] = None
+
+
+def set_pending_marker_context(fn: Optional[Callable[[], Optional[tuple]]]) -> None:
+    global _marker_context
+    _marker_context = fn
+
+
+def _iso(value) -> str:
+    from datetime import datetime
+
+    try:
+        when = datetime.fromtimestamp(value) if isinstance(value, (int, float)) else datetime.fromisoformat(value)
+        return when.astimezone().isoformat(timespec="seconds")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+
+
+def write_pending_marker(
+    state: str,
+    reason: str,
+    fault_class: str = "",
+    chips: Optional[dict] = None,
+    hold_since: str = "",
+    lead_sec: float = 0.0,
+) -> bool:
+    """Write the pending-cycle marker; False (logged) when it could not. Never raises."""
+    tmp = ""
+    try:
+        now = time.time()
+        rows = sorted((chips or {}).items(), key=lambda i: (len(str(i[0])), str(i[0])))
+        row = {
+            "version": PENDING_MARKER_VERSION,
+            "state": state,
+            "fault_class": fault_class or "unknown",
+            "chips": [{"index": int(c) if str(c).isdigit() else str(c), "bdf": bdf or ""} for c, bdf in rows],
+            "reason": _one_line(reason)[:500],
+            "hold_since": _iso(hold_since) if hold_since else "",
+            "earliest_cycle_at": _iso(now + max(0.0, lead_sec)),
+            "updated_at": _iso(now),
+        }
+        path = PENDING_MARKER_PATH
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".power-cycle-pending.", suffix=".tmp", dir=os.path.dirname(path))
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+        return True
+    except Exception as exc:  # noqa: BLE001 - advisory only; recovery never depends on it
+        try:
+            if tmp:
+                os.unlink(tmp)
+        except OSError:
+            pass
+        try:
+            _logger.warning("power-cycle pending marker (%s) not written: %r; recovery goes on", state, exc)
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+
+def note_cycle_possible(reason: str, lead_sec: float = 0.0) -> None:
+    """A hold entered a path that can end in a power cycle: mark it 'possible'. Skipped when the
+    broker cannot power-cycle, and outside a broker (no provider set): only the broker removes the
+    marker when its hold lifts. Never raises."""
+    try:
+        ctx = _marker_context() if _marker_context is not None else None
+        if ctx is not None:
+            fault_class, chips, hold_since = ctx
+            write_pending_marker("possible", reason, fault_class, chips, hold_since, lead_sec)
+    except Exception as exc:  # noqa: BLE001
+        try:
+            _logger.warning("power-cycle pending marker unread: %r; recovery goes on", exc)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _mark_cycle_requested(reason: str) -> None:
+    """Mark the cycle 'requested' just before its unit starts, with the trigger's fields. Never raises."""
+    try:
+        t = dict(_trigger)
+        if not t or time.monotonic() - t.get("at", 0.0) > TRIGGER_MAX_AGE_SEC:
+            t = {}
+        write_pending_marker(
+            "requested", t.get("reason") or reason, t.get("fault_class", ""), t.get("chips"), t.get("hold", "")
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def clear_pending_marker() -> None:
+    """The hold lifted: no cycle is pending. Never raises."""
+    try:
+        os.unlink(PENDING_MARKER_PATH)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        try:
+            _logger.warning("power-cycle pending marker not removed: %r", exc)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def fallback_pid_file() -> str:
     """Where the fallback records its pid for the hook: beside the request, so both share /run."""
     base = REQUEST_FILE[: -len(".request")] if REQUEST_FILE.endswith(".request") else REQUEST_FILE
@@ -259,18 +419,21 @@ def request_text(argv: list, reason: str, now: float, timeout: float = DEFAULT_P
     return "\n".join([str(int(now)), _one_line(reason), str(hook_try_timeout_sec(timeout)), *argv]) + "\n"
 
 
-def fallback_argv(argv: list, bound: int, unit: str, *, reason: str = "", timeout: float = STEP_TIMEOUT_SEC) -> list:
+def fallback_argv(
+    argv: list, bound: int, unit: str, *, reason: str = "", timeout: float = STEP_TIMEOUT_SEC, trigger: str = ""
+) -> list:
     """The transient unit that cycles a hung shutdown. DefaultDependencies=no keeps it out of the
     shutdown transaction, and its '@' argv[0] keeps it alive through systemd-shutdown's killall, so it
     bounds every stage up to the hook, which stops it by its recorded pid and fires instead. The cycle
-    command gets the reason in ``TT_DEVICE_MCP_POWER_CYCLE_REASON`` and runs under ``timeout``."""
+    command gets the reason in ``TT_DEVICE_MCP_POWER_CYCLE_REASON`` and runs under ``timeout``; the
+    ``trigger`` line goes in the unit's description, so the unit's own journal says why."""
     return [
         "systemd-run",
         f"--unit={unit}",
         "--collect",
         "--property=DefaultDependencies=no",
         f"--setenv=TT_DEVICE_MCP_POWER_CYCLE_REASON={_one_line(reason)}",
-        "--description=tt-device-mcp: power-cycle a hung shutdown (spec 04 I88)",
+        "--description=tt-device-mcp: power-cycle a hung shutdown (spec 04 I88)" + (f": {trigger}" if trigger else ""),
         "/bin/bash",
         "-c",
         FALLBACK_LAUNCH_SH,
@@ -596,7 +759,9 @@ def fire_os_first(argv: list, reason: str, timeout: float = DEFAULT_POWER_CYCLE_
         except OSError as e:
             why = f"could not write {REQUEST_FILE}: {e}"
     if not why:
-        rc, out = _run_step(fallback_argv(argv, bound, unit, reason=reason, timeout=timeout))
+        _mark_cycle_requested(reason)
+        trigger = _journal_trigger(reason, unit)
+        rc, out = _run_step(fallback_argv(argv, bound, unit, reason=reason, timeout=timeout, trigger=trigger))
         if rc == 0:
             started = True
         else:
