@@ -38,7 +38,20 @@ def _one(script: Path, *needles: str) -> str:
 #   that is a link or not a plain file, is the real one. The tests that pin the rename itself
 #   (no half-written hold, no temporary left) define their own mv over this one.
 # - rm: `rm -f` of paths none of which exist does nothing, as rm would; otherwise the real one.
-LAP_STAND_INS = r"""mv() {
+# - au_cap: the script's capture seam, `au_cap v cmd args` for `v="$(cmd args)"`. The stand-ins for
+#   systemd, pgrep and curl are shell functions, so each $(...) of one is a subshell, several on every
+#   poll of a drain. This runs the command in the shell itself, its stdout through a file beside
+#   $ROOT, and keeps what $(...) keeps: the output less its trailing newlines, and the exit status.
+#   tests/test_deploy_autoupdate_forks.py holds it to the script's own au_cap.
+LAP_STAND_INS = r"""au_cap() {
+    local _cap_f="${ROOT%/*}/au-cap.${#FUNCNAME[@]}" _cap_o="" _cap_rc=0
+    "${@:2}" > "$_cap_f" || _cap_rc=$?
+    IFS= read -r -d '' _cap_o < "$_cap_f"
+    while [ "${_cap_o%$'\n'}" != "$_cap_o" ]; do _cap_o="${_cap_o%$'\n'}"; done
+    printf -v "$1" '%s' "$_cap_o"
+    return "$_cap_rc"
+}
+mv() {
     if [ "$#" -eq 3 ] && [ "$1" = -f ] && [ "$2" = "$3.$$" ] && [ -f "$2" ] && [ ! -L "$2" ] \
         && { [ ! -e "$3" ] && [ ! -L "$3" ] || { [ -f "$3" ] && [ ! -L "$3" ]; }; }; then
         local _mv_b=""

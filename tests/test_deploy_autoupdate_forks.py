@@ -186,3 +186,32 @@ def test_this_file_runs_on_the_forks_worker_under_loadgroup(request):
     if not hasattr(request.config, "workerinput") or any(a.startswith("--dist") for a in passed):
         return
     assert request.node.nodeid.endswith("@forks"), request.node.nodeid
+
+
+def test_the_capture_stand_in_keeps_what_the_scripts_au_cap_keeps(tmp_path):
+    """The lap tests capture through LAP_STAND_INS's au_cap, with no subshell; the fork bounds above
+    run the script's own. Both keep the same value and exit status for every kind of output."""
+    from tests.deploy_helpers import LAP_STAND_INS
+    from tests.test_deploy_autoupdate_idle_gate import _SCRIPT, _clock
+
+    root = tmp_path / "root"
+    root.mkdir()
+    cases = r"""
+f() { printf "$1"; return "$2"; }
+for c in "" "a" "a\n" "a\n\n\n" "\na b\n c\n" "  x  " "x\ny" "\n" "\n\n"; do
+    for rc in 0 1 3; do
+        v=unset; got=0; au_cap v f "$c" "$rc" 2>/dev/null || got=$?
+        printf '%s|%s|%q\n' "$c" "$got" "$v"
+    done
+done
+v=unset; au_cap v eval 'echo out; echo err >&2' 2>/dev/null; printf 'stderr|%q\n' "$v"
+v=unset; au_cap v true; printf 'none|%q\n' "$v"
+"""
+    runs = {}
+    for name, seam in (("script", ""), ("stand-in", LAP_STAND_INS)):
+        script = f"set -u\nROOT={root}\n{_clock(_SCRIPT.read_text())}{seam}{cases}"
+        done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+        assert done.returncode == 0 and not done.stderr, done.stderr
+        runs[name] = done.stdout.splitlines()
+    assert len(runs["script"]) == 9 * 3 + 2
+    assert runs["stand-in"] == runs["script"]
