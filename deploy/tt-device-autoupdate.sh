@@ -269,7 +269,7 @@ if [ "$MIN_APPLY" -gt 0 ] 2>/dev/null; then
             au_log deferred "apply rate limit: last apply $(( now - last ))s ago (min ${MIN_APPLY}s); apply_by=$apply_by"
             exit 0
         fi
-        echo "autoupdate: rate limit skipped: the broker $broken; ${remote_sha:0:9} applies now (last apply $(( now - last ))s ago)" >&2
+        echo "autoupdate: rate limit skipped: the broker $broken; ${remote_sha:0:9} goes on to the next gates (last apply $(( now - last ))s ago)" >&2
     fi
 fi
 

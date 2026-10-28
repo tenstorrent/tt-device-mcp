@@ -246,7 +246,7 @@ job log, so every "installed" claim below is verified, not assumed.
   bars nothing; the stamp is read base 10. The dispatch hold, drain and busy gate (I18, I20, I24)
   are unchanged, and the startup check after the restart is never skipped, deferred or shortened. **The limit applies to a
   healthy broker only**: the next sha may be the fix for a broker the last apply broke, so a lap
-  inside the interval applies at once, and logs `rate limit skipped` with the reason, when the
+  inside the interval applies at once (past the rate limit; later gates may still defer it), and logs `rate limit skipped` with the reason, when the
   broker is not `active` (failed, activating, inactive), when its systemd `NRestarts` grew past the
   count saved in `$ROOT/last-apply-nrestarts` right after the last apply's restart (a crash loop),
   or when `/health` does not answer, reports `held`, or reports an FSM that is `recovering` or
