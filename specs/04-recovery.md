@@ -764,7 +764,11 @@ each rung fires only when the gentler one failed or cannot apply.
   window, took a 4-chip drop to 31 and then 32 off the bus. A reset whose own post-reset check read
   every expected chip present (enum and ARC passed) did not regress the mesh: a chip off the bus
   after it dropped later, under that check's fabric pass, so it is a new drop. Neither the gate nor
-  the idle ladder latches it, and the next mesh reset still runs. Only the latest reset counts: an
+  the idle ladder latches it as a regression or journals `reset_regressed_offbus`. This changes the
+  label, not the climb: the reset's failed verify still spends the episode's mesh reset (I87) and
+  arms the failed-reset cooldown, so no second mesh reset runs inside it (the gate journals
+  `reset_suppressed_cooldown`). The climb goes on to the last-chance sweep and then the power
+  cycle (I22): one more mesh reset after the drop, then the cycle. Only the latest reset counts: an
   earlier reset that read every chip does not excuse a later one that left more chips off the bus.
 
 - **I32 — No reset releases the device until a fabric pass has passed since.** Every reset action

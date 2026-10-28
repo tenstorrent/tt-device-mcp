@@ -112,7 +112,8 @@ def _gate_reset_whose_verify_reads(monkeypatch, tmp_path, evidence):
 @pytest.mark.asyncio
 async def test_post_verify_drop_not_regressed(monkeypatch, tmp_path, clear_job_state):
     """The reset's own check read all 32 chips; a chip dropped under its fabric pass (the check was
-    killed). That is a new drop, not a regression: no latch, and the next gate's galaxy reset runs."""
+    killed). That is a new drop, not a regression: no latch and no reset_regressed_offbus. The failed
+    verify still arms the failed-reset cooldown, so the next gate runs no second reset inside it."""
     events, resets = _gate_reset_whose_verify_reads(monkeypatch, tmp_path, KILLED)
     await srv._device_health_gate(None, phase="post-job", run_fabric=False)
     assert resets["n"] == 1
@@ -120,7 +121,9 @@ async def test_post_verify_drop_not_regressed(monkeypatch, tmp_path, clear_job_s
     assert srv.recovery_mechanism.regressed_reset_since is None
     events.clear()
     await srv._device_health_gate(None, phase="post-job", run_fabric=False)
-    assert "galaxy_reset_skipped_regressed" not in events, "glx_reset is not suppressed for a later drop"
+    assert "galaxy_reset_skipped_regressed" not in events, "a later drop is not latched as a regression"
+    assert "reset_suppressed_cooldown" in events, "the failed verify's cooldown still applies"
+    assert resets["n"] == 1, "no second reset inside the failed-reset cooldown"
 
 
 @pytest.mark.asyncio
