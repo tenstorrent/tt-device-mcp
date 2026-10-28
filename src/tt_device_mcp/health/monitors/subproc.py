@@ -20,6 +20,7 @@ from typing import Awaitable, Callable, Optional
 
 from tt_device_mcp import aio
 from tt_device_mcp.device_holders import note_broker_internal
+from tt_device_mcp.health import chip_state
 from tt_device_mcp.health.shutdown import SIGNAL_RCS, interrupted_by_shutdown
 
 Track = Callable[[Optional["asyncio.subprocess.Process"]], None]
@@ -107,6 +108,9 @@ async def run_probe(
         return proc.returncode, b"".join(chunks)
     except asyncio.TimeoutError:
         if proc is not None:
+            # A reader an AER stop left SIGSTOPped while a chip it may read is attached is not killed
+            # on its own timeout until the stop is settled, at most to the hold's bound (spec 03 I92).
+            await chip_state.await_reader_release(proc.pid)
             try:
                 await terminate(proc.pid)
             except (ProcessLookupError, OSError):

@@ -1007,6 +1007,8 @@ class HealthMonitor:
             try:
                 out, err = proc.communicate(timeout=timeout_sec)
             except subprocess.TimeoutExpired:
+                # Held by an AER stop: no kill until it is settled, bounded (spec 03 I92).
+                chip_state.wait_reader_release(proc.pid)
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except (ProcessLookupError, OSError):
@@ -1209,6 +1211,9 @@ class HealthMonitor:
             await asyncio.sleep(0.2)
             alive = [pid for pid in alive if _group_alive(pid)]
         for pid in alive:
+            # A group an AER stop holds SIGSTOPped acts on neither signal: its SIGKILL waits for the
+            # stop to be settled, at most to the hold's bound (spec 03 I92).
+            await chip_state.await_reader_release(pid)
             try:
                 os.killpg(pid, signal.SIGKILL)
             except (ProcessLookupError, OSError):
@@ -1771,6 +1776,7 @@ class HealthMonitor:
             # above) — kill it now, or a HOLD verdict leaves a reader attached to a wedged mesh.
             proc = held["proc"]
             if proc is not None:
+                await chip_state.await_reader_release(proc.pid)  # held by an AER stop (spec 03 I92)
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except (ProcessLookupError, OSError):

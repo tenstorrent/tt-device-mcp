@@ -330,6 +330,9 @@ class RecoveryDeps:
     # leaves them stopped for the dead-chip valve (I94). None: no watch.
     broker_check_readers: Optional[Callable[[], list]] = None
     stop_check_readers_on_aer: Optional[Callable[..., list]] = None
+    # Spec 03 I92: SIGKILL, of the readers an earlier stop left stopped (its ``[{"pid", "user"}]``),
+    # only those still running; never a reader started after it (server._kill_stopped_check_readers).
+    kill_stopped_check_readers: Optional[Callable[[list], list]] = None
     # Spec 03 I96: the dead-chip watch thread's containment. ``stop_device_users`` SIGSTOPs the
     # running job's process groups (its leader's and its scope's) and every other device holder, and
     # returns them; ``signal_device_holders(reason, stopped)`` SIGKILLs every device holder, the

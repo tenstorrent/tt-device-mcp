@@ -37,7 +37,9 @@ from tt_device_mcp.health.monitors.pci import chip_pci_bdf
 HEARTBEAT_SETTLE_SEC = 0.5
 
 
-def read_heartbeats(*, probe_lost: bool = False, only: Optional[frozenset] = None) -> dict[str, int]:
+def read_heartbeats(
+    *, probe_lost: bool = False, only: Optional[frozenset] = None, unread: Optional[set] = None
+) -> dict[str, int]:
     """Per-chip ARC heartbeat counters, keyed by device index.
 
     Each attribute read is a PCIe read of the chip (the KMD reads the counter from the chip's
@@ -45,7 +47,8 @@ def read_heartbeats(*, probe_lost: bool = False, only: Optional[frozenset] = Non
     allows it (spec 03 I66); it reports ALL_ONES, what its last real read said. ``probe_lost`` is for
     a health check's decision read: each lost chip is read for real once, so a chip that answers
     again is judged on its answer, not on the mark. ``only``, when given, limits the read to those
-    chips (spec 03 I83: the chips that just failed POST_RESET, and no other).
+    chips (spec 03 I83: the chips that just failed POST_RESET, and no other). ``unread``, when given,
+    gets every chip reported ALL_ONES without a read (lost or fenced, its re-read not due).
 
     A chip whose attribute is missing or unreadable is omitted rather than zeroed,
     so the caller sees it as an absent chip (a real fault) and not as a chip whose
@@ -63,6 +66,8 @@ def read_heartbeats(*, probe_lost: bool = False, only: Optional[frozenset] = Non
             continue
         if not chip_state.may_read(idx, ent, probe=probe_lost):
             beats[idx] = ALL_ONES
+            if unread is not None:
+                unread.add(idx)
             continue
         try:
             beats[idx] = int(_read_beat(ent))
@@ -174,10 +179,14 @@ def unreadable_on_bus_chips(ids) -> set[str]:
     this (spec 04 I37): survivors of a whole-tray drop that read like this must not hide the drop's
     shape. A chip that reads now (a counter or all-ones), or reads ENODATA with its vendor id 0x1e52
     or 0xffff, is not in it; those have their own handling. Nor is a lingering node whose link is down (speed ``Unknown`` or width 63,
-    :func:`hostpci.link_down`): spec 03 I9 never counts it back on the bus."""
+    :func:`hostpci.link_down`): spec 03 I9 never counts it back on the bus. A lost or fenced chip
+    (:func:`chip_state.read_blocked`) is not read: it counts as reading all-ones, off the bus (spec 03
+    I97)."""
     out: set[str] = set()
     for idx in sorted({str(i) for i in ids}, key=int):
         node = pci.SYSFS_CLASS_DIR / f"tenstorrent!{idx}"
+        if chip_state.read_blocked(idx):
+            continue
         try:
             _read_beat(node)
             continue
@@ -265,7 +274,8 @@ def heartbeat_absence_reason() -> Optional[str]:
       "attr_unreadable" — nodes are present and expose tt_heartbeat, but no read of it
                        succeeds right now (e.g. every chip left in a bad state by a failed
                        reset). The driver HAS the counter; the chips are not answering.
-    Returns None as soon as one chip exposes a readable counter — the probe works.
+    Returns None as soon as one chip exposes a readable counter — the probe works. A lost or fenced
+    chip (:func:`chip_state.read_blocked`) is not read and never counts as that chip (spec 03 I97).
     """
     try:
         entries = sorted(pci.SYSFS_CLASS_DIR.iterdir())
@@ -275,6 +285,8 @@ def heartbeat_absence_reason() -> Optional[str]:
     if not nodes:
         return "sysfs_absent"
     for ent in nodes:
+        if chip_state.read_blocked(ent.name.rsplit("!", 1)[-1]):
+            continue
         try:
             int(_read_beat(ent))
             return None
