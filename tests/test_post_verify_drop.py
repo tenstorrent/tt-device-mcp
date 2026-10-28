@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
 """A chip lost after a reset's own check (spec 04 I31, I84).
 
 Dead-chip isolation can kill the post-reset fabric check: that pass reaches no verdict, but not
