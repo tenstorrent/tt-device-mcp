@@ -225,7 +225,7 @@ def test_the_sampler_reads_no_chip_while_a_reset_owns_them(monkeypatch, sysfs, o
     takes no sample at all, and reads again once the step is over."""
     samples = []
     monkeypatch.setattr(srv, "chip_sample", lambda: samples.append(1) or {})
-    monkeypatch.setattr(srv, "append_trace", lambda s: None)
+    monkeypatch.setattr(srv, "append_trace", lambda s, ts=None: None)
     if owner == "reset_in_flight":
         srv.recovery_mechanism.reset_in_flight = True
     else:

@@ -200,8 +200,26 @@ TRACE_FILE = "telemetry.jsonl"
 MAX_TRACE_BYTES = 512 * 1024 * 1024
 
 
-def append_trace(sample: dict) -> None:
+# Spec 03 I98: trace rows queued for their own writer thread, apart from the decision journal's, so
+# neither the sampler's dead-chip check nor a flushed containment record ever waits on a trace fsync.
+# A storm that stalls the disk past TRACE_BACKLOG rows drops the newest rows, never blocks the sampler.
+TRACE_BACKLOG = 256
+_trace_rows: "queue.Queue" = queue.Queue(maxsize=TRACE_BACKLOG)
+_trace_writer: Optional[threading.Thread] = None
+
+
+def _drain_trace() -> None:
+    while True:
+        path, rec = _trace_rows.get()
+        _append_durable(path, rec, MAX_TRACE_BYTES)
+
+
+def append_trace(sample: dict, ts: Optional[float] = None) -> bool:
     """Persist one telemetry sample as it is taken.
+
+    Queued for the trace's own writer thread, which does the fsync; this returns at once (spec 03
+    I98). The row carries ``ts`` (the read time; this call's time when omitted), not the write's.
+    False when the row could not be queued (backlog full, or the writer could not start).
 
     The in-memory ring is enough to explain a failed JOB, because the broker survives to
     read it. It is worthless for explaining a REBOOT: the host goes down and takes the ring
@@ -212,7 +230,17 @@ def append_trace(sample: dict) -> None:
     dies moments later, a core stalled on a hung ASIC is the story. If every chip is ticking
     normally right up to the last sample, it is not — and the CPU erratum is.
     """
-    _append_durable(HEALTH_DIR / TRACE_FILE, {"ts": time.time(), "chips": sample}, MAX_TRACE_BYTES)
+    global _trace_writer
+    rec = {"ts": time.time() if ts is None else float(ts), "chips": sample}
+    try:
+        with _detached_lock:
+            if _trace_writer is None or not _trace_writer.is_alive():
+                _trace_writer = threading.Thread(target=_drain_trace, name="telemetry-trace", daemon=True)
+                _trace_writer.start()
+        _trace_rows.put_nowait((HEALTH_DIR / TRACE_FILE, rec))
+    except (RuntimeError, queue.Full):
+        return False
+    return True
 
 
 INCIDENTS_DIR = "incidents"

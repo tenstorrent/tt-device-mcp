@@ -1923,7 +1923,8 @@ cooldown (spec 04 I65) holds longer.
   the sampler's dead-chip valve (`isolate_dead_chips`, I84), which writes the same record with the
   fields it has (no `vanished` or `users_stopped`). `first_evidence_ts` is the earliest sign of the
   episode on the chips (`first_evidence`: `aer_burst`, the first read of the window that counted a
-  burst on their path, or `all_ones`, the first sample that read them all-ones; `trigger` when
+  burst on their path, or `all_ones`, the first sample that read them all-ones, at its read time
+  (I98); `trigger` when
   none came before the trigger read; signs more than `chip_state.EVIDENCE_GAP_SEC` (60 s) apart
   start a new episode), never later than `trigger_ts`, so `first_evidence_to_remove_s` is at least
   `trigger_to_remove_s` and shows the time from the first sign to the remove. No containment lifts a hold or releases the device: the contained
@@ -1973,6 +1974,18 @@ cooldown (spec 04 I65) holds longer.
   answering. Known gaps: in-kernel tt-kmd reads already in flight cannot be fenced; a remove that
   failed (kill refused, I84) releases the held readers, and a dead watch thread ends in the kill at
   `READER_HOLD_SEC` with `check_reader_hold_expired` journaled.
+- **I98 — The sampler's dead-chip check never waits on the durable trace write, and an all-ones
+  read is evidence from its read time.** Each sample's trace row (`telemetry.jsonl`) is queued for
+  the trace's own writer thread (`evidence.append_trace`), apart from the decision journal's (I92),
+  and the sampler goes straight on to `check_for_dead_chips`: the poller stop on a hung chip (I66),
+  the fast cadence a first all-ones read arms (I79) and the dead-chip valve (I84) never wait on a
+  trace fsync, which an AER storm can stall for seconds. The row carries the sample's read time,
+  not the write's. A disk stalled past `evidence.TRACE_BACKLOG` (256) queued rows drops the newest
+  rows rather than block the sampler. The all-ones evidence for the containment record (I96
+  `first_evidence`) is stamped with the read time of the sample that showed it, not the time the
+  check ran, so `first_evidence_ts` is the first sampler read of the chip as all-ones. The two-sample
+  proof, the `FAST_CONFIRM_SEC` gate and every hold rule are unchanged: nothing here lifts a hold or
+  releases the device. Known gap: rows dropped on a full backlog are not on disk.
 
 ## Interfaces
 
@@ -2708,6 +2721,7 @@ refuses.
 | I95 | `tests/test_aer_stop_contain.py::test_the_stop_record_is_on_disk_when_the_process_dies_right_after_the_stop`, `tests/test_aer_stop_contain.py::test_a_journal_stalled_in_fsync_bounds_the_wait_and_delays_neither_signal`, `tests/test_aer_stop_contain.py::test_a_failed_journal_write_is_not_reported_on_disk` |
 | I96 | `tests/test_dead_chip_watch.py::test_an_idle_drop_is_contained_by_the_watch_with_no_check_running`, `tests/test_dead_chip_watch.py::test_an_idle_all_ones_burst_is_contained_by_the_watch`, `tests/test_dead_chip_watch.py::test_a_drop_during_a_tenant_job_stops_the_job_before_the_remove_and_kills_it_after`, `tests/test_dead_chip_watch.py::test_a_drop_during_each_broker_check_stops_its_reader_before_the_remove`, `tests/test_dead_chip_watch.py::test_a_blocked_event_loop_does_not_delay_the_containment`, `tests/test_dead_chip_watch.py::test_a_benign_burst_kills_no_tenant`, `tests/test_dead_chip_watch.py::test_aer_and_node_churn_inside_a_reset_are_excused`, `tests/test_dead_chip_watch.py::test_a_blackout_keeps_the_class_a_c_path`, `tests/test_dead_chip_watch.py::test_a_foreign_holder_is_stopped_before_the_remove_and_killed_only_after_it`, `tests/test_dead_chip_watch.py::test_a_failed_remove_leaves_the_foreign_holder_stopped`, `tests/test_dead_chip_watch.py::test_the_chip_contained_row_carries_its_fields_and_latencies_within_budget`, `tests/test_dead_chip_watch.py::test_the_contained_hold_lifts_only_on_a_just_passed_full_check_with_fabric`, `tests/test_aer_stop_contain.py::test_with_no_loop_the_watch_thread_still_removes_before_any_kill`, `tests/test_dead_chip_watch_armed.py::test_an_armed_watch_logs_one_info_line_and_one_row`, `tests/test_dead_chip_watch_armed.py::test_no_link_signals_read_warns_not_armed`, `tests/test_dead_chip_watch_armed.py::test_a_thread_that_is_not_running_warns_not_armed`, `tests/test_dead_chip_watch_armed.py::test_a_read_listing_no_chip_warns_not_armed`, `tests/test_dead_chip_watch_armed.py::test_a_failing_read_warns_and_never_raises`, `tests/test_dead_chip_watch_armed.py::test_a_broken_watch_or_logger_never_raises`, `tests/test_dead_chip_watch_armed.py::test_the_report_only_reads_and_leaves_the_watch_as_it_was`, `tests/test_dead_chip_watch_armed.py::test_startup_reports_the_watch_right_after_starting_it`, `tests/test_own_read_fence.py::test_the_sampler_path_writes_its_containment_record_from_the_first_evidence`, `tests/test_own_read_fence.py::test_the_watch_path_record_names_its_path_and_first_evidence` |
 | I97 | `tests/test_own_read_fence.py::test_a_snapshot_mid_chip_stops_at_its_next_read_and_the_remove_is_in_budget`, `tests/test_own_read_fence.py::test_without_the_fence_the_same_snapshot_holds_the_remove_past_its_budget`, `tests/test_own_read_fence.py::test_a_fence_set_mid_snapshot_stops_the_next_attribute_read`, `tests/test_own_read_fence.py::test_a_fence_ends_with_the_broker_s_own_reset_step`, `tests/test_own_read_fence.py::test_a_failed_fence_never_stops_the_containment`, `tests/test_own_read_fence.py::test_the_pre_reset_scan_never_detaches_a_chip_fenced_on_one_sample`, `tests/test_own_read_fence.py::test_the_pre_reset_scan_still_detaches_a_fenced_chip_a_real_read_finds_dead` |
+| I98 | `tests/test_trace_off_critical_path.py::test_a_stalled_trace_fsync_does_not_delay_the_fast_watch`, `tests/test_trace_off_critical_path.py::test_a_stalled_trace_fsync_does_not_delay_the_hung_chip_poller_stop`, `tests/test_trace_off_critical_path.py::test_first_evidence_is_the_earliest_all_ones_read_not_the_check_time`, `tests/test_trace_off_critical_path.py::test_the_sampler_loop_stamps_all_ones_evidence_at_the_read`, `tests/test_trace_off_critical_path.py::test_a_full_trace_backlog_drops_the_row_and_never_blocks` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

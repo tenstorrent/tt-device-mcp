@@ -380,7 +380,7 @@ def test_the_fast_cadence_leaves_housekeeping_and_relift_on_the_regular_cadence(
     s, clock, _, _ = watch
     samples, ledger, relift = [], [], []
     monkeypatch.setattr(srv, "chip_sample", lambda: samples.append(clock.t) or {"0": LIVE})
-    monkeypatch.setattr(srv, "append_trace", lambda sample: None)
+    monkeypatch.setattr(srv, "append_trace", lambda sample, ts=None: None)
     monkeypatch.setattr(srv, "_refresh_idle_hold_ledger", lambda: ledger.append(clock.t))
     monkeypatch.setattr(srv, "_maybe_spawn_idle_relift", lambda: relift.append(clock.t))
     monkeypatch.setattr(srv, "_maybe_spawn_idle_holder_watch", lambda: None)
@@ -460,7 +460,7 @@ def test_a_sustained_aer_storm_keeps_every_gap_and_is_capped(watch, monkeypatch)
     s, clock, _, events = watch
     samples: list = []
     monkeypatch.setattr(srv, "chip_sample", lambda: samples.append(clock.t) or {"0": LIVE})
-    monkeypatch.setattr(srv, "append_trace", lambda sample: None)
+    monkeypatch.setattr(srv, "append_trace", lambda sample, ts=None: None)
     monkeypatch.setattr(srv, "_refresh_idle_hold_ledger", lambda: None)
     monkeypatch.setattr(srv, "_maybe_spawn_idle_relift", lambda: None)
     monkeypatch.setattr(srv, "_maybe_spawn_idle_holder_watch", lambda: None)

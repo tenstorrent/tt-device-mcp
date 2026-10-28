@@ -1624,9 +1624,9 @@ def test_sampler_drives_the_idle_hold_ledger(monkeypatch):
     calls = []
     monkeypatch.setattr(srv, "_refresh_idle_hold_ledger", lambda: calls.append(1))
     monkeypatch.setattr(srv, "chip_sample", lambda: {})
-    monkeypatch.setattr(srv, "append_trace", lambda s: None)
+    monkeypatch.setattr(srv, "append_trace", lambda s, ts=None: None)
 
-    async def _noop_dead_check(sample):
+    async def _noop_dead_check(sample, read_ts=None):
         pass
 
     monkeypatch.setattr(srv.sampler, "check_for_dead_chips", _noop_dead_check)

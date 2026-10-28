@@ -316,7 +316,7 @@ class RecoveryDeps:
     chip_sample: Optional[Callable[[], dict]] = None
     # The sampler's early off-bus watch (spec 03 I79): kernel-held AER counters and the node list.
     link_signals: Optional[Callable[[], dict]] = None
-    append_trace: Optional[Callable[[dict], None]] = None
+    append_trace: Optional[Callable[..., object]] = None
     capture_incident: Optional[Callable[..., object]] = None
     isolate_chip: Optional[Callable[[str], bool]] = None
     chip_pci_bdf: Optional[Callable[[str], Optional[str]]] = None

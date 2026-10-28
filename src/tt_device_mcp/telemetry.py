@@ -371,10 +371,14 @@ class TelemetrySampler:
                 # by design, and only the step's own reads may reach them (spec 03 I66).
                 if not await self.recovering_now():
                     sample = await asyncio.to_thread(self._deps.chip_sample)
-                    self.ring.append({"ts": time.time(), "chips": sample})
-                    await asyncio.to_thread(self._deps.append_trace, sample)
+                    read_ts = time.time()
+                    self.ring.append({"ts": read_ts, "chips": sample})
+                    # Spec 03 I98: the durable trace row is queued for its own writer thread, never
+                    # awaited: under an AER storm its fsync stalls for seconds, and the dead-chip
+                    # check below (the poller stop, the fast cadence, the remove) must not wait on it.
+                    self._deps.append_trace(sample, read_ts)
 
-                    await self.check_for_dead_chips(sample)
+                    await self.check_for_dead_chips(sample, read_ts)
                 await asyncio.to_thread(chip_state.publish)
                 # The rest keeps the regular cadence while the fast one runs (I79): only the
                 # off-bus check gets faster, never the ledger, the relift or the holder scan.
@@ -727,7 +731,7 @@ class TelemetrySampler:
         ours = set(isolated() if isolated is not None else ())
         return [i for i in chips if i in ours]
 
-    async def check_for_dead_chips(self, sample: dict) -> None:
+    async def check_for_dead_chips(self, sample: dict, read_ts: Optional[float] = None) -> None:
         """Decide whether all-ones means a chip died — or something else entirely.
 
         All-ones is only evidence of a dead chip when nothing else can explain it, and two
@@ -754,6 +758,9 @@ class TelemetrySampler:
         sample, so 24 answering chips on a 32-chip host look healthy chip by chip. The count is
         held to the same baseline heartbeat_verdict uses, on the same two-sample proof; a host
         with no baseline yet is never short.
+
+        ``read_ts`` is the sample's read time: an all-ones chip's evidence is stamped with it, not
+        with the time this check runs (spec 03 I98).
         """
         log = self._deps.logger()
         dead = sorted((i for i, v in sample.items() if v and v[0] == ALL_ONES), key=int)
@@ -835,7 +842,7 @@ class TelemetrySampler:
             return
 
         self.bad_since.pop("gone", None)
-        chip_state.note_evidence(dead, "all_ones")
+        chip_state.note_evidence(dead, "all_ones", read_ts)
         if not (len(dead) == len(sample) and len(sample) > 1):
             # A chip read all-ones is fenced from this sample on (I97): no snapshot or heartbeat poll
             # of the broker's reads it again until a probe read, a reset step or a new node. A

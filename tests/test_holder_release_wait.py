@@ -448,7 +448,7 @@ async def test_the_release_wait_runs_off_the_sampler_loop(monkeypatch):
     order, events = _dead_chip_harness(monkeypatch, holding_scans=None)
     sample = {"0": [1], "13": [telemetry.ALL_ONES]}
     monkeypatch.setattr(srv, "chip_sample", lambda: sample)
-    monkeypatch.setattr(srv, "append_trace", lambda s: None)
+    monkeypatch.setattr(srv, "append_trace", lambda s, ts=None: None)
     monkeypatch.setattr(srv, "_maybe_spawn_idle_relift", lambda: None)
     monkeypatch.setattr(srv.sampler._deps, "watch_idle_holders", None)
     monkeypatch.setattr(srv.sampler, "recovering_now", lambda: asyncio.sleep(0, result=False))

@@ -1246,7 +1246,7 @@ _recovery_deps = RecoveryDeps(
     gone_chip_confirm_settle_sec=lambda: GONE_CHIP_CONFIRM_SETTLE_SEC,
     chip_sample=lambda: chip_sample(),
     link_signals=lambda: link_signals(),
-    append_trace=lambda s: append_trace(s),
+    append_trace=lambda s, ts=None: append_trace(s, ts),
     capture_incident=lambda *a, **k: capture_incident(*a, **k),
     isolate_chip=lambda idx: isolate_chip(idx),
     chip_pci_bdf=lambda idx: chip_pci_bdf(idx),
