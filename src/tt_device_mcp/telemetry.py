@@ -896,6 +896,14 @@ class TelemetrySampler:
                     f"chip(s) {corroborated} read all-ones right after an AER error on their own PCIe "
                     f"path — off the bus; isolating on this sample"
                 )
+        # Spec 03 I79: a chip's first all-ones read arms the fast cadence, so its proof stands at
+        # FAST_CONFIRM_SEC and its containment follows, not a whole SAMPLE_INTERVAL_SEC on while a
+        # tenant still reads it; a drop with only correctable AER on its path arms nothing else. It
+        # arms after this sample's verdicts, so it changes only the next sample, and a window already
+        # running is left alone: the strike does not stretch it.
+        first = [i for i in dead if not self.dead_chip_strikes.get(i) and i not in confirmed]
+        if first and not self.fast_active() and not chip_state.recovering():
+            self.arm_fast(f"chip(s) {', '.join(first)} read all-ones")
         for i in dead:
             self.dead_chip_strikes[i] = self.dead_chip_strikes.get(i, 0) + 1
             self._mark_bad(f"chip:{i}")

@@ -1438,7 +1438,15 @@ cooldown (spec 04 I65) holds longer.
   still applies on the samples after the window ends (by its natural end or the storm cap), since
   the first of them comes only `FAST_SAMPLE_SEC` after the last fast one. A reading that began after
   the window is proved by the regular cadence as before. A chip node the sampler removed itself
-  (isolating a dead chip) moves the baseline and arms nothing. An armed watch therefore lowers the effective debounce
+  (isolating a dead chip) moves the baseline and arms nothing. A chip's own first all-ones read
+  arms the window too (`chip(s) N read all-ones`), so a lone chip that drops with only correctable
+  AER on its path, which arms nothing above, is proved at `FAST_CONFIRM_SEC` and contained (I84)
+  instead of a whole `SAMPLE_INTERVAL_SEC` later. It arms only for a chip with no strike yet that
+  this sample did not confirm, after this sample's verdicts (so it changes only the next sample's
+  timing), never on a blackout (every chip all-ones: the all-gone/blackout checks keep their
+  cadence), never while a window is already running (the strike does not stretch it) and never
+  while a recovery step owns the chips (`chip_state.recovering()`). A chip that answers again
+  before the bound clears its strike and is not confirmed. An armed watch therefore lowers the effective debounce
   from about `SAMPLE_INTERVAL_SEC` (10 s, two regular samples) to `FAST_CONFIRM_SEC` (4 s); it
   never goes lower, except under I86, where an all-ones read with an AER rise on the chip's own path
   confirms on that first sample. A chip all-ones on two consecutive samples is marked lost (I66) on the second,
@@ -1452,8 +1460,9 @@ cooldown (spec 04 I65) holds longer.
   cooldown are unchanged. TTR effect: detection of class A (whole-tray or whole-mesh drop) and
   class B1 (partial off-bus) moves from 10-20 s after the first off-bus reading to about 4-5 s when
   the kernel counted the fault (AER rise or node removal); about 10 s saved on average, up to 15 s.
-  With no kernel signal, or a storm past `FAST_MAX_SEC`, the regular cadence and its 10-20 s
-  stand. No class gets slower.
+  A lone chip's drop with no kernel signal is proved about `FAST_CONFIRM_SEC` after its first
+  all-ones read instead of a whole `SAMPLE_INTERVAL_SEC`. A blackout with no kernel signal, or a
+  storm past `FAST_MAX_SEC`, keeps the regular cadence and its 10-20 s. No class gets slower.
 
 - **I78 — A fabric hold on a missing or broken link lifts only on a passing full fabric check.** No
   path lifts or clears an open hold, whatever its class or latch, or gives the device back to the
@@ -2675,6 +2684,7 @@ refuses.
 | I79 (early off-bus watch: kernel AER/node signal samples sooner; 4 s confirm bound; lift path unchanged) | `tests/test_offbus_early_watch.py` (all: signal source, arming, early confirmation for A and B1, transient-AER and sub-bound blip debounce, housekeeping/relift cadence, no lift) |
 | I79 (no sample gap under `FAST_SAMPLE_SEC`; a storm keeps the fast cadence at most `FAST_MAX_SEC`, re-arms after a quiet window; a reset arms nothing) | `tests/test_offbus_early_watch.py::test_a_sustained_aer_storm_keeps_every_gap_and_is_capped`, `test_a_capped_storm_rearms_only_after_a_quiet_window`, `test_the_arming_edge_never_samples_sooner_than_the_fast_interval`, `test_a_reset_moves_the_baseline_without_arming` |
 | I79/I66 (two fast all-ones samples mark the chip lost before the confirm bound; one gated real read while it is pending) | `tests/test_offbus_early_watch.py::test_two_fast_all_ones_samples_mark_a_chip_lost_before_the_confirm_bound`, `test_two_fast_blackout_samples_mark_every_chip_lost_before_the_confirm_bound` |
+| I79 (a lone chip's first all-ones read arms the window and confirms at the bound; one that answers again is not confirmed; a blackout or a recovery step arms nothing) | `tests/test_offbus_early_watch.py::test_a_lone_chip_s_first_all_ones_read_arms_the_watch_and_confirms_at_the_bound`, `test_a_lone_chip_that_answers_again_after_its_first_all_ones_read_is_not_confirmed`, `test_a_first_all_ones_read_arms_nothing_on_a_blackout_or_under_a_recovery_step` |
 | I79 (the 4 s confirm bound holds across the window end and the storm cap, for the per-chip, blackout, all-gone and short-count paths; a later reading keeps the regular proof; an isolated chip's node arms nothing) | `tests/test_offbus_early_watch.py::test_the_confirm_bound_holds_across_the_end_of_a_fast_window`, `test_a_pending_chip_past_the_window_still_gets_its_real_read`, `test_a_reading_that_began_after_the_window_keeps_the_regular_proof`, `test_a_chip_the_sampler_isolated_arms_nothing_when_its_node_leaves` |
 | I80 | `tests/test_health_held_during_op.py::test_health_stays_held_while_a_forced_rung_runs`, `tests/test_health_held_during_op.py::test_health_lifts_the_hold_only_when_the_gate_passes_inside_the_op`, `tests/test_health_held_during_op.py::test_a_routine_op_on_a_device_that_was_not_held_does_not_read_held`, `tests/test_health_held_during_op.py::test_a_hold_opened_inside_an_op_keeps_its_held_since_after_the_op`, `tests/test_health_held_during_op.py::test_a_closed_episodes_held_since_never_carries_into_the_next_hold`, `tests/test_health_held_during_op.py::test_a_rehold_inside_the_carry_window_reports_the_carried_start_in_and_after_the_op`, `tests/test_health_held_during_op.py::test_an_in_window_rehold_inside_an_op_with_no_read_keeps_the_carried_start_after_it`, `tests/test_health_held_during_op.py::test_an_in_window_rehold_outside_an_op_reports_the_carried_start`, `tests/test_health_held_during_op.py::test_a_read_before_an_in_window_reholds_verdict_yields_to_the_carried_start` |
 | I81 | `tests/test_validator_not_built.py::test_the_not_built_read_speaks_only_for_the_pinned_validator`, `tests/test_validator_not_built.py::test_a_post_reset_77_with_the_validator_not_built_takes_no_eth_training_wait`, `tests/test_validator_not_built.py::test_the_post_reset_log_names_the_missing_validator_not_a_trained_link`, `tests/test_validator_not_built.py::test_an_operators_own_fabric_check_keeps_the_eth_training_wait`, `tests/test_validator_not_built.py::test_health_shows_whether_the_validator_is_built`, `tests/test_validator_not_built.py::test_the_build_is_requested_once_per_hold_episode_without_blocking`, `tests/test_validator_not_built.py::test_no_build_request_without_systemd_or_root`, `tests/test_validator_not_built.py::test_a_hung_build_request_is_bounded`, `tests/test_validator_not_built.py::test_the_watch_requests_the_build_then_lifts_only_on_a_passing_full_check`, `tests/test_validator_not_built.py::test_an_idle_relift_on_a_not_built_validator_never_resets_or_lifts`, `tests/test_validator_not_built.py::test_the_10_min_bound_still_forces_a_not_built_hold` |

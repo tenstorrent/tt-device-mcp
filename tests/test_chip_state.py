@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import fsm_healthy, patch_health_event, stub_device_pollers
+from tests.conftest import fsm_healthy, patch_health_event, step_sampler_clock, stub_device_pollers
 from tt_device_mcp import server as srv
 from tt_device_mcp.health import chip_state
 from tt_device_mcp.health import monitor as monitor_mod
@@ -194,6 +194,7 @@ async def test_a_single_blip_is_not_marked_lost_but_two_samples_are(monkeypatch,
     monkeypatch.setattr(srv.sampler, "isolate_dead_chips", fake)
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
     stub_device_pollers(monkeypatch)
+    step_sampler_clock(monkeypatch)
     live = lambda b: [b, 800, 800, 0, 0, 0]  # noqa: E731
     await srv.sampler.check_for_dead_chips({"0": live(1), "2": live(ALL_ONES), "3": live(1)})
     assert chip_state.lost_chips() == [], "one sample is a blip"

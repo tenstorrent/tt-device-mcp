@@ -19,7 +19,14 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import fsm_dirty, fsm_healthy, patch_health_event, patch_recovery, stub_device_pollers
+from tests.conftest import (
+    fsm_dirty,
+    fsm_healthy,
+    patch_health_event,
+    patch_recovery,
+    step_sampler_clock,
+    stub_device_pollers,
+)
 from tt_device_mcp import device_holders, privileges
 from tt_device_mcp import server as srv
 from tt_device_mcp.constants import ETH_POST_JOB_TIMEOUT_SEC, FABRIC_CHECK_CANNOT_CHECK_RC
@@ -2276,6 +2283,7 @@ async def test_a_chip_dead_on_two_consecutive_samples_is_isolated(monkeypatch):
     after its remove (I84)."""
     isolated = _no_isolation(monkeypatch)
     pollers = stub_device_pollers(monkeypatch)
+    step_sampler_clock(monkeypatch)
 
     live = [100, 800, 800, 0, 0, 0]
     dead = {"0": live, "13": [heartbeat.ALL_ONES, 0, 0, 0, 0, 0], "31": live}

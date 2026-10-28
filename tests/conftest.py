@@ -796,6 +796,13 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     monkeypatch.setattr(srv.sampler, "last_sample_all_ones", [], raising=False)
     monkeypatch.setattr(srv.sampler, "valve_detaching", set(), raising=False)
     monkeypatch.setattr(srv.sampler, "valve_removed", set(), raising=False)
+    # The early off-bus watch (spec 03 I79): a chip's first all-ones read arms it on the real clock,
+    # and a window left running would hold the next test's second-sample proof to FAST_CONFIRM_SEC.
+    monkeypatch.setattr(srv.sampler, "fast_until", 0.0, raising=False)
+    monkeypatch.setattr(srv.sampler, "bad_since", {}, raising=False)
+    monkeypatch.setattr(srv.sampler, "_storm_start", None, raising=False)
+    monkeypatch.setattr(srv.sampler, "_last_signal", None, raising=False)
+    monkeypatch.setattr(srv.sampler, "_storm_capped", False, raising=False)
     monkeypatch.setattr(srv, "_last_dispatch_recheck_at", None, raising=False)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
     # A link drop an eth test measured on the singleton would turn the next test's 77 hold into a fault.
@@ -1244,6 +1251,27 @@ def stub_device_pollers(monkeypatch, stopped=()) -> list:
 
     monkeypatch.setattr(srv, "_set_device_pollers", pollers)
     return calls
+
+
+def step_sampler_clock(monkeypatch) -> None:
+    """Put the sampler on a clock that also moves FAST_CONFIRM_SEC before each check_for_dead_chips.
+
+    A chip's first all-ones read arms the early off-bus watch (spec 03 I79), so its second-sample
+    proof must also have lasted FAST_CONFIRM_SEC. A test that shows only the samples that decide
+    would otherwise take them microseconds apart on the real clock; each step stands for the fast
+    samples the cadence takes in between. The clock still follows real time between steps, so the
+    sampler loop's own waits end. Nothing else in the proof is changed."""
+    from tt_device_mcp import telemetry
+
+    skew = [1000.0]
+    monkeypatch.setattr(srv.sampler, "_clock", lambda: time.monotonic() + skew[0])
+    check = srv.sampler.check_for_dead_chips
+
+    async def stepped(*a, **k):
+        skew[0] += telemetry.FAST_CONFIRM_SEC
+        return await check(*a, **k)
+
+    monkeypatch.setattr(srv.sampler, "check_for_dead_chips", stepped)
 
 
 def patch_health_event(monkeypatch, fn) -> None:

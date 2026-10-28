@@ -16,7 +16,7 @@ import time
 
 import pytest
 
-from tests.conftest import fsm_dirty, fsm_healthy, patch_health_event
+from tests.conftest import fsm_dirty, fsm_healthy, patch_health_event, step_sampler_clock
 from tests.test_job_reap import _escaped_child, _kill_quietly, _unique_tag
 from tt_device_mcp import device_holders, job_reap
 from tt_device_mcp import server as srv
@@ -441,6 +441,10 @@ async def test_the_release_wait_runs_off_the_sampler_loop(monkeypatch):
 
     monkeypatch.setattr(srv, "HOLDER_RELEASE_WAIT_SEC", 1.5)
     monkeypatch.setattr(telemetry, "SAMPLE_INTERVAL_SEC", 0.02)
+    # The first all-ones read arms the early watch (I79): sample at the same pace under it, and
+    # let each sample stand for FAST_CONFIRM_SEC of the fast cadence so the proof still holds.
+    monkeypatch.setattr(telemetry, "FAST_SAMPLE_SEC", 0.02)
+    step_sampler_clock(monkeypatch)
     order, events = _dead_chip_harness(monkeypatch, holding_scans=None)
     sample = {"0": [1], "13": [telemetry.ALL_ONES]}
     monkeypatch.setattr(srv, "chip_sample", lambda: sample)
