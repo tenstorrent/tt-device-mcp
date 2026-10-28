@@ -893,22 +893,32 @@ class RecoveryMechanism:
             # Kept in memory either way; only a broker restart before the next write forgets it.
             health_event("reset_record_unwritable", path=str(path), error=repr(exc))
 
-    def note_rung_failed(self, hold_since: str, rung: str, off_before, off_after, rc: Optional[int] = None) -> None:
+    def note_rung_failed(
+        self,
+        hold_since: str,
+        rung: str,
+        off_before,
+        off_after,
+        rc: Optional[int] = None,
+        present_after: Optional[bool] = None,
+    ) -> None:
         """Record that ``rung`` ran and failed this boot (spec 04 I36, I58), on disk before the caller
         goes on to any other rung. Every launched failure counts toward class C (I37); only one that
         left the off-bus set exactly as it found it stops a repeat: a set that grew is a regression
-        (I31) and one that shrank is progress another try may finish."""
+        (I31) and one that shrank is progress another try may finish. ``present_after``: the reset's own
+        post-reset check read every chip present, so a chip in ``off_after`` dropped later (I108)."""
         rec = self._reset_record()
-        rec["failed"].append(
-            {
-                "rung": rung,
-                "rc": rc,
-                "off_before": None if off_before is None else sorted(map(str, off_before), key=_chip_key),
-                "off_after": None if off_after is None else sorted(map(str, off_after), key=_chip_key),
-                "episode": hold_since or "",
-                "at_epoch": time.time(),
-            }
-        )
+        entry = {
+            "rung": rung,
+            "rc": rc,
+            "off_before": None if off_before is None else sorted(map(str, off_before), key=_chip_key),
+            "off_after": None if off_after is None else sorted(map(str, off_after), key=_chip_key),
+            "episode": hold_since or "",
+            "at_epoch": time.time(),
+        }
+        if present_after is not None:
+            entry["present_after"] = bool(present_after)
+        rec["failed"].append(entry)
         del rec["failed"][:-RESET_RECORD_MAX]
         self._save_reset_record(rec)
 
@@ -935,10 +945,34 @@ class RecoveryMechanism:
         self.mesh_reset_failed_since_release = True
         self.mesh_reset_failed_episode = self._device_hold_episode_since() or None
 
-    def mesh_reset_spent(self, hold_since: str) -> bool:
+    def mesh_reset_spent(self, hold_since: str, off_now=None) -> bool:
         """True once this hold episode's one mesh reset ran and failed: in this process, or in this boot's
         record across a broker restart. No path fires the mesh reset again in the episode except the
-        last-chance sweep in front of the power cycle (spec 04 I87)."""
+        last-chance sweep in front of the power cycle (spec 04 I87).
+
+        With chips off the bus now (``off_now``), only a failed reset that already faced every one of
+        them spends the rung (spec 04 I108): each was off before it ran, or its own post-reset check
+        found it off (it failed on it). A reset that ran while a chip was still present and passed its
+        own enum+ARC check never saw that chip's later drop, so the off-bus ladder runs its mesh reset.
+        A reset that regressed the mesh (I31) stays spent, and so does one with no record of its sets (an
+        operator reset): the in-memory latch decides as before."""
+        now = {str(c) for c in off_now or ()}
+        if now and hold_since:
+            if self.reset_regressed_in(hold_since):
+                return True
+            entries = [
+                e
+                for e in self._reset_record()["failed"]
+                if e.get("rung") == "mesh_reset" and e.get("episode") == hold_since and e.get("off_before") is not None
+            ]
+            if entries:
+                for e in entries:
+                    faced = set(e["off_before"])
+                    if not e.get("present_after", False):
+                        faced |= set(e.get("off_after") or ())
+                    if now <= faced:
+                        return True
+                return False
         if self.mesh_reset_failed_since_release and (
             not hold_since or self.mesh_reset_failed_episode in (None, hold_since)
         ):

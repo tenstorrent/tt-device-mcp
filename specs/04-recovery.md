@@ -979,7 +979,8 @@ each rung fires only when the gentler one failed or cannot apply.
   ARC-not-ready retry inside a reset call and I97's one reset of the whole mesh before the cycle. A spent mesh reset also lets the power cycle fire before
   the 10-min ceiling: the stuck-hold escalation journals `host_rung_not_deferred` (reason
   `mesh_reset_spent`), runs the sweep once if this phase has not, then cycles, instead of waiting
-  out the ceiling with no rung left to try.
+  out the ceiling with no rung left to try. With chips off the bus, a failed reset spends the
+  episode's mesh reset only if it faced every one of them (I108).
 
 - **I81 — A mesh reset re-adds the chips the broker isolated at tt-smi's driver wait.**
   `tt-smi -glx_reset` re-powers every tray, counts a 30 s settle, then waits up to 100 s for every
@@ -2930,6 +2931,32 @@ each rung fires only when the gentler one failed or cannot apply.
   Saving: about 37 s per such hold (the early glx_reset and its check). On the replayed hold the power
   cycle request moves from a hold age of about 109 s to about 72 s.
 
+- **I108 — A mesh reset spends the off-bus ladder's mesh reset only for chips it faced.** Seen on a
+  Galaxy hold: a job timed out, the post-kill mesh reset ran with every chip present, passed its own
+  enum+ARC check, and one chip dropped off the bus about a minute later, under that reset's fabric
+  check. The reset was recorded as failed (`off_before` empty, `off_after` the dropped chip), so the
+  off-bus one-shot's forced run journaled `reset_rung_skipped_spent` and went straight to the
+  last-chance sweep: the off-bus ladder's own mesh reset never ran on the drop it is for. Now, while
+  chips are off the bus, `mesh_reset_spent` counts a failed mesh reset of this hold episode as spent
+  only when it faced every chip off now: each was in its `off_before`, or its own post-reset check
+  found it off (it is in `off_after` and the record's `present_after` is false). The record keeps
+  `present_after` (the reset's own enum+ARC check read every expected chip present) on disk, so a
+  broker restart decides the same way. The off-bus stuck-hold escalation and the gate's mesh reset
+  stage pass the chips off now; a reset that never faced the new drop leaves the rung to run, in
+  order: the mesh reset (glx_reset with its full check, fabric included), then on its failure the
+  climb, whose last-chance sweep runs before the power cycle request (I100). That reset's own failure
+  spends the rung for the rest of the episode, so it runs at most once per new drop.
+
+  Unchanged: a present mesh (no chip off) keeps I87's one reset per episode; a reset that regressed
+  the mesh (I31) stays spent; a set that shrank stays spent (every chip off now was off before); a
+  failed reset with no off-bus sets on record (an operator reset) stays spent through the in-memory
+  latch; the I102 late-chip second mesh reset is still not run while a chip is off the bus; classes A
+  and C keep their direct power cycle (I37); the last-chance sweep, the I76 10-min bound's ladder and
+  removed rungs are unchanged. Nothing here lifts a hold: only a full health check with fabric over
+  every cabled link that has just passed does (I32). Cost: one more mesh reset and its check (about
+  70 s) on a drop that follows a failed reset in the same hold, in exchange for the full ladder
+  before the power cycle.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -3642,4 +3669,6 @@ sees a silent fabric pass.
 | I107 the I94 check's verdict reaches the per-hold record; the record is keyed by the hold and the lift clears it | `tests/test_arc_dead_skips_early_mesh_reset.py::test_the_arc_check_records_the_dead_chips_and_a_lift_clears_the_record` |
 | I107 a power cycle denied (I65 cooldown, backstop, unreadable ledger), at the check or at the climb, keeps the early mesh reset; only its passing full check with fabric lifts | `tests/test_arc_dead_skips_early_mesh_reset.py::test_a_denied_power_cycle_keeps_the_early_mesh_reset`, `tests/test_arc_dead_skips_early_mesh_reset.py::test_a_denied_power_cycle_lifts_only_on_the_mesh_resets_passing_full_check`, `tests/test_arc_dead_skips_early_mesh_reset.py::test_a_denial_at_the_climb_itself_still_runs_the_early_mesh_reset` |
 | I107 no power cycle armed: the early mesh reset runs before any operator hand-off | `tests/test_arc_dead_skips_early_mesh_reset.py::test_no_power_cycle_armed_runs_the_early_mesh_reset_before_any_hand_off` |
+| I108 a mesh reset that ran before a chip dropped does not spend the off-bus ladder's mesh reset: mesh reset, sweep, power cycle, in order, across a broker restart too | `tests/test_no_repeat_failed_rung.py::test_a_reset_that_ran_before_the_drop_does_not_spend_the_offbus_mesh_reset` |
+| I108 a mesh reset that faced the dropped chip (off before it, or found off by its own check) still spends it; a regressed reset and one with no sets on record stay spent | `tests/test_no_repeat_failed_rung.py::test_a_reset_that_faced_the_dropped_chip_still_spends_the_offbus_mesh_reset`, `::test_mesh_reset_spent_counts_only_chips_the_reset_faced`, `::test_a_reset_with_no_record_of_its_sets_stays_spent` |
 | I102 with I103: the late-chip second mesh reset runs in the pre-cycle sweep, so its pre-reset scan clears a holder outside every broker scope and runs (at the 10-min bound, on the I97 path, and in the sweep outside the bound); its wait still ends at the step's start plus `LATE_CHIP_STEP_SEC`; a failed full check keeps the hold and the cycle journals the holder; a holder in a broker job's scope or the running job's own process still refuses it, nothing lifts and the hold goes on to the cycle | `tests/test_late_chips_after_driver_wait.py::test_the_late_chip_second_reset_clears_a_foreign_holder_and_keeps_its_bound`, `::test_a_job_holder_still_refuses_the_late_chip_second_reset_and_the_hold_goes_on_to_the_cycle` |

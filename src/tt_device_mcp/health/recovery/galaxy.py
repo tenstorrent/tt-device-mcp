@@ -1653,7 +1653,7 @@ class GalaxyRecovery(Recovery):
             hold_since = self.deps.device_hold_episode_since() or ""
             if stage == STAGE_SMI_RESET and not await asyncio.to_thread(self.mechanism.scope_active):
                 failed = self.mechanism.failed_unchanged_entry("", "mesh_reset", ids_before) if ids_before else None
-                if failed is None and self.mechanism.mesh_reset_spent(hold_since):
+                if failed is None and self.mechanism.mesh_reset_spent(hold_since, ids_before):
                     # Spec 04 I87: this hold's one mesh reset already ran and failed. The gate never runs a
                     # second one in the episode; it reports the failed rung, so the routing below climbs to
                     # the power cycle (whose last-chance sweep is the one re-run allowed) or hands off.
@@ -3632,7 +3632,8 @@ class GalaxyRecovery(Recovery):
             await self._climb_to_host_recovery_after_failed_reset(expected, off_bus, log)
             return True
         ids_now = await self._offbus_ids_now(expected) if off_bus > 0 else None
-        spent = self.mechanism.mesh_reset_spent(hold_since)
+        # Spec 04 I108: with chips off the bus, only a failed reset that already faced them spends the rung.
+        spent = self.mechanism.mesh_reset_spent(hold_since, ids_now)
         if spent or self.mechanism.rung_failed_unchanged(hold_since, "mesh_reset", ids_now):
             # This episode already ran the ladder to its mesh reset and that reset failed on exactly the
             # chips off the bus now. Re-running it repeats a known failure (one Galaxy host fired six
@@ -4085,7 +4086,14 @@ class GalaxyRecovery(Recovery):
         rc = self.mechanism.last_reset_rc
         if recovered is False and rc is not None:
             ids_after = await self._offbus_ids_now(expected)
-            self.mechanism.note_rung_failed(hold_since, "mesh_reset", ids_before, ids_after, rc=rc)
+            self.mechanism.note_rung_failed(
+                hold_since,
+                "mesh_reset",
+                ids_before,
+                ids_after,
+                rc=rc,
+                present_after=self.mechanism.last_reset_verified_present(),
+            )
 
     async def _climb_past_failed_rung(
         self, expected: int, ids_now: Optional[set], hold_since: str, log, *, spent: bool = False

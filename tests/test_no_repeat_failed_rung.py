@@ -618,3 +618,118 @@ async def test_the_failed_reset_survives_a_broker_restart_but_not_a_new_boot(mon
     monkeypatch.setattr(srv.recovery_mechanism, "_current_boot_id", lambda: "another-boot")
     assert not srv.recovery_mechanism.rung_failed_unchanged("", "mesh_reset", _ids()), "a new boot starts fresh"
     assert await _window() is True and counters["resets"] == 2
+
+
+# --- a mesh reset spends the off-bus rung only for chips it faced (spec 04 I108) ------------------
+
+
+def _drop_after_a_verified_reset(monkeypatch, *, off_before=(), present_after=True, off_after=("27",)):
+    """Replay a job timeout's post-kill mesh reset in this hold: it ran with ``off_before`` off the bus,
+    exited 0 and failed its verify, then chip 27 is off the bus. ``present_after``: its own enum+ARC
+    check read every chip present, so 27 dropped later, under the fabric check. Returns the sequence
+    list the ladder's mesh reset, the last-chance sweep and the power cycle append to, and the events."""
+    clock = [ONE_SHOT]
+    counters, events, _ = _episode(monkeypatch, power_cycle=True, clock=clock, off_bus=1)
+    state = {"off": set(off_after)}
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: _beats_with_off(state["off"]))
+    srv.isolated_chips = set()
+    mech = srv.recovery_mechanism
+    mech.last_reset_monotonic = time.monotonic()
+    mech.last_reset_rc = 0
+    mech.verified_present_reset_at = mech.last_reset_monotonic if present_after else None
+    mech.mark_mesh_reset_failed()
+    hold_since = srv.device_hold_episode_since
+    seq = []
+    reset, sweep = srv.galaxy_recovery._reset_and_verify_device, srv.galaxy_recovery._settle_and_verify_before_host_rung
+
+    async def ladder_reset(indices, log):
+        seq.append("mesh_reset")
+        return await reset(indices, log)
+
+    async def last_chance_sweep(*a, **k):
+        seq.append("sweep")
+        return await sweep(*a, **k)
+
+    async def power_cycle(log, reason):
+        seq.append("power_cycle")
+        counters["power_cycles"] += 1
+
+    patch_recovery(monkeypatch, "_reset_and_verify_device", ladder_reset)
+    monkeypatch.setattr(srv.galaxy_recovery, "_settle_and_verify_before_host_rung", last_chance_sweep)
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    return seq, events, counters, hold_since, set(off_before)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [False, True], ids=["same-process", "after-broker-restart"])
+async def test_a_reset_that_ran_before_the_drop_does_not_spend_the_offbus_mesh_reset(
+    monkeypatch, clear_job_state, restart
+):
+    """A post-kill mesh reset ran with every chip present and passed its own enum+ARC check; chip 27
+    dropped later, under its fabric check. That reset never faced the drop, so the off-bus ladder runs
+    its own mesh reset first, then the last-chance sweep, then asks for the power cycle (goal: the full
+    ladder right before every power cycle). Fails on base, which skipped the rung as spent."""
+    seq, events, counters, hold_since, before = _drop_after_a_verified_reset(monkeypatch)
+    await srv.galaxy_recovery._note_mesh_reset_failed(False, hold_since, before, EXPECTED)
+    entry = srv.recovery_mechanism._reset_record()["failed"][-1]
+    assert entry["off_before"] == [] and entry["off_after"] == ["27"]
+    if restart:
+        _restart(monkeypatch)
+    assert await _window() is True
+    assert SPENT not in events and SKIP not in events
+    assert seq == ["mesh_reset", "sweep", "power_cycle"], "mesh reset, then the sweep, then the power cycle"
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "nothing lifts the hold"
+    assert entry.get("present_after") is True, "the record keeps that the reset's own check saw 27 present"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "off_before,present_after",
+    [(("27",), True), (("27",), False), ((), False)],
+    ids=["chip-already-off", "chip-already-off-unverified", "own-check-found-it-off"],
+)
+async def test_a_reset_that_faced_the_dropped_chip_still_spends_the_offbus_mesh_reset(
+    monkeypatch, clear_job_state, off_before, present_after
+):
+    """The episode's failed mesh reset already faced chip 27: it was off the bus before the reset ran, or
+    the reset's own check found it off. I87 holds: no second mesh reset, the sweep, then the cycle."""
+    seq, events, counters, hold_since, before = _drop_after_a_verified_reset(
+        monkeypatch, off_before=off_before, present_after=present_after
+    )
+    await srv.galaxy_recovery._note_mesh_reset_failed(False, hold_since, before, EXPECTED)
+    assert await _window() is True
+    assert SPENT in events or SKIP in events
+    assert seq == ["sweep", "power_cycle"], "the spent mesh reset is not repeated; the sweep runs before the cycle"
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
+
+
+def test_mesh_reset_spent_counts_only_chips_the_reset_faced(monkeypatch, clear_job_state):
+    """Spec 04 I108 on the record alone: each case of who faced which chip."""
+    _fresh_reset_record(monkeypatch)
+    mech = srv.recovery_mechanism
+    monkeypatch.setattr(mech, "mesh_reset_failed_since_release", False)
+    monkeypatch.setattr(mech, "regressed_reset_since", None)
+    ep = "2026-01-01T00:00:00"
+    assert not mech.mesh_reset_spent(ep, {"27"}), "nothing ran"
+    mech.note_rung_failed(ep, "mesh_reset", set(), {"27"}, rc=0, present_after=True)
+    assert mech.mesh_reset_spent(ep), "a present mesh: the episode's one reset is spent (I87)"
+    assert mech.mesh_reset_spent(ep, set()), "no chip off now: unchanged I87"
+    assert not mech.mesh_reset_spent(ep, {"27"}), "27 dropped after the reset's own check passed"
+    assert not mech.mesh_reset_spent("another-episode", {"27"})
+    mech.note_rung_failed(ep, "mesh_reset", {"27"}, {"27"}, rc=1, present_after=False)
+    assert mech.mesh_reset_spent(ep, {"27"}), "the second reset faced 27"
+    assert not mech.mesh_reset_spent(ep, {"27", "5"}), "chip 5 is a new drop no reset faced"
+    mech.note_reset_regressed(ep)
+    assert mech.mesh_reset_spent(ep, {"27", "5"}), "a reset that regressed the mesh stays spent (I31)"
+
+
+def test_a_reset_with_no_record_of_its_sets_stays_spent(monkeypatch, clear_job_state):
+    """An operator mesh reset latches the episode in memory with no off-bus sets on record: spent as
+    before (I87), whatever is off now."""
+    _fresh_reset_record(monkeypatch)
+    mech = srv.recovery_mechanism
+    ep = srv.device_hold_episode_since = "2026-01-01T00:00:00"
+    monkeypatch.setattr(mech, "regressed_reset_since", None)
+    monkeypatch.setattr(mech, "_device_hold_episode_since", lambda: ep)
+    mech.mark_mesh_reset_failed()
+    assert mech.mesh_reset_spent(ep, {"27"})
