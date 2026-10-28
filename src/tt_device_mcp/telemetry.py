@@ -899,10 +899,11 @@ class TelemetrySampler:
         # Spec 03 I79: a chip's first all-ones read arms the fast cadence, so its proof stands at
         # FAST_CONFIRM_SEC and its containment follows, not a whole SAMPLE_INTERVAL_SEC on while a
         # tenant still reads it; a drop with only correctable AER on its path arms nothing else. It
-        # arms after this sample's verdicts, so it changes only the next sample, and a window already
-        # running is left alone: the strike does not stretch it.
+        # arms after this sample's verdicts, so it changes only the next sample. A running window
+        # that ends before this reading's FAST_CONFIRM_SEC proof can stand is extended too (the
+        # storm cap, FAST_MAX_SEC, still bounds it); one with that much left is left alone.
         first = [i for i in dead if not self.dead_chip_strikes.get(i) and i not in confirmed]
-        if first and not self.fast_active() and not chip_state.recovering():
+        if first and self.fast_until - self._clock() < FAST_CONFIRM_SEC and not chip_state.recovering():
             self.arm_fast(f"chip(s) {', '.join(first)} read all-ones")
         for i in dead:
             self.dead_chip_strikes[i] = self.dead_chip_strikes.get(i, 0) + 1
