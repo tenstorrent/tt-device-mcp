@@ -266,6 +266,51 @@ async def test_a_lone_chip_that_answers_again_after_its_first_all_ones_read_is_n
 
 
 @pytest.mark.asyncio
+async def test_a_lone_chip_s_first_all_ones_read_at_a_window_s_tail_still_confirms_at_the_bound(watch):
+    """A first all-ones read less than FAST_CONFIRM_SEC before a running window ends extends it, so
+    the sample after the second one is still a fast one and the chip is contained at
+    FAST_CONFIRM_SEC, not a whole SAMPLE_INTERVAL_SEC after the window lapsed. The proof is unchanged."""
+    s, clock, isolated, events = watch
+    bad = {"0": DEAD, "13": LIVE, "31": LIVE}
+    assert s.arm_fast("an AER rise")
+    clock.t = s.fast_until - 1  # the window's last second
+    first = clock.t
+
+    await s.check_for_dead_chips(bad)  # strike 1, the window about to end
+    clock.t += telemetry.FAST_SAMPLE_SEC
+    await s.check_for_dead_chips(bad)  # +2 s: two samples, the bound not yet
+    assert isolated == [], "two fast samples 2 s apart are not the debounce"
+    assert s.fast_active(), "the next sample must come FAST_SAMPLE_SEC on, not SAMPLE_INTERVAL_SEC"
+    clock.t += telemetry.FAST_SAMPLE_SEC
+    await s.check_for_dead_chips(bad)  # +4 s: lasted the bound
+    assert isolated == ["0"] and clock.t - first == telemetry.FAST_CONFIRM_SEC
+    assert _kinds(events).count("offbus_watch_armed") == 1, "extending a live window journals nothing"
+
+
+@pytest.mark.asyncio
+async def test_a_first_all_ones_read_at_a_capped_storm_s_tail_never_stretches_the_cap(watch):
+    """The extension stays inside the storm cap: at FAST_MAX_SEC the window ends regardless, and the
+    chip then keeps the regular cadence and its FAST_CONFIRM_SEC proof (never a shorter one)."""
+    s, clock, isolated, _ = watch
+    start = clock.t
+    s.arm_fast("an AER rise")
+    while clock.t + telemetry.FAST_SAMPLE_SEC < start + telemetry.FAST_MAX_SEC:
+        clock.t += telemetry.FAST_SAMPLE_SEC
+        s.arm_fast("an AER rise")
+    assert s.fast_until == start + telemetry.FAST_MAX_SEC
+    clock.t = s.fast_until - 1
+    bad = {"0": DEAD, "13": LIVE, "31": LIVE}
+    await s.check_for_dead_chips(bad)
+    assert s.fast_until == start + telemetry.FAST_MAX_SEC, "the cap still bounds the window"
+    clock.t += telemetry.FAST_SAMPLE_SEC
+    await s.check_for_dead_chips(bad)
+    assert not s.fast_active() and isolated == []
+    clock.t += telemetry.SAMPLE_INTERVAL_SEC  # the regular cadence's next sample
+    await s.check_for_dead_chips(bad)
+    assert isolated == ["0"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["blackout", "recovering"])
 async def test_a_first_all_ones_read_arms_nothing_on_a_blackout_or_under_a_recovery_step(watch, case):
     """Every chip at once is the re-init blip the blackout check proves on the regular cadence, and a
@@ -574,8 +619,10 @@ async def test_the_confirm_bound_holds_across_the_end_of_a_fast_window(watch, mo
 
     await s.check_for_dead_chips(bad)  # the last fast sample
     clock.t += telemetry.FAST_SAMPLE_SEC
-    assert not s.fast_active()
-    await s.check_for_dead_chips(bad)  # 2 s later, the window over
+    # A lone chip's first all-ones read extends a window that would end before its proof stands,
+    # inside the storm cap; every other case runs the next sample with the window over.
+    assert s.fast_active() == (path == "per-chip" and not capped)
+    await s.check_for_dead_chips(bad)  # 2 s later
     assert isolated == [], "two samples 2 s apart isolated a chip"
     assert verdict not in _kinds(events), "two samples 2 s apart reached a verdict"
     assert srv.fsm.state is ServerState.HEALTHY
