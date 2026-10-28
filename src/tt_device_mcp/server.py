@@ -6485,8 +6485,7 @@ def _stop_device_users(reason: str) -> list:
             stopped.append({"pid": h.pid, "user": h.username})
         except (ProcessLookupError, PermissionError, OSError):
             continue
-    if stopped and logger:
-        logger.error(f"DEAD-CHIP stopped the device's users {stopped} before the remove — {reason}")
+    # No log line here: the containment logs the stopped users after the remove (spec 03 I99).
     return stopped
 
 
@@ -9239,6 +9238,18 @@ def _leftover_rung_candidates(now_epoch: float) -> list:
     return [hold_report.RungCandidate(at, "power cycle", "unkillable leftover budget")]
 
 
+def _dead_chip_watch_armed() -> bool:
+    """Spec 03 I99: the dead-chip watch runs its fast cadence or a containment is removing chips. A
+    status read then makes no config-space read of its own. No chip read."""
+    s = sampler
+    if s is None:
+        return False
+    try:
+        return bool(s.fast_active() or s.valve_detaching)
+    except Exception:  # noqa: BLE001 - unknown reads as armed: skip the reads
+        return True
+
+
 def _hold_report(now: Optional[datetime] = None) -> dict:
     """The read-only hold fields for /health while the FSM is RECOVERING or DOWN (spec 03 I72):
     ``hold_class``, ``hold_started_at``, ``next_rung``/``next_rung_at`` and ``trays_present``.
@@ -9268,9 +9279,14 @@ def _hold_report(now: Optional[datetime] = None) -> dict:
         off_ids = {int(i) for i in offbus_chip_ids(beats, expected, not_ready)}
         # The ladder's own presence read (galaxy _presence_read): a chip off the bus by the heartbeat,
         # or whose link reads down, is not present even if its node lingers, so a dead but still
-        # enumerated tray reads as the whole-tray drop the ladder sees.
+        # enumerated tray reads as the whole-tray drop the ladder sees. A fenced or lost chip is not
+        # present and its link is never read; while the dead-chip watch is armed no link is read at
+        # all (spec 03 I99): a link read is a config-space read that stalls this loop on a dying chip.
+        watching = _dead_chip_watch_armed()
         present = {
-            i: pci_bus_number(a) for i, a in chip_pci_bdfs().items() if int(i) not in off_ids and not link_down(a)
+            i: pci_bus_number(a)
+            for i, a in chip_pci_bdfs().items()
+            if int(i) not in off_ids and not chip_state.read_blocked(i) and (watching or not link_down(a))
         }
         whole = False
         if off_ids and len(off_ids) < expected:
@@ -13285,16 +13301,20 @@ def save_stats():
     """Save stats to disk and update symlink."""
     if not stats or not stats_file or not stats_dir:
         return
+    _write_stats(stats.to_dict(), stats_file, stats_dir)
 
+
+def _write_stats(body: dict, path: Path, folder: Path) -> None:
+    """The file I/O of :func:`save_stats`, safe on a worker thread: ``body`` is a snapshot."""
     # Write stats file
-    with open(stats_file, "w") as f:
-        json.dump(stats.to_dict(), f, indent=2)
+    with open(path, "w") as f:
+        json.dump(body, f, indent=2)
 
     # Update 'current' symlink
-    current_link = stats_dir / "current"
+    current_link = folder / "current"
     if current_link.is_symlink() or current_link.exists():
         current_link.unlink()
-    current_link.symlink_to(stats_file.name)
+    current_link.symlink_to(path.name)
 
 
 async def stats_persistence_loop():
@@ -13307,7 +13327,10 @@ async def stats_persistence_loop():
     while True:
         await asyncio.sleep(STATS_UPDATE_SEC)
         try:
-            save_stats()
+            # Snapshot on the loop, write on a worker thread (spec 03 I99): a write or unlink that
+            # blocks on a stalled host never holds up the loop.
+            if stats and stats_file and stats_dir:
+                await asyncio.to_thread(_write_stats, stats.to_dict(), stats_file, stats_dir)
             if logger:
                 logger.debug(f"STATS saved to {stats_file}")
         except Exception as e:

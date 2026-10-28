@@ -211,6 +211,8 @@ async def test_a_remove_that_times_out_latches_pci_wedged_and_asks_for_the_power
     stuck = threading.Event()
     monkeypatch.setattr(srv, "isolate_chip", lambda idx: log.append(("detach", idx)) or stuck.wait(30))
     monkeypatch.setattr(telemetry, "DETACH_TIMEOUT_SEC", 0.3)
+    monkeypatch.setattr(telemetry, "WATCH_HARD_BOUND_SEC", 0.3)
+    monkeypatch.setattr(telemetry, "WATCH_REMOVE_BUDGET_SEC", 0.3)
     monkeypatch.setattr(srv, "_pci_wedged_asked", None, raising=False)
     monkeypatch.setattr(srv, "_forced_escalation_task", None)
     monkeypatch.setattr(srv, "_recovery_degraded", lambda: True)

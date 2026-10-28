@@ -869,3 +869,19 @@ def test_the_power_cycle_gates_read_marks_nothing(held, monkeypatch):
 
     monkeypatch.setattr(m, "read_auto_recovery_ledger", _boom)
     assert m.power_cycle_gates(START + 100) == []
+
+
+def test_a_fenced_chip_link_is_never_read_and_none_while_the_dead_chip_watch_is_armed(held, monkeypatch):
+    """Spec 03 I99: a link read is a config-space read, which stalls the loop on a dying chip. A fenced
+    or lost chip is not present and its link is never read; while the dead-chip watch is armed the
+    report reads no link at all."""
+    reads = []
+    monkeypatch.setattr(srv, "link_down", lambda bdf: reads.append(GALAXY_BUS_IDS.index(bdf)) or False)
+    monkeypatch.setattr(srv.chip_state, "read_blocked", lambda i: str(i) == "27")
+    monkeypatch.setattr(srv.sampler, "fast_active", lambda: False)
+    _payload()
+    assert reads and 27 not in reads, "the fenced chip's link is skipped, the others read"
+    reads.clear()
+    monkeypatch.setattr(srv.sampler, "fast_active", lambda: True)
+    _payload()
+    assert reads == [], "no link read while the watch is armed"
