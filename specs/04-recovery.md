@@ -2899,6 +2899,27 @@ each rung fires only when the gentler one failed or cannot apply.
   the driver-wait rescans came back without a power cycle (0 of 7 such holds); the step's value so
   far is that the ladder before the cycle is complete.
 
+- **I107 — A below-floor drop whose every off-bus chip a bridge reset left ARC-dead skips the early
+  mesh reset and climbs at once to the ladder before the power cycle.** Seen on a Galaxy class B1 hold
+  (one chip isolated): the gate's SBR brought the chip back with a dead ARC (I94), the off-bus one-shot
+  forced run found its SBR round spent (I98) and ran the below-floor mesh reset (glx_reset, about 33 s,
+  then its full check: about 37 s in all). That reset failed on the same chip, so I58 climbed, and the
+  last-chance sweep ran the same SBR and glx_reset again before the power cycle. The early reset did
+  nothing the sweep does not repeat. Now `GalaxyRecovery` keeps a per-hold record of the chips the I94
+  check found ARC-dead (`_arc_dead_now`; keyed by the hold episode like the I98 record, a chip seen
+  back on the bus since leaves it, and the lift clears it). On the off-bus escalation's below-floor
+  path, below the I76 bound and after the whole-tray check (I37), a drop whose every off-bus chip is
+  in that record journals `galaxy_reset_skipped_arc_dead`, runs no mesh reset and climbs with
+  `host_rung_not_deferred` reason `bridge_reset_arc_dead`: no wait for the 10-min ladder end. The
+  last-chance sweep (I58, I100) then runs its SBR, the mesh reset (glx_reset with POST_RESET and board
+  re-init) and the full check with fabric over every cabled link; only its pass lifts the hold, and a
+  fail keeps it and requests the power cycle. A bridge reset that brings the chip back with a live ARC
+  records nothing, and the full check with fabric decides the lift as before. The I76 bound's ladder,
+  the gate path, classes A and C (their direct power cycle) and the PCI-wedged latch are unchanged.
+
+  Saving: about 37 s per such hold (the early glx_reset and its check). On the replayed hold the power
+  cycle request moves from a hold age of about 109 s to about 72 s.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -3603,4 +3624,10 @@ sees a silent fabric pass.
 | I106 the replayed hold: the repeat gives up at a hold age of about 592 s; the rescan, the re-init of the chips present and the full check with fabric run, the check fails, nothing lifts and the power cycle is requested within the repeat's start plus 570 s | `tests/test_late_chips_after_driver_wait.py::test_the_replayed_give_up_gets_the_rescan_the_reinit_and_the_check_before_the_power_cycle` |
 | I106 the same hold with the chip back after the re-init: the full check passes and lifts the hold once, no power cycle | `tests/test_late_chips_after_driver_wait.py::test_the_replayed_give_up_lifts_with_no_power_cycle_when_the_late_chip_returns_and_the_check_passes` |
 | I106 a repeat that gives up again gets its full check before the power cycle | `tests/test_below_floor_offbus_ladder.py::test_the_power_cycle_after_the_mesh_reset_before_the_host_rung_is_requested_by_its_bound` |
+| I107 an ARC-dead chip still dead at the forced run: no early mesh reset, no ladder-end wait, the sweep runs next | `tests/test_arc_dead_skips_early_mesh_reset.py::test_arc_dead_and_still_dead_skips_the_early_mesh_reset_and_climbs_at_once`, `tests/test_arc_dead_skips_early_mesh_reset.py::test_without_an_arc_dead_record_the_early_mesh_reset_still_runs`, `tests/test_arc_dead_skips_early_mesh_reset.py::test_a_chip_seen_back_since_its_arc_dead_round_is_out_of_the_record` |
+| I107 a bridge reset that brings the ARC back lifts only on a passing full check with fabric | `tests/test_arc_dead_skips_early_mesh_reset.py::test_arc_dead_healed_by_the_bridge_reset_lifts_only_on_the_full_check_with_fabric` |
+| I107 the ladder right before the power cycle still runs the SBR, the glx_reset and the full check with fabric (goal of I100) | `tests/test_arc_dead_skips_early_mesh_reset.py::test_the_pre_cycle_ladder_still_runs_the_mesh_reset_and_the_last_chance_sweep` |
+| I107 the I76 bound's ladder is unchanged and still runs the mesh reset | `tests/test_arc_dead_skips_early_mesh_reset.py::test_the_10_min_bound_ladder_is_unchanged_and_still_runs_the_mesh_reset` |
+| I107 a failed full check after the ladder keeps the hold and requests the power cycle | `tests/test_arc_dead_skips_early_mesh_reset.py::test_a_failed_full_check_after_the_ladder_keeps_the_hold_and_requests_the_cycle` |
+| I107 the I94 check's verdict reaches the per-hold record; the record is keyed by the hold and the lift clears it | `tests/test_arc_dead_skips_early_mesh_reset.py::test_the_arc_check_records_the_dead_chips_and_a_lift_clears_the_record` |
 | I102 with I103: the late-chip second mesh reset runs in the pre-cycle sweep, so its pre-reset scan clears a holder outside every broker scope and runs (at the 10-min bound, on the I97 path, and in the sweep outside the bound); its wait still ends at the step's start plus `LATE_CHIP_STEP_SEC`; a failed full check keeps the hold and the cycle journals the holder; a holder in a broker job's scope or the running job's own process still refuses it, nothing lifts and the hold goes on to the cycle | `tests/test_late_chips_after_driver_wait.py::test_the_late_chip_second_reset_clears_a_foreign_holder_and_keeps_its_bound`, `::test_a_job_holder_still_refuses_the_late_chip_second_reset_and_the_hold_goes_on_to_the_cycle` |

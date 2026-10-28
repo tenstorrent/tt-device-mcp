@@ -1041,6 +1041,10 @@ class GalaxyRecovery(Recovery):
     # keeps apart the spent chips no bridge write reached (no_bridge): never reset, so for I69 a removed
     # one still withholds the rescan.
     _sbr_hold: Optional[tuple] = None
+    # Spec 04 I107: the (episode, wall time, {chip: back seq}) of the chips a bridge reset this hold left
+    # back on the bus with a dead ARC (I94), and the chips the last SBR left so.
+    _arc_dead_hold: Optional[tuple] = None
+    last_bridge_reset_arc_dead: set = set()
 
     def __init__(self, monitor, mechanism, deps) -> None:
         super().__init__(monitor, mechanism, deps)
@@ -1919,7 +1923,9 @@ class GalaxyRecovery(Recovery):
         kw = {"exclude": frozenset(spent)} if spent else {}
         if unreset:
             kw["not_reset"] = unreset
+        self.last_bridge_reset_arc_dead = set()
         ok = await self._recover_isolated_chips(log, **kw)
+        self._note_arc_dead(self.last_bridge_reset_arc_dead)
         fired = {str(c) for c in getattr(self, "last_bridge_reset_fired", set()) or set()}
         # A chip with no bridge to write to is a topology fact no retry in this hold changes: its SBR
         # round is spent too (the gated, unprivileged and wedged declines are not). No write reached
@@ -1988,6 +1994,38 @@ class GalaxyRecovery(Recovery):
         """A hold lifted on a just-passed full check: its SBR record ends with it (spec 04 I98), so a hold
         that carries the same episode (I82) starts with an empty one."""
         self._sbr_hold = None
+        self._arc_dead_hold = None
+
+    async def _arc_dead_after_bridge_reset(self, chips: list, log) -> list:
+        """Spec 04 I94's ARC check, keeping the chips it found dead for this hold's record (I107)."""
+        dead = await super()._arc_dead_after_bridge_reset(chips, log)
+        self.last_bridge_reset_arc_dead = {str(c) for c in dead}
+        return dead
+
+    def _note_arc_dead(self, chips) -> None:
+        """Spec 04 I107: add to this hold's record the chips the SBR just left with a dead ARC."""
+        since = self.deps.device_hold_episode_since() or ""
+        dead = set(self._arc_dead_now(since)) | {str(c) for c in chips or ()}
+        if not dead and not self._arc_dead_hold:
+            return
+        self._arc_dead_hold = (since, time.time(), {c: chip_back_seq(c) for c in dead})
+
+    def _arc_dead_now(self, hold_since: Optional[str]) -> frozenset:
+        """The chips a bridge reset this hold left with a dead ARC that have not been seen back on the
+        bus since (spec 04 I107). Keyed by the hold episode the same way as :meth:`_sbr_done`."""
+        rec = self._arc_dead_hold
+        if not rec:
+            return frozenset()
+        if rec[0] != (hold_since or ""):
+            if rec[0] or not hold_since:
+                return frozenset()
+            try:
+                start = datetime.fromisoformat(hold_since).timestamp()
+            except ValueError:
+                return frozenset()
+            if rec[1] < start - SBR_RECORD_ADOPT_SEC:
+                return frozenset()
+        return frozenset(c for c, seq in rec[2].items() if seq == chip_back_seq(c))
 
     def _sbr_owed(self, hold_since: Optional[str], off_ids: Optional[set], beats: Optional[dict] = None) -> list:
         """The off-bus chips the kept SBR rung could reset that this hold has not SBR'd yet (spec 04
@@ -3737,6 +3775,26 @@ class GalaxyRecovery(Recovery):
                     _offbus_chip_ids(beats_pre or {}, expected), expected, log, sbr_tried=sbr_tried
                 ):
                     return True
+                # Spec 04 I107: below the bound, a drop whose every off-bus chip a bridge reset this hold
+                # left with a dead ARC skips this mesh reset. The last-chance sweep runs one, with the
+                # full check with fabric, right before the power cycle; the bound's ladder runs its own.
+                off_ids = _offbus_chip_ids(beats_pre or {}, expected) | {str(c) for c in isolated_chips}
+                arc_dead = self._arc_dead_now(hold_since)
+                if not self._bound and off_ids and off_ids <= arc_dead:
+                    log(
+                        f"chip(s) {sorted(off_ids, key=int)} are still ARC-dead after this hold's bridge "
+                        "reset — skipping the early mesh reset; the full ladder runs before the power cycle"
+                    )
+                    health_event(
+                        "galaxy_reset_skipped_arc_dead",
+                        held_since=hold_since,
+                        chips=sorted(off_ids, key=int),
+                        off_bus=off_bus_pre,
+                        expected=expected,
+                    )
+                    metrics.stage_fired("smi_reset", "blocked")
+                    await self._climb_or_hand_off(expected, off_bus_pre, hold_since, log, arc_dead=True)
+                    return True
             off_bus_before = off_bus_pre
         if off_bus_before is None:
             # The floor read above did not run (floor opted out, or a reset was cycling), so take a
@@ -4026,14 +4084,21 @@ class GalaxyRecovery(Recovery):
         await self._climb_or_hand_off(expected, off_bus, hold_since, log, present_reset_failed=off_bus == 0)
 
     async def _climb_or_hand_off(
-        self, expected: int, off_bus: Optional[int], hold_since: str, log, *, present_reset_failed: bool = False
+        self,
+        expected: int,
+        off_bus: Optional[int],
+        hold_since: str,
+        log,
+        *,
+        present_reset_failed: bool = False,
+        arc_dead: bool = False,
     ) -> None:
         """Climb a failed (or skipped) reset to the host rung. With no host rung available the hold goes
         to an operator, once per episode, and no further reset fires on it while its off-bus set stays
         the same (spec 04 I36, I33)."""
         if (
             await self._climb_to_host_recovery_after_failed_reset(
-                expected, off_bus, log, present_reset_failed=present_reset_failed
+                expected, off_bus, log, present_reset_failed=present_reset_failed, arc_dead=arc_dead
             )
             != NO_HOST_RUNG
         ):
@@ -4280,6 +4345,7 @@ class GalaxyRecovery(Recovery):
         on_fire: Optional[Callable[[], None]] = None,
         ladder_ran: bool = False,
         present_reset_failed: bool = False,
+        arc_dead: bool = False,
     ) -> str:
         """Climb an idle escalation whose galaxy reset failed to revive the mesh to the host rung — the
         power cycle, the only host rung (I71) — so a reset that did not recover does not sit.
@@ -4432,6 +4498,21 @@ class GalaxyRecovery(Recovery):
                 held_age_sec=int(hold_age),
                 ceiling_sec=_stuck_hold_ceiling_sec(),
                 reason="mesh_reset_spent",
+            )
+        elif arc_dead and hold_age is not None and hold_age < _stuck_hold_ceiling_sec():
+            # Spec 04 I107: the bridge reset left every off-bus chip with a dead ARC and the early mesh
+            # reset was skipped. The ceiling wait would only delay the one ladder left: the last-chance
+            # sweep below (SBR, mesh reset, full check with fabric) runs before the power cycle.
+            log(
+                f"this {int(hold_age)}s-old hold's chips are ARC-dead after the bridge reset — not waiting "
+                f"for the {_stuck_hold_ceiling_sec()}s ladder end; the full ladder runs before the host rung"
+            )
+            health_event(
+                "host_rung_not_deferred",
+                held_since=hold_since,
+                held_age_sec=int(hold_age),
+                ceiling_sec=_stuck_hold_ceiling_sec(),
+                reason="bridge_reset_arc_dead",
             )
         elif hold_age is not None and hold_age < _stuck_hold_ceiling_sec():
             log(
