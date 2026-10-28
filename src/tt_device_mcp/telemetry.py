@@ -97,13 +97,16 @@ INFLIGHT_DETACH_TIMEOUT_SEC = 15.0
 # config space, so both stay off until a device proof shows them safe on a dying link.
 WATCH_CONFIG_CONFIRM = False
 WATCH_DLLLA = False
-# Latency budget, counted from the trigger read (spec 03 I96): every user of the chip SIGSTOPped
+# Latency budget, counted from the trigger read (spec 03 I96, I99): every user of the chip SIGSTOPped
 # within WATCH_STOP_BUDGET_SEC, the PCI remove done within WATCH_REMOVE_BUDGET_SEC typically and
-# never later than DETACH_TIMEOUT_SEC after the stop (a remove past that latches PCI-wedged and asks
-# for the power cycle). On the hosts this guards, the first SMI stall of a storm came about 4 s after
-# its first AER record. The containment row journals the measured times against these.
+# never later than WATCH_HARD_BOUND_SEC after the trigger (a remove still running then latches
+# PCI-wedged and asks for the power cycle). A host stall that delays the start past the bound
+# still gets WATCH_REMOVE_BUDGET_SEC for the remove. On the hosts this guards, the first SMI stall
+# of a storm came about 4 s after its first AER record. The containment row journals the measured
+# times against these.
 WATCH_STOP_BUDGET_SEC = 1.0
 WATCH_REMOVE_BUDGET_SEC = 5.0
+WATCH_HARD_BOUND_SEC = 15.0
 INFLIGHT_KILL_TIMEOUT_SEC = 30.0
 # Spec 03 I84: the dead-chip valve's PCI removes together get at most this long. A remove drains the
 # driver's in-flight ioctls, and a reader wedged on the dead chip can hold that drain open; the write
@@ -1094,7 +1097,7 @@ class TelemetrySampler:
         """Spec 03 I96: contain dead ``chips`` on the calling thread, with no event loop, in order:
         SIGSTOP the broker's readers and every user of the device (the job's process groups, any other
         holder); mark the chips lost; PCI-remove each through the one PCI writer (``vanished`` chips
-        are already gone), all within DETACH_TIMEOUT_SEC; the I84 kill, only once every all-ones chip
+        are already gone), all within WATCH_HARD_BOUND_SEC of the trigger (I99); the I84 kill, only once every all-ones chip
         is detached; the hold, the pollers and the incident handed to the loop; then the
         ``chip_contained`` record, fsynced (I95). A remove that times out or fails latches PCI-wedged,
         which asks for the power cycle (spec 04 I76, I65), and kills nobody: the stopped stay stopped.
@@ -1141,14 +1144,17 @@ class TelemetrySampler:
             except Exception:  # noqa: BLE001
                 users = []
             t_stop = time.monotonic()
-            chip_state.mark_lost(fresh, f"dead under the watch ({reason})", self._nodes(fresh))
+            # No blocking I/O between the stop and the remove (I99): the mark's journal line goes
+            # through the detached writer and the state file is written after the remove.
+            chip_state.mark_lost(fresh, f"dead under the watch ({reason})", self._nodes(fresh), deferred=True)
             pci = dict(pci or {})
             for i in fresh:
                 if not pci.get(i) and getattr(deps, "chip_pci_bdf", None) is not None:
                     pci[i] = deps.chip_pci_bdf(i)
 
-            # 2. Remove: the one PCI writer, all chips inside one DETACH_TIMEOUT_SEC bound. Budget:
-            # WATCH_REMOVE_BUDGET_SEC typical, DETACH_TIMEOUT_SEC hard.
+            # 2. Remove: the one PCI writer, all chips inside one bound, WATCH_HARD_BOUND_SEC from the
+            # trigger (I99; WATCH_REMOVE_BUDGET_SEC from now when a host stall started us past it).
+            # Budget: WATCH_REMOVE_BUDGET_SEC typical. A remove still running at the bound latches.
             removed = [i for i in fresh if i in vanished]
             to_remove = [i for i in fresh if i not in vanished]
             stuck: list = []
@@ -1158,7 +1164,7 @@ class TelemetrySampler:
                 # remove, no kill; the power cycle the latch asked for is the recovery.
                 stuck = list(to_remove)
             else:
-                deadline = time.monotonic() + DETACH_TIMEOUT_SEC
+                deadline = max(t0 + WATCH_HARD_BOUND_SEC, time.monotonic() + WATCH_REMOVE_BUDGET_SEC)
                 for n, idx in enumerate(to_remove):
                     left = deadline - time.monotonic()
                     ok = False
@@ -1183,6 +1189,7 @@ class TelemetrySampler:
             t_remove = time.monotonic()
             self.valve_removed.update(removed)
             self.valve_detaching.difference_update(fresh)
+            chip_state.publish()
 
             # 3. The I84 kill: only with every chip any run or the latest sample read all-ones detached.
             seen = set(fresh).union(set(all_ones), *list(self.valve_runs), self.last_sample_all_ones)
@@ -1252,6 +1259,7 @@ class TelemetrySampler:
                     if not stuck
                     else f"remove of {stuck} failed, PCI-wedged, power cycle requested"
                 )
+                + (f"; stopped users {users}" if users else "")
                 + f"; killed {len(killed)}"
                 + (f", kill refused ({refused})" if refused else "")
                 + "; hold kept"

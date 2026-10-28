@@ -427,6 +427,8 @@ def pci_bus_number(address) -> Optional[int]:
 REMOVED_CHIPS: dict = {}
 # The rung, the sampler and the gate read and write the records from worker threads.
 _REMOVED_LOCK = threading.RLock()
+# One write of the records file at a time (its temp name is shared).
+_SAVE_LOCK = threading.Lock()
 REMOVED_CHIPS_FILE = "removed_chips.json"
 # Spec 04 I98: how many times each chip was seen back on the bus (forget_removed_chip), so the hold's
 # SBR record can tell a chip that came back and dropped again from one that never returned.
@@ -454,17 +456,20 @@ def _boot_id() -> str:
         return ""
 
 
-def _save_removed_chips() -> None:
+def _save_removed_chips(health_dir: Optional[Path] = None) -> None:
     """Write the records with this boot's id, atomically. State that cannot be written must not
-    break recovery: the in-memory records still guard this process."""
+    break recovery: the in-memory records still guard this process. One write at a time, each of the
+    records as they are when it runs, so the last write always holds the latest state."""
     try:
-        with _REMOVED_LOCK:
-            body = json.dumps({"boot_id": _boot_id(), "chips": dict(REMOVED_CHIPS)})
-        p = evidence.health_dir() / REMOVED_CHIPS_FILE
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(body)
-        os.replace(tmp, p)
+        with _SAVE_LOCK:
+            with _REMOVED_LOCK:
+                chips = dict(REMOVED_CHIPS)
+            body = json.dumps({"boot_id": _boot_id(), "chips": chips})
+            p = (health_dir or evidence.health_dir()) / REMOVED_CHIPS_FILE
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_name(p.name + ".tmp")
+            tmp.write_text(body)
+            os.replace(tmp, p)
     except Exception:  # noqa: BLE001 - persistence is best effort; recovery must go on
         pass
 
@@ -558,6 +563,19 @@ def chip_back_seq(idx) -> int:
         return _BACK_SEQ.get(str(idx), 0)
 
 
+_save_thread: Optional[threading.Thread] = None
+
+
+def wait_removed_chips_saved(timeout: float = 5.0) -> bool:
+    """Wait up to ``timeout`` for the last records-file write :func:`isolate_chip` started. True once
+    none is running. Never on the containment's path: only callers that read the file back."""
+    t = _save_thread
+    if t is not None:
+        t.join(timeout)
+        return not t.is_alive()
+    return True
+
+
 def isolate_chip(idx: str) -> bool:
     """Remove a dead chip from the kernel, so nothing on the box can reach it any more.
 
@@ -582,7 +600,15 @@ def isolate_chip(idx: str) -> bool:
     rec = {"bdf": bdf, "bridge": parent_bridge(bdf)}
     with _REMOVED_LOCK:
         REMOVED_CHIPS[str(idx)] = rec
-    _save_removed_chips()
+    # The file write runs beside the remove, never ahead of it (spec 03 I99): on a host whose I/O
+    # stalls, a write before the remove would hold the remove up while the dead chip stays mapped.
+    try:
+        where: Optional[Path] = evidence.health_dir()
+    except Exception:  # noqa: BLE001 - the save finds out on its own; the remove goes on
+        where = None
+    global _save_thread
+    _save_thread = threading.Thread(target=_save_removed_chips, args=(where,), name="removed-chips-save", daemon=True)
+    _save_thread.start()
     try:
         (PCI_DEVICES_DIR / bdf / "remove").write_text("1")
         return True

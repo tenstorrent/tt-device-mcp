@@ -9,6 +9,8 @@ rescans."""
 
 import asyncio
 import json
+import threading
+import time
 
 import pytest
 
@@ -67,6 +69,7 @@ class FakeBus:
     def remove(self, idx):
         """isolate_chip, then what the kernel does on the remove write."""
         assert pci.isolate_chip(idx) is True
+        assert pci.wait_removed_chips_saved()
         bdf, _ = CHIPS[idx]
         (self.devices / bdf).unlink()
         (self.cls / f"tenstorrent!{idx}" / "device").unlink()
@@ -708,3 +711,19 @@ def test_the_broker_hands_the_driver_wait_sbr_its_live_startup_map(monkeypatch):
     """The shared mechanism reads the broker's startup map at SBR time, not a copy from construction."""
     monkeypatch.setattr(srv, "device_pci_map", {"24": "0000:81:00.0"})
     assert srv.recovery_mechanism.chip_pci_map() == {"24": "0000:81:00.0"}
+
+
+def test_the_records_file_write_never_holds_up_the_remove(tmp_path, monkeypatch):
+    """Spec 03 I99: the record is in memory before the remove; its file is written beside it."""
+    FakeBus(tmp_path, monkeypatch)
+    gate = threading.Event()
+    real = pci._save_removed_chips
+    monkeypatch.setattr(pci, "_save_removed_chips", lambda d=None: gate.wait(10) and real(d))
+    t0 = time.monotonic()
+    assert pci.isolate_chip("13") is True
+    assert time.monotonic() - t0 < 1, "the remove did not wait for the file write"
+    assert "13" in pci.REMOVED_CHIPS, "the record is in memory before the remove"
+    assert not pci.wait_removed_chips_saved(0.05), "the write is still waiting"
+    gate.set()
+    assert pci.wait_removed_chips_saved()
+    assert '"13"' in (pci.evidence.health_dir() / pci.REMOVED_CHIPS_FILE).read_text()

@@ -209,9 +209,11 @@ def op_running() -> bool:
 # --- lost ------------------------------------------------------------------------------------
 
 
-def mark_lost(ids: Iterable, reason: str, nodes: Optional[dict] = None) -> list:
+def mark_lost(ids: Iterable, reason: str, nodes: Optional[dict] = None, deferred: bool = False) -> list:
     """Mark chips confirmed off the bus. ``nodes`` maps an index to its sysfs node, for its identity.
-    Returns the newly marked ones."""
+    With ``deferred`` (the dead-chip containment, before its PCI remove, spec 03 I99) the mark does no
+    blocking I/O: the journal line goes through the detached writer and the state file is left to the
+    caller's :func:`publish` after the remove. Returns the newly marked ones."""
     fresh = []
     now = time.monotonic()
     with _lock:
@@ -229,7 +231,9 @@ def mark_lost(ids: Iterable, reason: str, nodes: Optional[dict] = None) -> list:
                 "sealed": False,
             }
             fresh.append(idx)
-    if fresh:
+    if fresh and deferred:
+        _event_detached("chip_marked_lost", chips=fresh, reason=reason)
+    elif fresh:
         _event("chip_marked_lost", chips=fresh, reason=reason)
         publish()
     return fresh
@@ -576,6 +580,15 @@ def publish() -> None:
     except Exception:  # noqa: BLE001 - publishing is advisory; the gate does not depend on it
         with _lock:
             _last_written = None
+
+
+def _event_detached(event: str, **fields) -> None:
+    try:
+        from tt_device_mcp.health.evidence import health_event_detached
+
+        health_event_detached(event, **fields)
+    except Exception:  # noqa: BLE001 - a journal failure must never break a containment
+        pass
 
 
 def _event(event: str, **fields) -> None:
