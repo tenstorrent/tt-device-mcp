@@ -2010,6 +2010,14 @@ class GalaxyRecovery(Recovery):
             return
         self._arc_dead_hold = (since, time.time(), {c: chip_back_seq(c) for c in dead})
 
+    def _host_rung_ready_now(self, off_bus: Optional[int], expected: int) -> tuple[bool, str]:
+        """Whether the power cycle is armed and the host-action ledger allows it now: the I107 skip's
+        precondition, read-only (the climb asks again with its own holder scan)."""
+        escalation, blocked = _host_escalation_for_drop(off_bus or 0, expected, **self.deps.host_escalation_kwargs())
+        if blocked:
+            return False, "no power cycle is armed"
+        return self.mechanism.auto_recovery_allowed(escalation, tenant_active=False)
+
     def _arc_dead_now(self, hold_since: Optional[str]) -> frozenset:
         """The chips a bridge reset this hold left with a dead ARC that have not been seen back on the
         bus since (spec 04 I107). Keyed by the hold episode the same way as :meth:`_sbr_done`."""
@@ -3778,23 +3786,41 @@ class GalaxyRecovery(Recovery):
                 # Spec 04 I107: below the bound, a drop whose every off-bus chip a bridge reset this hold
                 # left with a dead ARC skips this mesh reset. The last-chance sweep runs one, with the
                 # full check with fabric, right before the power cycle; the bound's ladder runs its own.
+                # Only when the power cycle can run now: an unarmed or denied one returns from the climb
+                # before its sweep, so the mesh reset runs here as before.
                 off_ids = _offbus_chip_ids(beats_pre or {}, expected) | {str(c) for c in isolated_chips}
                 arc_dead = self._arc_dead_now(hold_since)
                 if not self._bound and off_ids and off_ids <= arc_dead:
+                    ready, why = self._host_rung_ready_now(off_bus_pre, expected)
+                    if ready:
+                        log(
+                            f"chip(s) {sorted(off_ids, key=int)} are still ARC-dead after this hold's bridge "
+                            "reset — skipping the early mesh reset; the full ladder runs before the power cycle"
+                        )
+                        health_event(
+                            "galaxy_reset_skipped_arc_dead",
+                            held_since=hold_since,
+                            chips=sorted(off_ids, key=int),
+                            off_bus=off_bus_pre,
+                            expected=expected,
+                        )
+                        metrics.stage_fired("smi_reset", "blocked")
+                        outcome = await self._climb_to_host_recovery_after_failed_reset(
+                            expected, off_bus_pre, log, arc_dead=True
+                        )
+                        if outcome not in HOST_RUNG_CANNOT_RUN:
+                            return True
+                        why = self._host_rung_denied_why if outcome == HOST_RUNG_DENIED else "no power cycle is armed"
                     log(
-                        f"chip(s) {sorted(off_ids, key=int)} are still ARC-dead after this hold's bridge "
-                        "reset — skipping the early mesh reset; the full ladder runs before the power cycle"
+                        f"chip(s) {sorted(off_ids, key=int)} are ARC-dead but the power cycle cannot run now "
+                        f"({why}) — running the early mesh reset"
                     )
                     health_event(
-                        "galaxy_reset_skipped_arc_dead",
+                        "galaxy_reset_arc_dead_skip_declined",
                         held_since=hold_since,
                         chips=sorted(off_ids, key=int),
-                        off_bus=off_bus_pre,
-                        expected=expected,
+                        why=why,
                     )
-                    metrics.stage_fired("smi_reset", "blocked")
-                    await self._climb_or_hand_off(expected, off_bus_pre, hold_since, log, arc_dead=True)
-                    return True
             off_bus_before = off_bus_pre
         if off_bus_before is None:
             # The floor read above did not run (floor opted out, or a reset was cycling), so take a
@@ -4084,21 +4110,14 @@ class GalaxyRecovery(Recovery):
         await self._climb_or_hand_off(expected, off_bus, hold_since, log, present_reset_failed=off_bus == 0)
 
     async def _climb_or_hand_off(
-        self,
-        expected: int,
-        off_bus: Optional[int],
-        hold_since: str,
-        log,
-        *,
-        present_reset_failed: bool = False,
-        arc_dead: bool = False,
+        self, expected: int, off_bus: Optional[int], hold_since: str, log, *, present_reset_failed: bool = False
     ) -> None:
         """Climb a failed (or skipped) reset to the host rung. With no host rung available the hold goes
         to an operator, once per episode, and no further reset fires on it while its off-bus set stays
         the same (spec 04 I36, I33)."""
         if (
             await self._climb_to_host_recovery_after_failed_reset(
-                expected, off_bus, log, present_reset_failed=present_reset_failed, arc_dead=arc_dead
+                expected, off_bus, log, present_reset_failed=present_reset_failed
             )
             != NO_HOST_RUNG
         ):

@@ -2917,6 +2917,16 @@ each rung fires only when the gentler one failed or cannot apply.
   records nothing, and the full check with fabric decides the lift as before. The I76 bound's ladder,
   the gate path, classes A and C (their direct power cycle) and the PCI-wedged latch are unchanged.
 
+  The skip needs a power cycle that can run now: armed (I71) and allowed by the host-action ledger
+  (`auto_recovery_allowed`, read-only). Otherwise the climb would return (`NO_HOST_RUNG`, or
+  `HOST_RUNG_DENIED` for the I65 cooldown, the backstop or an unreadable ledger) before its sweep, and
+  the chip would get no mesh reset until the I76 bound (10 min) or the I33 hand-off. So with the cycle
+  unarmed or denied, and also when the climb itself is denied after the check said yes, the
+  escalation journals `galaxy_reset_arc_dead_skip_declined` (with the reason) and runs the below-floor
+  mesh reset and its full check with fabric as before I107. Bound for these cases: the same as
+  without I107, the mesh reset at the off-bus one-shot's forced run (about 72 s into the hold); only
+  its passing full check lifts, a fail climbs as I58 says, and an operator hand-off comes only after it.
+
   Saving: about 37 s per such hold (the early glx_reset and its check). On the replayed hold the power
   cycle request moves from a hold age of about 109 s to about 72 s.
 
@@ -3630,4 +3640,6 @@ sees a silent fabric pass.
 | I107 the I76 bound's ladder is unchanged and still runs the mesh reset | `tests/test_arc_dead_skips_early_mesh_reset.py::test_the_10_min_bound_ladder_is_unchanged_and_still_runs_the_mesh_reset` |
 | I107 a failed full check after the ladder keeps the hold and requests the power cycle | `tests/test_arc_dead_skips_early_mesh_reset.py::test_a_failed_full_check_after_the_ladder_keeps_the_hold_and_requests_the_cycle` |
 | I107 the I94 check's verdict reaches the per-hold record; the record is keyed by the hold and the lift clears it | `tests/test_arc_dead_skips_early_mesh_reset.py::test_the_arc_check_records_the_dead_chips_and_a_lift_clears_the_record` |
+| I107 a power cycle denied (I65 cooldown, backstop, unreadable ledger), at the check or at the climb, keeps the early mesh reset; only its passing full check with fabric lifts | `tests/test_arc_dead_skips_early_mesh_reset.py::test_a_denied_power_cycle_keeps_the_early_mesh_reset`, `tests/test_arc_dead_skips_early_mesh_reset.py::test_a_denied_power_cycle_lifts_only_on_the_mesh_resets_passing_full_check`, `tests/test_arc_dead_skips_early_mesh_reset.py::test_a_denial_at_the_climb_itself_still_runs_the_early_mesh_reset` |
+| I107 no power cycle armed: the early mesh reset runs before any operator hand-off | `tests/test_arc_dead_skips_early_mesh_reset.py::test_no_power_cycle_armed_runs_the_early_mesh_reset_before_any_hand_off` |
 | I102 with I103: the late-chip second mesh reset runs in the pre-cycle sweep, so its pre-reset scan clears a holder outside every broker scope and runs (at the 10-min bound, on the I97 path, and in the sweep outside the bound); its wait still ends at the step's start plus `LATE_CHIP_STEP_SEC`; a failed full check keeps the hold and the cycle journals the holder; a holder in a broker job's scope or the running job's own process still refuses it, nothing lifts and the hold goes on to the cycle | `tests/test_late_chips_after_driver_wait.py::test_the_late_chip_second_reset_clears_a_foreign_holder_and_keeps_its_bound`, `::test_a_job_holder_still_refuses_the_late_chip_second_reset_and_the_hold_goes_on_to_the_cycle` |

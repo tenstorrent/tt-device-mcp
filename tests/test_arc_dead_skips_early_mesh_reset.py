@@ -175,3 +175,82 @@ async def test_the_arc_check_records_the_dead_chips_and_a_lift_clears_the_record
     gr.sbr_record_clear()
     assert gr._arc_dead_now(srv.device_hold_episode_since) == frozenset()
     assert isinstance(gr, galaxy.GalaxyRecovery)
+
+
+def _deny_power_cycle(monkeypatch, answers):
+    """The host-action ledger's answers for the power cycle, in order (the last one repeats)."""
+    calls = []
+
+    def allowed(action, *, tenant_active, now_epoch=None):
+        calls.append(action)
+        return answers[min(len(calls), len(answers)) - 1]
+
+    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", allowed)
+    return calls
+
+
+def _record_handoff(monkeypatch, order):
+    real = galaxy.offbus_power_cycle.note_hold_handoff
+
+    def handoff(*a, **k):
+        order.append("hand-off")
+        return real(*a, **k)
+
+    monkeypatch.setattr(galaxy.offbus_power_cycle, "note_hold_handoff", handoff)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("why", ["I65 cooldown: a power cycle 300s ago", "backstop reached", "ledger unreadable"])
+async def test_a_denied_power_cycle_keeps_the_early_mesh_reset(monkeypatch, tmp_path, clear_job_state, why):
+    """A power cycle the ledger denies (the I65 cooldown, the backstop, an unreadable ledger) would
+    return from the climb before its sweep: the early mesh reset and its full check run as before,
+    and a failing check lifts nothing."""
+    order, events, counters, _state = _arc_rig(monkeypatch, tmp_path, held_min=1, verdicts=[False])
+    _deny_power_cycle(monkeypatch, [(False, why)])
+    await _gate_sbr_then_forced_run(order)
+    assert "galaxy_reset_skipped_arc_dead" not in events
+    assert "galaxy_reset_arc_dead_skip_declined" in events
+    assert order == ["mesh reset", "full check"]
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_denied_power_cycle_lifts_only_on_the_mesh_resets_passing_full_check(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Goals 8/11: the early mesh reset run because the cycle is denied lifts the hold only after its
+    full check with fabric has passed."""
+    order, _events, counters, _state = _arc_rig(monkeypatch, tmp_path, held_min=1, verdicts=[True])
+    _deny_power_cycle(monkeypatch, [(False, "I65 cooldown")])
+    await _gate_sbr_then_forced_run(order)
+    assert order == ["mesh reset", "full check"]
+    assert counters["dirty_cleared"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_denial_at_the_climb_itself_still_runs_the_early_mesh_reset(monkeypatch, tmp_path, clear_job_state):
+    """The ledger allows the cycle at the skip's check, then the climb's own ask is denied (a record
+    written in between): the climb returns before its sweep, so the early mesh reset runs after all."""
+    order, events, counters, _state = _arc_rig(monkeypatch, tmp_path, held_min=1, verdicts=[False])
+    _deny_power_cycle(monkeypatch, [(True, ""), (False, "I65 cooldown")])
+    await _gate_sbr_then_forced_run(order)
+    assert "galaxy_reset_skipped_arc_dead" in events
+    assert "galaxy_reset_arc_dead_skip_declined" in events
+    assert order == ["mesh reset", "full check"]
+    assert counters["dirty_cleared"] == 0
+
+
+@pytest.mark.asyncio
+async def test_no_power_cycle_armed_runs_the_early_mesh_reset_before_any_hand_off(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """No power cycle armed: the climb would hand the hold to an operator before any sweep. The early
+    mesh reset and its full check run first; no hand-off comes before them."""
+    order, events, counters, _state = _arc_rig(monkeypatch, tmp_path, held_min=1, verdicts=[False])
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: False)
+    _record_handoff(monkeypatch, order)
+    await _gate_sbr_then_forced_run(order)
+    assert "galaxy_reset_skipped_arc_dead" not in events
+    assert order[:2] == ["mesh reset", "full check"]
+    assert "power cycle" not in order
+    assert counters["dirty_cleared"] == 0
