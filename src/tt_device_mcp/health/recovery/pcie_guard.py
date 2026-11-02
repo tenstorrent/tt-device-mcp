@@ -12,8 +12,8 @@ getting there:
 * :class:`AerMask` — mask AER and DPC on root ports for the reset window, then clear their status,
   watch them for a moment and restore only the quiet ones. A port that keeps erroring stays masked
   and is reported, so a flood cannot take the host down.
-* :func:`host_reset_gate` — refuses an automatic reset while AER errors are flooding, or while chips
-  are off the bus under the host-hang latch.
+* :func:`host_reset_gate` — refuses an automatic reset while chips are off the bus under the
+  host-hang latch.
 * The host-hang latch — :func:`begin_offbus_reset` writes an intent before an automatic reset with
   chips off the bus, and :func:`check_offbus_reset_latch` reads one left by an earlier boot as a
   reset that hung the host, and holds every later off-bus reset on this boot until every chip is
@@ -471,78 +471,19 @@ class AerMask:
                 self.kept_masked.append(bdf)
         self.saved.clear()
         if self.kept_masked:
-            _note_flood()
             health_event("aer_ports_kept_masked", ports=self.kept_masked, host_at_risk=True)
         return self.kept_masked
 
 
 # ---- the per-host gate ------------------------------------------------------------------------------
 
-_FLOOD_UNTIL = 0.0
-_LAST_AER_SAMPLE: Optional[tuple] = None
-
-
-def _note_flood() -> None:
-    global _FLOOD_UNTIL
-    _FLOOD_UNTIL = time.monotonic() + _env_float("TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC", 1800)
-
-
-def flood_window_open() -> bool:
-    """A flood was seen within ``TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC``: by :func:`aer_flooding`, or
-    by a re-power or reset whose root port kept erroring and stayed masked."""
-    return time.monotonic() < _FLOOD_UNTIL
-
-
-def _aer_total(ports: list) -> int:
-    total = 0
-    for bdf in ports:
-        for name in ("aer_rootport_total_err_cor", "aer_rootport_total_err_nonfatal", "aer_rootport_total_err_fatal"):
-            try:
-                total += int((_pci_dir() / bdf / name).read_text().split()[0])
-            except (OSError, ValueError, IndexError):
-                continue
-    return total
-
-
-def _uptime_sec() -> Optional[float]:
-    try:
-        return float((SYS_ROOT / "proc/uptime").read_text().split()[0])
-    except (OSError, ValueError, IndexError):
-        return None
-
-
-def aer_flooding(ports: Optional[list] = None) -> bool:
-    """True while the Tenstorrent root ports are flooding AER errors, or within the flood window
-    (``TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC``, default 1800) after one was seen. A flood is a rate:
-    ``TT_DEVICE_MCP_AER_FLOOD_THRESHOLD`` (default 50) new errors per
-    ``TT_DEVICE_MCP_AER_FLOOD_PERIOD_SEC`` (default 60) since the previous look, so a steady trickle
-    between looks hours apart is not one. The first look after a boot inside the window counts from
-    zero over the uptime, so errors that carried on through a reboot are seen."""
-    global _LAST_AER_SAMPLE
-    ports = tt_root_ports() if ports is None else ports
-    now = time.monotonic()
-    total = _aer_total(ports)
-    prev = _LAST_AER_SAMPLE
-    if prev is None:
-        up = _uptime_sec()
-        if up is not None and up < _env_float("TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC", 1800):
-            prev = (now - up, 0)
-    _LAST_AER_SAMPLE = (now, total)
-    if prev is not None:
-        period = max(_env_float("TT_DEVICE_MCP_AER_FLOOD_PERIOD_SEC", 60), 1.0)
-        per_period = (total - prev[1]) * period / max(now - prev[0], period)
-        if per_period >= _env_float("TT_DEVICE_MCP_AER_FLOOD_THRESHOLD", 50):
-            _note_flood()
-    return flood_window_open()
-
-
 GATE_GUARD, GATE_HOLD = "guard", "hold"
 
 
 def gate_mode() -> str:
-    """``guard`` masks AER on every Tenstorrent root port around each automatic mesh reset and refuses
-    one while AER errors flood; ``hold`` also refuses one while any chip is off the bus, and is in force
-    only while the host-hang latch (:func:`check_offbus_reset_latch`) stands."""
+    """``guard`` masks AER on every Tenstorrent root port around each automatic mesh reset; ``hold``
+    also refuses one while any chip is off the bus, and is in force only while the host-hang latch
+    (:func:`check_offbus_reset_latch`) stands."""
     if offbus_reset_latched() is not None:
         return GATE_HOLD  # the last off-bus reset hung this host: hold until the chips are back (I25)
     return GATE_GUARD
@@ -576,8 +517,6 @@ def host_reset_gate(off_bus: int) -> tuple:
             f"{off_bus} chip(s) off the bus and {_latch_boots(latch)} until every chip is back on the "
             f"bus, the host boots again{ceiling} or an operator runs `{clear_latch_cmd()}`"
         )
-    if aer_flooding():
-        return False, "AER errors are flooding the Tenstorrent root ports"
     return True, ""
 
 
@@ -810,7 +749,7 @@ def expire_offbus_reset_latch(
             reason = (
                 f"chips are still off the bus (or sysfs cannot be read), TT_DEVICE_MCP_POWER_CYCLE_CMD is "
                 f"not set, so no power cycle would end the hold, and it reached its {latch_max_sec():.0f} s "
-                f"ceiling; automatic resets follow the AER guard again"
+                f"ceiling; automatic resets fire again"
             )
     else:
         return None

@@ -35,7 +35,6 @@ def _hold_gate(monkeypatch, tmp_path, *, held_sec, manual="exit 1", off_bus=1, c
     False, no power cycle configured unless ``cmd`` names one."""
     hold_since, rec = _gated(monkeypatch, tmp_path, held_sec=held_sec, cmd=cmd, manual=manual)
     monkeypatch.setattr(pcie_guard, "host_reset_gate", _REAL_GATE)
-    monkeypatch.setattr(pcie_guard, "aer_flooding", lambda ports=None: False)
     monkeypatch.setattr(pcie_guard, "mask_for_mesh_reset", lambda log: None)
     monkeypatch.setattr(pcie_guard, "chips_off_bus", lambda expected: off_bus)
     if latched:

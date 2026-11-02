@@ -1114,10 +1114,9 @@ class Recovery(ABC):
                 "`-r`, which does NOT recover a Galaxy; set TT_DEVICE_MCP_RESET_MODE"
             )
 
-        # The per-host gate (spec 04 I24): on a host whose resets have flooded AER into a crash, an
-        # automatic reset never fires over chips already off the bus or during a flood, and the
-        # Tenstorrent root ports are masked for the reset window. Checked before
-        # reset_begin and the cooldown clock: a refused reset did not happen.
+        # The per-host gate (spec 04 I24): under the host-hang latch an automatic reset never fires
+        # over chips already off the bus, and the Tenstorrent root ports are masked for the reset window.
+        # Checked before reset_begin and the cooldown clock: a refused reset did not happen.
         off_bus = pcie_guard.chips_off_bus(expected)
         allowed, why = pcie_guard.host_reset_gate(off_bus)
         if not allowed:

@@ -479,11 +479,10 @@ each rung fires only when the gentler one failed or cannot apply.
   and a chip's root port is the first port above it in its own domain.
 
 - **I24 — A gate on automatic host-affecting resets.** It masks AER on every Tenstorrent root
-  port around each automatic mesh reset and refuses an automatic mesh reset or last-chance sweep
-  while the root ports' AER counters rise at `TT_DEVICE_MCP_AER_FLOOD_THRESHOLD` or more errors per
-  `TT_DEVICE_MCP_AER_FLOOD_PERIOD_SEC` (a rate, so a trickle between looks hours apart is not a
-  flood), or within `TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC` of one (the first look after a recent boot
-  counts from zero at boot). Under the I25 host-hang latch it also refuses while any chip has no PCI function, or keeps its
+  port around each automatic mesh reset; a port that keeps erroring stays masked. It never refuses a
+  reset for AER errors: a refused reset holds the rungs above it (I22), so an on-bus hold during an
+  AER flood would reach neither the 10-min ladder nor the power cycle (I76). Under the I25 host-hang
+  latch it refuses an automatic mesh reset or last-chance sweep while any chip has no PCI function, or keeps its
   function but its ARC heartbeat reads all-ones (its BAR reads return nothing: it has left the bus
   too), so a reset that dropped a chip is not re-issued over it. ENODATA alone proves nothing:
   the driver returns it while the chip still needs its post-reset init, whether or not the chip
@@ -502,12 +501,7 @@ each rung fires only when the gentler one failed or cannot apply.
   state, `config_unreadable`: like an EIO chip it counts off the bus for every rung and floor, so
   its hold stays and never lifts on it, and it is on the bus only for the class A read (I37); the
   heartbeat verdict and `/health` name it. The config read is made only for a chip missing from
-  the heartbeat read with ENODATA, so a healthy pass reads no config space. An automatic reset is refused while
-  the flood window a port that errored again after its mask opened is still open: that
-  holds every automatic mesh reset and last-chance sweep (and so the host rung above
-  them, I22) for `TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC`. The one exception is inside a last-chance
-  sweep that already started: its mesh reset still follows its bridge reset, because no host rung fires without the full ladder (I22); the erroring port stays masked
-  across that reset. The gate is checked before
+  the heartbeat read with ENODATA, so a healthy pass reads no config space. The gate is checked before
   the reset is recorded (`reset_begin`, the cooldown clock): a refused reset did not happen. A
   refusal is handed to an operator, never a climb (I22), bounded by I27 and, with no power cycle
   configured, by the I33 operator hand-off. Operator and tool resets are not gated.
@@ -563,7 +557,7 @@ each rung fires only when the gentler one failed or cannot apply.
   allows (none is skipped, I22). After that, once the episode has stood
   `TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC` (default 300 s), a partial off-bus drop (any drop that is
   not exactly one or more whole trays by the I16 map, or with no map) the gate refuses only under
-  the I25 latch or during an AER flood, so without them its mesh reset runs as the ladder allows,
+  the I25 latch, so without it its mesh reset runs as the ladder allows,
   and each reset owes the full health check, fabric included, before any release. Once the grace
   has run out on a hold the gate still refuses, the hold watchdog forces one pass at once and that
   pass runs the power cycle. A whole tray down (every off-bus chip's
@@ -731,7 +725,7 @@ each rung fires only when the gentler one failed or cannot apply.
   only the I32 debt's passing pass settles it.
 
 - **I33 — With no power cycle configured, the gated off-bus hold is handed to an operator.** When
-  the I24 gate refuses every reset of an idle off-bus hold (the I25 latch, or an AER flood) and
+  the I24 gate refuses every reset of an idle off-bus hold (the I25 latch) and
   `TT_DEVICE_MCP_POWER_CYCLE_CMD` is unset (no I27 cycle can end it), the first escalation of the
   episode hands the hold to an operator, once per episode: one high-severity page
   (`offbus_gated_hold_page`) that names the host, says no power cycle is configured and that the
@@ -3170,16 +3164,16 @@ sees a silent fabric pass.
 | I84 a post-reset fabric check that a lost chip ended fails the verify at once, with no eth-training wait | `tests/test_post_verify_drop.py::test_killed_check_no_sleep`, `::test_killed_check_no_sleep_when_a_chip_is_isolated_during_the_check`, `::test_a_plain_no_trained_link_77_still_waits` |
 | I24 the latched gate counts an all-ones chip still in sysfs as off the bus; the mesh reset and the sweep refuse over it | `tests/test_pcie_guard.py::test_chips_off_bus_counts_an_all_ones_chip_still_in_sysfs`, `::test_a_hold_gate_refuses_the_mesh_reset_and_the_sweep_over_an_all_ones_chip` |
 | I24 ENODATA on a bound endpoint is ARC-not-ready, not off the bus, only with a live link and a config vendor read of 0x1e52; 0xffff or a down link is off the bus and a whole tray of it is class A; an unreadable config is held, never ARC-not-ready, never lifts; healthy chips get no config read; an unbound endpoint, a missing node or another errno is off | `tests/test_arc_not_ready.py::test_enodata_on_31_bound_chips_is_not_off_the_bus`, `tests/test_arc_not_ready.py::test_an_unbound_or_missing_chip_still_counts_off_the_bus`, `::test_enodata_with_vendor_ffff_is_off_the_bus`, `::test_enodata_with_the_link_down_is_off_the_bus`, `::test_enodata_with_config_unreadable_is_held_and_named`, `::test_a_healthy_read_makes_no_config_read`, `tests/test_hostpci.py::test_config_vendor_state_reads_the_first_two_bytes`, `tests/test_classac_power_cycle_direct.py::test_an_enodata_tray_reading_ffff_is_class_a`, `::test_an_enodata_tray_with_unreadable_config_never_lifts` |
-| I24 the per-chip bridge SBR obeys the gate and the latch | `tests/test_pcie_guard.py::test_the_per_chip_bridge_reset_obeys_the_hold_gate_and_the_latch` |
+| I24 the per-chip bridge SBR obeys the latch | `tests/test_pcie_guard.py::test_the_per_chip_bridge_reset_obeys_the_latch` |
 | I25 the last-chance sweep names each off-bus chip, its PCI address and tray, read fresh from the heartbeats | `tests/test_ubb_tray_map.py::test_the_off_bus_placement_marks_what_the_map_cannot_place` |
 | I25 the host-hang latch: intent, latch on a new boot, not on the same boot, clear | `tests/test_pcie_guard.py::test_an_off_bus_reset_writes_an_intent_and_removes_it_when_done`, `::test_an_intent_from_a_boot_that_died_latches_hold_until_cleared`, `::test_an_intent_from_this_boot_does_not_latch` |
 | I25 the broker's own reboot or power cycle never latches: the intent is removed and synced before it fires; the next boot drops an intent older than its ledger row, leaves glx_reset ungated and still runs the full startup check after hugepages; an intent with no later host action, or one whose row did not bring this boot up (boot outside the attribution window, btime unreadable, a missed request past its pending window), still latches; a late cycle (I72) inside its window does not | `tests/test_pcie_guard.py::test_a_sweep_that_fails_its_verify_leaves_no_intent_for_the_power_cycle`, `::test_a_broker_host_action_closes_an_open_intent_durably_before_it_fires`, `::test_an_intent_older_than_the_brokers_own_cycle_does_not_latch`, `::test_an_intent_with_no_later_host_action_still_latches`, `::test_a_host_action_that_did_not_bring_this_boot_up_still_latches`, `::test_the_brokers_cycle_that_brought_this_boot_up_does_not_latch`, `tests/test_startup_fabric_hugepages.py::test_the_boot_after_the_brokers_own_power_cycle_latches_nothing_and_still_runs_the_full_check` |
-| I24 the gate allows a reset with no latch and no flood, refuses over an off-bus chip under the latch, and refuses during a flood | `tests/test_pcie_guard.py::test_the_gate_allows_a_reset_with_no_latch_and_no_flood`, `::test_the_latch_refuses_a_reset_over_chips_already_off_the_bus`, `::test_guard_refuses_during_an_aer_flood`, `::test_first_look_after_a_recent_boot_counts_errors_since_boot`, `::test_hold_gate_stops_an_automatic_mesh_reset_over_an_off_bus_chip`, `::test_guard_masks_the_root_ports_around_an_automatic_mesh_reset` |
+| I24 the gate allows a reset with no latch, refuses over an off-bus chip under the latch, and never refuses for an AER flood (the reset fires, masked) | `tests/test_pcie_guard.py::test_the_gate_allows_a_reset_with_no_latch`, `::test_the_latch_refuses_a_reset_over_chips_already_off_the_bus`, `::test_an_aer_flood_never_refuses_the_mesh_reset`, `::test_hold_gate_stops_an_automatic_mesh_reset_over_an_off_bus_chip`, `::test_guard_masks_the_root_ports_around_an_automatic_mesh_reset` |
 | I23 an off-bus chip's remembered root port is masked (tray fire and mesh reset); a port gone from sysfs is not | `tests/test_pcie_guard.py::test_guard_masks_an_off_bus_chips_port_around_a_mesh_reset`, `::test_a_remembered_port_gone_from_sysfs_is_not_masked` |
 | I23 the topology is recorded at broker start and in each between-jobs check, rewritten only on change; a port never seen is not known | `tests/test_pcie_guard.py::test_an_unchanged_topology_is_not_rewritten` |
 | I23 unreadable sysfs refuses the tray fire (all-off included) and a look keeps the recorded topology | `tests/test_pcie_guard.py::test_an_unreadable_look_keeps_the_recorded_topology`, `::test_an_unreadable_sysfs_counts_every_chip_off_so_a_hold_gate_holds` |
 | I23 a 5+ digit PCI domain parses; an unrelated entry sysfs cannot read is skipped; a `guard` mask over unreadable sysfs logs `aer_mask_failed` | `tests/test_pcie_guard.py::test_a_5_digit_domain_beside_the_mesh_does_not_make_sysfs_unreadable`, `::test_a_chip_in_a_5_digit_domain_is_parsed_and_counted`, `::test_an_unrelated_entry_the_scan_cannot_read_is_skipped`, `::test_an_unreadable_sysfs_under_guard_logs_a_mask_failure` |
-| I24 the flood is a rate; the flood window refuses; a refused reset is not recorded | `tests/test_pcie_guard.py::test_a_steady_trickle_between_distant_looks_is_not_a_flood`, `::test_a_trickle_since_an_old_boot_is_not_a_flood`, `::test_after_a_kept_masked_port_the_stuck_hold_mesh_reset_does_not_fire`, `::test_a_gated_mesh_reset_records_no_reset_and_arms_no_cooldown` |
+| I24 a refused reset is not recorded | `tests/test_pcie_guard.py::test_a_gated_mesh_reset_records_no_reset_and_arms_no_cooldown` |
 | I25 the clear command finds the system broker's latch; one it cannot remove is reported | `tests/test_pcie_guard.py::test_the_clear_command_finds_the_system_brokers_latch`, `::test_a_latch_that_cannot_be_removed_is_reported_not_called_absent` |
 | I25 the latch is scoped to its boot: a later boot ignores and drops it, and it never holds the I27 power cycle | `tests/test_pcie_guard.py::test_a_latch_holds_only_on_the_boot_it_was_written_in`, `::test_a_latch_from_an_ended_boot_never_gates_even_if_the_broker_never_restarted`, `tests/test_offbus_power_cycle.py::test_a_latch_never_blocks_a_rung_after_its_boot_nor_the_power_cycle_on_it` |
 | I25 the latch is bounded: it lifts with every chip on the bus (a link that reads down is not) and host-pci OK, or at its ceiling with every chip on the bus; with a chip off or sysfs unreadable only at its ceiling with no power cycle configured (paged once, the gate falls back to its mode); one it cannot remove keeps holding; the hold names both boots | `tests/test_pcie_guard.py::test_the_latch_lifts_once_every_chip_is_back_and_host_pci_is_ok`, `::test_the_latch_never_lifts_while_a_chip_is_off_the_bus`, `::test_the_latch_never_lifts_while_a_listed_link_reads_down`, `::test_with_no_power_cycle_a_latch_with_a_chip_off_lifts_at_its_ceiling`, `::test_with_no_power_cycle_the_gate_itself_lifts_a_latch_past_its_ceiling`, `::test_with_a_power_cycle_a_latch_with_a_chip_off_still_holds_past_its_ceiling`, `::test_the_hold_message_names_both_boots`, `::test_the_latch_lifts_at_its_ceiling_with_every_chip_on_the_bus`, `::test_the_latch_ceiling_defaults_and_rejects_nonsense`, `::test_a_latch_that_cannot_be_removed_keeps_holding`, `::test_the_between_jobs_check_lifts_the_latch_once_the_mesh_is_back` |

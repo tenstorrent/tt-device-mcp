@@ -75,8 +75,6 @@ def sysfs(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "tt_smi", pkg)
     monkeypatch.setitem(sys.modules, "tt_smi.constants", constants)
     monkeypatch.setattr(pcie_guard, "SYS_ROOT", tmp_path)
-    monkeypatch.setattr(pcie_guard, "_FLOOD_UNTIL", 0.0)
-    monkeypatch.setattr(pcie_guard, "_LAST_AER_SAMPLE", None)
     monkeypatch.setenv("TT_DEVICE_MCP_AER_QUIET_CHECK_SEC", "0.01")
     patch_health_event(monkeypatch, lambda *a, **k: None)
     monkeypatch.setattr(pcie_guard, "health_event", lambda *a, **k: None)
@@ -147,7 +145,7 @@ def _latch_now():
     (pcie_guard.health_dir() / pcie_guard.LATCH_FILE).write_text('{"boot_id": "boot-a"}')
 
 
-def test_the_gate_allows_a_reset_with_no_latch_and_no_flood(sysfs, monkeypatch):
+def test_the_gate_allows_a_reset_with_no_latch(sysfs, monkeypatch):
     assert pcie_guard.host_reset_gate(5) == (True, "")
 
 
@@ -207,22 +205,6 @@ async def test_a_hold_gate_refuses_the_mesh_reset_and_the_sweep_over_an_all_ones
     assert events.count("host_reset_gated") == 2 and "reset_begin" not in events
 
 
-def test_guard_refuses_during_an_aer_flood(sysfs, monkeypatch):
-    counter = sysfs / "sys/bus/pci/devices/0000:40:01.1/aer_rootport_total_err_cor"
-    assert pcie_guard.host_reset_gate(0)[0]
-    counter.write_text("500\n")
-    allowed, why = pcie_guard.host_reset_gate(0)
-    assert not allowed and "flooding" in why
-    assert not pcie_guard.host_reset_gate(0)[0], "the flood window holds after the counters stop moving"
-
-
-def test_first_look_after_a_recent_boot_counts_errors_since_boot(sysfs, monkeypatch):
-    (sysfs / "proc").mkdir()
-    (sysfs / "proc/uptime").write_text("585.0 1000.0\n")
-    (sysfs / "sys/bus/pci/devices/0000:40:01.1/aer_rootport_total_err_cor").write_text("500\n")
-    assert not pcie_guard.host_reset_gate(0)[0]
-
-
 # ---------------------------------------------------------------- wired into the ladder
 
 
@@ -257,6 +239,30 @@ async def test_guard_masks_the_root_ports_around_an_automatic_mesh_reset(sysfs, 
     await g._reset_and_verify_device(["0", "1", "2", "3"], lambda m: None)
     assert masked == [True]
     assert all(_restored(sysfs, p) for p in PORTS)
+
+
+@pytest.mark.asyncio
+async def test_an_aer_flood_never_refuses_the_mesh_reset(sysfs, monkeypatch):
+    """A refused reset holds every rung above it (I22), so an on-bus hold during a flood would reach
+    neither the 10-min ladder nor the power cycle (I76): the reset fires, masked, whatever the counters."""
+    (sysfs / "proc").mkdir()
+    (sysfs / "proc/uptime").write_text("60.0 10.0\n")
+    g = srv.galaxy_recovery
+    monkeypatch.setattr(g.mechanism, "await_foreign_scope", lambda log: _false())
+    monkeypatch.setattr(g.monitor, "expected", lambda n: 4)
+    masked = []
+
+    async def reset(*a, **k):
+        masked.append(all(_masked(sysfs, p) for p in PORTS))
+        return 1, "reset failed"
+
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", reset)
+    for total in (5000, 50000):
+        for p in PORTS:
+            (sysfs / f"sys/bus/pci/devices/{p}/aer_rootport_total_err_cor").write_text(f"{total}\n")
+        assert pcie_guard.host_reset_gate(0) == (True, "")
+        await g._reset_and_verify_device(["0", "1", "2", "3"], lambda m: None)
+    assert masked == [True, True]
 
 
 async def _false():
@@ -700,14 +706,10 @@ async def test_the_between_jobs_check_lifts_the_latch_once_the_mesh_is_back(sysf
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("latched", [False, True])
-async def test_the_per_chip_bridge_reset_obeys_the_hold_gate_and_the_latch(sysfs, monkeypatch, latched):
+async def test_the_per_chip_bridge_reset_obeys_the_latch(sysfs, monkeypatch):
     from tt_device_mcp.health import recovery as recovery_pkg
 
-    if latched:
-        _latch_now()
-    else:
-        monkeypatch.setattr(pcie_guard, "aer_flooding", lambda ports=None: True)
+    _latch_now()
     srv.isolated_chips = {"1"}
     srv.device_pci_map = {"1": "0000:41:00.0"}
     monkeypatch.setattr(recovery_pkg, "bridge_reset_enabled", lambda: True)
@@ -786,41 +788,6 @@ def test_a_latch_that_cannot_be_removed_is_reported_not_called_absent(sysfs, mon
     assert pcie_guard.main(["--clear-hang-latch"]) == 1
     out = capsys.readouterr().out
     assert "could not be cleared" in out and "no host-hang hold" not in out
-
-
-@pytest.mark.asyncio
-async def test_after_a_kept_masked_port_the_stuck_hold_mesh_reset_does_not_fire(sysfs, monkeypatch):
-    pcie_guard._note_flood()
-    g = srv.galaxy_recovery
-    monkeypatch.setattr(g.mechanism, "await_foreign_scope", lambda log: _false())
-    monkeypatch.setattr(g.monitor, "expected", lambda n: 4)
-
-    async def no_reset(*a, **k):
-        pytest.fail("mesh reset fired inside the flood window")
-
-    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", no_reset)
-    assert await g._reset_and_verify_device(["0", "1", "2", "3"], lambda m: None) is False
-
-
-def test_a_steady_trickle_between_distant_looks_is_not_a_flood(sysfs, monkeypatch):
-    counter = sysfs / "sys/bus/pci/devices/0000:40:01.1/aer_rootport_total_err_cor"
-    clock = [10_000.0]
-    monkeypatch.setattr(pcie_guard.time, "monotonic", lambda: clock[0])
-    assert pcie_guard.host_reset_gate(0)[0]
-    clock[0] += 6 * 3600  # six hours later, 300 more correctable errors: under one a minute
-    counter.write_text("300\n")
-    assert pcie_guard.host_reset_gate(0)[0], "a trickle hours apart is not a flood"
-    clock[0] += 10  # 100 more in ten seconds is
-    counter.write_text("400\n")
-    allowed, why = pcie_guard.host_reset_gate(0)
-    assert not allowed and "flooding" in why
-
-
-def test_a_trickle_since_an_old_boot_is_not_a_flood(sysfs, monkeypatch):
-    (sysfs / "proc").mkdir()
-    (sysfs / "proc/uptime").write_text("1500.0 1000.0\n")  # 25 min up, 60 errors since: a trickle
-    (sysfs / "sys/bus/pci/devices/0000:40:01.1/aer_rootport_total_err_cor").write_text("60\n")
-    assert pcie_guard.host_reset_gate(0)[0]
 
 
 @pytest.mark.asyncio
