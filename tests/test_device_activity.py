@@ -234,11 +234,19 @@ async def test_the_sampler_is_stopped_before_the_post_job_gate(monkeypatch, clea
             super().__init__(lambda: (False, "quiet"), interval=0.01, idle_after=0.0)
 
     monkeypatch.setattr(device_activity, "DeviceActivitySampler", Quiet)
+    real_job_end = srv._pcie_job_end
+
+    async def _slow_job_end(job_id):
+        # The job is already marked finished here; a slow host can sit this long before the gate.
+        await asyncio.sleep(0.2)
+        await real_job_end(job_id)
+
+    monkeypatch.setattr(srv, "_pcie_job_end", _slow_job_end)
     # _run_one_job quiets the gate with a no-op; watch it instead.
     monkeypatch.setattr(
         test_device_safety, "_quiet_post_job_gate", lambda mp: mp.setattr(srv, "_verify_device_after_job", _gate)
     )
-    await _run_one_job(monkeypatch, "962", privsep=False, scope_active=True)
+    await _run_one_job(monkeypatch, "962", privsep=False, scope_active=True, until=lambda: bool(seen_at_gate))
     assert seen_at_gate, "the post-job gate never ran"
     assert seen_at_gate == [{}], "the sampler was still running on the between-jobs path"
 

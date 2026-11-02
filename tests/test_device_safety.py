@@ -4749,14 +4749,18 @@ def _patch_device_holders(monkeypatch, scan, ppids=None):
     monkeypatch.setattr(device_holders, "_read_proc_ppid", (ppids or {}).get)
 
 
-async def _run_one_job(monkeypatch, job_id, *, privsep, scope_active, holders=lambda: "", settle_sec=0.05):
+async def _run_one_job(
+    monkeypatch, job_id, *, privsep, scope_active, holders=lambda: "", settle_sec=0.05, until=lambda: True
+):
     """Run one exit-0 job through the real runner; return (job, systemctl calls, is-active calls, killpgs).
 
     ``scope_active`` answers every is-active query, or is a list answered in order (the last
     answer then repeats). ``holders`` stands in for the holder scan before dispatch.
     ``settle_sec`` is the scope settle window: short by default so a leftover is reaped fast; a
     test whose scope must settle inside it passes a long one, since each is-active re-check is a
-    thread hop that a loaded host can delay past a short window."""
+    thread hop that a loaded host can delay past a short window. The runner is stopped once the
+    job is finished and ``until()`` holds: a test of what follows the finish (the post-job gate)
+    waits for it, since the runner marks the job finished before those steps."""
     _free_device_lock(monkeypatch)
     _quiet_post_job_gate(monkeypatch)
 
@@ -4808,7 +4812,7 @@ async def _run_one_job(monkeypatch, job_id, *, privsep, scope_active, holders=la
     runner = asyncio.create_task(srv.job_runner())
     try:
         deadline = asyncio.get_running_loop().time() + 30.0
-        while not job.finished_at and asyncio.get_running_loop().time() < deadline:
+        while not (job.finished_at and until()) and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.02)
     finally:
         runner.cancel()
