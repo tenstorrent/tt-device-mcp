@@ -747,6 +747,28 @@ if [ -z "$why_restart" ]; then
 fi
 echo "autoupdate: restart needed: $why_restart" >&2
 
+# The deploy scripts the full apply stages, deploy/<source>:<name under $ROOT>. The eth-heartbeat
+# probe is one of them: its resolution/classification lives in-package (health.monitors.eth) and
+# runs this script via the broker-owned eth-venv; a probe the deploy does not carry is a rung that
+# silently rots. The retired wrapper at $ROOT/eth-heartbeat-check.sh is cleaned up by
+# apply-host-config.sh below.
+REQUIRED_STAGES=(
+    tt-device-reconcile.sh:reconcile.sh
+    tt-device-client-setup.sh:client-setup.sh
+    tt-device-autoupdate.sh:autoupdate.sh
+    tt-device-fabric-check.sh:fabric-check.sh
+    tt-device-eth-heartbeat-probe.py:eth-heartbeat-probe.py
+)
+# Preflight: every source the apply below stages or runs is in the pulled tree before anything
+# changes. A source found missing only at its copy would leave the new venv and the scripts staged
+# before it beside the old broker and the old installed.sha until a later lap finished the apply.
+for stage in "${REQUIRED_STAGES[@]}"; do
+    [ -f "$clone/deploy/${stage%%:*}" ] \
+        || { echo "autoupdate: deploy/${stage%%:*} missing from the pulled tree (required); nothing changed, not marking current" >&2; exit 1; }
+done
+[ -x "$clone/deploy/apply-host-config.sh" ] \
+    || { echo "autoupdate: deploy/apply-host-config.sh missing from the pulled tree or not executable (required); nothing changed, not marking current" >&2; exit 1; }
+
 if ! "$VENV/bin/pip" install -q "$clone"; then
     # Recover from a venv left half-installed by an earlier crash/race: pip refuses
     # to uninstall a dist-info it can't inventory ("no RECORD file"), which would
@@ -761,44 +783,28 @@ fi
 # the prior version's script while installed.sha below marks it current — a silent
 # degrade that no later reconcile would retry. Fail closed instead: surface it and leave
 # the host on the last-known-good sha so the next reconcile tries again.
-if [ -d "$clone/deploy" ]; then
-    install -m 0755 "$clone/deploy/tt-device-reconcile.sh"    "$ROOT/reconcile.sh" \
-        || { echo "autoupdate: staging reconcile.sh failed (required); not marking current" >&2; exit 1; }
-    install -m 0755 "$clone/deploy/tt-device-client-setup.sh" "$ROOT/client-setup.sh" \
-        || { echo "autoupdate: staging client-setup.sh failed (required); not marking current" >&2; exit 1; }
-    install -m 0755 "$clone/deploy/tt-device-autoupdate.sh"   "$ROOT/autoupdate.sh" \
-        || { echo "autoupdate: staging autoupdate.sh failed (required); not marking current" >&2; exit 1; }
-    install -m 0755 "$clone/deploy/tt-device-fabric-check.sh" "$ROOT/fabric-check.sh" \
-        || { echo "autoupdate: staging fabric-check.sh failed (required); not marking current" >&2; exit 1; }
-    # The eth-heartbeat probe. Its resolution/classification lives in-package
-    # (health.monitors.eth) and runs this script via the broker-owned eth-venv; a probe the
-    # deploy does not carry is a rung that silently rots, so it stages fail-closed like the
-    # rest. The retired wrapper at $ROOT/eth-heartbeat-check.sh is cleaned up by
-    # apply-host-config.sh below.
-    install -m 0755 "$clone/deploy/tt-device-eth-heartbeat-probe.py" "$ROOT/eth-heartbeat-probe.py" \
-        || { echo "autoupdate: staging eth-heartbeat-probe.py failed (required); not marking current" >&2; exit 1; }
-    # The reader's interpreter, broker-owned. Pinning a developer's tt-metal python_env makes a
-    # health rung die the moment that user rebuilds or moves their tree; tt-exalens ships manylinux
-    # wheels on PyPI, so the box owns its own copy at a pinned version. Idempotent, and fail-OPEN:
-    # a box that cannot build it reports the rung OFF at startup, which is loud enough on its own.
-    if ! "$ROOT/eth-venv/bin/python" -c 'import ttexalens' >/dev/null 2>&1; then
-        python3 -m venv "$ROOT/eth-venv" >/dev/null 2>&1
-        if "$ROOT/eth-venv/bin/pip" install -q "tt-exalens==$ETH_EXALENS_VERSION" >/dev/null 2>&1; then
-            chmod -R a+rX "$ROOT/eth-venv" 2>/dev/null || true
-            echo "autoupdate: provisioned eth-venv (tt-exalens $ETH_EXALENS_VERSION)" >&2
-            # Check and warm it once before the broker restart below, so the restarted broker's
-            # startup self-test finds an importable ttexalens (a running broker picks it up on its
-            # paced retry, spec 03 I28). Fail-open, as above, but never silent.
-            if ! timeout 60 "$ROOT/eth-venv/bin/python" -c 'import ttexalens' >/dev/null 2>&1; then
-                echo "autoupdate: WARNING eth-venv installed but 'import ttexalens' FAILS; eth-heartbeat rung will report OFF" >&2
-            fi
-        else
-            echo "autoupdate: eth-venv provisioning failed; eth-heartbeat rung will report OFF" >&2
+for stage in "${REQUIRED_STAGES[@]}"; do
+    install -m 0755 "$clone/deploy/${stage%%:*}" "$ROOT/${stage#*:}" \
+        || { echo "autoupdate: staging ${stage#*:} failed (required); not marking current" >&2; exit 1; }
+done
+# The reader's interpreter, broker-owned. Pinning a developer's tt-metal python_env makes a
+# health rung die the moment that user rebuilds or moves their tree; tt-exalens ships manylinux
+# wheels on PyPI, so the box owns its own copy at a pinned version. Idempotent, and fail-OPEN:
+# a box that cannot build it reports the rung OFF at startup, which is loud enough on its own.
+if ! "$ROOT/eth-venv/bin/python" -c 'import ttexalens' >/dev/null 2>&1; then
+    python3 -m venv "$ROOT/eth-venv" >/dev/null 2>&1
+    if "$ROOT/eth-venv/bin/pip" install -q "tt-exalens==$ETH_EXALENS_VERSION" >/dev/null 2>&1; then
+        chmod -R a+rX "$ROOT/eth-venv" 2>/dev/null || true
+        echo "autoupdate: provisioned eth-venv (tt-exalens $ETH_EXALENS_VERSION)" >&2
+        # Check and warm it once before the broker restart below, so the restarted broker's
+        # startup self-test finds an importable ttexalens (a running broker picks it up on its
+        # paced retry, spec 03 I28). Fail-open, as above, but never silent.
+        if ! timeout 60 "$ROOT/eth-venv/bin/python" -c 'import ttexalens' >/dev/null 2>&1; then
+            echo "autoupdate: WARNING eth-venv installed but 'import ttexalens' FAILS; eth-heartbeat rung will report OFF" >&2
         fi
+    else
+        echo "autoupdate: eth-venv provisioning failed; eth-heartbeat rung will report OFF" >&2
     fi
-else
-    echo "autoupdate: pulled tree has no deploy/ dir; cannot stage required scripts — not marking current" >&2
-    exit 1
 fi
 # Reconcile host config (systemd unit + watchdog, sudoers, smi wrapper, reconcile
 # units, profile.d) from the pulled tree. This is what makes a deploy-surface
@@ -810,10 +816,6 @@ fi
 # once installed.sha marks the sha current. On failure (or an unrunnable script)
 # leave installed.sha on the last-known-good so the next reconcile retries, and do
 # not restart onto a half-applied host config.
-if [ ! -x "$clone/deploy/apply-host-config.sh" ]; then
-    echo "autoupdate: apply-host-config.sh missing or not executable (required); not marking current" >&2
-    exit 1
-fi
 bash "$clone/deploy/apply-host-config.sh" "$clone" \
     || { echo "autoupdate: host-config apply failed (required); not marking current" >&2; exit 1; }
 # Nothing slow runs between the last busy look and the restart, so this goes first.
