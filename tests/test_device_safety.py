@@ -7555,11 +7555,10 @@ def _reach_reboot_rung(monkeypatch, tmp_path, n_present):
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
     monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", lambda action, *, tenant_active: (True, "ok"))
     srv.recovery_mechanism.last_reset_failed = True  # a prior pass already failed => was_failing
-    # Its cooldown has elapsed, so this pass resets again. Must be phrased relative to
-    # time.monotonic(): a bare 0.0 only reads as "long ago" on a box whose monotonic clock
-    # is already large. On a freshly-booted runner (monotonic ~90s) 0.0 lands *inside* the
-    # 600s cooldown, so the gate holds off instead of resetting and every reboot/reset
-    # assertion below silently fails. Anchor to now so it is past the cooldown on any uptime.
+    # Its cooldown has elapsed, so this pass resets again. Must be phrased relative to time.monotonic(): a bare 0.0 only
+    # reads as "long ago" on a box whose monotonic clock is already large. On a freshly-booted runner (monotonic ~90s)
+    # 0.0 lands *inside* the 600s cooldown, so the gate holds off instead of resetting and every reboot/reset assertion
+    # below silently fails. Anchor to now so it is past the cooldown on any uptime.
     srv.recovery_mechanism.last_reset_monotonic = srv.time.monotonic() - 100_000.0
     reboots = {"n": 0}
 
@@ -11187,9 +11186,8 @@ async def test_forced_offbus_escalation_bypasses_the_once_per_episode_latch(monk
     )
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
-    # Latch through the writer, not fsm.set_latch directly: the predicate the escalator reads
-    # (_hold_escalation_latched) also checks the expiry clock, and a raw latch with a zero stamp
-    # reads as already re-armed.
+    # Latch through the writer, not fsm.set_latch directly: the predicate the escalator reads (_hold_escalation_latched)
+    # also checks the expiry clock, and a raw latch with a zero stamp reads as already re-armed.
     srv._set_hold_escalated(True)  # this episode's one recovery already ran
 
     gated = await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)

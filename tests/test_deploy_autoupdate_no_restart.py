@@ -436,8 +436,7 @@ def test_the_idle_gate_still_drains_before_a_no_restart_apply(box):
     done, lines, events = _lap(box, new, job_polls=3)
     assert done.returncode == 0, done.stderr
     assert "draining" in done.stderr and "drained after" in done.stderr, done.stderr
-    # The hold's settle and every poll of the drain ran with the old sha still installed; the move
-    # came after them.
+    # The hold's settle and every poll of the drain ran with the old sha still installed; the move came after them.
     polls = [x for x in lines if x.startswith("sleep")]
     assert len(polls) == 3 and all(x == f"sleep {box['installed']}" for x in polls), lines
     assert _installed(box) == new and _restarts(lines) == []

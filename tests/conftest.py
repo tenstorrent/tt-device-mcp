@@ -166,11 +166,10 @@ def isolate_process_globals():
     sys.argv[:] = argv
 
 
-# Spec 09 I9: a test may signal only processes this pytest process spawned. The broker's kill
-# paths (the dead-chip valve's holder kill, the survivor reap's pgid backstop, foreign-holder
-# reclaim) act on whatever the host's /proc shows, and a test that reached one unstubbed on a
-# device host SIGKILLed real jobs holding the real device. Every child inherits this token, so a
-# child that left the session or was re-parented still reads as ours; each process (an xdist
+# Spec 09 I9: a test may signal only processes this pytest process spawned. The broker's kill paths (the dead-chip
+# valve's holder kill, the survivor reap's pgid backstop, foreign-holder reclaim) act on whatever the host's /proc
+# shows, and a test that reached one unstubbed on a device host SIGKILLed real jobs holding the real device. Every child
+# inherits this token, so a child that left the session or was re-parented still reads as ours; each process (an xdist
 # worker included) gets its own value.
 _SPAWN_TOKEN_ENV = "TT_DEVICE_MCP_TEST_SPAWN_TOKEN"
 _SPAWN_TOKEN = f"{os.getpid()}-{time.time_ns()}"
@@ -876,11 +875,10 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     # leaves its per-kind key set, which would suppress the NEXT test's expected notify warning.
     monkeypatch.setattr(srv, "_sd_notify_errors_logged", set(), raising=False)
 
-    # The suite must never actually power-cycle the box it runs on. The host rung defaults ON
-    # (a ladder nobody armed is a ladder that ends in a permanent hold), so this pins it OFF
-    # explicitly — deleting the var would select the armed default and point every gate test at
-    # the real thing. The fire below stays a loud tripwire so a test that DOES reach it fails instead
-    # of taking CI (or a dev box) down. A test exercising that path re-patches the fire itself.
+    # The suite must never actually power-cycle the box it runs on. The host rung defaults ON (a ladder nobody armed is
+    # a ladder that ends in a permanent hold), so this pins it OFF explicitly — deleting the var would select the armed
+    # default and point every gate test at the real thing. The fire below stays a loud tripwire so a test that DOES
+    # reach it fails instead of taking CI (or a dev box) down. A test exercising that path re-patches the fire itself.
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
 
     # The bounded off-bus hold (spec 04 I27) runs a host-supplied power-cycle command: unset here, a
@@ -902,10 +900,9 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     monkeypatch.setattr(power_cycle_stage, "_run_step", _no_os_first_step_in_tests)
     monkeypatch.setattr(offbus_power_cycle, "_pending", {})
 
-    # The tray-down prelude (spec 04 I19) rescans the bus and reads the BMC: never the real sysfs
-    # or ipmitool from the suite. Its reads answer "not run in tests", so every gate/ladder test
-    # still passes through the prelude unchanged. Its onset latch lives on the module-global
-    # GalaxyRecovery, so every test starts with none.
+    # The tray-down prelude (spec 04 I19) rescans the bus and reads the BMC: never the real sysfs or ipmitool from the
+    # suite. Its reads answer "not run in tests", so every gate/ladder test still passes through the prelude unchanged.
+    # Its onset latch lives on the module-global GalaxyRecovery, so every test starts with none.
     def _no_rescan_in_tests():
         raise OSError("a test reached the real PCI rescan; _pci_rescan must be mocked")
 

@@ -24,10 +24,9 @@ from tests.test_deploy_autoupdate_rate_limit import _lap
 # Fork-heavy deploy-script laps: one xdist worker runs them all (conftest: --dist loadgroup).
 pytestmark = pytest.mark.xdist_group("forks")
 
-# Forks the script itself starts, measured with stand-in commands (each a $(...) subshell; on a box
-# an external command, one fork each): 5 a poll and 7 a lap, where they were 13 and 19 before the
-# shell read the clock and matched /health itself. A lap that finds its sha already installed, the
-# lap of nearly every minute, starts none.
+# Forks the script itself starts, measured with stand-in commands (each a $(...) subshell; on a box an external command,
+# one fork each): 5 a poll and 7 a lap, where they were 13 and 19 before the shell read the clock and matched /health
+# itself. A lap that finds its sha already installed, the lap of nearly every minute, starts none.
 _POLL_FORKS = 5
 _LAP_FORKS = 7
 

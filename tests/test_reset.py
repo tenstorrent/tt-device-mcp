@@ -1843,8 +1843,7 @@ def test_forced_reset_waits_for_a_killed_readopted_job_seen_only_by_the_recheck(
     assert any(s.startswith("waiting for re-adopted job 906-1 (killed)") for s in d["steps"])
 
 
-# A fabric pass that found fewer links than the cabling expects: a failed check, not a pass on the
-# links it could see.
+# A fabric pass that found fewer links than the cabling expects: a failed check, not a pass on the links it could see.
 _FEWER_LINKS = (
     False,
     {

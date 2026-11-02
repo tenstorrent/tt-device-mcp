@@ -9,10 +9,9 @@ import pytest
 
 import tt_device_mcp.device_holders as dh
 
-# Stubbed scans use small made-up pids. The reclaim's self-exclusion reads the real process
-# group of each pid, so in a pid namespace (a sandboxed run) a made-up pid can be a real
-# process in this test's own group and be dropped as "self". Calls that do not test the
-# self-exclusion get an identity no stubbed pid can match.
+# Stubbed scans use small made-up pids. The reclaim's self-exclusion reads the real process group of each pid, so in a
+# pid namespace (a sandboxed run) a made-up pid can be a real process in this test's own group and be dropped as "self".
+# Calls that do not test the self-exclusion get an identity no stubbed pid can match.
 _NOT_SELF = {"getpid": lambda: -1, "getpgid": lambda pid: pid}
 
 

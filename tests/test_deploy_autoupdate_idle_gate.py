@@ -202,10 +202,9 @@ def test_an_idle_box_applies_and_keeps_the_hold_until_the_restart(tmp_path):
 
 
 def test_the_cut_runs_with_the_production_glob_options(tmp_path):
-    # A test-only shell option over the real cut hides regressions in its globs (an unguarded
-    # queued/*.json loop counts its unmatched pattern as a job under bash's defaults, not under
-    # nullglob), so the simulation leaves bash's glob options as production has them.
-    # Read before the cut (the prelude's options) and after it (what it leaves behind).
+    # A test-only shell option over the real cut hides regressions in its globs (an unguarded queued/*.json loop counts
+    # its unmatched pattern as a job under bash's defaults, not under nullglob), so the simulation leaves bash's glob
+    # options as production has them. Read before the cut (the prelude's options) and after it (what it leaves behind).
     show = "shopt nullglob failglob dotglob extglob >&2"
     done, _, _ = _gate(tmp_path, stand_ins=show, install=show)
     assert done.returncode == 0, done.stderr

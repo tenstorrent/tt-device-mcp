@@ -1248,10 +1248,9 @@ def test_a_boot_long_after_the_request_is_not_checked(booted, monkeypatch):
     assert booted["calls"] == []
 
 
-# A Galaxy BMC that answers no restart cause ("Unspecified error") still logs the power-off in its
-# SEL. Measured: the request at 03:02:49 UTC, the hook's TTPC record at 03:03:09 and the power-off at
-# 03:03:14 on the BMC clock (about 2 s behind the host's), the boot at 03:05:29, the broker's check at
-# 03:05:51.
+# A Galaxy BMC that answers no restart cause ("Unspecified error") still logs the power-off in its SEL. Measured: the
+# request at 03:02:49 UTC, the hook's TTPC record at 03:03:09 and the power-off at 03:03:14 on the BMC clock (about 2 s
+# behind the host's), the boot at 03:05:29, the broker's check at 03:05:51.
 SEL_REQUEST = 1792638169.550994
 SEL_BTIME = 1792638329
 SEL_CHECK = 1792638351.98

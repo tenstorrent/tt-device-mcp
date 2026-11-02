@@ -150,8 +150,7 @@ def test_a_broker_that_does_not_answer_is_not_deferred_for(tmp_path):
 
 
 def test_a_hold_older_than_the_bound_lets_the_update_apply(tmp_path):
-    # Every fault class's budget is under the bound: a hold past it is over budget, and the update
-    # may be its fix.
+    # Every fault class's budget is under the bound: a hold past it is over budget, and the update may be its fix.
     done, _, _ = _gate(tmp_path, health=[_health(held=True, state="recovering", age=1200)])
     assert "GATE PASSED" in done.stdout, done.stderr
     assert "past the deferral bound" in done.stderr

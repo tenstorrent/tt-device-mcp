@@ -72,9 +72,8 @@ async def test_startup_release_dispatches_a_held_job_within_a_second(monkeypatch
 
     assert result == "", result
     assert job.status is srv.JobStatus.QUEUED, "a woken hold must hand the job on, never cancel it"
-    # The wake keeps TENANT_HOLD_WAKE_MIN_GAP_SEC (0.1 s here) between gate passes; a loaded suite
-    # run adds to that. The poll is 60 s and wait_for caps the hold at 5 s, so 2 s tells a wake from
-    # a poll.
+    # The wake keeps TENANT_HOLD_WAKE_MIN_GAP_SEC (0.1 s here) between gate passes; a loaded suite run adds to that. The
+    # poll is 60 s and wait_for caps the hold at 5 s, so 2 s tells a wake from a poll.
     assert time.monotonic() - released < 2.0, "the held job waited for the poll, not the release"
     assert len(passes) == 1, "the wake must re-run the gate once, and only the gate releases the job"
     assert "device_released" in events

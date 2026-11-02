@@ -71,8 +71,7 @@ def valve(monkeypatch):
     log = []
     detach_ok = {}
     monkeypatch.setattr(srv, "isolate_chip", lambda idx: log.append(("detach", idx)) or detach_ok.get(idx, True))
-    # A SIGSTOP is logged as a stop: it closes no fd and issues no read (03 I96); every other signal
-    # counts as a kill.
+    # A SIGSTOP is logged as a stop: it closes no fd and issues no read (03 I96); every other signal counts as a kill.
     monkeypatch.setattr(srv.os, "kill", lambda pid, sig: log.append(("stop" if sig == signal.SIGSTOP else "kill", pid)))
     monkeypatch.setattr(
         srv.os, "killpg", lambda pid, sig: log.append(("stop" if sig == signal.SIGSTOP else "kill", pid))

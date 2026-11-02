@@ -122,8 +122,7 @@ def _rig(
         return healthy, {"snapshot": {"ok": healthy}, "fabric": {"ok": healthy}}
 
     async def bare_mesh(indices, log):
-        # The stuck-hold ladder's own mesh reset: a launched reset (rc recorded for I58), then its
-        # full check.
+        # The stuck-hold ladder's own mesh reset: a launched reset (rc recorded for I58), then its full check.
         order.append("mesh reset")
         srv.recovery_mechanism.last_reset_rc = mesh_rc
         healthy, _evidence = await verify(32, log, run_fabric=True)

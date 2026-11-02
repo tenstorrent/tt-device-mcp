@@ -37,9 +37,8 @@ _LOGGED = (
     " --- /opt/x/libtt_metal.so(+0x1234)\n"
 )
 _NO_ERROR_LINE = "banner\nsomething odd\nlast words\n"
-# metal's TT_FATAL: the what() header names only the source line and the failed condition; the
-# message itself comes two lines down, under "info:" (as run_cluster_validation printed it when a
-# route was missing on a galaxy).
+# metal's TT_FATAL: the what() header names only the source line and the failed condition; the message itself comes two
+# lines down, under "info:" (as run_cluster_validation printed it when a route was missing on a galaxy).
 _TT_FATAL = (
     "2026-10-14 08:55:40.1 | info     | Device | Opening 32 chips\n"
     "terminate called after throwing an instance of 'std::runtime_error'\n"
