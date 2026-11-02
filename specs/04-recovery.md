@@ -198,9 +198,7 @@ each rung fires only when the gentler one failed or cannot apply.
   holds and is asked again at the deadline `/health` shows; a cycle that cannot launch (its command
   is missing or exits non-zero, so its ledger row is taken back) keeps the hold, pages, and is asked
   again on the next pass and at the I76 bound. No flag, env var, config key or CLI option brings a
-  reboot back: `TT_DEVICE_MCP_AUTO_REBOOT`, `TT_DEVICE_MCP_POST_REBOOT_VERIFY`,
-  `TT_DEVICE_MCP_AUTO_RECOVERY_INTERVAL_SEC` (the reboot's spacing) and `TTDEV_AUTO_REBOOT` are no
-  longer read. **Time to recover** (a present-mesh wedge the ladder does
+  reboot back. **Time to recover** (a present-mesh wedge the ladder does
   not heal, classes D and G2): the ladder, then one power cycle (about 5-8 min with its boot), or
   the I65 cooldown's end when a cycle or boot fell inside it, then the startup gate's full check,
   fabric included; before, a reboot and its boot (about 3-5 min) came first and the cycle only after
@@ -433,7 +431,7 @@ each rung fires only when the gentler one failed or cannot apply.
   the live per-chip PCI snapshot. Because the prelude changes no ladder
   decision, it is safe on any Galaxy the tray map covers.
 
-- **I20 — Retired.** A reset re-applies no AICLK ceiling; the broker sets none (spec 03 I35).
+- **I20 — Retired** (number reserved).
 
 - **I21 — No reset runs over a reaped job's leftover.** While a process a finished job left
   holding the device stands (spec 01 I16), every reset is refused: the reset tool and the
@@ -548,8 +546,7 @@ each rung fires only when the gentler one failed or cannot apply.
   rung: a latch from an earlier boot, or one naming no boot, is ignored and dropped at broker start
   (`offbus_reset_hold_expired`); with this boot's id unreadable it cannot be shown stale and holds.
 
-- **I26 — Retired.** The broker runs no command of its own before a power cycle and waits on
-  nothing there; other users of the host are warned through the pending file (I88).
+- **I26 — Retired** (number reserved).
 
 - **I27 — An off-bus hold the I24 gate refuses to reset is bounded.** Once the gate refuses every
   reset because chips are off the bus, the hold no longer stands until an operator power-cycles the
@@ -850,14 +847,7 @@ each rung fires only when the gentler one failed or cannot apply.
   the 120 s wait), when no cycle or boot fell within the last cooldown; within one, at the cooldown's end
   (I65). Bounds the idle 5-6 min one Galaxy host sat between a failed mesh reset and the ceiling
   window; a second mesh reset on the same chips after an exit 1 killed another host.
-- **I39 — Retired: no progress retry.** A failed mesh reset that brought chips back no longer gets
-  a second reset: the hold's one mesh reset is spent (I87), and the climb goes to the last-chance
-  sweep, then the power cycle. The `progress_retry` trigger kind is gone. Time to recover, class B1 whose first reset fails with chips
-  back: the failed reset, the sweep (SBR and mesh reset, once in this phase, I87), then the power
-  cycle and the startup gate's full check, fabric included, unless the I65 cooldown holds it; before,
-  a second reset 60 s later healed some episodes (about 8-10 min) and repeated resets on a changed set
-  ran without bound on the rest. I81 and I78 now rescan an isolated chip back inside the first
-  reset's driver wait, the case the retry was for.
+- **I39 — Retired** (number reserved).
 
 - **I87 — One mesh reset per hold episode; the last-chance sweep at most once per phase.** Once a
   mesh reset (`tt-smi -glx_reset`) has run in a hold episode and left the mesh unhealthy, no path
@@ -875,7 +865,7 @@ each rung fires only when the gentler one failed or cannot apply.
   power cycle, once an SBR has every chip back on the bus. A power cycle the governor denies, the I65
   cooldown holds or that is not opted in buys no second reset: the hold waits for the cycle (asked
   again at its deadline), or goes to an operator (I33) when there is none. No flag, env var, config
-  key or CLI option brings a repeat back: `TT_DEVICE_MCP_AUTO_UBB_RESET` is no longer read. A new episode (after a verified release or a
+  key or CLI option brings a repeat back. A new episode (after a verified release or a
   power cycle) gets its own one reset. Releases nothing: only a full health check, fabric included,
   that has just passed lifts the hold (I32). Time to recover: a fabric, dispatch or hold-deadline
   hold whose reset failed reaches the power cycle at once instead of after 8-10 min of repeated
@@ -896,7 +886,7 @@ each rung fires only when the gentler one failed or cannot apply.
   broker isolated (its PCI endpoint removed) cannot show up on its own: only a PCI rescan adds it
   back, and the rescan `reset_with_quiesce` ends with runs after tt-smi has exited. So before I81
   every mesh reset over an isolated chip failed after about 263 s even when the re-power had healed
-  the chip, and only a second reset (the retired I39 retry) finished the job. Now, when a `-glx_reset` runs with at
+  the chip, and only a second reset finished the job. Now, when a `-glx_reset` runs with at
   least one isolated chip, `reset_with_quiesce` watches the reset's output and, at the first marker
   of that wait (`Waiting for 30 seconds: 30`, the settle's end, or `Waiting for all N chips to show
   up`, matched across split reads), runs one global PCI rescan, journaled as

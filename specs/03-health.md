@@ -546,8 +546,7 @@ cooldown (spec 04 I65) holds longer.
   re-runs the read-only fabric pass instead (on by default; `TT_DEVICE_MCP_FABRIC_RELIFT=0` drops
   that re-run, except for the one startup pass I39 owes), after the hugepage pool is full. At the
   bound spec 04 I76 runs the full ladder, then the power cycle, relift or not. Once a pass measures the fabric bad, the hold is no longer 77-only and I23 applies.
-- **I35 — Retired.** The broker applies no AICLK ceiling of its own; the firmware and the job
-  own the clock.
+- **I35 — Retired** (number reserved).
 - **I36 — A failed job that never reached the device does not force a second pass.** A FAILED
   job with a normal exit code of its own (not a signal death, timeout, kill or hang, and never a
   missing exit code) that ran under `NOOP_FAILURE_MAX_RUNTIME_SEC` (2s)
@@ -567,10 +566,7 @@ cooldown (spec 04 I65) holds longer.
   Rationale: box A lost its host ~9s into a pass forced 2s after a green one by a job that had
   failed in 0s on a missing directory; the pass is the heaviest load the broker puts on the mesh,
   and that job told it nothing.
-- **I37 — Retired.** The opt-in stuck-hold alert hook is gone; `hold_stuck_past_deadline` and
-  the other host-at-risk events stay in the health journal.
-- **I38 — Retired.** A failed job's forced post-job pass is never skipped for its exit code; the
-  one stand-in is I36's fresh green pass for a job that never reached the device.
+- **I37, I38 — Retired** (numbers reserved).
 - **I39 — A startup pass that a missing prerequisite turned into a 77 is owed again once it lands.**
   The broker can start before `install-fabric-validator.sh` publishes the pinned validator's
   `current` link (its timer runs minutes after boot), and the startup pass then exits 77. When the
