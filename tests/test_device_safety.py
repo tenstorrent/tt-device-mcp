@@ -16452,7 +16452,6 @@ async def test_an_offbus_startup_hold_keeps_its_one_shot_while_the_startup_gate_
         "progress_retry",
         "ipmi_handoff_bound",
         "tray_walk_handoff_bound",
-        "gated_hold_handoff_bound",
         "gated_offbus_grace",
     ],
 )

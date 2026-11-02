@@ -62,7 +62,6 @@ def held(monkeypatch, galaxy_trays):
     monkeypatch.setattr(m, "host_action_requested", None)
     monkeypatch.setattr(opc, "_pending", {})
     monkeypatch.delenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", raising=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC", raising=False)
     monkeypatch.delenv("TT_DEVICE_MCP_STUCK_HOLD_SEC", raising=False)
     monkeypatch.delenv("TT_DEVICE_MCP_OFFBUS_HOLD_SEC", raising=False)
     monkeypatch.delenv("TT_DEVICE_MCP_FORCE_ESCALATE", raising=False)
@@ -329,12 +328,6 @@ def _gated(monkeypatch, **pending) -> None:
     "pending, cmd, at, source",
     [
         ({"gated": True}, True, START + 300, "gated off-bus grace"),
-        (
-            {"handoff": {"deadline": START + 1200, "why": "w", "latched": "", "operator_seen": "none"}},
-            False,
-            START + 1200,
-            "gated off-bus operator hand-off bound",
-        ),
     ],
 )
 def test_the_off_bus_forced_pass_bounds_are_named_when_they_fire(held, monkeypatch, pending, cmd, at, source):

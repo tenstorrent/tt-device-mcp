@@ -1730,7 +1730,6 @@ async def test_the_boot_after_the_brokers_own_power_cycle_latches_nothing_and_st
     from tt_device_mcp.health.recovery import pcie_guard
 
     events, rows, gate_calls = _startup
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
     monkeypatch.setattr(pcie_guard, "record_topology", lambda: None)
     hd = evidence.health_dir()
     hd.mkdir(parents=True, exist_ok=True)

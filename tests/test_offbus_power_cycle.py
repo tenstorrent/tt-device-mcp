@@ -24,7 +24,7 @@ from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 from tt_device_mcp.health.recovery import galaxy, pcie_guard
 from tt_device_mcp.health.recovery import offbus_power_cycle as opc
 
-GATE_WHY = "3 chip(s) off the bus and TT_DEVICE_MCP_HOST_RESET_GATE=hold"
+GATE_WHY = "3 chip(s) off the bus and 1 boot(s) under the host-hang latch"
 OFF_BUS, EXPECTED = 3, 32
 # Taken at import, before conftest swaps in its tripwire; only ever called on stand-in scripts.
 _REAL_FIRE = opc.fire_command
@@ -273,7 +273,6 @@ async def test_a_latch_never_blocks_a_rung_after_its_boot_nor_the_power_cycle_on
     reset, and that refusal is exactly what the bounded power cycle answers."""
     hold_since, rec = _gated(monkeypatch, tmp_path)
     monkeypatch.setattr(pcie_guard, "host_reset_gate", _REAL_GATE)
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
     (pcie_guard.health_dir() / pcie_guard.LATCH_FILE).write_text(
         json.dumps({"boot_id": "boot-a", "latched_on_boot": "boot-b"})
     )

@@ -548,23 +548,6 @@ def test_a_whole_tray_drop_marks_a_cycle_possible(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_whole_tray_sent_straight_to_the_cycle_marks_it_possible(monkeypatch):
-    from tt_device_mcp.health.recovery import galaxy
-
-    monkeypatch.setattr(opc, "power_cycle_argv", lambda: CYCLE)
-    monkeypatch.setattr(opc, "partial_reset_due", lambda since: True)
-    monkeypatch.setattr(galaxy, "_hold_gate_liftable", lambda: True)
-    monkeypatch.setattr(galaxy, "offbus_count", lambda beats, expected: 8)
-    monkeypatch.setattr(galaxy, "_offbus_chip_ids", lambda beats, expected: list(range(8, 16)))
-    monkeypatch.setattr(galaxy, "_whole_tray_drop_trays", lambda chips, expected, trays: {1})
-    pc.set_pending_marker_context(lambda: ("whole_tray", {}, "2026-01-01T00:00:00"))
-    deps = SimpleNamespace(device_hold_episode_since=lambda: "2026-01-01T00:00:00", read_heartbeats=lambda: [])
-    fake = SimpleNamespace(deps=deps, _tray_map_now=lambda: None)
-    assert await galaxy.GalaxyRecovery._offbus_hold_lift(fake, 32, lambda line: None) == ""
-    assert (_marker()["state"], _marker()["reason"]) == ("possible", "8/32 chip(s) off the bus fill whole trays")
-
-
-@pytest.mark.asyncio
 async def test_the_last_chance_ladder_marks_a_cycle_possible_before_it_runs():
     from tt_device_mcp.health.recovery.galaxy import GalaxyRecovery
 

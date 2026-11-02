@@ -8886,7 +8886,6 @@ def _hold_tray_groups() -> dict:
 # Names for the watchdog's off-bus forced-pass bounds (offbus_power_cycle.watchdog_due_at kinds).
 _HOLD_OFFBUS_DUE_SOURCES = {
     "gated_offbus_grace": "gated off-bus grace",
-    "gated_hold_handoff_bound": "gated off-bus operator hand-off bound",
 }
 
 
@@ -9310,11 +9309,11 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
             payload["held_age_sec"] = None  # a since we cannot parse is still a hold; report it without an age
         # Keyed on the hold EPISODE (survives a broker restart), the clock the hand-off was armed on.
         episode = device_hold_episode_since or since
-        handoff = offbus_power_cycle.hold_handoff_status(episode, now.timestamp() if now else None)
+        handoff = offbus_power_cycle.hold_handoff_status(episode)
         if handoff is None and galaxy_recovery is not None:
             handoff = galaxy_recovery.fabric_77_handoff_status(episode)  # spec 04 I29: a 77 past its host rung
         if handoff is not None:
-            payload["operator_handoff"] = handoff  # spec 04 I33: who must act on the hold, and by when
+            payload["operator_handoff"] = handoff  # spec 04 I33: who must act on the hold
         # Spec 04 I65: a power cycle the cooldown holds off, and the moment it is asked again.
         cooldown = recovery_mechanism.power_cycle_cooldown_state
         now_epoch = now.timestamp() if now else time.time()
@@ -10616,15 +10615,8 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     # A gated off-bus hold (spec 04 I27) gets one forced pass the moment its grace runs out, so the
     # bounded power cycle fires at the grace and not at the next ceiling window.
     if not only_77 and offbus_power_cycle.due_for_watchdog(device_hold_episode_since, now):
-        if offbus_power_cycle.hold_handoff_due(device_hold_episode_since, now.timestamp() if now else None):
-            # spec 04 I33: the operator's hand-off ran out with no power cycle configured.
-            device_hold_escalation_kind = "gated_hold_handoff_bound"
-            device_hold_escalation_trigger = (
-                f"the {offbus_power_cycle.hold_handoff_sec()}s gated off-bus operator hand-off bound"
-            )
-        else:
-            device_hold_escalation_kind = "gated_offbus_grace"
-            device_hold_escalation_trigger = f"the {offbus_power_cycle.grace_sec()}s gated off-bus grace"
+        device_hold_escalation_kind = "gated_offbus_grace"
+        device_hold_escalation_trigger = f"the {offbus_power_cycle.grace_sec()}s gated off-bus grace"
         if _maybe_spawn_forced_escalation():
             offbus_power_cycle.mark_spawned(device_hold_episode_since)
     # Spec 04 I65: a power cycle the cooldown (or the per-boot cap or the backstop) denied is asked

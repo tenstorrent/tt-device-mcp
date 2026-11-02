@@ -12,8 +12,8 @@ getting there:
 * :class:`AerMask` — mask AER and DPC on root ports for the reset window, then clear their status,
   watch them for a moment and restore only the quiet ones. A port that keeps erroring stays masked
   and is reported, so a flood cannot take the host down.
-* :func:`host_reset_gate` — the per-host switch (``TT_DEVICE_MCP_HOST_RESET_GATE``) that refuses an
-  automatic reset while chips are off the bus or AER errors are flooding.
+* :func:`host_reset_gate` — refuses an automatic reset while AER errors are flooding, or while chips
+  are off the bus under the host-hang latch.
 * The host-hang latch — :func:`begin_offbus_reset` writes an intent before an automatic reset with
   chips off the bus, and :func:`check_offbus_reset_latch` reads one left by an earlier boot as a
   reset that hung the host, and holds every later off-bus reset on this boot until every chip is
@@ -24,8 +24,6 @@ Everything reads and writes through :data:`SYS_ROOT` so tests run against a fake
 
 from __future__ import annotations
 
-import contextlib
-import contextvars
 import json
 import logging
 import os
@@ -538,19 +536,16 @@ def aer_flooding(ports: Optional[list] = None) -> bool:
     return flood_window_open()
 
 
-GATE_OFF, GATE_GUARD, GATE_HOLD = "off", "guard", "hold"
+GATE_GUARD, GATE_HOLD = "guard", "hold"
 
 
 def gate_mode() -> str:
-    """``TT_DEVICE_MCP_HOST_RESET_GATE``: ``off`` (default) keeps the old reset behaviour, except
-    while a port that kept erroring after a re-power or reset holds the flood window open; ``guard``
-    masks AER on every Tenstorrent root port around each automatic mesh reset and refuses one while
-    AER errors flood; ``hold`` also refuses one while any chip is off the bus. Set per host. A latched
-    host-hang hold (:func:`check_offbus_reset_latch`) reads as ``hold`` whatever the setting."""
+    """``guard`` masks AER on every Tenstorrent root port around each automatic mesh reset and refuses
+    one while AER errors flood; ``hold`` also refuses one while any chip is off the bus, and is in force
+    only while the host-hang latch (:func:`check_offbus_reset_latch`) stands."""
     if offbus_reset_latched() is not None:
         return GATE_HOLD  # the last off-bus reset hung this host: hold until the chips are back (I25)
-    mode = os.environ.get("TT_DEVICE_MCP_HOST_RESET_GATE", GATE_OFF).strip().lower()
-    return mode if mode in (GATE_GUARD, GATE_HOLD) else GATE_OFF
+    return GATE_GUARD
 
 
 def chips_off_bus(expected: int) -> int:
@@ -566,21 +561,6 @@ def chips_off_bus(expected: int) -> int:
     return max(0, expected - len(eps)) + len(dead_chips(read_heartbeats(probe_lost=True)))
 
 
-_HOLD_LIFTED: contextvars.ContextVar = contextvars.ContextVar("tt_device_mcp_hold_lifted", default="")
-
-
-@contextlib.contextmanager
-def hold_lifted(why: str):
-    """Inside this scope (and the threads it starts) a configured ``hold`` gate reads as ``guard`` for a
-    chip off the bus: the AER flood checks still refuse, the I25 host-hang latch still holds. Scoped to
-    one escalation pass, so nothing outlives it (spec 04 I33)."""
-    token = _HOLD_LIFTED.set(why)
-    try:
-        yield
-    finally:
-        _HOLD_LIFTED.reset(token)
-
-
 def host_reset_gate(off_bus: int) -> tuple:
     """``(allowed, why)`` for an automatic host-affecting reset (the mesh reset) with
     ``off_bus`` chips already off the bus. A refused reset is a rung that did not fire, so the ladder
@@ -589,26 +569,15 @@ def host_reset_gate(off_bus: int) -> tuple:
         expire_offbus_reset_latch(None, None, lambda m: None)  # only the ceiling: no host-pci look here
     elif not _power_cycle_bounds_latch():
         expire_offbus_reset_latch(None, None, _logger.warning, off_bus=off_bus)  # no I27 cycle to end it
-    mode = gate_mode()
-    if mode == GATE_OFF:
-        if flood_window_open():
-            # Set by a port the envelope had to leave masked: the next reset is the one that, in the
-            # incident, followed a tray re-power into a dead host. Holds whatever the gate's mode.
-            return False, "a root port kept erroring AER after the last re-power or reset (flood window open)"
-        return True, ""
-    if mode == GATE_HOLD and off_bus > 0:
-        latch = offbus_reset_latched()
-        if latch is not None:
-            ceiling = "" if _power_cycle_bounds_latch() else f", it reaches its {latch_max_sec():.0f} s ceiling"
-            return False, (
-                f"{off_bus} chip(s) off the bus and {_latch_boots(latch)} until every chip is back on the "
-                f"bus, the host boots again{ceiling} or an operator runs `{clear_latch_cmd()}`"
-            )
-        if not _HOLD_LIFTED.get():
-            return False, f"{off_bus} chip(s) off the bus and TT_DEVICE_MCP_HOST_RESET_GATE=hold"
-        # The off-bus hold's operator hand-off ran out (spec 04 I33): this pass reads `hold` as `guard`.
+    latch = offbus_reset_latched() if off_bus > 0 else None
+    if latch is not None:
+        ceiling = "" if _power_cycle_bounds_latch() else f", it reaches its {latch_max_sec():.0f} s ceiling"
+        return False, (
+            f"{off_bus} chip(s) off the bus and {_latch_boots(latch)} until every chip is back on the "
+            f"bus, the host boots again{ceiling} or an operator runs `{clear_latch_cmd()}`"
+        )
     if aer_flooding():
-        return False, f"AER errors are flooding the Tenstorrent root ports (TT_DEVICE_MCP_HOST_RESET_GATE={mode})"
+        return False, "AER errors are flooding the Tenstorrent root ports"
     return True, ""
 
 
@@ -841,7 +810,7 @@ def expire_offbus_reset_latch(
             reason = (
                 f"chips are still off the bus (or sysfs cannot be read), TT_DEVICE_MCP_POWER_CYCLE_CMD is "
                 f"not set, so no power cycle would end the hold, and it reached its {latch_max_sec():.0f} s "
-                f"ceiling; automatic resets follow TT_DEVICE_MCP_HOST_RESET_GATE again"
+                f"ceiling; automatic resets follow the AER guard again"
             )
     else:
         return None
@@ -942,11 +911,9 @@ def clear_offbus_reset_latch(dirs: Optional[list] = None) -> list:
 
 
 def mask_for_mesh_reset(log) -> Optional[AerMask]:
-    """Mask every Tenstorrent root port before a mesh reset when the gate is on, else None. A port
+    """Mask every Tenstorrent root port before a mesh reset, or None when that fails. A port
     that cannot be masked is logged and the reset goes ahead unmasked, as before the gate. Sysfs that
     cannot be read is logged the same way, and only the recorded root ports are masked."""
-    if gate_mode() == GATE_OFF:
-        return None
     try:
         eps = _scan_endpoints()
         _remember(eps)

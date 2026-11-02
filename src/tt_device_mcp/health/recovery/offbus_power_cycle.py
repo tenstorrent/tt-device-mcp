@@ -35,7 +35,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from tt_device_mcp import metrics
 from tt_device_mcp.health.evidence import health_dir, health_event
 
 STATE_FILE = "offbus_power_cycle.json"
@@ -43,7 +42,6 @@ GRACE_DEFAULT_SEC = 300
 CHECK_TIMEOUT_DEFAULT_SEC = 10.0
 FIRE_TIMEOUT_DEFAULT_SEC = 120.0
 BLOCKED_PAGE_DEFAULT_SEC = 1800
-HOLD_HANDOFF_DEFAULT_SEC = 1200  # two 600 s ceiling windows
 # Where the installer stages deploy/tt-manual-recovery-check.sh; the manual-recovery check when
 # TT_DEVICE_MCP_MANUAL_RECOVERY_CMD is unset.
 MANUAL_RECOVERY_CHECK = "manual-recovery-check.sh"
@@ -196,8 +194,6 @@ def episode_age_sec(episode: str, now: Optional[datetime] = None) -> Optional[fl
 
 def _track(episode: str) -> None:
     if _pending.get("episode") != episode:
-        if _pending.get("handoff"):
-            metrics.offbus_operator_deadline(0)
         _pending.clear()
         _pending.update(episode=episode, ladder_ran=False, paged=set(), journaled=set(), spawned=False)
 
@@ -311,152 +307,69 @@ def note_ladder_ran(episode: str) -> None:
         return
     _track(episode)
     _pending["ladder_ran"] = True
-    if _PARTIAL_PASS.get() == episode:
-        _pending["partial_reset"] = True  # the lifted pass reached its rungs: spent, whatever its outcome
 
 
 def ladder_ran(episode: str) -> bool:
     return _pending.get("episode") == episode and bool(_pending.get("ladder_ran"))
 
 
-def partial_reset_due(episode: str, now: Optional[datetime] = None) -> bool:
-    """True once per episode when, with the power cycle configured, a gated hold has run its ladder and
-    outlived its grace and has not had its one lifted pass yet: a partial off-bus drop then gets the
-    ladder's own rungs (the mesh reset included) with the gate lifted before the power cycle (spec 04
-    I27). A whole tray down never gets it; the caller decides that."""
-    if not episode or _pending.get("episode") != episode or _pending.get("partial_reset"):
-        return False
-    if not (_pending.get("gated") and _pending.get("ladder_ran")):
-        return False
-    age = episode_age_sec(episode, now)
-    return age is not None and age >= grace_sec()
-
-
-_PARTIAL_PASS: contextvars.ContextVar = contextvars.ContextVar("tt_device_mcp_partial_pass", default="")
-
-
-@contextlib.contextmanager
-def partial_pass(episode: str):
-    """Scope this episode's one lifted pass (spec 04 I27). It is spent only once its climb has passed
-    the climb's own guards (ceiling, latch, reset scope, tenant, cooldown) and reaches the rungs
-    (:func:`note_ladder_ran`): a climb those guards decline leaves it due, so the mesh reset is never
-    skipped on the way to the power cycle. A spent pass that leaves the hold standing re-arms the
-    watchdog once (:func:`rearm_after_partial_reset`). With no power cycle configured the lift is the
-    I33 operator hand-off's, not this pass: nothing is tracked."""
-    if power_cycle_argv() is None:
-        yield
-        return
-    token = _PARTIAL_PASS.set(episode)
-    try:
-        yield
-    finally:
-        _PARTIAL_PASS.reset(token)
-        rearm_after_partial_reset(episode)
-
-
-def rearm_after_partial_reset(episode: str) -> None:
-    """The lifted pass ran and ended with the hold still standing: the watchdog forces one more pass,
-    which fires the power cycle, instead of waiting for the next ceiling window (once per episode). A
-    pass that never reached its rungs re-arms nothing."""
-    if _pending.get("episode") == episode and _pending.get("partial_reset") and not _pending.get("partial_rearmed"):
-        _pending["partial_rearmed"] = True
-        _pending["spawned"] = False
-
-
-def hold_handoff_sec() -> int:
-    """Seconds, from the episode start, an off-bus hold the gate refuses with no power cycle configured
-    stands for an operator before the broker lifts the gate for its own ladder (spec 04 I33). A
-    non-positive or malformed value reads as 1200."""
-    return _int_env("TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC", HOLD_HANDOFF_DEFAULT_SEC)
-
-
-def _handoff_deadline(episode: str) -> Optional[float]:
-    try:
-        return datetime.fromisoformat(episode).timestamp() + hold_handoff_sec()
-    except (TypeError, ValueError):
-        return None
-
-
 def note_hold_handoff(
     episode: str, off_bus: int, expected: int, why: str, log, *, latched: str = "", cause: str = ""
 ) -> None:
-    """The gate refuses every reset of this episode's off-bus hold and no power cycle is configured: hand
-    the hold to an operator with a deadline, once per episode (spec 04 I33). The manual-recovery check
-    runs once here, so the page says whether an operator is already on it. ``latched`` names an operator
-    gate (the I25 latch) that keeps the gate shut past the deadline. ``cause`` replaces the page's
-    default reason (no power-cycle command) when another path hands the hold off (spec 04 I36)."""
+    """The I25 host-hang latch refuses every reset of this episode's off-bus hold, or no power cycle is
+    configured: hand the hold to an operator, once per episode (spec 04 I33). The manual-recovery check
+    runs once here, so the page says whether an operator is already on it. ``latched`` names what keeps
+    the hold standing. ``cause`` replaces the page's default reason (no power-cycle command) when
+    another path hands the hold off (spec 04 I36)."""
     if not episode:
         return
     _track(episode)
     if not _pending.get("handoff"):
-        deadline = None if latched else _handoff_deadline(episode)
         argv = manual_recovery_argv()
         seen = standback_reason(require_manual_check=False) if argv is not None else ""
         _pending["handoff"] = {
-            "deadline": deadline,
             "why": why,
-            "latched": latched or ("" if deadline else "its start time is unreadable"),
+            "latched": latched,
             "operator_seen": seen or ("none seen" if argv is not None else "no manual-recovery check configured"),
         }
-        metrics.offbus_operator_deadline(deadline or 0)
         health_event(
             "offbus_gated_hold",
             phase="operator_handoff",
             held_since=episode,
-            deadline_epoch=deadline,
-            latched=_pending["handoff"]["latched"],
+            latched=latched,
             operator_seen=_pending["handoff"]["operator_seen"],
         )
     h = _pending["handoff"]
-    if h["deadline"]:
-        then = (
-            f"an operator must recover the host by {datetime.fromtimestamp(h['deadline']).isoformat(timespec='seconds')}; "
-            f"after that the broker lifts the gate for this hold and runs its own reset ladder (bridge reset, "
-            f"then the mesh reset), the full health check, fabric included, before any release"
-        )
-    else:
-        then = f"the hold stands until an operator recovers the host ({h['latched']})"
     page_once(
         "offbus_gated_hold_page",
         log,
         f"{off_bus}/{expected} chip(s) off the bus and no reset can end the hold ({why}); "
-        f"{cause or 'TT_DEVICE_MCP_POWER_CYCLE_CMD is not set'}, so {then}; manual-recovery check: {h['operator_seen']}",
+        f"{cause or 'TT_DEVICE_MCP_POWER_CYCLE_CMD is not set'}, so the hold stands until an operator "
+        f"recovers the host ({h['latched']}); manual-recovery check: {h['operator_seen']}",
         held_since=episode,
         off_bus=off_bus,
         expected=expected,
-        deadline_epoch=h["deadline"],
     )
 
 
-def hold_handoff_due(episode: str, now: Optional[float] = None) -> bool:
-    """True once this episode's operator hand-off deadline has passed (never for a latched one)."""
-    h = _pending.get("handoff") if _pending.get("episode") == episode else None
-    return bool(h and h["deadline"] and (now_epoch() if now is None else now) >= h["deadline"])
-
-
-def hold_handoff_status(episode: str, now: Optional[float] = None) -> Optional[dict]:
-    """The /health ``operator_handoff`` field while this episode's hold is handed off: who must act and by
-    when, or None."""
+def hold_handoff_status(episode: str) -> Optional[dict]:
+    """The /health ``operator_handoff`` field while this episode's hold is handed off: who must act, or
+    None."""
     h = _pending.get("handoff") if episode and _pending.get("episode") == episode else None
     if not h:
         return None
-    out = {"reason": h["why"], "operator_seen": h["operator_seen"]}
-    if not h["deadline"]:
-        return {**out, "owner": "operator", "act_by": None, "then": f"hold ({h['latched']})"}
-    due = hold_handoff_due(episode, now)
     return {
-        **out,
-        "owner": "broker" if due else "operator",
-        "act_by": datetime.fromtimestamp(h["deadline"]).isoformat(timespec="seconds"),
-        "act_by_epoch": h["deadline"],
-        "then": "the broker runs its reset ladder with the gate lifted, then the full health check",
+        "reason": h["why"],
+        "operator_seen": h["operator_seen"],
+        "owner": "operator",
+        "act_by": None,
+        "then": f"hold ({h['latched']})",
     }
 
 
 def end_hold_handoff() -> None:
-    """The hold ended: the deadline metric goes back to 0."""
-    if _pending.pop("handoff", None):
-        metrics.offbus_operator_deadline(0)
+    """The hold ended: no hold is handed off any more."""
+    _pending.pop("handoff", None)
 
 
 def due_for_watchdog(episode: str, now: Optional[datetime] = None) -> bool:
@@ -464,9 +377,7 @@ def due_for_watchdog(episode: str, now: Optional[datetime] = None) -> bool:
     cycle fires at the bound, not at the next ceiling window."""
     if not episode or _pending.get("episode") != episode or _pending.get("spawned"):
         return False
-    if power_cycle_argv() is None:
-        return hold_handoff_due(episode, None if now is None else now.timestamp())
-    if not _pending.get("ladder_ran"):
+    if power_cycle_argv() is None or not _pending.get("ladder_ran"):
         return False
     age = episode_age_sec(episode, now)
     return bool(_pending.get("gated")) and age is not None and age >= grace_sec()
@@ -479,10 +390,7 @@ def watchdog_due_at(episode: str) -> Optional[tuple[float, str]]:
     Read-only, for the /health hold report (spec 04 I75): moves no clock."""
     if not episode or _pending.get("episode") != episode or _pending.get("spawned"):
         return None
-    if power_cycle_argv() is None:
-        h = _pending.get("handoff")
-        return (float(h["deadline"]), "gated_hold_handoff_bound") if h and h["deadline"] else None
-    if not _pending.get("ladder_ran"):
+    if power_cycle_argv() is None or not _pending.get("ladder_ran"):
         return None
     out = []
     if _pending.get("gated"):
