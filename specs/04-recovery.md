@@ -1726,8 +1726,7 @@ each rung fires only when the gentler one failed or cannot apply.
   fabric fault (I30's causes other than a 77: the full fabric check counts fewer links or ports than
   the cabling expects; such a count is a failed check, never a pass), is the fabric link-short class.
   So are the measured holds of the same shape: one under spec 03 I42's latch, and one whose last full
-  fabric check failed on missing descriptor ports (spec 03 I71; ports that
-  `TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS` excuses never fail it, so they stay excused). On the
+  fabric check failed on missing descriptor ports (spec 03 I71). On the
   hold's first watchdog tick the broker runs its full reset ladder once (`escalation_kind`
   `fabric_link_short`; under the I42 latch, past its one-tick bound, the same one ladder runs as that
   bound's), lifting only spec 03 I46's known-fabric-fault latch first as at the bound, never the I42

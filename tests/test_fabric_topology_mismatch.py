@@ -181,49 +181,39 @@ def _baseline(tmp_path) -> dict:
     return json.loads((tmp_path / HealthMonitor.ETH_LINK_BASELINE_FILE).read_text())
 
 
-@pytest.fixture
-def accepted(topo, monkeypatch):
-    """The descriptor run loses one port connection the operator accepted as dead (I71)."""
-    topo[1]["first"] = _LOST
-    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS", _LOST_PORT)
-    return topo
-
-
 @pytest.mark.asyncio
-async def test_a_lift_rebaselines_the_eth_mark_at_the_discovered_links(accepted, tmp_path):
-    m, _ = accepted
+async def test_a_lift_rebaselines_the_eth_mark_at_the_discovered_links(topo, tmp_path):
+    m, _ = topo
     m.eth_link_drop(256)  # the pre-lift high-water mark
-    assert "252 of 256" in m.eth_link_drop(252)
     ok, _ = await m._verify_fabric_health_body(60)
     assert ok is True
     # The first read after the lift sets the mark at the links it found, keyed to the bus map.
-    assert m.eth_link_drop(252) == ""
-    assert _baseline(tmp_path) == {"links": 252, "high_water": 256, "asic_bus": {"a": 0xC1}, "accepted": True}
-    assert m.eth_link_drop(252) == ""
-    # Still a high-water rule: a link lost after the re-baseline is a drop.
-    assert "250 of 252" in m.eth_link_drop(250)
+    assert m.eth_link_drop(256) == ""
+    assert _baseline(tmp_path) == {"links": 256, "high_water": 256, "asic_bus": {"a": 0xC1}}
+    # Never below the high-water mark (I71): a link lost after the re-baseline is a drop.
+    assert "252 of 256" in m.eth_link_drop(252)
     # A second lift on the same map keeps that mark rather than re-baselining onto the loss.
     await m._verify_fabric_health_body(60)
-    assert "250 of 252" in m.eth_link_drop(250)
+    assert "252 of 256" in m.eth_link_drop(252)
 
 
 @pytest.mark.asyncio
-async def test_trays_moving_again_drop_the_rebaseline_back_to_the_high_water_mark(accepted, tmp_path, monkeypatch):
-    m, _ = accepted
+async def test_trays_moving_again_drop_the_rebaseline_back_to_the_high_water_mark(topo, tmp_path, monkeypatch):
+    m, _ = topo
     m.eth_link_drop(256)
     await m._verify_fabric_health_body(60)
-    assert m.eth_link_drop(252) == ""
+    assert m.eth_link_drop(256) == ""
     monkeypatch.setattr(monitor_mod, "_asic_bus_map", lambda: {"a": 0x01})
     assert "252 of 256" in m.eth_link_drop(252)
     assert _baseline(tmp_path) == {"links": 256}
 
 
 @pytest.mark.asyncio
-async def test_a_clean_pass_without_the_marker_restores_the_high_water_rule(accepted, tmp_path, monkeypatch):
-    m, state = accepted
+async def test_a_clean_pass_without_the_marker_restores_the_high_water_rule(topo, tmp_path, monkeypatch):
+    m, state = topo
     m.eth_link_drop(256)
     await m._verify_fabric_health_body(60)
-    assert m.eth_link_drop(252) == ""
+    assert m.eth_link_drop(256) == ""
     assert (tmp_path / monitor_mod.TOPOLOGY_CACHE_FILE).exists()
 
     async def clean(argv, env, **kw):
@@ -232,7 +222,7 @@ async def test_a_clean_pass_without_the_marker_restores_the_high_water_rule(acce
 
     monkeypatch.setattr(fabric, "check", clean)
     # The cached mismatch is forgotten once the link count moves, so the descriptor runs again.
-    assert m.eth_link_drop(256) == ""
+    assert "252 of 256" in m.eth_link_drop(252)
     assert not (tmp_path / monitor_mod.TOPOLOGY_CACHE_FILE).exists()
     ok, detail = await m._verify_fabric_health_body(60)
     assert ok is True and "TOPOLOGY" not in detail

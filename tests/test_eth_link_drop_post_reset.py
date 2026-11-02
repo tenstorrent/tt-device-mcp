@@ -47,7 +47,6 @@ def replay(monkeypatch, tmp_path, mesh):  # noqa: F811
     monkeypatch.setattr(monitor_mod, "_asic_bus_map", lambda: {"a": 0xC1})
     monkeypatch.setattr(monitor_mod, "health_event", lambda ev, **f: mesh["mon_events"].append((ev, f)))
     monkeypatch.setattr(monitor_mod.alert, "send_alert", lambda ev, log=None: object())
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS", raising=False)
     monkeypatch.setattr(srv, "last_relift_monotonic", srv.last_relift_monotonic)
     for attr, value in (
         ("verify_eth_heartbeat", HealthMonitor.verify_eth_heartbeat.__get__(mon)),

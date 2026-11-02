@@ -312,7 +312,6 @@ def wrapper(monkeypatch, tmp_path, eth_mesh):  # noqa: F811
     m = srv.health_monitor
     monkeypatch.delattr(m, "verify_fabric_health")  # the monitor's real pass, not the fixture's stand-in
     monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "/opt/fabric-check.sh")
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS", raising=False)
     for attr, value in (
         ("topology_hw_fault", ""),
         ("topology_lift_pending", False),
@@ -442,20 +441,17 @@ async def test_a_latched_topology_hold_whose_bound_ladder_leaves_the_port_missin
     assert "topology_hw_fault" not in cleared
 
 
-@pytest.mark.parametrize("accepted", ["", "tray 1 QSFP_DD 2"])
-def test_a_shortfall_the_accept_list_names_reads_excused_not_short(monkeypatch, accepted):
-    """The fabric verdict every lift event carries (spec 03 I78). A shortfall whose every missing port
-    the operator's accept list names passed the check (I71): ``links_short`` is False and
-    ``excused_ports`` names them. Without the list the same marker is short and excuses nothing."""
+def test_a_shortfall_reads_short(monkeypatch):
+    """The fabric verdict every lift event carries (spec 03 I78). More ports missing than extra is
+    ``links_short`` (I71), whatever the pass said."""
     m = srv.health_monitor
-    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS", accepted)
     monkeypatch.setattr(m, "_fabric_verdict", {})
-    monkeypatch.setattr(m, "last_fabric_ok", bool(accepted))
+    monkeypatch.setattr(m, "last_fabric_ok", False)
     marker = fabric.topology_marker("d", 1, 0, (["tray 1 QSFP_DD 2"], []))
-    m._note_fabric_verdict(bool(accepted), f"fabric links healthy on discovered links (50s); {marker}")
+    m._note_fabric_verdict(False, f"fabric links healthy on discovered links (50s); {marker}")
     v = m.fabric_verdict()
-    assert v["missing_vs_cabling"] == 1 and v["links_short"] is (not accepted)
-    assert v.get("excused_ports", []) == (["tray 1 QSFP_DD 2"] if accepted else [])
+    assert v["missing_vs_cabling"] == 1 and v["links_short"] is True
+    assert "excused_ports" not in v
 
 
 SHORT = (False, f"{fabric.LINKS_MISSING}: {fabric.topology_marker('d', 1, 0, (['tray 1 QSFP_DD 2'], []))}")
@@ -468,7 +464,6 @@ def _verdict_events(monkeypatch, r) -> list:
     m = srv.health_monitor
     monkeypatch.setattr(m, "_fabric_verdict", {})
     monkeypatch.setattr(m, "last_fabric_ok", None)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS", raising=False)
 
     async def fabric_pass(*a, **k):
         r.order.append("fabric")

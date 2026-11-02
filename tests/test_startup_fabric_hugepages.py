@@ -1139,7 +1139,6 @@ async def test_the_crash_reset_keeps_the_hold_on_a_pass_with_links_missing(
     That check FAILED: the hold stays, its episode with it, and no lift path may clear it; the
     bounded recovery (the climb, then the I76 bound) owns it from here."""
     m, state = topo
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS", raising=False)
     state["first"] = _LOST  # the descriptor run: one QSFP-DD connection gone
     state["rerun"] = (0, "all links ok\n")  # the traffic-only rerun on the links that are left
     since = (datetime.now() - timedelta(seconds=galaxy_mod._present_mesh_reset_grace_sec() + 5)).isoformat()

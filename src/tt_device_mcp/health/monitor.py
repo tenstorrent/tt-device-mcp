@@ -372,8 +372,7 @@ class HealthMonitor:
         self.topology_hw_fault: str = ""
         self._topology_alerted: set[str] = set()
         # The last pass's port connections against the cabling descriptor, by name, for /health
-        # (spec 03 I71): ``{"verdict": "failed"|"lift", "missing_ports", "extra_ports", "accepted_ports",
-        # "marker"}``, ``accepted_ports`` naming the missing ports the accept list excused on a lift;
+        # (spec 03 I71): ``{"verdict": "failed"|"lift", "missing_ports", "extra_ports", "marker"}``;
         # empty after a clean pass on the full topology.
         self.fabric_topology: dict = {}
         # Whether the last fabric pass that ran reached no verdict (a 77). A job that then dies on the
@@ -709,24 +708,22 @@ class HealthMonitor:
             # A topology-mismatch lift re-baselined this host (I45): the mark belongs to the
             # chip-to-bus map it was taken on, and the pre-lift mark is kept as ``high_water``.
             high, keyed, pending = topo
-            accepted = bool(data.get("accepted"))
             if keyed != _asic_bus_map():
                 # Trays moved again since: the re-baseline no longer describes this mesh.
                 data, baseline = {"links": high}, high
                 _write_json(self.ETH_LINK_BASELINE_FILE, data)
-            elif pending and (accepted or measured >= high):
+            elif pending and measured >= high:
                 # The first read after the lift sets the mark at the links it discovered.
                 _write_json(
                     self.ETH_LINK_BASELINE_FILE,
-                    {"links": measured, "high_water": max(high, measured), "asic_bus": keyed, "accepted": accepted},
+                    {"links": measured, "high_water": max(high, measured), "asic_bus": keyed},
                 )
                 health_event("eth_link_rebaselined", links=measured, high_water=high)
                 self.last_eth_link_drop = ""
                 return ""
-            elif baseline < high and not accepted:
-                # Never down to a degraded count (I71): only a lift over ports the operator accepted
-                # as dead lowers the mark, so a lost link stays a drop for every later read. A mark a
-                # broker before I71 lowered reads at the high-water mark again.
+            elif baseline < high:
+                # Never down to a degraded count (I71): a lost link stays a drop for every later read.
+                # A mark an earlier broker lowered reads at the high-water mark again.
                 data, baseline = {**data, "links": high}, high
                 _write_json(self.ETH_LINK_BASELINE_FILE, data)
             elif measured != baseline:
@@ -761,10 +758,9 @@ class HealthMonitor:
             return None
         return high, keyed, bool(data.get("rebaseline"))
 
-    def _arm_eth_rebaseline(self, accepted: bool = False) -> None:
+    def _arm_eth_rebaseline(self) -> None:
         """A topology-mismatch lift: key the link mark to this chip-to-bus map and let the next read
-        set it at the links the traffic-only pass found, never below the high-water mark unless
-        ``accepted`` (a lift over ports the operator accepted as dead, I71). A map already
+        set it at the links the traffic-only pass found, never below the high-water mark (I71). A map already
         re-baselined the same way keeps its mark, so a link lost since then still reads as a drop."""
         now = _asic_bus_map()
         if not now:
@@ -775,12 +771,12 @@ class HealthMonitor:
             links = int(data.get("links", 0))
         except (OSError, ValueError, TypeError, AttributeError):
             data, topo, links = {}, None, 0
-        if topo is not None and topo[1] == now and bool(data.get("accepted")) == accepted:
+        if topo is not None and topo[1] == now:
             return
         high = max(links, topo[0] if topo else 0)
         _write_json(
             self.ETH_LINK_BASELINE_FILE,
-            {"links": high, "high_water": high, "asic_bus": now, "rebaseline": True, "accepted": accepted},
+            {"links": high, "high_water": high, "asic_bus": now, "rebaseline": True},
         )
 
     def _restore_eth_high_water(self) -> None:
@@ -1162,18 +1158,15 @@ class HealthMonitor:
         """The last fabric verdict, for the detail of every hold-lift and release event (spec 03 I78):
         ``result`` (pass/fail/skipped/none), ``missing_vs_cabling``/``extra_vs_cabling`` (port connections
         the links found lack, or add, against the cabling descriptor: 0/0 on a clean pass means every
-        cabled link was found), ``links_short`` (True when more are missing than extra and the operator's
-        accept list does not name every missing port, which FAILS the check, I71), ``excused_ports``
-        (only when that list turned a shortfall into a pass: the ports it excused) and ``age_s``. Only
+        cabled link was found), ``links_short`` (True when more are missing than extra, which FAILS the check,
+        I71) and ``age_s``. Only
         the shortfall is logged: the validator prints no link totals. ``result`` "none" once a reset
         voided it or before any check ran."""
         v = dict(self._fabric_verdict)
         if not v or self.last_fabric_ok is None and v["result"] != "skipped":
             return {"result": "none"}
         marker = v.pop("_marker", "")
-        v["links_short"] = bool(fabric.links_missing(marker, fabric.accepted_missing_ports()))
-        if v["missing_vs_cabling"] > v["extra_vs_cabling"] and not v["links_short"]:
-            v["excused_ports"] = sorted(fabric.marker_ports(marker)[0])
+        v["links_short"] = bool(fabric.links_missing(marker))
         v["age_s"] = round(time.monotonic() - v.pop("_at"), 1)
         return v
 
@@ -1307,7 +1300,7 @@ class HealthMonitor:
         # again and a reset that brought the link back reads clean.
         marker = fabric.find_topology_marker(text) if ok is True else None
         marker = fabric.with_ports(marker, text) if marker else None
-        lost = fabric.links_missing(marker, fabric.accepted_missing_ports()) if marker else ""
+        lost = fabric.links_missing(marker) if marker else ""
         if marker and not lost and self.topology_hw_fault:
             # The lift's first job already failed on these links (I42): a mismatch now FAILS, so the
             # ladder (a reset, then a power cycle) runs instead of a second lift.
@@ -1376,7 +1369,6 @@ class HealthMonitor:
                 "verdict": "failed",
                 "missing_ports": missing,
                 "extra_ports": extra,
-                "accepted_ports": [],
                 "marker": marker,
             }
             health_event("fabric_links_missing", detail=lost[:400], missing_ports=missing, extra_ports=extra)
@@ -1536,14 +1528,10 @@ class HealthMonitor:
         next job (the lift is bounded by that one job, see note_job_after_topology_lift)."""
         moved = moved_trays(_load_asic_bus_map(), _asic_bus_map())
         missing, extra = fabric.marker_ports(marker)
-        # A lift that would have FAILED without the accept list: the ports it excused, by name (I71).
-        excused = bool(fabric.links_missing(marker))
-        accepted = sorted(set(missing) & fabric.accepted_missing_ports()) if excused else []
         self.fabric_topology = {
             "verdict": "lift",
             "missing_ports": missing,
             "extra_ports": extra,
-            "accepted_ports": accepted,
             "marker": marker,
         }
         health_event(
@@ -1552,18 +1540,12 @@ class HealthMonitor:
             moved_trays=moved,
             missing_ports=missing,
             extra_ports=extra,
-            accepted_ports=accepted,
         )
         self.topology_lift_pending = True
-        # Only a lift over ports the operator accepted as dead may lower the link mark (I71).
-        self._arm_eth_rebaseline(accepted=excused)
+        self._arm_eth_rebaseline()
         log = self._logger()
         if log:
-            log.warning(
-                f"FABRIC TOPOLOGY MISMATCH: {marker}"
-                + (f"; moved: {', '.join(moved)}" if moved else "")
-                + (f"; excused by TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS: {', '.join(accepted)}" if accepted else "")
-            )
+            log.warning(f"FABRIC TOPOLOGY MISMATCH: {marker}" + (f"; moved: {', '.join(moved)}" if moved else ""))
         key = marker + "|" + ",".join(moved)
         if key not in self._topology_alerted:
             self._topology_alerted.add(key)

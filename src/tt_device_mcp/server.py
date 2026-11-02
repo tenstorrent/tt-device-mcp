@@ -4469,7 +4469,9 @@ async def selftest_eth_heartbeat() -> str:
                 + (
                     f" (retried every {ETH_CHECK_REARM_INTERVAL_SEC:.0f}s, idle or at a full health check)"
                     if eth_rearm_no_reader
-                    else " (retried at the next full health check or reset)" if eth_rearm_retryable else ""
+                    else " (retried at the next full health check or reset)"
+                    if eth_rearm_retryable
+                    else ""
                 )
                 + ", so a frozen core is left to the traffic pass, which can knock it off the PCIe bus "
                 "instead of naming it."
@@ -5208,7 +5210,7 @@ def _fabric_no_reset_hold() -> str:
 # full check counts fewer links (or ports) than the cabling expects.
 _FABRIC_LINK_SHORT_CAUSES = ("topology mismatch", "known fabric fault")
 # Spec 04 I83: the measured link-short causes, which keep the reset: the spec 03 I42 latch, and a full
-# check that failed on descriptor ports missing (spec 03 I71; ports the accept list excuses never fail).
+# check that failed on descriptor ports missing (spec 03 I71).
 _FABRIC_LINK_SHORT_LATCHED = "topology latch"
 _FABRIC_LINK_SHORT_MISSING = "fabric links missing"
 
@@ -7840,7 +7842,11 @@ async def device_health_gate(
                 (
                     "eth_timeout"
                     if eth_timeout_due
-                    else "job_killed" if kill_reset_due else "unhealthy" if not healthy else "dirty"
+                    else "job_killed"
+                    if kill_reset_due
+                    else "unhealthy"
+                    if not healthy
+                    else "dirty"
                 ),
                 job=dirty_job,
                 job_log=job_log_file,
@@ -9417,8 +9423,6 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
     # Spec 03 I71: the descriptor's port connections the last fabric pass found missing or extra, by
     # name; null after a clean pass on the full topology.
     payload["fabric_topology"] = (getattr(health_monitor, "fabric_topology", None) or None) if health_monitor else None
-    # Spec 03 I71: the ports an operator accepted as dead, so a lift on them is never silent.
-    payload["fabric_accepted_missing_ports"] = sorted(fabric.accepted_missing_ports())
     # Spec 03 I81: whether the pinned fabric validator is on disk (stat calls only), and what is missing.
     not_built = fabric.validator_not_built()
     payload["fabric_validator"] = {"built": not_built is None, "missing": not_built}
@@ -9530,7 +9534,9 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         cont = (
             {"continues_episode": device_hold_episode_since, "prior_reason": str(carry.get("reason") or "")}
             if carry
-            else {"carry_deferred": str(deferred.get("since") or "")} if isinstance(deferred, dict) else {}
+            else {"carry_deferred": str(deferred.get("since") or "")}
+            if isinstance(deferred, dict)
+            else {}
         )
         if carried is not None:
             health_event("device_held", reason=reason, carried_from=carried.get("iso") or carried.get("ts"), **cont)

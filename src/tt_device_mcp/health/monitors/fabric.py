@@ -172,26 +172,16 @@ def names_links_missing(text: str) -> bool:
     return LINKS_MISSING in (text or "")
 
 
-def accepted_missing_ports() -> frozenset[str]:
-    """Port connections an operator accepts as known dead (``TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS``,
-    comma-separated names exactly as the marker prints them). Empty by default: nothing is accepted."""
-    raw = os.environ.get("TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS", "")
-    return frozenset(" ".join(n.split()) for n in raw.split(",") if n.strip())
-
-
-def links_missing(marker: str, accepted: frozenset[str] = frozenset()) -> str:
+def links_missing(marker: str) -> str:
     """The FAILED detail for a topology marker whose descriptor ports are missing, else "".
 
     A moved tray renames its links (as many extra as missing, I42) and stays a lift. More missing
-    than extra means links are gone. Only an explicit accept list naming every missing port (all
-    names known, none cut off) turns that back into a lift (I71)."""
+    than extra means links are gone (I71)."""
     m = _MARKER_COUNTS.search(marker or "")
     if not m or int(m.group(1)) <= int(m.group(2)):
         return ""
     missing, extra = int(m.group(1)), int(m.group(2))
     names = marker_ports(marker)[0]
-    if accepted and len(names) == missing and set(names) <= accepted:
-        return ""
     named = f": {_names(names)}" if names else " (names not listed by the check)"
     return (
         f"{LINKS_MISSING}: {missing} port connection(s) of the cabling descriptor missing, {extra} extra, "

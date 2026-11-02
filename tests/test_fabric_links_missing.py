@@ -6,8 +6,7 @@
 Traffic that passes on the discovered links does not make a lost link healthy: a job that routes
 over the whole mesh (e.g. "Could not find any forwarding direction from src (M0, D0) to dst
 (M0, D28)") fails on it. So the check FAILS by port name, the hold keeps the reset ladder, the
-eth link mark is never lowered to the links that are left, and only an explicit accept list turns a
-known-dead port into a lift. No device is opened: the validator, the chip snapshot, the reset and
+eth link mark is never lowered to the links that are left. No device is opened: the validator, the chip snapshot, the reset and
 the alert hook are stand-ins."""
 
 import json
@@ -25,8 +24,6 @@ from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import monitor as monitor_mod
 from tt_device_mcp.health.monitor import HealthMonitor
 from tt_device_mcp.health.monitors import fabric
-
-ACCEPT = "TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS"
 
 
 def _baseline(tmp_path) -> dict:
@@ -74,18 +71,6 @@ def test_more_missing_than_extra_is_links_missing_and_a_moved_tray_is_not():
     assert fabric.links_missing(moved) == ""
 
 
-def test_only_an_explicit_accept_list_naming_every_missing_port_lifts(monkeypatch):
-    two = fabric.topology_marker("d", 2, 0, ([_LOST_PORT, "tray 1 QSFP_DD 1"], []))
-    monkeypatch.delenv(ACCEPT, raising=False)
-    assert fabric.accepted_missing_ports() == frozenset(), "the default accepts nothing"
-    monkeypatch.setenv(ACCEPT, f" {_LOST_PORT} ")
-    accepted = fabric.accepted_missing_ports()
-    assert fabric.links_missing(fabric.topology_marker("d", 1, 0, ([_LOST_PORT], [])), accepted) == ""
-    assert fabric.links_missing(two, accepted), "a port not on the list still fails"
-    # A count with no names (nothing to match) is never accepted.
-    assert fabric.links_missing(fabric.topology_marker("d", 1, 0), accepted)
-
-
 # --- the monitor ----------------------------------------------------------------------------------
 
 
@@ -96,7 +81,6 @@ async def test_a_lost_link_whose_rerun_passes_fails_the_check_and_names_the_port
     monkeypatch,
 ):
     m, state = topo
-    monkeypatch.delenv(ACCEPT, raising=False)
     state["first"] = _LOST
     m.eth_link_drop(256)
     ok, detail = await m._verify_fabric_health_body(60)
@@ -121,7 +105,6 @@ async def test_a_lost_link_whose_rerun_passes_fails_the_check_and_names_the_port
 @pytest.mark.asyncio
 async def test_an_override_wrapper_that_exits_0_on_a_lost_link_still_fails(topo, monkeypatch):  # noqa: F811
     m, _ = topo
-    monkeypatch.delenv(ACCEPT, raising=False)
 
     async def check(argv, env, **kw):
         return 0, f"{_LOST}TOPOLOGY MISMATCH vs d: 1 missing, 0 extra port connections\nall links ok\n"
@@ -135,18 +118,17 @@ async def test_an_override_wrapper_that_exits_0_on_a_lost_link_still_fails(topo,
 @pytest.mark.asyncio
 async def test_a_moved_tray_still_lifts_and_never_lowers_the_mark(topo, tmp_path, monkeypatch):  # noqa: F811
     m, state = topo
-    monkeypatch.delenv(ACCEPT, raising=False)
     m.eth_link_drop(256)
     ok, _ = await m._verify_fabric_health_body(60)
     assert ok is True and m.topology_lift_pending is True
     assert m.fabric_topology["verdict"] == "lift"
     assert m.fabric_topology["extra_ports"] == ["tray 3 port ?", "tray 4 port ?"]
-    assert "252 of 256" in m.eth_link_drop(252), "a lift without the accept list keeps the mark"
+    assert "252 of 256" in m.eth_link_drop(252), "a moved-tray lift keeps the mark"
     assert _baseline(tmp_path)["links"] == 256
 
 
 def test_a_mark_lowered_before_this_fix_is_restored(topo, tmp_path):  # noqa: F811
-    """A baseline an earlier lift wrote at 252 (no accept flag) reads 252 as a drop again."""
+    """A baseline an earlier lift wrote at 252 reads 252 as a drop again."""
     m, _ = topo
     (tmp_path / HealthMonitor.ETH_LINK_BASELINE_FILE).write_text(
         json.dumps({"links": 252, "high_water": 256, "asic_bus": {"a": 0xC1}})
@@ -179,52 +161,10 @@ def test_a_links_missing_hold_is_not_a_no_reset_topology_hold(monkeypatch):
     assert srv._fabric_no_reset_hold() == "", "the measured fault keeps the reset ladder (04 I30)"
 
 
-@pytest.mark.asyncio
-async def test_a_lift_the_accept_list_excused_names_the_accepted_ports(topo, monkeypatch):  # noqa: F811
-    """A lost link the operator's accept list excuses lifts, and the event, /health and
-    the broker log name the port the list excused; a moved tray excuses nothing."""
-    m, state = topo
-    lines = []
-
-    class _Log:
-        def warning(self, msg):
-            lines.append(msg)
-
-        info = error = warning
-
-    monkeypatch.setattr(m, "_logger", lambda: _Log())
-    monkeypatch.setenv(ACCEPT, f"{_LOST_PORT}, tray 9 port 9")
-    state["first"] = _LOST
-    m.eth_link_drop(256)
-    ok, _ = await m._verify_fabric_health_body(60)
-    assert ok is True and m.fabric_topology["verdict"] == "lift"
-    assert m.fabric_topology["accepted_ports"] == [_LOST_PORT], "only the missing port, not the whole list"
-    assert dict(state["events"])["fabric_topology_mismatch"]["accepted_ports"] == [_LOST_PORT]
-    assert any("TOPOLOGY MISMATCH" in ln and f"ACCEPT_MISSING_PORTS: {_LOST_PORT}" in ln for ln in lines)
-    monkeypatch.setattr(srv.health_monitor, "fabric_topology", m.fabric_topology)
-    assert srv._health_payload()["fabric_topology"]["accepted_ports"] == [_LOST_PORT]
-
-
-@pytest.mark.asyncio
-async def test_a_moved_tray_lift_excuses_no_port(topo, monkeypatch):  # noqa: F811
-    m, state = topo
-    monkeypatch.setenv(ACCEPT, _LOST_PORT)
-    ok, _ = await m._verify_fabric_health_body(60)
-    assert ok is True and m.fabric_topology["accepted_ports"] == []
-    assert dict(state["events"])["fabric_topology_mismatch"]["accepted_ports"] == []
-
-
 def test_health_names_the_ports(monkeypatch):
     topology = {"verdict": "failed", "missing_ports": [_LOST_PORT], "extra_ports": [], "marker": "m"}
     monkeypatch.setattr(srv.health_monitor, "fabric_topology", topology)
     assert srv._health_payload()["fabric_topology"]["missing_ports"] == [_LOST_PORT]
-
-
-def test_health_shows_the_accepted_ports(monkeypatch):
-    monkeypatch.delenv(ACCEPT, raising=False)
-    assert srv._health_payload()["fabric_accepted_missing_ports"] == [], "nothing is accepted by default"
-    monkeypatch.setenv(ACCEPT, f"{_LOST_PORT}, b")
-    assert srv._health_payload()["fabric_accepted_missing_ports"] == sorted([_LOST_PORT, "b"])
 
 
 @pytest.fixture
@@ -347,7 +287,6 @@ def _monitor_fabric(monkeypatch, tmp_path, st):
     monkeypatch.setattr(monitor_mod, "health_event", lambda ev, **f: st.setdefault("events", []).append(ev))
     monkeypatch.setattr(monitor_mod.alert, "send_alert", lambda ev, log=None: object())
     (hdir / monitor_mod.ASIC_BUS_FILE).write_text('{"a": 1}')
-    monkeypatch.delenv(ACCEPT, raising=False)
 
     async def verify(expected, log, run_fabric=True, **kw):
         st.setdefault("verifies", []).append(run_fabric)

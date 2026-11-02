@@ -750,8 +750,7 @@ async def test_an_offbus_hold_under_the_latch_is_not_this_class(monkeypatch, cle
 
 
 def test_a_missing_port_hold_needs_a_failed_full_check(monkeypatch, clear_job_state):
-    """(f) the missing-port class is a FAILED full check (spec 03 I71). A check that passed (ports the
-    accept list excuses never fail it) or one with no verdict is not this class."""
+    """(f) the missing-port class is a FAILED full check (spec 03 I71). A check that passed or one with no verdict is not this class."""
     _arm(monkeypatch, "missing ports")
     assert srv._fabric_link_short_hold() == "fabric links missing"
     monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", True)
