@@ -35,7 +35,7 @@ def _deadline_gauge() -> float:
     return metrics.REGISTRY.get_sample_value("tt_device_broker_offbus_operator_deadline_seconds")
 
 
-def _hold_gate(monkeypatch, tmp_path, *, held_sec, handoff=None, manual="exit 1", off_bus=1, cmd=None):
+def _hold_gate(monkeypatch, tmp_path, *, held_sec, manual="exit 1", off_bus=1, cmd=None):
     """An off-bus hold refused by a real ``hold`` gate (not a stub), no power cycle configured unless
     ``cmd`` names one."""
     hold_since, rec = _gated(monkeypatch, tmp_path, held_sec=held_sec, cmd=cmd, manual=manual)
@@ -44,10 +44,7 @@ def _hold_gate(monkeypatch, tmp_path, *, held_sec, handoff=None, manual="exit 1"
     monkeypatch.setattr(pcie_guard, "mask_for_mesh_reset", lambda log: None)
     monkeypatch.setattr(pcie_guard, "chips_off_bus", lambda expected: off_bus)
     monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "hold")
-    if handoff is None:
-        monkeypatch.delenv("TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC", raising=False)
-    else:
-        monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC", handoff)
+    monkeypatch.delenv("TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC", raising=False)
     return hold_since, rec
 
 
@@ -122,15 +119,11 @@ async def test_past_the_deadline_the_ladder_runs_with_the_gate_lifted_for_that_p
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("latch", ["handoff-off", "hang-latch"])
-async def test_an_operator_latch_keeps_the_hold_past_the_deadline(monkeypatch, tmp_path, clear_job_state, latch):
-    hold_since, rec = _hold_gate(
-        monkeypatch, tmp_path, held_sec=1300, handoff="off" if latch == "handoff-off" else None
-    )
-    if latch == "hang-latch":
-        # A fresh latch: well inside its I25 ceiling, so expire_offbus_reset_latch keeps it.
-        latch_rec = {"boot_id": "b", "since": hold_since, "latched_at_epoch": time.time()}
-        monkeypatch.setattr(pcie_guard, "offbus_reset_latched", lambda: latch_rec)
+async def test_an_operator_latch_keeps_the_hold_past_the_deadline(monkeypatch, tmp_path, clear_job_state):
+    hold_since, rec = _hold_gate(monkeypatch, tmp_path, held_sec=1300)
+    # A fresh latch: well inside its I25 ceiling, so expire_offbus_reset_latch keeps it.
+    latch_rec = {"boot_id": "b", "since": hold_since, "latched_at_epoch": time.time()}
+    monkeypatch.setattr(pcie_guard, "offbus_reset_latched", lambda: latch_rec)
     counters = {"resets": 0}
     seen = _gate_seen_by_reset(monkeypatch, counters)
     for _ in range(2):
@@ -185,7 +178,7 @@ def test_the_handoff_knob(monkeypatch):
         monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC", bad)
         assert opc.hold_handoff_sec() == 1200
     monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC", "OFF")
-    assert opc.hold_handoff_sec() is None
+    assert opc.hold_handoff_sec() == 1200, "no value keeps the hold from the broker's own ladder"
 
 
 # ---- goal: no lifted reset releases the device before the full health check, fabric included ----

@@ -364,19 +364,16 @@ def rearm_after_partial_reset(episode: str) -> None:
         _pending["spawned"] = False
 
 
-def hold_handoff_sec() -> Optional[int]:
+def hold_handoff_sec() -> int:
     """Seconds, from the episode start, an off-bus hold the gate refuses with no power cycle configured
     stands for an operator before the broker lifts the gate for its own ladder (spec 04 I33). A
-    non-positive or malformed value reads as 1200; ``off`` is the operator's latch: None, never lifted."""
-    if os.environ.get("TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC", "").strip().lower() == "off":
-        return None
+    non-positive or malformed value reads as 1200."""
     return _int_env("TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC", HOLD_HANDOFF_DEFAULT_SEC)
 
 
 def _handoff_deadline(episode: str) -> Optional[float]:
-    sec = hold_handoff_sec()
     try:
-        return None if sec is None else datetime.fromisoformat(episode).timestamp() + sec
+        return datetime.fromisoformat(episode).timestamp() + hold_handoff_sec()
     except (TypeError, ValueError):
         return None
 
@@ -399,7 +396,7 @@ def note_hold_handoff(
         _pending["handoff"] = {
             "deadline": deadline,
             "why": why,
-            "latched": latched or ("" if deadline else "TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC=off"),
+            "latched": latched or ("" if deadline else "its start time is unreadable"),
             "operator_seen": seen or ("none seen" if argv is not None else "no manual-recovery check configured"),
         }
         metrics.offbus_operator_deadline(deadline or 0)

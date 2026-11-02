@@ -23,7 +23,6 @@ from tests.test_ladder_v2 import _ev
 from tt_device_mcp import alert
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
-from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy, pcie_guard
 from tt_device_mcp.health.recovery import offbus_power_cycle as opc
 

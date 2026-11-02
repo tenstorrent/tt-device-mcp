@@ -124,13 +124,9 @@ def _reboot_min_dead_chips(expected: int) -> int:
 
 def _hold_gate_liftable() -> bool:
     """The gate refuses off-bus resets only because ``TT_DEVICE_MCP_HOST_RESET_GATE=hold`` is configured:
-    no I25 host-hang latch and no ``TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC=off``. Only such a hold's
-    operator hand-off ends in the broker's own ladder (spec 04 I33)."""
-    return (
-        pcie_guard.offbus_reset_latched() is None
-        and pcie_guard.gate_mode() == pcie_guard.GATE_HOLD
-        and offbus_power_cycle.hold_handoff_sec() is not None
-    )
+    and no I25 host-hang latch. Only such a hold's operator hand-off ends in the broker's own ladder
+    (spec 04 I33)."""
+    return pcie_guard.offbus_reset_latched() is None and pcie_guard.gate_mode() == pcie_guard.GATE_HOLD
 
 
 def _galaxy_reset_min_dead_chips(expected: int) -> Optional[int]:
@@ -3395,9 +3391,8 @@ class GalaxyRecovery(Recovery):
         configured ``hold`` gate refuses, with no power cycle to end it, has outlived its operator
         hand-off, the pass runs with the gate lifted (spec 04 I33): the ladder's own rungs (the bridge
         reset, then the mesh reset) may fire, each followed by the full health check, fabric included,
-        before anything releases the device. An operator latch (the I25 host-hang latch,
-        ``TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC=off``) or a manual-recovery check that says an operator
-        is acting keeps the hold."""
+        before anything releases the device. The I25 host-hang latch or a manual-recovery check that
+        says an operator is acting keeps the hold."""
         lift = await self._offbus_hold_lift(expected, log)
         if not lift:
             return await self._climb_offbus_stuck_hold(indices, expected, log, force=force)
@@ -3443,7 +3438,7 @@ class GalaxyRecovery(Recovery):
                 offbus_power_cycle.episode_age_sec(hold_since) or 0.0,
                 log,
                 standback,
-                bound=offbus_power_cycle.hold_handoff_sec() or 0,
+                bound=offbus_power_cycle.hold_handoff_sec(),
                 off_bus=off_bus,
             )
             return ""

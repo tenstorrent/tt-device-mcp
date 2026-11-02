@@ -19,10 +19,8 @@ import pytest
 
 from tests.test_device_safety import _ledger_dir
 from tests.test_ladder_v2 import _wire_failed_climb
-from tests.test_offbus_power_cycle import _gated, _ladder_ran, _pass
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.recovery import base as recovery_base
-from tt_device_mcp.health.recovery import offbus_power_cycle as opc
 
 DAY = 1_760_486_400.0  # a fixed midnight; only differences matter
 

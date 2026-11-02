@@ -267,6 +267,7 @@ async def test_the_prelude_changes_no_ladder_input(rig, monkeypatch, stage, rung
     assert rig["order"][:2] == ["rescan", "capture"]
     g.tray_down_episode_end()
     rig["order"].clear()
+
     async def no_onset(*a, **k):
         return None
 

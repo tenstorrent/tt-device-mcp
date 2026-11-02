@@ -583,7 +583,7 @@ each rung fires only when the gentler one failed or cannot apply.
   `TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC` (default 300 s), a partial off-bus drop (any drop that is
   not exactly one or more whole trays by the I16 map, or with no map) first gets one pass of the
   ladder's own rungs, the mesh reset included, with the `hold` gate read as `guard` for that pass
-  only, once per episode, unless an I25 latch, `TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC=off` or a
+  only, once per episode, unless an I25 latch or a
   stand-back keeps the gate shut. The pass is spent only once its climb has passed the climb's own
   guards (the ceiling for a pass the watchdog did not force, the episode latch, a reset cycling in
   its own scope, a tenant, the reset cooldown) and reached the rungs: a pass those guards decline
@@ -794,9 +794,8 @@ each rung fires only when the gentler one failed or cannot apply.
   that pass runs with the gate's off-bus refusal lifted for that pass only (`hold` reads as `guard`:
   the AER flood checks still refuse): the ladder's own rungs (the bridge reset, then the mesh reset)
   may fire as I22 allows, and outside the pass the gate holds again. Nothing lifts the gate while an
-  operator owns the hold: `TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC=off` (the operator's latch: the page
-  says the hold stands until an operator recovers the host, and `act_by` is null), the I25 host-hang
-  latch, a stand-back path or command (I27), or a manual-recovery check that exits 0; a stand-back
+  operator owns the hold: the I25 host-hang latch (the page says the hold stands until an operator
+  recovers the host, and `act_by` is null), a stand-back path or command (I27), or a manual-recovery check that exits 0; a stand-back
   past the deadline pages once (`offbus_power_cycle_blocked`). A missing manual-recovery check does
   not stand back here: this lifts a mesh reset, not a power cycle. Every reset a lifted pass fires owes
   the I32 fabric debt, so the device is released only after the full health check, fabric included,
@@ -3350,9 +3349,9 @@ sees a silent fabric pass.
 | I32 no rung outcome lifts the funnel's hold: the last-chance sweep on a fabric 77, no verdict or an unavailable check holds fabric-unverified with no host rung; a 77-only hold never goes DOWN | `tests/test_post_reset_gate.py::test_the_gate_ladders_last_chance_sweep`, `::test_no_rung_outcome_lifts_a_fabric_unverified_hold`, `::test_a_terminal_rung_on_a_measured_fault_still_goes_down`, `::test_every_rung_outcome_folds_through_the_helper` |
 | I32a a reset drops the pre-reset fabric FAIL: a post-reset 77 holds RECOVERING (bounded), never DOWN | `tests/test_post_reset_gate.py::test_the_measured_fabric_failure_reset_on_the_first_relift` |
 | I32 the post-job gate runs the pass only while a reset owes one, never pre-job; the I40 fallback climbs instead of releasing an owed reset | `tests/test_post_reset_gate.py::test_a_clean_post_job_gate_with_no_debt_runs_no_fabric_pass`, `::test_a_post_job_gate_owed_a_fabric_pass_runs_it_and_settles`, `::test_a_pre_job_gate_never_runs_the_owed_pass`, `::test_the_77_fallback_never_releases_a_reset_with_no_passing_fabric_pass` |
-| I33 no power cycle configured: the gated off-bus hold is handed to an operator once per episode (one page, the deadline gauge, `/health` `operator_handoff`), which end with the hold; the knob's default, `off` and malformed values | `tests/test_gated_hold_handoff.py::test_the_hold_is_handed_to_an_operator_once_with_a_deadline`, `::test_the_handoff_knob` |
+| I33 no power cycle configured: the gated off-bus hold is handed to an operator once per episode (one page, the deadline gauge, `/health` `operator_handoff`), which end with the hold; the knob's default and malformed values | `tests/test_gated_hold_handoff.py::test_the_hold_is_handed_to_an_operator_once_with_a_deadline`, `::test_the_handoff_knob` |
 | I33 before the deadline the gate holds; past it the watchdog forces one pass, and only that pass runs the ladder with the gate lifted | `tests/test_gated_hold_handoff.py::test_before_the_deadline_the_gate_holds_and_no_reset_fires`, `::test_the_watchdog_forces_one_pass_at_the_handoff_bound`, `::test_past_the_deadline_the_ladder_runs_with_the_gate_lifted_for_that_pass_only` |
-| I33 an operator latch (`off`, the I25 latch) or an operator at work keeps the hold past the deadline | `tests/test_gated_hold_handoff.py::test_an_operator_latch_keeps_the_hold_past_the_deadline`, `::test_an_operator_at_work_keeps_the_gate_shut` |
+| I33 an operator latch (the I25 latch) or an operator at work keeps the hold past the deadline | `tests/test_gated_hold_handoff.py::test_an_operator_latch_keeps_the_hold_past_the_deadline`, `::test_an_operator_at_work_keeps_the_gate_shut` |
 | I33 / I32 a lifted reset releases only after a passing full health check, fabric included; a reset the gate still refuses releases nothing | `tests/test_gated_hold_handoff.py::test_the_lifted_mesh_reset_releases_only_after_a_passing_fabric_check`, `::test_a_reset_the_gate_still_refuses_releases_nothing` |
 | I34 a requested power cycle or reboot suppresses every hold-deadline tick and a forced escalation waiting on the lock; the device stays held with the check owed; one line per request | `tests/test_host_action_suppress.py::test_power_cycle_request_suppresses_every_deadline_tick`, `::test_reboot_request_suppresses_the_deadline_tick`, `::test_escalation_waiting_on_the_lock_runs_no_rung` |
 | I34 bounded: a refused or failed request never suppresses; an expired one resumes the ladder; the window is always finite | `tests/test_host_action_suppress.py::test_power_cycle_that_fails_to_launch_does_not_suppress`, `::test_power_cycle_refused_by_the_ledger_does_not_suppress`, `::test_a_request_the_host_never_acted_on_expires_and_the_ladder_resumes`, `::test_pending_window_is_always_finite` |
