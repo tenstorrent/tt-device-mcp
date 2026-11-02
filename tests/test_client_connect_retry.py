@@ -17,8 +17,7 @@ from tt_device_mcp import utils
 
 @pytest.fixture(autouse=True)
 def _fast(monkeypatch):
-    monkeypatch.setenv(utils.CONNECT_DELAY_ENV, "0")
-    monkeypatch.delenv(utils.CONNECT_RETRIES_ENV, raising=False)
+    monkeypatch.setattr(utils, "DEFAULT_CONNECT_DELAY_SEC", 0)
 
 
 @pytest.fixture
@@ -69,7 +68,7 @@ def test_retry_then_success(monkeypatch, tmp_path, capsys):
 def test_retries_exhausted_same_error(monkeypatch, tmp_path):
     path = str(tmp_path / "missing.sock")
     monkeypatch.setattr(utils, "resolve_socket", lambda *a: path)
-    monkeypatch.setenv(utils.CONNECT_RETRIES_ENV, "3")
+    monkeypatch.setattr(utils, "DEFAULT_CONNECT_RETRIES", 3)
     sleeps = []
     monkeypatch.setattr(utils.time, "sleep", sleeps.append)
     res = utils.api_call(0, "/x")
@@ -158,7 +157,7 @@ def test_health_probe_fails_fast_without_retry(monkeypatch, tmp_path, capsys, ki
 
     path = _refused_socket(tmp_path) if kind == "refused" else str(tmp_path / "none.sock")
     monkeypatch.setattr(health_probe, "DEFAULT_SOCKET", path)
-    monkeypatch.delenv(utils.CONNECT_DELAY_ENV)  # real 1 s default: a retry would show
+    monkeypatch.setattr(utils, "DEFAULT_CONNECT_DELAY_SEC", 1.0)  # real 1 s default: a retry would show
     sleeps = []
     monkeypatch.setattr(utils.time, "sleep", sleeps.append)
     attempts = _count_attempts(monkeypatch)

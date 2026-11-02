@@ -36,8 +36,6 @@ def mon(monkeypatch, health_deps):
     monkeypatch.setattr(fabric, "_validator_paths", lambda: ("bin", "root", ""))
     monkeypatch.setattr(monitor_mod, "_save_asic_bus_map", lambda: None)
     monkeypatch.setattr(monitor_mod, "health_event", lambda ev, **f: state["events"].append(ev))
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_ROUTE_FAULT_JOBS", raising=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_KNOWN_FAULT_HOLD_SEC", raising=False)
     return m, state
 
 
@@ -94,7 +92,7 @@ def test_the_known_fault_is_bounded_and_rearms_one_short(mon, monkeypatch):
     """Past its bound the fault expires so the usual 77 path gets one more try; the streak is left one
     short, so the next job that dies the same way declares it again at once."""
     m, state = mon
-    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_KNOWN_FAULT_HOLD_SEC", "600")
+    monkeypatch.setattr(monitor_mod, "FABRIC_KNOWN_FAULT_HOLD_SEC", 600)
     m.last_fabric_skipped = True
     m._fabric_route_fault_streak = 1
     assert m.note_job_fabric_route_fault(True, _ROUTE)

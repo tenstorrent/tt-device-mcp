@@ -6564,13 +6564,6 @@ async def test_a_fail_closed_gate_holds_the_idle_self_test_off_until_it_ends(mon
         await asyncio.gather(runner, return_exceptions=True)
 
 
-@pytest.mark.parametrize("raw, want", [("", 800), ("950", 950), ("fast", 800), ("0", 800), ("-5", 800)])
-def test_idle_aiclk_ceiling_falls_back_on_a_bad_value(monkeypatch, raw, want):
-    """A bad TT_DEVICE_MCP_IDLE_AICLK_MAX_MHZ must not stop the broker from importing."""
-    monkeypatch.setenv("TT_DEVICE_MCP_IDLE_AICLK_MAX_MHZ", raw)
-    assert srv._idle_aiclk_max_mhz() == want
-
-
 def test_aiclk_left_busy_names_only_chips_above_the_idle_clock(monkeypatch):
     """03 B-post-job clock check. A chip still at the busy clock once nothing holds it was not
     closed. Values it cannot read are not evidence either way."""
@@ -14569,7 +14562,6 @@ def _stale_healthy_device(monkeypatch, *, age_sec: float, present: int = 32):
     """A HEALTHY 32-chip host whose last gate verdict is ``age_sec`` old."""
     fsm_healthy(srv)
     monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
-    monkeypatch.delenv("TT_DEVICE_MCP_DISPATCH_RECHECK_SEC", raising=False)
     monkeypatch.setattr(srv, "_last_dispatch_recheck_at", None)
     monkeypatch.setattr(
         srv.health_monitor,
@@ -15443,11 +15435,6 @@ async def test_the_dispatch_recheck_off_switch_tenant_and_errors(monkeypatch):
     monkeypatch.setattr(srv, "heartbeat_verdict", _healthy)
     monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", _no_eth)
 
-    monkeypatch.setenv("TT_DEVICE_MCP_DISPATCH_RECHECK_SEC", "0")
-    await srv._ensure_device_clean_for_next_job(None)
-    assert beats == [], "a window of 0 turns the recheck off"
-
-    monkeypatch.delenv("TT_DEVICE_MCP_DISPATCH_RECHECK_SEC")
     for scan in (
         HolderScan(holders=[DeviceHolder(pid=4242, uid=1000)], complete=True),
         HolderScan(holders=[], complete=False),

@@ -581,25 +581,6 @@ async def test_the_77_only_relift_reruns_the_fabric_pass_and_never_resets(monkey
 # --- I48: a 77-only hold re-checks on a backoff ------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "raw,steps",
-    [
-        (None, [120, 300, 600, 1200]),
-        ("90,240", [90, 240]),
-        ("5,5000", [60, 1200]),
-        ("2m,5m", [120, 300, 600, 1200]),
-        (" , ", [120, 300, 600, 1200]),
-    ],
-)
-def test_the_77_backoff_parses_and_clamps(monkeypatch, raw, steps):
-    """Each step clamps to 60..1200 s; a malformed or empty value reads as the default."""
-    if raw is None:
-        monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raising=False)
-    else:
-        monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raw)
-    assert srv._fabric_77_backoff_sec() == steps
-
-
 def _opened_ago(monkeypatch, seconds):
     since = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
     monkeypatch.setattr(srv.fsm, "_record", dataclasses.replace(srv.fsm.record, since=since))
@@ -610,8 +591,7 @@ async def test_the_77_only_relift_reruns_the_pass_only_once_its_step_is_due(monk
     """I48: before the first step the relift skips the pass; once due it runs it once, and the 77 it
     reads again moves the next re-check to the second step."""
     _hold_77(monkeypatch, tmp_path, due=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raising=False)
-    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", "99")
+    monkeypatch.setattr(srv, "FABRIC_77_MAX_RETRIES", 99)
     seen = []
 
     async def verify(expected, log, run_fabric=True, **_):
@@ -641,7 +621,6 @@ async def test_the_77_only_relift_reruns_the_pass_only_once_its_step_is_due(monk
 def test_a_77_recheck_advances_the_backoff_step(monkeypatch, tmp_path, clear_job_state):
     """Each re-check that 77s again moves to the next step; the last step repeats; a new episode starts over."""
     _hold_77(monkeypatch, tmp_path, due=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raising=False)
 
     def due_after(seconds):
         monkeypatch.setattr(srv, "_fabric_77_recheck_monotonic", srv.time.monotonic() - seconds)
@@ -672,8 +651,6 @@ async def test_a_hugepage_77_rechecks_every_30s_and_spends_no_retry(monkeypatch,
     not on the 120 s relift interval or the I48 backoff, and its re-checks do not spend the I40 retries
     that would release a box no job can open yet."""
     _hold_77(monkeypatch, tmp_path, due=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raising=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", raising=False)
     monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
     monkeypatch.setattr(srv, "_fabric_77_streak", 0)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_skipped", True)
@@ -728,8 +705,6 @@ def test_the_77_age_bound_counts_from_the_fsm_stamp(monkeypatch, tmp_path, clear
     """I40's age bound ends a hold the retries do not: a hugepage 77 spends none, so only the age
     ends it. The bound reads the FSM's own ``...Z`` stamp."""
     _hold_77(monkeypatch, tmp_path)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", raising=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BOUND_SEC", raising=False)
     monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
     monkeypatch.setattr(srv, "_fabric_77_streak", 0)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_skipped", True)
@@ -747,7 +722,6 @@ def test_an_unparseable_stamp_falls_back_to_the_retry_count(monkeypatch, tmp_pat
     """A ``since`` the bound cannot read must not hold forever: each 77, a hugepage one too, then
     counts as a retry, so the retry bound still ends the hold."""
     _hold_77(monkeypatch, tmp_path)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", raising=False)
     monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
     monkeypatch.setattr(srv, "_fabric_77_streak", 0)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_skipped", True)
@@ -761,8 +735,6 @@ async def test_a_hugepage_77_hold_past_its_age_bound_takes_the_fallback(monkeypa
     """A pool that never fills does not hold forever: past the age bound the relift's hugepage 77
     hands over to the I40 fallback."""
     _hold_77(monkeypatch, tmp_path)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", raising=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BOUND_SEC", raising=False)
     monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
     monkeypatch.setattr(srv, "_fabric_77_streak", 0)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_skipped", True)
@@ -1517,7 +1489,7 @@ def test_an_owed_pass_does_not_carry_to_another_episode(monkeypatch, tmp_path, c
 
 def _bound(monkeypatch, tmp_path, eth):
     _hold_77(monkeypatch, tmp_path)
-    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", "1")
+    monkeypatch.setattr(srv, "FABRIC_77_MAX_RETRIES", 1)
 
     async def verify(expected, log, run_fabric=True, **_):
         return True, {"snapshot": {"ok": True}, "fabric": {"ok": None, "detail": "could not run (77)"}}
@@ -1643,7 +1615,7 @@ async def test_after_an_unknown_reset_the_next_relift_77_reaches_the_bound(
     ladder (never a release on the startup checks, 03 I78). Without them, the same relift is still
     under the default bound and just holds."""
     rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", raising=False)
+    monkeypatch.setattr(srv, "FABRIC_77_MAX_RETRIES", 3)
     monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
     monkeypatch.setattr(srv, "_fabric_77_streak", 0)
     if reset_passes:
@@ -1682,7 +1654,7 @@ async def test_a_topology_mismatch_whose_rerun_77s_takes_the_bounded_fallback(
 @pytest.mark.asyncio
 async def test_a_77_only_hold_under_its_bound_still_just_holds(monkeypatch, tmp_path, clear_job_state):
     rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
-    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", "5")
+    monkeypatch.setattr(srv, "FABRIC_77_MAX_RETRIES", 5)
     await srv._attempt_idle_relift()
     assert rungs == []
     assert srv.fsm.state is ServerState.RECOVERING

@@ -221,17 +221,6 @@ def test_retention_never_prunes_a_tracked_or_fresh_log(tmp_path):
     assert [p.name[-7:] for p in gone] == ["003.log"]
 
 
-def test_retention_defaults_and_overrides(monkeypatch):
-    monkeypatch.delenv("TT_DEVICE_MCP_JOB_LOG_KEEP", raising=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_JOB_LOG_MAX_MB", raising=False)
-    assert store.job_log_limits() == (store.JOB_LOG_KEEP_DEFAULT, store.JOB_LOG_MAX_MB_DEFAULT << 20)
-    monkeypatch.setenv("TT_DEVICE_MCP_JOB_LOG_KEEP", "50")
-    monkeypatch.setenv("TT_DEVICE_MCP_JOB_LOG_MAX_MB", "junk")
-    assert store.job_log_limits() == (50, store.JOB_LOG_MAX_MB_DEFAULT << 20)
-    monkeypatch.setenv("TT_DEVICE_MCP_JOB_LOG_KEEP", "0")
-    assert store.job_log_limits()[0] == store.JOB_LOG_KEEP_DEFAULT
-
-
 def test_read_log_tail_edge_cases(tmp_path):
     p = tmp_path / "a.log"
     p.write_bytes(b"")

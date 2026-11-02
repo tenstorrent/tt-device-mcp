@@ -80,7 +80,6 @@ def cable(monkeypatch, health_deps, tmp_path):
     monkeypatch.setattr(monitor_mod, "_save_asic_bus_map", lambda: None)
     monkeypatch.setattr(monitor_mod, "capture_incident", lambda *a, **k: None)
     monkeypatch.setattr(monitor_mod, "health_event", lambda ev, **f: state["events"].append((ev, f)))
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_KNOWN_FAULT_HOLD_SEC", raising=False)
     return m, state
 
 

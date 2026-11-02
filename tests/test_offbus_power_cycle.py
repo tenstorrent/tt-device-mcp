@@ -38,11 +38,7 @@ def _gated(monkeypatch, tmp_path, *, held_sec=600, cmd="/usr/local/sbin/host-pow
     Returns (hold_since, rec) where rec collects the fake fires (each with the state file as it stood
     when the command ran), alerts and journal events."""
     _arm_offbus_stuck_hold(monkeypatch, off_bus=OFF_BUS, isolated=set(), reset_result=False)
-    for name in (
-        "TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC",
-        "TT_DEVICE_MCP_MANUAL_RECOVERY_CMD",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", raising=False)
     if cmd is None:
         monkeypatch.delenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", raising=False)
     else:
@@ -254,16 +250,6 @@ async def test_a_blocked_power_cycle_pages_once_past_its_bound(monkeypatch, tmp_
     assert rec["fires"] == []
 
 
-def test_the_blocked_page_bound_defaults_and_rejects_nonsense(monkeypatch):
-    monkeypatch.delenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC", raising=False)
-    assert opc.blocked_page_sec() == 1800
-    for bad in ("0", "-1", "later"):
-        monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC", bad)
-        assert opc.blocked_page_sec() == 1800
-    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC", "600")
-    assert opc.blocked_page_sec() == 600
-
-
 @pytest.mark.asyncio
 async def test_a_latch_never_blocks_a_rung_after_its_boot_nor_the_power_cycle_on_it(
     monkeypatch, tmp_path, clear_job_state
@@ -447,7 +433,6 @@ def test_fire_command_never_runs_the_command_under_a_live_os(tmp_path, monkeypat
 
 def test_due_for_the_watchdog_once_per_episode(monkeypatch):
     monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", "/bin/true")
-    monkeypatch.delenv("TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC", raising=False)
     since = datetime(2026, 10, 13, 19, 29, 0)
     ep = since.isoformat()
     assert not opc.due_for_watchdog(ep, since + timedelta(seconds=400)), "not armed"
@@ -488,14 +473,7 @@ def test_the_hold_watchdog_forces_one_pass_at_the_grace(monkeypatch, clear_job_s
     assert fired == [True], "one forced pass per episode from the grace"
 
 
-def test_the_knobs_default_and_reject_nonsense(monkeypatch):
-    monkeypatch.delenv("TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC", raising=False)
-    assert opc.grace_sec() == 300
-    for bad in ("0", "-5", "soon", ""):
-        monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC", bad)
-        assert opc.grace_sec() == 300
-    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC", "90")
-    assert opc.grace_sec() == 90
+def test_a_blank_or_unparseable_power_cycle_command_is_none(monkeypatch):
     monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", "")
     assert opc.power_cycle_argv() is None
     monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", "cycle 'unterminated")

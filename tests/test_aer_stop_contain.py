@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from tests.conftest import fsm_dirty
+from tests.conftest import fsm_dirty, settle_isolations
 from tests.test_aer_check_stop import _sig
 from tests.test_deadchip_detach_before_kill import FABRIC, TENANT, valve  # noqa: F401 - the fixture
 from tests.test_offbus_early_watch import _Clock
@@ -82,7 +82,7 @@ async def _contain(burst):
     fut = srv.sampler.aer_containment
     assert fut is not None, "the containment was handed to the loop"
     await asyncio.wait_for(asyncio.wrap_future(fut), 10)
-    await asyncio.wait_for(srv.sampler.settle_isolations(), 10)
+    await asyncio.wait_for(settle_isolations(srv.sampler), 10)
     return reason
 
 
@@ -334,7 +334,7 @@ async def test_overlapping_valve_runs_kill_nobody_before_every_all_ones_chip_is_
         gate.set()
         gate2.set()
     await asyncio.wait_for(asyncio.gather(*runs), 15)
-    await asyncio.wait_for(srv.sampler.settle_isolations(), 15)
+    await asyncio.wait_for(settle_isolations(srv.sampler), 15)
     last = max(log.index(("detached", "13")), log.index(("detached", "14")))
     early = [e for e in log[:last] if e[0] in ("kill", "pollers")]
     assert not early, f"a kill or poller stop came while an all-ones chip was attached: {log}"

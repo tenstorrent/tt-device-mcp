@@ -125,9 +125,9 @@ def reset_broker_internal_pids():
     spawned through run_probe must not discount a holder in the next."""
     from tt_device_mcp import device_holders
 
-    device_holders._clear_broker_internal()
+    device_holders._broker_internal.clear()
     yield
-    device_holders._clear_broker_internal()
+    device_holders._broker_internal.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -1318,3 +1318,9 @@ def armed_power_cycle(monkeypatch):
     monkeypatch.setattr(privileges, "can_ipmi", lambda: True)
     monkeypatch.setattr(srv, "_fire_power_cycle", lambda: fired.append("power-cycle"))
     return fired
+
+
+async def settle_isolations(sampler) -> None:
+    """Wait for every detached holder release wait to finish."""
+    while sampler.isolations:
+        await asyncio.gather(*list(sampler.isolations), return_exceptions=True)

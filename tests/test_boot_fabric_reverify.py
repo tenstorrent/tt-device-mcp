@@ -157,7 +157,7 @@ async def test_a_reopened_hold_that_77s_again_is_held_without_a_reset_then_bound
     climbs, even on a healthy eth read, since the startup checks never lift a hold (03 I78)."""
     _events, seen = await _reopened(monkeypatch, tmp_path)
     monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_RELIFT", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", "2")
+    monkeypatch.setattr(srv, "FABRIC_77_MAX_RETRIES", 2)
     monkeypatch.setattr(srv, "_fabric_77_recheck_due", lambda: True)
 
     async def eth_read(*a, **k):
@@ -180,7 +180,7 @@ async def test_a_reopened_hold_that_77s_again_is_held_without_a_reset_then_bound
 async def test_a_reopened_known_fabric_fault_is_held_without_a_climb(monkeypatch, tmp_path, clear_job_state):
     """03 I46: a known fabric fault stays held past the bound: no release, no rung, no reset."""
     _events, seen = await _reopened(monkeypatch, tmp_path)
-    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", "1")
+    monkeypatch.setattr(srv, "FABRIC_77_MAX_RETRIES", 1)
     monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "known fabric fault: 2 jobs in a row")
 
     async def eth_read(*a, **k):

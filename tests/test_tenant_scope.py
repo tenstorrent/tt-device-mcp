@@ -37,9 +37,11 @@ def scope_proc(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _fresh_tenant_uid_cache():
-    dh._clear_tenant_uid_cache()
+    dh._tenant_uid_cache.clear()
+    dh._tenant_uid_warned.clear()
     yield
-    dh._clear_tenant_uid_cache()
+    dh._tenant_uid_cache.clear()
+    dh._tenant_uid_warned.clear()
 
 
 # ------------------------------------------------------------------ scope detection

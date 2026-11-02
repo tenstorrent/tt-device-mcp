@@ -159,20 +159,6 @@ def test_an_unreadable_holder_record_is_unknown(proc, monkeypatch):
 # --- cadence and lifetime ------------------------------------------------------------------------
 
 
-def test_the_cadence_and_threshold_default_to_one_second(monkeypatch):
-    monkeypatch.delenv("TT_DEVICE_MCP_ACTIVITY_INTERVAL_SEC", raising=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_DEVICE_IDLE_AFTER_SEC", raising=False)
-    assert device_activity.interval_sec() == 1.0
-    assert device_activity.idle_after_sec() == 1.0
-    monkeypatch.setenv("TT_DEVICE_MCP_ACTIVITY_INTERVAL_SEC", "0.25")
-    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_IDLE_AFTER_SEC", "30")
-    assert device_activity.interval_sec() == 0.25
-    assert device_activity.idle_after_sec() == 30.0
-    for bad in ("x", "-1", "0"):
-        monkeypatch.setenv("TT_DEVICE_MCP_ACTIVITY_INTERVAL_SEC", bad)
-        assert device_activity.interval_sec() == 1.0, f"interval {bad!r} must fall back to 1 s"
-
-
 @pytest.mark.asyncio
 async def test_the_sampler_reads_once_per_interval_and_a_failed_read_is_unknown():
     clock = Clock()

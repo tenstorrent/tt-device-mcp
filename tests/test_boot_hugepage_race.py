@@ -59,8 +59,6 @@ def _race(monkeypatch, tmp_path, *, cable=False):
     cable)."""
     _events, seen = _broker(monkeypatch, tmp_path, _carried(tmp_path))
     monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_RELIFT", raising=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raising=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", raising=False)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_skipped", False)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_output", "")
     clock = _clock(monkeypatch)

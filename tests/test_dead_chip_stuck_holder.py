@@ -17,6 +17,7 @@ import time
 
 import pytest
 
+from tests.conftest import settle_isolations
 from tests.test_classac_power_cycle_direct import EXPECTED, rig  # noqa: F401 - the fixture
 from tests.test_reaped_leftover import SIGKILL_PENDING, _stage
 from tests.test_ubb_tray_map import galaxy_seen  # noqa: F401 - the fixture
@@ -758,7 +759,7 @@ async def test_the_dead_chip_path_notes_stuck_holders_and_says_the_host_is_still
     monkeypatch.setattr(srv.sampler._deps, "logger", lambda: log)
 
     await srv.sampler.isolate_dead_chips(["13"])
-    await srv.sampler.settle_isolations()
+    await settle_isolations(srv.sampler)
 
     assert noted and noted[0][0] == ["13"] and [k["pid"] for k in noted[0][1]] == [4242]
     assert noted[0][2] == (BDF,)

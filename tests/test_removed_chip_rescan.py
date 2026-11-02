@@ -26,6 +26,15 @@ from tt_device_mcp.health.recovery.stages import bridge_reset as bridge
 CHIPS = {"13": ("0000:46:00.0", "0000:40:01.1"), "14": ("0000:47:00.0", "0000:40:01.2")}
 
 
+def _wait_saved(timeout: float = 5.0) -> bool:
+    """Wait up to ``timeout`` for the last records-file write isolate_chip started."""
+    t = pci._save_thread
+    if t is not None:
+        t.join(timeout)
+        return not t.is_alive()
+    return True
+
+
 class FakeBus:
     """Fake /sys/bus/pci/devices and /sys/class/tenstorrent. ``trace`` records ("sbr", bridge) for
     each Secondary Bus Reset assert and ("rescan",) for each scoped rescan. A rescan brings back
@@ -69,7 +78,7 @@ class FakeBus:
     def remove(self, idx):
         """isolate_chip, then what the kernel does on the remove write."""
         assert pci.isolate_chip(idx) is True
-        assert pci.wait_removed_chips_saved()
+        assert _wait_saved()
         bdf, _ = CHIPS[idx]
         (self.devices / bdf).unlink()
         (self.cls / f"tenstorrent!{idx}" / "device").unlink()
@@ -710,7 +719,7 @@ def test_the_records_file_write_never_holds_up_the_remove(tmp_path, monkeypatch)
     assert pci.isolate_chip("13") is True
     assert time.monotonic() - t0 < 1, "the remove did not wait for the file write"
     assert "13" in pci.REMOVED_CHIPS, "the record is in memory before the remove"
-    assert not pci.wait_removed_chips_saved(0.05), "the write is still waiting"
+    assert not _wait_saved(0.05), "the write is still waiting"
     gate.set()
-    assert pci.wait_removed_chips_saved()
+    assert _wait_saved()
     assert '"13"' in (pci.evidence.health_dir() / pci.REMOVED_CHIPS_FILE).read_text()

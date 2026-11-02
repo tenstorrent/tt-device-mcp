@@ -75,7 +75,7 @@ def sysfs(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "tt_smi", pkg)
     monkeypatch.setitem(sys.modules, "tt_smi.constants", constants)
     monkeypatch.setattr(pcie_guard, "SYS_ROOT", tmp_path)
-    monkeypatch.setenv("TT_DEVICE_MCP_AER_QUIET_CHECK_SEC", "0.01")
+    monkeypatch.setattr(pcie_guard, "AER_QUIET_CHECK_SEC", 0.01)
     patch_health_event(monkeypatch, lambda *a, **k: None)
     monkeypatch.setattr(pcie_guard, "health_event", lambda *a, **k: None)
     return tmp_path
@@ -660,14 +660,8 @@ def test_the_latch_lifts_at_its_ceiling_with_every_chip_on_the_bus(sysfs, monkey
     path.write_text('{"latched_on_boot": "boot-b"}')
     old = time.time() - 120
     os.utime(path, (old, old))
-    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_HANG_LATCH_MAX_SEC", "60")
+    monkeypatch.setattr(pcie_guard, "LATCH_MAX_SEC", 60)
     assert "ceiling" in pcie_guard.expire_offbus_reset_latch(len(CHIPS), False, lambda m: None)
-
-
-@pytest.mark.parametrize("raw", ["", "0", "-5", "nan", "inf", "six hours"])
-def test_the_latch_ceiling_defaults_and_rejects_nonsense(monkeypatch, raw):
-    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_HANG_LATCH_MAX_SEC", raw)
-    assert pcie_guard.latch_max_sec() == pcie_guard.LATCH_MAX_SEC == 21600
 
 
 def test_a_latch_that_cannot_be_removed_keeps_holding(sysfs, monkeypatch):
