@@ -1,24 +1,15 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""Read-only BMC/CPLD/PCIe evidence at a tray-down onset (spec 04 I19, issue #26).
+"""Read-only BMC/PCIe evidence at a tray-down onset (spec 04 I19, issue #26).
 
 The reset ladder that follows a tray-down onset (and the power cycle, when the ladder fails)
-erases the state that explains the drop: the tray and PDB CPLDs' power-good and fault latches,
-the BMC's SEL and sensors, the bridge's link status, the kernel's account of the drop. So the
-prelude copies them first, concurrently, under one deadline, and fsyncs them to disk before the
-ladder's first rung.
+erases the state that explains the drop: the BMC's SEL and sensors, the bridge's link status,
+the kernel's account of the drop. So the prelude copies them first, concurrently, under one
+deadline, and fsyncs them to disk before the ladder's first rung.
 
 Read-only by construction: every argv is checked against a fixed shape allow-list before it is
-spawned. A CPLD read is ``ipmitool raw 0x06 0x52 <bus> <addr> 0x01 <reg>`` (master write-read,
-one register byte selected, one byte read): a direct register read, never an index/data pair,
-so nothing is ever written to a CPLD. Nothing else of ``ipmitool raw`` passes. The bus, address
-and register numbers are site data, never shipped in code: the tray CPLDs come from
-``TT_DEVICE_MCP_TRAY_CPLD_BUSES``/``_ADDR``/``_REGS`` and the PDB CPLD from
-``TT_DEVICE_MCP_PDB_CPLD_BUS``/``_ADDR``/``_REGS``. Each set is all-or-nothing; without it those
-reads are skipped (journalled) while the SEL, sensor, BMC, lspci and kernel-log reads still run.
-Every configured tray's CPLD is read, not only the dropped one's, so the healthy trays give the
-baseline to compare against.
+spawned; no ``ipmitool raw`` command passes.
 
 The last tt-smi telemetry is deliberately not read again here: the gate's own ``unhealthy``
 incident bundle, written just before, holds the sampler's telemetry ring, and the ``tray_down``
@@ -53,49 +44,12 @@ _IPMI_FIXED = (
 # The spawner, one name the test suite's isolation can replace (spec 09 I1: no real subprocess).
 _RUN: Callable = subprocess.run
 
-_HEX_BYTE = re.compile(r"^0x[0-9a-fA-F]{1,2}$")
 _PCI_ADDR = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$")
-
-
-def cpld_config() -> Optional[tuple[dict, str, list]]:
-    """``({tray: i2c bus}, cpld address, [registers])`` from the broker's environment, or None when
-    any of the three is unset or malformed. All-or-nothing: a partial config would read some
-    registers on some trays and look like a complete capture."""
-    raw_buses = os.environ.get("TT_DEVICE_MCP_TRAY_CPLD_BUSES", "").strip()
-    addr = os.environ.get("TT_DEVICE_MCP_TRAY_CPLD_ADDR", "").strip()
-    raw_regs = os.environ.get("TT_DEVICE_MCP_TRAY_CPLD_REGS", "").strip()
-    if not (raw_buses and addr and raw_regs) or not _HEX_BYTE.match(addr):
-        return None
-    buses: dict = {}
-    try:
-        for item in raw_buses.split(","):
-            tray, bus = item.split(":")
-            if not _HEX_BYTE.match(bus.strip()):
-                return None
-            buses[int(tray)] = bus.strip()
-    except ValueError:
-        return None
-    regs = [r.strip() for r in raw_regs.split(",")]
-    if not buses or not all(_HEX_BYTE.match(r) for r in regs):
-        return None
-    return buses, addr, regs
-
-
-def pdb_cpld_config() -> Optional[tuple[str, str, list]]:
-    """``(i2c bus, cpld address, [registers])`` of the power-distribution board's CPLD, from
-    ``TT_DEVICE_MCP_PDB_CPLD_BUS``/``_ADDR``/``_REGS``, or None when any is unset or malformed
-    (all-or-nothing, like :func:`cpld_config`)."""
-    bus = os.environ.get("TT_DEVICE_MCP_PDB_CPLD_BUS", "").strip()
-    addr = os.environ.get("TT_DEVICE_MCP_PDB_CPLD_ADDR", "").strip()
-    regs = [r.strip() for r in os.environ.get("TT_DEVICE_MCP_PDB_CPLD_REGS", "").split(",") if r.strip()]
-    if not (bus and addr and regs) or not all(_HEX_BYTE.match(x) for x in (bus, addr, *regs)):
-        return None
-    return bus, addr, regs
 
 
 def fallback_bundle() -> Path:
     """A bundle directory of its own for the capture when no incident bundle was written (incident
-    capture switched off, or it failed), so the BMC/CPLD reads are never dropped for want of one."""
+    capture switched off, or it failed), so the BMC reads are never dropped for want of one."""
     from tt_device_mcp.health import evidence
 
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -110,11 +64,6 @@ def argv_allowed(argv: list) -> bool:
     a = list(argv)
     if any(a == fixed for fixed in _IPMI_FIXED):
         return True
-    if len(a) == 8 and a[:2] == ["ipmitool", "raw"]:
-        netfn, cmd, bus, addr, count, reg = a[2:]
-        return (
-            netfn == "0x06" and cmd == "0x52" and count == "0x01" and all(_HEX_BYTE.match(x) for x in (bus, addr, reg))
-        )
     if len(a) == 4 and a[0] == "lspci" and a[1] == "-s" and a[3] == "-vv":
         return bool(_PCI_ADDR.match(a[2]))
     if len(a) == 5 and a[:2] == ["journalctl", "-k"] and a[2].startswith("--since=@") and a[3:] == ["--no-pager", "-q"]:
@@ -156,26 +105,13 @@ def lspci_targets(addrs: list) -> list:
     return out
 
 
-def capture_argvs(pci_targets: list, onset_epoch: float) -> tuple[list, dict]:
-    """Every argv the capture runs, and which CPLD sets were included (config present). Every
-    configured tray's CPLD is read: the trays that stayed up are the baseline for the one that
-    dropped."""
+def capture_argvs(pci_targets: list, onset_epoch: float) -> list:
+    """Every argv the capture runs."""
     argvs: list = [list(a) for a in _IPMI_FIXED]
-    cfg = cpld_config()
-    if cfg is not None:
-        buses, addr, regs = cfg
-        for tray in sorted(buses):
-            for reg in regs:
-                argvs.append(["ipmitool", "raw", "0x06", "0x52", buses[tray], addr, "0x01", reg])
-    pdb = pdb_cpld_config()
-    if pdb is not None:
-        bus, addr, regs = pdb
-        for reg in regs:
-            argvs.append(["ipmitool", "raw", "0x06", "0x52", bus, addr, "0x01", reg])
     for target in pci_targets:
         argvs.append(["lspci", "-s", target, "-vv"])
     argvs.append(["journalctl", "-k", f"--since=@{max(0, int(onset_epoch) - 60)}", "--no-pager", "-q"])
-    return [a for a in argvs if argv_allowed(a)], {"tray": cfg is not None, "pdb": pdb is not None}
+    return [a for a in argvs if argv_allowed(a)]
 
 
 def _run_one(argv: list, run: Callable) -> str:
@@ -219,7 +155,7 @@ def capture_tray_down(
     reaps it shortly after)."""
     run = run or _RUN
     t0 = time.monotonic()
-    argvs, cpld = capture_argvs(pci_targets, onset.get("epoch", time.time()))
+    argvs = capture_argvs(pci_targets, onset.get("epoch", time.time()))
     results: dict = {}
     pool = ThreadPoolExecutor(max_workers=max(1, len(argvs)))
     try:
@@ -234,8 +170,6 @@ def capture_tray_down(
         "finished": sum(1 for v in results.values() if "deadline" not in v),
         "trays": list(trays),
         "all_trays": list(all_trays or []),
-        "cpld": "read" if cpld["tray"] else "skipped (no TT_DEVICE_MCP_TRAY_CPLD_* config)",
-        "pdb_cpld": "read" if cpld["pdb"] else "skipped (no TT_DEVICE_MCP_PDB_CPLD_* config)",
         "elapsed_sec": round(time.monotonic() - t0, 2),
         "bundle": str(bundle) if bundle else None,
     }

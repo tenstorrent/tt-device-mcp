@@ -401,7 +401,7 @@ each rung fires only when the gentler one failed or cannot apply.
   sighting of an episode is latched before any reset fires: if the I16 tray map places every off
   chip and puts 4 or more (`TRAY_DOWN_MIN_CHIPS`) on one tray, the episode is a tray-down onset.
   Before the ladder's first rung, an onset gets, in this order: (1) one PCI rescan; (2) a read-only
-  capture of the BMC, CPLD and PCIe state, under one deadline (`CAPTURE_DEADLINE_SEC`, 10 s); then
+  capture of the BMC and PCIe state, under one deadline (`CAPTURE_DEADLINE_SEC`, 10 s); then
   (3) the full reset ladder, exactly as it runs without the prelude — the same stage from the
   router, the same evidence, the same rungs, the same last-chance sweep; and (4) the power cycle
   only from the ladder's own host rung, when the ladder has failed, under the same guard (opt-in,
@@ -427,15 +427,10 @@ each rung fires only when the gentler one failed or cannot apply.
   fsync'd to disk before the first rung: into the `tray_down` incident bundle, or, when none was
   written, a `<stamp>_tray_down_bmc` directory of its own under the incidents root. It reads the
   BMC SEL, sensors (`sdr elist`) and controller state (`mc info`), `lspci -vv` of the upstream
-  bridge of every off chip, the kernel log since the onset, and, when configured, the CPLD of
-  every configured tray (the trays that stayed up are the baseline) and of the power-distribution
-  board. CPLD bus, address and register numbers come only from the broker's config
-  (`TT_DEVICE_MCP_TRAY_CPLD_*`, `TT_DEVICE_MCP_PDB_CPLD_*`, spec 06); without them those reads are
-  skipped and journalled while the rest still run. A CPLD read is one register, never an
-  index/data pair: that needs an index write to a tray that has just dropped, and costs time
-  against the deadline. The last tt-smi telemetry is not read again: the gate's `unhealthy` bundle,
-  written just before, holds the sampler's telemetry ring, and the `tray_down` bundle's
-  `incident.json` holds the live per-chip PCI snapshot. Because the prelude changes no ladder
+  bridge of every off chip and the kernel log since the onset; no `ipmitool raw` command runs.
+  The last tt-smi telemetry is not read again: the gate's `unhealthy` bundle, written just
+  before, holds the sampler's telemetry ring, and the `tray_down` bundle's `incident.json` holds
+  the live per-chip PCI snapshot. Because the prelude changes no ladder
   decision, it is safe on any Galaxy the tray map covers.
 
 - **I20 — Retired.** A reset re-applies no AICLK ceiling; the broker sets none (spec 03 I35).
@@ -3475,7 +3470,7 @@ sees a silent fabric pass.
 | I19 the latch is not persisted: a restarted broker latches a tray still missing afresh, and buys no power cycle | `tests/test_tray_down_prelude.py::test_a_restarted_broker_latches_a_tray_still_missing_afresh` |
 | I19 the gate (`device_health_gate`) runs the prelude, then its own rung | `tests/test_tray_down_prelude.py::test_the_gate_runs_the_prelude_then_its_ladder_end_to_end` |
 | I19 the whole bus off keeps its own route | `tests/test_tray_down_prelude.py::test_the_whole_bus_off_keeps_its_own_route` |
-| I19 the capture is read-only, CPLD reads (every configured tray, the PDB) come only from config, BMC reads get the long timeout, it meets its deadline, fsyncs, and is written even with no incident bundle | `tests/test_tray_down_prelude.py::test_the_allow_list_refuses_anything_but_the_read_shapes`, `::test_cpld_reads_come_only_from_config_and_cover_every_configured_tray`, `::test_bmc_reads_get_the_long_timeout_inside_the_deadline`, `::test_the_capture_meets_its_deadline_survives_a_missing_tool_and_fsyncs_the_bundle`, `::test_a_missing_incident_bundle_still_gets_the_bmc_reads_written` |
+| I19 the capture is read-only and needs no config, BMC reads get the long timeout, it meets its deadline, fsyncs, and is written even with no incident bundle | `tests/test_tray_down_prelude.py::test_the_allow_list_refuses_anything_but_the_read_shapes`, `::test_the_capture_reads_the_bmc_without_any_config`, `::test_bmc_reads_get_the_long_timeout_inside_the_deadline`, `::test_the_capture_meets_its_deadline_survives_a_missing_tool_and_fsyncs_the_bundle`, `::test_a_missing_incident_bundle_still_gets_the_bmc_reads_written` |
 | I19 lspci targets the upstream bridge of every off chip, by sysfs parent or secondary bus, plus the endpoint while present | `tests/test_tray_down_prelude.py::test_lspci_targets_the_bridge_above_each_off_chip`, `::test_the_capture_reads_the_bridge_of_every_off_chip` |
 | Last-chance sweep gates EVERY host rung (gate ladder, idle escalation); a sweep that recovers cancels the cycle; never over a tenant; no per-chip SBR on a mass drop | `tests/test_ladder_v2.py::test_gate_ladder_sweeps_every_reset_before_the_power_cycle`, `tests/test_ladder_v2.py::test_a_sweep_that_recovers_the_mesh_cancels_the_power_cycle`, `tests/test_ladder_v2.py::test_the_idle_escalation_road_to_a_power_cycle_goes_through_the_sweep`, `tests/test_ladder_v2.py::test_the_last_chance_sweep_never_resets_over_a_tenant`, `tests/test_device_safety.py::test_a_mass_gone_drop_is_left_to_the_galaxy_reset` |
 | A RUNNING broker job counts as a tenant even with an empty holder scan; `force` waives an unreadable scan but never a running job; no rung hand-rolls the fd-only check | `tests/test_ladder_v2.py::test_a_running_job_is_a_tenant_even_with_an_empty_holder_scan`, `tests/test_ladder_v2.py::test_force_waives_an_unreadable_scan_but_never_a_running_job`, `tests/test_ladder_v2.py::test_the_last_chance_sweep_never_resets_over_a_running_job`, `tests/test_ladder_v2.py::test_every_tenant_guard_goes_through_the_one_helper` |

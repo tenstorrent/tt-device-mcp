@@ -811,7 +811,7 @@ def _placement_text(placement: list) -> str:
 
 # Issue #26 (spec 04 I19): a tray with this many chips off the bus at the FIRST sighting is a tray that
 # has lost power, not a chip that dropped. Such an onset gets one PCI rescan and a read-only capture of
-# the BMC/CPLD/PCIe state in front of the ladder; the ladder itself, and the power cycle only when the
+# the BMC/PCIe state in front of the ladder; the ladder itself, and the power cycle only when the
 # ladder fails, are unchanged.
 TRAY_DOWN_MIN_CHIPS = 4
 TRAY_DOWN_RESCAN_SETTLE_SEC = 3
@@ -1819,8 +1819,6 @@ class GalaxyRecovery(Recovery):
             td["captured"] = True
             onset = {"off_per_tray": td["onset"], "off": td["off"], "expected": expected, "epoch": td["epoch"]}
             capture = await asyncio.to_thread(self._tray_down_capture, onset, expected)
-            if str(capture.get("cpld", "")).startswith("skipped"):
-                log("tray-down capture: no TT_DEVICE_MCP_TRAY_CPLD_* config — CPLD registers not read")
         td["prelude_done"] = td["rescanned"] and td["captured"]
         trays = sorted(k for k in td["onset"] if isinstance(k, int))
         if rescan != "ran":

@@ -5,7 +5,7 @@
 
 Four or more chips off ONE physical tray at the first sighting of an episode is a tray that lost
 power. Before the ladder's first rung it gets one PCI rescan and a read-only capture of the
-BMC/CPLD/PCIe state; then the full reset ladder runs exactly as before, and the power cycle fires
+BMC/PCIe state; then the full reset ladder runs exactly as before, and the power cycle fires
 only from the ladder's own host rung, when every reset failed. Anything else keeps the ladder
 with no prelude.
 """
@@ -150,7 +150,7 @@ def rig(monkeypatch, galaxy_trays):
 
     def capture(onset, expected):
         order.append("capture")
-        return {"cpld": "read"}
+        return {"reads": 4}
 
     monkeypatch.setattr(g, "_tray_down_capture", capture)
 
@@ -540,7 +540,7 @@ async def test_the_whole_bus_off_keeps_its_own_route(rig):
     [
         ["ipmitool", "raw", "0x30", "0x8b", "0x01"],  # the tray re-power: a write
         ["ipmitool", "raw", "0x06", "0x52", "0x03", "0x42", "0x00", "0x0C", "0x0D"],  # index write
-        ["ipmitool", "raw", "0x06", "0x52", "0x03", "0x42", "0x01", "0x0A", "0x00"],
+        ["ipmitool", "raw", "0x06", "0x52", "0x03", "0x42", "0x01", "0x0A"],  # a register read
         ["ipmitool", "chassis", "power", "cycle"],
         ["ipmitool", "sel", "clear"],
         ["ipmitool", "sdr", "elist", "full"],
@@ -553,33 +553,12 @@ def test_the_allow_list_refuses_anything_but_the_read_shapes(argv):
     assert not bmc_capture.argv_allowed(argv)
 
 
-def test_cpld_reads_come_only_from_config_and_cover_every_configured_tray(monkeypatch):
-    for k in ("BUSES", "ADDR", "REGS"):
-        monkeypatch.delenv(f"TT_DEVICE_MCP_TRAY_CPLD_{k}", raising=False)
-    for k in ("BUS", "ADDR", "REGS"):
-        monkeypatch.delenv(f"TT_DEVICE_MCP_PDB_CPLD_{k}", raising=False)
-    argvs, cpld = bmc_capture.capture_argvs(["0000:c1:00.0"], 1000.0)
-    assert cpld == {"tray": False, "pdb": False} and not any(a[:2] == ["ipmitool", "raw"] for a in argvs)
+def test_the_capture_reads_the_bmc_without_any_config():
+    argvs = bmc_capture.capture_argvs(["0000:c1:00.0"], 1000.0)
+    assert not any(a[:2] == ["ipmitool", "raw"] for a in argvs)
     for fixed in (["ipmitool", "sel", "elist", "last", "40"], ["ipmitool", "sdr", "elist"], ["ipmitool", "mc", "info"]):
         assert fixed in argvs, "the SEL, sensors and BMC state are read without any config"
-    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_CPLD_BUSES", "3:0x07,1:0x05")
-    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_CPLD_ADDR", "0x42")
-    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_CPLD_REGS", "0x0A,0x0B")
-    monkeypatch.setenv("TT_DEVICE_MCP_PDB_CPLD_BUS", "0x02")
-    monkeypatch.setenv("TT_DEVICE_MCP_PDB_CPLD_ADDR", "0x44")
-    monkeypatch.setenv("TT_DEVICE_MCP_PDB_CPLD_REGS", "0x10")
-    argvs, cpld = bmc_capture.capture_argvs(["0000:c1:00.0"], 1000.0)
-    raw = [a for a in argvs if a[:2] == ["ipmitool", "raw"]]
-    assert cpld == {"tray": True, "pdb": True} and raw == [
-        ["ipmitool", "raw", "0x06", "0x52", "0x05", "0x42", "0x01", "0x0A"],
-        ["ipmitool", "raw", "0x06", "0x52", "0x05", "0x42", "0x01", "0x0B"],
-        ["ipmitool", "raw", "0x06", "0x52", "0x07", "0x42", "0x01", "0x0A"],
-        ["ipmitool", "raw", "0x06", "0x52", "0x07", "0x42", "0x01", "0x0B"],
-        ["ipmitool", "raw", "0x06", "0x52", "0x02", "0x44", "0x01", "0x10"],
-    ], "every configured tray (the healthy ones are the baseline) and the PDB, as single-byte reads"
     assert all(bmc_capture.argv_allowed(a) for a in argvs)
-    monkeypatch.setenv("TT_DEVICE_MCP_PDB_CPLD_REGS", "0x10,nope")
-    assert bmc_capture.capture_argvs([], 1000.0)[1]["pdb"] is False, "a malformed PDB config reads nothing"
 
 
 def test_bmc_reads_get_the_long_timeout_inside_the_deadline():
@@ -667,7 +646,7 @@ def test_lspci_targets_the_bridge_above_each_off_chip(tmp_path, monkeypatch):
     assert bmc_capture.upstream_bridge("0000:03:00.0") is None
     targets = bmc_capture.lspci_targets(["0000:01:00.0", "0000:02:00.0", "0000:03:00.0", "x; reboot", "0000:01:00.0"])
     assert targets == ["0000:00:01.1", "0000:01:00.0", "0000:00:01.2"]
-    argvs, _ = bmc_capture.capture_argvs(targets, 1000.0)
+    argvs = bmc_capture.capture_argvs(targets, 1000.0)
     assert [a[2] for a in argvs if a[0] == "lspci"] == targets
 
 
