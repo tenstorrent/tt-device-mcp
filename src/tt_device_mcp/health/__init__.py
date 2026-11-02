@@ -137,7 +137,6 @@ from tt_device_mcp.health.recovery.base import (
     RESET_SCOPE_PREFIX,
     RecoveryMechanism,
     host_action_pending_sec,
-    mesh_hold_repage_sec,
     mesh_reset_hold_reason,
     refuse_mesh_reset,
 )
@@ -273,7 +272,6 @@ __all__ = [
     "RESET_SCOPE_PREFIX",
     "_declared_reset_mode",
     # how often a standing hardware-fault hold is paged again (spec 03 I42)
-    "mesh_hold_repage_sec",
     # how long a requested host reboot/power cycle keeps the forced ladder from resetting
     "host_action_pending_sec",
     "mesh_reset_hold_reason",

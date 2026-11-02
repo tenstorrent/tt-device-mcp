@@ -845,7 +845,7 @@ cooldown (spec 04 I65) holds longer.
   check keeps it held and goes on up the bounded ladder (the host rungs when opted in, the idle
   relift and the hold deadline); a second dispatch failure in the same episode takes the
   self-heal hold and that ladder, never a second gate reset. Under an outage hold or
-  `TT_DEVICE_MCP_AUTO_MESH_RESET=0` (spec 04 I28) no reset fires: the gate holds and pages
+  `TT_DEVICE_MCP_AUTO_MESH_RESET=0` (spec 04 I28) no reset fires: the gate holds
   (`mesh_reset_held`), and its log names the held reset instead of an escalation that will not come.
   The fabric verdict names the dispatch failure: `first_reason()` reads the wrapper's dispatch line
   first and, past a `TOPOLOGY MISMATCH` marker, never the descriptor run's downgraded

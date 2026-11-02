@@ -14,7 +14,7 @@ from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health.monitor import ETH_COULD_NOT_CHECK, ETH_LINK_DROP_SKIP
 from tt_device_mcp.health.monitors import eth, hostpci
-from tt_device_mcp.health.recovery import base, pcie_guard
+from tt_device_mcp.health.recovery import pcie_guard
 
 CHIPS = 32
 TIMED_OUT = (None, f"{ETH_COULD_NOT_CHECK}: {eth.READ_TIMED_OUT}")
@@ -63,7 +63,6 @@ def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "1")  # not the outage hold; OUTAGE_HOLD sets it to 0
     monkeypatch.delenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", raising=False)
-    monkeypatch.setattr(base, "_mesh_hold_paged", {})
     monkeypatch.setattr(srv, "eth_check_armed", True)
     monkeypatch.setattr(srv, "last_fabric_check_monotonic", srv.time.monotonic())
     mon = srv.health_monitor

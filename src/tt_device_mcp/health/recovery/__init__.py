@@ -1125,7 +1125,7 @@ class Recovery(ABC):
             log(f"automatic reset NOT fired: {why}; holding for an operator")
             health_event("host_reset_gated", argv=argv, reason=why, host_at_risk=True)
             return False
-        # The operator's outage hold (spec 04 I28): held like the gate above, and paged.
+        # The operator's outage hold (spec 04 I28): held like the gate above.
         if refuse_mesh_reset("gate/relift", argv, log, off_bus):
             return False
 

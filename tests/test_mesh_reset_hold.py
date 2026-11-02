@@ -15,14 +15,13 @@ def held(monkeypatch):
     """The outage hold: the mesh-reset knob at 0, the host rung off as well."""
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    monkeypatch.setattr(base, "_mesh_hold_paged", {})
 
 
 @pytest.fixture
 def rec(monkeypatch):
     """A Galaxy gate pass with no tenant, no foreign scope and an open host gate. Records the
-    journal, the pages and every mesh reset that fires."""
-    out = {"events": [], "alerts": [], "resets": []}
+    journal and every mesh reset that fires."""
+    out = {"events": [], "resets": []}
     g = srv.galaxy_recovery
 
     async def no_scope(log):
@@ -72,9 +71,9 @@ def test_the_host_rung_off_or_a_removed_rungs_switch_never_holds_the_mesh_reset(
 
 
 @pytest.mark.asyncio
-async def test_the_gate_holds_the_mesh_reset_under_an_outage_hold_and_pages_once(held, rec):
+async def test_the_gate_holds_the_mesh_reset_under_an_outage_hold(held, rec):
     """The observed case: an outage-hold drop-in turned every hardware rung off and the gate still fired
-    `tt-smi -glx_reset`. Held now: nothing fires, nothing is recorded as a reset, one page."""
+    `tt-smi -glx_reset`. Held now: nothing fires, nothing is recorded as a reset."""
     g = srv.galaxy_recovery
     logs = []
     for _ in range(2):
@@ -89,7 +88,6 @@ async def test_the_gate_holds_the_mesh_reset_under_an_outage_hold_and_pages_once
 @pytest.mark.asyncio
 async def test_the_gate_holds_with_the_explicit_knob_alone(monkeypatch, rec):
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "0")
-    monkeypatch.setattr(base, "_mesh_hold_paged", {})
     assert await srv.galaxy_recovery._reset_and_verify_device(["0", "1", "2", "3"], lambda m: None) is False
     assert rec["resets"] == []
 
@@ -99,7 +97,6 @@ async def test_the_gate_still_resets_with_the_host_rung_off(monkeypatch, rec):
     """The power cycle off on its own is a per-host choice: the ladder still climbs through the mesh reset."""
     monkeypatch.delenv("TT_DEVICE_MCP_AUTO_MESH_RESET", raising=False)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    monkeypatch.setattr(base, "_mesh_hold_paged", {})
     await srv.galaxy_recovery._reset_and_verify_device(["0", "1", "2", "3"], lambda m: None)
     assert rec["resets"] == [["tt-smi", "-glx_reset"]] and "mesh_reset_held" not in rec["events"]
 
@@ -108,7 +105,7 @@ async def test_the_gate_still_resets_with_the_host_rung_off(monkeypatch, rec):
 async def test_an_explicit_opt_in_re_arms_the_mesh_reset_under_an_outage_hold(monkeypatch, held, rec):
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "1")
     await srv.galaxy_recovery._reset_and_verify_device(["0", "1", "2", "3"], lambda m: None)
-    assert len(rec["resets"]) == 1 and rec["alerts"] == []
+    assert len(rec["resets"]) == 1
 
 
 @pytest.mark.asyncio
@@ -141,7 +138,7 @@ def one_off_bus(monkeypatch):
 async def test_the_gate_holds_with_a_chip_off_the_bus_under_an_outage_hold(held, rec, one_off_bus, phase):
     """The observed case: with an outage hold in force and a chip off the bus, the startup and
     pre-job gates fired `tt-smi -glx_reset` again and again (each exited 1 after ~130 s) until the
-    whole mesh was off the bus. Held now: no reset, no off-bus intent, and the page names the drop."""
+    whole mesh was off the bus. Held now: no reset, no off-bus intent, and the log names the drop."""
     g = srv.galaxy_recovery
     logs = []
     outcome = await g._fire_gate_rung(
@@ -164,29 +161,4 @@ async def test_without_the_hold_a_chip_off_the_bus_still_gets_the_mesh_reset(mon
     await g._fire_gate_rung(phase, galaxy.STAGE_SMI_RESET, ["0", "1", "2", "3"], 4, lambda m: None, ev=None, beats={})
     assert rec["resets"] == [["tt-smi", "-glx_reset"]]
     assert one_off_bus == [("mesh reset", 1)] and "reset_begin" in rec["events"]
-    assert "mesh_reset_held" not in rec["events"] and rec["alerts"] == []
-
-
-@pytest.mark.asyncio
-async def test_a_standing_hold_pages_again_after_the_repage_interval(monkeypatch, held, rec, one_off_bus):
-    """Bounded: the hold never sits in silence. Within the interval one page; past it, another."""
-    g = srv.galaxy_recovery
-    await g._reset_and_verify_device(["0"], lambda m: None)
-    await g._reset_and_verify_device(["0"], lambda m: None)
-    why = base.mesh_reset_hold_reason()
-    base._mesh_hold_paged[why] -= base.mesh_hold_repage_sec()
-    await g._reset_and_verify_device(["0"], lambda m: None)
-    assert rec["resets"] == []
-    monkeypatch.setenv("TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC", "0")
-    base._mesh_hold_paged[why] -= 10 * base.MESH_HOLD_REPAGE_DEFAULT_SEC
-    await g._reset_and_verify_device(["0"], lambda m: None)
-
-
-def test_the_repage_knob_defaults_and_rejects_nonsense(monkeypatch):
-    monkeypatch.delenv("TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC", raising=False)
-    assert base.mesh_hold_repage_sec() == 3600
-    for bad in ("soon", "-5", ""):
-        monkeypatch.setenv("TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC", bad)
-        assert base.mesh_hold_repage_sec() == 3600
-    monkeypatch.setenv("TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC", "600")
-    assert base.mesh_hold_repage_sec() == 600
+    assert "mesh_reset_held" not in rec["events"]

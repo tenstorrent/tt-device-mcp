@@ -8111,7 +8111,7 @@ async def device_health_gate(
         # Spec 03 I55: the fabric moved traffic but mesh dispatch failed. On a present mesh no
         # self-heal clears that (measured: a 100-min eth_frozen hold with no exit), so it earns the
         # present-mesh reset once per hold episode; the full check, fabric included, decides the
-        # release after it. The outage hold (04 I28) forbids that reset: held and paged below.
+        # release after it. The outage hold (04 I28) forbids that reset: held below.
         dispatch_failed = fabric_ok is False and fabric.names_dispatch_failure(health_monitor.last_fabric_output or "")
         if dispatch_failed and not _dispatch_reset_spent and not mesh_reset_hold_reason():
             ev = replace(ev, dispatch_reset_due=True)
@@ -8237,7 +8237,7 @@ async def device_health_gate(
             # anyone watching. Only a real drop (off_bus>0) is an off-bus hold.
             if dispatch_failed and ev.off_bus == 0 and ev.frozen_chips == 0 and mesh_reset_hold_reason():
                 # Spec 03 I55 under the outage hold (04 I28): the one present-mesh reset this
-                # dispatch failure earns is refused — paged and journaled as mesh_reset_held, and the
+                # dispatch failure earns is refused — logged and journaled as mesh_reset_held, and the
                 # hold says so rather than promising a self-heal a dispatch failure never gets.
                 refuse_mesh_reset(f"gate/{phase}", galaxy_recovery.reset_argv(indices), _log, 0)
                 why = (

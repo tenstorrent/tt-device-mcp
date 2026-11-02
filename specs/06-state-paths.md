@@ -268,7 +268,6 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_REBOOT_MIN_DEAD_FRAC` | 0.5 | Dead fraction gating the power cycle (the floor below which it never fires; the name is kept from the removed reboot rung) | 04 |
 | `TT_DEVICE_MCP_AUTO_POWER_CYCLE` | 1 | Arm the BMC power-cycle rung | 04 |
 | `TT_DEVICE_MCP_AUTO_MESH_RESET` | unset | `0` (the outage hold) holds every automatic mesh reset; unset or `1` arms it | 04 |
-| `TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC` | 3600 | While a held mesh reset stands, page again after this long; `0` pages once per hold | 03, 04 |
 | `TT_DEVICE_MCP_OFFBUS_HANG_LATCH_MAX_SEC` | 21600 | A host-hang latch older than this lifts once every chip is on the bus, even without a clean host-pci look; with a chip off only when `TT_DEVICE_MCP_POWER_CYCLE_CMD` is unset (spec 04 I25) | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_CMD` | unset (off) | The host's own power-cycle command, run to end an off-bus hold the reset gate refuses (spec 04 I27); unset = page and hold | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC` | 120 | Timeout for that command when the I88 fallback unit runs it; the shutdown hook clamps it to 5-15 s per try (3 tries, worst case 86 s, inside systemd-shutdown's 90 s). A malformed value reads as the default | 04 |
