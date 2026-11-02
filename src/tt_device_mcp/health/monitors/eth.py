@@ -32,7 +32,10 @@ mesh or, worse, hides a wedge:
 from __future__ import annotations
 
 import os
+import re
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -54,6 +57,18 @@ DEFAULT_ETH_VENV_PYTHON = "/opt/tt-device-broker/eth-venv/bin/python"
 # an unsandboxed test would resolve to the real probe script instead of a scripted stand-in.
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 
+# resolve_python() spawns up to three `python -c "import ttexalens"` checks (10s each), and on an
+# armed host build() calls it on every clean post-job gate — outside the read's own bound. So the
+# answer is cached per process, keyed on the candidate list and where the validator's `current`
+# symlink points: re-pointing `current`, or changing any candidate env var, re-resolves. A hit is
+# re-checked with cheap stat calls only (the python still executable, its tree still there). A
+# miss (None) is cached for NEGATIVE_TTL_SEC only, and not at all when an import check timed out,
+# so a venv provisioned later is picked up without a restart. forget_python() drops the entry
+# when a read crashes. One slot: (key, answer, monotonic time it was stored), or None.
+NEGATIVE_TTL_SEC = 60.0
+_python_cache: Optional[tuple[tuple, Optional[tuple[str, str]], float]] = None
+_python_cache_lock = threading.Lock()
+
 
 def _tree_for(python: str, current: str) -> str:
     """The tt-metal checkout ``python`` was built from — THAT tree, not the validator's,
@@ -70,19 +85,8 @@ def _tree_for(python: str, current: str) -> str:
     return current
 
 
-def resolve_python(*, import_timeout_sec: float = 10.0) -> Optional[tuple[str, str]]:
-    """The first candidate python that can ``import ttexalens``, as ``(python, tt_metal_tree)``.
-
-    Candidates, in order — deterministic and controlled, never a glob into a user's home (that
-    would make the reader depend on some random dev's tree):
-      1. ``TTDEV_ETH_CHECK_PYTHON`` — the portable, operator-pinned mechanism.
-      2. ``$TTDEV_VALIDATOR_ROOT/current/python_env/bin/python`` — the pinned validator's own env.
-      3. a broker-owned eth-venv, if one was provisioned — at ``TTDEV_ETH_VENV`` (the retired
-         wrapper honoured it, so a host that relocated its venv must not lose its python to the
-         in-package move) or the default install path.
-    ``None`` if no candidate both exists and can import it — a check that cannot read must
-    never guess.
-    """
+def _python_candidates() -> tuple[list[str], str]:
+    """``(candidate pythons in resolve_python() order, the validator's current dir)``."""
     vroot = os.environ.get("TTDEV_VALIDATOR_ROOT", "/opt/tt-device-broker/validator").strip()
     current = f"{vroot}/current"
     eth_venv = os.environ.get("TTDEV_ETH_VENV", "").strip()
@@ -95,7 +99,72 @@ def resolve_python(*, import_timeout_sec: float = 10.0) -> Optional[tuple[str, s
         )
         if c
     ]
+    return candidates, current
 
+
+def reader_installed() -> bool:
+    """Whether the built-in reader is installed at all: its probe script is readable and some
+    candidate python is executable. Spawns nothing (``os.access`` only), so the startup preflight
+    can ask it without delaying the broker start. Whether that python imports ttexalens, and
+    whether the read is fast enough to arm, is the startup self-test's call, not this one's."""
+    return _probe_path() is not None and any(os.access(c, os.X_OK) for c in _python_candidates()[0])
+
+
+def resolve_python(*, import_timeout_sec: float = 10.0) -> Optional[tuple[str, str]]:
+    """The first candidate python that can ``import ttexalens``, as ``(python, tt_metal_tree)``.
+
+    Candidates, in order — deterministic and controlled, never a glob into a user's home (that
+    would make the reader depend on some random dev's tree):
+      1. ``TTDEV_ETH_CHECK_PYTHON`` — the portable, operator-pinned mechanism.
+      2. ``$TTDEV_VALIDATOR_ROOT/current/python_env/bin/python`` — the pinned validator's own env.
+      3. a broker-owned eth-venv, if one was provisioned — at ``TTDEV_ETH_VENV`` (the retired
+         wrapper honoured it, so a host that relocated its venv must not lose its python to the
+         in-package move) or the default install path.
+    ``None`` if no candidate both exists and can import it — a check that cannot read must
+    never guess.
+
+    Cached per process (see ``_python_cache``): only the first call, or the first after
+    ``current`` is re-pointed, a candidate env var changes, a cached python or tree disappears,
+    a ``None`` ages past ``NEGATIVE_TTL_SEC`` or ``forget_python()`` runs, spawns anything. A
+    candidate that starts importing ttexalens in place, ahead of the cached one, is picked up only
+    after one of those (or a broker restart).
+    """
+    candidates, current = _python_candidates()
+    key = (tuple(candidates), os.path.realpath(current))
+    with _python_cache_lock:
+        cached = _python_cache
+    if cached is not None and cached[0] == key:
+        _, resolved, at = cached
+        if resolved is None:
+            if time.monotonic() - at < NEGATIVE_TTL_SEC:
+                return None
+        elif os.access(resolved[0], os.X_OK) and os.path.isdir(resolved[1]):
+            return resolved
+    # Spawned outside the lock, so forget_python() (called on the event loop) never waits on it.
+    resolved, timed_out = _resolve_python_uncached(candidates, current, import_timeout_sec)
+    with _python_cache_lock:
+        _set_python_cache(None if resolved is None and timed_out else (key, resolved, time.monotonic()))
+    return resolved
+
+
+def _set_python_cache(value: Optional[tuple[tuple, Optional[tuple[str, str]], float]]) -> None:
+    global _python_cache
+    _python_cache = value
+
+
+def forget_python() -> None:
+    """Drop the cached ``resolve_python()`` answer, so the next ``build()`` re-runs the import
+    checks — called when the built-in read crashes or cannot spawn, which a python that lost
+    ttexalens in place (``current`` unchanged) would cause."""
+    with _python_cache_lock:
+        _set_python_cache(None)
+
+
+def _resolve_python_uncached(
+    candidates: list[str], current: str, import_timeout_sec: float
+) -> tuple[Optional[tuple[str, str]], bool]:
+    """``(answer, whether any import check timed out)`` — a timeout is not proof of absence."""
+    timed_out = False
     for python in candidates:
         if not os.access(python, os.X_OK):
             continue
@@ -108,14 +177,17 @@ def resolve_python(*, import_timeout_sec: float = 10.0) -> Optional[tuple[str, s
                 ).returncode
                 == 0
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            continue
+        except OSError:
             continue
         if not imported:
             continue
         tree = _tree_for(python, current)
         if os.path.isdir(tree):
-            return python, tree
-    return None
+            return (python, tree), timed_out
+    return None, timed_out
 
 
 def _probe_path() -> Optional[str]:
@@ -190,8 +262,9 @@ def build() -> Optional[tuple[list[str], dict[str, str]]]:
     ``TTDEV_ETH_CHECK_ALLOW_KNOWN_BROKEN=1`` (below) to run the probe itself, laundered.
 
     Spawns nothing and does no I/O beyond ``os.access`` checks EXCEPT ``resolve_python()``,
-    which can shell out up to three candidate pythons — callers on an event loop should run
-    this off it (e.g. ``asyncio.to_thread``), see ``monitor.verify_eth_heartbeat``.
+    which can shell out up to three candidate pythons on a cache miss — callers on an event
+    loop should run this off it (e.g. ``asyncio.to_thread``), see
+    ``monitor.verify_eth_heartbeat``.
 
     The built-in path is ``None`` — unavailable, same as no override and no validator
     installed for fabric — until ALL of: the rung is armed on this host (the broker's startup
@@ -287,6 +360,11 @@ def build_reason() -> str:
     return unavailable()[1]
 
 
+# classify_exit's reason for a read that hit run_probe's own timeout. The post-job gate tells this
+# stuck read apart from a crash or the probe's own 77 (spec 03 I61).
+READ_TIMED_OUT = "eth-heartbeat read timed out without reaching a verdict"
+
+
 def classify_exit(rc: Optional[int]) -> tuple[Optional[bool], str]:
     """The probe's own exit-code contract: ``True`` healthy, ``False`` unhealthy (a reset can
     act on this — well, HOLD can; a frozen core is never reset), ``None`` skipped (nothing was
@@ -308,18 +386,45 @@ def classify_exit(rc: Optional[int]) -> tuple[Optional[bool], str]:
     if rc == _PROBE_FROZEN:
         return False, "a frozen active-eth core: heartbeat not advancing"
     if rc is None:
-        return None, "eth-heartbeat read timed out without reaching a verdict"
+        return None, READ_TIMED_OUT
     return None, f"probe exited {rc} (not a frozen verdict)"
 
 
+_LINK_COUNT = re.compile(r"^eth-links: measured=(\d+)\b", re.MULTILINE)
+
+
+def parse_link_count(text: str) -> Optional[int]:
+    """How many up-link cores the built-in probe measured, from its ``eth-links: measured=<n>``
+    line, or ``None`` when the output has no such line (an older probe, an attach failure, or an
+    operator override, whose output is never parsed)."""
+    m = _LINK_COUNT.search(text or "")
+    return int(m.group(1)) if m else None
+
+
 async def check(
-    argv: list[str], env: dict[str, str], *, timeout_sec: float, track: Track, cwd: Optional[str] = None
+    argv: list[str],
+    env: dict[str, str],
+    *,
+    timeout_sec: float,
+    track: Track,
+    cwd: Optional[str] = None,
+    reap_sec: float = 0.0,
 ) -> tuple[Optional[int], str]:
     """Run an already-built eth-heartbeat command (see ``build()``) and return ``(rc, output)``.
 
     ``terminate`` is deliberately left at ``run_probe``'s own default (a hard ``killpg``): a
     hung register read has no graceful unwind worth waiting for, unlike the fabric traffic
-    pass's own escalation ladder — it is either measuring or already wedged.
+    pass's own escalation ladder — it is either measuring or already wedged. ``reap_sec`` is
+    ``run_probe``'s bounded wait for the killed reader to finish exiting.
     """
-    rc, raw = await run_probe(argv, timeout_sec=timeout_sec, track=track, stream=False, env=env, cwd=cwd)
+    rc, raw = await run_probe(
+        argv,
+        timeout_sec=timeout_sec,
+        track=track,
+        stream=False,
+        env=env,
+        cwd=cwd,
+        reap_sec=reap_sec,
+        name="eth-heartbeat",
+    )
     return rc, raw.decode("utf-8", "replace").strip()

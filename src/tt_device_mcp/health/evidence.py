@@ -15,9 +15,12 @@ from __future__ import annotations
 import json
 import os
 import platform
+import queue
 import re
 import subprocess
+import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -62,8 +65,8 @@ MAX_EVENTS_BYTES = 32 * 1024 * 1024
 MAX_CHIPS_BYTES = 256 * 1024 * 1024
 
 
-def _append_durable(path: Path, rec: dict, max_bytes: int) -> None:
-    """Append one JSON record and fsync it.
+def _append_durable(path: Path, rec: dict, max_bytes: int) -> bool:
+    """Append one JSON record and fsync it. True only once the fsync returned (spec 03 I95).
 
     fsync per record is the entire contract: the events worth having are the ones
     written moments before the machine dies. Never raises — a journal that cannot be
@@ -82,7 +85,8 @@ def _append_durable(path: Path, rec: dict, max_bytes: int) -> None:
             f.flush()
             os.fsync(f.fileno())
     except (OSError, ValueError, TypeError):
-        pass
+        return False
+    return True
 
 
 def health_event(kind: str, **fields) -> None:
@@ -90,6 +94,67 @@ def health_event(kind: str, **fields) -> None:
     rec = {"ts": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "kind": kind}
     rec.update(fields)
     _append_durable(HEALTH_DIR / EVENTS_FILE, rec, MAX_EVENTS_BYTES)
+
+
+# Spec 03 I92: records queued for the journal's own writer thread, which does their fsync, so a
+# caller on the event loop (or the AER watch thread, right after its stop) never waits on the disk.
+# One writer keeps them in order; an fsync a storm stalls for tens of seconds delays only them.
+_detached: "queue.SimpleQueue" = queue.SimpleQueue()
+_detached_writer: Optional[threading.Thread] = None
+_detached_lock = threading.Lock()
+
+
+class _Flush:
+    """One waiter's record: set once the writer is done with it, ``ok`` only if its fsync returned."""
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.ok = False
+
+
+def _drain_detached() -> None:
+    while True:
+        path, rec, max_bytes, done = _detached.get()
+        ok = False
+        try:
+            ok = _append_durable(path, rec, max_bytes)
+        finally:
+            if done is not None:
+                done.ok = ok is True
+                done.event.set()
+
+
+def _queue_detached(kind: str, fields: dict, done: Optional[_Flush]) -> bool:
+    global _detached_writer
+    rec = {"ts": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "kind": kind}
+    rec.update(fields)
+    try:
+        with _detached_lock:
+            if _detached_writer is None or not _detached_writer.is_alive():
+                _detached_writer = threading.Thread(target=_drain_detached, name="health-journal", daemon=True)
+                _detached_writer.start()
+        _detached.put((HEALTH_DIR / EVENTS_FILE, rec, MAX_EVENTS_BYTES, done))
+    except RuntimeError:
+        return False
+    return True
+
+
+def health_event_detached(kind: str, **fields) -> None:
+    """Queue one decision for the journal's writer thread and return at once. The record carries the
+    time of this call, not of the write. Never raises."""
+    _queue_detached(kind, fields, None)
+
+
+def health_event_flushed(kind: str, timeout: float, **fields) -> bool:
+    """Queue one decision for the journal's writer thread, then wait up to ``timeout`` for its fsync.
+    Records queued before it are written first, so a True return means they are on disk too. False
+    when the bound passed first (the record stays queued), the writer could not start, or the
+    write or its fsync failed. Spec 03 I95: the AER watch's stop record, which a host lost after the stop must still show. Never
+    raises. Never call it on the event loop: it blocks for up to ``timeout``."""
+    done = _Flush()
+    if not _queue_detached(kind, fields, done):
+        return False
+    return done.event.wait(timeout) and done.ok
 
 
 def read_health_events(since_ts: float | None = None, kinds: "set[str] | None" = None) -> list[dict]:
@@ -135,8 +200,26 @@ TRACE_FILE = "telemetry.jsonl"
 MAX_TRACE_BYTES = 512 * 1024 * 1024
 
 
-def append_trace(sample: dict) -> None:
+# Spec 03 I98: trace rows queued for their own writer thread, apart from the decision journal's, so
+# neither the sampler's dead-chip check nor a flushed containment record ever waits on a trace fsync.
+# A storm that stalls the disk past TRACE_BACKLOG rows drops the newest rows, never blocks the sampler.
+TRACE_BACKLOG = 256
+_trace_rows: "queue.Queue" = queue.Queue(maxsize=TRACE_BACKLOG)
+_trace_writer: Optional[threading.Thread] = None
+
+
+def _drain_trace() -> None:
+    while True:
+        path, rec = _trace_rows.get()
+        _append_durable(path, rec, MAX_TRACE_BYTES)
+
+
+def append_trace(sample: dict, ts: Optional[float] = None) -> bool:
     """Persist one telemetry sample as it is taken.
+
+    Queued for the trace's own writer thread, which does the fsync; this returns at once (spec 03
+    I98). The row carries ``ts`` (the read time; this call's time when omitted), not the write's.
+    False when the row could not be queued (backlog full, or the writer could not start).
 
     The in-memory ring is enough to explain a failed JOB, because the broker survives to
     read it. It is worthless for explaining a REBOOT: the host goes down and takes the ring
@@ -147,7 +230,17 @@ def append_trace(sample: dict) -> None:
     dies moments later, a core stalled on a hung ASIC is the story. If every chip is ticking
     normally right up to the last sample, it is not — and the CPU erratum is.
     """
-    _append_durable(HEALTH_DIR / TRACE_FILE, {"ts": time.time(), "chips": sample}, MAX_TRACE_BYTES)
+    global _trace_writer
+    rec = {"ts": time.time() if ts is None else float(ts), "chips": sample}
+    try:
+        with _detached_lock:
+            if _trace_writer is None or not _trace_writer.is_alive():
+                _trace_writer = threading.Thread(target=_drain_trace, name="telemetry-trace", daemon=True)
+                _trace_writer.start()
+        _trace_rows.put_nowait((HEALTH_DIR / TRACE_FILE, rec))
+    except (RuntimeError, queue.Full):
+        return False
+    return True
 
 
 INCIDENTS_DIR = "incidents"
@@ -357,6 +450,11 @@ def _prune_incidents() -> None:
             pass
 
 
+def _utc_iso(at: datetime) -> str:
+    """A datetime as UTC ISO 8601 with a Z; a naive one is read as local time."""
+    return at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def capture_incident(
     label: str,
     *,
@@ -367,6 +465,8 @@ def capture_incident(
     fabric_output: str = "",
     evidence: dict | None = None,
     job_log_bytes: int = 256 * 1024,
+    fabric_output_at: Optional[datetime] = None,
+    fabric_since: Optional[datetime] = None,
 ) -> Optional[Path]:
     """Freeze everything a root-cause investigation will want, at the moment it exists.
 
@@ -376,6 +476,12 @@ def capture_incident(
     all lived somewhere volatile — a rotating log, a kernel ring buffer an ungraceful
     reboot erases, a truncated string in a JSON field. Each one is copied here, once,
     while it still exists.
+
+    ``fabric_since`` is when the calling gate pass began, ``fabric_output_at`` when the run that
+    produced ``fabric_output`` began. With ``fabric_since`` set, output from an earlier pass is
+    stale: it is left out of the bundle, and incident.json says so, so no bundle presents another
+    pass's transcript as this one's; fresh output goes to fabric.log under a header naming its run
+    time (spec 03 I57). Without ``fabric_since`` the output is kept as given.
 
     Never raises. Returns the bundle directory.
     """
@@ -400,6 +506,15 @@ def capture_incident(
             "chips": chips,
             "chips_present_at_capture": len(chips),
         }
+        fabric_header = ""
+        if fabric_output and fabric_since is not None:
+            at_iso = _utc_iso(fabric_output_at) if fabric_output_at is not None else None
+            if fabric_output_at is None or fabric_output_at < fabric_since:
+                meta["fabric_output"] = {"at": at_iso, "stale": True, "omitted": True}
+                fabric_output = ""
+            else:
+                meta["fabric_output"] = {"at": at_iso, "stale": False}
+                fabric_header = f"# fabric check run started {at_iso}\n"
         (root / "incident.json").write_text(json.dumps(meta, indent=2, default=str))
 
         # The kernel's view — the piece that a reboot destroys and that nobody has had.
@@ -417,7 +532,7 @@ def capture_incident(
         if reset_output:
             (root / "reset.log").write_text(reset_output)
         if fabric_output:
-            (root / "fabric.log").write_text(fabric_output)
+            (root / "fabric.log").write_text(fabric_header + fabric_output)
 
         for f in root.iterdir():
             try:
