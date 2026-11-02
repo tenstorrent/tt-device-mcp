@@ -911,12 +911,6 @@ def _pci_rescan() -> None:
     pcie_guard.rescan_tt_root_ports()
 
 
-def tray_down_capture_enabled() -> bool:
-    """``TT_DEVICE_MCP_TRAY_DOWN_CAPTURE``: the rescan and capture in front of the ladder for a
-    tray-down onset. ON by default; ``0`` turns it off and every drop goes straight to the ladder."""
-    return os.environ.get("TT_DEVICE_MCP_TRAY_DOWN_CAPTURE", "1").strip() != "0"
-
-
 def _off_per_tray(off_ids, tray_map: Optional[dict]) -> Optional[dict]:
     """``{tray: chips off}`` for every tray with a chip off, or None when the map is missing or does
     not place every off chip — no tray decision rests on a partial picture (I16)."""
@@ -1726,10 +1720,9 @@ class GalaxyRecovery(Recovery):
 
     async def _tray_down_latch(self, expected: int, beats: Optional[dict]) -> Optional[str]:
         """``TRAY_DOWN_ONSET``/``"PARTIAL"`` for the open episode, latching it at the first off-bus
-        sighting; None when nothing is off the bus yet, the prelude is switched off, or this is not
-        a Galaxy-sized mesh. An off set first seen after any reset (the ladder's own, or a manual
+        sighting; None when nothing is off the bus yet or this is not a Galaxy-sized mesh. An off set first seen after any reset (the ladder's own, or a manual
         ``reset_with_quiesce`` since the last release) or while one is cycling is never an onset."""
-        if not tray_down_capture_enabled() or expected < 2 * UBB_CHIP_COUNT:
+        if expected < 2 * UBB_CHIP_COUNT:
             return None
         if self._td is not None:
             return self._td["path"]

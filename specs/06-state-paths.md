@@ -277,7 +277,6 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_AUTO_POWER_CYCLE` | 1 | Arm the BMC power-cycle rung | 04 |
 | `TT_DEVICE_MCP_AUTO_MESH_RESET` | unset | `0` (the outage hold) holds every automatic mesh reset; unset or `1` arms it | 04 |
 | `TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC` | 3600 | While a held mesh reset stands, page again after this long; `0` pages once per hold | 03, 04 |
-| `TT_DEVICE_MCP_TRAY_DOWN_CAPTURE` | `1` | `0` turns off the tray-down prelude (one PCI rescan and the read-only BMC/CPLD/PCIe capture before the ladder at a tray-down onset); the ladder is the same either way | 04 |
 | `TT_DEVICE_MCP_TRAY_CPLD_BUSES` | unset | Site data for the tray-down capture: each tray's CPLD BMC I2C bus, `tray:0xNN,...`. All three CPLD vars must be set and well formed; otherwise the CPLD reads are skipped | 04 |
 | `TT_DEVICE_MCP_TRAY_CPLD_ADDR` | unset | Site data: the tray CPLD's I2C address, `0xNN`; unset = CPLD reads skipped | 04 |
 | `TT_DEVICE_MCP_TRAY_CPLD_REGS` | unset | Site data: the CPLD registers to read on every configured tray, `0xNN,...`; unset = CPLD reads skipped | 04 |

@@ -436,8 +436,7 @@ each rung fires only when the gentler one failed or cannot apply.
   against the deadline. The last tt-smi telemetry is not read again: the gate's `unhealthy` bundle,
   written just before, holds the sampler's telemetry ring, and the `tray_down` bundle's
   `incident.json` holds the live per-chip PCI snapshot. Because the prelude changes no ladder
-  decision, it is safe on any Galaxy the tray map covers. `TT_DEVICE_MCP_TRAY_DOWN_CAPTURE=0`
-  turns the prelude off: every drop takes the ladder alone.
+  decision, it is safe on any Galaxy the tray map covers.
 
 - **I20 — A reset puts an operator's AICLK ceiling back before anything else touches the chips.**
   Any reset clears the firmware clock cap (spec 03 I35), so `reset_with_quiesce` marks it owed
@@ -3497,7 +3496,7 @@ sees a silent fabric pass.
 | I19 a tray with 4+ chips off at first sighting is an onset; no map, an unplaced chip, or fewer off gets no prelude | `tests/test_tray_down_prelude.py::test_a_tray_with_four_or_more_chips_off_is_a_tray_down_onset`, `::test_no_map_or_an_unplaced_chip_never_classifies_as_tray_down`, `::test_one_to_three_chips_off_get_no_prelude` |
 | I19 replay: no recorded episode that recovered without a power cycle gets the prelude | `tests/test_tray_down_prelude.py::test_replay_the_prelude_runs_only_on_onsets_that_never_recovered_without_a_power_cycle` (fixture `tests/fixtures/tray_down_replay.tsv`) |
 | I19 order: rescan, capture, the full ladder, the power cycle only when the ladder fails (a whole tray, class A, goes to the cycle after the capture: I37) | `tests/test_tray_down_prelude.py::test_a_tray_down_onset_rescans_captures_then_runs_its_ladder`, `::test_a_ladder_that_recovers_the_tray_fires_no_power_cycle`, `::test_the_last_chance_sweep_still_gates_the_power_cycle_of_a_tray_down` |
-| I19 the prelude changes no ladder input (same stage, indices, evidence, beats and rungs as with it off) | `tests/test_tray_down_prelude.py::test_the_prelude_changes_no_ladder_input`, `::test_capture_off_runs_the_ladder_alone` |
+| I19 the prelude changes no ladder input (same stage, indices, evidence, beats and rungs as with no onset) | `tests/test_tray_down_prelude.py::test_the_prelude_changes_no_ladder_input` |
 | I19 once per episode from any caller; a tenant defers the rescan, never the capture | `tests/test_tray_down_prelude.py::test_the_prelude_runs_once_per_episode_from_any_caller`, `::test_a_tenant_defers_the_rescan_but_not_the_capture` |
 | I19 after the rescan: every chip back runs the full verify and stops only if it passes; the runtime fault is kept and the chips leave the isolated set | `tests/test_tray_down_prelude.py::test_every_chip_back_after_the_rescan_runs_the_full_verify_and_stops`, `::test_a_rescan_recovery_keeps_the_runtime_fault_and_un_isolates_the_chips`, `::test_chips_back_on_a_mesh_that_fails_verify_still_get_the_full_ladder` |
 | I19 an off set first seen after a reset (the ladder's, a manual `reset_with_quiesce`, one in flight, a live scope) is not an onset; the latch is fresh after the episode | `tests/test_tray_down_prelude.py::test_the_latch_does_not_change_after_a_reset_and_is_fresh_after_the_episode`, `::test_a_manual_reset_before_the_first_sighting_is_not_an_onset`, `::test_a_reset_in_flight_or_a_live_scope_is_not_an_onset` |

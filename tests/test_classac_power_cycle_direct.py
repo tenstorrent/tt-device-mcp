@@ -80,7 +80,6 @@ def rig(monkeypatch, tmp_path, galaxy_trays):
     monkeypatch.setenv("TTDEV_ROOT", str(tmp_path))
     for name in (
         "TT_DEVICE_MCP_MANUAL_RECOVERY_CMD",
-        "TT_DEVICE_MCP_TRAY_DOWN_CAPTURE",
         "TT_DEVICE_MCP_OFFBUS_HOLD_ESCALATE",
     ):
         monkeypatch.delenv(name, raising=False)

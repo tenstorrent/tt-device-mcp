@@ -140,7 +140,6 @@ def rig(monkeypatch, galaxy_trays):
     monkeypatch.setattr(g.mechanism, "auto_recovery_allowed", lambda action, tenant_active=False, **k: state["allowed"])
     monkeypatch.setattr(g.mechanism, "_journal_auto_recovery_denied", lambda *a, **k: None)
     monkeypatch.setattr(galaxy, "TRAY_DOWN_RESCAN_SETTLE_SEC", 0)
-    monkeypatch.delenv("TT_DEVICE_MCP_TRAY_DOWN_CAPTURE", raising=False)
 
     def rescan():
         order.append("rescan")
@@ -250,8 +249,8 @@ async def test_the_last_chance_sweep_still_gates_the_power_cycle_of_a_tray_down(
 )
 async def test_the_prelude_changes_no_ladder_input(rig, monkeypatch, stage, rung):
     """The ladder sees the caller's own stage, indices, evidence and beats, with or without the
-    prelude: the same call with TT_DEVICE_MCP_TRAY_DOWN_CAPTURE=0 (1.0.0's path) records the same
-    arguments and the same rungs."""
+    prelude: the same call with no onset latched (1.0.0's path) records the same arguments and the
+    same rungs."""
     g = rig["g"]
     seen = []
     real = galaxy.GalaxyRecovery._fire_gate_rung
@@ -268,7 +267,10 @@ async def test_the_prelude_changes_no_ladder_input(rig, monkeypatch, stage, rung
     assert rig["order"][:2] == ["rescan", "capture"]
     g.tray_down_episode_end()
     rig["order"].clear()
-    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_DOWN_CAPTURE", "0")
+    async def no_onset(*a, **k):
+        return None
+
+    monkeypatch.setattr(g, "_tray_down_latch", no_onset)
     await g.escalate("gate/post-job", ["24"], 32, lambda m: None, stage=stage, ev=None, beats=dict(beats))
     assert rig["order"] == with_prelude and rung in with_prelude
     assert seen[0] == seen[1]
@@ -519,15 +521,6 @@ async def test_the_gate_runs_the_prelude_then_its_ladder_end_to_end(rig, monkeyp
     assert rig["order"][:3] == ["rescan", "capture", f"rung:{rungs[0]}"]
     assert "power_cycle" not in rig["order"]
     assert rig["g"]._td["path"] == "TRAY_DOWN"
-
-
-@pytest.mark.asyncio
-async def test_capture_off_runs_the_ladder_alone(rig, monkeypatch):
-    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_DOWN_CAPTURE", "0")
-    g = rig["g"]
-    rig["beats"] = _beats_without(_off(rig["map"], {3: 6}))
-    await _run_ladder(g, [])
-    assert rig["order"] == ["glx_reset", "last_chance", "power_cycle"] and g._td is None
 
 
 @pytest.mark.asyncio
