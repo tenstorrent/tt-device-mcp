@@ -61,7 +61,7 @@ def bh_map():
     ],
 )
 def test_a_tray_with_four_or_more_chips_off_is_a_tray_down_onset(bh_map, spec, fast):
-    onset = galaxy.tray_down_onset(_off(bh_map, spec), BH_CHIP_BUSES, "tt-galaxy-bh")
+    onset = galaxy._tray_down_counts(_off(bh_map, spec), galaxy._tray_map(BH_CHIP_BUSES, "tt-galaxy-bh"))
     assert (onset is not None) is fast
     if fast:
         assert onset == dict(sorted(spec.items()))
@@ -69,11 +69,13 @@ def test_a_tray_with_four_or_more_chips_off_is_a_tray_down_onset(bh_map, spec, f
 
 def test_no_map_or_an_unplaced_chip_never_classifies_as_tray_down(bh_map):
     off = _off(bh_map, {3: 8})
-    assert galaxy.tray_down_onset(off, {}, "tt-galaxy-bh") is None
-    assert galaxy.tray_down_onset(off, BH_CHIP_BUSES, "tt-galaxy-wh-unknown") is None
+    assert galaxy._tray_down_counts(off, galaxy._tray_map({}, "tt-galaxy-bh")) is None
+    assert galaxy._tray_down_counts(off, galaxy._tray_map(BH_CHIP_BUSES, "tt-galaxy-wh-unknown")) is None
     partial = {c: a for c, a in BH_CHIP_BUSES.items() if c != min(off)}
-    assert galaxy.tray_down_onset(off, partial, "tt-galaxy-bh") is None, "a chip the map cannot place declines"
-    assert galaxy.tray_down_onset(set(), BH_CHIP_BUSES, "tt-galaxy-bh") is None
+    assert (
+        galaxy._tray_down_counts(off, galaxy._tray_map(partial, "tt-galaxy-bh")) is None
+    ), "a chip the map cannot place declines"
+    assert galaxy._tray_down_counts(set(), galaxy._tray_map(BH_CHIP_BUSES, "tt-galaxy-bh")) is None
 
 
 def _replay_rows():
@@ -97,7 +99,7 @@ def test_replay_the_prelude_runs_only_on_onsets_that_never_recovered_without_a_p
         else:
             spec = {int(t[1:]): int(n) for t, n in (p.split(":") for p in per_tray.split(","))}
             off = _off(bh_map, spec)
-        onset = galaxy.tray_down_onset(off, BH_CHIP_BUSES, "tt-galaxy-bh")
+        onset = galaxy._tray_down_counts(off, galaxy._tray_map(BH_CHIP_BUSES, "tt-galaxy-bh"))
         if outcome == "NO-BOOT":
             no_boot += 1
             assert onset is None, f"a recoverable onset ({per_tray}) gets no prelude"

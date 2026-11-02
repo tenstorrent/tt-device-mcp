@@ -251,7 +251,7 @@ def test_a_longest_argument_is_redacted_in_linear_bounded_time(prefix):
     assert time.perf_counter() - t0 < 0.05
     assert len(line) <= hi.CMDLINE_MAX_CHARS
     t0 = time.perf_counter()
-    hi.redact_argv(["tool", _long_arg(prefix).decode()])  # the whole argument, no cut
+    list(hi._redacted(["tool", _long_arg(prefix).decode()]))  # the whole argument, no cut
     assert time.perf_counter() - t0 < 0.25
 
 

@@ -943,13 +943,6 @@ def _tray_down_counts(off_ids, tray_map: Optional[dict]) -> Optional[dict]:
     return per
 
 
-def tray_down_onset(off_ids, chip_buses, board_type) -> Optional[dict]:
-    """``{tray: chips off}`` when the off-bus set puts TRAY_DOWN_MIN_CHIPS or more chips off ONE
-    physical tray (by the bus-derived map, I16), else None — also None for no ids, no map, or a chip
-    the map does not place. Pure: the classification the tray-down latch takes at the first sighting."""
-    return _tray_down_counts(off_ids, _tray_map(chip_buses, board_type))
-
-
 def _whole_trays_off(offbus_chips: set, expected: int, tray_map: Optional[dict]) -> list:
     """The sorted trays every chip of which is off the bus (others may be partly off too), or [] on
     every condition :func:`_offbus_ids_on_trays` refuses. Pure and side-effect-free."""
