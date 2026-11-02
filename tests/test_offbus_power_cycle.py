@@ -10,7 +10,6 @@ may run a real power-cycle command (conftest makes the real one a tripwire)."""
 
 import json
 import os
-import socket
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -20,7 +19,6 @@ import pytest
 from tests.conftest import patch_recovery
 from tests.test_device_safety import _arm_offbus_stuck_hold
 from tests.test_ladder_v2 import _ev
-from tt_device_mcp import alert
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 from tt_device_mcp.health.recovery import galaxy, pcie_guard
@@ -60,7 +58,6 @@ def _gated(monkeypatch, tmp_path, *, held_sec=600, cmd="/usr/local/sbin/host-pow
         rec["fires"].append({"argv": argv, "reason": reason, "state": opc.load_state()})
 
     monkeypatch.setattr(opc, "fire_command", fire)
-    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: rec["alerts"].append(event))
     for mod in (opc, galaxy):
         monkeypatch.setattr(mod, "health_event", lambda kind, **f: rec["events"].append((kind, f)))
     return hold_since, rec
@@ -111,8 +108,6 @@ async def test_an_unset_command_pages_once_and_the_hold_stands(monkeypatch, tmp_
     assert await _pass(hold_since) is None
     assert await _pass(hold_since) is None
     assert rec["fires"] == []
-    assert [a["kind"] for a in rec["alerts"]] == ["offbus_gated_hold_page"], "one page per episode"
-    assert "TT_DEVICE_MCP_POWER_CYCLE_CMD is not set" in rec["alerts"][0]["message"]
 
 
 @pytest.mark.asyncio
@@ -247,29 +242,16 @@ async def test_a_blocked_power_cycle_pages_once_past_its_bound(monkeypatch, tmp_
         monkeypatch.setenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", _script(tmp_path, "mr", "exit 0"))
     _ladder_ran(hold_since)
     assert await _pass(hold_since) is False
-    assert rec["alerts"] == [], "inside the bound it only holds"
+    blocked = lambda: [f for k, f in rec["events"] if k == "offbus_power_cycle_blocked"]  # noqa: E731
+    assert blocked() == [], "inside the bound it only holds"
     later = (datetime.fromisoformat(hold_since) - timedelta(seconds=20)).isoformat()
     srv.device_hold_episode_since = later
     _ladder_ran(later)
     for _ in range(3):
         assert await _pass(later) is False
-    assert [a["kind"] for a in rec["alerts"]] == ["offbus_power_cycle_blocked"], "one page per episode"
-    page = rec["alerts"][0]
+    (page,) = blocked()
     assert page["severity"] == "high" and page["host_at_risk"] is True and page["held_since"] == later
     assert rec["fires"] == []
-
-
-def test_a_page_the_alert_hook_drops_is_sent_again(monkeypatch):
-    """A page dropped because the hook is busy is retried on the next pass; journaled only once."""
-    sent, events = [], []
-    monkeypatch.setattr(opc, "health_event", lambda kind, **f: events.append(kind))
-    monkeypatch.setattr(alert, "alert_argv", lambda: ["/bin/true"])
-    results = iter([None, object()])
-    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: sent.append(event) or next(results))
-    opc.arm("2026-10-13T19:29:00")
-    for _ in range(3):
-        opc.page_once("offbus_gated_hold_page", lambda m: None, "held")
-    assert len(sent) == 2 and events.count("offbus_gated_hold_page") == 1
 
 
 def test_the_blocked_page_bound_defaults_and_rejects_nonsense(monkeypatch):
@@ -322,8 +304,6 @@ async def test_no_manual_recovery_check_never_fires_and_pages_once(monkeypatch, 
     for _ in range(3):
         assert await _pass(hold_since) is None
     assert rec["fires"] == [] and opc.load_state() == {}
-    assert [a["kind"] for a in rec["alerts"]] == ["offbus_power_cycle_unguarded"]
-    assert rec["alerts"][0]["severity"] == "high" and rec["alerts"][0]["host_at_risk"] is True
     assert "no manual-recovery check" in opc.standback_reason(), "standback_reason fails closed on its own too"
     monkeypatch.setenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", "'unbalanced")
     assert opc.manual_recovery_argv() is None and await _pass(hold_since) is None
@@ -381,8 +361,6 @@ async def test_a_manual_recovery_check_that_cannot_answer_holds_until_the_bound(
     assert rec["fires"] == [] and opc.load_state() == {}
     standing = [f["why"] for k, f in rec["events"] if f.get("phase") == "standing_back"]
     assert standing and all(why in w for w in standing)
-    assert [a["kind"] for a in rec["alerts"]] == ["offbus_power_cycle_blocked"]
-    assert why in rec["alerts"][0]["why"]
 
 
 @pytest.mark.asyncio
@@ -414,16 +392,6 @@ async def test_a_tenant_arriving_during_the_checks_holds(monkeypatch, tmp_path, 
     assert rec["fires"] == [] and opc.load_state() == {}
 
 
-def test_the_pages_name_the_host(monkeypatch):
-    sent = []
-    monkeypatch.setattr(opc, "health_event", lambda kind, **f: None)
-    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: sent.append(event))
-    opc.arm("2026-10-13T19:29:00")
-    opc.page_once("offbus_power_cycle_unguarded", lambda m: None, "held")
-    opc.page_if_blocked("2026-10-13T19:29:00", 10**6, lambda m: None, "a marker")
-    assert [e["host"] for e in sent] == [socket.gethostname()] * 2
-
-
 @pytest.mark.asyncio
 async def test_the_mechanism_limits_still_apply(monkeypatch, tmp_path, clear_job_state):
     hold_since, rec = _gated(monkeypatch, tmp_path)
@@ -433,8 +401,6 @@ async def test_the_mechanism_limits_still_apply(monkeypatch, tmp_path, clear_job
     _ladder_ran(hold_since)
     assert await _pass(hold_since) is None
     assert rec["fires"] == []
-    assert [a["kind"] for a in rec["alerts"]] == ["offbus_power_cycle_denied"]
-    assert "per-boot cap reached" in rec["alerts"][0]["message"]
 
 
 @pytest.mark.asyncio

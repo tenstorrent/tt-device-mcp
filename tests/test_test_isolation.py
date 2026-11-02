@@ -44,8 +44,6 @@ FRESH = {
     "device_held_since": "",
     "device_hold_escalated_monotonic": 0.0,
     "device_hold_deadline_bucket": 0,
-    "device_hold_alert_next_bucket": 0,
-    "device_hold_alert_gap": 0,
     "device_hold_escalate_bucket": 0,
     "device_hold_offbus_escalated": False,
     "device_hold_offbus_tenant_wait": False,

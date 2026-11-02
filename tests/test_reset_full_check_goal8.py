@@ -254,7 +254,6 @@ async def test_fabric_fail_after_any_reset_keeps_the_hold_and_enters_bounded_rec
     monkeypatch.setattr(srv, "device_hold_deadline_bucket", 0)
     monkeypatch.setattr(srv, "device_hold_offbus_escalated", False)
     monkeypatch.setattr(srv, "_hold_episode_tenant", "")
-    monkeypatch.setattr(srv, "_maybe_alert_stuck_hold", lambda *a: None)
     since = datetime.now() - timedelta(seconds=srv._stuck_hold_ceiling_sec() + 60)
     monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
     srv._check_hold_deadline()

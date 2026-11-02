@@ -60,7 +60,6 @@ def replay(rig, monkeypatch, clear_job_state):  # noqa: F811
     monkeypatch.setattr(mon, "last_fabric_ok", None)
     monkeypatch.setattr(mon, "topology_hw_fault", "")
     monkeypatch.setattr(mon, "topology_lift_pending", False)
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
     monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
     monkeypatch.setattr(srv, "device_hold_job_bound_escalated", False)
     monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)

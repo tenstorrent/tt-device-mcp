@@ -281,8 +281,6 @@ async def test_a_fault_hold_over_a_readopted_job_pages_once_and_runs_the_ladder_
     srv._persist_hold_episode(old)
     _restart_broker(monkeypatch)
     job = _readopted_job(monkeypatch, tmp_path)
-    alerts = []
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: alerts.append(event))
     monkeypatch.setattr(srv, "device_hold_tenant_deferred", False)
 
     srv._note_tenant_gate_verdict(srv._device_unavailable_for_tenant())
@@ -293,7 +291,6 @@ async def test_a_fault_hold_over_a_readopted_job_pages_once_and_runs_the_ladder_
     await _drain()
 
     kinds = [k for k, _ in rig["events"]]
-    assert [a["kind"] for a in alerts].count("hold_bound_tenant_blocked") == 1
     assert kinds.count("hold_bound_tenant_blocked") == 1
     assert "glx_reset" not in order and "power_cycle" not in order, "no reset over the running job"
 

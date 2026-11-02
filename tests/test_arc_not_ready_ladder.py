@@ -158,7 +158,6 @@ async def test_a_failed_check_after_that_reset_keeps_the_hold_and_the_bound_stil
     monkeypatch.setattr(srv, "_forced_escalation_task", None)
     monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_retry", None)
     monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_cooldown_state", None)
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
     monkeypatch.setattr(srv.fsm, "on_outcome", lambda outcome: None)
     ladders = []
 

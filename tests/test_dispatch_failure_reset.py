@@ -6,7 +6,6 @@ present-mesh reset per hold episode, and only the full check after it releases t
 import pytest
 
 from tests.conftest import fsm_dirty, patch_health_event
-from tt_device_mcp import alert
 from tt_device_mcp import device_holders as dh
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
@@ -100,7 +99,6 @@ def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
     monkeypatch.setattr(g.mechanism, "await_foreign_scope", no_scope)
     monkeypatch.setattr(g.mechanism, "reset_with_quiesce", reset)
     patch_health_event(monkeypatch, lambda name, *a, **k: st["events"].append(name))
-    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: st["alerts"].append(event) or object())
     monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: {})
     monkeypatch.setattr(srv, "capture_incident", lambda *a, **k: None)
     log = _Logger()
@@ -169,7 +167,6 @@ async def test_outage_hold_holds_and_pages_without_a_reset(monkeypatch, mesh):
     assert mesh["resets"] == [], "the outage hold forbids the reset"
     assert srv.fsm.state is ServerState.RECOVERING
     assert "mesh_reset_held" in mesh["events"] and "dispatch_failure_mesh_reset" not in mesh["events"]
-    assert [a["kind"] for a in mesh["alerts"]] == ["mesh_reset_held"]
     said = mesh["log"].text()
     assert "present-mesh reset is HELD" in said and "present-mesh reset is HELD" in srv.fsm.record.detail
     assert "escalates" not in said, "no escalation is promised under the hold"

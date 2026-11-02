@@ -15,7 +15,7 @@ import pytest
 
 from tests.conftest import patch_health_event, patch_recovery
 from tests.test_device_safety import _arm_offbus_stuck_hold, _arm_stuck_hold
-from tt_device_mcp import alert, privileges
+from tt_device_mcp import privileges
 from tt_device_mcp import server as srv
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.evidence import health_dir
@@ -46,7 +46,6 @@ def _episode(monkeypatch, *, power_cycle=False, clock=None, off_bus=OFF_BUS):
     events, alerts = [], []
     patch_health_event(monkeypatch, lambda kind, **f: events.append(kind))
     monkeypatch.setattr(opc, "health_event", lambda kind, **f: events.append(kind))
-    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: alerts.append(event))
     counters["sweeps"] = counters["trays"] = 0
     _fresh_reset_record(monkeypatch)
 
@@ -109,9 +108,6 @@ async def test_a_failed_unchanged_reset_is_not_repeated_and_with_no_host_rung_is
         assert await _window() is True
     assert counters["resets"] == 1, "a reset that failed on this same set must not fire again in the hold"
     assert _skipped(events) == 4
-    pages = [a for a in alerts if a["kind"] == "offbus_gated_hold_page"]
-    assert len(pages) == 1, "one operator page per episode"
-    assert "no power cycle to climb to" in pages[0]["message"]
     handoff = opc._pending["handoff"]
     assert handoff["deadline"] is None and handoff["latched"], "latched: no deadline lifts it into a reset"
     assert counters["power_cycles"] == 0 and counters["reboots"] == 0 and counters["sweeps"] == 0
@@ -518,15 +514,13 @@ async def test_e3_offbus_classes_reset_once_then_take_the_next_rung(monkeypatch,
         assert order == [1], "the mesh reset ran first, then the power cycle in the same window"
         assert counters["sweeps"] == 1, "the last-chance sweep runs right before the power cycle"
     else:
-        pages = [a for a in alerts if a["kind"] == "offbus_gated_hold_page"]
-        assert len(pages) == 1 and opc._pending["handoff"]["latched"], "handed to an operator at once"
+        assert opc._pending["handoff"]["latched"], "handed to an operator at once"
     for w in range(1, WINDOWS):
         clock[0] = max(clock[0], 600.0 * w)
         assert await _window() is True
     assert counters["resets"] == 1, "the failed reset is never repeated on the unchanged set"
     assert _skipped(events) >= WINDOWS - 1, "every later window skips it"
     if not power_cycle:
-        assert len([a for a in alerts if a["kind"] == "offbus_gated_hold_page"]) == 1, "one page per episode"
         assert counters["power_cycles"] == 0 and counters["reboots"] == 0
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "the device stays held"
 
@@ -591,7 +585,6 @@ async def test_a_failed_reset_that_shrank_the_set_is_not_repeated_and_climbs(mon
     if power_cycle:
         assert order[:1] == [1], "the power cycle follows the one failed reset"
     else:
-        assert len([a for a in alerts if a["kind"] == "offbus_gated_hold_page"]) == 1, "one page per episode"
         assert counters["power_cycles"] == 0
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "the device stays held"
 

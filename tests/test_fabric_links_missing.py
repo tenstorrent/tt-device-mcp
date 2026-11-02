@@ -285,7 +285,6 @@ def _monitor_fabric(monkeypatch, tmp_path, st):
     monkeypatch.setattr(monitor_mod, "health_dir", lambda: hdir)
     monkeypatch.setattr(monitor_mod, "_asic_bus_map", lambda: {"a": 0xC1})
     monkeypatch.setattr(monitor_mod, "health_event", lambda ev, **f: st.setdefault("events", []).append(ev))
-    monkeypatch.setattr(monitor_mod.alert, "send_alert", lambda ev, log=None: object())
     (hdir / monitor_mod.ASIC_BUS_FILE).write_text('{"a": 1}')
 
     async def verify(expected, log, run_fabric=True, **kw):

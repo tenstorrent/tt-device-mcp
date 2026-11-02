@@ -230,7 +230,6 @@ def _runner_setup(monkeypatch, tmp_path):
     _free_device_lock(monkeypatch)
     _no_workspace_activation(monkeypatch)
     monkeypatch.setattr(srv, "job_log_dir", tmp_path)
-    monkeypatch.setattr(srv.alert, "send_alert", lambda *a, **k: None)
     monkeypatch.setattr(srv, "TENANT_HOLD_POLL_SEC", 0.02)
 
     async def _free(job_log_file):

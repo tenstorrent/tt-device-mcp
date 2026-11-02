@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-from tt_device_mcp import alert, metrics, pre_reset_scan
+from tt_device_mcp import metrics, pre_reset_scan
 from tt_device_mcp.constants import PRE_RESET_ZOMBIE_WAIT_SEC
 from tt_device_mcp.device_holders import discount_broker_internal, holder_comm, is_tenant, username_for_uid
 from tt_device_mcp.health.evidence import health_event
@@ -1125,9 +1125,7 @@ class GalaxyRecovery(Recovery):
         health_event("power_cycle_launch_failed_holding", cause=cause, paged=page, held_since=episode or None)
         if not page:
             return
-        event = {"kind": "power_cycle_launch_failed_holding", "cause": cause, "held_since": episode or None}
-        if alert.send_alert(event, _logger) is not None or alert.alert_argv() is None:
-            self._cycle_launch_paged = (episode, mono)
+        self._cycle_launch_paged = (episode, mono)
 
     def _platform_reset_argv(self, indices: list) -> list:
         # All ASICs, no targets: a 6U Galaxy needs -glx_reset — per-PCIe-target -r does not
@@ -4256,7 +4254,6 @@ class GalaxyRecovery(Recovery):
             f"device stays held and the broker re-runs the full health check, fabric included, on its "
             f"backoff, releasing only on a pass"
         )
-        alert.send_alert(event, _logger)
 
     def fabric_77_handoff_status(self, episode: str) -> Optional[dict]:
         """The /health ``operator_handoff`` field while this episode's 77 is handed off, or None."""
@@ -4297,7 +4294,6 @@ class GalaxyRecovery(Recovery):
             "the reset and the last-chance sweep both left the fabric unverified (77) for a known no-reset "
             "cause — no power cycle; holding, paging once, the idle relift keeps re-checking"
         )
-        alert.send_alert(event, _logger)
 
     async def _climb_to_host_recovery_after_failed_reset(
         self,

@@ -30,14 +30,12 @@ import json
 import logging
 import os
 import re
-import socket
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from tt_device_mcp import alert
 from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.monitors.heartbeat import dead_chips, read_heartbeats
 from tt_device_mcp.health.monitors.hostpci import link_down
@@ -855,17 +853,6 @@ def expire_offbus_reset_latch(
         return None
     log(f"the host-hang hold latched on boot {rec.get('latched_on_boot') or '(unknown)'} lifted: {reason}")
     health_event("offbus_reset_hold_expired", latch=rec, boot_id=_boot_id(), reason=reason, chips_off_bus=off)
-    if off:  # the latch file is gone, so this pages once per latch
-        alert.send_alert(
-            {
-                "kind": "offbus_reset_hold_expired_off_bus",
-                "message": f"{_latch_boots(rec)}; lifted: {reason}",
-                "host": socket.gethostname(),
-                "host_at_risk": True,
-                "severity": "high",
-            },
-            _logger,
-        )
     return reason
 
 

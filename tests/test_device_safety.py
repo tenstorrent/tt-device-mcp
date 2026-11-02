@@ -13425,7 +13425,6 @@ async def test_a_sweep_that_still_reads_77_holds_and_pages_once_instead_of_climb
     monkeypatch.setattr(g, "_sweep_read_77", False)
     monkeypatch.setattr(g, "_host_rung_77_paged_since", None)
     alerts = []
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: alerts.append(event["kind"]))
 
     async def sweep(expected, log, gate_phase, **k):
         sweeps.append(k)
@@ -13438,7 +13437,6 @@ async def test_a_sweep_that_still_reads_77_holds_and_pages_once_instead_of_climb
     assert len(sweeps) == 1 and counters["resets"] == 0
     if read_77:
         assert climbs == [], "a 77 is no measured fault: never a host rung"
-        assert alerts == ["fabric_unverified_no_host_rung"], "one page per episode"
     else:
         assert climbs == [{"swept": True, "ladder_ran": True}] * 2
         assert alerts == []
@@ -13462,7 +13460,6 @@ def _arm_sweep_still_77(monkeypatch, *, climb_outcome=galaxy_mod.HOST_RUNG_FIRED
     monkeypatch.setattr(g, "_host_rung_77_paged_since", None)
     monkeypatch.setattr(g, "_fabric_77_handoff", None)
     alerts = []
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: alerts.append(event))
 
     async def sweep(expected, log, gate_phase, **k):
         sweeps.append(k)
@@ -13497,10 +13494,8 @@ async def test_a_sweep_still_reading_77_with_no_known_cause_climbs_to_the_host_r
     for _ in range(2):
         assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
     assert len(climbs) == 1, "one host rung per episode"
-    assert [a["kind"] for a in alerts] == ["fabric_unverified_operator_handoff"], "one page per episode"
-    assert alerts[0]["deadline_epoch"] - time.time() == pytest.approx(galaxy_mod.FABRIC_77_HANDOFF_SEC, abs=60)
     status = g.fabric_77_handoff_status(srv.device_hold_episode_since)
-    assert status["owner"] == "operator" and status["act_by_epoch"] == alerts[0]["deadline_epoch"]
+    assert status["owner"] == "operator"
     assert g.fabric_77_handoff_status("another-episode") is None, "the hand-off ends with its hold"
     assert counters["resets"] == 0 and counters["dirty_cleared"] == 0, "held, never released unverified"
 
@@ -13535,7 +13530,6 @@ async def test_a_latched_hold_whose_sweep_still_reads_a_mismatch_77_climbs_to_th
         assert [a["kind"] for a in alerts] == []
     else:
         assert climbs == []
-        assert [a["kind"] for a in alerts] == ["fabric_unverified_no_host_rung"]
     assert counters["dirty_cleared"] == 0, "held, never released unverified"
 
 
@@ -13548,8 +13542,6 @@ async def test_a_77_host_rung_that_could_not_run_hands_off_and_retries(monkeypat
     for _ in range(2):
         assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
     assert len(climbs) == 2, "a host rung that did not run is not spent"
-    assert [a["kind"] for a in alerts] == ["fabric_unverified_operator_handoff"]
-    assert "could not run" in alerts[0]["why"]
     assert srv.recovery_mechanism.unverified_77_host_rung_since is None
     assert counters["dirty_cleared"] == 0
 
@@ -13576,7 +13568,6 @@ async def test_a_boot_the_77_host_rung_brought_up_hands_off_instead_of_climbing_
     )
     assert await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
     assert bool(climbs) is climbs_again
-    assert [a["kind"] for a in alerts] == ([] if climbs_again else ["fabric_unverified_operator_handoff"])
 
 
 def test_an_owed_77_hold_skips_the_i40_retries_and_the_i48_backoff_and_a_first_time_77_keeps_them(
@@ -13627,7 +13618,6 @@ def _arm_77_host_rung_end_to_end(monkeypatch):
     monkeypatch.setattr(srv.FABRIC_DEBT, "passed_since_start", False)
     monkeypatch.setattr(g, "_fabric_77_handoff", None)
     alerts, reasons, events = [], [], []
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: alerts.append(event))
 
     async def power_cycle(log, reason):
         counters["power_cycles"] += 1
@@ -13684,18 +13674,15 @@ async def test_a_77_host_rung_that_cannot_run_pages_once_and_a_later_rung_clears
         )
     for _ in range(3):
         assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
-    assert [a["kind"] for a in alerts] == ["fabric_unverified_operator_handoff"], "exactly one page"
-    assert "could not run" in alerts[0]["why"]
     # A denied rung is only held off: the broker fires it itself once allowed (spec 04 I79).
     owner = "operator" if cannot_run == "not_opted_in" else "broker"
     assert g.fabric_77_handoff_status(srv.device_hold_episode_since)["owner"] == owner
-    assert alerts[0]["broker_retries"] is (cannot_run == "denied")
     assert reasons == [] and "fabric_unverified_host_rung" not in events
 
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", lambda esc, *, tenant_active: (True, "ok"))
     assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
-    assert reasons == [galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE] and len(alerts) == 1
+    assert reasons == [galaxy_mod.FABRIC_77_HOST_RUNG_CAUSE]
     assert g.fabric_77_handoff_status(srv.device_hold_episode_since) is None, "the fired rung ends the hand-off"
     assert counters["dirty_cleared"] == 0
 
@@ -13773,7 +13760,6 @@ async def test_a_cooldown_denied_cold_rung_is_retried_on_each_re_check_and_fires
     assert counters["power_cycles"] == 1 and len(reasons) == 1, "at most one power cycle per episode"
     assert len(asked) == 3
     assert counters["resets"] == 0 and counters["dirty_cleared"] == 0, "held, never released unverified"
-    assert [a["why"] for a in alerts] == ["the host rung already ran on this hold"], "paged only once spent"
 
 
 @pytest.mark.asyncio
@@ -13802,8 +13788,6 @@ async def test_a_cold_rung_denied_for_a_reason_other_than_the_cooldown_pages_onc
     for _ in range(2):
         assert await g._escalate_stuck_hold(["0", "1"], 32, lambda m: None) is True
     assert asked == ["power-cycle"] * 2 and counters["power_cycles"] == 0 and reasons == []
-    assert [a["kind"] for a in alerts] == ["fabric_unverified_operator_handoff"], "one page per episode"
-    assert why in alerts[0]["why"] and alerts[0]["broker_retries"] is True
     assert g.fabric_77_handoff_status(srv.device_hold_episode_since)["owner"] == "broker"
     assert "fabric_unverified_host_rung_cooldown" not in events
     assert counters["resets"] == 0 and counters["dirty_cleared"] == 0, "held, never released unverified"
@@ -13913,7 +13897,6 @@ def _arm_fabric_only_deadline_hold(monkeypatch, *, why, detail, fabric_output=""
 
     monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
     monkeypatch.setattr(srv.fsm, "on_outcome", lambda outcome: None)
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: alerts.append(event))
     patch_health_event(monkeypatch, lambda kind, **k: events.append(kind))
     return escalations, alerts, events
 
@@ -13952,7 +13935,6 @@ async def test_the_deadline_escalation_holds_a_fabric_only_present_mesh_without_
     await srv._force_escalate_stuck_hold()
     await srv._force_escalate_stuck_hold()  # the next ceiling window: still no reset, no second page
     assert escalations == [], "no reset or ladder rung on a fabric-only hold with every chip present"
-    assert [a["cause"] for a in alerts] == [cause], "page once per episode"
     assert events.count("hold_deadline_no_reset") == 1
     assert "hold_deadline_forced_escalation" not in events
 
@@ -15606,7 +15588,6 @@ async def test_the_deadline_escalation_holds_a_known_fabric_fault_without_a_rese
     monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "known fabric fault: 2 jobs in a row")
     await srv._force_escalate_stuck_hold()
     assert escalations == []
-    assert [a["cause"] for a in alerts] == ["known fabric fault"]
 
 
 def _boot_split_hold(monkeypatch, tmp_path, clear_job_state, *, sidecar):
@@ -16047,17 +16028,6 @@ async def test_replay_a_20_min_readopted_job_then_the_startup_check(monkeypatch,
         assert climbs == ["present-forced"] and len(cycles) == 1, "one ladder, then one power-cycle request"
 
 
-def _capture_alerts(monkeypatch):
-    """The operator's alert hook, armed; returns the events it was handed."""
-    sent = []
-    monkeypatch.setattr(srv.alert, "alert_argv", lambda: ["alert-cmd"])
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log: sent.append(event) or 0)
-    monkeypatch.setattr(srv, "_persist_hold_alert_backoff", lambda *a: None)
-    monkeypatch.setattr(srv, "device_hold_alert_next_bucket", 1)
-    monkeypatch.setattr(srv, "device_hold_alert_gap", 0)
-    return sent
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("job_kind", ["placeholder", "preemptable_past_soft_limit"])
 async def test_a_readopted_job_serves_the_startup_hold_only_up_to_its_stated_end(monkeypatch, tmp_path, job_kind):
@@ -16079,7 +16049,6 @@ async def test_a_readopted_job_serves_the_startup_hold_only_up_to_its_stated_end
         job.timeout_sec = srv.DEFAULT_TIMEOUT_SEC
     gate_heals["on"] = False
     cycles = _arm_unhealed_power_cycle(monkeypatch)
-    sent = _capture_alerts(monkeypatch)
     pages = []
     patch_health_event(
         monkeypatch, lambda kind, **f: (events.append((kind, f.get("blocker"))), pages.append((kind, f)))
@@ -16102,7 +16071,6 @@ async def test_a_readopted_job_serves_the_startup_hold_only_up_to_its_stated_end
     assert "re-adopted job 428" in health["blocked_by"]
     await at(stuck + 1)
     assert "hold_stuck_past_deadline" in [k for k, _ in events], "a hold past the stated end is flagged"
-    assert [e for e in sent if e["kind"] == "hold_stuck_past_deadline"], "and alerted"
 
     await job_ends()
     assert gate_calls == [("startup", True, True, [])], "the full check, fabric included, runs first"
@@ -16124,7 +16092,6 @@ async def test_the_stuck_hold_watchdog_counts_a_readopted_job_from_its_end(monke
     )
     gate_heals["on"] = False
     cycles = _arm_unhealed_power_cycle(monkeypatch)
-    sent = _capture_alerts(monkeypatch)
     _, at, job_ends = _deferred_behind_the_job(monkeypatch, job, release_job)
     ceiling, stuck = srv._stuck_hold_ceiling_sec(), srv._hold_deadline_sec()
     assert stuck == 2 * ceiling
@@ -16132,7 +16099,6 @@ async def test_the_stuck_hold_watchdog_counts_a_readopted_job_from_its_end(monke
     for sec in (ceiling + 1, stuck + 1, job_end):
         await at(sec)
     assert "hold_stuck_past_deadline" not in [k for k, _ in events], "the job's run time flagged as stuck"
-    assert sent == [], "the operator was alerted over the broker's own job"
 
     await job_ends()  # the full check fails, the ladder's too: the hold stands
     await at(job_end + ceiling + 1)
@@ -16142,7 +16108,6 @@ async def test_the_stuck_hold_watchdog_counts_a_readopted_job_from_its_end(monke
     assert "hold_stuck_past_deadline" not in [k for k, _ in events]
     await at(job_end + stuck + 1)
     assert "hold_stuck_past_deadline" in [k for k, _ in events], "the hold went silent after the job's end"
-    assert [e["kind"] for e in sent] == ["hold_stuck_past_deadline"]
 
 
 @pytest.mark.asyncio
@@ -16166,7 +16131,6 @@ async def test_a_readopted_job_the_broker_is_stopping_serves_until_the_stop_s_bo
         job.preempt_deadline_monotonic = time.monotonic() + srv.PREEMPT_GRACE_SEC
     gate_heals["on"] = False
     cycles = _arm_unhealed_power_cycle(monkeypatch)
-    sent = _capture_alerts(monkeypatch)
 
     # The broker's stop: the monitor's 5 s poll (twice), then SIGINT + its grace + the reap's `systemctl
     # stop` (systemd's default 90 s), or the preempt window and its SIGKILL.
@@ -16177,7 +16141,6 @@ async def test_a_readopted_job_the_broker_is_stopping_serves_until_the_stop_s_bo
         await at(sec)
     assert "hold_bound_tenant_blocked" not in [k for k, _ in events], "the broker's own stop paged as a tenant"
     assert "hold_stuck_past_deadline" not in [k for k, _ in events], "the broker's own stop flagged as stuck"
-    assert sent == [], "the operator was alerted over the broker's own stop"
     assert climbs == [] and cycles == []
     grace = srv.READOPTED_SERVICE_GRACE_SEC
     assert stop_bound < grace <= 300, "the grace covers the broker's whole stop, and stays bounded"
@@ -16187,7 +16150,6 @@ async def test_a_readopted_job_the_broker_is_stopping_serves_until_the_stop_s_bo
     blocked = [b for k, b in events if k == "hold_bound_tenant_blocked"]
     assert blocked, "a job past the stop's bound is paged"
     assert "hold_stuck_past_deadline" in [k for k, _ in events], "and flagged"
-    assert [e for e in sent if e["kind"] == "hold_stuck_past_deadline"], "and alerted"
     health = srv._hold_bound_health(t0 + timedelta(seconds=1200 + grace + 1))
     assert health["next_step"] == "tenant_blocked" and "re-adopted job 428" in health["blocked_by"]
     assert climbs == [] and cycles == [], "no reset under the running job"

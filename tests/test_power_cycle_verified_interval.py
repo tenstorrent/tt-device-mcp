@@ -78,43 +78,8 @@ def test_a_stamp_is_written_once_per_boot(ledger, tmp_path):
     assert json.loads((tmp_path / recovery_base.AUTO_RECOVERY_VERIFIED).read_text())["at_epoch"] == VERIFIED_AT
 
 
-@pytest.mark.parametrize("hook", ["delivers", "still running"])
-def test_the_backstop_refuses_and_pages_once_at_the_cap(ledger, tmp_path, monkeypatch, hook):
-    """While the alert hook is still running send_alert returns None and the page is retried, but the
-    journal row is written once per cap reached, not on every gate pass."""
-    pages, events = [], []
-    sent = object() if hook == "delivers" else None
-    monkeypatch.setattr(recovery_base.alert, "send_alert", lambda ev, *a: pages.append(ev) or sent)
-    monkeypatch.setattr(recovery_base.alert, "alert_argv", lambda: ["hook"])
-    monkeypatch.setattr(srv.recovery_mechanism, "_power_cycle_backstop_logged", 0.0)
-    monkeypatch.setattr(recovery_base, "health_event", lambda kind, **f: events.append((kind, f)))
-    with ledger.open("a") as f:
-        for boot, at in (("boot-B", CYCLED_AT + 1000), ("boot-C", CYCLED_AT + 2000)):
-            f.write(json.dumps({"action": "power-cycle", "boot_id": boot, "at_epoch": at}) + "\n")
-    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-D")
-    _stamp(tmp_path, boot_id="boot-D", at=CYCLED_AT + 2400)
-    now = CYCLED_AT + 3000  # every cycle verified, the interval and the per-boot cap all clear
-
-    allowed, why = _allowed(at=now)
-    assert allowed is False and "backstop" in why
-    reopen = CYCLED_AT + recovery_base.POWER_CYCLE_BACKSTOP_WINDOW_SEC
-    assert "verified or not" in why and f"(epoch {int(reopen)})" in why
-    assert "after verified cycles" not in why
-    assert [p["kind"] for p in pages] == ["power_cycle_backstop"]
-    assert events and events[0][0] == "power_cycle_backstop" and events[0][1]["host_at_risk"] is True
-    assert events[0][1]["allowed_at_epoch"] == reopen
-    assert _allowed(at=now + 60)[0] is False
-    assert _allowed(at=now + 120)[0] is False
-    assert len(events) == 1, "the journal row is written once per cap reached"
-    assert len(pages) == (1 if hook == "delivers" else 3), "paged once, or retried until the hook takes it"
-    assert _allowed(at=reopen - 1)[0] is False
-    # The oldest cycle leaves the window: two remain, under the cap.
-    assert _allowed(at=CYCLED_AT + recovery_base.POWER_CYCLE_BACKSTOP_WINDOW_SEC)[0] is True
-
-
 def _three_cycles_all_verified(ledger, tmp_path, monkeypatch, third_at=CYCLED_AT + 2000):
     pages = []
-    monkeypatch.setattr(recovery_base.alert, "send_alert", lambda ev, *a: pages.append(ev) or object())
     monkeypatch.setattr(recovery_base, "health_event", lambda kind, **f: None)
     with ledger.open("a") as f:
         for boot, at in (("boot-B", CYCLED_AT + 1000), ("boot-C", third_at)):

@@ -410,7 +410,6 @@ def ladder(monkeypatch, tmp_path, clear_job_state):
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     monkeypatch.setattr(srv, "_clear_device_reported_fault", lambda why: None)
     pages = []
-    monkeypatch.setattr(recovery_base.alert, "send_alert", lambda event: pages.append(event) or 0)
     launches = []
     fsm_dirty(srv, "gate/post-job: reset", why="job_killed")
     return {"g": g, "m": m, "events": events, "pages": pages, "launches": launches}
@@ -463,7 +462,6 @@ async def test_the_fallback_never_reads_as_a_passing_reset_and_pages_once(ladder
         assert rc == 1, "tt-smi's exit 0 after the fallback is not a recovered mesh"
     attempted = [f for k, f in rig["events"] if k == "bmc_legacy_reset_attempted"]
     assert len(attempted) == 2 and all(f["host_at_risk"] for f in attempted)
-    assert len(rig["pages"]) == 1, "paged once per episode"
     assert srv._health_payload()["mesh_reset_bmc_guard"]["kind"] == kind
 
 

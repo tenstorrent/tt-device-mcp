@@ -36,7 +36,6 @@ def mon(monkeypatch, health_deps):
     monkeypatch.setattr(fabric, "_validator_paths", lambda: ("bin", "root", ""))
     monkeypatch.setattr(monitor_mod, "_save_asic_bus_map", lambda: None)
     monkeypatch.setattr(monitor_mod, "health_event", lambda ev, **f: state["events"].append(ev))
-    monkeypatch.setattr(monitor_mod.alert, "send_alert", lambda ev, log=None: state["alerts"].append(ev))
     monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_ROUTE_FAULT_JOBS", raising=False)
     monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_KNOWN_FAULT_HOLD_SEC", raising=False)
     return m, state
@@ -54,7 +53,6 @@ async def test_two_jobs_dying_on_routing_after_77_passes_are_a_known_fault(mon):
     why = m.note_job_fabric_route_fault(True, _ROUTE)
     assert why and why.startswith("known fabric fault: 2 jobs in a row") and "forwarding direction" in why.lower()
     assert m.known_fabric_fault() == why
-    assert [a["kind"] for a in state["alerts"]] == ["fabric_known_fault"]
     assert "fabric_known_fault" in state["events"]
 
 
@@ -117,7 +115,6 @@ async def test_the_runner_holds_a_known_fabric_fault_without_the_dirty_reset(mon
     _free_device_lock(monkeypatch)
     _no_workspace_activation(monkeypatch)
     monkeypatch.setattr(srv, "device_fault_reported", "")
-    monkeypatch.setattr(srv.alert, "send_alert", lambda *a, **k: None)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_skipped", True)
     monkeypatch.setattr(srv.health_monitor, "_fabric_route_fault_streak", 1)
     monkeypatch.setattr(srv.health_monitor, "fabric_known_fault", "")

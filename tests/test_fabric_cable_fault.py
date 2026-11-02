@@ -80,7 +80,6 @@ def cable(monkeypatch, health_deps, tmp_path):
     monkeypatch.setattr(monitor_mod, "_save_asic_bus_map", lambda: None)
     monkeypatch.setattr(monitor_mod, "capture_incident", lambda *a, **k: None)
     monkeypatch.setattr(monitor_mod, "health_event", lambda ev, **f: state["events"].append((ev, f)))
-    monkeypatch.setattr(monitor_mod.alert, "send_alert", lambda ev, log=None: state["alerts"].append(ev))
     monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_KNOWN_FAULT_HOLD_SEC", raising=False)
     return m, state
 
@@ -99,11 +98,10 @@ async def test_a_missing_cable_is_a_hardware_verdict_held_and_paged_once(cable):
     assert state["status"] == "hardware_fault"
     assert [ev for ev, _ in state["events"]] == ["fabric_known_fault"]
     assert state["events"][0][1]["cause"] == "missing_cable"
-    assert [(a["kind"], a["cause"]) for a in state["alerts"]] == [("fabric_known_fault", "missing_cable")]
     # The idle relift re-runs the pass (the cached mismatch skips the descriptor run): no second
     # page and no second event while the same fault is open.
     await m._verify_fabric_health_body(60)
-    assert len(state["alerts"]) == 1 and len(state["events"]) == 1
+    assert len(state["events"]) == 1
 
 
 @pytest.mark.asyncio
@@ -114,7 +112,6 @@ async def test_a_missing_cable_paged_once_even_after_its_hold_expires(cable, mon
     assert m.known_fabric_fault() == ""
     await m._verify_fabric_health_body(60)
     assert m.known_fabric_fault().startswith(fabric.CABLE_FAULT)
-    assert len(state["alerts"]) == 1
 
 
 @pytest.mark.asyncio
@@ -183,7 +180,6 @@ async def test_an_override_wrapper_exit_78_is_the_hardware_verdict(cable, monkey
     assert bool(m.known_fabric_fault()) is known
     if known:
         assert detail.startswith("fabric HARDWARE FAULT") and line.split(": ", 1)[1] in detail
-        assert len(state["alerts"]) == 1
 
 
 @pytest.mark.asyncio

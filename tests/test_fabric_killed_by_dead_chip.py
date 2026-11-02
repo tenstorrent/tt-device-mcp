@@ -226,7 +226,6 @@ def gate(monkeypatch, tmp_path, clear_job_state):
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 0.0)
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", False)
-    monkeypatch.setattr(srv.alert, "send_alert", lambda *a, **k: None)
     events = []
     patch_health_event(monkeypatch, lambda kind, *a, **f: events.append((kind, f)))
     seen = {"resets": 0, "rungs": []}

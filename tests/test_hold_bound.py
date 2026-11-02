@@ -163,7 +163,6 @@ async def test_below_the_bound_a_no_reset_hold_keeps_its_fast_path(monkeypatch, 
     )
     await srv._force_escalate_stuck_hold()
     assert escalations == [] and "host_rung" not in events
-    assert [a["cause"] for a in alerts] == ["topology mismatch"]
 
 
 @pytest.mark.asyncio
@@ -493,13 +492,9 @@ def test_every_hold_kind_reports_one_escalation_deadline(monkeypatch, clear_job_
     seen = []
     patch_health_event(monkeypatch, lambda kind, **k: seen.append((kind, k)))
     monkeypatch.setattr(srv, "_maybe_spawn_forced_escalation", lambda: False)
-    monkeypatch.setattr(srv.alert, "alert_argv", lambda: ["true"])
-    monkeypatch.setattr(srv, "_persist_hold_alert_backoff", lambda *a: None)
-    monkeypatch.setattr(srv, "device_hold_alert_next_bucket", 0)
     srv._check_hold_deadline()
     stuck = [k for kind, k in seen if kind == "hold_stuck_past_deadline"]
     assert stuck and all(k["escalation_deadline"] == want for k in stuck)
-    assert alerts and alerts[0]["escalation_deadline"] == want
     monkeypatch.setattr(srv, "device_hold_episode_since", "")
     assert srv.hold_bound_deadline() is None and srv._hold_bound_health() is None
 
@@ -542,7 +537,6 @@ async def test_replay_a_latched_topology_mismatch_hold_gets_the_ladder_then_the_
     monkeypatch.setattr(srv, "device_hold_episode_since", _since(BOUND + 1))
     monkeypatch.setattr(srv, "device_hold_episode_reason", "post-job: fabric check COULD NOT RUN (77)")
     monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
     _watchdog(monkeypatch)
     assert srv._fabric_77_only_hold(), "the latch made the hold 77-only: on the old code nothing runs"
     checks = []
@@ -657,7 +651,6 @@ def _bound_hold_with_a_failing_full_check(rig, monkeypatch):  # noqa: F811
     monkeypatch.setattr(srv, "device_hold_episode_since", _since(BOUND + 1))
     monkeypatch.setattr(srv, "device_hold_episode_reason", "gate/post-job: eth/fabric fault on a present mesh")
     monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
     _watchdog(monkeypatch)
     checks = []
 
@@ -720,8 +713,6 @@ async def test_a_tenant_the_holder_scan_finds_bounds_the_hold_and_the_ladder_run
     order = rig["order"]
     checks = _bound_hold_with_a_failing_full_check(rig, monkeypatch)
     scans = _scan_refuses_the_mesh_reset(rig, monkeypatch, [_refusing_scan("survivor")])
-    alerts = []
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: alerts.append(event))
     monkeypatch.setattr(srv, "device_hold_tenant_deferred", False)
     tenant = {"on": True}
     monkeypatch.setattr(
@@ -741,8 +732,6 @@ async def test_a_tenant_the_holder_scan_finds_bounds_the_hold_and_the_ladder_run
     await _drain()
 
     kinds = [k for k, _ in rig["events"]]
-    pages = [a for a in alerts if a["kind"] == "hold_bound_tenant_blocked"]
-    assert len(pages) == 1 and "4303" in pages[0]["blocked_by"]
     assert kinds.count("hold_bound_tenant_blocked") == 1
     assert srv._hold_bound_health()["next_step"] == "tenant_blocked"
     assert "reset_ran" not in order and "power_cycle" not in order and "released" not in order
@@ -791,7 +780,6 @@ async def test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_che
     monkeypatch.setattr(mon, "last_fabric_output", MISMATCH)
     monkeypatch.setattr(mon, "last_fabric_ok", None)
     monkeypatch.setattr(mon, "topology_hw_fault", "")
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
     monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
     # The mismatch lift arms the one-job watch; that job dies on the fabric and sets the latch.
     monkeypatch.setattr(mon, "topology_lift_pending", True)
@@ -838,7 +826,6 @@ async def test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_che
         monkeypatch.setattr(fabric, "_validator_paths", lambda: ("bin", "root", desc))
         monkeypatch.setattr(monitor_mod, "health_dir", lambda: tmp_path)
         monkeypatch.setattr(monitor_mod, "_asic_bus_map", lambda: {"a": 0xC1})
-        monkeypatch.setattr(monitor_mod.alert, "send_alert", lambda ev, log=None: None)
     monkeypatch.setattr(g, "_reset_and_verify_device", reset_then_full_check)
     monkeypatch.setattr(g, "_verify_device", full_check)
     rig_cycle = srv._auto_power_cycle_host
@@ -891,7 +878,6 @@ async def test_replay_a_disproven_lift_hold_gets_the_ladder_and_power_cycle_with
     monkeypatch.setattr(mon, "last_fabric_output", MISMATCH)
     monkeypatch.setattr(mon, "last_fabric_ok", None)
     monkeypatch.setattr(mon, "topology_hw_fault", "")
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
     monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
     monkeypatch.setattr(mon, "topology_lift_pending", True)
     why = mon.note_job_after_topology_lift(True, "... could not find any forwarding direction ...")
@@ -996,7 +982,6 @@ async def test_replay_post_reset_lift_latch_with_gated_queued_job_runs_the_ladde
     monkeypatch.setattr(mon, "topology_lift_pending", False)
     monkeypatch.setattr(mon, "_topology_alerted", set())
     monkeypatch.setattr(monitor_mod, "_asic_bus_map", lambda: {})  # no chip-to-bus map off the host
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
     monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
     monkeypatch.setattr(srv, "device_hold_logged", False)
     monkeypatch.setattr(srv, "device_hold_episode_since", "")
@@ -1135,7 +1120,6 @@ def _present_hold_at_the_bound(r, monkeypatch, *, why, detail, age=BOUND + 1):
     monkeypatch.setattr(srv, "device_hold_episode_since", since)
     monkeypatch.setattr(srv, "device_hold_episode_reason", detail)
     monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
     monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
     _watchdog(monkeypatch)
     return since
@@ -1260,7 +1244,6 @@ async def test_a_bound_cycle_that_cannot_launch_pages_once_and_is_asked_every_ti
         assert srv._hold_bound_rung_pending, "a failed launch keeps the rung pending: asked again next tick"
     assert cycles == ["power_cycle", "power_cycle"]
     assert events.count("power_cycle_launch_failed_holding") == 2, "every failure is journaled"
-    assert [a["kind"] for a in alerts] == ["power_cycle_launch_failed_holding"], "one page per episode"
     assert srv._recovery_degraded() and "device_released" not in events, "the hold stays"
 
 
@@ -1442,8 +1425,6 @@ async def test_a_live_tenant_at_the_bound_is_paged_once_and_the_ladder_runs_when
     await _drain()
     _tick()
     await _drain()
-    pages = [a for a in alerts if a["kind"] == "hold_bound_tenant_blocked"]
-    assert len(pages) == 1 and pages[0]["pid"] == 5151 and "5151" in pages[0]["blocked_by"]
     assert events.count("hold_bound_tenant_blocked") == 1
     health = srv._hold_bound_health()
     assert health["next_step"] == "tenant_blocked" and "5151" in health["blocked_by"]

@@ -67,7 +67,6 @@ def topo(monkeypatch, health_deps, tmp_path):
     monkeypatch.setattr(monitor_mod, "health_dir", lambda: tmp_path)
     monkeypatch.setattr(monitor_mod, "_asic_bus_map", lambda: {"a": 0xC1})
     monkeypatch.setattr(monitor_mod, "health_event", lambda ev, **f: state["events"].append((ev, f)))
-    monkeypatch.setattr(monitor_mod.alert, "send_alert", lambda ev, log=None: state["alerts"].append(ev))
     (tmp_path / monitor_mod.ASIC_BUS_FILE).write_text('{"a": 1}')
     return m, state
 
@@ -83,7 +82,6 @@ async def test_a_mismatch_reruns_traffic_only_and_an_ok_names_it_and_pages_once(
     assert state["events"][0][0] == "fabric_topology_mismatch"
     assert state["events"][0][1]["moved_trays"] == ["tray 1 -> tray 3 (1 chips)"]
     await m._verify_fabric_health_body(60)
-    assert len(state["alerts"]) == 1
 
 
 @pytest.mark.asyncio

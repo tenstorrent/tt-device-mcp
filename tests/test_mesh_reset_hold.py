@@ -6,7 +6,6 @@ mesh reset (``tt-smi -glx_reset``). No other switch holds it."""
 import pytest
 
 from tests.conftest import patch_health_event
-from tt_device_mcp import alert
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.recovery import base, galaxy, pcie_guard
 
@@ -35,7 +34,6 @@ def rec(monkeypatch):
 
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
     patch_health_event(monkeypatch, lambda name, **k: out["events"].append(name))
-    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: out["alerts"].append(event) or object())
     monkeypatch.setattr(g.mechanism, "await_foreign_scope", no_scope)
     monkeypatch.setattr(g.mechanism, "reset_with_quiesce", reset)
     monkeypatch.setattr(g.mechanism, "last_reset_monotonic", 123.0)
@@ -83,8 +81,6 @@ async def test_the_gate_holds_the_mesh_reset_under_an_outage_hold_and_pages_once
         assert await g._reset_and_verify_device(["0", "1", "2", "3"], logs.append) is False
     assert rec["resets"] == []
     assert rec["events"].count("mesh_reset_held") == 2 and "reset_begin" not in rec["events"]
-    assert len(rec["alerts"]) == 1 and rec["alerts"][0]["kind"] == "mesh_reset_held"
-    assert rec["alerts"][0]["reason"] == "TT_DEVICE_MCP_AUTO_MESH_RESET=0"
     assert any("automatic mesh reset NOT fired" in m for m in logs)
     assert g.mechanism.last_reset_monotonic == 123.0, "a held reset arms no cooldown"
     assert g.mechanism.last_reset_failed is False, "nor a failed-reset flag"
@@ -95,7 +91,7 @@ async def test_the_gate_holds_with_the_explicit_knob_alone(monkeypatch, rec):
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "0")
     monkeypatch.setattr(base, "_mesh_hold_paged", {})
     assert await srv.galaxy_recovery._reset_and_verify_device(["0", "1", "2", "3"], lambda m: None) is False
-    assert rec["resets"] == [] and rec["alerts"][0]["reason"] == "TT_DEVICE_MCP_AUTO_MESH_RESET=0"
+    assert rec["resets"] == []
 
 
 @pytest.mark.asyncio
@@ -129,24 +125,6 @@ async def test_the_last_chance_sweep_is_refused_under_an_outage_hold(monkeypatch
     assert rec["resets"] == [] and "mesh_reset_held" in rec["events"]
 
 
-@pytest.mark.asyncio
-async def test_a_dropped_page_is_sent_again_and_a_lifted_hold_re_arms_it(monkeypatch, held, rec):
-    g = srv.galaxy_recovery
-    results = iter([None, object(), object()])
-    sent = []
-    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: sent.append(event) or next(results))
-    monkeypatch.setattr(alert, "alert_argv", lambda: ["page"])
-    await g._reset_and_verify_device(["0"], lambda m: None)  # dropped: hook busy
-    await g._reset_and_verify_device(["0"], lambda m: None)  # sent again
-    await g._reset_and_verify_device(["0"], lambda m: None)  # already paged
-    assert len(sent) == 2
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "1")
-    await g._reset_and_verify_device(["0"], lambda m: None)  # the hold lifted: a reset fires
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "0")
-    await g._reset_and_verify_device(["0"], lambda m: None)  # a new hold pages again
-    assert len(sent) == 3 and len(rec["resets"]) == 1
-
-
 @pytest.fixture
 def one_off_bus(monkeypatch):
     """One chip off the PCIe bus, with the host reset gate at its default (off), so nothing but the
@@ -172,7 +150,6 @@ async def test_the_gate_holds_with_a_chip_off_the_bus_under_an_outage_hold(held,
     assert outcome == galaxy.OUTCOME_WAITING, "held, never terminal: the episode stands for an operator"
     assert rec["resets"] == [] and one_off_bus == []
     assert "reset_begin" not in rec["events"] and "mesh_reset_held" in rec["events"]
-    assert len(rec["alerts"]) == 1 and rec["alerts"][0]["off_bus"] == 1
     assert any("1 chip(s) off the bus" in m and "HELD" in m for m in logs)
     assert g.mechanism.last_reset_monotonic == 123.0 and g.mechanism.last_reset_failed is False
 
@@ -196,15 +173,13 @@ async def test_a_standing_hold_pages_again_after_the_repage_interval(monkeypatch
     g = srv.galaxy_recovery
     await g._reset_and_verify_device(["0"], lambda m: None)
     await g._reset_and_verify_device(["0"], lambda m: None)
-    assert len(rec["alerts"]) == 1
     why = base.mesh_reset_hold_reason()
     base._mesh_hold_paged[why] -= base.mesh_hold_repage_sec()
     await g._reset_and_verify_device(["0"], lambda m: None)
-    assert len(rec["alerts"]) == 2 and rec["resets"] == []
+    assert rec["resets"] == []
     monkeypatch.setenv("TT_DEVICE_MCP_MESH_HOLD_REPAGE_SEC", "0")
     base._mesh_hold_paged[why] -= 10 * base.MESH_HOLD_REPAGE_DEFAULT_SEC
     await g._reset_and_verify_device(["0"], lambda m: None)
-    assert len(rec["alerts"]) == 2, "0 pages once per hold"
 
 
 def test_the_repage_knob_defaults_and_rejects_nonsense(monkeypatch):

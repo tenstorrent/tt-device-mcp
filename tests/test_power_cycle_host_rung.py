@@ -111,14 +111,12 @@ async def test_a_cycle_that_does_not_launch_holds_pages_and_retries(monkeypatch,
     counters = _arm_partial_drop(monkeypatch, off_bus)
     asked = _deny(monkeypatch)
     cycles = _cycle_never_launches(monkeypatch)
-    events, alerts = [], []
+    events = []
     patch_health_event(monkeypatch, lambda kind, **k: events.append(kind))
-    monkeypatch.setattr(galaxy_mod.alert, "send_alert", lambda ev, *a, **k: alerts.append(ev["kind"]))
 
     await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
     assert cycles["n"] == 1
     assert "power_cycle_launch_failed_holding" in events
-    assert "power_cycle_launch_failed_holding" in alerts, "a cycle that cannot launch pages"
     assert srv.recovery_mechanism.host_action_requested is None, "nothing launched, nothing pending"
 
     await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
@@ -145,10 +143,9 @@ async def test_a_cycle_that_cannot_launch_os_first_never_reboots_and_holds(monke
     monkeypatch.setattr(srv.recovery_mechanism, "_power_cycle_not_launched_paged", None)
     monkeypatch.setattr(srv, "device_hold_episode_since", "2026-01-01T00:00:00")
     monkeypatch.setattr(srv.galaxy_recovery, "_cycle_launch_paged", None)
-    events, alerts = [], []
+    events = []
     patch_health_event(monkeypatch, lambda kind, **k: events.append(kind))
     monkeypatch.setattr(recovery_base, "health_event", lambda kind, **k: events.append(kind))
-    monkeypatch.setattr(galaxy_mod.alert, "send_alert", lambda ev, *a, **k: alerts.append(ev["kind"]))
 
     for force in (False, True):
         await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=force)
@@ -159,16 +156,14 @@ async def test_a_cycle_that_cannot_launch_os_first_never_reboots_and_holds(monke
     assert set(asked) == {"power-cycle"}, "the next pass asks for the cycle again, nothing else"
     assert events.count("power_cycle_not_launched") == 2 and "auto_reboot" not in " ".join(events)
     assert events.count("power_cycle_launch_failed_holding") == 2, "every failure is journaled"
-    assert alerts == ["power_cycle_not_launched"], "one page per hold episode"
     assert counters["fault_cleared"] == 0 and counters["dirty_cleared"] == 0, "the hold stays"
 
     episode, at = srv.galaxy_recovery._cycle_launch_paged
     assert episode == "2026-01-01T00:00:00"
     srv.galaxy_recovery._cycle_launch_paged = (episode, at - recovery_base.CYCLE_LAUNCH_REPAGE_SEC)
     await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
-    assert alerts == ["power_cycle_not_launched", "power_cycle_launch_failed_holding"], "the hourly re-page"
     await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None, force=True)
-    assert len(alerts) == 2 and steps == [] and set(asked) == {"power-cycle"}
+    assert steps == [] and set(asked) == {"power-cycle"}
 
 
 @pytest.mark.asyncio
@@ -180,9 +175,8 @@ async def test_two_failed_launches_in_one_episode_page_once_and_retry_each_pass(
     counters = _arm_partial_drop(monkeypatch, 8)
     _deny(monkeypatch)
     cycles = _cycle_never_launches(monkeypatch)
-    events, alerts = [], []
+    events = []
     patch_health_event(monkeypatch, lambda kind, **k: events.append((kind, k)))
-    monkeypatch.setattr(galaxy_mod.alert, "send_alert", lambda ev, *a, **k: alerts.append(ev))
     monkeypatch.setattr(srv, "device_hold_episode_since", "2026-01-01T00:00:00")
 
     async def one_pass(force):
@@ -193,21 +187,16 @@ async def test_two_failed_launches_in_one_episode_page_once_and_retry_each_pass(
     failed = [k for kind, k in events if kind == "power_cycle_launch_failed_holding"]
     assert cycles["n"] == 2, "every pass asks for the cycle again (no pacing)"
     assert [k["paged"] for k in failed] == [True, False], "each failure is journaled; only the first pages"
-    assert len(alerts) == 1 and alerts[0]["kind"] == "power_cycle_launch_failed_holding"
-    assert alerts[0]["held_since"] == "2026-01-01T00:00:00"
     assert counters["fault_cleared"] == 0 and counters["dirty_cleared"] == 0, "the hold stays"
     assert srv.recovery_mechanism.host_action_requested is None
 
     episode, at = srv.galaxy_recovery._cycle_launch_paged
     srv.galaxy_recovery._cycle_launch_paged = (episode, at - recovery_base.CYCLE_LAUNCH_REPAGE_SEC)
     await one_pass(True)
-    assert len(alerts) == 2, "still failing an interval later: one more page"
     await one_pass(True)
-    assert len(alerts) == 2
 
     monkeypatch.setattr(srv, "device_hold_episode_since", "2026-01-01T01:00:00")
     await one_pass(True)
-    assert len(alerts) == 3 and alerts[2]["held_since"] == "2026-01-01T01:00:00", "a new episode pages again"
     assert cycles["n"] == 5
     assert counters["fault_cleared"] == 0 and counters["dirty_cleared"] == 0
 

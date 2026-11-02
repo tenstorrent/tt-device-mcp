@@ -23,7 +23,7 @@ import time
 from datetime import datetime
 from typing import Callable, Optional
 
-from tt_device_mcp import aio, alert, metrics
+from tt_device_mcp import aio, metrics
 from tt_device_mcp.constants import (
     ETH_POST_JOB_TIMEOUT_SEC,
     ETH_REAP_SEC,
@@ -1536,10 +1536,6 @@ class HealthMonitor:
         key = marker + "|" + ",".join(moved)
         if key not in self._topology_alerted:
             self._topology_alerted.add(key)
-            alert.send_alert(
-                {"kind": "fabric_topology_mismatch", "detail": marker, "moved_trays": moved},
-                log,
-            )
 
     def note_job_after_topology_lift(self, failed: bool, log_tail: Optional[str]) -> Optional[str]:
         """Called once per finished job. Only the first job after a topology-mismatch lift
@@ -1603,7 +1599,6 @@ class HealthMonitor:
         log = self._logger()
         if log:
             log.error(f"FABRIC {self.fabric_known_fault}")
-        alert.send_alert({"kind": "fabric_known_fault", "detail": self.fabric_known_fault}, log)
         return self.fabric_known_fault
 
     def _declare_cable_fault(self, detail: str) -> None:
@@ -1620,7 +1615,6 @@ class HealthMonitor:
             log.error(f"FABRIC HARDWARE FAULT: {detail}")
         if detail not in self._cable_fault_alerted:
             self._cable_fault_alerted.add(detail)
-            alert.send_alert({"kind": "fabric_known_fault", "cause": "missing_cable", "detail": detail}, log)
 
     def known_fabric_fault(self) -> str:
         """The open known fabric fault, or "". Bounded: past ``TT_DEVICE_MCP_FABRIC_KNOWN_FAULT_HOLD_SEC``

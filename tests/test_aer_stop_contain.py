@@ -252,7 +252,6 @@ async def test_the_contained_hold_runs_the_full_ladder_at_the_bound_then_the_hos
     monkeypatch.setattr(srv.galaxy_recovery, "escalate", ladder)
     monkeypatch.setattr(srv, "_hold_bound_host_rung", host_rung)
     monkeypatch.setattr(srv.fsm, "on_outcome", lambda outcome: None)
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
     monkeypatch.setattr(srv, "_forced_escalation_task", None)
     # The host as the containment left it: chip 13 removed from the bus, chip 14 present and beating.
     monkeypatch.setattr(srv, "_present_chip_indices", lambda: ["14"])

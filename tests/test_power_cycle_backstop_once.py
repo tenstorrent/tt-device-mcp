@@ -55,7 +55,6 @@ def _arm_all_off_with_two_cycles(monkeypatch, tmp_path):
     cycles = []
     monkeypatch.setattr(srv, "_fire_power_cycle", lambda: cycles.append(time.time()))
     alerts = []
-    monkeypatch.setattr(recovery_base.alert, "send_alert", lambda event, *a, **k: alerts.append(event) or True)
     events = []
     patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
     return cycles, alerts, events, boot
@@ -120,5 +119,4 @@ async def test_the_backstop_still_denies_a_real_fourth_cycle(monkeypatch, tmp_pa
     assert len(cycles) == 1, "the backstop refuses a fourth cycle in the window"
     assert len(_ledger_cycles(tmp_path)) == 3
     assert "power_cycle_backstop" in events and "auto_recovery_denied" in events, events
-    assert [a for a in alerts if a.get("kind") == "power_cycle_backstop"], "the backstop pages"
     assert rm.power_cycle_retry is not None, "asked again when the oldest cycle leaves the window"

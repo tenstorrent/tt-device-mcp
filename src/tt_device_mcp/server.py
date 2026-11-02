@@ -57,7 +57,6 @@ from starlette.responses import JSONResponse, StreamingResponse
 from tt_device_mcp import (
     __version__,
     aio,
-    alert,
     device_activity,
     device_lock,
     loop_watch,
@@ -1126,11 +1125,6 @@ def _set_hold_escalated(value: bool) -> None:
 # so the watchdog writes one durable event per window rather than one per sample. Re-arms (0) with
 # the episode clock the moment the device comes back fit — the next episode gets its own deadline.
 device_hold_deadline_bucket: int = 0
-# The opt-in alert hook (TT_DEVICE_MCP_ALERT_CMD) fires on the first of those windows, then backs
-# off: the deadline window it may fire again at, and the last gap in windows (doubles, capped at
-# 24 h). Both re-arm (0) with the episode, like the bucket above.
-device_hold_alert_next_bucket: int = 0
-device_hold_alert_gap: int = 0
 # Which ceiling window this episode has already FORCE-ESCALATED for. The relift and the class
 # escalators fail closed to "keep holding" on their guards (an unconfigured eth reader, a last-fabric
 # verdict that never re-runs on an idle box, an unreadable tenant scan, the one-reset latch), which is
@@ -1745,36 +1739,6 @@ def _resume_hold_bound(carry: dict) -> None:
     )
 
 
-# The alert hook's backoff for that episode, on disk beside it. In memory alone a restart during a
-# stuck hold (a self-update, a crash loop) re-arms it, and every restart pages again on its first
-# sample. Kept only for the episode it was written in.
-HOLD_ALERT_BACKOFF_FILE = "hold_alert_backoff.json"
-
-
-def _persist_hold_alert_backoff(since: str, next_bucket: int, gap: int) -> None:
-    """Record (or, with no episode, clear) the alert backoff for the episode that started at since."""
-    try:
-        path = health_dir() / HOLD_ALERT_BACKOFF_FILE
-        if since:
-            path.write_text(json.dumps({"since": since, "next_bucket": next_bucket, "gap": gap}))
-        elif path.exists():
-            path.unlink()
-    except OSError:
-        pass  # never let bookkeeping break the gate
-
-
-def _restore_hold_alert_backoff(since: str) -> tuple[int, int]:
-    """The (next_bucket, gap) a previous process recorded for the episode that started at since,
-    or (0, 0) when there is none, it is unreadable, or it belongs to another episode."""
-    try:
-        rec = json.loads((health_dir() / HOLD_ALERT_BACKOFF_FILE).read_text())
-        if rec.get("since") == since:
-            return max(0, int(rec["next_bucket"])), max(0, int(rec["gap"]))
-    except (OSError, ValueError, TypeError, KeyError, AttributeError):
-        pass
-    return 0, 0
-
-
 # A surgical bridge reset fired seconds after a chip leaves the bus can lose the race
 # with the endpoint's link retrain and report failure, yet the same chip re-binds in ~2s
 # once the link settles. Retry the bridge reset a few times before escalating to a much
@@ -1960,7 +1924,6 @@ _dead_chip_stuck_lock = threading.Lock()
 # clock (spec 04 I77). Read once at startup; a different boot id means every pid in it is gone.
 DEAD_CHIP_STUCK_FILE = "dead_chip_stuck.json"
 _dead_chip_stuck_save_lock = threading.Lock()  # one snapshot+write of the record at a time
-_dead_chip_page_pending: Optional[dict] = None  # a page the alert hook dropped, sent again next scan
 _leftover_dead_chip: bool = False  # the open I70 episode names a dead-chip stuck holder
 stats: Stats | None = None  # Session statistics
 stats_dir: Path | None = None  # Directory for stats files
@@ -2342,8 +2305,7 @@ async def _acquire_device_op_flock(name: str) -> Optional[int]:
                 holders = _flock_holder_pids(fd)
                 if logger:
                     logger.info(
-                        f"DEVICE-OP {name}: waiting for {path} "
-                        f"(held by pid {','.join(map(str, holders)) or 'unknown'})"
+                        f"DEVICE-OP {name}: waiting for {path} (held by pid {','.join(map(str, holders)) or 'unknown'})"
                     )
             if time.monotonic() - started >= DEVICE_OP_FLOCK_TIMEOUT_SEC:
                 holders = _flock_holder_pids(fd) or holders
@@ -2843,11 +2805,11 @@ def _reset_for_testing():
     """
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global _hold_episode_restorable, _hold_episode_tenant, _hold_episode_startup, _hold_carry, _hold_carry_loaded
-    global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic, _fabric_77_paged_since
+    global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic
     global _dispatch_reset_spent, _kill_reset_owed, _kill_reset_owed_at, _pre_reset_blocker
     global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
     global device_op_stage_started_at, device_held_since, device_hold_escalated_monotonic, tenant_job_degraded_since
-    global device_hold_deadline_bucket, device_hold_alert_next_bucket, device_hold_alert_gap
+    global device_hold_deadline_bucket
     global device_hold_escalate_bucket, device_hold_offbus_escalated, device_hold_offbus_tenant_wait
     global device_hold_offbus_idle_early, device_hold_offbus_prior_bucket, device_hold_tenant_deferred
     global device_hold_job_bound_escalated, device_hold_escalation_trigger, device_hold_escalation_kind
@@ -2881,7 +2843,6 @@ def _reset_for_testing():
         recovery_mechanism._class_a_ladder_anchor = None
     _fabric_77_streak_since = None
     _fabric_77_streak = 0
-    _fabric_77_paged_since = None
     _fabric_77_recheck_since = None
     _fabric_77_rechecks = 0
     _fabric_77_recheck_monotonic = 0.0
@@ -2891,8 +2852,6 @@ def _reset_for_testing():
     tenant_job_degraded_since = ""
     device_hold_escalated_monotonic = 0.0
     device_hold_deadline_bucket = 0
-    device_hold_alert_next_bucket = 0
-    device_hold_alert_gap = 0
     device_hold_escalate_bucket = 0
     device_hold_offbus_escalated = False
     device_hold_offbus_tenant_wait = False
@@ -3018,7 +2977,7 @@ def get_activation_script(
     # Validate python env exists
     if validate and not os.path.exists(python_env):
         raise FileNotFoundError(
-            f"Python env not found at {python_env}. " "Set PYTHON_ENV_DIR in your env file or activate a virtualenv."
+            f"Python env not found at {python_env}. Set PYTHON_ENV_DIR in your env file or activate a virtualenv."
         )
 
     # Build script
@@ -4666,10 +4625,7 @@ def _hold_escalation_note(off_bus: int = 0) -> str:
                 f"{whole}; any other off-bus hold climbs at the {ceiling_min}-min hold ceiling — do not plan "
                 f"around waiting the wedge out."
             )
-        return (
-            f"The ladder escalates at the {ceiling_min}-min hold ceiling — do not plan around waiting "
-            f"the wedge out."
-        )
+        return f"The ladder escalates at the {ceiling_min}-min hold ceiling — do not plan around waiting the wedge out."
     # Spec 04 I76: the kill switch governs only the runs below the bound; the bound's own ladder runs.
     bound = (
         f"the ladder still runs at the {max(1, round(_stuck_hold_ceiling_sec() / 60))}-min hold bound "
@@ -4923,9 +4879,6 @@ def _idle_relift_armed() -> tuple[bool, bool, bool]:
 # with at least one retry behind it, the fabric pass stops being the gate (see _fabric_77_fallback).
 _fabric_77_streak_since: Optional[str] = None
 _fabric_77_streak: int = 0
-# The hold episode (its ``since``) whose bound the alert hook has already paged. Every relift pass past
-# the bound runs the fallback again; only the first on an episode pages.
-_fabric_77_paged_since: Optional[str] = None
 
 
 def _env_int(name: str, default: int, floor: int) -> int:
@@ -5396,14 +5349,12 @@ def _note_fabric_77_reset_passes(passes: int) -> None:
 
 
 async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
-    """The fabric check could not run on a bounded number of retries: alert, then climb the ladder (the
+    """The fabric check could not run on a bounded number of retries: journal it, then climb the ladder (the
     present-mesh rung, with every guard of _escalate_stuck_hold). A 77 is never a healthy fabric, and
     the startup checks (enum+ARC, the eth heartbeat) say nothing about links no traffic crossed, so the
     bound never releases on them: only a passing full check, fabric included, lifts the hold (spec 03
-    I78), and the ladder's own post-reset check is the next one. Pages once per hold episode: a later
-    pass on the same episode journals but does not page again, and a page the hook dropped is tried
-    again on the next pass. No eth read runs here. Returns True when the climb settled the hold."""
-    global _fabric_77_paged_since
+    I78), and the ladder's own post-reset check is the next one. No eth read runs here. Returns True when the climb settled the hold.
+    """
     event = {
         "kind": "fabric_check_unrunnable_bound",
         "host": socket.gethostname(),
@@ -5417,10 +5368,6 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
             f"FABRIC-77-BOUND the fabric check could not run on {_fabric_77_streak} retries of this hold "
             "— climbing the recovery ladder; only a passing full check lifts the hold"
         )
-    if _fabric_77_paged_since != fsm.record.since and (
-        alert.send_alert(event, logger) is not None or alert.alert_argv() is None
-    ):
-        _fabric_77_paged_since = fsm.record.since
     log("the startup checks never lift a hold the fabric check could not verify — climbing the recovery ladder")
     if (
         galaxy_recovery is not None
@@ -5615,8 +5562,7 @@ async def _attempt_idle_relift() -> None:
                 if selfheal and mass_wedge and await _escalate("present"):
                     return
                 _log(
-                    "still degraded — holding; the wedge clears on its own or the next gate resets, "
-                    "never a reset here"
+                    "still degraded — holding; the wedge clears on its own or the next gate resets, never a reset here"
                 )
                 return
             if fabric:
@@ -6237,20 +6183,7 @@ def _watch_idle_foreign_holders(scan: HolderScan, now: float) -> list:
                 idle_sec=int(idle),
                 threshold_sec=int(threshold),
             )
-        if alert.alert_argv() is None:
-            entry["alerted"] = True
-            continue
-        event = {
-            "kind": "idle_foreign_holder",
-            "host": socket.gethostname(),
-            "pid": h.pid,
-            "uid": h.uid,
-            "user": user,
-            "idle_sec": int(idle),
-            "threshold_sec": int(threshold),
-        }
-        if alert.send_alert(event, logger) is not None:
-            entry["alerted"] = True
+        entry["alerted"] = True
     for key in list(_idle_holders):
         if key not in seen:
             del _idle_holders[key]
@@ -6739,7 +6672,7 @@ def _reboot_why_status(rec: dict) -> tuple[str, str]:
     if not rec.get("present"):
         return "reboot — no firmware crash record (clean shutdown or intentional)", "reboot"
     kind = "PCIe" if rec.get("is_pcie") else "processor" if rec.get("is_processor") else "other"
-    return (f"reboot — previous boot ended in a {kind} hardware error " f"({rec.get('event_severity', '?')})", "crash")
+    return (f"reboot — previous boot ended in a {kind} hardware error ({rec.get('event_severity', '?')})", "crash")
 
 
 def _consume_pre_down_escalation_row(action: str) -> None:
@@ -7076,7 +7009,7 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
         # on a quiet bus — the real pollers may still be hammering MMIO under a name we were never
         # told. On the stop path that is the host-reboot hazard the quiesce exists to prevent, so
         # flag it host_at_risk; either way, do not let the absence read as a clean quiesce.
-        log(f"WARNING: no configured device poller answered '{verb}': " f"{', '.join(services)}")
+        log(f"WARNING: no configured device poller answered '{verb}': {', '.join(services)}")
         health_event("pollers_none_active", verb=verb, configured=list(services), host_at_risk=not active)
     health_event("pollers_" + ("restarted" if active else "quiesced"), services=touched)
     return touched
@@ -7352,7 +7285,7 @@ async def _journal_power_cycle_foreign_holders(reason: str) -> None:
 # to avoid. add_2_integers_in_compute enqueues one compute kernel — the cheapest proof a kernel runs.
 DISPATCH_PROBE_BIN = os.environ.get(
     "TT_DEVICE_MCP_DISPATCH_BIN",
-    "/opt/tt-device-broker/validator/current/build/programming_examples/" "metal_example_add_2_integers_in_compute",
+    "/opt/tt-device-broker/validator/current/build/programming_examples/metal_example_add_2_integers_in_compute",
 )
 DISPATCH_PROBE_TIMEOUT_SEC = int(os.environ.get("TT_DEVICE_MCP_DISPATCH_TIMEOUT_SEC", "90"))
 
@@ -7378,8 +7311,7 @@ async def _dispatch_probe_ok(job_log_file: "Optional[Path]" = None) -> bool:
         return True
     ok, detail = await _dispatch_probe()
     verdict = (
-        f"HEALTH-GATE[pre-job] dispatch probe: "
-        f"{'SKIPPED' if ok is None else ('OK' if ok else 'UNHEALTHY')} — {detail}"
+        f"HEALTH-GATE[pre-job] dispatch probe: {'SKIPPED' if ok is None else ('OK' if ok else 'UNHEALTHY')} — {detail}"
     )
     if logger:
         logger.info(verdict)
@@ -7980,7 +7912,7 @@ async def device_health_gate(
             # Believing it is what let a box pass every check while every tenant job died on
             # the same core.
             if dirty:
-                _log(f"device verified healthy (incl. fabric) despite: {dirty_reason}" f" — no reset needed")
+                _log(f"device verified healthy (incl. fabric) despite: {dirty_reason} — no reset needed")
             else:
                 _log("device healthy; no reset needed")
             prior_carry = _load_hold_carry()  # spec 04 I82: the release below may save a new one
@@ -9443,7 +9375,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     onto one degraded device writes a single ``device_held`` event, not one per job."""
     global device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global device_hold_deadline_bucket, device_hold_escalate_bucket
-    global device_hold_offbus_escalated, device_hold_alert_next_bucket, device_hold_alert_gap
+    global device_hold_offbus_escalated
     global device_hold_tenant_deferred, device_hold_offbus_prior_bucket, device_hold_offbus_tenant_wait
     global device_hold_escalated_monotonic, _hold_row, _hold_episode_restorable
     global device_hold_job_bound_escalated, _dispatch_reset_spent, _carried_hold, device_held_since
@@ -9495,8 +9427,6 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         # Spec 03 I80: a latch a status read took before this verdict yields to an earlier episode start.
         if device_held_since and _iso_before(device_hold_episode_since, device_held_since):
             device_held_since = device_hold_episode_since
-        # ...and the alert hook's backoff for that same episode, so a restart does not page again.
-        device_hold_alert_next_bucket, device_hold_alert_gap = _restore_hold_alert_backoff(device_hold_episode_since)
         device_hold_episode_reason = reason
         _note_escalation_stage("")  # a fresh episode starts with no escalation behind it
         # Reserve the ledger row now, so the live row and the durable one share id, start, and name.
@@ -9587,10 +9517,6 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         device_hold_escalated_monotonic = 0.0
         # ...and its own deadline watchdog: re-arm the stuck-hold alert for the next episode.
         device_hold_deadline_bucket = 0
-        # ...and its alert hook's backoff.
-        device_hold_alert_next_bucket = 0
-        device_hold_alert_gap = 0
-        _persist_hold_alert_backoff("", 0, 0)
         # ...and its own forced-escalation windows, and where the last one stood.
         device_hold_escalate_bucket = 0
         _note_escalation_stage("")
@@ -10156,7 +10082,6 @@ async def _hold_bound_host_rung(age: float, log, skipped: str = "") -> None:
                 "held_age_sec": int(age),
             }
             health_event(event["kind"], **{k: v for k, v in event.items() if k != "kind"})
-            alert.send_alert(event, logger)
         log("10-min hold bound: the ladder did not heal the hold and the operator opted out of the power cycle")
         return
     blocker = await asyncio.to_thread(_bound_tenant_blocker, True)
@@ -10269,7 +10194,6 @@ def _hold_bound_tenant_blocked(blocker: dict, log) -> None:
         **{k: v for k, v in blocker.items() if k != "kind"},
     }
     health_event(event["kind"], **{k: v for k, v in event.items() if k != "kind"})
-    alert.send_alert(event, logger)
     log(f"10-min hold bound: {desc} — no reset or host rung runs over a broker job; it runs once the job ends")
 
 
@@ -10488,7 +10412,6 @@ def _hold_without_reset(cause: str, expected: int, log) -> None:
         f"all {expected} chips present with live ARC and the hold names only the fabric ({cause}) — "
         "no reset or power cycle can fix that; holding and paging once"
     )
-    alert.send_alert(event, logger)
 
 
 def _host_action_blocks_escalation() -> bool:
@@ -10800,39 +10723,6 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
             f"cleared it (opted out, a stuck tenant/unreadable holder scan, its one reset spent, or "
             f"a killed relift). Manual recovery is likely required — a hold must terminate."
         )
-    _maybe_alert_stuck_hold(bucket, deadline, age)
-
-
-def _maybe_alert_stuck_hold(bucket: int, deadline: int, age: float) -> None:
-    """Hand a stuck hold to the operator's opt-in alert hook (TT_DEVICE_MCP_ALERT_CMD, spec 03 I37).
-
-    The timeline event above repeats every deadline window so a recency monitor keeps alarming; a
-    page must not. This fires on the episode's first stuck window, then waits 2, 4, 8 ... windows
-    (capped at 24 h) before the next. The backoff is kept on disk with the episode, so a restart
-    mid-episode does not page again. Unset, it does nothing. A run still in flight leaves the
-    backoff untouched, so the next window tries again."""
-    global device_hold_alert_next_bucket, device_hold_alert_gap
-    if bucket < device_hold_alert_next_bucket or alert.alert_argv() is None:
-        return
-    gap = alert.next_gap_windows(device_hold_alert_gap, deadline)
-    event = {
-        "kind": "hold_stuck_past_deadline",
-        "host": socket.gethostname(),
-        "held_since": device_hold_episode_since,
-        "reason": device_hold_episode_reason,
-        "held_age_sec": int(age),
-        "deadline_sec": deadline,
-        "escalated": _hold_escalated_report(),
-        "escalation_deadline": _hold_bound_deadline_iso(),
-        "next_alert_after_sec": gap * deadline,
-    }
-    if alert.send_alert(event, logger) is None:
-        return
-    device_hold_alert_next_bucket = bucket + gap
-    device_hold_alert_gap = gap
-    _persist_hold_alert_backoff(device_hold_episode_since, device_hold_alert_next_bucket, gap)
-    if logger:
-        logger.info(f"ALERT-HOOK stuck hold sent ({int(age)}s held); next in {gap * deadline}s if still held")
 
 
 def _refresh_idle_hold_ledger() -> None:
@@ -11580,7 +11470,6 @@ def _note_dead_chip_stuck_holders(chips: list, killed: list, bdfs: Optional[tupl
     journaled ``dead_chip_holder_stuck`` with host_at_risk, and paged at once. The I70 episode opens
     with it. ``bdfs``: the chips' PCI addresses, read before their removal (None: read them now).
     Returns the stuck pids. Never raises."""
-    global _dead_chip_page_pending
     label = DEAD_CHIP_LABEL_PREFIX + ",".join(str(c) for c in chips)
     bdfs = _dead_chip_bdfs(chips) if bdfs is None else tuple(bdfs)
     stuck: list[ReapedLeftover] = []
@@ -11619,15 +11508,6 @@ def _note_dead_chip_stuck_holders(chips: list, killed: list, bdfs: Optional[tupl
         "budget_sec": DEAD_CHIP_STUCK_BUDGET_SEC,
     }
     health_event("dead_chip_holder_stuck", message=message, host_at_risk=True, severity="high", **fields)
-    _dead_chip_page_pending = {
-        "kind": "dead_chip_holder_stuck",
-        "message": message,
-        "host": socket.gethostname(),
-        "host_at_risk": True,
-        "severity": "high",
-        **fields,
-    }
-    _send_dead_chip_page()
     _reaped_leftovers()  # open the I70 episode now: its clock and /health's leftover_fence
     _save_dead_chip_stuck()
     return [f.pid for f in stuck]
@@ -11761,21 +11641,9 @@ def _dead_chip_bdfs(chips: list) -> tuple:
     return tuple(bdfs)
 
 
-def _send_dead_chip_page() -> None:
-    """Send the pending I77 page; one the alert hook drops (a run still in flight) is sent again on
-    the next leftover scan."""
-    global _dead_chip_page_pending
-    event = _dead_chip_page_pending
-    if event is None:
-        return
-    if alert.send_alert(event, logger) is not None or alert.alert_argv() is None:
-        _dead_chip_page_pending = None
-
-
 def _dead_chip_stuck_leftovers() -> list[ReapedLeftover]:
     """The registered dead-chip stuck holders still stuck (spec 04 I77), as leftovers. One that is gone (or a reused pid), a zombie, or no longer
     stuck with a device reference is dropped and journaled ``dead_chip_holder_released``."""
-    _send_dead_chip_page()
     with _dead_chip_stuck_lock:
         entries = list(_dead_chip_stuck.items())
     found = []
@@ -13598,9 +13466,7 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
         readopted_scopes.pop(job_id, None)
         _sync_fsm_readopted_jobs()  # spec 03 I76: this job no longer holds the startup hold
         if logger:
-            logger.info(
-                f"RE-ADOPT job_id={job_id} scope {scope} ended; finalized " f"exit={job.exit_code if job else '?'}"
-            )
+            logger.info(f"RE-ADOPT job_id={job_id} scope {scope} ended; finalized exit={job.exit_code if job else '?'}")
 
 
 async def _follow_job_spool(job: "Job", done: Callable[[], bool]) -> None:
@@ -13989,8 +13855,7 @@ async def _job_runner_loop():
             health_event("job_cooldown", job=job_id, owner=job.owner, wait_sec=round(cooldown, 1))
             if logger:
                 logger.info(
-                    f"JOB_RUNNER job_id={job_id} cooling down {cooldown:.1f}s "
-                    f"before dispatch (mesh rest between jobs)"
+                    f"JOB_RUNNER job_id={job_id} cooling down {cooldown:.1f}s before dispatch (mesh rest between jobs)"
                 )
             await asyncio.sleep(cooldown)
 
@@ -15504,7 +15369,7 @@ def _close_orphaned_hold() -> Optional[dict]:
     _write_action_log_file(
         next_job_id(),
         "[broker]hold",
-        f"device HELD, refused to tenants: {reason} " f"(episode ended by a broker restart)",
+        f"device HELD, refused to tenants: {reason} (episode ended by a broker restart)",
         datetime.now(),
         "ended",
         0,
@@ -16891,7 +16756,7 @@ def create_mcp_server() -> MCPServer:
         # on whoever queues next, so "the broker killed it" must never be the whole record:
         # without the requester this reads as the broker acting on its own.
         if logger:
-            logger.info(f"KILL job_id={job_id} ({action}) requested by {caller_owner} " f"— job owner {job.owner}")
+            logger.info(f"KILL job_id={job_id} ({action}) requested by {caller_owner} — job owner {job.owner}")
         health_event("job_killed", job_id=job_id, action=action, requested_by=caller_owner, job_owner=job.owner)
 
         if action == "cancelled" and job.log_file:
@@ -18413,7 +18278,7 @@ def _sd_notify(state: str) -> None:
             _sd_notify_errors_logged.add(kind)
             if logger:
                 logger.warning(
-                    f"systemd notify {kind} failed ({e}); if this persists systemd may " f"count the broker as wedged"
+                    f"systemd notify {kind} failed ({e}); if this persists systemd may count the broker as wedged"
                 )
 
 
@@ -18429,7 +18294,7 @@ async def _watchdog_heartbeat() -> None:
         # silently without it. Fires once — this coroutine is started once per process.
         if logger:
             logger.warning(
-                "systemd watchdog not armed (WATCHDOG_USEC unset) — a wedged event loop " "will not be auto-restarted"
+                "systemd watchdog not armed (WATCHDOG_USEC unset) — a wedged event loop will not be auto-restarted"
             )
         return
     interval = max(1.0, int(usec) / 1_000_000 / 2)
@@ -18536,8 +18401,7 @@ async def run_transports(mcp: MCPServer, port: int, socket_path: str | None, ser
     device_pci_map = await asyncio.to_thread(_startup_pci_map)
     if logger:
         logger.info(
-            f"HEALTH mapped {len(device_pci_map)} chips to PCI addresses "
-            f"(needed to reset a chip that has left the bus)"
+            f"HEALTH mapped {len(device_pci_map)} chips to PCI addresses (needed to reset a chip that has left the bus)"
         )
 
     # What killed the machine last time, straight from the firmware. This is readable
@@ -18884,7 +18748,7 @@ def main():
         for f in preflight_fails:
             logger.error(f"  - {f}")
         logger.error(
-            "Provision the above (or its deploy) and restart; do not run device work the " "broker cannot recover."
+            "Provision the above (or its deploy) and restart; do not run device work the broker cannot recover."
         )
         logger.error("=" * 60)
         sys.exit(1)

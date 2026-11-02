@@ -11,7 +11,7 @@ import os
 import pytest
 
 from tests.conftest import patch_health_event
-from tt_device_mcp import alert, device_holders
+from tt_device_mcp import device_holders
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan, read_proc_cpu
 
@@ -30,8 +30,6 @@ def watch(monkeypatch):
     monkeypatch.setattr(srv, "descends_from", lambda pid, ancestor: False)
     events, alerts, signals = [], [], []
     patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
-    monkeypatch.setattr(alert, "alert_argv", lambda: ["/bin/true"])
-    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: alerts.append(event) or object())
     monkeypatch.setattr(os, "kill", lambda *a: signals.append(a))
 
     class NS:
@@ -59,9 +57,6 @@ def test_a_flat_holder_past_the_threshold_is_named_once_and_never_signalled(watc
     kinds = [k for k, _ in watch.events]
     assert kinds == ["idle_foreign_holder"], "one event for the holder's lifetime"
     assert watch.events[0][1]["pid"] == 4242 and watch.events[0][1]["user"] == f"user{TENANT_UID}"
-    assert len(watch.alerts) == 1, "one alert"
-    assert watch.alerts[0]["kind"] == "idle_foreign_holder"
-    assert (watch.alerts[0]["pid"], watch.alerts[0]["user"]) == (4242, f"user{TENANT_UID}")
     assert watch.signals == [], "never killed or signalled"
 
 
@@ -104,20 +99,6 @@ def test_a_reused_pid_is_a_new_process(watch):
     watch.cpu[4242] = (100, "777")  # same pid and ticks, new starttime
     assert srv._watch_idle_foreign_holders(_scan(h), 900.0) == [], "the new process starts its own clock"
     assert srv._watch_idle_foreign_holders(_scan(h), 1800.0) != []
-
-
-def test_a_busy_alert_hook_is_retried_without_a_second_event(watch, monkeypatch):
-    h = DeviceHolder(pid=4242, uid=TENANT_UID)
-    watch.cpu[4242] = (100, "555")
-    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: None)  # hook still busy
-    srv._watch_idle_foreign_holders(_scan(h), 0.0)
-    srv._watch_idle_foreign_holders(_scan(h), 900.0)
-    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: watch.alerts.append(event) or object())
-    srv._watch_idle_foreign_holders(_scan(h), 960.0)
-    srv._watch_idle_foreign_holders(_scan(h), 1020.0)
-
-    assert [k for k, _ in watch.events] == ["idle_foreign_holder"]
-    assert len(watch.alerts) == 1, "sent once the hook is free, then never again"
 
 
 def test_a_gone_holder_is_forgotten(watch):

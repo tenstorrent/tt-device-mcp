@@ -14,7 +14,6 @@ from pathlib import Path
 import pytest
 
 from tests.deploy_helpers import _one, _statements
-from tt_device_mcp import alert
 from tt_device_mcp import health_probe as hp
 
 APPLY = Path(__file__).resolve().parent.parent / "deploy" / "apply-host-config.sh"
@@ -105,8 +104,9 @@ def hdir(tmp_path, monkeypatch):
 
 @pytest.fixture
 def sent(monkeypatch):
+    """The probe's ALERT lines, the operator's once-per-episode record."""
     events = []
-    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: events.append(event))
+    monkeypatch.setattr(hp, "log", lambda msg: events.append(msg[6:]) if msg.startswith("ALERT ") else None)
     return events
 
 
@@ -212,8 +212,7 @@ def test_missing_chips_rescan_then_alert_once(tmp_path, hdir, sent):
     p = FakeProbe(tmp_path, chips=6)
     p.run()
     assert p.rescans == 1
-    assert [e["kind"] for e in sent] == ["health_probe_chips_missing"]
-    assert sent[0]["present"] == 6 and sent[0]["expected"] == 8 and sent[0]["host"]
+    assert sent == ["rescan left 6/8 chips: a link is down, needs a reset"]
 
     # Next laps inside the gap: no rescan, no second page.
     p.clock += 120
@@ -242,8 +241,7 @@ def test_telemetry_restart_and_alert(tmp_path, hdir, sent):
     p.run()
     assert ("reset-failed", "tt-telemetry.service") in p.calls
     assert ("start", "tt-telemetry.service") in p.calls
-    assert [e["kind"] for e in sent] == ["health_probe_telemetry_down"]
-    assert sent[0]["state"] == "failed"
+    assert len(sent) == 1 and sent[0].startswith("tt-telemetry.service failed after a restart")
     p.run()  # still down: restarted again, not paged again
     assert p.calls.count(("start", "tt-telemetry.service")) == 2 and len(sent) == 1
 
@@ -301,7 +299,7 @@ def test_an_activating_poller_is_left_to_systemd_then_paged_once(tmp_path, hdir,
     for _ in range(5):
         p.run()
     assert p.mutations() == []  # never restarted: systemd is already on it
-    assert [(e["kind"], e["state"]) for e in sent] == [("health_probe_telemetry_down", "activating")]
+    assert len(sent) == 1 and "still activating" in sent[0]
 
 
 def test_a_start_that_is_still_activating_does_not_page(tmp_path, hdir, sent):
@@ -324,7 +322,7 @@ def test_a_flapping_poller_pages_once_per_episode(tmp_path, hdir, sent):
         p.run()
         p.run()
     assert p.calls.count(("start", "tt-telemetry.service")) == 10
-    assert [(e["kind"], e["restarts"]) for e in sent] == [("health_probe_telemetry_down", 2)]
+    assert len(sent) == 1 and "start 2 this episode" in sent[0]
     # Up for POLLER_OK_LAPS laps in a row closes the episode; the next fall is a new one.
     for _ in range(hp.POLLER_OK_LAPS):
         p.run()
@@ -509,7 +507,7 @@ def test_aer_growth_alerts_once_an_hour(tmp_path, hdir, sent):
     p.run()  # the first lap of the boot sets the baseline
     _pci(p, "0000:01:00.0", "0x1e52", 2)
     p.run()
-    assert [(e["kind"], e["aer_total"]) for e in sent] == [("health_probe_aer", 2)]
+    assert len(sent) == 1 and sent[0].startswith("AER count 2 ")
     p.run()  # no growth
     assert len(sent) == 1
     _pci(p, "0000:01:00.0", "0x1e52", 5)
@@ -518,7 +516,7 @@ def test_aer_growth_alerts_once_an_hour(tmp_path, hdir, sent):
     assert len(sent) == 1
     p.clock += hp.AER_ALERT_MIN_GAP_SEC
     p.run()
-    assert [e["aer_new"] for e in sent] == [2, 3]
+    assert "(+2 " in sent[0] and "(+3 " in sent[1]
 
 
 def test_aer_already_counted_at_the_first_lap_is_a_baseline_not_a_page(tmp_path, hdir, sent):
@@ -529,7 +527,7 @@ def test_aer_already_counted_at_the_first_lap_is_a_baseline_not_a_page(tmp_path,
     assert json.loads((hdir / hp.STATE_FILE).read_text())["aer_seen"] == 40
     _pci(p, "0000:01:00.0", "0x1e52", 41)
     p.run()
-    assert [(e["aer_total"], e["aer_new"]) for e in sent] == [(41, 1)]
+    assert len(sent) == 1 and sent[0] == "AER count 41 across the chips (+1 since the last alert)"
     p.boot_id_path.write_text("boot-b\n")  # a new boot sets a new baseline
     _pci(p, "0000:01:00.0", "0x1e52", 3)
     p.run()
@@ -546,24 +544,16 @@ def test_a_reboot_resets_episodes_and_counters(tmp_path, hdir, sent):
     assert len(sent) == 2  # a new boot is a new episode
 
 
-# --- the hook and the broker's environment ----------------------------------------------------
+# --- the broker's environment ------------------------------------------------------------------
 
 
-def test_hook_and_chip_count_come_from_the_broker_env(tmp_path, hdir, monkeypatch):
-    out = tmp_path / "alert.json"
-    hook = tmp_path / "hook.sh"
-    hook.write_text(f"#!/bin/sh\ncat > {out}\n")
-    hook.chmod(0o755)
+def test_the_chip_count_comes_from_the_broker_env(tmp_path, hdir, sent):
     p = FakeProbe(tmp_path, chips=6)
     p.main_pid = "4242"
     (p.proc_dir / "4242").mkdir()
-    (p.proc_dir / "4242" / "environ").write_bytes(
-        b"PATH=/usr/bin\0TT_DEVICE_MCP_ALERT_CMD=" + str(hook).encode() + b"\0TT_DEVICE_MCP_EXPECTED_CHIPS=8\0"
-    )
+    (p.proc_dir / "4242" / "environ").write_bytes(b"PATH=/usr/bin\0TT_DEVICE_MCP_EXPECTED_CHIPS=8\0")
     p.run()
-    event = json.loads(out.read_text())  # the real hook ran, and the probe waited for it
-    assert event["kind"] == "health_probe_chips_missing"
-    assert event["expected"] == 8 and event["present"] == 6
+    assert sent == ["rescan left 6/8 chips: a link is down, needs a reset"]
 
 
 def test_broker_env_keeps_only_the_inherited_keys(tmp_path, hdir):
@@ -571,8 +561,10 @@ def test_broker_env_keeps_only_the_inherited_keys(tmp_path, hdir):
     assert p.broker_env() == {}  # broker not running
     p.main_pid = "7"
     (p.proc_dir / "7").mkdir()
-    (p.proc_dir / "7" / "environ").write_bytes(b"SECRET=x\0TT_DEVICE_MCP_HEALTH_DIR=/h\0TT_DEVICE_MCP_ALERT_CMD=a b\0")
-    assert p.broker_env() == {"TT_DEVICE_MCP_HEALTH_DIR": "/h", "TT_DEVICE_MCP_ALERT_CMD": "a b"}
+    (p.proc_dir / "7" / "environ").write_bytes(
+        b"SECRET=x\0TT_DEVICE_MCP_HEALTH_DIR=/h\0TT_DEVICE_MCP_EXPECTED_CHIPS=8\0"
+    )
+    assert p.broker_env() == {"TT_DEVICE_MCP_HEALTH_DIR": "/h", "TT_DEVICE_MCP_EXPECTED_CHIPS": "8"}
 
 
 def test_the_unit_setting_beats_the_broker_env(tmp_path, hdir, sent, monkeypatch):

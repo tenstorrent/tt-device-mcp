@@ -34,7 +34,6 @@ from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy
 from tt_device_mcp.health.recovery.base import (
-    AC_POWER_REPAGE_SEC,
     POWER_CYCLE_AC_NEEDED_AFTER,
     POWER_CYCLE_MIN_INTERVAL_SEC,
 )
@@ -46,7 +45,6 @@ BOUND = 600  # the 10-min hold bound (spec 04 I76)
 @pytest.fixture
 def paged(cool, monkeypatch):  # noqa: F811
     sent = []
-    monkeypatch.setattr(recovery_base.alert, "send_alert", lambda event, log=None: sent.append(event) or object())
     return sent
 
 
@@ -134,7 +132,6 @@ async def test_cycles_continue_at_cooldown_spacing_past_the_ac_needed_state(cool
         await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
         assert m.power_cycle_cooldown_state["ac_power_needed"]["attempts"] == n
     assert gaps == sorted(gaps) and gaps[-1] <= 4 * 3600, "spaced by the doubling cooldown, capped at 4 h"
-    assert any(e["kind"] == "power_cycle_ac_power_needed" for e in paged), "the AC page still goes out"
 
 
 def _full_checks(cool, monkeypatch, *, heals=False):  # noqa: F811
@@ -343,22 +340,6 @@ async def test_the_watchdog_run_at_the_bound_runs_the_class_a_ladder_once(cool, 
     cool["clk"][0] = until
     steps = await run("power_cycle_cooldown")
     assert not LADDER & set(steps) and _cycles(cool) == 3, "the cycle fires the moment the cooldown ends"
-
-
-@pytest.mark.asyncio
-async def test_the_ac_hold_pages_once_then_hourly(cool, monkeypatch, paged):  # noqa: F811
-    mono = [1000.0]
-    monkeypatch.setattr(recovery_base.time, "monotonic", lambda: mono[0])
-    await _two_cycles_that_do_not_heal(cool)
-    pages = lambda: [e for e in paged if e["kind"] == "power_cycle_ac_power_needed"]  # noqa: E731
-    assert len(pages()) == 1
-    for step in (60, AC_POWER_REPAGE_SEC - 120):
-        mono[0] += step
-        await cool["g"].escalate("offbus-forced", [], EXPECTED, lambda msg: None)
-    assert len(pages()) == 1, "no page inside the hour"
-    mono[0] += 120
-    await cool["g"].escalate("offbus-forced", [], EXPECTED, lambda msg: None)
-    assert len(pages()) == 2, "paged again after an hour"
 
 
 @pytest.mark.asyncio

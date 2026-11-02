@@ -23,7 +23,6 @@ import pytest
 from tests.conftest import GALAXY_BUS_IDS, patch_health_event
 from tests.test_classac_power_cycle_direct import EXPECTED, _beats_without, _gate, _off, rig  # noqa: F401 - the fixture
 from tests.test_offbus_power_cycle import _below_floor_episode, _gate_below_floor, _spy_gated_power_cycle
-from tt_device_mcp import alert
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy
@@ -709,7 +708,6 @@ def escalation(os_first, monkeypatch, tmp_path):
     monkeypatch.setattr(mech, "_power_cycle_miss_paged", 0.0)
     monkeypatch.setattr(mech, "_device_hold_episode_since", lambda: "held-since-1")
     pages = []
-    monkeypatch.setattr(alert, "send_alert", lambda ev: pages.append(ev) or 0)
     os_first.update(mech=mech, pages=pages, hevents=hevents)
     return os_first
 
@@ -876,14 +874,10 @@ async def test_a_cycle_that_cannot_launch_retracts_holds_and_pages_once_per_epis
     monkeypatch.setattr(pc, "os_first_unavailable", lambda: "no executable hook")
     assert await srv._auto_power_cycle_host(lambda _l: None, REASON) is False
     assert mech.read_auto_recovery_ledger() == [] and mech.host_action_requested is None
-    assert [p["kind"] for p in escalation["pages"]] == ["power_cycle_not_launched"]
-    assert "no executable hook" in escalation["pages"][0]["message"]
     assert await srv._auto_power_cycle_host(lambda _l: None, REASON) is False
-    assert len(escalation["pages"]) == 1, "one page per hold episode"
     assert sum(n == "power_cycle_not_launched" for n, _ in escalation["hevents"]) == 2
     monkeypatch.setattr(mech, "_device_hold_episode_since", lambda: "held-since-2")
     await srv._auto_power_cycle_host(lambda _l: None, REASON)
-    assert len(escalation["pages"]) == 2
     assert _steps(escalation) == []
 
 
@@ -892,7 +886,7 @@ async def test_a_preflight_failure_retracts_and_never_reboots(escalation):
     escalation["rc"]["preflight"] = 1
     assert await srv._auto_power_cycle_host(lambda _l: None, REASON) is False
     assert escalation["mech"].read_auto_recovery_ledger() == []
-    assert _steps(escalation) == ["preflight"] and "pre-flight" in escalation["pages"][0]["why"]
+    assert _steps(escalation) == ["preflight"]
 
 
 @pytest.mark.asyncio
@@ -1003,7 +997,6 @@ def test_a_refuted_cycle_is_retried_under_i72_and_pages_from_the_second(booted, 
     assert mech.power_cycle_cooldown(now_epoch=now, ledger=[], requests=ledger) is None
     state = mech.power_cycle_miss_state(ledger, now_epoch=now)
     assert state["missed"] == 2 and state["until"] == second_at + window + recovery_base.POWER_CYCLE_MISS_RETRY_SEC[1]
-    assert [p["count"] for p in booted["pages"] if p["kind"] == "power_cycle_missed"] == [2]
     assert not mech.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=now)[0]
     assert mech.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=state["until"] + 1)[0]
 

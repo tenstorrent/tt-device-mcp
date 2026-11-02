@@ -23,7 +23,6 @@ from tests.test_post_reset_gate import mesh  # noqa: F401
 from tests.test_reset_full_check_goal8 import PATHS as RESET_PATHS
 from tests.test_reset_full_check_goal8 import _drive, rig  # noqa: F401  (fixture)
 from tests.test_startup_fabric_hugepages import _bound
-from tt_device_mcp import alert
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import monitor as monitor_mod
@@ -179,8 +178,7 @@ async def test_a_handed_off_hold_with_no_power_cycle_lifts_only_on_a_passing_ful
     monkeypatch.setattr(srv.recovery_mechanism, "mesh_reset_failed_since_release", True)
     monkeypatch.setattr(srv.recovery_mechanism, "mesh_reset_failed_episode", episode)
     assert srv.recovery_mechanism.mesh_reset_spent(episode)
-    alerts, resets, cycles = [], [], []
-    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: alerts.append(event))
+    resets, cycles = [], []
     monkeypatch.setattr(opc, "_pending", {})
     opc.note_hold_handoff(episode, 4, 32, "mesh reset failed", lambda m: None, latched="no power cycle")
 
@@ -204,7 +202,6 @@ async def test_a_handed_off_hold_with_no_power_cycle_lifts_only_on_a_passing_ful
         await srv._attempt_idle_relift()
     assert (srv.fsm.state is ServerState.HEALTHY) is (verdict == "pass")
     assert resets == [] and cycles == [], "the relift fires no rung: no mesh reset, no power cycle"
-    assert [a["kind"] for a in alerts] == ["offbus_gated_hold_page"], "the hand-off pages once"
     if verdict != "pass":
         assert srv.fsm.record.why == "off_bus" and srv.device_hold_episode_since == episode
         assert opc.hold_handoff_status(episode)["owner"] == "operator"
@@ -327,7 +324,6 @@ def wrapper(monkeypatch, tmp_path, eth_mesh):  # noqa: F811
     monkeypatch.setattr(monitor_mod, "health_dir", lambda: hdir)
     monkeypatch.setattr(monitor_mod, "_asic_bus_map", lambda: {"a": 0xC1})
     monkeypatch.setattr(monitor_mod, "health_event", lambda ev, **f: None)
-    monkeypatch.setattr(monitor_mod.alert, "send_alert", lambda ev, log=None: object())
     monkeypatch.setattr(fabric, "build_command", lambda descriptor=True: (["run_cluster_validation"], {}))
     monkeypatch.setattr(fabric, "_validator_paths", lambda: ("bin", "root", "/x/d"))
 

@@ -61,7 +61,7 @@ def _stage_holder(proc, pid=PID, *, state="D", sigpnd="0" * 16, fds=(f"{NODE_DIR
 @pytest.fixture
 def stuck(rig, monkeypatch, tmp_path):  # noqa: F811 - the imported fixture
     """A staged pid stuck in D on chip 3's node, on the rig's 32-chip host with every chip present.
-    ``s['pages']`` records the alert hook, ``s['order']`` the rig's rungs, ``s['events']`` the journal."""
+    ``s['order']`` records the rig's rungs, ``s['events']`` the journal."""
     proc = tmp_path / "proc"
     proc.mkdir()
     _stage_holder(proc)
@@ -86,12 +86,7 @@ def stuck(rig, monkeypatch, tmp_path):  # noqa: F811 - the imported fixture
         fired.append("power_cycle")
 
     monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
-    pages = []
-    s = {"proc": proc, "pages": pages, "order": rig["order"], "events": rig["events"], "rig": rig, "deliver": True}
-    monkeypatch.setattr(srv.alert, "alert_argv", lambda: ["page"])
-    monkeypatch.setattr(
-        srv.alert, "send_alert", lambda e, log=None: (pages.append(e), object())[1] if s["deliver"] else None
-    )
+    s = {"proc": proc, "order": rig["order"], "events": rig["events"], "rig": rig}
     return s
 
 
@@ -189,36 +184,23 @@ def test_a_maps_read_that_blocks_is_bounded_and_fds_still_count(tmp_path, monkey
         release.set()
 
 
-# --- journal, page, I70 episode -------------------------------------------------------------------
+# --- journal, I70 episode -------------------------------------------------------------------------
 
 
-def test_a_stuck_holder_is_journaled_host_at_risk_paged_once_and_opens_the_episode(stuck):
+def test_a_stuck_holder_is_journaled_host_at_risk_once_and_opens_the_episode(stuck):
     assert _note(stuck) == [PID]
 
     (ev,) = _events(stuck, "dead_chip_holder_stuck")
     assert ev["host_at_risk"] is True and ev["severity"] == "high"
     assert ev["fault_class"] == "J-dead-chip-stuck-holder" and ev["budget_sec"] == BUDGET
     assert ev["chips"] == [CHIP] and ev["holders"][0]["pid"] == PID and ev["holders"][0]["state"] == "D"
-    (page,) = stuck["pages"]
-    assert page["kind"] == "dead_chip_holder_stuck" and page["host_at_risk"] is True
     srv._reaped_leftovers()
     srv._reaped_leftovers()
-    assert len(stuck["pages"]) == 1, "paged once, not once per scan"
+    assert len(_events(stuck, "dead_chip_holder_stuck")) == 1, "journaled once, not once per scan"
     assert srv._leftover_unkillable_mono is not None
     fenced = srv._health_payload()["leftover_fence"]
     assert fenced["fault_class"] == "J-dead-chip-stuck-holder" and fenced["budget_sec"] == BUDGET
     assert f"killed holder of chip(s) 3 pid {PID}" in fenced["leftovers"]
-
-
-def test_a_dropped_page_is_sent_on_the_next_scan(stuck):
-    stuck["deliver"] = False
-    _note(stuck)
-    assert stuck["pages"] == []
-
-    stuck["deliver"] = True
-    srv._reaped_leftovers()
-    srv._reaped_leftovers()
-    assert [p["kind"] for p in stuck["pages"]] == ["dead_chip_holder_stuck"]
 
 
 def test_a_killed_holder_that_exited_or_is_not_stuck_names_nothing(stuck):
@@ -227,7 +209,7 @@ def test_a_killed_holder_that_exited_or_is_not_stuck_names_nothing(stuck):
     killed = KILLED + [{"pid": 6301}, {"pid": None}, "junk"]
 
     assert srv._note_dead_chip_stuck_holders([CHIP], killed) == []
-    assert _events(stuck, "dead_chip_holder_stuck") == [] and stuck["pages"] == []
+    assert _events(stuck, "dead_chip_holder_stuck") == []
     assert srv._dead_chip_stuck == {} and srv._dead_chip_stuck_reason() == ""
     assert srv._leftover_unkillable_mono is None
 

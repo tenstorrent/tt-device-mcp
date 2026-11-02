@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from tt_device_mcp import aio, alert, metrics, pre_reset_scan, privileges
+from tt_device_mcp import aio, metrics, pre_reset_scan, privileges
 from tt_device_mcp.constants import DEVICE_RESET_OVERRUN_SEC, DEVICE_RESET_TIMEOUT_SEC
 from tt_device_mcp.health import chip_state
 from tt_device_mcp.health import pci_writer as _pci_writer_mod
@@ -327,11 +327,10 @@ POWER_CYCLE_MISS_REPAGE_SEC = 3600
 
 # Spec 04 I73: a whole tray (class A) still off the bus after this many broker power cycles that took
 # the host down, with no verified release since, may need AC removal (no in-band cycle healed some such
-# drops on this hardware). The broker says so on /health, pages once and then hourly, and keeps
+# drops on this hardware). The broker says so on /health, journals it once per episode, and keeps
 # recovering: a cycle at the end of each cooldown (I65), and the full ladder in the 10-min hold bound's
 # run (I76) once per cycle or boot. Nothing stops the cycles but the cooldown.
 POWER_CYCLE_AC_NEEDED_AFTER = 2
-AC_POWER_REPAGE_SEC = 3600
 # Spec 04 I71: a power cycle that does not launch pages once per hold episode, then at most this often
 # while it keeps failing; every failure is still journaled and the cycle asked again each pass.
 CYCLE_LAUNCH_REPAGE_SEC = 3600
@@ -528,9 +527,7 @@ def refuse_mesh_reset(context: str, argv: list, log, off_bus: int = 0) -> bool:
     paged_at = _mesh_hold_paged.get(why)
     repage = mesh_hold_repage_sec()
     if paged_at is None or (repage > 0 and time.monotonic() - paged_at >= repage):
-        event = {"kind": "mesh_reset_held", "context": context, "reason": why, "off_bus": off_bus, "message": message}
-        if alert.send_alert(event) is not None or alert.alert_argv() is None:
-            _mesh_hold_paged[why] = time.monotonic()
+        _mesh_hold_paged[why] = time.monotonic()
     return True
 
 
@@ -1467,9 +1464,7 @@ class RecoveryMechanism:
             "at": now,
         }
         if not self._bmc_guard_paged:
-            event = {"kind": "bmc_legacy_reset_attempted", "sent": sent, "host_at_risk": True, "message": message}
-            if alert.send_alert(event) is not None or alert.alert_argv() is None:
-                self._bmc_guard_paged = True
+            self._bmc_guard_paged = True
         return 1 if rc == 0 else rc
 
     async def reset_with_quiesce(
@@ -2213,7 +2208,7 @@ class RecoveryMechanism:
         Some such drops on this hardware came back only after AC removal, so a human is told; the
         broker refuses nothing for it and keeps cycling at the cooldown's spacing (I65), with the
         class-A 10-min ladder in between. A cooldown denial carries it to /health. Journals once per
-        counted cycle and per episode; pages once, then every AC_POWER_REPAGE_SEC."""
+        counted cycle and per episode."""
         chips = self.whole_tray_off
         if not chips:
             return None
@@ -2248,11 +2243,7 @@ class RecoveryMechanism:
                 last_cycle_epoch=last,
                 host_at_risk=False,
             )
-        mono = time.monotonic()
-        if not self._ac_power_paged or mono - self._ac_power_paged >= AC_POWER_REPAGE_SEC:
-            event = {"kind": "power_cycle_ac_power_needed", "chips": list(chips), "attempts": len(rows), "message": why}
-            if alert.send_alert(event) is not None or alert.alert_argv() is None:
-                self._ac_power_paged = mono
+            self._ac_power_paged = time.monotonic()
         return info
 
     def _class_a_ladder_anchor_now(self, now: float) -> Optional[float]:
@@ -2383,25 +2374,17 @@ class RecoveryMechanism:
         if state is not None and state["missed"] >= POWER_CYCLE_MISS_PAGE_AFTER:
             mono = time.monotonic()
             if not self._power_cycle_miss_paged or mono - self._power_cycle_miss_paged >= POWER_CYCLE_MISS_REPAGE_SEC:
-                event = {"kind": "power_cycle_missed", "count": state["missed"], "message": state["why"]}
-                if alert.send_alert(event) is not None or alert.alert_argv() is None:
-                    self._power_cycle_miss_paged = mono
+                self._power_cycle_miss_paged = mono
 
     def _page_power_cycle_not_launched(self, label: str, reason: str, why: str) -> None:
         """Spec 04 I88: a power cycle that could not start with the OS brought down first fired
         nothing; the device stays held and the I76 bound retries it. Journal every one, page once per
         hold episode, naming why."""
         episode = self._device_hold_episode_since() or ""
-        message = (
-            f"{label} NOT LAUNCHED ({reason}): {why}. Nothing fired and the device stays held; the "
-            f"cycle is retried under the 10-min hold bound once the cause is fixed (spec 04 I76/I88)"
-        )
         health_event("power_cycle_not_launched", reason=reason, why=why[-300:], held_since=episode, host_at_risk=True)
         if self._power_cycle_not_launched_paged == episode:
             return
-        event = {"kind": "power_cycle_not_launched", "reason": reason, "why": why[-300:], "message": message}
-        if alert.send_alert(event) is not None or alert.alert_argv() is None:
-            self._power_cycle_not_launched_paged = episode
+        self._power_cycle_not_launched_paged = episode
 
     def power_cycle_not_launched_paged_for(self, episode: str) -> bool:
         """Whether the I88 not-launched page already went out for hold ``episode``: the caller's own
@@ -2991,9 +2974,8 @@ class RecoveryMechanism:
     def _power_cycle_backstop(self, ledger: list[dict], now_epoch: float) -> Optional[dict]:
         """The refusal when POWER_CYCLE_BACKSTOP_MAX power cycles already ran inside the backstop
         window, verified or not (a refuted one, I88, restarted the host warm and counts too); None
-        otherwise. Journals and pages once per cap reached: a tray that
-        keeps dropping after cycles is a hardware fault for its owners. The page is retried on later
-        passes until the alert hook takes it. The hold is bounded all the same (spec 04 I65):
+        otherwise. Journals once per cap reached: a tray that
+        keeps dropping after cycles is a hardware fault for its owners. The hold is bounded all the same (spec 04 I65):
         ``until`` is when the oldest counted cycle leaves the window, and the cycle is asked again
         then. A missing, non-finite or future stamp counts as nothing here (the interval loop fails
         closed on an unreadable one), so no corrupt record can hold the cycle for good."""
@@ -3014,9 +2996,7 @@ class RecoveryMechanism:
                 "power_cycle_backstop", count=len(stamps), reason=why, allowed_at_epoch=until, host_at_risk=True
             )
         if newest != self._power_cycle_backstop_paged:
-            event = {"kind": "power_cycle_backstop", "count": len(stamps), "message": why}
-            if alert.send_alert(event) is not None or alert.alert_argv() is None:
-                self._power_cycle_backstop_paged = newest
+            self._power_cycle_backstop_paged = newest
         return {
             "until": until,
             "last": newest,

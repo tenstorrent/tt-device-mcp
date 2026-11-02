@@ -29,14 +29,13 @@ import json
 import os
 import shlex
 import signal
-import socket
 import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from tt_device_mcp import alert, metrics
+from tt_device_mcp import metrics
 from tt_device_mcp.health.evidence import health_dir, health_event
 
 STATE_FILE = "offbus_power_cycle.json"
@@ -506,26 +505,13 @@ def blocked_page_sec() -> int:
 
 
 def page_once(kind: str, log, message: str, **fields) -> None:
-    """Journal, log and alert ``kind`` once per episode (the journal line is the kill-safe record).
-    A page the alert hook drops (a previous run still in flight) is sent again on the next pass."""
+    """Journal and log ``kind`` once per episode (the journal line is the kill-safe record)."""
     journaled = _pending.setdefault("journaled", set())
-    paged = _pending.setdefault("paged", set())
-    if kind in paged:
+    if kind in journaled:
         return
-    if kind not in journaled:
-        journaled.add(kind)
-        log(message)
-        health_event(kind, message=message, host_at_risk=True, severity="high", **fields)
-    event = {
-        "kind": kind,
-        "message": message,
-        "host": socket.gethostname(),
-        "host_at_risk": True,
-        "severity": "high",
-        **fields,
-    }
-    if alert.send_alert(event) is not None or alert.alert_argv() is None:
-        paged.add(kind)
+    journaled.add(kind)
+    log(message)
+    health_event(kind, message=message, host_at_risk=True, severity="high", **fields)
 
 
 def page_if_blocked(episode: str, age: float, log, why: str, *, bound: Optional[int] = None, **fields) -> None:

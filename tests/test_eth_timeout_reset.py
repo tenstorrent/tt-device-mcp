@@ -9,7 +9,6 @@ The real probe pass runs here (HealthMonitor.update); only its leaf probes are s
 import pytest
 
 from tests.conftest import fsm_dirty, patch_health_event
-from tt_device_mcp import alert
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.fsm import ServerState
@@ -118,7 +117,6 @@ def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
     monkeypatch.setattr(g.mechanism, "await_foreign_scope", no_scope)
     monkeypatch.setattr(g.mechanism, "reset_with_quiesce", reset)
     patch_health_event(monkeypatch, lambda name, *a, **k: st["events"].append(name))
-    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: object())
     monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: {})
     captured = []
     monkeypatch.setattr(srv, "capture_incident", lambda kind, **k: captured.append((kind, k.get("evidence"))))
