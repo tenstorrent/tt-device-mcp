@@ -15,7 +15,9 @@ These pin the fail-closed shape of those specific `install` statements; on base 
 them carried `2>/dev/null || true` and these assertions fail.
 """
 
+import os
 import re
+import subprocess
 from pathlib import Path
 
 from tests.deploy_helpers import _statements
@@ -122,3 +124,34 @@ def test_autoupdate_host_config_apply_precedes_installed_sha():
     apply_idx = next(i for i, s in enumerate(stmts) if "apply-host-config.sh" in s and '"$clone"' in s)
     sha_idx = _restart_path_state_write(stmts)
     assert apply_idx < sha_idx
+
+
+# The staging block of an updater from before the AICLK ceiling's removal, verbatim. A host on
+# that version runs this block from its own installed copy against the new tree, so every file it
+# names must still be in deploy/, or the upgrade stops before installed.sha moves.
+_OLD_STAGING = r"""
+    install -m 0755 "$clone/deploy/tt-device-reconcile.sh"    "$ROOT/reconcile.sh" \
+        || { echo "autoupdate: staging reconcile.sh failed (required); not marking current" >&2; exit 1; }
+    install -m 0755 "$clone/deploy/tt-device-client-setup.sh" "$ROOT/client-setup.sh" \
+        || { echo "autoupdate: staging client-setup.sh failed (required); not marking current" >&2; exit 1; }
+    install -m 0755 "$clone/deploy/tt-device-autoupdate.sh"   "$ROOT/autoupdate.sh" \
+        || { echo "autoupdate: staging autoupdate.sh failed (required); not marking current" >&2; exit 1; }
+    install -m 0755 "$clone/deploy/tt-device-fabric-check.sh" "$ROOT/fabric-check.sh" \
+        || { echo "autoupdate: staging fabric-check.sh failed (required); not marking current" >&2; exit 1; }
+    install -m 0755 "$clone/deploy/tt-device-eth-heartbeat-probe.py" "$ROOT/eth-heartbeat-probe.py" \
+        || { echo "autoupdate: staging eth-heartbeat-probe.py failed (required); not marking current" >&2; exit 1; }
+    install -m 0755 "$clone/deploy/tt-device-aiclk-ceiling.py" "$ROOT/aiclk-ceiling.py" \
+        || { echo "autoupdate: staging aiclk-ceiling.py failed (required); not marking current" >&2; exit 1; }
+"""
+
+
+def test_older_updater_stages_this_tree(tmp_path):
+    clone = _DEPLOY.parent
+    r = subprocess.run(
+        ["bash", "-c", _OLD_STAGING],
+        env={"PATH": os.environ["PATH"], "clone": str(clone), "ROOT": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert r.returncode == 0, r.stderr
