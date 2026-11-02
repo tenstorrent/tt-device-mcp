@@ -431,19 +431,6 @@ BOOT_ESCALATION_ATTRIBUTION_WINDOW_SEC = int(
 )
 
 
-def mesh_reset_hold_reason() -> str:
-    """Why the operator forbids an AUTOMATIC mesh-wide reset (the gate's, the idle relift's, the
-    watchdog's or the last-chance sweep's ``tt-smi -glx_reset``), or "" when it may fire.
-
-    ``TT_DEVICE_MCP_AUTO_MESH_RESET=0`` is the operator's outage hold; unset (or ``=1``) arms it. No
-    other switch holds it: with the power cycle the only host rung left, reading ``AUTO_POWER_CYCLE=0``
-    as an outage hold would take the first mesh reset away from every host that merely has no BMC
-    power cycle. The operator's own reset tool is never held."""
-    if os.environ.get("TT_DEVICE_MCP_AUTO_MESH_RESET", "").strip() == "0":
-        return "TT_DEVICE_MCP_AUTO_MESH_RESET=0"
-    return ""
-
-
 def drop_returned_isolated(isolated: set, context: str, log=None) -> list:
     """Re-read sysfs and take every chip of ``isolated`` that is back on the bus out of it, in place.
     Run after every mesh reset and PCI rescan, whatever the verify that follows says:
@@ -488,25 +475,6 @@ def reenumerate_withheld(mechanism, context: str, log) -> str:
         _reenumerate_withheld_journaled[context] = reason
         health_event("reenumerate_withheld", context=context, reason=reason, host_at_risk=True)
     return reason
-
-
-def refuse_mesh_reset(context: str, argv: list, log, off_bus: int = 0) -> bool:
-    """True when :func:`mesh_reset_hold_reason` holds the mesh reset: logged and journaled. A refused
-    reset did not happen, so the caller holds exactly as for a gated one and arms no cooldown or
-    failed-reset flag. ``off_bus`` (chips off the bus this pass) is named in the log: the case a mesh
-    reset turns into an off-bus power-cycle loop."""
-    why = mesh_reset_hold_reason()
-    if not why:
-        return False
-    held = f"{off_bus} chip(s) off the bus, " if off_bus > 0 else ""
-    message = (
-        f"automatic mesh reset NOT fired ({context}): {held}{why}; device HELD for an operator — "
-        f"lift the hold or set TT_DEVICE_MCP_AUTO_MESH_RESET=1 to re-arm it"
-    )
-    log(message)
-    health_event("mesh_reset_held", context=context, argv=argv, reason=why, off_bus=off_bus, host_at_risk=True)
-    metrics.stage_fired("smi_reset", "blocked")
-    return True
 
 
 def _later_boot_verified(boot_id, at: Optional[float], verified: Optional[dict], now: float) -> bool:

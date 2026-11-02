@@ -17,10 +17,9 @@ from tests.conftest import patch_health_event, patch_recovery
 from tests.test_device_safety import _arm_offbus_stuck_hold, _arm_stuck_hold
 from tt_device_mcp import privileges
 from tt_device_mcp import server as srv
-from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.evidence import health_dir
 from tt_device_mcp.health.recovery import base as recovery_base
-from tt_device_mcp.health.recovery import galaxy
+from tt_device_mcp.health.recovery import galaxy, pcie_guard
 from tt_device_mcp.health.recovery import offbus_power_cycle as opc
 from tt_device_mcp.health.recovery.base import POWER_CYCLE_MIN_INTERVAL_SEC, RESET_RECORD_FILE
 
@@ -187,22 +186,23 @@ async def test_a_reset_that_never_launched_is_not_recorded(monkeypatch, clear_jo
 
 @pytest.mark.asyncio
 async def test_a_refused_reset_is_not_recorded(monkeypatch, clear_job_state):
-    """A reset an outage hold refused never ran: it is not a failed rung, so the next window tries it
+    """A reset the per-host gate refused never ran: it is not a failed rung, so the next window tries it
     again rather than climbing past it. The real reset path runs here; the command itself must not."""
     counters, events, _ = _episode(monkeypatch)
     monkeypatch.delattr(srv.galaxy_recovery, "_reset_and_verify_device")
     refusals = []
-    monkeypatch.setattr(recovery_pkg, "refuse_mesh_reset", lambda *a, **k: refusals.append(a) or True)
+    monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off_bus: refusals.append(off_bus) or (False, "gated"))
 
     async def no_reset(*a, **k):
         raise AssertionError("a refused reset must not run")
 
     monkeypatch.setattr(srv.recovery_mechanism, "reset_with_quiesce", no_reset)
     hold_since = srv.device_hold_episode_since
-    assert await _window() is True and len(refusals) == 1
+    assert await _window() is True and refusals
     assert not srv.recovery_mechanism.rung_failed_unchanged(hold_since, "mesh_reset", _ids())
+    first = len(refusals)
     assert await _window() is True
-    assert len(refusals) == 2 and SKIP not in events, "the refused reset is offered again, not skipped"
+    assert len(refusals) > first and SKIP not in events, "the refused reset is offered again, not skipped"
     assert counters["dirty_cleared"] == 0
 
 

@@ -73,7 +73,6 @@ def _episode(monkeypatch, *, held_sec=96, check_passes=False):
     monkeypatch.setattr(srv.galaxy_recovery, "_tray_map_now", lambda: None)
     monkeypatch.setattr(srv.galaxy_recovery, "_chip_buses_now", lambda: {})
     monkeypatch.setattr(galaxy_mod, "_settle_before_host_rung_sec", lambda: 0)
-    monkeypatch.setattr(galaxy_mod, "refuse_mesh_reset", lambda *a, **k: False)
     monkeypatch.setattr(pcie_guard, "chips_off_bus", lambda expected: 1)
     monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off_bus: (True, ""))
     monkeypatch.setattr(pcie_guard, "mask_for_mesh_reset", lambda log: None)

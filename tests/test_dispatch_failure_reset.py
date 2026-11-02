@@ -22,10 +22,6 @@ FABRIC_OUT = (
     "TOPOLOGY MISMATCH vs galaxy_8x4: 2 missing, 0 extra port connections — rerunning on the discovered graph\n"
     f"{DISPATCH_LINE}\n"
 )
-OUTAGE_HOLD = {
-    "TT_DEVICE_MCP_AUTO_MESH_RESET": "0",
-    "TT_DEVICE_MCP_AUTO_POWER_CYCLE": "0",
-}
 
 
 class _Logger:
@@ -58,7 +54,6 @@ def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
     srv.device_op_lock = None
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "1")  # not the outage hold; OUTAGE_HOLD sets it to 0
     g = srv.galaxy_recovery
     monkeypatch.setattr(srv.health_monitor, "expected", lambda present: CHIPS)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_output", "")
@@ -158,20 +153,6 @@ async def test_a_failed_post_reset_check_stays_held_and_climbs(mesh, armed_power
     assert "mesh_reset_spaced" in mesh["events"]
 
 
-@pytest.mark.asyncio
-async def test_outage_hold_holds_and_pages_without_a_reset(monkeypatch, mesh):
-    for var, value in OUTAGE_HOLD.items():
-        monkeypatch.setenv(var, value)
-    await _gate()
-    assert mesh["resets"] == [], "the outage hold forbids the reset"
-    assert srv.fsm.state is ServerState.RECOVERING
-    assert "mesh_reset_held" in mesh["events"] and "dispatch_failure_mesh_reset" not in mesh["events"]
-    said = mesh["log"].text()
-    assert "present-mesh reset is HELD" in said and "present-mesh reset is HELD" in srv.fsm.record.detail
-    assert "escalates" not in said, "no escalation is promised under the hold"
-    assert srv._dispatch_reset_spent is False, "a refused reset is not spent"
-
-
 def test_first_reason_names_the_dispatch_failure_over_a_downgraded_mismatch():
     assert fabric.first_reason(FABRIC_OUT) == DISPATCH_LINE
     # Without the marker the descriptor run's line is still read.
@@ -188,31 +169,6 @@ def test_a_dispatch_failure_hold_is_not_a_topology_mismatch(monkeypatch):
     fsm_dirty(srv, "gate/post-job: enum+ARC healthy, fabric unverified", why=srv.FABRIC_RELIFT_WHY)
     monkeypatch.setattr(srv, "device_hold_episode_reason", f"fabric failed: {DISPATCH_LINE}")
     assert srv._fabric_no_reset_hold() != "topology mismatch"
-
-
-def test_rung_gap_boot_warning_and_health_field(monkeypatch):
-    log = _Logger()
-    monkeypatch.setattr(srv, "logger", log)
-    for var in ("TT_DEVICE_MCP_SELFHEAL_RELIFT", "TT_DEVICE_MCP_FORCE_ESCALATE", "TT_DEVICE_MCP_AUTO_MESH_RESET"):
-        monkeypatch.delenv(var, raising=False)
-    for var in OUTAGE_HOLD:
-        monkeypatch.delenv(var, raising=False)
-    srv.log_rung_inventory()
-    assert not any("RUNG GAP" in m for _, m in log.said)
-    assert srv._health_payload()["hold_exit_gap"] is None
-
-    monkeypatch.setenv("TT_DEVICE_MCP_SELFHEAL_RELIFT", "0")
-    monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
-    log.said.clear()
-    srv.log_rung_inventory()
-    # Spec 04 I76: the 10-min hold bound ignores the kill switch, so its ladder is still an exit.
-    assert not any("RUNG GAP" in m for _, m in log.said)
-    assert srv._health_payload()["hold_exit_gap"] is None
-
-    monkeypatch.delenv("TT_DEVICE_MCP_SELFHEAL_RELIFT")
-    monkeypatch.delenv("TT_DEVICE_MCP_FORCE_ESCALATE")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "0")
-    assert "present-mesh reset held: TT_DEVICE_MCP_AUTO_MESH_RESET=0" in srv._health_payload()["hold_exit_gap"]
 
 
 def test_floor_message_promises_escalation_only_when_armed(monkeypatch):
@@ -263,24 +219,6 @@ async def test_a_uid0_telemetry_holder_does_not_block_the_reset(monkeypatch, mes
     await _gate()
     assert mesh["resets"] == [["tt-smi", "-glx_reset"]]
     assert srv.fsm.state is ServerState.HEALTHY
-
-
-@pytest.mark.asyncio
-async def test_frozen_chip_outage_hold_does_not_claim_a_reset_ran(monkeypatch, mesh):
-    """An ARC-frozen chip under the outage hold: no reset ran, so the hold must not say one did."""
-    for var, value in OUTAGE_HOLD.items():
-        monkeypatch.setenv(var, value)
-    tick = {"n": 0}
-
-    def beats():
-        tick["n"] += 1
-        return {str(i): (100 if i == 5 else 100 + tick["n"]) for i in range(CHIPS)}
-
-    monkeypatch.setattr(srv, "read_heartbeats", beats)
-    await _gate()
-    assert mesh["resets"] == [] and srv._dispatch_reset_spent is False
-    assert srv.fsm.state is ServerState.RECOVERING
-    assert "already ran" not in srv.fsm.record.detail
 
 
 @pytest.mark.asyncio

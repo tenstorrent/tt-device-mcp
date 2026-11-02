@@ -1000,7 +1000,6 @@ def _present_rung_chain(monkeypatch, post_reset):
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 0.0)
     monkeypatch.setattr(srv.recovery_mechanism, "unverified_reset_since", None)
     monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRIES", 0)
-    monkeypatch.setattr(recovery_pkg, "refuse_mesh_reset", lambda *a, **k: False)
     monkeypatch.setattr(pcie_guard, "chips_off_bus", lambda expected: 0)
     monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off_bus: (True, ""))
     monkeypatch.setattr(pcie_guard, "mask_for_mesh_reset", lambda log: None)

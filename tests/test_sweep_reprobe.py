@@ -33,7 +33,6 @@ def _arm(monkeypatch, *, heals_after_sbr: bool, verdicts: list, isolated=PARTIAL
     monkeypatch.setattr(g.deps, "isolated_chips", lambda: set(bus["isolated"]))
     monkeypatch.setattr(pcie_guard, "chips_off_bus", lambda expected: bus["off"])
     monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off_bus: (True, ""))
-    monkeypatch.setattr(galaxy, "refuse_mesh_reset", lambda *a, **k: False)
     monkeypatch.setattr(pcie_guard, "mask_for_mesh_reset", lambda log: None)
 
     async def sbr(log):

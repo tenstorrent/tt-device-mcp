@@ -205,7 +205,6 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     link_signals,
     load_removed_chips,
     mark_boot,
-    mesh_reset_hold_reason,
     note_broker_stopping,
     note_cycle_possible,
     note_power_cycle_trigger,
@@ -219,7 +218,6 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     previous_boot_error,
     read_health_events,
     read_heartbeats,
-    refuse_mesh_reset,
     set_pending_marker_context,
     sysfs_chip_ids,
     version_floor_warnings,
@@ -4531,11 +4529,6 @@ def log_rung_inventory() -> None:
         # elsewhere the inventory is the only place its OFF is ever explained.
         if not on and not (name == "eth-heartbeat" and should_privsep()):
             logger.warning(f"RUNG OFF {name}: {why}")
-    gap = _hold_exit_gap()
-    if gap:
-        logger.warning(
-            f"RUNG GAP: {gap} — a held present mesh has no automatic exit; it stays held until an operator acts"
-        )
 
 
 # The telemetry trace: what the chips were doing while the job ran. Snapshots at the gate
@@ -4561,18 +4554,6 @@ def _selfheal_relift_enabled() -> bool:
     is exactly what strands a below-floor hold, so this must be live for the reset floor to be safe.
     The kill switch (TT_DEVICE_MCP_SELFHEAL_RELIFT=0) restores the wait for an operator who needs it."""
     return os.environ.get("TT_DEVICE_MCP_SELFHEAL_RELIFT", "1").strip() != "0"
-
-
-def _hold_exit_gap() -> str:
-    """Why a held present mesh has NO automatic exit, or "" when it has one (spec 03 I55): the outage
-    hold (spec 04 I28) refusing the present-mesh reset. The relift and the forced escalation both off
-    is no gap: the 10-min hold bound's ladder ignores the kill switch (spec 04 I76). Logged at boot as
-    ``RUNG GAP`` and served on /health as ``hold_exit_gap``."""
-    gaps = []
-    held = mesh_reset_hold_reason()
-    if held:
-        gaps.append(f"present-mesh reset held: {held}")
-    return "; ".join(gaps)
 
 
 _DISPROVEN_LIFT_NOTE = (
@@ -7572,8 +7553,8 @@ async def device_health_gate(
         # pass force_fabric or run with the device idle.
         prejob = phase == "pre-job"
         # Spec 03 I69: a job the broker stopped mid-run owes the mesh one reset, paid here with no
-        # pre-reset fabric pass or eth read: the full check after the reset runs both. A spent latch,
-        # the outage hold or a cooldown clears the debt and keeps today's path (the dirty exit's pass).
+        # pre-reset fabric pass or eth read: the full check after the reset runs both. A spent latch
+        # or a cooldown clears the debt and keeps today's path (the dirty exit's pass).
         # The startup gate pays a debt it finds the same way (I74): a re-adopted job the broker stopped
         # before it ran. Its one full check, fabric included, then follows the reset instead of a pass
         # before it, and the post-job gate owes nothing after. A debt owed after this gate stays open.
@@ -7582,8 +7563,7 @@ async def device_health_gate(
             refused = (
                 "this hold episode's present-mesh reset is spent"
                 if _dispatch_reset_spent
-                else mesh_reset_hold_reason()
-                or ("a failed reset's cooldown is running" if recovery_mechanism.cooling() else "")
+                else ("a failed reset's cooldown is running" if recovery_mechanism.cooling() else "")
             )
             if refused:
                 _log(f"{kill_debt}: no reset before release ({refused}); the full check decides")
@@ -7640,7 +7620,6 @@ async def device_health_gate(
             and not device_fault_reported
             and not isolated_chips
             and not _dispatch_reset_spent
-            and not mesh_reset_hold_reason()
             and not recovery_mechanism.cooling()
         )
         # Spec 03 I91: per-chip AER and link counts just before and just after this pass, after a job
@@ -8111,15 +8090,15 @@ async def device_health_gate(
         # Spec 03 I55: the fabric moved traffic but mesh dispatch failed. On a present mesh no
         # self-heal clears that (measured: a 100-min eth_frozen hold with no exit), so it earns the
         # present-mesh reset once per hold episode; the full check, fabric included, decides the
-        # release after it. The outage hold (04 I28) forbids that reset: held below.
+        # release after it.
         dispatch_failed = fabric_ok is False and fabric.names_dispatch_failure(health_monitor.last_fabric_output or "")
-        if dispatch_failed and not _dispatch_reset_spent and not mesh_reset_hold_reason():
+        if dispatch_failed and not _dispatch_reset_spent:
             ev = replace(ev, dispatch_reset_due=True)
         # Spec 03 I61: the same one reset, shared latch, for a clean exit's timed-out eth read.
-        if eth_timeout_due and not _dispatch_reset_spent and not mesh_reset_hold_reason():
+        if eth_timeout_due and not _dispatch_reset_spent:
             ev = replace(ev, eth_timeout_reset_due=True)
         # Spec 03 I69: the same one reset, shared latch, for a job the broker stopped mid-run.
-        if kill_reset_due and not _dispatch_reset_spent and not mesh_reset_hold_reason():
+        if kill_reset_due and not _dispatch_reset_spent:
             ev = replace(ev, kill_reset_due=True)
         stage = galaxy_recovery.next_stage(ev)
 
@@ -8197,14 +8176,7 @@ async def device_health_gate(
                 _offbus_hold_chips.clear()
                 _offbus_hold_chips.update(await asyncio.to_thread(offbus_chip_ids, fresh, expected))
             reset_floor = _galaxy_reset_min_dead_chips(expected)
-            outage_held = mesh_reset_hold_reason() if dispatch_failed and ev.off_bus == 0 else ""
-            # Under the outage hold no rung may reset this mesh, so name the held reset rather than
-            # an escalation that will not come (spec 03 I55).
-            next_step = (
-                f"Its present-mesh reset is HELD ({outage_held}): an operator must reset or lift the hold."
-                if outage_held
-                else _hold_escalation_note(ev.off_bus)
-            )
+            next_step = _hold_escalation_note(ev.off_bus)
             _log(
                 f"{ev.off_bus} of {expected} chip(s) off the bus — below the galaxy-reset "
                 f"floor ({reset_floor}). A galaxy reset here is the measured all-chip drop, so "
@@ -8235,17 +8207,7 @@ async def device_health_gate(
             # Name the ACTUAL cause. off_bus==0 is a present mesh (every chip on the bus) held for
             # an eth/fabric fault — "0/32 off-bus below the reset floor" reads as nonsense to
             # anyone watching. Only a real drop (off_bus>0) is an off-bus hold.
-            if dispatch_failed and ev.off_bus == 0 and ev.frozen_chips == 0 and mesh_reset_hold_reason():
-                # Spec 03 I55 under the outage hold (04 I28): the one present-mesh reset this
-                # dispatch failure earns is refused — logged and journaled as mesh_reset_held, and the
-                # hold says so rather than promising a self-heal a dispatch failure never gets.
-                refuse_mesh_reset(f"gate/{phase}", galaxy_recovery.reset_argv(indices), _log, 0)
-                why = (
-                    f"gate/{phase}: dispatch failed on a green fabric over a present mesh (all "
-                    f"{expected} chips on the bus) — its present-mesh reset is HELD "
-                    f"({mesh_reset_hold_reason()}); an operator must reset or lift the hold"
-                )
-            elif dispatch_failed and ev.off_bus == 0 and _dispatch_reset_spent:
+            if dispatch_failed and ev.off_bus == 0 and _dispatch_reset_spent:
                 why = (
                     f"gate/{phase}: dispatch failed on a green fabric over a present mesh (all "
                     f"{expected} chips on the bus) — held; this episode's present-mesh reset already ran"
@@ -8306,7 +8268,7 @@ async def device_health_gate(
             reset_clock = recovery_mechanism.last_reset_monotonic
             recovered = await _fire(stage)
             # The latch is spent only once a reset actually started (the clock moves at reset begin):
-            # one the per-host gate or the outage hold refused leaves the episode's reset unspent.
+            # one the per-host gate refused leaves the episode's reset unspent.
             if (
                 (ev.dispatch_reset_due or ev.eth_timeout_reset_due or ev.kill_reset_due)
                 and stage == STAGE_SMI_RESET
@@ -9341,8 +9303,6 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
     # Spec 04 I91: why the last mesh reset did not run or did not count (BMC preflight refused, guard
     # not armed, tt-smi's op_mode 0x0 fallback refused or sent); null after a clean mesh reset.
     payload["mesh_reset_bmc_guard"] = getattr(recovery_mechanism, "bmc_guard_state", None)
-    # Spec 03 I55: why a held present mesh would have no automatic exit on this host; null otherwise.
-    payload["hold_exit_gap"] = _hold_exit_gap() or None
     # Spec 03 I71: the descriptor's port connections the last fabric pass found missing or extra, by
     # name; null after a clean pass on the full topology.
     payload["fabric_topology"] = (getattr(health_monitor, "fabric_topology", None) or None) if health_monitor else None

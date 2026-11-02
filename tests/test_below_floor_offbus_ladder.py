@@ -92,7 +92,6 @@ def _rig(
     monkeypatch.setattr(pcie_guard, "chips_off_bus", lambda expected: expected - len(bus["beats"]))
     monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off_bus: (True, ""))
     monkeypatch.setattr(pcie_guard, "mask_for_mesh_reset", lambda log: None)
-    monkeypatch.setattr(galaxy, "refuse_mesh_reset", lambda *a, **k: False)
     monkeypatch.setattr(galaxy, "MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC", 0)  # no real settle in these tests
     order, events = [], []
     patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
@@ -906,22 +905,20 @@ async def test_an_sbr_that_has_every_chip_back_on_arc_not_ready_chips_gets_one_m
 
 @pytest.mark.asyncio
 async def test_a_refused_repeated_mesh_reset_holds_with_no_power_cycle(monkeypatch, tmp_path, clear_job_state):
-    """The outage hold (I28) starts after the sweep's SBR and refuses the repeated mesh reset: the full
+    """The per-host gate (I24) starts refusing after the sweep's SBR and refuses the repeated mesh reset: the full
     ladder did not run, so nothing lifts, no power cycle is requested on it (I22) and the sweep is not
     spent (the second verdict, a pass, is never read)."""
     order, events, counters, reasons = _b1_sweep(monkeypatch, tmp_path, verdicts=[False, True])
-    calls = []
-
-    def refuse(*a, **k):
-        calls.append(a)
-        if len(calls) == 1:
-            return False  # the sweep's SBR
-        order.append("refused")
-        return True
-
-    monkeypatch.setattr(galaxy, "refuse_mesh_reset", refuse)
-    await srv.galaxy_recovery.escalate("offbus-forced", [GONE], 32, lambda m: None)
     sbr = f"sbr ['{GONE}']"
+
+    def refuse(off_bus):
+        if sbr not in order:
+            return True, ""  # up to the sweep's SBR
+        order.append("refused")
+        return False, "refused"
+
+    monkeypatch.setattr(pcie_guard, "host_reset_gate", refuse)
+    await srv.galaxy_recovery.escalate("offbus-forced", [GONE], 32, lambda m: None)
     assert order[order.index(sbr) :] == [sbr, "full check", "refused"]
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
     assert not reasons and "host_rung_held" in [n for n, _ in events]
@@ -930,12 +927,12 @@ async def test_a_refused_repeated_mesh_reset_holds_with_no_power_cycle(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_an_outage_hold_refuses_the_sweep_and_holds_for_the_operator(monkeypatch, tmp_path, clear_job_state):
-    """The outage hold (I28) refuses the whole sweep, as it does for every sweep: the full ladder did not
-    run, so nothing lifts and no power cycle is requested on it (I22); the device stays held for the
-    operator (the second verdict, a pass, is never read)."""
+async def test_a_gate_refusal_refuses_the_sweep_and_holds(monkeypatch, tmp_path, clear_job_state):
+    """The per-host gate (I24) refuses the whole sweep, as it does for every sweep: the full ladder did not
+    run, so nothing lifts and no power cycle is requested on it (I22); the device stays held (the second verdict, a pass, is never read).
+    """
     order, events, counters, reasons = _b1_sweep(monkeypatch, tmp_path, verdicts=[False, True])
-    monkeypatch.setattr(galaxy, "refuse_mesh_reset", lambda *a, **k: order.append("refused") or True)
+    monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off_bus: order.append("refused") or (False, "refused"))
     await srv.galaxy_recovery.escalate("offbus-forced", [GONE], 32, lambda m: None)
     assert order[order.index("readers stopped") :] == ["readers stopped", f"isolate {GONE}", "refused", "full check"]
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0
@@ -1013,7 +1010,7 @@ async def test_the_i97_reset_keeps_its_deadline_and_a_refusal_power_cycles_but_t
     else:
         assert "mesh reset" not in order and "would not end" in _i97(events)[-1]["reason"]
     srv.device_hold_episode_since = (datetime.now() - timedelta(seconds=60)).isoformat()  # a new episode
-    monkeypatch.setattr(galaxy, "refuse_mesh_reset", lambda *a, **k: True)
+    monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off_bus: (False, "refused"))
     resets = order.count("mesh reset")
     assert await run(32, lambda m: None, "idle-escalation", failed_hb, repeat=repeat) is (None if repeat else False)
     assert order.count("mesh reset") == resets, "a refused reset never launches"

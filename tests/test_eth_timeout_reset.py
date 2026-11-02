@@ -19,10 +19,6 @@ from tt_device_mcp.health.recovery import pcie_guard
 CHIPS = 32
 TIMED_OUT = (None, f"{ETH_COULD_NOT_CHECK}: {eth.READ_TIMED_OUT}")
 ADVANCING = (True, "all active-eth cores advancing (1s)")
-OUTAGE_HOLD = {
-    "TT_DEVICE_MCP_AUTO_MESH_RESET": "0",
-    "TT_DEVICE_MCP_AUTO_POWER_CYCLE": "0",
-}
 
 
 class _Logger:
@@ -61,7 +57,6 @@ def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
     srv.device_op_lock = None
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "1")  # not the outage hold; OUTAGE_HOLD sets it to 0
     monkeypatch.delenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", raising=False)
     monkeypatch.setattr(srv, "eth_check_armed", True)
     monkeypatch.setattr(srv, "last_fabric_check_monotonic", srv.time.monotonic())
@@ -286,16 +281,6 @@ async def test_a_degraded_pcie_link_holds_and_never_releases(mesh):
     await _gate()
     assert srv.fsm.state is not ServerState.HEALTHY, "a failed host-pci check never releases"
     assert "PCIe link degraded" in mesh["log"].text()
-
-
-@pytest.mark.asyncio
-async def test_an_outage_hold_refuses_the_reset_and_keeps_todays_pass(mesh, monkeypatch):
-    for var, value in OUTAGE_HOLD.items():
-        monkeypatch.setenv(var, value)
-    await _gate()
-    assert mesh["resets"] == [] and "eth_timeout_mesh_reset" not in mesh["events"]
-    assert mesh["fabric"] == [0], "today's fabric pass ran instead"
-    assert srv._dispatch_reset_spent is False
 
 
 @pytest.mark.asyncio

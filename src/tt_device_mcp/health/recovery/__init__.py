@@ -47,7 +47,6 @@ from tt_device_mcp.health.recovery.base import (
     pci_rescan,
     pci_wedged_refusal,
     reenumerate_withheld,
-    refuse_mesh_reset,
 )
 from tt_device_mcp.health.recovery.stages.bridge_reset import (
     SBR_RETRAIN_SETTLE_SEC,
@@ -180,13 +179,13 @@ class Evidence:
     reset_exit_nonzero: bool
     holding_fabric_unverified: bool = False
     # Spec 03 I61: a clean post-job eth read timed out on a present mesh, and this hold episode's one
-    # present-mesh reset is unspent and not refused by the outage hold. Routed like dispatch_reset_due.
+    # present-mesh reset is unspent. Routed like dispatch_reset_due.
     eth_timeout_reset_due: bool = False
     # Spec 03 I69: a job the broker stopped mid-run (its timeout, or a requested kill) owes the mesh
     # one reset before release, on the same unspent latch. Routed like dispatch_reset_due.
     kill_reset_due: bool = False
     # Spec 03 I55: the fabric passed traffic but mesh dispatch failed over a present mesh, and this
-    # hold episode has not had its one present-mesh reset yet (nor does the outage hold forbid it).
+    # hold episode has not had its one present-mesh reset yet.
     dispatch_reset_due: bool = False
     # Chips on the bus whose ARC is not ready (ENODATA on a bound, link-up endpoint, spec 04 I24):
     # counted neither off the bus nor frozen. On a present mesh they take the mesh reset at once
@@ -1117,16 +1116,13 @@ class Recovery(ABC):
 
         # The per-host gate (spec 04 I24): on a host whose resets have flooded AER into a crash, an
         # automatic reset never fires over chips already off the bus or during a flood, and the
-        # Tenstorrent root ports are masked for the reset window. Off by default. Checked before
+        # Tenstorrent root ports are masked for the reset window. Checked before
         # reset_begin and the cooldown clock: a refused reset did not happen.
         off_bus = pcie_guard.chips_off_bus(expected)
         allowed, why = pcie_guard.host_reset_gate(off_bus)
         if not allowed:
             log(f"automatic reset NOT fired: {why}; holding for an operator")
             health_event("host_reset_gated", argv=argv, reason=why, host_at_risk=True)
-            return False
-        # The operator's outage hold (spec 04 I28): held like the gate above.
-        if refuse_mesh_reset("gate/relift", argv, log, off_bus):
             return False
 
         log(f"resetting device: {' '.join(argv)}  ({expected} device(s); ~30-60s, restart-safe)")
@@ -1173,7 +1169,7 @@ class Recovery(ABC):
                 self.mechanism.mark_mesh_reset_failed()
             metrics.stage_fired("smi_reset", "timeout" if rc is None else "failed")
             if rc is not None and arc_retry and await self._arc_not_ready_retry_due(argv, expected, log):
-                # The retry is this same gated path (host gate, outage hold, cooldown clock, full verify
+                # The retry is this same gated path (host gate, cooldown clock, full verify
                 # with the fabric), only once: a second failure returns False and the ladder climbs on.
                 return await self._reset_and_verify_device_once(indices, log, arc_retry=False)
             return False

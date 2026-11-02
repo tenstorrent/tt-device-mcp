@@ -71,7 +71,6 @@ from tt_device_mcp.health.recovery.base import (
     drop_returned_isolated,
     pci_rescan,
     reenumerate_withheld,
-    refuse_mesh_reset,
 )
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
 from tt_device_mcp.health.recovery.stages.power_cycle import note_cycle_possible
@@ -2389,8 +2388,8 @@ class GalaxyRecovery(Recovery):
         there is nothing left to lose. The caller owns the guards (tenant, scope), the settle and the
         verify.
 
-        Returns whether the sweep was COMPLETE: False when the per-host gate (spec 04 I24) or the
-        outage hold (I28) refused it. An incomplete sweep is not the full ladder,
+        Returns whether the sweep was COMPLETE: False when the per-host gate (spec 04 I24) refused
+        it. An incomplete sweep is not the full ladder,
         so the caller must not climb to a power cycle on it (I22).
 
         ``mesh_reset=False`` fires SBR only, so the last-chance sweep can re-probe the bus before the
@@ -2407,9 +2406,6 @@ class GalaxyRecovery(Recovery):
         if not allowed:
             log(f"back-to-back reset sweep NOT fired: {why}; holding — no host rung without the full ladder")
             health_event("host_reset_gated", context="reset_sweep", reason=why, trays=trays, host_at_risk=True)
-            return False
-        # The operator's outage hold (spec 04 I28) refuses the whole sweep: its last step is the mesh reset.
-        if refuse_mesh_reset("reset_sweep", self.reset_argv([str(i) for i in range(expected)]), log, off_bus):
             return False
         # The caller ends it after its settle and verify (the host-hang latch, I25).
         pcie_guard.begin_offbus_reset("reset sweep", off_bus)
@@ -3036,9 +3032,7 @@ class GalaxyRecovery(Recovery):
         self._td_reset_seen = True  # an onset first sighted after a reset is not an onset (I19)
         complete = await self._issue_all_resets_back_to_back(trays, expected, log, late_chips=False)
         if not complete:
-            log(
-                "class A 10-min sweep refused (reset gate or outage hold) — holding; the cycle follows at the cooldown's end"
-            )
+            log("class A 10-min sweep refused (reset gate) — holding; the cycle follows at the cooldown's end")
             return OUTCOME_WAITING
         try:
             await asyncio.sleep(settle)
@@ -3933,8 +3927,8 @@ class GalaxyRecovery(Recovery):
         self, recovered: Optional[bool], hold_since: str, ids_before: Optional[set], expected: int
     ) -> None:
         """Record a mesh reset that RAN and failed in this boot's record, on disk before any next rung
-        (spec 04 I36, I58). Only a launched reset counts (``last_reset_rc`` set): one the host gate or an
-        outage hold refused, or one still cycling at its timeout, did not fail here. The reset clock
+        (spec 04 I36, I58). Only a launched reset counts (``last_reset_rc`` set): one the host gate
+        refused, or one still cycling at its timeout, did not fail here. The reset clock
         cannot tell, since it is stamped before launch."""
         rc = self.mechanism.last_reset_rc
         if recovered is False and rc is not None:
