@@ -1591,10 +1591,7 @@ class HealthMonitor:
         """The open known fabric fault, or "". Bounded: past ``FABRIC_KNOWN_FAULT_HOLD_SEC``
         (21600 s) it expires and the usual 77 path (03 I40) gets one more try; the streak is
         left one short, so the next job that dies the same way declares it again at once."""
-        if self.fabric_known_fault and (
-            time.monotonic() - self._fabric_known_fault_at
-            >= FABRIC_KNOWN_FAULT_HOLD_SEC
-        ):
+        if self.fabric_known_fault and (time.monotonic() - self._fabric_known_fault_at >= FABRIC_KNOWN_FAULT_HOLD_SEC):
             health_event("fabric_known_fault_expired", detail=self.fabric_known_fault)
             self.fabric_known_fault = ""
             self._fabric_route_fault_streak = FABRIC_ROUTE_FAULT_JOBS - 1
