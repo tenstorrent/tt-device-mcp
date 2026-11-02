@@ -5403,8 +5403,7 @@ async def _fabric_77_fallback(evidence: dict, log, escalate) -> bool:
     bound never releases on them: only a passing full check, fabric included, lifts the hold (spec 03
     I78), and the ladder's own post-reset check is the next one. Pages once per hold episode: a later
     pass on the same episode journals but does not page again, and a page the hook dropped is tried
-    again on the next pass. ``retried`` is kept for callers; no eth read runs here. Returns True when
-    the climb settled the hold."""
+    again on the next pass. No eth read runs here. Returns True when the climb settled the hold."""
     global _fabric_77_paged_since
     event = {
         "kind": "fabric_check_unrunnable_bound",

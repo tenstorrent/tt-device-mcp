@@ -257,9 +257,6 @@ async def test_an_unlatched_mismatch_hold_gets_its_ladder_at_start_and_none_agai
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True, reason="pending fix: the fabric-unrunnable fallback lifts a hold with no passing fabric"
-)
 async def test_a_latched_topology_hold_is_not_lifted_while_the_link_is_still_missing(replay, monkeypatch):
     """The I40 fallback (fabric pass could not run past its bound, eth heartbeat healthy) must not
     lift a hold whose cause is a missing fabric link: only a passing full check, fabric included,
@@ -277,10 +274,9 @@ async def test_a_latched_topology_hold_is_not_lifted_while_the_link_is_still_mis
 
     monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_ok)
     monkeypatch.setattr(srv, "_post_reset_debt", lambda: "")
-    monkeypatch.setattr(srv, "_fabric_77_fallback_release_monotonic", 0.0)
     monkeypatch.setattr(srv, "_clear_device_dirty", lambda **k: lifted.append(k) or True)
     evidence = {"fabric": {"ok": None, "detail": "rc 77"}}
-    await srv._fabric_77_fallback(evidence, lambda m: None, escalate, retried=True)
+    await srv._fabric_77_fallback(evidence, lambda m: None, escalate)
     assert lifted == [], "a hold on a missing link is not lifted without a passing fabric check"
 
 
