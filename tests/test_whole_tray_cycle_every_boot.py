@@ -130,7 +130,6 @@ def gated(cool, monkeypatch, tmp_path):  # noqa: F811
     check.write_text("#!/bin/sh\nexit 1\n")
     check.chmod(0o755)
     monkeypatch.setenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", str(check))
-    monkeypatch.delenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", raising=False)
     monkeypatch.setattr(opc, "fire_command", lambda argv, reason, timeout=0: cool["order"].append("power_cycle"))
     monkeypatch.setattr(galaxy.pcie_guard, "host_reset_gate", lambda off_bus: (True, ""))
     opc._pending.clear()
@@ -171,37 +170,6 @@ async def test_the_off_bus_path_inside_the_cooldown_holds_with_a_deadline_and_no
     cool["clk"][0] = until
     assert await _gated_pass(cool, gated) is True
     assert _cycles(cool) == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("env", ["600", "86400"])
-async def test_an_operator_attempt_interval_is_a_stated_wait_capped_at_the_backoff_cap(
-    cool, monkeypatch, gated, env  # noqa: F811
-):  # noqa: F811
-    """``TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC`` still spaces attempts when set, but as a
-    stated wait on /health that the watchdog retries at its end, and never past the I65 cap."""
-    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", env)
-    # The ledger cooldown has ended (a record from long ago); only the attempt file is recent.
-    cool["boot"].update(id="boot-B", btime=T0 - 86400)
-    _ledger({"action": "power-cycle", "boot_id": "boot-A", "at_epoch": T0 - 86400, "at": "x"})
-    opc.save_state({"attempts": [{"at_epoch": T0 + 300, "episode": "earlier", "reason": "tray", "boot_id": "boot-B"}]})
-    monkeypatch.setattr(opc, "now_epoch", lambda: cool["clk"][0])
-    cool["clk"][0] = T0 + 360
-    _tray_off(cool)
-    assert await _gated_pass(cool, gated) is False
-    until = T0 + 300 + min(int(env), recovery_base.POWER_CYCLE_BACKOFF_CAP_SEC)
-    assert _deadline(cool) == until and cool["g"].mechanism.power_cycle_retry[0] == until
-    assert _cycles(cool) == 0
-    cool["clk"][0] = until
-    assert await _gated_pass(cool, gated) is True
-    assert _cycles(cool) == 1
-
-
-def test_the_attempt_interval_default_adds_no_wait_beyond_the_cooldown(monkeypatch):
-    monkeypatch.delenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", raising=False)
-    assert opc.min_interval_sec() == 0
-    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", str(10**6))
-    assert opc.min_interval_sec() == recovery_base.POWER_CYCLE_BACKOFF_CAP_SEC
 
 
 @pytest.mark.asyncio

@@ -3345,36 +3345,6 @@ class GalaxyRecovery(Recovery):
         fault_class = _offbus_fault_class(off_bus, expected, whole=whole_now)
         state = offbus_power_cycle.load_state()
         now = offbus_power_cycle.now_epoch()
-        interval = offbus_power_cycle.min_interval_sec()
-        last = (
-            offbus_power_cycle.last_attempt_within(state, now, interval, healed=self.mechanism.power_cycle_healed)
-            if interval > 0
-            else None
-        )
-        if last is not None:
-            # Spec 04 I65: an attempt spacing is a stated, bounded wait like the cooldown — on /health,
-            # asked again by the watchdog at its end — and the hold runs no reset meanwhile.
-            until = last + interval
-            _, why = self.mechanism._deny_power_cycle(
-                {
-                    "until": until,
-                    "last": last,
-                    "cause": "off-bus power-cycle attempt",
-                    "interval_sec": interval,
-                    "why": f"off-bus power cycle last attempted {int(now - last)}s ago (spacing {interval}s): "
-                    f"held until {datetime.fromtimestamp(until).isoformat(sep=' ', timespec='seconds')}",
-                }
-            )
-            offbus_power_cycle.page_once(
-                "offbus_power_cycle_rate_limited",
-                log,
-                f"{off_bus}/{expected} chip(s) still off the bus {int(age)}s into the hold; {why}",
-                held_since=hold_since,
-                off_bus=off_bus,
-                last_attempt_epoch=last,
-                last_error=state.get("last_error", ""),
-            )
-            return False
         allowed, deny = self.mechanism.auto_recovery_allowed("power-cycle", tenant_active=False)
         if not allowed:
             offbus_power_cycle.page_once(

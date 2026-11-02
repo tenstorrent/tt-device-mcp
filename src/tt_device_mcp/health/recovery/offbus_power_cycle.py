@@ -8,9 +8,7 @@ the hold is bounded: once the episode has stood ``TT_DEVICE_MCP_OFFBUS_GATED_GRA
 300 s) and the ladder's safe rungs have run once, the broker runs the host's own power-cycle command
 ``TT_DEVICE_MCP_POWER_CYCLE_CMD`` — but only on a tenant-free box, with no operator recovery in
 progress, and spaced by the power cycle's cooldown (spec 04
-I65). ``TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC`` (unset by default) adds a spacing between
-attempts on top of it, never above the I65 backoff cap; either wait is stated on /health and the cycle
-is asked again the moment it ends. With the command unset it pages instead and the hold stands as
+I65), a wait stated on /health after which the cycle is asked again at once. With the command unset it pages instead and the hold stands as
 before; a cycle blocked ``TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC`` (default 1800 s) past
 the grace pages too.
 
@@ -43,7 +41,6 @@ from tt_device_mcp.health.evidence import health_dir, health_event
 
 STATE_FILE = "offbus_power_cycle.json"
 GRACE_DEFAULT_SEC = 300
-MIN_INTERVAL_DEFAULT_SEC = 0  # no spacing beyond the I65 cooldown unless an operator sets one
 CHECK_TIMEOUT_DEFAULT_SEC = 10.0
 FIRE_TIMEOUT_DEFAULT_SEC = 120.0
 BLOCKED_PAGE_DEFAULT_SEC = 1800
@@ -73,17 +70,6 @@ def grace_sec() -> int:
     """Seconds an off-bus hold the gate refuses to reset stands before the power cycle may fire,
     counted from the start of the hold episode. A non-positive or malformed value reads as 300."""
     return _int_env("TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC", GRACE_DEFAULT_SEC)
-
-
-def min_interval_sec() -> int:
-    """Seconds an attempt holds the next one off, on top of the I65 cooldown; 0 (the default) adds
-    none. Never above the I65 backoff cap: a wait with no stated, bounded end is an open-ended hold."""
-    from tt_device_mcp.health.recovery.base import POWER_CYCLE_BACKOFF_CAP_SEC
-
-    return min(
-        _int_env("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", MIN_INTERVAL_DEFAULT_SEC),
-        POWER_CYCLE_BACKOFF_CAP_SEC,
-    )
 
 
 def _argv(name: str) -> Optional[list]:
@@ -193,20 +179,6 @@ def save_state(state: dict) -> None:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
-
-
-def last_attempt_within(state: dict, now: float, interval: int, healed=None) -> Optional[float]:
-    """Epoch of an attempt younger than ``interval``, or None. An unreadable stamp counts as now. An
-    attempt ``healed(rec)`` says a later boot verified healthy is skipped: the hold after it is a new
-    episode, not a loop (spec 04 I9); the ledger's backstop still caps every cycle."""
-    for rec in state.get("attempts") or []:
-        try:
-            at = float(rec.get("at_epoch"))
-        except (AttributeError, TypeError, ValueError):
-            return now
-        if now - at < interval and not (healed and healed(rec)):
-            return at
-    return None
 
 
 def record_attempt(state: dict, now: float, episode: str, reason: str, boot_id: str = "") -> None:
