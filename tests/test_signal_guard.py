@@ -231,13 +231,12 @@ def _exiting_view(real, exiting_tids=None):
 
 @pytest.mark.parametrize("view", ["exiting", "reaped"])
 def test_a_group_member_killed_mid_exit_after_its_parent_was_reaped_passes(signal_guard, monkeypatch, view):
-    """The race behind a live-scope preemption's flaky teardown: the scope's SIGKILL ends the
-    job's shell and its `sleep` together and the group's SIGKILL follows at once. The shell has
-    exited (its `sleep` re-parented to init, ppid no longer ours) while the `sleep` is still in
-    do_exit with its mm dropped (empty environ, no token) and not yet a zombie, or init reaps it
-    during the guard's reads. A signal reaches nothing in either, so it is not a foreign process.
-    The decoy stands in for that `sleep`: no token, not ours by ancestry, live until the reader
-    shows it dying."""
+    """The race behind a live-scope preemption's flaky teardown: the scope's SIGKILL ends the job's shell and its
+    `sleep` together and the group's SIGKILL follows at once. The shell has exited (its `sleep` re-parented to init,
+    ppid no longer ours) while the `sleep` is still in do_exit with its mm dropped (empty environ, no token) and not yet
+    a zombie, or init reaps it during the guard's reads. A signal reaches nothing in either, so it is not a foreign
+    process. The decoy stands in for that `sleep`: no token, not ours by ancestry, live until the reader shows it dying.
+    """
     decoy = _stdin_child(start_new_session=True, env=_no_token_env())
     try:
         monkeypatch.setattr(signal_guard, "owned", _carries_spawn_token)

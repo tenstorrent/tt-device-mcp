@@ -63,8 +63,7 @@ def test_a_blackhole_tray_comes_from_the_bus_group_not_the_chip_index():
     ],
 )
 def test_each_blackhole_bus_range_maps_to_its_tray(chip, bus, tray):
-    """All four bus ranges, pinned: 0x0X tray 1, 0x4X tray 2, 0xCX tray 3, 0x8X tray 4. Fails on
-    base for the 0x8X/0xCX rows: read by position, 0x8X was tray 3."""
+    """All four bus ranges, pinned: 0x0X tray 1, 0x4X tray 2, 0xCX tray 3, 0x8X tray 4."""
     assert BH_CHIP_BUSES[chip] == f"0000:{bus:02x}:00.0"
     trays = galaxy._tray_map(BH_CHIP_BUSES, "tt-galaxy-bh")
 
@@ -96,10 +95,9 @@ def test_a_missing_chip_does_not_shift_any_other_chips_tray():
 
 
 def test_a_wormhole_tray_uses_the_wormhole_table_for_the_same_buses():
-    """The bus groups are the same silicon layout on both architectures; the tray NUMBERING is not.
-    Wormhole numbers 0xc0 tray 1, 0x80 tray 2, 0x00 tray 3 and 0x40 tray 4 — so the identical map
-    must resolve differently from the Blackhole case above, which is the whole reason the board
-    type selects the table instead of one being hardcoded."""
+    """The bus groups are the same silicon layout on both architectures; the tray NUMBERING is not. Wormhole numbers
+    0xc0 tray 1, 0x80 tray 2, 0x00 tray 3 and 0x40 tray 4 — so the identical map must resolve differently from the
+    Blackhole case above, which is the whole reason the board type selects the table instead of one being hardcoded."""
     trays = galaxy._tray_map(BH_CHIP_BUSES, "tt-galaxy-wh")
 
     assert trays[1] == list(range(16, 24))
@@ -178,9 +176,8 @@ def test_a_whole_tray_drop_names_the_tray_that_is_down(bh_trays):
 
 
 def test_affected_trays_names_the_tray_an_operator_would_read_from_tt_smi(bh_trays):
-    """The tray ids ride out in the hold_classified event and the last-chance sweep's operator line.
-    A lone off-bus chip 20 (0xc5) is on tray 3, which is what
-    `tt-smi -glx_list_tray_to_device` prints for it."""
+    """The tray ids ride out in the hold_classified event and the last-chance sweep's operator line. A lone off-bus chip
+    20 (0xc5) is on tray 3, which is what `tt-smi -glx_list_tray_to_device` prints for it."""
     assert galaxy._affected_trays({"20"}, 32, bh_trays) == [3]
     assert galaxy._affected_trays({"0", "31"}, 32, bh_trays) == [1, 4]
 
@@ -225,9 +222,8 @@ def _fake_smi(snapshot):
 
 
 def _seed_sysfs(tmp_path, chip_buses):
-    """Give the (sealed, per-test) sysfs class dir one ``tenstorrent!N`` node per chip, its
-    ``device`` link pointing at a PCI device dir named for the chip's address — the shape the
-    KMD exposes. Any nodes already there are replaced."""
+    """Give the (sealed, per-test) sysfs class dir one ``tenstorrent!N`` node per chip, its ``device`` link pointing at
+    a PCI device dir named for the chip's address — the shape the KMD exposes. Any nodes already there are replaced."""
     for node in list(pci.SYSFS_CLASS_DIR.iterdir()):
         (node / "device").unlink(missing_ok=True)
         node.rmdir()
@@ -263,9 +259,8 @@ def test_the_snapshot_caches_every_chips_bus_id(galaxy_seen):
 
 
 def test_the_tray_map_keys_on_the_kernels_chip_ids_not_the_snapshots_list_order(galaxy_seen):
-    """tt-smi's snapshot is in PCI order; the kernel's ids put 0xCX before 0x8X. The banked map is
-    the kernel's, so chip 24 (0x81) is on tray 4 — the case issue #27 found re-powering tray 3.
-    Fails on base: the map was read by position from the PCI-ordered list."""
+    """tt-smi's snapshot is in PCI order; the kernel's ids put 0xCX before 0x8X. The banked map is the kernel's, so chip
+    24 (0x81) is on tray 4 — the case issue #27 found re-powering tray 3."""
     assert srv.health_monitor._chip_buses == BH_CHIP_BUSES
     trays = srv.galaxy_recovery._tray_map_now()
 
@@ -296,9 +291,8 @@ def _recording_events(monkeypatch):
     ids=["sysfs-short", "sysfs-other-bus"],
 )
 def test_sysfs_and_tt_smi_disagreeing_banks_no_map_and_logs_both(monkeypatch, tmp_path, sysfs):
-    """The self-check: the kernel's map and tt-smi's snapshot must name the same buses. When they do
-    not, one read raced the bus, so nothing is banked, both are journaled, and the next full pass
-    that agrees banks the map."""
+    """The self-check: the kernel's map and tt-smi's snapshot must name the same buses. When they do not, one read raced
+    the bus, so nothing is banked, both are journaled, and the next full pass that agrees banks the map."""
     events = _recording_events(monkeypatch)
     monkeypatch.setattr(srv.health_monitor, "_board_types", None)
     monkeypatch.setattr(srv.health_monitor, "_bus_ids", None, raising=False)
@@ -393,10 +387,9 @@ def test_a_full_read_that_matches_the_banked_map_changes_nothing(monkeypatch, ga
 
 
 def test_a_drifted_snapshot_journals_but_leaves_the_cached_map_standing(monkeypatch):
-    """A warm reset (this rung's own, the per-chip bridge, or a power cycle) can re-order PCI
-    enumeration. tt-smi's bus list is banked once beside the chip map, and a later full snapshot
-    that disagrees is worth naming (spec 04 I16). No tray is read from this list (the chip map,
-    which re-banks, is what the trays come from), so the list stands."""
+    """A warm reset (this rung's own, the per-chip bridge, or a power cycle) can re-order PCI enumeration. tt-smi's bus
+    list is banked once beside the chip map, and a later full snapshot that disagrees is worth naming (spec 04 I16). No
+    tray is read from this list (the chip map, which re-banks, is what the trays come from), so the list stands."""
     from tt_device_mcp.health import monitor as monitor_mod
 
     monkeypatch.setattr(srv.health_monitor, "_board_types", None)

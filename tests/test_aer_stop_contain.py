@@ -138,10 +138,9 @@ async def test_an_all_ones_burst_chip_is_removed_before_any_reader_is_killed(wat
     ["no sample", "every chip answers", "another chip all-ones", "blackout", "stale sample"],
 )
 def test_with_no_all_ones_burst_chip_the_stop_kills_only_once_the_chips_answer(watch, case):
-    """No contained chip: the I92 stop, SIGSTOP, no remove. The burst chip is still attached, so no
-    SIGKILL until a sample after the stop reads it answering (a killed reader's fd close would reach
-    it). A blackout (every chip all-ones, the class A/C fault) is never contained here: its direct
-    power cycle path stands."""
+    """No contained chip: the I92 stop, SIGSTOP, no remove. The burst chip is still attached, so no SIGKILL until a
+    sample after the stop reads it answering (a killed reader's fd close would reach it). A blackout (every chip
+    all-ones, the class A/C fault) is never contained here: its direct power cycle path stands."""
     w, log, _detach_ok, burst = watch
     if case == "every chip answers":
         _sample()
@@ -267,8 +266,7 @@ async def test_the_contained_hold_runs_the_full_ladder_at_the_bound_then_the_hos
 
 @pytest.mark.asyncio
 async def test_the_contained_hold_fails_the_full_check_gate_into_the_bounded_recovery(watch):
-    """A pass from before the fault no longer vouches (03 I82, I78): the hold needs a new full
-    check with fabric."""
+    """A pass from before the fault no longer vouches (03 I82, I78): the hold needs a new full check with fabric."""
     _w, _log, _detach_ok, burst = watch
     FABRIC_DEBT.note_fabric(True)
     fsm_dirty(srv, "startup: the mesh is unverified after a broker start", why="job_killed")

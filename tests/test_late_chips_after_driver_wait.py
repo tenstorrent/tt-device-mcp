@@ -51,17 +51,16 @@ def _late(
     reinit_rc=0,
     held_sec=None,
 ):
-    """The 10-min bound on a 32-chip mesh holding with chip 31 off the bus. The sweep's mesh reset is a
-    glx_reset whose tt-smi gave up at its driver wait with chips 30 and 31 out (after the tray re-power
-    when ``repower``); the late-chip rescan brings ``back`` of the two back. A second mesh reset ends
-    clean, or gives up again (``second_gives_up``). ``i97``: the sweep's repeated mesh reset runs as the
-    I97 one under its deadline (I100); otherwise as a plain sweep reset. ``gives_up_sec``: how far the
-    first reset moves galaxy's clock. Returns (order, events, counters): events are (name, fields);
-    ``counters["waits"]`` holds each mesh reset's ``wait_until`` (None when not given) and
-    ``counters["rescanned_at"]`` the monotonic time of each rescan. The I104 re-init of the chips present
-    (``present reinit`` in ``order``) ends with ``reinit_rc``; when ``reinit_back`` the reset path's rescan
-    after it finds the missing chips back. Its waits are in ``counters["reinit_waits"]``. ``held_sec``: the hold's age when the ladder starts
-    (the rig's 21 min when None)."""
+    """The 10-min bound on a 32-chip mesh holding with chip 31 off the bus. The sweep's mesh reset is a glx_reset whose
+    tt-smi gave up at its driver wait with chips 30 and 31 out (after the tray re-power when ``repower``); the late-chip
+    rescan brings ``back`` of the two back. A second mesh reset ends clean, or gives up again (``second_gives_up``).
+    ``i97``: the sweep's repeated mesh reset runs as the I97 one under its deadline (I100); otherwise as a plain sweep
+    reset. ``gives_up_sec``: how far the first reset moves galaxy's clock. Returns (order, events, counters): events are
+    (name, fields); ``counters["waits"]`` holds each mesh reset's ``wait_until`` (None when not given) and
+    ``counters["rescanned_at"]`` the monotonic time of each rescan. The I104 re-init of the chips present (``present
+    reinit`` in ``order``) ends with ``reinit_rc``; when ``reinit_back`` the reset path's rescan after it finds the
+    missing chips back. Its waits are in ``counters["reinit_waits"]``. ``held_sec``: the hold's age when the ladder
+    starts (the rig's 21 min when None)."""
     held = {} if held_sec is None else {"held_min": held_sec / 60}
     order, _names, counters = _rig(monkeypatch, tmp_path, verdicts=verdicts, **held)
     if not i97:
@@ -131,9 +130,8 @@ def _step(events) -> list:
 async def test_both_chips_back_late_get_one_more_mesh_reset_then_the_full_check_lifts(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """The two-chip replay: both chips come back after tt-smi gave up. One rescan, the readers stop, one
-    more mesh reset (its POST_RESET and re-init), then the full check with fabric passes and lifts the
-    hold. No power cycle."""
+    """The two-chip replay: both chips come back after tt-smi gave up. One rescan, the readers stop, one more mesh reset
+    (its POST_RESET and re-init), then the full check with fabric passes and lifts the hold. No power cycle."""
     order, events, counters = _late(monkeypatch, tmp_path, back=2, verdicts=[False, True])
     await _bound_ladder()
     assert _after_sweep_mesh(order) == ["mesh reset", "rescan", "readers stopped", "mesh reset", "full check"]
@@ -280,12 +278,11 @@ async def test_under_an_i97_deadline_the_rescan_runs_when_the_reinit_and_check_f
 async def test_on_the_i100_repeat_a_give_up_gets_the_rescan_the_reinit_and_the_check_before_the_cycle(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """The sweep's repeated mesh reset runs as the I97 one (I100) under a deadline of its start plus
-    300 s. Its tt-smi gives up at the driver wait after 263 s with both chips back. I106: the give-up
-    moves that deadline on by GAVE_UP_TAIL_SEC, so the rescan runs; a second mesh reset no longer fits,
-    so the chips present get their POST_RESET and re-init (I104) instead, and the full check with fabric
-    decides. It fails: the hold stays and the power cycle is requested by the repeat's start plus its
-    allowance, the tail, the kill grace and the reap."""
+    """The sweep's repeated mesh reset runs as the I97 one (I100) under a deadline of its start plus 300 s. Its tt-smi
+    gives up at the driver wait after 263 s with both chips back. I106: the give-up moves that deadline on by
+    GAVE_UP_TAIL_SEC, so the rescan runs; a second mesh reset no longer fits, so the chips present get their POST_RESET
+    and re-init (I104) instead, and the full check with fabric decides. It fails: the hold stays and the power cycle is
+    requested by the repeat's start plus its allowance, the tail, the kill grace and the reap."""
     order, events, counters = _late(monkeypatch, tmp_path, back=2, i97=True, gives_up_sec=263)
     cycled_at = []
 
@@ -319,12 +316,11 @@ async def test_on_the_i100_repeat_a_give_up_gets_the_rescan_the_reinit_and_the_c
 async def test_on_the_i97_path_a_give_up_gets_the_rescan_the_reinit_and_the_check_then_the_cycle_by_the_bound(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """Class B1: the SBR has every chip back, the check fails on ARC-not-ready chips, and the sweep's
-    repeated mesh reset starts at the latest hold age the I97 deadline allows. Its tt-smi gives up at
-    the driver wait after 263 s with the trays re-powered and chip 31 out again. I106: the rescan, the
-    POST_RESET and re-init of the chips present and the full check with fabric still run, in that
-    order. The check fails, the hold stays, and the power cycle is requested by the repeat's start plus
-    its allowance, the give-up tail, the kill grace and the reap."""
+    """Class B1: the SBR has every chip back, the check fails on ARC-not-ready chips, and the sweep's repeated mesh
+    reset starts at the latest hold age the I97 deadline allows. Its tt-smi gives up at the driver wait after 263 s with
+    the trays re-powered and chip 31 out again. I106: the rescan, the POST_RESET and re-init of the chips present and
+    the full check with fabric still run, in that order. The check fails, the hold stays, and the power cycle is
+    requested by the repeat's start plus its allowance, the give-up tail, the kill grace and the reap."""
     deadline = galaxy._mesh_reset_before_host_rung_deadline_sec()
     order, events, counters, _reasons = _b1_sweep(
         monkeypatch, tmp_path, verdicts=[False, False], held_sec=deadline - NEEDS - 10
@@ -388,10 +384,9 @@ async def test_the_class_a_cooldown_sweep_takes_no_late_chip_step(monkeypatch, t
 async def test_a_second_give_up_on_the_plain_sweep_is_checked_and_power_cycles_within_the_step_bound(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """Both chips are back, the second mesh reset runs and gives up at its driver wait too: the full
-    check still runs (it decides) after the I104 re-init of the chips present, fails, nothing lifts and
-    the power cycle is requested. The wait for that reset ended by the step's start plus
-    LATE_CHIP_STEP_SEC; the sweep's own reset had no such bound."""
+    """Both chips are back, the second mesh reset runs and gives up at its driver wait too: the full check still runs
+    (it decides) after the I104 re-init of the chips present, fails, nothing lifts and the power cycle is requested. The
+    wait for that reset ended by the step's start plus LATE_CHIP_STEP_SEC; the sweep's own reset had no such bound."""
     order, events, counters = _late(monkeypatch, tmp_path, back=2, second_gives_up=True)
     assert await _bound_ladder() == OUTCOME_TERMINAL
     tail = ["mesh reset", "rescan", "readers stopped", "mesh reset", "readers stopped", "present reinit"]
@@ -561,11 +556,10 @@ async def _climb(bound: bool):
 async def test_the_late_chip_second_reset_clears_a_foreign_holder_and_keeps_its_bound(
     monkeypatch, tmp_path, clear_job_state, i97, bound
 ):
-    """Spec 04 I102 under I103: the second mesh reset runs inside the last-chance sweep right before the
-    power cycle, so its pre-reset scan runs with foreign holders yielding. A holder outside every broker
-    scope is TERMed like a reader and refuses neither reset; the second reset's wait still ends at the
-    step's start plus LATE_CHIP_STEP_SEC. Its full check fails, so nothing lifts and the power cycle
-    follows, journaling the holder."""
+    """Spec 04 I102 under I103: the second mesh reset runs inside the last-chance sweep right before the power cycle, so
+    its pre-reset scan runs with foreign holders yielding. A holder outside every broker scope is TERMed like a reader
+    and refuses neither reset; the second reset's wait still ends at the step's start plus LATE_CHIP_STEP_SEC. Its full
+    check fails, so nothing lifts and the power cycle follows, journaling the holder."""
     order, events, counters, box = _scanned_late(
         monkeypatch, tmp_path, i97=i97, holders=[FOREIGN] if bound else [], late_holder=None if bound else FOREIGN
     )
@@ -609,11 +603,10 @@ async def test_a_job_holder_still_refuses_the_late_chip_second_reset_and_the_hol
 
 
 def _replay(monkeypatch, tmp_path, **kw):
-    """The replayed Galaxy hold: chip 31 off the bus, the climb's sweep repeats the failed mesh reset at a
-    hold age of about 459 s (under a deadline of its start plus 300 s, the I97 one being too close), and
-    its tt-smi gives up at the driver wait after 133 s with chip 30 back on the rescan and chip 31 still
-    out. Before I106 the broker requested the power cycle at about 592 s with no rescan, no re-init and
-    no check. Returns (order, events, counters, cycled_at)."""
+    """The replayed Galaxy hold: chip 31 off the bus, the climb's sweep repeats the failed mesh reset at a hold age of
+    about 459 s (under a deadline of its start plus 300 s, the I97 one being too close), and its tt-smi gives up at the
+    driver wait after 133 s with chip 30 back on the rescan and chip 31 still out. Before I106 the broker requested the
+    power cycle at about 592 s with no rescan, no re-init and no check. Returns (order, events, counters, cycled_at)."""
     order, events, counters = _late(monkeypatch, tmp_path, back=1, i97=True, gives_up_sec=133, held_sec=459, **kw)
     cycled_at = []
 

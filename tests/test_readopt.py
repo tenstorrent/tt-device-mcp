@@ -608,10 +608,9 @@ async def test_a_per_user_daemon_start_runs_a_light_probe_and_a_pass_reads_healt
 
 @pytest.mark.asyncio
 async def test_a_per_user_daemon_start_on_a_bad_device_stays_recovering(monkeypatch, clear_job_state, tmp_path):
-    """The hole: a per-user daemon restarted onto a device whose ARC stopped ticking read HEALTHY and
-    admitted its first job onto it. A failing start pass must hold the door — a self-heal hold, not a
-    dirty mark, see the next test — journal the verdict, and never climb the ladder itself.
-    Fails on base: BOOT went straight to HEALTHY."""
+    """The hole: a per-user daemon restarted onto a device whose ARC stopped ticking read HEALTHY and admitted its first
+    job onto it. A failing start pass must hold the door — a self-heal hold, not a dirty mark, see the next test —
+    journal the verdict, and never climb the ladder itself."""
     events = _per_user_start(monkeypatch, tmp_path)
     _probe(monkeypatch, healthy=False)
     ladder = _no_ladder(monkeypatch)

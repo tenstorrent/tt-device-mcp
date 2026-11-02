@@ -483,9 +483,8 @@ def _beat(idx, value):
 
 @pytest.mark.parametrize("age", [0.0, chip_state.PROBE_MIN_SEC + 1])
 def test_the_pre_reset_scan_never_detaches_a_chip_fenced_on_one_sample(monkeypatch, age):
-    """One all-ones sample fences a chip (maybe a blip). The pre-reset scan's off-bus read is a
-    decision: it reads the chip for real when due, and never detaches it on the all-ones the fence
-    reports without a read (I97)."""
+    """One all-ones sample fences a chip (maybe a blip). The pre-reset scan's off-bus read is a decision: it reads the
+    chip for real when due, and never detaches it on the all-ones the fence reports without a read (I97)."""
     from tt_device_mcp import pre_reset_scan
 
     _beat("13", 100)

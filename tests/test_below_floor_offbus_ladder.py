@@ -247,10 +247,9 @@ async def test_an_enumerated_chip_is_never_sbrd_even_at_the_bound(monkeypatch, t
 async def test_below_the_bound_a_gone_chip_waits_for_the_opt_in_and_the_host_rung_for_the_bound(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """A forced run on a young hold keeps its own path: the mesh reset, no rescan and no SBR of a gone
-    chip (the gate ran the rescan at once; the SBR waits for the opt-in or the bound), and the host
-    rung waits for the ladder's end (I38; a reset with no recorded failure, so I58 does not climb at
-    once)."""
+    """A forced run on a young hold keeps its own path: the mesh reset, no rescan and no SBR of a gone chip (the gate
+    ran the rescan at once; the SBR waits for the opt-in or the bound), and the host rung waits for the ladder's end
+    (I38; a reset with no recorded failure, so I58 does not climb at once)."""
     order, events, _counters = _rig(monkeypatch, tmp_path, held_min=3, mesh_rc=None)
     await srv.galaxy_recovery.escalate("offbus-forced", [GONE], 32, lambda m: None)
     assert order == ["mesh reset", "full check"]
@@ -352,10 +351,9 @@ async def test_a_remove_blocked_in_the_kernel_still_lets_the_bound_reach_the_pow
 
 
 def _real_bridge_rung(monkeypatch, tmp_path):
-    """Undo _rig's fake: the real _recover_isolated_chips and reset_chip_via_bridge run, against a fake
-    sysfs where chip 31's bridge (0000:40:1f.0) is still enumerated with chip 31's bus as its secondary
-    bus and chip 31's own node is gone. Returns ``spy``: the bridge lookups by secondary bus, the setpci
-    argvs and the scoped rescans."""
+    """Undo _rig's fake: the real _recover_isolated_chips and reset_chip_via_bridge run, against a fake sysfs where chip
+    31's bridge (0000:40:1f.0) is still enumerated with chip 31's bus as its secondary bus and chip 31's own node is
+    gone. Returns ``spy``: the bridge lookups by secondary bus, the setpci argvs and the scoped rescans."""
     for inst in (srv.galaxy_recovery, srv.per_target_recovery):
         monkeypatch.delattr(inst, "_recover_isolated_chips", raising=False)
     spy = {"find": [], "setpci": [], "rescan": 0}
@@ -394,10 +392,9 @@ def _real_bridge_rung(monkeypatch, tmp_path):
 async def test_without_the_opt_in_the_bound_tries_no_sbr_on_a_gone_chip_and_queues_nothing(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """The review finding: the bound used to queue a gone chip whatever the opt-in, the real rung found
-    no bridge (no SBR fired) and the chip stayed isolated, so every later gate pass went to a no-op
-    bridge rung. Now: no bridge lookup, no setpci, nothing queued, and the next pass does not route to
-    the bridge rung."""
+    """The review finding: the bound used to queue a gone chip whatever the opt-in, the real rung found no bridge (no
+    SBR fired) and the chip stayed isolated, so every later gate pass went to a no-op bridge rung. Now: no bridge
+    lookup, no setpci, nothing queued, and the next pass does not route to the bridge rung."""
     order, events, _counters = _rig(monkeypatch, tmp_path)
     spy = _real_bridge_rung(monkeypatch, tmp_path)
     srv.isolated_chips.clear()
@@ -598,11 +595,10 @@ async def test_a_dead_link_chip_whose_remove_fails_is_not_reset(monkeypatch, tmp
 async def test_the_sweep_runs_its_sbr_when_none_ran_this_hold(
     monkeypatch, tmp_path, clear_job_state, heals, verdict, how
 ):
-    """Below the bound, this hold's mesh reset already failed on exactly these chips (I58). The
-    last-chance sweep still runs in full before the host rung: the readers stop, the dead-link chip is
-    isolated and gets the SBR no SBR ran on this hold, and, unless that SBR and the full check with
-    fabric heal it, the failed mesh reset runs once more under the I97 deadline with its own full check.
-    Only a pass lifts, else the power cycle."""
+    """Below the bound, this hold's mesh reset already failed on exactly these chips (I58). The last-chance sweep still
+    runs in full before the host rung: the readers stop, the dead-link chip is isolated and gets the SBR no SBR ran on
+    this hold, and, unless that SBR and the full check with fabric heal it, the failed mesh reset runs once more under
+    the I97 deadline with its own full check. Only a pass lifts, else the power cycle."""
     order, events, counters = _rig(
         monkeypatch, tmp_path, held_min=3, enumerated=True, sbr_heals=heals, verdicts=[verdict]
     )
@@ -648,10 +644,9 @@ async def test_the_sweep_sbrs_a_chip_whose_round_this_hold_already_spent(monkeyp
 @pytest.mark.asyncio
 @pytest.mark.parametrize("off", [32, 20], ids=["all-off", "above-floor"])
 async def test_the_sweep_sbr_is_below_the_floor_only(monkeypatch, tmp_path, clear_job_state, off):
-    """At or above the floor (16 of 32) the drop is a mass drop, all chips off (class C) included: once
-    its mesh reset failed on exactly these chips, the climb goes straight to the power cycle. No reader
-    is stopped, no chip removed and no per-chip SBR runs, even with no SBR this hold and every off chip's
-    node present with its link down."""
+    """At or above the floor (16 of 32) the drop is a mass drop, all chips off (class C) included: once its mesh reset
+    failed on exactly these chips, the climb goes straight to the power cycle. No reader is stopped, no chip removed and
+    no per-chip SBR runs, even with no SBR this hold and every off chip's node present with its link down."""
     order, _events, counters = _rig(monkeypatch, tmp_path, held_min=3)
     gone = {str(i) for i in range(32 - off, 32)}
     beats = {str(i): 100 for i in range(32 - off)}
@@ -834,13 +829,12 @@ def _clock(monkeypatch):
 
 
 def _b1_sweep(monkeypatch, tmp_path, *, verdicts, mesh_heals=False, held_sec=120):
-    """Class B1 after a mesh reset whose tt-smi gave up at its driver wait: chip 31 is off the bus (node
-    present, link down) and that reset failed on exactly it, so the climb skips the sweep's mesh reset
-    and runs the SBR this hold owes. The SBR brings chip 31 back, but the chips tt-smi found never got
-    POST_RESET: chips 0-3 read ARC-not-ready (missing from the heartbeat read, ENODATA on a bound
-    endpoint whose config reads back, as :func:`arc_not_ready_chips` reads them). ``mesh_heals``: a mesh
-    reset after the SBR brings them up. Returns (order, events, counters, reasons): ``events`` holds
-    (name, fields), ``reasons`` each power cycle's reason."""
+    """Class B1 after a mesh reset whose tt-smi gave up at its driver wait: chip 31 is off the bus (node present, link
+    down) and that reset failed on exactly it, so the climb skips the sweep's mesh reset and runs the SBR this hold
+    owes. The SBR brings chip 31 back, but the chips tt-smi found never got POST_RESET: chips 0-3 read ARC-not-ready
+    (missing from the heartbeat read, ENODATA on a bound endpoint whose config reads back, as
+    :func:`arc_not_ready_chips` reads them). ``mesh_heals``: a mesh reset after the SBR brings them up. Returns (order,
+    events, counters, reasons): ``events`` holds (name, fields), ``reasons`` each power cycle's reason."""
     order, _names, counters = _rig(
         monkeypatch, tmp_path, held_min=held_sec / 60, enumerated=True, sbr_heals=True, verdicts=verdicts
     )
@@ -881,10 +875,9 @@ def _i97(events) -> list:
 async def test_an_sbr_that_has_every_chip_back_on_arc_not_ready_chips_gets_one_mesh_reset_first(
     monkeypatch, tmp_path, clear_job_state, verdict
 ):
-    """The SBR brings chip 31 back and the full check fails on the chips left ARC-not-ready. One mesh
-    reset of the now-whole mesh and the full check with fabric run before the power cycle: only that
-    check passing lifts the hold. A failed one requests the power cycle in the same pass, its reason read
-    from the bus as it is now."""
+    """The SBR brings chip 31 back and the full check fails on the chips left ARC-not-ready. One mesh reset of the
+    now-whole mesh and the full check with fabric run before the power cycle: only that check passing lifts the hold. A
+    failed one requests the power cycle in the same pass, its reason read from the bus as it is now."""
     order, events, counters, reasons = _b1_sweep(monkeypatch, tmp_path, verdicts=[False, verdict], mesh_heals=verdict)
     await srv.galaxy_recovery.escalate("offbus-forced", [GONE], 32, lambda m: None)
     sbr = f"sbr ['{GONE}']"
@@ -991,10 +984,9 @@ async def test_the_repeated_mesh_reset_runs_at_once_under_the_deadline_or_one_fr
 async def test_the_i97_reset_keeps_its_deadline_and_a_refusal_power_cycles_but_the_repeat_holds(
     monkeypatch, tmp_path, clear_job_state, repeat
 ):
-    """I97's own reset, past the latest start its deadline allows, does not run, and a refused one
-    returns False: the caller power-cycles. The sweep's repeat at that age runs under a deadline from its
-    start, and its failed check returns False; refused, it returns None: it did not run, so no power
-    cycle. Nothing lifts on either."""
+    """I97's own reset, past the latest start its deadline allows, does not run, and a refused one returns False: the
+    caller power-cycles. The sweep's repeat at that age runs under a deadline from its start, and its failed check
+    returns False; refused, it returns None: it did not run, so no power cycle. Nothing lifts on either."""
     deadline = galaxy._mesh_reset_before_host_rung_deadline_sec()
     order, events, counters, _reasons = _b1_sweep(
         monkeypatch, tmp_path, verdicts=[False], held_sec=deadline - NEEDS + 5
@@ -1020,13 +1012,12 @@ async def test_the_i97_reset_keeps_its_deadline_and_a_refusal_power_cycles_but_t
 async def test_a_deadline_crossed_during_the_sweep_sbr_still_runs_the_repeated_mesh_reset_and_its_check(
     monkeypatch, tmp_path, clear_job_state, reset_sec, gives_up
 ):
-    """The sweep starts 5 s before the latest hold age the I97 deadline allows the repeat, and its SBR
-    takes 20 s. The repeated mesh reset still runs, with a deadline from its own start: a skipped repeat
-    is never read as one that ran and failed, so no power cycle is requested without it. Its full check
-    runs when the reset left the check's allowance, and after a give-up at the driver wait too (I106:
-    the deadline moves on by GAVE_UP_TAIL_SEC). Nothing lifts on a failed check, and the power cycle is
-    requested within the repeat's start plus the reset's and check's 300 s (and the give-up tail), the
-    kill grace and the reap."""
+    """The sweep starts 5 s before the latest hold age the I97 deadline allows the repeat, and its SBR takes 20 s. The
+    repeated mesh reset still runs, with a deadline from its own start: a skipped repeat is never read as one that ran
+    and failed, so no power cycle is requested without it. Its full check runs when the reset left the check's
+    allowance, and after a give-up at the driver wait too (I106: the deadline moves on by GAVE_UP_TAIL_SEC). Nothing
+    lifts on a failed check, and the power cycle is requested within the repeat's start plus the reset's and check's 300
+    s (and the give-up tail), the kill grace and the reap."""
     deadline = galaxy._mesh_reset_before_host_rung_deadline_sec()
     order, events, counters, reasons = _b1_sweep(
         monkeypatch, tmp_path, verdicts=[False, False], held_sec=deadline - NEEDS - 5
@@ -1206,13 +1197,12 @@ async def test_the_gates_i58_skip_reaches_the_power_cycle_only_through_the_sweep
 async def test_the_power_cycle_after_the_mesh_reset_before_the_host_rung_is_requested_by_its_bound(
     monkeypatch, tmp_path, clear_job_state, reset_sec, gives_up, checked
 ):
-    """The reset starts at the latest hold age the deadline allows. In its budget, the full check runs
-    and its failure requests the power cycle. A reset that runs long leaves less than the check's
-    allowance before the deadline, one that runs past the deadline leaves none (a reset is never
-    killed mid-run, I4): no check, the hold stays, the power cycle at once, by the 600 s bound. One
-    whose tt-smi gave up at its driver wait again gets GAVE_UP_TAIL_SEC more (I106): the full check
-    with fabric runs and decides, and its failure requests the power cycle by the repeat's start plus
-    its allowance, that tail, the kill grace and the reap."""
+    """The reset starts at the latest hold age the deadline allows. In its budget, the full check runs and its failure
+    requests the power cycle. A reset that runs long leaves less than the check's allowance before the deadline, one
+    that runs past the deadline leaves none (a reset is never killed mid-run, I4): no check, the hold stays, the power
+    cycle at once, by the 600 s bound. One whose tt-smi gave up at its driver wait again gets GAVE_UP_TAIL_SEC more
+    (I106): the full check with fabric runs and decides, and its failure requests the power cycle by the repeat's start
+    plus its allowance, that tail, the kill grace and the reap."""
     ceiling = galaxy._stuck_hold_ceiling_sec()
     deadline = galaxy._mesh_reset_before_host_rung_deadline_sec()
     order, events, counters, reasons = _b1_sweep(
@@ -1351,10 +1341,9 @@ async def test_a_fabric_check_short_of_the_cabled_links_after_the_mesh_reset_bef
 async def test_a_refused_lift_after_the_mesh_reset_before_the_host_rung_still_power_cycles_by_the_bound(
     monkeypatch, tmp_path, clear_job_state, bound
 ):
-    """The mesh reset heals the chips and the full check passes, but the release funnel refuses the
-    lift (a fabric pass still owed, say): the hold stays, and no power cycle comes on a check that
-    passed. The next pass, before the bound or the bound's own, runs no third mesh reset and requests
-    the power cycle by the bound."""
+    """The mesh reset heals the chips and the full check passes, but the release funnel refuses the lift (a fabric pass
+    still owed, say): the hold stays, and no power cycle comes on a check that passed. The next pass, before the bound
+    or the bound's own, runs no third mesh reset and requests the power cycle by the bound."""
     order, events, counters, reasons = _b1_sweep(monkeypatch, tmp_path, verdicts=[False, True], mesh_heals=True)
     lifts = []
     monkeypatch.setattr(srv, "_clear_device_dirty", lambda **kw: lifts.append(kw["why"]) or False)
@@ -1402,9 +1391,8 @@ async def test_the_mesh_reset_before_the_host_rung_runs_once_per_hold_episode(mo
 async def test_a_whole_tray_off_with_arc_not_ready_chips_still_power_cycles_with_no_reset(
     monkeypatch, tmp_path, clear_job_state, galaxy_trays
 ):
-    """Class A is unchanged (class C has no chip left on the bus: the A/C test above): a whole tray off
-    goes straight to the power cycle, even with chips on the other trays ARC-not-ready. No SBR, no
-    mesh reset of any kind."""
+    """Class A is unchanged (class C has no chip left on the bus: the A/C test above): a whole tray off goes straight to
+    the power cycle, even with chips on the other trays ARC-not-ready. No SBR, no mesh reset of any kind."""
     order, events, counters, _killed = _regressed(monkeypatch, tmp_path, how=None)
     patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
     tray = sorted(galaxy_trays)[-1]

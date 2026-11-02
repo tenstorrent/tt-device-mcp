@@ -65,10 +65,9 @@ def _before_sweep(events: list) -> list:
 async def test_a_chip_the_gate_reset_is_not_reset_again_by_the_escalation_or_the_sweep(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """(a) The gate's round counts: the escalation runs no second SBR round on the chip. The last-chance
-    sweep right before the power cycle still writes it (the full ladder, whatever failed earlier in the
-    hold; here no chip is isolated or removed, so it has no bridge to write), and the hold climbs to the power cycle with the hold kept.
-    """
+    """(a) The gate's round counts: the escalation runs no second SBR round on the chip. The last-chance sweep right
+    before the power cycle still writes it (the full ladder, whatever failed earlier in the hold; here no chip is
+    isolated or removed, so it has no bridge to write), and the hold climbs to the power cycle with the hold kept."""
     order, events, counters = _rig(monkeypatch, tmp_path, opt_in=True, held_min=3)
     _reset_still_off(monkeypatch, order)
     assert await _gate() == OUTCOME_WAITING
@@ -93,8 +92,7 @@ async def test_a_chip_the_gate_reset_is_not_reset_again_by_the_escalation_or_the
 
 @pytest.mark.asyncio
 async def test_the_record_starts_empty_for_each_new_hold(monkeypatch, tmp_path, clear_job_state):
-    """(b) The record is keyed by the hold: after the gate's round, a new hold's escalation SBRs the chip
-    again."""
+    """(b) The record is keyed by the hold: after the gate's round, a new hold's escalation SBRs the chip again."""
     order, events, _counters = _rig(monkeypatch, tmp_path, opt_in=True, held_min=3)
     _reset_still_off(monkeypatch, order)
     await _gate()

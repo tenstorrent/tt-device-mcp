@@ -258,10 +258,9 @@ def _queue(job, tmp_path):
 async def test_a_held_tenant_yields_to_a_verification_job_that_lifts_the_hold(
     monkeypatch, tmp_path, clear_job_state, broker_root, fabric_hold, enum_arc, events
 ):
-    """The whole path: a tenant job held on a fabric-only hold, an operator fabric check queued
-    behind it. The tenant hands the runner back, the check runs through the hold, its pass lifts
-    the hold, and the tenant then dispatches. Without the class the check waited behind the
-    tenant until the hold bound refused it."""
+    """The whole path: a tenant job held on a fabric-only hold, an operator fabric check queued behind it. The tenant
+    hands the runner back, the check runs through the hold, its pass lifts the hold, and the tenant then dispatches.
+    Without the class the check waited behind the tenant until the hold bound refused it."""
     _runner_setup(monkeypatch, tmp_path)
     tenant = _job("201", "echo tenant-ran", peer_uid=1000)
     check = _job("202", f"{broker_root}/fabric-check.sh", peer_uid=0)

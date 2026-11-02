@@ -281,9 +281,8 @@ async def test_a_latched_topology_hold_is_not_lifted_while_the_link_is_still_mis
 
 @pytest.mark.asyncio
 async def test_a_latched_hold_inside_the_post_cycle_cooldown_cycles_the_moment_it_ends(replay, monkeypatch):
-    """The I42-latched hold opens right after a power cycle: its ladder still runs at 10 min, the
-    cooldown refuses the cycle (the only wait allowed past the bound) and the cycle fires on the first
-    tick after the cooldown ends, once."""
+    """The I42-latched hold opens right after a power cycle: its ladder still runs at 10 min, the cooldown refuses the
+    cycle (the only wait allowed past the bound) and the cycle fires on the first tick after the cooldown ends, once."""
     order, g = replay["order"], replay["g"]
     srv.health_monitor.topology_hw_fault = MISMATCH
     cooldown_end = 1800

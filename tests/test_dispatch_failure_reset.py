@@ -43,9 +43,8 @@ class _Logger:
 
 @pytest.fixture
 def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
-    """A 32-chip Galaxy, every chip on the bus, whose fabric pass moves traffic but cannot dispatch.
-    ``bad`` keeps the dispatch failing; the reset records its argv and the verify records whether
-    it ran the fabric pass."""
+    """A 32-chip Galaxy, every chip on the bus, whose fabric pass moves traffic but cannot dispatch. ``bad`` keeps the
+    dispatch failing; the reset records its argv and the verify records whether it ran the fabric pass."""
     st = {"bad": True, "resets": [], "verifies": [], "events": [], "alerts": []}
     for i in range(CHIPS):
         (tmp_path / str(i)).write_text("")

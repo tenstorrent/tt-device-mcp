@@ -405,10 +405,9 @@ def test_the_in_flight_guard_catches_a_hung_jobs_teardown_window(monkeypatch, cl
 
 @pytest.mark.parametrize("status", ["KILLED", "RUNNING", None])
 def test_the_in_flight_guard_catches_a_readopted_jobs_scope_until_it_ends(monkeypatch, clear_job_state, status):
-    """A job re-adopted after a broker restart has no `current_job_id`. A kill or a forced reset
-    marks it KILLED before its scope has wound down; its `readopted_scopes` entry stays until the
-    scope ends. A step in that window would read the device as idle, and post-step's reclaim would
-    SIGTERM the scope's processes mid-teardown."""
+    """A job re-adopted after a broker restart has no `current_job_id`. A kill or a forced reset marks it KILLED before
+    its scope has wound down; its `readopted_scopes` entry stays until the scope ends. A step in that window would read
+    the device as idle, and post-step's reclaim would SIGTERM the scope's processes mid-teardown."""
     _no_holders(monkeypatch)
     _quiet_gate(monkeypatch)
     fsm_healthy(srv)

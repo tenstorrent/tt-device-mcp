@@ -252,9 +252,8 @@ def test_the_app_serves_the_shims_synthetic_socket_host():
 async def test_a_blocking_job_run_reports_progress_through_the_mcp_layer(monkeypatch, tmp_path, clear_job_state):
     """Drives the tool over a real MCP session so the SDK has to inject the `Context`.
 
-    job_run/job_wait are the only tools taking one, and calling them directly skips the
-    injection entirely. `ctx.info` is deprecated (MCP SEP 2577), so this fails on its removal.
-    """
+    job_run/job_wait are the only tools taking one, and calling them directly skips the injection entirely. `ctx.info`
+    is deprecated (MCP SEP 2577), so this fails on its removal."""
     from mcp.client import Client
 
     import tt_device_mcp.server as srv

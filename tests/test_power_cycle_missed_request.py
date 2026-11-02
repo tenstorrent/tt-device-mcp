@@ -132,9 +132,8 @@ def test_no_retry_while_the_earlier_request_is_still_pending(cool):  # noqa: F81
 
 
 def test_a_late_cycle_before_the_retry_is_never_cycled_again_on_top(cool):  # noqa: F811
-    """The retry's boot check: the host went down a minute after the window (a slow cycler). On the
-    boot it brought up that request is a cycle that ran, so no second cycle follows before the
-    cooldown it anchors ends."""
+    """The retry's boot check: the host went down a minute after the window (a slow cycler). On the boot it brought up
+    that request is a cycle that ran, so no second cycle follows before the cooldown it anchors ends."""
     m = cool["g"].mechanism
     _request(cool, T0)
     _window_ends(cool, T0 + WINDOW)
@@ -223,11 +222,10 @@ def test_a_cycle_that_took_the_host_down_still_anchors_the_cooldown_and_doubles(
 def test_cycles_that_land_after_their_window_still_double_the_cooldown_and_count_for_the_backstop(
     cool,  # noqa: F811
 ):
-    """The loop guard (spec 04 I65/I72): a slow cycler takes the host down 2 min after each window
-    ran out, so each row was marked missed first. The next boot starts within the window plus the
-    attribution window of it with no other escalation between: it is a cycle that ran (late), on that
-    boot and every later one. The cooldown doubles 30 min, 1 h, 2 h, then 4 h; the backstop and
-    the boot's attribution count it; no miss is paged."""
+    """The loop guard (spec 04 I65/I72): a slow cycler takes the host down 2 min after each window ran out, so each row
+    was marked missed first. The next boot starts within the window plus the attribution window of it with no other
+    escalation between: it is a cycle that ran (late), on that boot and every later one. The cooldown doubles 30 min, 1
+    h, 2 h, then 4 h; the backstop and the boot's attribution count it; no miss is paged."""
     m = cool["g"].mechanism
     at, intervals = T0, []
     for n in range(5):

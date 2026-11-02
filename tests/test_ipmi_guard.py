@@ -556,9 +556,8 @@ async def test_a_plain_tt_smi_override_runs_unguarded(ladder, monkeypatch):
 async def test_an_unclassifiable_override_is_refused_and_the_ladder_climbs_with_the_hold_kept(
     ladder, monkeypatch, override
 ):
-    """Fail closed: an override the guard cannot classify never runs. The rung did not fire (rc None,
-    no cooldown), the ladder climbs, and the hold lifts only after a full check (fabric included)
-    passes after a reset that did run."""
+    """Fail closed: an override the guard cannot classify never runs. The rung did not fire (rc None, no cooldown), the
+    ladder climbs, and the hold lifts only after a full check (fabric included) passes after a reset that did run."""
     rig = ladder
     _launch(monkeypatch, rig, 0, "ok")
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_ARGS", override)

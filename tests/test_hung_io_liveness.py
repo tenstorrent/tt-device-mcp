@@ -26,8 +26,7 @@ from tt_device_mcp import server as srv
 
 
 class _Io:
-    """Stands in for job_io_bytes: one process whose storage counter grows on each sample while
-    ``advancing`` is set."""
+    """Stands in for job_io_bytes: one process whose storage counter grows on each sample while ``advancing`` is set."""
 
     def __init__(self, advancing=True):
         self.advancing = advancing

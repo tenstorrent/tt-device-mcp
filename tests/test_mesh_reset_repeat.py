@@ -180,9 +180,8 @@ async def test_a_first_reset_ending_late_waits_only_to_the_bound(mesh, clock, mo
 async def test_the_sweep_waits_only_on_a_present_mesh_after_this_episodes_reset(
     mesh, clock, monkeypatch, why  # noqa: F811
 ):
-    """A link-short hold (I79/I83: the power cycle at once), a chip off the bus, a BMC guard finding
-    (I91), a first reset from another episode or a spent sweep: no wait, the sweep runs (or skips) at
-    once, as before."""
+    """A link-short hold (I79/I83: the power cycle at once), a chip off the bus, a BMC guard finding (I91), a first
+    reset from another episode or a spent sweep: no wait, the sweep runs (or skips) at once, as before."""
     mesh["reset_heals"] = False
     await _gate()  # the first reset fails; no prior failure, so the gate holds without climbing
     assert len(clock["runs"]) == 1 and srv.fsm.state is ServerState.RECOVERING

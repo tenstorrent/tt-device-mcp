@@ -470,9 +470,8 @@ def test_no_possible_marker_when_no_cycle_can_follow(monkeypatch, provider, logg
 
 
 def test_the_marker_reads_requested_when_the_unit_starts(os_first, monkeypatch):
-    """The fallback unit's start is the last step before the reboot: the marker already says
-    'requested' there, with the trigger's class, chips, reason and hold; with no fresh trigger note
-    it carries the cycle's own reason."""
+    """The fallback unit's start is the last step before the reboot: the marker already says 'requested' there, with the
+    trigger's class, chips, reason and hold; with no fresh trigger note it carries the cycle's own reason."""
     seen, step = [], pc._run_step
 
     def reading(argv, timeout=pc.STEP_TIMEOUT_SEC):
@@ -831,10 +830,9 @@ async def test_a_whole_tray_the_gate_sends_to_the_cycle_is_marked_and_journaled_
 async def test_a_drop_its_class_sends_straight_to_the_cycle_is_marked_and_journaled_with_it(
     escalation, rig, monkeypatch, fault_class, phase  # noqa: F811 - the imported fixture
 ):
-    """Spec 04 I37's direct cycle with the auto power cycle on: class A (tray 1 off) at a post-job
-    pass, class C (every chip off, a mesh reset already failed) at the startup gate. It fires on the
-    hold's first pass, before the gate fills the hold's off-bus set: the markers and the trigger line
-    read the class and the chips that cycle was decided on."""
+    """Spec 04 I37's direct cycle with the auto power cycle on: class A (tray 1 off) at a post-job pass, class C (every
+    chip off, a mesh reset already failed) at the startup gate. It fires on the hold's first pass, before the gate fills
+    the hold's off-bus set: the markers and the trigger line read the class and the chips that cycle was decided on."""
     monkeypatch.setattr(srv, "_auto_power_cycle_host", _real_auto_power_cycle_host)
     written = _broker_context(escalation, monkeypatch)
     off = set(range(EXPECTED)) if fault_class == "all_off" else _off(rig["map"], {1: 8})
@@ -884,8 +882,7 @@ BOOT_NOW = 1_800_000_000.0
 
 @pytest.fixture
 def booted(escalation, monkeypatch, tmp_path):
-    """A ledger whose last row is a power-cycle request from the previous boot, 100 s before this
-    boot started."""
+    """A ledger whose last row is a power-cycle request from the previous boot, 100 s before this boot started."""
     mech = escalation["mech"]
     btime = BOOT_NOW - 200
     monkeypatch.setattr(mech, "_current_boot_id", lambda: "boot-2")
@@ -1696,15 +1693,14 @@ def _children(pid):
 
 @pytest.mark.parametrize("fired", [False, True], ids=["waiting-out-the-bound", "cycle-command-running"])
 def test_hook_stops_the_fallback_and_its_children_before_any_wait(hook, tmp_path, fired):
-    """The fallback, run for real: still waiting out its bound, or past it, as `timeout` with the cycle
-    command as its child. The hook stops it and every process it started before the RAID wait (the
-    stub mdadm sees none of them alive), so no orphan can cut power alongside the hook's own tries.
-    A SIGKILL is delivered at once but the kernel tears the process down after kill(2) returns, so a
-    single look can still see a killed process: the stub waits up to 5 s for the processes to go,
-    while the hook is held in the RAID wait, so only what the hook did before that wait can end them
-    (none of them exits on its own within 60 s).
-    The fallback's `sync &` is a stand-in that outlives the cycle's start: the host's sync may sit
-    uninterruptible in a flush for many seconds, where no SIGKILL ends it, and could never cut power."""
+    """The fallback, run for real: still waiting out its bound, or past it, as `timeout` with the cycle command as its
+    child. The hook stops it and every process it started before the RAID wait (the stub mdadm sees none of them alive),
+    so no orphan can cut power alongside the hook's own tries. A SIGKILL is delivered at once but the kernel tears the
+    process down after kill(2) returns, so a single look can still see a killed process: the stub waits up to 5 s for
+    the processes to go, while the hook is held in the RAID wait, so only what the hook did before that wait can end
+    them (none of them exits on its own within 60 s). The fallback's `sync &` is a stand-in that outlives the cycle's
+    start: the host's sync may sit uninterruptible in a flush for many seconds, where no SIGKILL ends it, and could
+    never cut power."""
     started = [[b"/bin/sleep", b"59"], [b"/bin/sleep", b"60"]]  # the sync stand-in, the cycle command
     pidf, proc = _run_fallback(
         tmp_path, 0 if fired else 300, ["/bin/sleep", "60"], timeout=60, sync="exec /bin/sleep 59"

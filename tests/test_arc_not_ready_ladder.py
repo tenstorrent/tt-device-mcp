@@ -180,8 +180,7 @@ async def test_a_failed_check_after_that_reset_keeps_the_hold_and_the_bound_stil
 
 @pytest.mark.asyncio
 async def test_the_gate_still_holds_a_fabric_wedge_with_every_arc_ticking(monkeypatch, tmp_path, clear_job_state):
-    """(c) Every chip on the bus with a ready ARC, the fabric failing: today's below-floor hold, no
-    reset."""
+    """(c) Every chip on the bus with a ready ARC, the fabric failing: today's below-floor hold, no reset."""
     fabric_bad = (
         False,
         {

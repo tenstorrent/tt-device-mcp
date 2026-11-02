@@ -193,10 +193,9 @@ async def test_an_idle_whole_tray_hold_cycles_with_no_reset(rig, monkeypatch, ph
 async def test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_tenant(
     rig, monkeypatch, phase, blocker, cycled
 ):
-    """A class A cycle is never held by an unreadable holder scan or by a holder outside every broker
-    job scope (spec 04 I103), before or at the deadline; a running job or a broker job's holder still
-    holds it. Nothing is released here: the boot after the cycle runs the startup gate's
-    full check, fabric included (03 I4)."""
+    """A class A cycle is never held by an unreadable holder scan or by a holder outside every broker job scope (spec 04
+    I103), before or at the deadline; a running job or a broker job's holder still holds it. Nothing is released here:
+    the boot after the cycle runs the startup gate's full check, fabric included (03 I4)."""
     rig["scan"] = HolderScan(holders=[], complete=False)
     if blocker == "job_running":
         monkeypatch.setattr(rig["g"].deps, "job_running", lambda: True)

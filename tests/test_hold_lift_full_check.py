@@ -380,11 +380,10 @@ async def test_a_post_job_wrapper_pass_with_a_port_missing_holds_and_admits_no_j
 
 @pytest.mark.asyncio
 async def test_a_kill_reset_whose_full_check_still_finds_the_port_missing_never_releases(wrapper, monkeypatch):
-    """(b) A job the broker stopped mid-run owes one reset (spec 03 I69): the kill mesh reset runs
-    glx_reset, and the full check after it still finds the cabled port missing. That is
-    reset_ineffective: the hold stays and no second reset runs at the door. At the 10-min bound (spec 04
-    I76) the ladder runs once more, its full check fails the same way, and the broker asks for exactly
-    one power cycle. Nothing releases the device at any step."""
+    """(b) A job the broker stopped mid-run owes one reset (spec 03 I69): the kill mesh reset runs glx_reset, and the
+    full check after it still finds the cabled port missing. That is reset_ineffective: the hold stays and no second
+    reset runs at the door. At the 10-min bound (spec 04 I76) the ladder runs once more, its full check fails the same
+    way, and the broker asks for exactly one power cycle. Nothing releases the device at any step."""
     wrapper["reset_heals"] = False
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = _stub_power_cycle(monkeypatch)
@@ -408,11 +407,10 @@ async def test_a_kill_reset_whose_full_check_still_finds_the_port_missing_never_
 async def test_a_latched_topology_hold_whose_bound_ladder_leaves_the_port_missing_power_cycles_once(
     wrapper, monkeypatch
 ):
-    """(c) The lift's first job failed on the fabric, so the I42 latch (``topology_hw_fault``) is set and
-    the device is held. At the 10-min bound (spec 04 I76) the ladder runs, the full check after each
-    reset still finds the cabled port missing, and the broker asks for exactly one power cycle. A second
-    bound tick adds no reset, check or cycle. The bound keeps the latch (it clears only
-    ``fabric_known_fault``) and nothing releases the device."""
+    """(c) The lift's first job failed on the fabric, so the I42 latch (``topology_hw_fault``) is set and the device is
+    held. At the 10-min bound (spec 04 I76) the ladder runs, the full check after each reset still finds the cabled port
+    missing, and the broker asks for exactly one power cycle. A second bound tick adds no reset, check or cycle. The
+    bound keeps the latch (it clears only ``fabric_known_fault``) and nothing releases the device."""
     mon = srv.health_monitor
     wrapper["reset_heals"] = False
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")

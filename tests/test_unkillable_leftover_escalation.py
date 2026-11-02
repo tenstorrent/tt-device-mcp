@@ -374,14 +374,13 @@ async def _bound(both):
 @pytest.mark.parametrize("outcome", ["launched", "timed-out"])
 @pytest.mark.parametrize("order", ["bound-first", "leftover-first", "leftover-try-spawned-before-the-bound"])
 async def test_replay_the_bound_and_the_leftover_budget_request_one_power_cycle(fence, both, order, outcome):
-    """Replay: a killed job's process stuck in the kernel keeps the device; the hold it left reaches
-    the 10-min bound (I76, ``hold_bound_leftover``) as the leftover reaches its 600 s budget (I70).
-    Both paths ask for the host rung, and here both would pick the power cycle. Whichever asks first,
-    and however its cycler launch ends, the cycler is launched once: the request marker (I34) and the
-    governor's ledger stop the other. The last order is the race: a leftover try the sampler spawned
-    before the bound's request, which reaches the device lock after it. A launch that timed out
-    retracts its ledger record but stays pending, so only the marker stops that try. Nothing
-    releases the device: it stays held with the full check, fabric included, owed."""
+    """Replay: a killed job's process stuck in the kernel keeps the device; the hold it left reaches the 10-min bound
+    (I76, ``hold_bound_leftover``) as the leftover reaches its 600 s budget (I70). Both paths ask for the host rung, and
+    here both would pick the power cycle. Whichever asks first, and however its cycler launch ends, the cycler is
+    launched once: the request marker (I34) and the governor's ledger stop the other. The last order is the race: a
+    leftover try the sampler spawned before the bound's request, which reaches the device lock after it. A launch that
+    timed out retracts its ledger record but stays pending, so only the marker stops that try. Nothing releases the
+    device: it stays held with the full check, fabric included, owed."""
     both["outcome"] = outcome
     t0 = _open(fence)
     if order == "bound-first":

@@ -46,13 +46,12 @@ _HEALTHY = '{"status":"ok","held":false,"fsm_state":"healthy","fsm_why":null}'
 def _lap(
     tmp_path, *, now, sha, interval=None, quiet=0, active="active", nrestarts="0", health=_HEALTHY, stand_ins=True
 ):
-    """One lap at fake time `now` that has just resolved `sha`: the already-current check, burst
-        coalescing and the rate limit, then (as if every gate passed) the tail that marks the sha
-        current and restarts. `active`, `nrestarts` and `health` are what systemd and the broker's
-        /health report. `quiet` is TTDEV_APPLY_QUIET_SEC: 0 (coalescing off) for the rate-limit tests
-        here, None for the script's default (tests/test_deploy_autoupdate_coalesce.py). `now=None`: the
-        lap reads the real clock, through the script's own seam. `stand_ins=False`: the real mv and rm,
-    for the tests that pin the rename itself or count the script's own processes."""
+    """One lap at fake time `now` that has just resolved `sha`: the already-current check, burst coalescing and the rate
+    limit, then (as if every gate passed) the tail that marks the sha current and restarts. `active`, `nrestarts` and
+    `health` are what systemd and the broker's /health report. `quiet` is TTDEV_APPLY_QUIET_SEC: 0 (coalescing off) for
+    the rate-limit tests here, None for the script's default (tests/test_deploy_autoupdate_coalesce.py). `now=None`: the
+    lap reads the real clock, through the script's own seam. `stand_ins=False`: the real mv and rm, for the tests that
+    pin the rename itself or count the script's own processes."""
     quoted_health = health.replace("'", "'\\''")  # a /health body may carry single quotes
     text = _SCRIPT.read_text()
     head = _cut(text, "# Read as $(cat) would", "INHIBIT=/run/")
@@ -243,11 +242,10 @@ def test_a_healthy_broker_stays_rate_limited(tmp_path, broker):
 
 
 def _startup_health(tmp_path, monkeypatch, *, op=False, fault=None, dirty=False):
-    """The /health body the broker itself serves right after a start: the real _health_payload()
-    once fsm.boot_merge() has opened RECOVERING(startup_unverified). `op` is the startup gate
-    running (a broker device op); `fault` is a failed startup check holding for its fault; `dirty` is a
-    fault found during the startup check (a dead chip, say), which keeps the why and marks the episode
-    dirty: held for that fault, not for the check."""
+    """The /health body the broker itself serves right after a start: the real _health_payload() once fsm.boot_merge()
+    has opened RECOVERING(startup_unverified). `op` is the startup gate running (a broker device op); `fault` is a
+    failed startup check holding for its fault; `dirty` is a fault found during the startup check (a dead chip, say),
+    which keeps the why and marks the episode dirty: held for that fault, not for the check."""
     f = ServerFsm(tmp_path / "fsm.json")
     monkeypatch.setattr(srv, "fsm", f)
     f.boot_merge(open_episode=None)

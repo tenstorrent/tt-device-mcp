@@ -223,10 +223,9 @@ async def _opted_out_or_denied(monkeypatch, escalations, events, how):
 async def test_an_at_start_ladder_whose_host_rung_never_fired_does_not_stand_in_for_the_bounds_ladder(
     monkeypatch, clear_job_state, hold, how
 ):
-    """The at-start ladder is a forced run below the
-    bound. When the host rung after it was never granted, the full ladder still runs at the 10-min mark,
-    and the later windows follow I76 as for any hold (a ladder each window when the power cycle is opted
-    out; a denied rung stays pending and is asked again each tick)."""
+    """The at-start ladder is a forced run below the bound. When the host rung after it was never granted, the full
+    ladder still runs at the 10-min mark, and the later windows follow I76 as for any hold (a ladder each window when
+    the power cycle is opted out; a denied rung stays pending and is asked again each tick)."""
     escalations, _alerts, events = _arm(monkeypatch, hold)
     await _opted_out_or_denied(monkeypatch, escalations, events, how)
     _ladder(monkeypatch, escalations, OUTCOME_RECOVERED)
@@ -346,11 +345,10 @@ async def test_a_latched_hold_cooling_past_the_ten_minute_mark_waits_only_for_th
 async def test_a_power_cycle_denied_before_the_ten_minute_ladder_waits_for_that_ladders_check(
     monkeypatch, clear_job_state, hold, verdict
 ):
-    """A power cycle denied below the 10-min mark for a reason other than the cooldown arms no retry: the
-    host rung stays pending. The 10-min ladder spends it. The full check after that ladder still waits on
-    the 1G hugepage pool when the denial clears, and no power cycle fires over it: only a failed verdict,
-    or the end of _HOLD_BOUND_CHECK_SEC with no verdict, asks for the cycle; a passing check lifts the
-    hold with none."""
+    """A power cycle denied below the 10-min mark for a reason other than the cooldown arms no retry: the host rung
+    stays pending. The 10-min ladder spends it. The full check after that ladder still waits on the 1G hugepage pool
+    when the denial clears, and no power cycle fires over it: only a failed verdict, or the end of _HOLD_BOUND_CHECK_SEC
+    with no verdict, asks for the cycle; a passing check lifts the hold with none."""
     escalations, _alerts, events = _arm(monkeypatch, hold)
     await _opted_out_or_denied(monkeypatch, escalations, events, "denied")
     clock = _clock(monkeypatch)
@@ -407,10 +405,9 @@ async def test_a_power_cycle_denied_before_the_ten_minute_ladder_waits_for_that_
 async def test_a_retry_after_no_cycle_that_ran_does_not_defer_the_ten_minute_ladder(
     monkeypatch, clear_job_state, hold, why
 ):
-    """Goal of spec 04 I76: only the boot / post-power-cycle cooldown holds past 10 min with no ladder. A
-    power cycle denied for a missed request's backoff, the backstop or the per-boot cap arms a retry at
-    that wait's end, but no cycle ran: the full ladder still runs at the 10-min mark, and the hold lifts
-    only on a passing check after it."""
+    """Goal of spec 04 I76: only the boot / post-power-cycle cooldown holds past 10 min with no ladder. A power cycle
+    denied for a missed request's backoff, the backstop or the per-boot cap arms a retry at that wait's end, but no
+    cycle ran: the full ladder still runs at the 10-min mark, and the hold lifts only on a passing check after it."""
     escalations, _alerts, events = _arm(monkeypatch, hold)
     await _opted_out_or_denied(monkeypatch, escalations, events, "denied")
     clock = _clock(monkeypatch)
@@ -499,11 +496,10 @@ async def test_a_full_check_that_passes_after_the_ladder_asks_for_no_power_cycle
 @pytest.mark.asyncio
 @pytest.mark.parametrize("hold", ["topology mismatch"] + MEASURED)
 async def test_a_check_still_waiting_gets_the_power_cycle_by_the_bound(monkeypatch, clear_job_state, hold):
-    """(d) a full check with no verdict yet (a 77 while the 1G hugepage pool fills) keeps the hold and
-    asks for no cycle while it runs; it has until min(ladder end + _HOLD_BOUND_CHECK_SEC, the 10-min
-    bound), then the host rung. The same window under the I42 latch, whose own bound is one sampler
-    tick: the hold is 1 s old, so the latched one takes the at-start pass, and its ladder takes real hold
-    time, so the latch's bound is long past when it ends."""
+    """(d) a full check with no verdict yet (a 77 while the 1G hugepage pool fills) keeps the hold and asks for no cycle
+    while it runs; it has until min(ladder end + _HOLD_BOUND_CHECK_SEC, the 10-min bound), then the host rung. The same
+    window under the I42 latch, whose own bound is one sampler tick: the hold is 1 s old, so the latched one takes the
+    at-start pass, and its ladder takes real hold time, so the latch's bound is long past when it ends."""
     escalations, _alerts, events = _arm(monkeypatch, hold, age_sec=1)
     monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: True)
     clock = _clock(monkeypatch)
@@ -730,10 +726,9 @@ async def test_the_idle_relift_runs_no_glx_reset_once_the_at_start_pass_ran(monk
 
 @pytest.mark.asyncio
 async def test_an_offbus_hold_under_the_latch_is_not_this_class(monkeypatch, clear_job_state):
-    """(f) the I42 latch does not make an off-bus hold a link-short one: a chip off the bus by heartbeat
-    runs no ladder at hold start (the at-start run reads the heartbeats, declines once and is not spawned
-    again), the off-bus one-shot keeps its time, and an isolated chip (partial off-bus, or a whole tray)
-    is never this class."""
+    """(f) the I42 latch does not make an off-bus hold a link-short one: a chip off the bus by heartbeat runs no ladder
+    at hold start (the at-start run reads the heartbeats, declines once and is not spawned again), the off-bus one-shot
+    keeps its time, and an isolated chip (partial off-bus, or a whole tray) is never this class."""
     escalations, _alerts, events = _arm(monkeypatch, "off-bus", age_sec=1, latched=True)
     monkeypatch.setattr(srv, "_offbus_one_shot_sec", lambda: 60.0)
     _ladder(monkeypatch, escalations, OUTCOME_TERMINAL)

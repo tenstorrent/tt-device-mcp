@@ -311,9 +311,8 @@ async def _noop():
 
 
 def _dead_chip_harness(monkeypatch, holding_scans):
-    """A dead chip with one tenant (pid 4242) mapping it. The tenant stays in the holder scan for
-    ``holding_scans`` scans after the kill (None: for ever). Records the order of kill, scans and
-    endpoint removal, and the journal."""
+    """A dead chip with one tenant (pid 4242) mapping it. The tenant stays in the holder scan for ``holding_scans``
+    scans after the kill (None: for ever). Records the order of kill, scans and endpoint removal, and the journal."""
     srv.device_op_lock = None
     srv.isolated_chips = set()
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
@@ -410,9 +409,8 @@ def _spy_scans(monkeypatch, order, seen):
 
 @pytest.mark.asyncio
 async def test_the_device_is_held_before_the_release_wait_starts(monkeypatch):
-    """Review fix: while a killed holder lingers the fsm is already out of HEALTHY and dirty, so no
-    gate admits the next job, and every reset is fenced until the wait and the stuck-holder check
-    ran (spec 03 I19)."""
+    """Review fix: while a killed holder lingers the fsm is already out of HEALTHY and dirty, so no gate admits the next
+    job, and every reset is fenced until the wait and the stuck-holder check ran (spec 03 I19)."""
     monkeypatch.setattr(srv, "HOLDER_RELEASE_WAIT_SEC", 0.4)
     order, _events = _dead_chip_harness(monkeypatch, holding_scans=None)
     fsm_healthy(srv)

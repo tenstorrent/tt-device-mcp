@@ -114,11 +114,10 @@ def _hw():
 
 @pytest.mark.asyncio
 async def test_b1_replay_one_mesh_reset_heals_an_isolated_chip_inside_the_budget(monkeypatch, clear_job_state):
-    """Replay of a B1 episode: chip 31 fell off and was isolated; the 120 s one-shot's mesh reset
-    re-powers its tray. The rescan at tt-smi's driver wait re-adds it, so that ONE reset exits 0 and
-    the full check, fabric included, passes and releases. Before I81 the reset exited 1 at ~263 s, the
-    post-reset rescan brought the chip back, and the I39 retry's second reset healed it 60 s later:
-    ONE_SHOT + 263 + 60 + 62 = 505 s against a 360 s budget."""
+    """Replay of a B1 episode: chip 31 fell off and was isolated; the 120 s one-shot's mesh reset re-powers its tray.
+    The rescan at tt-smi's driver wait re-adds it, so that ONE reset exits 0 and the full check, fabric included, passes
+    and releases. Before I81 the reset exited 1 at ~263 s, the post-reset rescan brought the chip back, and the I39
+    retry's second reset healed it 60 s later: ONE_SHOT + 263 + 60 + 62 = 505 s against a 360 s budget."""
     clock = [ONE_SHOT]
     counters, events, _ = _episode(monkeypatch, power_cycle=True, clock=clock, off_bus=1)
     hw = _hw()

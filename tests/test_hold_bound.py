@@ -675,11 +675,10 @@ def _bound_hold_with_a_failing_full_check(rig, monkeypatch):  # noqa: F811
 async def test_a_reset_the_holder_scan_refuses_keeps_the_hold_and_the_bound_cycles(
     rig, monkeypatch, clear_job_state, outcome  # noqa: F811
 ):
-    """Spec 04 I92 with I76: the pre-reset scan refuses the bound ladder's mesh reset (a reader that would
-    not let go, an off-bus chip it could not detach, a reader stuck in the kernel, a zombie whose live
-    threads never settled within its wait). No reset runs and none
-    is counted; the hold stays, the full check with fabric still fails, and the broker's own code asks for
-    the power cycle once. Nothing is released and the fabric stays owed."""
+    """Spec 04 I92 with I76: the pre-reset scan refuses the bound ladder's mesh reset (a reader that would not let go,
+    an off-bus chip it could not detach, a reader stuck in the kernel, a zombie whose live threads never settled within
+    its wait). No reset runs and none is counted; the hold stays, the full check with fabric still fails, and the
+    broker's own code asks for the power cycle once. Nothing is released and the fabric stays owed."""
     order, g = rig["order"], rig["g"]
     checks = _bound_hold_with_a_failing_full_check(rig, monkeypatch)
     scans = _scan_refuses_the_mesh_reset(rig, monkeypatch, [_refusing_scan(outcome)])
@@ -860,13 +859,12 @@ async def test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_che
 async def test_replay_a_disproven_lift_hold_gets_the_ladder_and_power_cycle_within_the_class_d_budget(
     rig, monkeypatch, clear_job_state  # noqa: F811
 ):
-    """A Galaxy host's post-job hold: a job's fabric failure after a topology lift sets the I42 latch, the
-    hold takes the ladder, and no idle relift reset ran first (the watchdog path). The latch stands, so the
-    bound applies after one sampler tick, not 600 s (where the ladder started 10 min in and the power
-    cycle came ~14-16 min into the hold, past the old latch's 20 min). Walked tick by tick: on the first
-    tick (spec 04 I83) the full ladder runs, the full check after it (fabric included) fails,
-    the broker asks for the power cycle; the 10-min mark adds no second ladder or cycle while it is
-    pending, and the deadline event reads escalated."""
+    """A Galaxy host's post-job hold: a job's fabric failure after a topology lift sets the I42 latch, the hold takes
+    the ladder, and no idle relift reset ran first (the watchdog path). The latch stands, so the bound applies after one
+    sampler tick, not 600 s (where the ladder started 10 min in and the power cycle came ~14-16 min into the hold, past
+    the old latch's 20 min). Walked tick by tick: on the first tick (spec 04 I83) the full ladder runs, the full check
+    after it (fabric included) fails, the broker asks for the power cycle; the 10-min mark adds no second ladder or
+    cycle while it is pending, and the deadline event reads escalated."""
     order, g = rig["order"], rig["g"]
     mon = srv.health_monitor
     rig["beats"] = {str(i): 100 for i in range(EXPECTED)}
@@ -963,12 +961,11 @@ async def test_replay_post_reset_lift_latch_with_gated_queued_job_runs_the_ladde
 ):
     """The same latch reached from an off-bus hold, with a tenant job parked at the door behind it.
 
-    An off-bus hold is healed by a mesh reset; the post-reset check passes with a topology mismatch and
-    lifts. The first job fails on the fabric and sets the I42 latch, which opens a new hold episode at
-    that job's end. The next tenant job is dequeued and held at the CLEAN-GATE (it opens no device fd).
-    At the bound the watchdog runs the ladder with the latch standing, so the full check fails on the
-    mismatch and the power cycle is asked for once. The gated job never dispatches, and its own bound
-    refuses it."""
+    An off-bus hold is healed by a mesh reset; the post-reset check passes with a topology mismatch and lifts. The first
+    job fails on the fabric and sets the I42 latch, which opens a new hold episode at that job's end. The next tenant
+    job is dequeued and held at the CLEAN-GATE (it opens no device fd). At the bound the watchdog runs the ladder with
+    the latch standing, so the full check fails on the mismatch and the power cycle is asked for once. The gated job
+    never dispatches, and its own bound refuses it."""
     order, g = rig["order"], rig["g"]
     mon = srv.health_monitor
     rig["beats"] = {str(i): 100 for i in range(EXPECTED)}
@@ -1695,10 +1692,9 @@ def _cooldown_governor(r, monkeypatch, until: float):
 async def test_t1_a_77_climb_that_fired_before_the_bound_is_not_driven_again_at_the_bound(
     rig, monkeypatch, clear_job_state  # noqa: F811
 ):
-    """T1: the I79 climb asked for the power cycle below the bound and the request is pending. The bound's
-    tick runs no reset, no sweep and no second power cycle (it journals the suppression), and the relift's
-    own I79 path (escalate("present")) adds nothing either. Held: only the full check after the boot
-    releases it."""
+    """T1: the I79 climb asked for the power cycle below the bound and the request is pending. The bound's tick runs no
+    reset, no sweep and no second power cycle (it journals the suppression), and the relift's own I79 path
+    (escalate("present")) adds nothing either. Held: only the full check after the boot releases it."""
     order, g = rig["order"], rig["g"]
     _77_climb_owed(rig, monkeypatch, fired=True)
     assert not srv._fabric_77_climb_retry_due(), "the fired climb is spent"
@@ -1720,10 +1716,9 @@ async def test_t1_a_77_climb_that_fired_before_the_bound_is_not_driven_again_at_
 async def test_t2_a_cooldown_denied_77_climb_fires_one_power_cycle_whichever_path_runs_first(
     rig, monkeypatch, clear_job_state, first  # noqa: F811
 ):
-    """T2: at the bound the climb is owed and the I65 cooldown denies the power cycle (the retry is
-    armed). When the cooldown ends, the relift's I79 path and the watchdog's I65 retry both may ask:
-    whichever runs first fires the one power cycle and the other sees the pending request. No reset
-    runs either way."""
+    """T2: at the bound the climb is owed and the I65 cooldown denies the power cycle (the retry is armed). When the
+    cooldown ends, the relift's I79 path and the watchdog's I65 retry both may ask: whichever runs first fires the one
+    power cycle and the other sees the pending request. No reset runs either way."""
     order, g = rig["order"], rig["g"]
     _77_climb_owed(rig, monkeypatch)
     until = time.time() + 900
@@ -1918,10 +1913,9 @@ async def test_a_bound_ladder_that_latches_the_pci_wedge_is_not_reported_as_skip
 
 @pytest.mark.asyncio
 async def test_a_skipped_ladders_reason_survives_the_cooldown_retry(monkeypatch, clear_job_state):
-    """A leftover holder skips the bound's ladder and the boot cooldown denies the host rung. The
-    cooldown's retry run takes the host-rung route, which reads no leftover itself: its request still
-    names the skip, never 'the full ladder did not heal it', since no ladder ran. Once a bound ladder
-    runs, the kept skip is spent."""
+    """A leftover holder skips the bound's ladder and the boot cooldown denies the host rung. The cooldown's retry run
+    takes the host-rung route, which reads no leftover itself: its request still names the skip, never 'the full ladder
+    did not heal it', since no ladder ran. Once a bound ladder runs, the kept skip is spent."""
     state, cycles, until = {"cooling": True}, [], datetime.now().timestamp() + 900
     escalations, _events = _bound_hold_with_a_governed_host_rung(monkeypatch, state, cycles, until)
     leftover = {"why": "job 7 pid 42 still holds the device"}

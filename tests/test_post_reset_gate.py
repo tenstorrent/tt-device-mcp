@@ -535,9 +535,8 @@ async def _arc_not_ready_retry(monkeypatch, tmp_path, evidence, released):
 
 @pytest.mark.asyncio
 async def test_a_broker_start_owes_a_fabric_pass_before_any_release(mesh, monkeypatch, tmp_path):
-    """Startup after a boot or a broker restart: the debt is noted before the startup gate, whose
-    own pass (run only once the hugepage pool is ready, tests/test_startup_fabric_hugepages.py)
-    settles it."""
+    """Startup after a boot or a broker restart: the debt is noted before the startup gate, whose own pass (run only
+    once the hugepage pool is ready, tests/test_startup_fabric_hugepages.py) settles it."""
     await _restart_broker(monkeypatch, tmp_path / "fsm.json")
     assert FABRIC_DEBT.owed == "broker start"
     assert srv.fsm.state is not ServerState.HEALTHY

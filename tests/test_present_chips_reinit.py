@@ -63,9 +63,8 @@ async def test_the_chip_back_after_the_reinit_passes_the_check_and_no_power_cycl
 async def test_a_failed_check_after_the_reinit_keeps_the_hold_and_cycles(
     monkeypatch, tmp_path, clear_job_state, reinit_rc
 ):
-    """Every chip is back after the re-init, but the full check fails (a fabric short of the cabled
-    links reads as a fail), or the re-init itself failed: the check still decides, nothing lifts, and
-    the power cycle follows."""
+    """Every chip is back after the re-init, but the full check fails (a fabric short of the cabled links reads as a
+    fail), or the re-init itself failed: the check still decides, nothing lifts, and the power cycle follows."""
     order, events, counters = _late(
         monkeypatch, tmp_path, back=1, reinit_back=True, reinit_rc=reinit_rc, verdicts=[False, False]
     )

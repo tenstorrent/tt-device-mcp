@@ -22,9 +22,8 @@ def _fast(monkeypatch):
 
 @pytest.fixture
 def tmp_path():
-    """A short socket dir: AF_UNIX paths stop at 107 bytes, and a deep pytest basetemp
-    (a long TMPDIR plus an xdist worker dir) passes it, so bind/connect fails with
-    "AF_UNIX path too long" instead of the error under test."""
+    """A short socket dir: AF_UNIX paths stop at 107 bytes, and a deep pytest basetemp (a long TMPDIR plus an xdist
+    worker dir) passes it, so bind/connect fails with "AF_UNIX path too long" instead of the error under test."""
     d = tempfile.mkdtemp(prefix="ttdm-", dir="/tmp")
     yield Path(d)
     shutil.rmtree(d, ignore_errors=True)

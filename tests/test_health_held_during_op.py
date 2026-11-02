@@ -50,10 +50,9 @@ def held(monkeypatch, clear_job_state, tmp_path):
 
 
 def test_health_stays_held_while_a_forced_rung_runs(held, monkeypatch):
-    """/health read held:false, status ok, while the forced glx_reset of a hold ran, then held:true again
-    once it ended. The op inside an open hold episode is the recovery of THAT hold: the device is still
-    refused, and a watcher that reads ``held`` must not see it lifted until the full gate, fabric
-    included, passes."""
+    """/health read held:false, status ok, while the forced glx_reset of a hold ran, then held:true again once it ended.
+    The op inside an open hold episode is the recovery of THAT hold: the device is still refused, and a watcher that
+    reads ``held`` must not see it lifted until the full gate, fabric included, passes."""
     srv._note_tenant_gate_verdict(f"device unverified: {REASON}")
     before = srv._health_payload(now=held + timedelta(seconds=30))
     assert before["held"] is True

@@ -97,10 +97,9 @@ def _restarted_over_a_live_job(monkeypatch, tmp_path):
 async def test_a_live_readopted_job_opens_no_hold_and_nothing_escalates_past_10_min(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """The startup hold over a healthy re-adopted job that runs 25 min opens no hold episode: no clock, no
-    deadline, no forced escalation, no tenant-blocked page. Fails on base: the hold opened at the restart
-    and its clock passed 10 min while the bound's ladder deferred on the running job. The device stays
-    refused to every other job meanwhile: the startup record and the re-adopted scope hold it."""
+    """The startup hold over a healthy re-adopted job that runs 25 min opens no hold episode: no clock, no deadline, no
+    forced escalation, no tenant-blocked page. The device stays refused to every other job meanwhile: the startup record
+    and the re-adopted scope hold it."""
     _restarted_over_a_live_job(monkeypatch, tmp_path)
     seen = _record_events(monkeypatch)
 

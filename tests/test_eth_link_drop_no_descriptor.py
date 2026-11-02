@@ -275,10 +275,9 @@ async def test_a_clean_exit_full_count_releases_without_a_pass(monkeypatch, tmp_
 async def test_the_clean_post_job_gate_holds_a_descriptorless_drop_inside_the_fabric_interval(
     monkeypatch, tmp_path, bad
 ):
-    """Through the broker's gate: a clean exit, a fabric pass fresher than the interval, the real eth
-    read one link short. The gate fails the check and runs no traffic pass: the ladder takes it (its
-    reset here does not heal, so the device stays withheld from the next tenant). A full count
-    releases with no reset."""
+    """Through the broker's gate: a clean exit, a fabric pass fresher than the interval, the real eth read one link
+    short. The gate fails the check and runs no traffic pass: the ladder takes it (its reset here does not heal, so the
+    device stays withheld from the next tenant). A full count releases with no reset."""
     from tests.conftest import patch_recovery
     from tests.test_device_safety import _clean_post_job_gate
 

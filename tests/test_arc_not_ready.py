@@ -244,10 +244,9 @@ def test_dropping_a_returned_chip_never_clears_the_hold(monkeypatch, tmp_path, c
 
 
 def test_unreadable_on_bus_chips_names_bound_eio_chips_only(monkeypatch, tmp_path):
-    """A bound, enumerated chip whose heartbeat read fails with EIO is on the bus (unhealthy) for the
-    class A read; ENODATA has its own path (vendor 0x1e52: ARC not ready; 0xffff: off), and a missing
-    or unbound chip stays off the bus. An ENODATA chip whose config read fails is the one ENODATA
-    shape that joins them (spec 04 I24)."""
+    """A bound, enumerated chip whose heartbeat read fails with EIO is on the bus (unhealthy) for the class A read;
+    ENODATA has its own path (vendor 0x1e52: ARC not ready; 0xffff: off), and a missing or unbound chip stays off the
+    bus. An ENODATA chip whose config read fails is the one ENODATA shape that joins them (spec 04 I24)."""
     _fake_sysfs(
         monkeypatch,
         tmp_path,
@@ -454,9 +453,8 @@ async def test_a_retry_whose_fabric_fails_is_not_a_recovery(monkeypatch, tmp_pat
     ["chip-still-off-bus", "arc-all-ready", "job-running", "tenant-holder", "scan-incomplete", "per-target-reset"],
 )
 async def test_no_retry_outside_the_bus_back_arc_not_ready_idle_shape(monkeypatch, tmp_path, clear_job_state, case):
-    """Every other failed reset keeps the no-repeat rule: a chip still off the bus (a dead endpoint),
-    nothing ARC-not-ready, a running job or a tenant (or a scan that cannot rule one out), or a
-    per-target ``-r``."""
+    """Every other failed reset keeps the no-repeat rule: a chip still off the bus (a dead endpoint), nothing
+    ARC-not-ready, a running job or a tenant (or a scan that cannot rule one out), or a per-target ``-r``."""
     missing = (0,) if case == "chip-still-off-bus" else ()
     not_ready = () if case == "arc-all-ready" else ALL_BUT_0
     g, resets, verifies, events = _mesh_reset_rig(monkeypatch, tmp_path, [(1, not_ready), (0, ())], missing=missing)

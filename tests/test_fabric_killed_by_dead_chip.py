@@ -32,9 +32,8 @@ _MISMATCH = "Connection mismatch detected\nfound 2 missing port/cable connection
 
 @pytest.fixture(params=["wrapper", "built-in"])
 def fab(request, monkeypatch, health_deps):
-    """Both fabric paths: an operator wrapper (its exit code is the verdict, so a bare -9 reads
-    UNHEALTHY) and the built-in validator (its output is classified, here a partial run that already
-    printed bad links)."""
+    """Both fabric paths: an operator wrapper (its exit code is the verdict, so a bare -9 reads UNHEALTHY) and the
+    built-in validator (its output is classified, here a partial run that already printed bad links)."""
     m = HealthMonitor(health_deps)
     state = {"rc": -signal.SIGKILL, "kill": True, "text": _BAD_LINKS}
 

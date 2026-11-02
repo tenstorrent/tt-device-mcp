@@ -556,12 +556,11 @@ def _witness(monkeypatch, *, clean, ok=True, why="", status=None):
 async def _preempt(
     monkeypatch, job_id, command, *, kill_grace, while_running=None, scope_sent=None, contender=_waiting_job
 ):
-    """Run a preemptable job past its 1 s limit with a job waiting, through the minute (1 s here)
-    and the kill, and let the runner reach the post-job gate. ``while_running`` is called once the
-    job runs. ``scope_sent``, a list: the job runs in a live scope (_live_scope) and the list gets
-    the signals sent to it. ``contender`` makes the contention once the job runs (default: a queued
-    job). Returns the job, the signals sent to its group or a pid, the gate's calls and the dirty
-    marks."""
+    """Run a preemptable job past its 1 s limit with a job waiting, through the minute (1 s here) and the kill, and let
+    the runner reach the post-job gate. ``while_running`` is called once the job runs. ``scope_sent``, a list: the job
+    runs in a live scope (_live_scope) and the list gets the signals sent to it. ``contender`` makes the contention once
+    the job runs (default: a queued job). Returns the job, the signals sent to its group or a pid, the gate's calls and
+    the dirty marks."""
     _free_device_lock(monkeypatch)
     _no_workspace_activation(monkeypatch)
     gate = _recording_post_job_gate(monkeypatch)
@@ -617,9 +616,8 @@ async def test_a_preempted_job_that_ends_cleanly_on_sigterm_takes_the_fast_check
 
 @pytest.mark.asyncio
 async def test_a_preempted_job_that_returns_0_on_sigterm_gets_no_check_and_no_reset(monkeypatch, clear_job_state):
-    """Spec 01 I20, case (b) with exit 0: the witness proves every process exited by its own code
-    and the job's own status is 0. Nothing runs before the waiter: no fast check, no full check,
-    no reset."""
+    """Spec 01 I20, case (b) with exit 0: the witness proves every process exited by its own code and the job's own
+    status is 0. Nothing runs before the waiter: no fast check, no full check, no reset."""
     fsm_healthy(srv)
     made = _witness(monkeypatch, clean=True, status=0)
     job, sent, gate, dirty, owed = await _preempt(monkeypatch, "966", "sleep 60", kill_grace=5)
@@ -635,9 +633,8 @@ async def test_a_preempted_job_that_returns_0_on_sigterm_gets_no_check_and_no_re
 @pytest.mark.asyncio
 @pytest.mark.parametrize("held", ["held", "debt"])
 async def test_a_preempted_exit_0_on_a_held_or_owing_device_keeps_its_gate(monkeypatch, clear_job_state, held):
-    """The exit-0 skip never lifts a hold: a device held while the job ran, or owing an I69 reset
-    for another reason, still goes through the post-job gate, where only a passing full check
-    releases it."""
+    """The exit-0 skip never lifts a hold: a device held while the job ran, or owing an I69 reset for another reason,
+    still goes through the post-job gate, where only a passing full check releases it."""
     srv._clear_device_dirty()
     fsm_healthy(srv)
     hold = None
@@ -755,10 +752,9 @@ def _broken_witness(monkeypatch, where):
 async def test_a_witness_error_keeps_the_reset_debt_and_the_kill_completes(
     monkeypatch, clear_job_state, where, ignores_term
 ):
-    """Case (c) by doubt: any unexpected error while witnessing (building it, draining it or
-    reading its verdict or the job's status) makes the end not clean. The I69 debt stays (reset + full check, fabric
-    included, before the waiter) and the kill still runs to the end: SIGTERM, then SIGKILL for a
-    tree that outlives it."""
+    """Case (c) by doubt: any unexpected error while witnessing (building it, draining it or reading its verdict or the
+    job's status) makes the end not clean. The I69 debt stays (reset + full check, fabric included, before the waiter)
+    and the kill still runs to the end: SIGTERM, then SIGKILL for a tree that outlives it."""
     made = _broken_witness(monkeypatch, where)
     command = "trap '' INT TERM; sleep 60" if ignores_term else "sleep 60"
     fsm_healthy(srv)
@@ -937,9 +933,8 @@ def test_the_witness_on_a_real_tree():
 
 
 def test_the_witness_keeps_up_with_a_busy_host_between_polls():
-    """A burst of process events larger than the receive buffer while the caller does not poll
-    (an unprivileged socket holds a few hundred) must not void the witness: a reader thread
-    drains it as events arrive."""
+    """A burst of process events larger than the receive buffer while the caller does not poll (an unprivileged socket
+    holds a few hundred) must not void the witness: a reader thread drains it as events arrive."""
     p = subprocess.Popen(["sleep", "30"], start_new_session=True)
     try:
         w = ExitWitness(p.pid, None)
@@ -967,11 +962,10 @@ def test_the_witness_keeps_up_with_a_busy_host_between_polls():
 
 
 def test_the_witness_fails_safe_in_a_pid_namespace(monkeypatch, tmp_path):
-    """In a PID namespace below the host's (its namespace inode is not the host's fixed one, or
-    NSpid lists more than one pid) the connector's events
-    carry host pids that never match the tree read from the namespace's /proc. The witness says
-    so (ok=False, before any subscription) instead of a misleading "no exit record", and its
-    verdict is "not proven clean" with no exit status, which the broker treats as a killed job."""
+    """In a PID namespace below the host's (its namespace inode is not the host's fixed one, or NSpid lists more than
+    one pid) the connector's events carry host pids that never match the tree read from the namespace's /proc. The
+    witness says so (ok=False, before any subscription) instead of a misleading "no exit record", and its verdict is
+    "not proven clean" with no exit status, which the broker treats as a killed job."""
     real = os.stat
     for ino, want in ((exit_witness._PROC_PID_INIT_INO, False), (0xF00010D0, True)):
 
@@ -1101,11 +1095,10 @@ _HANDLES_TERM = "import signal, sys, time; signal.signal(signal.SIGTERM, lambda 
 async def test_the_real_job_wrapper_reports_a_handled_sigterm_by_the_jobs_own_status(
     monkeypatch, clear_job_state, program, want
 ):
-    """The real job wrapper (its TERM trap is `exit 143`, not overridden here) around a program,
-    preempted within the 10 s grace and judged from the kernel's own exit records. The wrapper's
-    trap runs after the program returns, so the shell exits 143 whatever the program did; the
-    broker reads the job's own status instead. A handled SIGTERM with exit 0 gets no check and no
-    reset."""
+    """The real job wrapper (its TERM trap is `exit 143`, not overridden here) around a program, preempted within the 10
+    s grace and judged from the kernel's own exit records. The wrapper's trap runs after the program returns, so the
+    shell exits 143 whatever the program did; the broker reads the job's own status instead. A handled SIGTERM with exit
+    0 gets no check and no reset."""
     probe = ExitWitness(os.getpgid(0), None)
     probe.close()
     if not probe.ok:
@@ -1230,11 +1223,10 @@ async def test_sigterm_reaches_a_preempted_job_once_never_by_scope_and_group_bot
 
 @pytest.mark.asyncio
 async def test_a_plain_python_handler_that_exits_0_ends_with_0_and_takes_the_skip(monkeypatch, clear_job_state):
-    """Spec 01 I20 exit-0 skip: a job in a live scope whose plain Python SIGTERM handler calls
-    sys.exit(0) gets one SIGTERM, exits 0 (not -15), and takes the skip: no check of any kind and
-    no reset. The witness here reads the job's real end (the test is its parent). Run five times:
-    with SIGTERM sent to the scope and the group both, about one run in three died of the second
-    signal."""
+    """Spec 01 I20 exit-0 skip: a job in a live scope whose plain Python SIGTERM handler calls sys.exit(0) gets one
+    SIGTERM, exits 0 (not -15), and takes the skip: no check of any kind and no reset. The witness here reads the job's
+    real end (the test is its parent). Run five times: with SIGTERM sent to the scope and the group both, about one run
+    in three died of the second signal."""
     fsm_healthy(srv)
     srv._clear_device_dirty()
     monkeypatch.setattr(srv, "PREEMPT_KILL_GRACE_SEC", 5)
@@ -1485,10 +1477,9 @@ async def test_a_readopted_job_whose_waiter_leaves_inside_the_minute_is_left_alo
 @pytest.mark.asyncio
 @pytest.mark.parametrize("rc", ["130", "-2", None])
 async def test_a_preempted_readopted_job_never_releases_the_device_clean(monkeypatch, tmp_path, clear_job_state, rc):
-    """A re-adopted job has no post-job gate: the runner that would have proved the fabric died with
-    the old broker. Whatever its exit status (a job may trap the signal and exit 130 / -2), the
-    device must be flagged for the reset + full check (fabric included) before the queue
-    moves on, whatever the exit status."""
+    """A re-adopted job has no post-job gate: the runner that would have proved the fabric died with the old broker.
+    Whatever its exit status (a job may trap the signal and exit 130 / -2), the device must be flagged for the reset +
+    full check (fabric included) before the queue moves on, whatever the exit status."""
     monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
     monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
     marks = _recording_dirty(monkeypatch)
@@ -1583,10 +1574,9 @@ def test_a_waiter_swap_between_polls_restarts_the_minute(clear_job_state):
 
 @pytest.mark.asyncio
 async def test_a_waiter_after_the_limit_shows_the_countdown_then_sigkills_at_the_minute(monkeypatch, clear_job_state):
-    """Past the limit, nobody waiting: PREEMPTABLE. A job queues: PREEMPTING <s>s counting down in
-    queue status and /health, then the kill one minute after the arrival; a job that ignores
-    SIGTERM is SIGKILLed PREEMPT_KILL_GRACE_SEC later. The device is flagged and the full
-    post-job gate runs."""
+    """Past the limit, nobody waiting: PREEMPTABLE. A job queues: PREEMPTING <s>s counting down in queue status and
+    /health, then the kill one minute after the arrival; a job that ignores SIGTERM is SIGKILLed PREEMPT_KILL_GRACE_SEC
+    later. The device is flagged and the full post-job gate runs."""
     _free_device_lock(monkeypatch)
     _no_workspace_activation(monkeypatch)
     gate = _recording_post_job_gate(monkeypatch)
@@ -1906,11 +1896,10 @@ while True:
 
 @pytest.mark.asyncio
 async def test_a_silent_job_past_its_limit_is_preempted_not_reaped(monkeypatch, tmp_path, clear_job_state):
-    """Past its limit with a job waiting, the preemption owns the stop. The silence reaper must
-    neither signal the job inside its minute nor relabel it hung. The kill ends it PREEMPTED. The
-    job exits 0 through its own SIGTERM handler, so (witness pinned to that verdict, whatever this
-    host's connector allows) it is case (b): no spec 03 I69 reset, only the fast post-job check.
-    Spec 01 I10/I20."""
+    """Past its limit with a job waiting, the preemption owns the stop. The silence reaper must neither signal the job
+    inside its minute nor relabel it hung. The kill ends it PREEMPTED. The job exits 0 through its own SIGTERM handler,
+    so (witness pinned to that verdict, whatever this host's connector allows) it is case (b): no spec 03 I69 reset,
+    only the fast post-job check. Spec 01 I10/I20."""
     import sys
 
     made = _witness(monkeypatch, clean=True)

@@ -299,12 +299,11 @@ def _watchdog_run(cool, monkeypatch):  # noqa: F811
 
 @pytest.mark.asyncio
 async def test_the_watchdog_run_at_the_bound_runs_the_class_a_ladder_once(cool, monkeypatch):  # noqa: F811
-    """End to end through _force_escalate_stuck_hold, the run the watchdog starts: a whole tray off and
-    the cycle in cooldown. Below the bound no forced run reaches the ladder. At the bound the cooldown
-    refuses the cycle, the sweep runs once (SBR, then the mesh reset) and one full check (fabric
-    included) follows; it fails, so the bound asks for the host rung, whose cooldown denial arms the retry at the
-    cooldown's end, where the cycle fires. A later bound window on the same anchor runs no second
-    ladder (spec 04 I73/I76)."""
+    """End to end through _force_escalate_stuck_hold, the run the watchdog starts: a whole tray off and the cycle in
+    cooldown. Below the bound no forced run reaches the ladder. At the bound the cooldown refuses the cycle, the sweep
+    runs once (SBR, then the mesh reset) and one full check (fabric included) follows; it fails, so the bound asks for
+    the host rung, whose cooldown denial arms the retry at the cooldown's end, where the cycle fires. A later bound
+    window on the same anchor runs no second ladder (spec 04 I73/I76)."""
     await _two_cycles_that_do_not_heal(cool)
     m = cool["g"].mechanism
     monkeypatch.setattr(m, "_class_a_ladder_anchor", None)  # the shared mechanism may carry an earlier anchor

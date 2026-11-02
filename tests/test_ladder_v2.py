@@ -26,9 +26,8 @@ async def _async_true(*a, **k):
 
 
 def _ev(**over):
-    """A minimal gate Evidence for the below-floor dispatch tests. Only ``off_bus`` matters to the
-    BELOW_FLOOR rung; everything else takes an inert default so a test names just the field it
-    exercises."""
+    """A minimal gate Evidence for the below-floor dispatch tests. Only ``off_bus`` matters to the BELOW_FLOOR rung;
+    everything else takes an inert default so a test names just the field it exercises."""
     base = dict(
         off_bus=0,
         frozen_chips=0,

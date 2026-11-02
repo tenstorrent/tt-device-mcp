@@ -74,9 +74,8 @@ async def test_a_restart_hours_after_a_cycle_that_never_went_down_cycles_at_once
 
 @pytest.mark.asyncio
 async def test_inside_the_cooldown_the_hold_shows_its_deadline_and_cycles_when_it_ends(cool, monkeypatch):  # noqa: F811
-    """Restart 10 min after the second request: held to its stated end, with the full ladder once in
-    the 10-min hold bound's run (spec 04 I76 with I73); then the watchdog asks once and the cycle
-    fires, whatever the per-boot count."""
+    """Restart 10 min after the second request: held to its stated end, with the full ladder once in the 10-min hold
+    bound's run (spec 04 I76 with I73); then the watchdog asks once and the cycle fires, whatever the per-boot count."""
     # The hold opened at boot B's startup; the restarted broker keeps it (same boot), windows fresh.
     monkeypatch.setattr(srv, "device_hold_episode_since", datetime.fromtimestamp(BOOT_B + 60).isoformat())
     for name in ("device_hold_escalate_bucket", "device_hold_deadline_bucket"):

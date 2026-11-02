@@ -267,10 +267,9 @@ GAVE_UP = "Didn't find all 32 chips in /dev/tenstorrent after 100 seconds, givin
 def _arm_sbr(
     monkeypatch, sysfs: FakeSysfs, *, heals: bool, started=None, hold_sec: float = 0.0, bdfs: dict | None = None
 ) -> list:
-    """Give the process the SBR capability. Each SBR is recorded as (chip, rescans so far), and the
-    startup address it was handed in ``bdfs``; ``heals``: the next rescan brings the chip back.
-    ``started`` (a threading.Event) is set as the write begins, which then takes ``hold_sec``. The
-    fabric and AICLK debts it notes are recorded, not kept."""
+    """Give the process the SBR capability. Each SBR is recorded as (chip, rescans so far), and the startup address it
+    was handed in ``bdfs``; ``heals``: the next rescan brings the chip back. ``started`` (a threading.Event) is set as
+    the write begins, which then takes ``hold_sec``. The fabric and AICLK debts it notes are recorded, not kept."""
     sbrs: list = []
 
     def reset_removed_chip(idx, bdf=None):

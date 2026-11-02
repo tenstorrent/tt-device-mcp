@@ -1171,9 +1171,8 @@ async def test_a_preemption_debt_resets_then_runs_the_full_check_before_release(
 
 @pytest.mark.asyncio
 async def test_a_preemption_debt_whose_full_check_fails_stays_held(mesh):  # noqa: F811
-    """A killed preemption whose full check after the reset fails (the fabric pass moves no
-    traffic) never releases the device to the waiting job: it stays held and goes on to the
-    bounded recovery."""
+    """A killed preemption whose full check after the reset fails (the fabric pass moves no traffic) never releases the
+    device to the waiting job: it stays held and goes on to the bounded recovery."""
     mesh["eth"] = ADVANCING
     mesh["reset_heals"] = False
     fsm_dirty(srv, "job 9 ended preempted (exit -9)")

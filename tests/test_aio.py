@@ -69,10 +69,9 @@ async def test_result_and_exception_pass_through():
 
 
 def test_the_broker_tasks_that_shutdown_cancels_use_aio_wait_for():
-    """The job runner and the startup tasks must end on the shutdown cancel. Every plain
-    asyncio.wait_for in server.py is one more place a cancel can be dropped (the output-dir
-    preflight was one: the runner then ran the job and waited on its queue forever), so only the
-    request handlers and the route-side wait below may keep it."""
+    """The job runner and the startup tasks must end on the shutdown cancel. Every plain asyncio.wait_for in server.py
+    is one more place a cancel can be dropped (the output-dir preflight was one: the runner then ran the job and waited
+    on its queue forever), so only the request handlers and the route-side wait below may keep it."""
     import ast
     from pathlib import Path
 

@@ -132,9 +132,8 @@ def reset_broker_internal_pids():
 
 @pytest.fixture(autouse=True)
 def reset_host_action_state():
-    """Clear the process-wide mechanism's pending host action (spec 04 I34) around every test:
-    escalate() refuses every rung under it, so one a test left behind would stop the next test's
-    ladder."""
+    """Clear the process-wide mechanism's pending host action (spec 04 I34) around every test: escalate() refuses every
+    rung under it, so one a test left behind would stop the next test's ladder."""
 
     def clear():
         m = srv.recovery_mechanism
@@ -242,12 +241,11 @@ def _thread_stat_fields(pid: int, tid: str) -> "list[str] | None":
 
 
 def _exited(pid: int) -> bool:
-    """pid has exited or is exiting (no thread of it can act on a signal any more), or is gone.
-    Once do_exit drops a process's mm its /proc environ is empty and, once its parent exits
-    first, its ppid is init, so it no longer reads as this run's; a SIGKILL to a killed job's
-    group can meet its `sleep` there, mid-exit (PF_EXITING) or a zombie, and init can reap it
-    during these reads. A leader that left its live threads behind also reads 'Z', so every
-    thread counts, listed again after the reads: only a live thread makes a new one."""
+    """pid has exited or is exiting (no thread of it can act on a signal any more), or is gone. Once do_exit drops a
+    process's mm its /proc environ is empty and, once its parent exits first, its ppid is init, so it no longer reads as
+    this run's; a SIGKILL to a killed job's group can meet its `sleep` there, mid-exit (PF_EXITING) or a zombie, and
+    init can reap it during these reads. A leader that left its live threads behind also reads 'Z', so every thread
+    counts, listed again after the reads: only a live thread makes a new one."""
     try:
         tids = os.listdir(f"/proc/{pid}/task")
         for tid in tids:
@@ -281,9 +279,8 @@ class _SignalGuard:
         self.owned = _spawned_by_this_run
 
     def _foreign(self, pids: list) -> list:
-        """The pids that exist and are not this run's. A process (or an ancestor) that exits during
-        the ppid walk breaks it, so a miss is read again; one that is gone, exiting or exited by
-        then is skipped."""
+        """The pids that exist and are not this run's. A process (or an ancestor) that exits during the ppid walk breaks
+        it, so a miss is read again; one that is gone, exiting or exited by then is skipped."""
         return [
             p
             for p in pids
@@ -397,11 +394,10 @@ def device_marked(request) -> bool:
 class _FlatTmpDirs:
     """A fresh empty dir per call, made in one session dir without listing it.
 
-    `tmp_path_factory.mktemp()` lists its whole base dir to pick the next number, so its cost grows
-    with every dir the run has made. The isolation below makes about 20 dirs per test; through
-    `mktemp` that made each test slower than the last (about 1 s each by the end of a CI run, and
-    the job hit its time limit). `tempfile.mkdtemp` picks a random name instead: constant cost.
-    """
+    `tmp_path_factory.mktemp()` lists its whole base dir to pick the next number, so its cost grows with every dir the
+    run has made. The isolation below makes about 20 dirs per test; through `mktemp` that made each test slower than the
+    last (about 1 s each by the end of a CI run, and the job hit its time limit). `tempfile.mkdtemp` picks a random name
+    instead: constant cost."""
 
     def __init__(self, root: Path):
         self._root = root
@@ -1038,21 +1034,18 @@ def _spawn_is_forbidden(argv, allow_device_spawns: bool = False) -> "str | None"
 def _install_spawn_tripwire(monkeypatch, allow_device_spawns: bool = False):
     """Refuse, loudly, any spawn that would reach real hardware or host services.
 
-    The seam is the process-spawn layer rather than each caller, because the callers are spread
-    across the gate, the recovery stages, and the pollers, and a new one must not be able to
-    slip past by being written after this fixture. A test that means to exercise such a path
-    stubs the function that composes the argv and asserts on the argv itself.
+    The seam is the process-spawn layer rather than each caller, because the callers are spread across the gate, the
+    recovery stages, and the pollers, and a new one must not be able to slip past by being written after this fixture. A
+    test that means to exercise such a path stubs the function that composes the argv and asserts on the argv itself.
 
-    `allow_device_spawns` moves _DEVICE_ONLY_SPAWN from refused to permitted for a
-    device-marked test. _NEVER_SPAWN and the mutating systemctl verbs are unaffected by it.
+    `allow_device_spawns` moves _DEVICE_ONLY_SPAWN from refused to permitted for a device-marked test. _NEVER_SPAWN and
+    the mutating systemctl verbs are unaffected by it.
 
-    A read-only systemctl naming a broker job or exec unit (spec 09 I10) is not refused but
-    answered here, marker or not: it runs a stand-in that prints nothing and exits 3 (systemctl's
-    "inactive"), so every caller reads no such unit live and never the host broker's. A test that
-    means a live scope stubs the query (`srv._scope_active`, `srv.list_active_job_scopes`) or
-    `subprocess.run` itself. asyncio's subprocess transport spawns through Popen, so it is
-    answered the same way.
-    """
+    A read-only systemctl naming a broker job or exec unit (spec 09 I10) is not refused but answered here, marker or
+    not: it runs a stand-in that prints nothing and exits 3 (systemctl's "inactive"), so every caller reads no such unit
+    live and never the host broker's. A test that means a live scope stubs the query (`srv._scope_active`,
+    `srv.list_active_job_scopes`) or `subprocess.run` itself. asyncio's subprocess transport spawns through Popen, so it
+    is answered the same way."""
 
     def _refuse(argv, kind):
         reason = _spawn_is_forbidden(argv, allow_device_spawns)
@@ -1096,14 +1089,13 @@ def _reset_server_state():
 def init_async_primitives():
     """Give every test fresh broker job and hold state, and fresh async primitives.
 
-    The queue, lock, runner and stats tasks, the jobs dict and the hold/action rows, hold-episode
-    latches, the hold-escalation buckets, latches and kind, the spec 04 I76 hold-bound latches, the
-    shared recovery mechanism's class-A ladder anchor and kill-reset debt are module globals. Left
-    over, they steer the next test: a queue bound to the previous test's closed loop fails the next
-    lifespan's job runner (which then marks the device dirty and holds it), a hold row one test
-    opened shows up in another's recent-jobs list, and a bound host-rung latch one test set skips
-    the next test's ladder. Everything _reset_for_testing names is reset around every test (spec 09
-    I7); a new global of this kind goes there too. Tasks a test started die with its own loop."""
+    The queue, lock, runner and stats tasks, the jobs dict and the hold/action rows, hold-episode latches, the
+    hold-escalation buckets, latches and kind, the spec 04 I76 hold-bound latches, the shared recovery mechanism's
+    class-A ladder anchor and kill-reset debt are module globals. Left over, they steer the next test: a queue bound to
+    the previous test's closed loop fails the next lifespan's job runner (which then marks the device dirty and holds
+    it), a hold row one test opened shows up in another's recent-jobs list, and a bound host-rung latch one test set
+    skips the next test's ladder. Everything _reset_for_testing names is reset around every test (spec 09 I7); a new
+    global of this kind goes there too. Tasks a test started die with its own loop."""
     _reset_server_state()
     _ensure_async_primitives()
     yield
@@ -1141,11 +1133,10 @@ def clear_job_state(init_async_primitives):
 
 @pytest.fixture
 def health_deps():
-    """A RecoveryDeps wired to tt_device_mcp.server's OWN module globals/functions via lambdas —
-    the same late-bound pattern server.py uses for its own module-level ``recovery_mechanism`` and
-    ``_recovery_deps`` — so a test that monkeypatches e.g. ``srv.health_monitor._board_types`` or
-    ``srv._auto_power_cycle_enabled`` still takes effect through a Recovery (or HealthMonitor) built
-    from this fixture."""
+    """A RecoveryDeps wired to tt_device_mcp.server's OWN module globals/functions via lambdas — the same late-bound
+    pattern server.py uses for its own module-level ``recovery_mechanism`` and ``_recovery_deps`` — so a test that
+    monkeypatches e.g. ``srv.health_monitor._board_types`` or ``srv._auto_power_cycle_enabled`` still takes effect
+    through a Recovery (or HealthMonitor) built from this fixture."""
     return RecoveryDeps(
         current_boot_id=lambda: srv._current_boot_id(),
         boot_btime_id=lambda: srv._boot_btime_id(),
@@ -1238,10 +1229,9 @@ def galaxy_trays(monkeypatch):
 
 
 def stub_device_pollers(monkeypatch, stopped=()) -> list:
-    """Replace the poller stop/start (a real `systemctl stop`, which the spawn tripwire refuses) with
-    a recorder: the per-tray walk quiesces the pollers across its re-powers. ``stopped`` is what the
-    stop reports it touched (empty: nothing to restore). Returns the list of `active` flags it was
-    called with."""
+    """Replace the poller stop/start (a real `systemctl stop`, which the spawn tripwire refuses) with a recorder: the
+    per-tray walk quiesces the pollers across its re-powers. ``stopped`` is what the stop reports it touched (empty:
+    nothing to restore). Returns the list of `active` flags it was called with."""
     calls: list = []
 
     async def pollers(active, log):
@@ -1255,11 +1245,10 @@ def stub_device_pollers(monkeypatch, stopped=()) -> list:
 def step_sampler_clock(monkeypatch) -> None:
     """Put the sampler on a clock that also moves FAST_CONFIRM_SEC before each check_for_dead_chips.
 
-    A chip's first all-ones read arms the early off-bus watch (spec 03 I79), so its second-sample
-    proof must also have lasted FAST_CONFIRM_SEC. A test that shows only the samples that decide
-    would otherwise take them microseconds apart on the real clock; each step stands for the fast
-    samples the cadence takes in between. The clock still follows real time between steps, so the
-    sampler loop's own waits end. Nothing else in the proof is changed."""
+    A chip's first all-ones read arms the early off-bus watch (spec 03 I79), so its second-sample proof must also have
+    lasted FAST_CONFIRM_SEC. A test that shows only the samples that decide would otherwise take them microseconds apart
+    on the real clock; each step stands for the fast samples the cadence takes in between. The clock still follows real
+    time between steps, so the sampler loop's own waits end. Nothing else in the proof is changed."""
     from tt_device_mcp import telemetry
 
     skew = [1000.0]
@@ -1276,12 +1265,11 @@ def step_sampler_clock(monkeypatch) -> None:
 def patch_health_event(monkeypatch, fn) -> None:
     """Patch ``health_event`` everywhere the recovery ladder can call it.
 
-    ``server.py``, ``health.recovery`` (the platform-invariant verify/reset loop), and
-    ``health.recovery.galaxy`` (the escalation ladder) each hold their OWN
-    ``from health.evidence import health_event`` binding — an import copies the reference, so
-    patching one module's copy never touches another's. A test that wants to see (or silence) an
-    event any of these bodies emits has to patch all three, and ``pcie_guard`` (the tray re-power
-    envelope and the tray rung's disable, which the walk reaches), and ``base`` (the re-enumeration rungs)."""
+    ``server.py``, ``health.recovery`` (the platform-invariant verify/reset loop), and ``health.recovery.galaxy`` (the
+    escalation ladder) each hold their OWN ``from health.evidence import health_event`` binding — an import copies the
+    reference, so patching one module's copy never touches another's. A test that wants to see (or silence) an event any
+    of these bodies emits has to patch all three, and ``pcie_guard`` (the tray re-power envelope and the tray rung's
+    disable, which the walk reaches), and ``base`` (the re-enumeration rungs)."""
     monkeypatch.setattr(srv, "health_event", fn)
     monkeypatch.setattr(srv, "health_event_detached", fn)
     monkeypatch.setattr(srv, "health_event_flushed", lambda kind, timeout, **f: fn(kind, **f) or True)

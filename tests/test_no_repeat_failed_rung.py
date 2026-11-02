@@ -658,10 +658,9 @@ def _drop_after_a_verified_reset(monkeypatch, *, off_before=(), present_after=Tr
 async def test_a_reset_that_ran_before_the_drop_does_not_spend_the_offbus_mesh_reset(
     monkeypatch, clear_job_state, restart
 ):
-    """A post-kill mesh reset ran with every chip present and passed its own enum+ARC check; chip 27
-    dropped later, under its fabric check. That reset never faced the drop, so the off-bus ladder runs
-    its own mesh reset first, then the last-chance sweep, then asks for the power cycle (goal: the full
-    ladder right before every power cycle). Fails on base, which skipped the rung as spent."""
+    """A post-kill mesh reset ran with every chip present and passed its own enum+ARC check; chip 27 dropped later,
+    under its fabric check. That reset never faced the drop, so the off-bus ladder runs its own mesh reset first, then
+    the last-chance sweep, then asks for the power cycle (goal: the full ladder right before every power cycle)."""
     seq, events, counters, hold_since, before = _drop_after_a_verified_reset(monkeypatch)
     await srv.galaxy_recovery._note_mesh_reset_failed(False, hold_since, before, EXPECTED)
     entry = srv.recovery_mechanism._reset_record()["failed"][-1]

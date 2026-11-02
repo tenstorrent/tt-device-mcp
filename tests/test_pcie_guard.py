@@ -336,10 +336,9 @@ def _watch_dir_fsyncs(monkeypatch) -> list:
 async def test_a_sweep_that_fails_its_verify_leaves_no_intent_for_the_power_cycle(
     sysfs, monkeypatch, tmp_path, clear_job_state
 ):
-    """The last-chance sweep, its failed verify, then the broker's own power cycle: when the cycle's
-    command runs, the intent is gone AND that unlink reached the disk (the directory was fsynced after
-    it). An unlink still in the page cache is undone by the power loss, and the next boot latched the
-    broker's own cycle as a host hang (spec 04 I25)."""
+    """The last-chance sweep, its failed verify, then the broker's own power cycle: when the cycle's command runs, the
+    intent is gone AND that unlink reached the disk (the directory was fsynced after it). An unlink still in the page
+    cache is undone by the power loss, and the next boot latched the broker's own cycle as a host hang (spec 04 I25)."""
     _boot(sysfs, "boot-a")
     monkeypatch.setattr(srv, "job_log_dir", tmp_path)
     g = srv.galaxy_recovery

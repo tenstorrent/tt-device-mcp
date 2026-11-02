@@ -221,10 +221,9 @@ def test_a_silent_reset_stream_sends_keepalives_when_asked(monkeypatch, tmp_path
 
 @pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
 def test_a_client_that_leaves_a_silent_reset_does_not_stop_it(monkeypatch, tmp_path, spec_version):
-    """The CLI can go away (Ctrl-C, a dropped socket) while the keepalive wrapper waits on
-    a reset step. The reset must still run to the end, the step must be closed, not left
-    pending, and cleanup must not race it ("already running") or drop it ("destroyed").
-    Starlette has two disconnect paths: under ASGI 2.3 (uvicorn) a cancel scope cancels the
+    """The CLI can go away (Ctrl-C, a dropped socket) while the keepalive wrapper waits on a reset step. The reset must
+    still run to the end, the step must be closed, not left pending, and cleanup must not race it ("already running") or
+    drop it ("destroyed"). Starlette has two disconnect paths: under ASGI 2.3 (uvicorn) a cancel scope cancels the
     stream; under 2.4 the send fails and the wrapper is left for the loop to finalize."""
     (tmp_path / "0").write_text("")
     monkeypatch.setattr(srv, "RESET_STREAM_KEEPALIVE_SEC", 0.02)
@@ -736,9 +735,8 @@ class _Calls(list):
 
 
 def _verify_seam(monkeypatch, fabric_ok):
-    """Fake the probe pass: heartbeat + snapshot pass, the fabric (when asked for) returns
-    ``fabric_ok``. Records the ``run_fabric`` each pass asked for, and on ``.expected`` the chip
-    count it verified against."""
+    """Fake the probe pass: heartbeat + snapshot pass, the fabric (when asked for) returns ``fabric_ok``. Records the
+    ``run_fabric`` each pass asked for, and on ``.expected`` the chip count it verified against."""
     calls = _Calls()
 
     async def verify(expected, log, *, run_fabric=True, phase="verify_device"):

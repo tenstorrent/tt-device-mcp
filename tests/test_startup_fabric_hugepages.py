@@ -83,10 +83,9 @@ def test_hugepages_shortfall_is_none_with_no_function_on_the_bus(tmp_path, monke
 
 
 def test_hugepages_shortfall_counts_pci_functions_not_chips(tmp_path, monkeypatch):
-    """UMD pins one 1G page per PCI function, and the vendor setup allocates per function. A card
-    with two chips behind one function (n300, T3K) needs one page, not two: keyed on the chip
-    count, a pool sized per function never reads full, and the startup pass and the relift wait
-    on it forever."""
+    """UMD pins one 1G page per PCI function, and the vendor setup allocates per function. A card with two chips behind
+    one function (n300, T3K) needs one page, not two: keyed on the chip count, a pool sized per function never reads
+    full, and the startup pass and the relift wait on it forever."""
     _fake_bus(tmp_path, monkeypatch, iommu_type="identity", nr="4", n_chips=4)
     monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "8")
     assert hostpci.hugepages_shortfall() is None
@@ -141,8 +140,7 @@ def test_override_reason_finds_a_filesystem_error():
 
 
 def test_override_reason_falls_back_to_the_wrappers_final_line():
-    """The wrapper prints its verdict, reason included, on the final line; blank lines after it
-    must not hide it."""
+    """The wrapper prints its verdict, reason included, on the final line; blank lines after it must not hide it."""
     text = "fabric-check: banner\nfabric-check: validator did not complete (rc=1): last output: x\n\n"
     assert (
         health_monitor_mod._override_reason(text) == "fabric-check: validator did not complete (rc=1): last output: x"
@@ -174,8 +172,7 @@ async def test_a_skipped_fabric_run_keeps_its_output_in_the_action_log(monkeypat
 
 @pytest.mark.asyncio
 async def test_a_failed_fabric_run_keeps_its_full_output_in_the_action_log(monkeypatch, tmp_path, clear_job_state):
-    """The validator names the cause near the head of a long run and the verdict at its tail: the row
-    keeps both. Fails on base, which kept only the last 8000 chars and lost the first error line."""
+    """The validator names the cause near the head of a long run and the verdict at its tail: the row keeps both."""
     monkeypatch.setattr(srv, "job_log_dir", tmp_path)
     monkeypatch.setattr(srv, "jobs", {})
     monkeypatch.setattr(srv, "_action_row", None, raising=False)
@@ -199,10 +196,9 @@ async def test_a_failed_fabric_run_keeps_its_full_output_in_the_action_log(monke
 async def test_a_77_run_keeps_its_stderr_tail_and_exit_code_in_an_incident_bundle(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """A 77 that aborted before any link test named its cause only on stderr, and nothing kept it:
-    the cause took a rerun to read. Its tail and exit code now go to an incident bundle the detail
-    names; a rerun with the same reason reuses that bundle instead of rotating others out. Fails on
-    base, which wrote no bundle."""
+    """A 77 that aborted before any link test named its cause only on stderr, and nothing kept it: the cause took a
+    rerun to read. Its tail and exit code now go to an incident bundle the detail names; a rerun with the same reason
+    reuses that bundle instead of rotating others out."""
     monkeypatch.setattr(srv, "job_log_dir", tmp_path / "jobs")
     monkeypatch.setattr(srv, "jobs", {})
     monkeypatch.setattr(srv, "_action_row", None, raising=False)
@@ -885,8 +881,7 @@ def test_a_77_with_eth_links_down_is_forced_past_the_hold_deadline(monkeypatch, 
 
 @pytest.mark.asyncio
 async def test_a_77_with_eth_links_full_keeps_the_backoff(monkeypatch, tmp_path, clear_job_state):
-    """256 of 256: a 77 is still a missing verdict. The relift waits for its I48 backoff step and
-    never resets."""
+    """256 of 256: a 77 is still a missing verdict. The relift waits for its I48 backoff step and never resets."""
     _hold_77_eth(monkeypatch, tmp_path, drop="", due=False)
     monkeypatch.setattr(srv, "_fabric_77_recheck_due", lambda: False)
     assert srv._fabric_77_only_hold()
@@ -1081,9 +1076,8 @@ async def test_a_validator_crash_77_escalates_on_the_first_relift(monkeypatch, t
 async def test_the_crash_reset_runs_the_full_check_and_releases_only_on_a_pass(
     monkeypatch, tmp_path, clear_job_state, post_reset, released
 ):
-    """The rung fires once the 120 s present-mesh grace has passed, well inside the 5 min budget;
-    full check after every reset: the reset is followed by the full check, fabric included, and only ok=True releases.
-    """
+    """The rung fires once the 120 s present-mesh grace has passed, well inside the 5 min budget; full check after every
+    reset: the reset is followed by the full check, fabric included, and only ok=True releases."""
     since = (datetime.now() - timedelta(seconds=galaxy_mod._present_mesh_reset_grace_sec() + 5)).isoformat()
     assert galaxy_mod._present_mesh_reset_grace_sec() <= 120
     _hold_77_crash(monkeypatch, tmp_path, since=since)
@@ -1610,10 +1604,9 @@ def test_a_latched_hold_whose_77_names_the_mismatch_is_no_77_no_reset_cause(
 async def test_after_an_unknown_reset_the_next_relift_77_reaches_the_bound(
     monkeypatch, tmp_path, clear_job_state, reset_passes, bounded
 ):
-    """Spec 04 I29: a reset whose post-reset fabric stayed a 77 (one pass and one retry) counts those
-    passes toward the episode's I40 bound, so the next relift's 77 reaches it at once and climbs the
-    ladder (never a release on the startup checks, 03 I78). Without them, the same relift is still
-    under the default bound and just holds."""
+    """Spec 04 I29: a reset whose post-reset fabric stayed a 77 (one pass and one retry) counts those passes toward the
+    episode's I40 bound, so the next relift's 77 reaches it at once and climbs the ladder (never a release on the
+    startup checks, 03 I78). Without them, the same relift is still under the default bound and just holds."""
     rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
     monkeypatch.setattr(srv, "FABRIC_77_MAX_RETRIES", 3)
     monkeypatch.setattr(srv, "_fabric_77_streak_since", None)

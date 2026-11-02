@@ -225,9 +225,8 @@ _T0 = 1_700_000_000
 
 
 def _broker(tmp_path, *, running, queue, job_ticks=3, on_sleep="", scope=False, jump=None):
-    """`jump=(a, b)`: a sleep that ends past a s and short of b s ends at b s instead. A long bound
-    then costs a dozen polls, not hundreds, and its exact time in the log still shows any early
-    let-go."""
+    """`jump=(a, b)`: a sleep that ends past a s and short of b s ends at b s instead. A long bound then costs a dozen
+    polls, not hundreds, and its exact time in the log still shows any early let-go."""
     m = tmp_path / "model"
     m.mkdir()
     (m / "running").write_text(str(running))
@@ -281,9 +280,8 @@ def _polls_held(trace):
 
 
 def test_a_running_job_scope_holds_dispatch_and_the_update_applies_when_it_ends(tmp_path):
-    """A ttdev-job scope runs (a long serving job) when an update is pending. No restart
-    until the scope ends, no new job starts meanwhile, and the restart follows the job's end in the
-    same lap, one 5 s poll later at most."""
+    """A ttdev-job scope runs (a long serving job) when an update is pending. No restart until the scope ends, no new
+    job starts meanwhile, and the restart follows the job's end in the same lap, one 5 s poll later at most."""
     done, trace, hold = _drain(tmp_path, running=4, queue=2, scope=True, job_age=300)
     assert done.returncode == 0, done.stderr
     assert "scopes=1" in done.stderr and "draining" in done.stderr, done.stderr
@@ -359,11 +357,10 @@ def _no_restart(done, trace, hold):
 
 
 def test_a_job_past_its_cap_never_gets_a_restart(tmp_path):
-    """A running ttdev-job scope holds the update at any age. The wait under the hold is bounded
-    by the broker's hard job limit (1500 s + 60 s kill grace) from the scope's start; past it the
-    lap releases dispatch and retries on the next lap until the job ends, never a restart (a
-    capped job by the broker's limit kill; a no-timeout-except-on-contention job only by itself
-    or on contention)."""
+    """A running ttdev-job scope holds the update at any age. The wait under the hold is bounded by the broker's hard
+    job limit (1500 s + 60 s kill grace) from the scope's start; past it the lap releases dispatch and retries on the
+    next lap until the job ends, never a restart (a capped job by the broker's limit kill; a
+    no-timeout-except-on-contention job only by itself or on contention)."""
     # Already past the cap: no wait under the hold, and no restart.
     past = tmp_path / "past"
     past.mkdir()
@@ -628,11 +625,10 @@ def _last_hold_epoch(trace):
 
 
 def test_an_op_that_never_ends_at_the_restart_point_is_never_restarted_over(tmp_path):
-    """The broker's own op (live-pid lock, in its cgroup: a restart SIGTERMs it) or a reset scope
-    the broker timed out and left running, never ending at the restart point. The wait ends at
-    OP_CAP, the lap restarts nothing and leaves installed.sha on the old sha, so the next lap
-    redoes the install and restarts once the broker is idle (spec 08 I7, I24). The hold is never
-    rewritten past the bound."""
+    """The broker's own op (live-pid lock, in its cgroup: a restart SIGTERMs it) or a reset scope the broker timed out
+    and left running, never ending at the restart point. The wait ends at OP_CAP, the lap restarts nothing and leaves
+    installed.sha on the old sha, so the next lap redoes the install and restarts once the broker is idle (spec 08 I7,
+    I24). The hold is never rewritten past the bound."""
     for name, lock in (("lock", True), ("scope", False)):
         d = tmp_path / name
         d.mkdir()
@@ -647,9 +643,8 @@ def test_an_op_that_never_ends_at_the_restart_point_is_never_restarted_over(tmp_
 
 
 def test_an_op_with_no_job_holds_dispatch_for_op_cap_not_the_job_cap(tmp_path):
-    """With no job running, a never-ending op keeps the hold for OP_CAP (under the broker's
-    DISPATCH_HOLD_MAX_SEC of 900 s), never for the job cap of 1560 s, before the install and after;
-    either way nothing restarts over it."""
+    """With no job running, a never-ending op keeps the hold for OP_CAP (under the broker's DISPATCH_HOLD_MAX_SEC of 900
+    s), never for the job cap of 1560 s, before the install and after; either way nothing restarts over it."""
     for name, kw in (
         ("drain-lock", {"lock": True, "install": False}),
         ("drain-scope", {"lock": False, "install": False}),
@@ -810,8 +805,7 @@ def test_a_failed_event_write_only_warns(tmp_path):
 
 
 def _recorded_lap(tmp_path, **kw):
-    """The real gate and last look against the model broker; the stub restart records what the
-    event would carry."""
+    """The real gate and last look against the model broker; the stub restart records what the event would carry."""
     rec = tmp_path / "lap"
     on_restart = f'\non_restart() {{ echo "idle=$idle drained_s=$drained_s" > {rec}; }}\n'
     done, trace, _ = _drain(tmp_path, stand_ins=on_restart, **kw)
@@ -875,10 +869,9 @@ def test_a_preemptable_job_before_its_limit_keeps_the_hold_until_the_limit_and_t
 
 @pytest.mark.parametrize("limit_left", [1461, 1480, 5000])
 def test_a_limit_too_far_off_for_the_job_cap_is_never_held_through(tmp_path, limit_left):
-    """limit + 100 s past the job cap: held through, the hold would preempt the job at its limit
-    and still let go at the cap, a kill on a lap that cannot apply. The lap lets go at once, before
-    the limit, so the hold never preempts the job; the model broker SIGTERMs it only under a live
-    hold a minute past its limit, as the broker does."""
+    """limit + 100 s past the job cap: held through, the hold would preempt the job at its limit and still let go at the
+    cap, a kill on a lap that cannot apply. The lap lets go at once, before the limit, so the hold never preempts the
+    job; the model broker SIGTERMs it only under a live hold a minute past its limit, as the broker does."""
     stub, _ = _preemptable(limit_left=limit_left, ends_after=10**9)
     kill = f'read -r t < $M/t; [ -e "$HOLD" ] && [ $t -ge {limit_left + 60} ] && echo "hold-driven kill" >> $M/kills;'
     done, trace, hold = _drain(tmp_path, running=10_000, queue=0, scope=True, job_age=10, stand_ins=stub, on_sleep=kill)

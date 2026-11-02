@@ -32,11 +32,10 @@ _REAL_GATE = pcie_guard.host_reset_gate
 
 
 def _gated(monkeypatch, tmp_path, *, held_sec=600, cmd="/usr/local/sbin/host-power-cycle --now", manual="exit 1"):
-    """An idle off-bus hold the gate refuses to reset, held ``held_sec``, with the power-cycle command
-    set (``cmd=None`` leaves it unset) and a manual-recovery check running ``manual`` (default: a
-    clean "none seen"; ``None`` leaves it unset, and conftest's TTDEV_ROOT has none installed).
-    Returns (hold_since, rec) where rec collects the fake fires (each with the state file as it stood
-    when the command ran), alerts and journal events."""
+    """An idle off-bus hold the gate refuses to reset, held ``held_sec``, with the power-cycle command set (``cmd=None``
+    leaves it unset) and a manual-recovery check running ``manual`` (default: a clean "none seen"; ``None`` leaves it
+    unset, and conftest's TTDEV_ROOT has none installed). Returns (hold_since, rec) where rec collects the fake fires
+    (each with the state file as it stood when the command ran), alerts and journal events."""
     _arm_offbus_stuck_hold(monkeypatch, off_bus=OFF_BUS, isolated=set(), reset_result=False)
     monkeypatch.delenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", raising=False)
     if cmd is None:
@@ -201,8 +200,7 @@ async def test_a_reset_in_its_own_scope_holds(monkeypatch, tmp_path, clear_job_s
     ],
 )
 async def test_anything_objecting_stands_back(monkeypatch, tmp_path, clear_job_state, setup, why):
-    """An operator recovery — and a check that cannot answer — stand back; only exit 1 clears the
-    check."""
+    """An operator recovery — and a check that cannot answer — stand back; only exit 1 clears the check."""
     hold_since, rec = _gated(monkeypatch, tmp_path)
     if setup == "manual_recovery":
         monkeypatch.setenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", _script(tmp_path, "mr", "echo sudo reboot; exit 0"))
@@ -677,8 +675,7 @@ async def test_the_idle_escalation_hands_a_whole_tray_drop_to_the_power_cycle(
 
 
 async def _gate_below_floor(off):
-    """One post-job gate pass at escalate's BELOW_FLOOR with ``off`` off the bus and no bridge window
-    recorded."""
+    """One post-job gate pass at escalate's BELOW_FLOOR with ``off`` off the bus and no bridge window recorded."""
     beats = {str(i): 100 for i in range(32) if i not in off}
     return await srv.galaxy_recovery.escalate(
         "gate/post-job",
@@ -715,9 +712,8 @@ async def test_the_post_job_gate_hands_a_whole_tray_drop_to_the_power_cycle(
 
 @pytest.mark.asyncio
 async def test_an_idle_whole_tray_drop_is_journaled_as_whole_tray(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
-    """The idle escalation journals a whole tray off the bus as its own class
-    (``galaxy_reset_skipped_whole_tray``, fault class ``whole_tray``). The cycle's own journal line names
-    the class and the hand-off."""
+    """The idle escalation journals a whole tray off the bus as its own class (``galaxy_reset_skipped_whole_tray``,
+    fault class ``whole_tray``). The cycle's own journal line names the class and the hand-off."""
     hold_since, rec, counters, state = _below_floor_episode(monkeypatch, tmp_path)
     await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], EXPECTED, lambda m: None, force=True)
     events = dict(rec["events"])
@@ -785,11 +781,10 @@ def _flapping_tray(monkeypatch, state, chip):
 async def test_a_flapping_whole_tray_still_reaches_the_power_cycle(
     monkeypatch, tmp_path, clear_job_state, galaxy_trays, path
 ):
-    """Chip 0 of tray 1 flickers, so each whole-tray read is followed by a partial
-    re-read before the cycle. The re-check holds the cycle back once per episode; the next pass that
-    sees the whole tray off fires at grace 0. Before, every pass cleared the whole-tray clock and held,
-    so the hold never ended (6 forced passes: 0 cycles). No tray step and no reset runs, and the
-    device stays held."""
+    """Chip 0 of tray 1 flickers, so each whole-tray read is followed by a partial re-read before the cycle. The
+    re-check holds the cycle back once per episode; the next pass that sees the whole tray off fires at grace 0. Before,
+    every pass cleared the whole-tray clock and held, so the hold never ended (6 forced passes: 0 cycles). No tray step
+    and no reset runs, and the device stays held."""
     hold_since, rec, counters, state = _below_floor_episode(monkeypatch, tmp_path)
     state["off"] = set(range(8))
     _flapping_tray(monkeypatch, state, 0)

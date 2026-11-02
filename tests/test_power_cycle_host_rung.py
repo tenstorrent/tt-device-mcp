@@ -168,10 +168,9 @@ async def test_a_cycle_that_cannot_launch_os_first_never_reboots_and_holds(monke
 
 @pytest.mark.asyncio
 async def test_two_failed_launches_in_one_episode_page_once_and_retry_each_pass(monkeypatch, clear_job_state):
-    """Spec 04 I71: an unreachable BMC fails every launch. Each pass journals the failure and asks for the
-    cycle again, but the operator is paged once per hold episode, then at most once per
-    CYCLE_LAUNCH_REPAGE_SEC while it keeps failing; a new episode pages again. The hold stays and the
-    fault is never cleared."""
+    """Spec 04 I71: an unreachable BMC fails every launch. Each pass journals the failure and asks for the cycle again,
+    but the operator is paged once per hold episode, then at most once per CYCLE_LAUNCH_REPAGE_SEC while it keeps
+    failing; a new episode pages again. The hold stays and the fault is never cleared."""
     counters = _arm_partial_drop(monkeypatch, 8)
     _deny(monkeypatch)
     cycles = _cycle_never_launches(monkeypatch)

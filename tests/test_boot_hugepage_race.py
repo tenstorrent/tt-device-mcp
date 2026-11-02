@@ -54,9 +54,8 @@ def _clock(monkeypatch):
 
 
 def _race(monkeypatch, tmp_path, *, cable=False):
-    """A carried DOWN fabric hold on a 32-chip broker with the default relift, whose fabric pass
-    77s on the hugepage pool until ``_POOL_READY``, then passes (or, with ``cable``, finds a missing
-    cable)."""
+    """A carried DOWN fabric hold on a 32-chip broker with the default relift, whose fabric pass 77s on the hugepage
+    pool until ``_POOL_READY``, then passes (or, with ``cable``, finds a missing cable)."""
     _events, seen = _broker(monkeypatch, tmp_path, _carried(tmp_path))
     monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_RELIFT", raising=False)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_skipped", False)

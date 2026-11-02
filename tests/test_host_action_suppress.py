@@ -336,10 +336,9 @@ async def test_a_power_cycle_command_that_timed_out_stays_pending(held, monkeypa
 async def test_a_shrinking_offbus_set_gets_no_second_reset_when_the_power_cycle_cannot_fire(
     monkeypatch, clear_job_state, cold_rung
 ):
-    """A reset ran, failed and left chips off the bus; the power cycle is denied by its rate limit or
-    not opted in. A chip came back by the next forced window, but the episode's one mesh reset is spent
-    (spec 04 I87): no later window resets again, and the device stays held for the power cycle or an
-    operator."""
+    """A reset ran, failed and left chips off the bus; the power cycle is denied by its rate limit or not opted in. A
+    chip came back by the next forced window, but the episode's one mesh reset is spent (spec 04 I87): no later window
+    resets again, and the device stays held for the power cycle or an operator."""
     from tests import test_no_repeat_failed_rung as nr
 
     counters, events, _ = nr._episode(monkeypatch, power_cycle=cold_rung == "refused")

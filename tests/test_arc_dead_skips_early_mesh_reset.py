@@ -202,9 +202,8 @@ def _record_handoff(monkeypatch, order):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("why", ["I65 cooldown: a power cycle 300s ago", "backstop reached", "ledger unreadable"])
 async def test_a_denied_power_cycle_keeps_the_early_mesh_reset(monkeypatch, tmp_path, clear_job_state, why):
-    """A power cycle the ledger denies (the I65 cooldown, the backstop, an unreadable ledger) would
-    return from the climb before its sweep: the early mesh reset and its full check run as before,
-    and a failing check lifts nothing."""
+    """A power cycle the ledger denies (the I65 cooldown, the backstop, an unreadable ledger) would return from the
+    climb before its sweep: the early mesh reset and its full check run as before, and a failing check lifts nothing."""
     order, events, counters, _state = _arc_rig(monkeypatch, tmp_path, held_min=1, verdicts=[False])
     _deny_power_cycle(monkeypatch, [(False, why)])
     await _gate_sbr_then_forced_run(order)

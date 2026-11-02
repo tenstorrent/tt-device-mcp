@@ -248,9 +248,8 @@ async def test_the_last_chance_sweep_still_gates_the_power_cycle_of_a_tray_down(
     ],
 )
 async def test_the_prelude_changes_no_ladder_input(rig, monkeypatch, stage, rung):
-    """The ladder sees the caller's own stage, indices, evidence and beats, with or without the
-    prelude: the same call with no onset latched (1.0.0's path) records the same arguments and the
-    same rungs."""
+    """The ladder sees the caller's own stage, indices, evidence and beats, with or without the prelude: the same call
+    with no onset latched (1.0.0's path) records the same arguments and the same rungs."""
     g = rig["g"]
     seen = []
     real = galaxy.GalaxyRecovery._fire_gate_rung

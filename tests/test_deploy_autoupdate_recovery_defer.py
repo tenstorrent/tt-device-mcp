@@ -45,8 +45,7 @@ def _health(held=False, state="healthy", age=None):
 
 
 def _top():
-    """From the decision log through the recovery gate: everything an update lap decides before
-    it touches dispatch."""
+    """From the decision log through the recovery gate: everything an update lap decides before it touches dispatch."""
     text = _SCRIPT.read_text()
     top = text[text.index("# Decision log (spec 08 I22)") : text.index("# Dispatch hold (spec 08 I18")]
     assert top.count("INHIBIT=/run/tt-device-broker/device-op.lock\n") == 1
@@ -59,8 +58,7 @@ def _tail():
 
 
 def _run(tmp_path, body, *, health=(), env=None, pending=None, curl_fails=False, stand_ins=""):
-    """Run `body` under the stand-ins. `health` is the /health answers in call order (the last one
-    repeats)."""
+    """Run `body` under the stand-ins. `health` is the /health answers in call order (the last one repeats)."""
     root = tmp_path / "root"
     root.mkdir(exist_ok=True)
     logs = tmp_path / "logs"
@@ -233,9 +231,8 @@ _RESET_SCOPE = """systemctl() {
 
 
 def test_a_running_reset_scope_always_defers_even_past_the_bound(tmp_path):
-    """A reset step is bounded, so it is waited out with no bound of the updater's own: a restart
-    mid-reset kills the running tt-smi. Holds well past the bound, or no /health at all, change
-    nothing."""
+    """A reset step is bounded, so it is waited out with no bound of the updater's own: a restart mid-reset kills the
+    running tt-smi. Holds well past the bound, or no /health at all, change nothing."""
     stand_ins = _RESET_SCOPE.replace("TRACE", str(tmp_path / "trace"))
     for name, kw in (
         ("held_past_bound", {"health": [_health(held=True, state="recovering", age=99999)]}),
@@ -295,9 +292,8 @@ def _pre_install():
 
 
 def _apply(tmp_path, **kw):
-    """The top gate (healthy at first), the drain and the check before the install, and the
-    restart tail, with the install in between elided. /health is asked once at the top, once
-    before the install and once before the restart."""
+    """The top gate (healthy at first), the drain and the check before the install, and the restart tail, with the
+    install in between elided. /health is asked once at the top, once before the install and once before the restart."""
     body = _top() + _waits() + _pre_install() + 'trap au_exit EXIT\necho "INSTALLED"\n' + _tail()
     return _run(tmp_path, body, **kw)
 
