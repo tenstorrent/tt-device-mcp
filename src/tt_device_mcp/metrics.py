@@ -75,15 +75,16 @@ FAULTS = (
     "gate_error",
     "foreign_holder",
     "probe_unhealthy",
+    "operator_reset_unhealthy",
 )
 
-# constants.STAGE_NAMES, in severity order (0..4) — imported, not copied. It lives in
+# constants.STAGE_NAMES, in severity order (0..2) — imported, not copied. It lives in
 # constants.py rather than the health.recovery.stages package the names actually name: importing
 # THAT package, even one with an empty __init__.py, still runs health/recovery/__init__.py first
 # (Python always executes a parent package before a submodule), which imports this module —
 # reintroducing exactly the metrics<->health cycle this module's own docstring avoids for fsm.
 # GalaxyRecovery.escalate() calls the underlying primitives (reset_chip_via_bridge,
-# reset_with_quiesce, _fire_ubb_reset, RecoveryMechanism._fire_recovery_escalation) directly
+# reset_with_quiesce, RecoveryMechanism._fire_recovery_escalation) directly
 # rather than through a dispatching object, so stage_fired() is wired at THOSE call sites using
 # these same names. See health/recovery/__init__.py, health/recovery/base.py,
 # health/recovery/galaxy.py.
@@ -97,8 +98,8 @@ VERDICTS = ("healthy", "unhealthy", "skipped")
 # writes into HealthState, and probe_observed() is wired into the same methods update() calls
 # (verify_device_health/verify_fabric_health/verify_eth_heartbeat/heartbeat_verdict) so every
 # caller of those — the gate, Recovery._verify_device, and update() itself — is covered from one
-# instrumentation point per probe.
-PROBES = ("hostpci", "heartbeat", "pci", "eth_heartbeat", "fabric")
+# instrumentation point per probe. "aiclk_ceiling" is the opt-in clock-cap step (health/aiclk_ceiling.py).
+PROBES = ("hostpci", "heartbeat", "pci", "aiclk_ceiling", "eth_heartbeat", "fabric")
 
 # The JobStatus values server.Stats.record_job_completion counts. There is no separate
 # "cancelled" outcome in the real code: _kill_job() cancels a QUEUED job by setting the same
@@ -108,7 +109,8 @@ PROBES = ("hostpci", "heartbeat", "pci", "eth_heartbeat", "fabric")
 # the LONGEST device occupancy, so omitting them from busy_seconds_total would make this series
 # read systematically lower than Stats.utilization (which DOES count hung time, via
 # update_device_state), and two disagreeing "utilization" numbers is worse than one.
-OUTCOMES = ("completed", "failed", "killed", "timeout", "hung")
+# "preempted" is counted the same way: a preemptable job stopped because another job was waiting.
+OUTCOMES = ("completed", "failed", "killed", "timeout", "hung", "preempted")
 
 # A stage/action's own firing outcome (independent of whether recovery later verified healthy):
 # "ok" the action ran and completed (rc 0, or a reboot/power-cycle that issued and took the box
@@ -119,10 +121,7 @@ OUTCOMES = ("completed", "failed", "killed", "timeout", "hung")
 # gives this stage no target (no bridge behind a chip that left the bus entirely, no UBB tray
 # concept on a per-target host). The split matters operationally: "blocked" is a policy knob an
 # operator can flip; "not_applicable" is a platform fact that will never change and must not be
-# graphed as if it were an outage. Before this split every stage's structural non-applicability
-# was folded into "blocked" too, which is why a per-target (non-Galaxy) host's ubb_tray series
-# climbed on every single below-floor off-bus drop forever — indistinguishable from an operator
-# leaving a kill-switch off.
+# graphed as if it were an outage.
 STAGE_OUTCOMES = ("ok", "failed", "timeout", "blocked", "not_applicable")
 
 
@@ -145,6 +144,7 @@ def _construct_metrics(registry: CollectorRegistry) -> None:
     global recovery_episode_seconds_total, stages_fired_total, probe_checks_total
     global probe_last_seconds, snapshot_gauges
     global platform_state, fault_state, probe_last_verdict
+    global offbus_operator_deadline_seconds
 
     jobs_total = Counter("tt_device_broker_jobs_total", "Jobs finished, by outcome", ["outcome"], registry=registry)
     # A labeled counter emits nothing until its first increment, so a freshly started broker
@@ -267,6 +267,12 @@ def _construct_metrics(registry: CollectorRegistry) -> None:
             registry=registry,
         ),
     }
+    offbus_operator_deadline_seconds = Gauge(
+        "tt_device_broker_offbus_operator_deadline_seconds",
+        "Unix time an operator must recover a gated off-bus hold by before the broker runs its own "
+        "reset ladder (spec 04 I33); 0 when no hold is handed off",
+        registry=registry,
+    )
     probe_last_seconds = Gauge(
         "tt_device_broker_probe_last_seconds",
         "How long the LAST run of each probe took — the one to alert on as the fabric pass creeps "
@@ -292,6 +298,11 @@ def job_completed(outcome: str) -> None:
     snapshot, busy/free from the occupancy clock — this counts, nothing more."""
     _validate(outcome, OUTCOMES, "job outcome")
     jobs_total.labels(outcome=outcome).inc()
+
+
+def offbus_operator_deadline(epoch: float) -> None:
+    """The gated off-bus hold's operator deadline (spec 04 I33), 0 once no hold is handed off."""
+    offbus_operator_deadline_seconds.set(epoch)
 
 
 def stage_fired(stage: str, outcome: str) -> None:

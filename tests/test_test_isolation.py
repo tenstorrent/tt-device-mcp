@@ -1,0 +1,231 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+"""Spec 09 I7: the autouse per-test reset leaves no broker job, hold, hold-bound or escalation state
+behind, so no test's result depends on the order it runs in or on the xdist worker it lands on."""
+
+from __future__ import annotations
+
+import os
+import resource
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from tests.conftest import _reset_server_state
+from tt_device_mcp import device_holders as dh
+from tt_device_mcp import server as srv
+from tt_device_mcp.health import chip_state
+
+REPO = Path(__file__).resolve().parent.parent
+
+# Each pair failed with its first test run first: the first leaves state the second reads.
+LEAKING_PAIRS = [
+    # The I76 bound's host-rung latch and the escalation kind ('hold_bound_cycle').
+    "tests/test_hold_bound.py::test_a_stuck_hold_event_past_the_bound_never_reads_escalated_false",
+    "tests/test_hold_bound.py::test_a_latched_i42_hold_still_escalates_and_its_latch_stands",
+    # The shared recovery mechanism's class-A 10-min ladder anchor.
+    "tests/test_power_cycle_ac_needed.py::test_the_hold_bound_is_the_one_trigger_of_the_class_a_ladder",
+    "tests/test_power_cycle_ac_needed.py::test_the_full_ladder_runs_at_the_10_min_hold_bound_then_the_cycle",
+    # chip_state's configured present/expected chip sources.
+    "tests/test_chip_state.py::test_the_published_state_is_atomic_and_names_every_expected_chip",
+    "tests/test_chip_state.py::test_a_re_created_node_is_read_at_once_and_a_valid_read_clears_lost",
+    # The I76 bound's ladder-skip reason: a refused kill's skip named the next test's PCI-wedged request.
+    "tests/test_deadchip_refused_bound.py::test_a_refused_holder_gets_the_power_cycle_at_the_bound[tenant]",
+    "tests/test_pci_wedged_latch.py::test_the_wedged_power_cycle_request_names_the_wedge_not_a_failed_ladder",
+]
+
+# Every global the reset owns, with the value a fresh broker process starts with.
+FRESH = {
+    "device_op_stage_started_at": "",
+    "device_held_since": "",
+    "device_hold_escalated_monotonic": 0.0,
+    "device_hold_deadline_bucket": 0,
+    "device_hold_alert_next_bucket": 0,
+    "device_hold_alert_gap": 0,
+    "device_hold_escalate_bucket": 0,
+    "device_hold_offbus_escalated": False,
+    "device_hold_offbus_tenant_wait": False,
+    "device_hold_offbus_idle_early": False,
+    "device_hold_offbus_prior_bucket": None,
+    "device_hold_tenant_deferred": False,
+    "device_hold_job_bound_escalated": False,
+    "device_hold_escalation_trigger": "",
+    "device_hold_escalation_kind": "",
+    "_forced_escalation_task": None,
+    "_host_action_suppressed_logged": None,
+    "exec_scope_seq": 0,
+    "_idle_holder_task": None,
+    "_idle_holder_last_scan": 0.0,
+    "_hold_bound_episode": "",
+    "_hold_bound_ladder_age": None,
+    "_hold_bound_ladder_recovered": False,
+    "_hold_bound_cycle_age": None,
+    "_hold_bound_check_failed_age": None,
+    "_hold_bound_unarmed_paged": "",
+    "_hold_bound_rung_pending": False,
+    "_hold_bound_denied_why": "",
+    "_hold_bound_tenant_paged": "",
+    "_hold_bound_tenant_blocker": None,
+}
+FRESH_SETS = ["reset_killed_job_ids", "request_killed_job_ids", "preempt_forced_job_ids", "_client_gone_kills"]
+
+
+def test_the_per_test_reset_clears_every_hold_bound_and_escalation_global(monkeypatch):
+    """A test that leaves a hold-bound latch, an escalation kind or a class-A ladder anchor set does
+    not hand it to the next test."""
+    for name, fresh in FRESH.items():
+        monkeypatch.setattr(srv, name, "left over" if isinstance(fresh, str) else 7)
+    for name in FRESH_SETS:
+        getattr(srv, name).add("job-1")
+    srv._idle_holders["1234"] = {"left": "over"}
+    srv.reset_killed_causes["job-1"] = "left over"
+    m = srv.recovery_mechanism
+    monkeypatch.setattr(m, "_class_a_ladder_anchor", 1.0)
+    chip_state.configure(present=lambda: ["0"], expected=lambda: 4)
+
+    _reset_server_state()
+
+    assert {name: getattr(srv, name) for name in FRESH} == FRESH
+    assert {name: getattr(srv, name) for name in FRESH_SETS} == {name: set() for name in FRESH_SETS}
+    assert srv._idle_holders == {}
+    assert srv.reset_killed_causes == {}, "spec 01 I70: a recycled job id never reads another's cause"
+    assert m._class_a_ladder_anchor is None
+    chip_state.reset()
+    assert (chip_state._present, chip_state._expected) == (chip_state._sysfs_indices, chip_state._no_baseline)
+
+
+def test_the_autouse_reset_covers_every_hold_bound_record(monkeypatch):
+    """The bound's per-episode records that _reset_for_testing does not own are reset by the autouse
+    fixture's monkeypatch. _hold_bound_sync keeps them while the episode stamp stays the same, and tests
+    share one (none, or a fixed one), so one it misses reaches the next test on the same worker."""
+    reset = {name for obj, name, _old in monkeypatch._setattr if obj is srv} | set(FRESH)
+    records = {n for n in vars(srv) if n.startswith("_hold_bound_") and not callable(getattr(srv, n))}
+    records |= {"_pci_wedged_asked", "_kill_refused_pids", "_kill_refused_job_pid", "_kill_refused_since"}
+    assert records - reset == set()
+
+
+class _HostHoldsTheRealDevice:
+    """``os`` as the holder walk sees it on a device host where this process has the real
+    /dev/tenstorrent/0 open as fd 9: no test may open the real node to set that up."""
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    def listdir(self, path):
+        return ["9"] if path == f"/proc/{os.getpid()}/fd" else os.listdir(path)
+
+    def readlink(self, path):
+        return "/dev/tenstorrent/0" if path == f"/proc/{os.getpid()}/fd/9" else os.readlink(path)
+
+
+def test_a_real_device_holder_on_the_host_is_not_a_holder_in_a_test(monkeypatch):
+    """Spec 09 I1 (holder scan): a real job holding the host's own /dev/tenstorrent does not read as
+    a tenant in an unmarked test. Unsealed, it kept a runner test's job waiting on the holder and
+    blocked a hold-bound test's host rung, only while the host ran device work."""
+    monkeypatch.setattr(dh, "os", _HostHoldsTheRealDevice())
+    monkeypatch.setattr(dh, "_iter_pids", lambda: [os.getpid()])
+    monkeypatch.setattr(srv, "_present_chip_indices", lambda: ["0"])
+
+    assert dh.enumerate_device_holders().holders == []
+    assert srv._tenant_holder_reason() == ""
+
+
+def _descendants(pid: int) -> "list[str]":
+    """Every live process under ``pid`` (any of its threads' children) as 'pid comm'."""
+    todo, found = [pid], []
+    while todo:
+        p = todo.pop()
+        try:
+            tids = os.listdir(f"/proc/{p}/task")
+        except OSError:
+            continue
+        for tid in tids:
+            try:
+                kids = [int(k) for k in Path(f"/proc/{p}/task/{tid}/children").read_text().split()]
+            except OSError:
+                continue
+            for k in kids:
+                try:
+                    found.append(f"{k} {Path(f'/proc/{k}/comm').read_text().strip()}")
+                except OSError:
+                    continue
+                todo.append(k)
+    return found
+
+
+# A whole pytest process: on a loaded host it can outlast the suite's 120 s per-test bound, which
+# would cut it off with no word from the child. Its own bound fires first and shows the child's output.
+@pytest.mark.timeout(300)
+def test_the_leaking_pairs_pass_with_the_leaking_test_first(tmp_path):
+    """The order that failed before the reset covered these globals: each pair's first test runs first,
+    in one process, and both pass."""
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [str(REPO / "src"), os.environ.get("PYTHONPATH")])))
+    # A child that hangs dumps every thread's stack on SIGABRT, so the failure names what held it.
+    env["PYTHONFAULTHANDLER"] = "1"
+    # Its output goes to files and the wait is on the child itself, not on its pipes: a process left
+    # under it cannot hold the wait open. Its stdin is not this worker's (xdist talks over it), and its
+    # temp dirs go under this test's own, away from the run's numbered basetemp dirs.
+    out_path, err_path = tmp_path / "child.out", tmp_path / "child.err"
+    with open(out_path, "w") as out_f, open(err_path, "w") as err_f:
+        child = subprocess.Popen(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", "-p", "no:xdist", "-p", "no:cacheprovider"]
+            + ["--no-device-tests", "-rA", "--durations=5", f"--basetemp={tmp_path / 'child-tmp'}", *LEAKING_PAIRS],
+            cwd=REPO,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=out_f,
+            stderr=err_f,
+            text=True,
+            preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_CORE, (0, 0)),
+        )
+    try:
+        child.wait(timeout=240)
+    except subprocess.TimeoutExpired:
+        below = _descendants(child.pid)
+        os.kill(child.pid, signal.SIGABRT)
+        try:
+            child.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=30)
+        pytest.fail(
+            f"the child pytest ran over 240 s (processes under it: {below}); "
+            f"its output:\n{out_path.read_text()[-3000:]}\n{err_path.read_text()[-6000:]}"
+        )
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+    out = out_path.read_text()
+    passed = [line.split(" ", 1)[1] for line in out.splitlines() if line.startswith("PASSED ")]
+    assert child.returncode == 0 and passed == LEAKING_PAIRS, out[-3000:]
+
+
+def test_the_isolation_dirs_go_in_one_session_dir(isolation_tmp_root, tmp_path_factory):
+    """The ~20 dirs each test's isolation makes land in one session dir, not pytest's base temp
+    dir, whose numbered `mktemp` lists that whole dir on every call (the suite went quadratic)."""
+    from tt_device_mcp.health import evidence
+    from tt_device_mcp.health.monitors import pci
+
+    assert isolation_tmp_root.parent == tmp_path_factory.getbasetemp()
+    for made in (Path(evidence.HEALTH_DIR), Path(pci.SYSFS_CLASS_DIR), Path(srv.TT_DEV_DIR)):
+        assert made.parent == isolation_tmp_root, made
+
+
+def test_making_an_isolation_dir_never_lists_its_root(tmp_path, monkeypatch):
+    """Constant cost per dir however many the run made: no listing of the shared root."""
+    from tests.conftest import _FlatTmpDirs
+
+    def no_listing(*_a, **_k):
+        raise AssertionError("listed the isolation root")
+
+    dirs = _FlatTmpDirs(tmp_path)
+    monkeypatch.setattr(os, "scandir", no_listing)
+    monkeypatch.setattr(os, "listdir", no_listing)
+    monkeypatch.setattr(Path, "iterdir", no_listing)
+    a, b = dirs.mktemp("health"), dirs.mktemp("health")
+    assert a != b and a.is_dir() and b.is_dir() and a.parent == b.parent == tmp_path
