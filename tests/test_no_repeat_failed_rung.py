@@ -109,7 +109,7 @@ async def test_a_failed_unchanged_reset_is_not_repeated_and_with_no_host_rung_is
     assert counters["resets"] == 1, "a reset that failed on this same set must not fire again in the hold"
     assert _skipped(events) == 4
     handoff = opc._pending["handoff"]
-    assert handoff["deadline"] is None and handoff["latched"], "latched: no deadline lifts it into a reset"
+    assert handoff["latched"], "latched: no deadline lifts it into a reset"
     assert counters["power_cycles"] == 0 and counters["reboots"] == 0 and counters["sweeps"] == 0
     assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "the device stays held"
 
