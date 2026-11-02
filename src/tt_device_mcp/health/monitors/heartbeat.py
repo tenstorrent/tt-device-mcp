@@ -42,18 +42,15 @@ def read_heartbeats(
 ) -> dict[str, int]:
     """Per-chip ARC heartbeat counters, keyed by device index.
 
-    Each attribute read is a PCIe read of the chip (the KMD reads the counter from the chip's
-    BAR), so a chip the broker has confirmed lost is not read again until :func:`chip_state.may_read`
-    allows it (spec 03 I66); it reports ALL_ONES, what its last real read said. ``probe_lost`` is for
-    a health check's decision read: each lost chip is read for real once, so a chip that answers
-    again is judged on its answer, not on the mark. ``only``, when given, limits the read to those
-    chips (spec 03 I83: the chips that just failed POST_RESET, and no other). ``unread``, when given,
-    gets every chip reported ALL_ONES without a read (lost or fenced, its re-read not due).
+    Each attribute read is a PCIe read of the chip (the KMD reads the counter from the chip's BAR), so a chip the broker
+    has confirmed lost is not read again until :func:`chip_state.may_read` allows it (spec 03 I66); it reports ALL_ONES,
+    what its last real read said. ``probe_lost`` is for a health check's decision read: each lost chip is read for real
+    once, so a chip that answers again is judged on its answer, not on the mark. ``only``, when given, limits the read
+    to those chips (spec 03 I83: the chips that just failed POST_RESET, and no other). ``unread``, when given, gets
+    every chip reported ALL_ONES without a read (lost or fenced, its re-read not due).
 
-    A chip whose attribute is missing or unreadable is omitted rather than zeroed,
-    so the caller sees it as an absent chip (a real fault) and not as a chip whose
-    counter happens to sit at zero.
-    """
+    A chip whose attribute is missing or unreadable is omitted rather than zeroed, so the caller sees it as an absent
+    chip (a real fault) and not as a chip whose counter happens to sit at zero."""
     beats: dict[str, int] = {}
     try:
         entries = sorted(pci.SYSFS_CLASS_DIR.iterdir())
@@ -103,14 +100,13 @@ def dead_chips(beats: dict[str, int]) -> list[str]:
 
 
 def enodata_presence(beats: dict[str, int]) -> dict[str, str]:
-    """The chips :func:`read_heartbeats` left out of ``beats`` whose heartbeat read fails with ENODATA
-    on an endpoint bound to the driver, each with where it stands by a live read (spec 04 I24):
-    :data:`hostpci.CONFIG_PRESENT` (its link does not read down and its config-space vendor id reads
-    0x1e52 now: on the bus, ARC not ready), :data:`hostpci.CONFIG_MISSING` (link down, or the vendor
-    id reads 0xffff: off the bus) or :data:`hostpci.CONFIG_UNREADABLE` (the config read failed: no
-    evidence either way). tt-kmd answers ENODATA while a chip needs hardware init, after a reset
-    whether it still has power or not, so ENODATA alone proves nothing. Only chips missing from
-    ``beats`` are read: a full read makes no read at all."""
+    """The chips :func:`read_heartbeats` left out of ``beats`` whose heartbeat read fails with ENODATA on an endpoint
+    bound to the driver, each with where it stands by a live read (spec 04 I24): :data:`hostpci.CONFIG_PRESENT` (its
+    link does not read down and its config-space vendor id reads 0x1e52 now: on the bus, ARC not ready),
+    :data:`hostpci.CONFIG_MISSING` (link down, or the vendor id reads 0xffff: off the bus) or
+    :data:`hostpci.CONFIG_UNREADABLE` (the config read failed: no evidence either way). tt-kmd answers ENODATA while a
+    chip needs hardware init, after a reset whether it still has power or not, so ENODATA alone proves nothing. Only
+    chips missing from ``beats`` are read: a full read makes no read at all."""
     try:
         entries = sorted(pci.SYSFS_CLASS_DIR.iterdir())
     except OSError:
@@ -150,38 +146,34 @@ def _enodata_state(idx: str) -> Optional[str]:
 
 
 def arc_not_ready_chips(beats: dict[str, int]) -> set[str]:
-    """Chips :func:`read_heartbeats` left out of ``beats`` that are still ON the bus: the KMD node is
-    there, its PCI endpoint is bound to the driver, its link does not read down, a live read of its
-    config-space vendor id gives 0x1e52, and the heartbeat read fails with ENODATA (the KMD has no ARC
-    telemetry for it yet: ARC not ready, e.g. mid-boot after a reset or re-power). Such a chip is
-    present but not usable. It is unhealthy for the gate, but it is not off the bus, so it never arms
-    an off-bus rung (bridge, tray, gone-chip) nor counts toward a floor (spec 04 I24). Only the chips
-    missing from ``beats`` are re-read; any other error, an endpoint that is gone, unbound or whose
-    link is down, a vendor id of 0xffff, or a config read that fails leaves the chip counted off the
-    bus (the last one is named by :func:`config_unreadable_chips`)."""
+    """Chips :func:`read_heartbeats` left out of ``beats`` that are still ON the bus: the KMD node is there, its PCI
+    endpoint is bound to the driver, its link does not read down, a live read of its config-space vendor id gives
+    0x1e52, and the heartbeat read fails with ENODATA (the KMD has no ARC telemetry for it yet: ARC not ready, e.g.
+    mid-boot after a reset or re-power). Such a chip is present but not usable. It is unhealthy for the gate, but it is
+    not off the bus, so it never arms an off-bus rung (bridge, tray, gone-chip) nor counts toward a floor (spec 04 I24).
+    Only the chips missing from ``beats`` are re-read; any other error, an endpoint that is gone, unbound or whose link
+    is down, a vendor id of 0xffff, or a config read that fails leaves the chip counted off the bus (the last one is
+    named by :func:`config_unreadable_chips`)."""
     return {i for i, s in enodata_presence(beats).items() if s == hostpci.CONFIG_PRESENT}
 
 
 def config_unreadable_chips(beats: dict[str, int]) -> set[str]:
-    """Chips whose heartbeat read gives ENODATA on a bound endpoint with its link up but whose live
-    config read fails (:data:`hostpci.CONFIG_UNREADABLE`): neither ARC-not-ready nor proven gone. The
-    rungs count them off the bus, so the hold stays; only the class A read takes them as on the bus
-    (:func:`unreadable_on_bus_chips`, spec 04 I37)."""
+    """Chips whose heartbeat read gives ENODATA on a bound endpoint with its link up but whose live config read fails
+    (:data:`hostpci.CONFIG_UNREADABLE`): neither ARC-not-ready nor proven gone. The rungs count them off the bus, so the
+    hold stays; only the class A read takes them as on the bus (:func:`unreadable_on_bus_chips`, spec 04 I37)."""
     return {i for i, s in enodata_presence(beats).items() if s == hostpci.CONFIG_UNREADABLE}
 
 
 def unreadable_on_bus_chips(ids) -> set[str]:
-    """Of ``ids``, the chips whose KMD node is there with its PCI endpoint bound to the driver but
-    whose heartbeat read fails with an error other than ENODATA (EIO, or the attribute missing on
-    that node), or with ENODATA while its live config read fails (:func:`config_unreadable_chips`),
-    and whose link does not read as down. :func:`offbus_chip_ids` counts such a chip off
-    the bus; it is enumerated and bound, so it is on the bus but unhealthy. Only the class A read uses
-    this (spec 04 I37): survivors of a whole-tray drop that read like this must not hide the drop's
-    shape. A chip that reads now (a counter or all-ones), or reads ENODATA with its vendor id 0x1e52
-    or 0xffff, is not in it; those have their own handling. Nor is a lingering node whose link is down (speed ``Unknown`` or width 63,
+    """Of ``ids``, the chips whose KMD node is there with its PCI endpoint bound to the driver but whose heartbeat read
+    fails with an error other than ENODATA (EIO, or the attribute missing on that node), or with ENODATA while its live
+    config read fails (:func:`config_unreadable_chips`), and whose link does not read as down. :func:`offbus_chip_ids`
+    counts such a chip off the bus; it is enumerated and bound, so it is on the bus but unhealthy. Only the class A read
+    uses this (spec 04 I37): survivors of a whole-tray drop that read like this must not hide the drop's shape. A chip
+    that reads now (a counter or all-ones), or reads ENODATA with its vendor id 0x1e52 or 0xffff, is not in it; those
+    have their own handling. Nor is a lingering node whose link is down (speed ``Unknown`` or width 63,
     :func:`hostpci.link_down`): spec 03 I9 never counts it back on the bus. A lost or fenced chip
-    (:func:`chip_state.read_blocked`) is not read: it counts as reading all-ones, off the bus (spec 03
-    I97)."""
+    (:func:`chip_state.read_blocked`) is not read: it counts as reading all-ones, off the bus (spec 03 I97)."""
     out: set[str] = set()
     for idx in sorted({str(i) for i in ids}, key=int):
         node = pci.SYSFS_CLASS_DIR / f"tenstorrent!{idx}"
@@ -228,10 +220,9 @@ def offbus_count(
 
 
 def returned_chips(ids) -> list[str]:
-    """Of ``ids``, the chips back on the bus by a fresh sysfs read: the KMD node is there and its
-    heartbeat is a counter that is not all-ones, or it is ARC-not-ready on a bound endpoint. Read
-    after every mesh reset and PCI rescan so a chip that came back leaves
-    ``isolated_chips`` at once, whatever the verify that follows says."""
+    """Of ``ids``, the chips back on the bus by a fresh sysfs read: the KMD node is there and its heartbeat is a counter
+    that is not all-ones, or it is ARC-not-ready on a bound endpoint. Read after every mesh reset and PCI rescan so a
+    chip that came back leaves ``isolated_chips`` at once, whatever the verify that follows says."""
     want = {str(i) for i in ids}
     if not want:
         return []
@@ -263,20 +254,14 @@ def heartbeat_attr_present(ids) -> bool:
 def heartbeat_absence_reason() -> Optional[str]:
     """Why read_heartbeats() came back empty, or None if a heartbeat is exposed.
 
-    read_heartbeats() collapses two opposite conditions to the same empty dict, and
-    the operator's response to each is different:
-      "sysfs_absent" — no tenstorrent class nodes at all: the KMD is not loaded, or
-                       no chip enumerated. At boot, where the device is meant to be
-                       present, this is an alarm, not a tolerable degrade.
-      "attr_absent"  — nodes are present but none expose tt_heartbeat: this KMD
-                       predates the counter. The detector genuinely does not exist
-                       on this host, and falling through to tt-smi is correct.
-      "attr_unreadable" — nodes are present and expose tt_heartbeat, but no read of it
-                       succeeds right now (e.g. every chip left in a bad state by a failed
-                       reset). The driver HAS the counter; the chips are not answering.
-    Returns None as soon as one chip exposes a readable counter — the probe works. A lost or fenced
-    chip (:func:`chip_state.read_blocked`) is not read and never counts as that chip (spec 03 I97).
-    """
+    read_heartbeats() collapses two opposite conditions to the same empty dict, and the operator's response to each is
+    different: "sysfs_absent" — no tenstorrent class nodes at all: the KMD is not loaded, or no chip enumerated. At
+    boot, where the device is meant to be present, this is an alarm, not a tolerable degrade. "attr_absent" — nodes are
+    present but none expose tt_heartbeat: this KMD predates the counter. The detector genuinely does not exist on this
+    host, and falling through to tt-smi is correct. "attr_unreadable" — nodes are present and expose tt_heartbeat, but
+    no read of it succeeds right now (e.g. every chip left in a bad state by a failed reset). The driver HAS the
+    counter; the chips are not answering. Returns None as soon as one chip exposes a readable counter — the probe works.
+    A lost or fenced chip (:func:`chip_state.read_blocked`) is not read and never counts as that chip (spec 03 I97)."""
     try:
         entries = sorted(pci.SYSFS_CLASS_DIR.iterdir())
     except OSError:

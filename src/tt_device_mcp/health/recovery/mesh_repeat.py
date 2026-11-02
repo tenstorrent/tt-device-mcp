@@ -24,9 +24,8 @@ HOLD_BOUND_SEC = 600
 
 
 def gap_wait(*, since_first_end_sec: Optional[float], hold_age_sec: Optional[float], bound_sec: float) -> float:
-    """Seconds the sweep's mesh reset still waits: the gap left after the first reset ended, cut so the
-    wait ends by the bound. 0 when nothing is known about the first reset or the hold clock (no wait),
-    or when the bound is reached."""
+    """Seconds the sweep's mesh reset still waits: the gap left after the first reset ended, cut so the wait ends by the
+    bound. 0 when nothing is known about the first reset or the hold clock (no wait), or when the bound is reached."""
     if since_first_end_sec is None or hold_age_sec is None:
         return 0.0
     left = min(MESH_RESET_MIN_GAP_SEC - since_first_end_sec, min(bound_sec, HOLD_BOUND_SEC) - hold_age_sec)

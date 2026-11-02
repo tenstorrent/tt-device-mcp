@@ -77,11 +77,10 @@ def parse_events(buf: bytes) -> Iterable[Tuple[str, Tuple[int, ...]]]:
 
 
 def _in_child_pid_namespace(ns: str = "/proc/self/ns/pid", status: str = "/proc/self/status") -> bool:
-    """True when this process runs in a PID namespace below the host's. The host's namespace has
-    a fixed inode number (PROC_PID_INIT_INO); where the namespace link cannot be read, the NSpid
-    line of the status lists one pid per namespace level, so more than one (it shows only levels
-    from the /proc mount's namespace down). False when neither can tell (kernels before 4.1 have
-    no NSpid line)."""
+    """True when this process runs in a PID namespace below the host's. The host's namespace has a fixed inode number
+    (PROC_PID_INIT_INO); where the namespace link cannot be read, the NSpid line of the status lists one pid per
+    namespace level, so more than one (it shows only levels from the /proc mount's namespace down). False when neither
+    can tell (kernels before 4.1 have no NSpid line)."""
     try:
         return os.stat(ns).st_ino != _PROC_PID_INIT_INO
     except OSError:
@@ -97,8 +96,7 @@ def _in_child_pid_namespace(ns: str = "/proc/self/ns/pid", status: str = "/proc/
 
 
 def _tree(pgid: Optional[int], scope: Optional[str]) -> Optional[Set[int]]:
-    """Every live process in the job's process group or its systemd scope, or None if /proc
-    cannot be read."""
+    """Every live process in the job's process group or its systemd scope, or None if /proc cannot be read."""
     found: Set[int] = set()
     try:
         names = os.listdir("/proc")
@@ -262,8 +260,7 @@ class ExitWitness:
         return 0 if shell in (0, 143) else shell
 
     def close(self) -> None:
-        """Stop the reader thread, unsubscribe (the connector counts listeners host-wide), then
-        close the socket."""
+        """Stop the reader thread, unsubscribe (the connector counts listeners host-wide), then close the socket."""
         self._stop.set()
         if self._reader is not None and self._reader is not threading.current_thread():
             self._reader.join(timeout=1)

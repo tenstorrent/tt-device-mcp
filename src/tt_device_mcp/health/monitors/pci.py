@@ -80,20 +80,17 @@ def _read_attr(path: Path) -> str:
 
 
 def chip_snapshot() -> dict:
-    """Everything the host knows about the chips. The telemetry attributes and link config are
-    PCIe reads of each chip, so a chip confirmed lost is listed without them (spec 03 I66).
+    """Everything the host knows about the chips. The telemetry attributes and link config are PCIe reads of each chip,
+    so a chip confirmed lost is listed without them (spec 03 I66).
 
-    This is the record that makes a post-mortem possible. When a chip wedges, the
-    question is always "what was it doing beforehand" — was it hot, was it throttling,
-    was its PCIe link taking errors, was it running different firmware than its
-    neighbours. None of that is recoverable after the fact, and all of it is free right
-    now, so it gets written down on every health decision.
+    This is the record that makes a post-mortem possible. When a chip wedges, the question is always "what was it doing
+    beforehand" — was it hot, was it throttling, was its PCIe link taking errors, was it running different firmware than
+    its neighbours. None of that is recoverable after the fact, and all of it is free right now, so it gets written down
+    on every health decision.
 
-    The PCIe error counters matter most: the documented path from a wedged chip to an
-    ungraceful host reboot runs through the root complex escalating accumulated errors
-    to fatal. If that is what is happening here, these counters are where it shows, and
-    without them the theory can be neither proved nor dropped.
-    """
+    The PCIe error counters matter most: the documented path from a wedged chip to an ungraceful host reboot runs
+    through the root complex escalating accumulated errors to fatal. If that is what is happening here, these counters
+    are where it shows, and without them the theory can be neither proved nor dropped."""
     chips: dict[str, dict] = {}
     try:
         entries = sorted(SYSFS_CLASS_DIR.iterdir())
@@ -104,10 +101,9 @@ def chip_snapshot() -> dict:
         if not idx.isdigit():
             continue
         rec: dict = {}
-        # A chip confirmed lost or fenced is not read (spec 03 I66/I97): its attributes and its link
-        # config are PCIe reads that would stall on it and hold up its PCI remove. The fence is checked
-        # before EACH read, so a containment that starts mid-chip stops the next one. The AER counters
-        # below are kernel memory and stay.
+        # A chip confirmed lost or fenced is not read (spec 03 I66/I97): its attributes and its link config are PCIe
+        # reads that would stall on it and hold up its PCI remove. The fence is checked before EACH read, so a
+        # containment that starts mid-chip stops the next one. The AER counters below are kernel memory and stay.
         lost = chip_state.read_blocked(idx)
         for attr in _CHIP_ATTRS:
             if lost or chip_state.read_blocked(idx):
@@ -207,14 +203,12 @@ SAMPLE_RING_SIZE = int(os.environ.get("TT_DEVICE_MCP_SAMPLE_RING", "120"))
 def chip_sample() -> dict:
     """One compact sample of every chip's volatile state.
 
-    Compact on purpose: this runs every few seconds for the life of a job, so it carries
-    the moving values only, as a flat list per chip — [heartbeat, aiclk, arcclk,
-    therm_trips, aer_correctable, aer_fatal].
+    Compact on purpose: this runs every few seconds for the life of a job, so it carries the moving values only, as a
+    flat list per chip — [heartbeat, aiclk, arcclk, therm_trips, aer_correctable, aer_fatal].
 
-    The four telemetry values are PCIe reads of the chip. A chip confirmed lost reads as
-    [ALL_ONES, None, None, None, ...] without touching it; when its re-read is due
-    (:func:`chip_state.may_read`) only its heartbeat is read, once (spec 03 I66).
-    """
+    The four telemetry values are PCIe reads of the chip. A chip confirmed lost reads as [ALL_ONES, None, None, None,
+    ...] without touching it; when its re-read is due (:func:`chip_state.may_read`) only its heartbeat is read, once
+    (spec 03 I66)."""
     out: dict = {}
     try:
         entries = sorted(SYSFS_CLASS_DIR.iterdir())
@@ -265,15 +259,14 @@ _BDF = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$")
 
 
 def _uncorrectable_aer(dev: Path) -> Optional[int]:
-    """Uncorrectable (non-fatal + fatal) AER errors the kernel has counted on one PCI function: its
-    own ``aer_dev_nonfatal``/``aer_dev_fatal`` and, on a root port, the ``aer_rootport_total_err_*``
-    messages it received from below, plus the one correctable row that is not link noise
-    (``NonFatalErr`` in ``aer_dev_correctable``: an Advisory Non-Fatal error, i.e. an uncorrectable
-    error the device downgraded, such as a completion timeout or an unsupported request). None when
-    no counter could be read. The other correctable rows (RxErr, BadTLP, Timeout, ...) are left
-    out on purpose: they are routine on a healthy link and would arm the watch all day. A chip that
-    stops answering with its reads in flight shows first as an Advisory Non-Fatal storm on the port
-    above it, often reported firmware-first, so this row is the earliest kernel signal of it."""
+    """Uncorrectable (non-fatal + fatal) AER errors the kernel has counted on one PCI function: its own
+    ``aer_dev_nonfatal``/``aer_dev_fatal`` and, on a root port, the ``aer_rootport_total_err_*`` messages it received
+    from below, plus the one correctable row that is not link noise (``NonFatalErr`` in ``aer_dev_correctable``: an
+    Advisory Non-Fatal error, i.e. an uncorrectable error the device downgraded, such as a completion timeout or an
+    unsupported request). None when no counter could be read. The other correctable rows (RxErr, BadTLP, Timeout, ...)
+    are left out on purpose: they are routine on a healthy link and would arm the watch all day. A chip that stops
+    answering with its reads in flight shows first as an Advisory Non-Fatal storm on the port above it, often reported
+    firmware-first, so this row is the earliest kernel signal of it."""
     total, seen = 0, False
     try:
         for line in (dev / "aer_dev_correctable").read_text().splitlines():
@@ -298,17 +291,16 @@ def _uncorrectable_aer(dev: Path) -> Optional[int]:
 
 
 def link_signals() -> dict:
-    """The kernel's own record of PCIe trouble on every chip's path, for the sampler's early
-    off-bus watch (spec 03 I79): ``{"chips": [index, ...], "aer": {bdf: uncorrectable total}}``.
+    """The kernel's own record of PCIe trouble on every chip's path, for the sampler's early off-bus watch (spec 03
+    I79): ``{"chips": [index, ...], "aer": {bdf: uncorrectable total}}``.
 
-    ``chips`` is the KMD node list; ``aer`` covers each chip's endpoint and every port above it up
-    to the root port, keyed by PCI address, so a link drop the port above a chip counted shows
-    even when the chip's own counters did not move (a vanished node is its own signal). ``paths``
-    maps each chip index to the addresses on its own path, endpoint first, so a rise can be pinned
-    to the chips below the port that counted it. Every value here is a counter the kernel keeps in memory:
-    no read reaches a chip, a switch or a config space, which is what makes it safe to take every
-    second while a chip may be dying (an access at a dead endpoint is what stalls a CPU core). The
-    link-state attributes (``current_link_speed``/``width``) are config reads and stay out."""
+    ``chips`` is the KMD node list; ``aer`` covers each chip's endpoint and every port above it up to the root port,
+    keyed by PCI address, so a link drop the port above a chip counted shows even when the chip's own counters did not
+    move (a vanished node is its own signal). ``paths`` maps each chip index to the addresses on its own path, endpoint
+    first, so a rise can be pinned to the chips below the port that counted it. Every value here is a counter the kernel
+    keeps in memory: no read reaches a chip, a switch or a config space, which is what makes it safe to take every
+    second while a chip may be dying (an access at a dead endpoint is what stalls a CPU core). The link-state attributes
+    (``current_link_speed``/``width``) are config reads and stay out."""
     chips: list = []
     aer: dict = {}
     paths: dict = {}
@@ -335,10 +327,9 @@ def link_signals() -> dict:
 
 
 def config_vendor_id(bdf: str) -> Optional[int]:
-    """The vendor ID in ``bdf``'s config space, one 2-byte config read (spec 03 I96), or None when
-    unreadable. 0xFFFF is the all-ones a function off the bus answers. Unlike :func:`link_signals`
-    this read reaches the device, so only the dead-chip watch takes it, once per trigger, and only
-    behind its own constant."""
+    """The vendor ID in ``bdf``'s config space, one 2-byte config read (spec 03 I96), or None when unreadable. 0xFFFF is
+    the all-ones a function off the bus answers. Unlike :func:`link_signals` this read reaches the device, so only the
+    dead-chip watch takes it, once per trigger, and only behind its own constant."""
     try:
         with open(f"/sys/bus/pci/devices/{bdf}/config", "rb", buffering=0) as f:
             raw = f.read(2)
@@ -348,9 +339,8 @@ def config_vendor_id(bdf: str) -> Optional[int]:
 
 
 def link_active(bdf: str) -> Optional[bool]:
-    """Data Link Layer Link Active (PCIe Link Status bit 13) of the port ``bdf``, or None when it
-    cannot be read (spec 03 I96). Meant for a chip's root port, never the chip: config reads of the
-    port's own capability list."""
+    """Data Link Layer Link Active (PCIe Link Status bit 13) of the port ``bdf``, or None when it cannot be read (spec
+    03 I96). Meant for a chip's root port, never the chip: config reads of the port's own capability list."""
     try:
         with open(f"/sys/bus/pci/devices/{bdf}/config", "rb", buffering=0) as f:
             cfg = f.read(256)
@@ -390,12 +380,11 @@ def sysfs_chip_ids() -> list[str]:
 
 
 def chip_pci_bdfs() -> dict:
-    """Every chip index the KMD currently exposes, mapped to its PCI address:
-    ``{0: '0000:01:00.0', ...}``. A chip whose address cannot be read is left out.
+    """Every chip index the KMD currently exposes, mapped to its PCI address: ``{0: '0000:01:00.0', ...}``. A chip whose
+    address cannot be read is left out.
 
-    The kernel's chip index is the one /dev, sysfs and the heartbeat read use, and it need not
-    follow PCI order — so this, not a list position in a tt-smi snapshot, is what ties a chip
-    index to its bus."""
+    The kernel's chip index is the one /dev, sysfs and the heartbeat read use, and it need not follow PCI order — so
+    this, not a list position in a tt-smi snapshot, is what ties a chip index to its bus."""
     out: dict = {}
     try:
         entries = sorted(SYSFS_CLASS_DIR.iterdir())
@@ -475,12 +464,11 @@ def _save_removed_chips(health_dir: Optional[Path] = None) -> None:
 
 
 def load_removed_chips() -> list:
-    """Reload the records a previous broker process of THIS boot left, at broker start (spec 04 I69).
-    A record from another boot is dropped: the boot reset every endpoint, so the chip is no longer
-    un-reset, and its bus numbers may have moved. Records of chips back on the bus are dropped too.
-    Returns the chip ids still recorded; the caller isolates them, so the bridge rung resets each
-    through its recorded bridge before anything re-enumerates it. The file is rewritten only when a
-    record was dropped."""
+    """Reload the records a previous broker process of THIS boot left, at broker start (spec 04 I69). A record from
+    another boot is dropped: the boot reset every endpoint, so the chip is no longer un-reset, and its bus numbers may
+    have moved. Records of chips back on the bus are dropped too. Returns the chip ids still recorded; the caller
+    isolates them, so the bridge rung resets each through its recorded bridge before anything re-enumerates it. The file
+    is rewritten only when a record was dropped."""
     try:
         data = json.loads((evidence.health_dir() / REMOVED_CHIPS_FILE).read_text())
     except (OSError, ValueError):
@@ -564,16 +552,6 @@ def chip_back_seq(idx) -> int:
 
 
 _save_thread: Optional[threading.Thread] = None
-
-
-def wait_removed_chips_saved(timeout: float = 5.0) -> bool:
-    """Wait up to ``timeout`` for the last records-file write :func:`isolate_chip` started. True once
-    none is running. Never on the containment's path: only callers that read the file back."""
-    t = _save_thread
-    if t is not None:
-        t.join(timeout)
-        return not t.is_alive()
-    return True
 
 
 def isolate_chip(idx: str) -> bool:

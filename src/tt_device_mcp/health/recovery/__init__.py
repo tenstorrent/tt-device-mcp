@@ -122,7 +122,7 @@ POST_RESET_FABRIC_RETRY_SLEEP_SEC = float(os.environ.get("TT_DEVICE_MCP_POST_RES
 # reset, after this settle, on an idle box (:meth:`Recovery._arc_not_ready_retry_due`). Measured on a
 # 32-chip Galaxy: the first -glx_reset brought an off-bus chip back but left 31 chips ARC-not-ready and
 # exited 1; the hold re-observed that for 10 min, and the next -glx_reset recovered it at once.
-ARC_NOT_READY_RETRY_SETTLE_SEC = float(os.environ.get("TT_DEVICE_MCP_ARC_NOT_READY_RETRY_SETTLE_SEC", "5"))
+ARC_NOT_READY_RETRY_SETTLE_SEC = 5.0
 
 
 def _fabric_of(monitor) -> dict:
@@ -187,9 +187,8 @@ class Evidence:
     # Spec 03 I55: the fabric passed traffic but mesh dispatch failed over a present mesh, and this
     # hold episode has not had its one present-mesh reset yet.
     dispatch_reset_due: bool = False
-    # Chips on the bus whose ARC is not ready (ENODATA on a bound, link-up endpoint, spec 04 I24):
-    # counted neither off the bus nor frozen. On a present mesh they take the mesh reset at once
-    # (spec 04 I105), never the below-floor hold.
+    # Chips on the bus whose ARC is not ready (ENODATA on a bound, link-up endpoint, spec 04 I24): counted neither off
+    # the bus nor frozen. On a present mesh they take the mesh reset at once (spec 04 I105), never the below-floor hold.
     arc_not_ready: int = 0
 
 
@@ -376,18 +375,16 @@ class RecoveryDeps:
     # Places a not-dirty fabric-unverified hold (server._hold_device_fabric_unverified): a reset whose
     # fabric stayed a 77 settles there, never as a failed reset.
     hold_device_fabric_unverified: Optional[Callable[[str], None]] = None
-    # Counts a reset's post-reset 77 passes toward the open episode's I40 bound
-    # (server._note_fabric_77_reset_passes), so the next relift falls back at once instead of
-    # re-running the passes the reset just spent.
+    # Counts a reset's post-reset 77 passes toward the open episode's I40 bound (server._note_fabric_77_reset_passes),
+    # so the next relift falls back at once instead of re-running the passes the reset just spent.
     note_fabric_77_reset_passes: Optional[Callable[[int], None]] = None
     # The open hold's fabric link-short cause (server._fabric_link_short_hold; "" when none): a lost
     # link, a latched topology mismatch or missing descriptor ports. Spec 04 I79/I83 send those holds
     # to the power cycle after one ladder pass, so the sweep never waits to space its mesh reset (I93).
     fabric_link_short_hold: Optional[Callable[[], str]] = None
-    # Whether the open hold's fabric 77 has a cause no reset or reboot fixes — a known cable fault (a 78),
-    # a topology mismatch, hugepages not yet allocated, the validator missing
-    # (server._fabric_77_no_reset_cause; never the I42 latch, which takes the ladder). Such a 77
-    # never climbs to a host rung (spec 04 I29).
+    # Whether the open hold's fabric 77 has a cause no reset or reboot fixes — a known cable fault (a 78), a topology
+    # mismatch, hugepages not yet allocated, the validator missing (server._fabric_77_no_reset_cause; never the I42
+    # latch, which takes the ladder). Such a 77 never climbs to a host rung (spec 04 I29).
     fabric_77_no_reset_cause: Optional[Callable[[], bool]] = None
     refresh_idle_hold_ledger: Optional[Callable[[], None]] = None
     spawn_idle_relift: Optional[Callable[[], None]] = None
@@ -526,20 +523,18 @@ class Recovery(ABC):
     async def _recover_isolated_chips(self, log, exclude=frozenset(), not_reset=frozenset()) -> bool:
         """Bring back chips that were cut out of the kernel after leaving the PCIe bus.
 
-        Reset through the parent bridge, not the chip: a dead endpoint cannot be reset through
-        its own config space, but it does not need to be, and the bridge above it always answers.
-        Each Blackhole sits alone behind its own bridge here, so this is surgical — measured on
-        live hardware, the other 31 chips keep ticking and a fabric traffic pass still passes
-        afterwards, so no galaxy-wide reset is needed to make the mesh usable again.
+        Reset through the parent bridge, not the chip: a dead endpoint cannot be reset through its own config space, but
+        it does not need to be, and the bridge above it always answers. Each Blackhole sits alone behind its own bridge
+        here, so this is surgical — measured on live hardware, the other 31 chips keep ticking and a fabric traffic pass
+        still passes afterwards, so no galaxy-wide reset is needed to make the mesh usable again.
 
-        Caller MUST hold the device lock: this ends with a PCI rescan, and nothing else may be
-        touching the device while the endpoint re-enumerates.
+        Caller MUST hold the device lock: this ends with a PCI rescan, and nothing else may be touching the device while
+        the endpoint re-enumerates.
 
-        ``exclude``: chips that already had their SBR round this hold (spec 04 I98). They get no
-        bridge write and stay isolated; a removed one among them was reset this hold, so it does not
-        withhold the rescan (I69), unless it is in ``not_reset``: spent with no bridge write (no_bridge),
-        never reset, so it still withholds every rescan of the pass.
-        """
+        ``exclude``: chips that already had their SBR round this hold (spec 04 I98). They get no bridge write and stay
+        isolated; a removed one among them was reset this hold, so it does not withhold the rescan (I69), unless it is
+        in ``not_reset``: spent with no bridge write (no_bridge), never reset, so it still withholds every rescan of the
+        pass."""
         # ladder-v2: the per-chip SBR window this rung reads, chip id -> {"reason": "no_bridge"} for
         # every chip whose reset could not fire because the endpoint left the bus. Reset FRESH every
         # call (before the empty-set early return), so a later reader never sees a stale prior pass.
@@ -611,10 +606,9 @@ class Recovery(ABC):
                 "removed is still un-reset"
             )
             health_event("host_reset_gated", context="bridge_reset", chips=targets, reason=why, host_at_risk=True)
-        # Spec 04 I92: every reset journals its pre-reset holder scan. This one needs none: each target
-        # was cut out of the kernel (detached), so no process can map it and closing a holder's fd
-        # makes the driver send it nothing. Killing readers here would only stop the device pollers'
-        # reads of the chips that stay on the bus.
+        # Spec 04 I92: every reset journals its pre-reset holder scan. This one needs none: each target was cut out of
+        # the kernel (detached), so no process can map it and closing a holder's fd makes the driver send it nothing.
+        # Killing readers here would only stop the device pollers' reads of the chips that stay on the bus.
         if sbr and not gated:
             health_event(
                 "pre_reset_holder_scan",
@@ -782,9 +776,8 @@ class Recovery(ABC):
             else:
                 lost.append(idx)
                 if idx in reset_this_pass:
-                    # A chip the broker removed, reset through its recorded bridge on every try and
-                    # still off the bus: no SBR brings it back, the same no-window fact as no_bridge
-                    # (spec 04 I69).
+                    # A chip the broker removed, reset through its recorded bridge on every try and still off the bus:
+                    # no SBR brings it back, the same no-window fact as no_bridge (spec 04 I69).
                     self.last_bridge_reset_reasons[idx] = {"reason": NO_WINDOW_REMOVED_REASON}
                 metrics.stage_fired("bridge_reset", "failed")
 
@@ -952,17 +945,16 @@ class Recovery(ABC):
     async def _verify_device_after_reset(self, expected: int, log) -> tuple[Optional[bool], dict, int]:
         """Verify a mesh after a reset, giving a post-reset fabric 77 time to settle before it is believed.
 
-        A reset returns before the eth links re-train, so the first fabric pass can find no trained link
-        (a 77 — a training-window verdict, not a cleared or a broken fabric). Re-check up to
-        ``POST_RESET_FABRIC_RETRIES`` times so it resolves to a REAL verdict; multi-chip only, while
-        enum+ARC pass. A fabric that STILL cannot verify after training (a persistent 77) is UNKNOWN —
-        ``healthy`` is None: never a recovery (no hold is cleared onto a fabric no pass proved, the box D
-        shape: enum+ARC read OK while every full-mesh job died on a down link), and never a failed reset
-        either (a 77 measured nothing, so it must not arm the host rungs). Falsy, so a caller that only
-        asks "recovered?" still reads no. A 77 from a validator that is not built yet (spec 03 I81) gets no
-        retry and no eth-training wait: it is the same UNKNOWN at once. A pass whose fabric check a lost
-        chip ended (dead-chip isolation) is a failed verify at once, with no retry and no wait
-        (:meth:`_note_post_reset_pass`). Returns ``(healthy, evidence, fabric_retries)``."""
+        A reset returns before the eth links re-train, so the first fabric pass can find no trained link (a 77 — a
+        training-window verdict, not a cleared or a broken fabric). Re-check up to ``POST_RESET_FABRIC_RETRIES`` times
+        so it resolves to a REAL verdict; multi-chip only, while enum+ARC pass. A fabric that STILL cannot verify after
+        training (a persistent 77) is UNKNOWN — ``healthy`` is None: never a recovery (no hold is cleared onto a fabric
+        no pass proved, the box D shape: enum+ARC read OK while every full-mesh job died on a down link), and never a
+        failed reset either (a 77 measured nothing, so it must not arm the host rungs). Falsy, so a caller that only
+        asks "recovered?" still reads no. A 77 from a validator that is not built yet (spec 03 I81) gets no retry and no
+        eth-training wait: it is the same UNKNOWN at once. A pass whose fabric check a lost chip ended (dead-chip
+        isolation) is a failed verify at once, with no retry and no wait (:meth:`_note_post_reset_pass`). Returns
+        ``(healthy, evidence, fabric_retries)``."""
         isolated_before = set(map(str, self.deps.isolated_chips()))
         healthy, evidence = await self._verify_device(expected, log)
         healthy = self._note_post_reset_pass(healthy, evidence, isolated_before, log)
@@ -1015,22 +1007,17 @@ class Recovery(ABC):
     async def _reset_and_verify_device(self, indices: list, log) -> Optional[bool]:
         """Recover the device with ONE reset, performed safely, then prove it worked.
 
-        Safety here is structural, not statistical — the reset is exclusive (the caller
-        holds ``device_op_lock``), lands on a bus quiesced of pollers, and runs in its
-        restart-safe systemd or local backend so nothing can interrupt it. A reset done
-        that way is a cheap, routine repair of an idle device, so we do not hesitate to
-        run it.
+        Safety here is structural, not statistical — the reset is exclusive (the caller holds ``device_op_lock``), lands
+        on a bus quiesced of pollers, and runs in its restart-safe systemd or local backend so nothing can interrupt it.
+        A reset done that way is a cheap, routine repair of an idle device, so we do not hesitate to run it.
 
-        What we do NOT do is run it twice in a row. A reset that did not revive the mesh
-        will not revive it on an immediate retry, and every extra reset is another pass
-        of MMIO at a dead endpoint — the exact traffic that promotes a PCIe error to
-        fatal and takes the host down with it. One attempt, then back off and let the
-        caller report honestly. The one exception is a reset that brought every chip back on the bus
-        but left ARC not ready: that is not a dead endpoint, and one more reset clears it
-        (:meth:`_arc_not_ready_retry_due`). Returns True if the device verified healthy, None when the reset ran,
-        enum+ARC verify and only the fabric stayed unverifiable (a persistent 77: held fabric-unverified,
-        the caller must not climb on it), False otherwise.
-        """
+        What we do NOT do is run it twice in a row. A reset that did not revive the mesh will not revive it on an
+        immediate retry, and every extra reset is another pass of MMIO at a dead endpoint — the exact traffic that
+        promotes a PCIe error to fatal and takes the host down with it. One attempt, then back off and let the caller
+        report honestly. The one exception is a reset that brought every chip back on the bus but left ARC not ready:
+        that is not a dead endpoint, and one more reset clears it (:meth:`_arc_not_ready_retry_due`). Returns True if
+        the device verified healthy, None when the reset ran, enum+ARC verify and only the fabric stayed unverifiable (a
+        persistent 77: held fabric-unverified, the caller must not climb on it), False otherwise."""
         started = time.monotonic()
         try:
             return await self._reset_and_verify_device_once(indices, log)

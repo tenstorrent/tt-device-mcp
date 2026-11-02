@@ -44,32 +44,6 @@ IDLE_AFTER_DEFAULT_SEC = 1.0
 STALE_INTERVALS = 5
 
 
-def _env_float(name: str, default: float, *, allow_zero: bool) -> float:
-    """``name`` as a float, or ``default`` when unset, malformed or out of range. A typo in a unit
-    file must not stop the broker from importing or the job from running."""
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        return default
-    if value < 0 or (value == 0 and not allow_zero):
-        return default
-    return value
-
-
-def interval_sec() -> float:
-    """TT_DEVICE_MCP_ACTIVITY_INTERVAL_SEC: seconds between samples (default 1)."""
-    return _env_float("TT_DEVICE_MCP_ACTIVITY_INTERVAL_SEC", INTERVAL_DEFAULT_SEC, allow_zero=False)
-
-
-def idle_after_sec() -> float:
-    """TT_DEVICE_MCP_DEVICE_IDLE_AFTER_SEC: how long the device must do no work, without a break,
-    before it reads IDLE (default 1). Any work seen resets it."""
-    return _env_float("TT_DEVICE_MCP_DEVICE_IDLE_AFTER_SEC", IDLE_AFTER_DEFAULT_SEC, allow_zero=True)
-
-
 def fmt_dur(seconds: float) -> str:
     """4s, 4m12s, 1h03m: the same shape the CLI's runtime column uses."""
     seconds = max(0, int(seconds))
@@ -81,8 +55,7 @@ def fmt_dur(seconds: float) -> str:
 
 
 def label(view: dict) -> str:
-    """The one line every surface shows: ``DEVICE IDLE for 4m12s``, ``active`` or
-    ``activity unknown``."""
+    """The one line every surface shows: ``DEVICE IDLE for 4m12s``, ``active`` or ``activity unknown``."""
     state = view.get("activity")
     if state == IDLE:
         return f"{IDLE_LABEL} for {fmt_dur(view.get('idle_seconds') or 0)}"
@@ -258,8 +231,8 @@ class DeviceActivitySampler:
         sleep: Callable = asyncio.sleep,
     ) -> None:
         self.source = source
-        self.interval = interval_sec() if interval is None else interval
-        self.tracker = ActivityTracker(idle_after_sec() if idle_after is None else idle_after)
+        self.interval = INTERVAL_DEFAULT_SEC if interval is None else interval
+        self.tracker = ActivityTracker(IDLE_AFTER_DEFAULT_SEC if idle_after is None else idle_after)
         self._clock = clock
         self._wall = wall
         self._sleep = sleep

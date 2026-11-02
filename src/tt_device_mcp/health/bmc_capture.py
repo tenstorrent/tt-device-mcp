@@ -72,10 +72,9 @@ def argv_allowed(argv: list) -> bool:
 
 
 def upstream_bridge(bdf: str) -> Optional[str]:
-    """The bridge or root port above ``bdf``: the parent of its sysfs node while the endpoint is
-    still enumerated, else the bridge whose secondary bus is the endpoint's bus. The bridge stays
-    on the bus when the endpoint drops, so its LnkSta/LnkCap still say what the link did. A sysfs
-    read only; None when neither finds one."""
+    """The bridge or root port above ``bdf``: the parent of its sysfs node while the endpoint is still enumerated, else
+    the bridge whose secondary bus is the endpoint's bus. The bridge stays on the bus when the endpoint drops, so its
+    LnkSta/LnkCap still say what the link did. A sysfs read only; None when neither finds one."""
     from tt_device_mcp.health.recovery.stages.bridge_reset import find_bridge_by_secondary_bus
 
     if not _PCI_ADDR.match(bdf or ""):
@@ -149,10 +148,9 @@ def capture_tray_down(
     deadline_sec: float = CAPTURE_DEADLINE_SEC,
     run: Optional[Callable] = None,
 ) -> dict:
-    """Run every allowed read concurrently, stop waiting at ``deadline_sec``, and write ``bmc.txt``
-    and ``onset.json`` into ``bundle`` (fsync'd). Never raises; returns a summary for the journal.
-    A read still running at the deadline is recorded as such and abandoned (its own per-call timeout
-    reaps it shortly after)."""
+    """Run every allowed read concurrently, stop waiting at ``deadline_sec``, and write ``bmc.txt`` and ``onset.json``
+    into ``bundle`` (fsync'd). Never raises; returns a summary for the journal. A read still running at the deadline is
+    recorded as such and abandoned (its own per-call timeout reaps it shortly after)."""
     run = run or _RUN
     t0 = time.monotonic()
     argvs = capture_argvs(pci_targets, onset.get("epoch", time.time()))

@@ -38,30 +38,26 @@ GRACEFUL_KILL_GRACE_SEC = 60
 # to the reap, and reaching SIGKILL means the device was NOT released.
 SIGTERM_GRACE_SEC = 15
 
-# SIGINT window for a job the hung reaper stops for silence (spec 01 I10), in place of
-# GRACEFUL_KILL_GRACE_SEC. A job that printed nothing for HUNG_SILENCE_SEC is blocked, most
-# often inside a device op, and does not unwind on SIGINT: on a Galaxy host every silence reap
-# observed ran the full 60 s and ended at SIGTERM. A HUNG job owes the mesh the reset and the
-# full check either way (spec 03 I69), so the long window only delayed recovery. The SIGINT
-# still goes first, and SIGTERM (SIGTERM_GRACE_SEC) and SIGKILL follow as on every ladder.
+# SIGINT window for a job the hung reaper stops for silence (spec 01 I10), in place of GRACEFUL_KILL_GRACE_SEC. A job
+# that printed nothing for HUNG_SILENCE_SEC is blocked, most often inside a device op, and does not unwind on SIGINT: on
+# a Galaxy host every silence reap observed ran the full 60 s and ended at SIGTERM. A HUNG job owes the mesh the reset
+# and the full check either way (spec 03 I69), so the long window only delayed recovery. The SIGINT still goes first,
+# and SIGTERM (SIGTERM_GRACE_SEC) and SIGKILL follow as on every ladder.
 HUNG_SIGINT_GRACE_SEC = 10
 
-# After a job is finalized, any of its processes still alive (a child that left the process
-# group, or one the ladder never reached) gets SIGTERM, then SIGKILL after this window. The
-# job itself is already gone, so this is a sweep of leftovers, not a teardown: it is kept
-# short because the next job waits on it, but never shorter than the 10 s every job process gets
-# between SIGTERM and SIGKILL (preemption's PREEMPT_KILL_GRACE_SEC).
+# After a job is finalized, any of its processes still alive (a child that left the process group, or one the ladder
+# never reached) gets SIGTERM, then SIGKILL after this window. The job itself is already gone, so this is a sweep of
+# leftovers, not a teardown: it is kept short because the next job waits on it, but never shorter than the 10 s every
+# job process gets between SIGTERM and SIGKILL (preemption's PREEMPT_KILL_GRACE_SEC).
 SURVIVOR_TERM_GRACE_SEC = 10
 
-# How long to wait after the survivors' SIGKILL before naming whoever is still alive. A
-# process that outlives SIGKILL is stuck in the kernel (state D, most often inside the
-# driver), and no signal will move it.
+# How long to wait after the survivors' SIGKILL before naming whoever is still alive. A process that outlives SIGKILL is
+# stuck in the kernel (state D, most often inside the driver), and no signal will move it.
 SURVIVOR_KILL_WAIT_SEC = 2
 
-# How long, counted from a SIGKILL, to keep polling the /dev/tenstorrent holders for the killed
-# processes to let go before naming one a holder that will not (spec 01 I67). An exit can sit in
-# the driver's release for seconds; reading that as a leftover skipped the post-job gate and left
-# the device held until the next job or the hold ceiling.
+# How long, counted from a SIGKILL, to keep polling the /dev/tenstorrent holders for the killed processes to let go
+# before naming one a holder that will not (spec 01 I67). An exit can sit in the driver's release for seconds; reading
+# that as a leftover skipped the post-job gate and left the device held until the next job or the hold ceiling.
 HOLDER_RELEASE_WAIT_SEC = 30
 
 # A preemptable job's grace minute. Contention (the job past its time limit AND another job
@@ -74,18 +70,16 @@ PREEMPT_GRACE_SEC = 60
 # an hour; the lower one keeps a job from being reaped (and the device reset) on a normal pause.
 HUNG_SILENCE_MIN_SEC = 60
 HUNG_SILENCE_MAX_SEC = 3600
-# Storage IO by the job's processes (read_bytes/write_bytes in /proc/<pid>/io) counts as liveness:
-# a silent job still reading a model or writing a cache is working. CPU time does not count: a
-# tt-metal host process busy-polls a hung device, and counting it would keep exactly the jobs
-# this reaper exists for. IO without output is believed only this long (or the job's own limit,
-# if longer): a job that loops on IO without ever printing is still reaped.
+# Storage IO by the job's processes (read_bytes/write_bytes in /proc/<pid>/io) counts as liveness: a silent job still
+# reading a model or writing a cache is working. CPU time does not count: a tt-metal host process busy-polls a hung
+# device, and counting it would keep exactly the jobs this reaper exists for. IO without output is believed only this
+# long (or the job's own limit, if longer): a job that loops on IO without ever printing is still reaped.
 HUNG_IO_CAP_SEC = 1800
 
-# Once the grace minute is spent, the job's whole process tree gets SIGTERM and, at most this
-# much later, SIGKILL: 10 s for its handlers to release the device. The job already had its
-# minute to end itself. A tree that all exits through its own code on SIGTERM inside it gets the
-# fast post-job check; a SIGKILL, any signal death or an unwitnessed exit gets a reset and the
-# full check.
+# Once the grace minute is spent, the job's whole process tree gets SIGTERM and, at most this much later, SIGKILL: 10 s
+# for its handlers to release the device. The job already had its minute to end itself. A tree that all exits through
+# its own code on SIGTERM inside it gets the fast post-job check; a SIGKILL, any signal death or an unwitnessed exit
+# gets a reset and the full check.
 PREEMPT_KILL_GRACE_SEC = 10
 
 # Before any reset, a process other than a tenant that still maps the device gets SIGTERM and
@@ -143,10 +137,9 @@ DEVICE_RESET_OVERRUN_SEC = 180
 # reset that had worked.
 DEVICE_RESET_TIMEOUT_SEC = 600
 
-# The CLI reads the streaming reset with a per-read socket timeout, and a reset can sit
-# silent far longer than that (quiesce, an overrun tt-smi, the post-reset check): the
-# overrun warning goes to the broker log, not the stream. A client that asks for it gets
-# this sentinel line after every quiet interval, so silence never reads as a dead broker.
+# The CLI reads the streaming reset with a per-read socket timeout, and a reset can sit silent far longer than that
+# (quiesce, an overrun tt-smi, the post-reset check): the overrun warning goes to the broker log, not the stream. A
+# client that asks for it gets this sentinel line after every quiet interval, so silence never reads as a dead broker.
 RESET_STREAM_KEEPALIVE_SEC = 15
 RESET_STREAM_KEEPALIVE_LINE = "::keepalive::"
 
@@ -171,13 +164,11 @@ def pre_reset_zombie_ladder_reserve_sec(chips: int) -> float:
     return scan + PRE_RESET_ZOMBIE_MESH_RESET_SEC + full_check
 
 
-# The caller's bound on the passive eth-heartbeat read a CLEAN post-job gate runs (spec 03 I30);
-# a healthy read answers in ~1s. Matches the self-test's arming budget
-# (server.ETH_CHECK_SELFTEST_BUDGET_SEC): a read this slow could not have armed the rung. The
-# built-in probe's own bound sits at most at 90% of this, and its expiry is "no verdict", so the
-# gate runs the full pass; this bound expiring is frozen evidence (I16) and holds. An operator
-# override's inner bound is this same bound, so its timeout is frozen evidence here as on every
-# other path.
+# The caller's bound on the passive eth-heartbeat read a CLEAN post-job gate runs (spec 03 I30); a healthy read answers
+# in ~1s. Matches the self-test's arming budget (server.ETH_CHECK_SELFTEST_BUDGET_SEC): a read this slow could not have
+# armed the rung. The built-in probe's own bound sits at most at 90% of this, and its expiry is "no verdict", so the
+# gate runs the full pass; this bound expiring is frozen evidence (I16) and holds. An operator override's inner bound is
+# this same bound, so its timeout is frozen evidence here as on every other path.
 ETH_POST_JOB_TIMEOUT_SEC = 10.0
 # The most the eth-heartbeat read waits for its own reader to finish exiting after killing it on
 # a timeout (see monitor._verify_eth_heartbeat_body): a SIGKILLed reader is normally gone in

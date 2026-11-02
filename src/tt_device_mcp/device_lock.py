@@ -33,9 +33,8 @@ _UDEV_TIMEOUT_SEC = 30
 
 
 def device_nodes() -> list:
-    """The device nodes, and only those. /dev/tenstorrent also holds a `by-id/`
-    directory (0755 root:root) — sampling it for permissions reads as 'unlocked' on
-    a locked host, so it must never be mistaken for a device."""
+    """The device nodes, and only those. /dev/tenstorrent also holds a `by-id/` directory (0755 root:root) — sampling it
+    for permissions reads as 'unlocked' on a locked host, so it must never be mistaken for a device."""
     return sorted(p for p in glob.glob(_DEV_GLOB) if os.path.basename(p).isdigit())
 
 

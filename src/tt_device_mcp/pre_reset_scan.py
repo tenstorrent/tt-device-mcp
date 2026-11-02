@@ -214,11 +214,10 @@ class PreResetScan:
 
 
 def _offbus_bound_chips() -> list:
-    """Chips still bound to the driver whose ARC heartbeat reads all-ones: off the bus, not detached.
-    A decision read (spec 03 I66, I97): a chip the broker marked lost or fenced is read for real when
-    its re-read is due. A lost chip whose re-read is not due counts as all-ones, as it was read; a
-    chip only fenced (one all-ones sample, maybe a blip) and not read here is never detached on the
-    all-ones it reports without a read."""
+    """Chips still bound to the driver whose ARC heartbeat reads all-ones: off the bus, not detached. A decision read
+    (spec 03 I66, I97): a chip the broker marked lost or fenced is read for real when its re-read is due. A lost chip
+    whose re-read is not due counts as all-ones, as it was read; a chip only fenced (one all-ones sample, maybe a blip)
+    and not read here is never detached on the all-ones it reports without a read."""
     from tt_device_mcp.health import chip_state
     from tt_device_mcp.health.monitors.heartbeat import dead_chips, read_heartbeats
 
@@ -264,12 +263,11 @@ def classify_gap_pids(
     zombie_of: Optional[Callable[[int], Optional[device_holders.ZombieInfo]]] = None,
     users_outside: Optional[Callable[[set], tuple]] = None,
 ) -> GapVerdicts:
-    """Spec 04 I92: settle each pid the driver names that the scan could not show holding the device.
-    A zombie whose whole thread group has exited is no holder (``cleared``), unless ``users_outside``
-    finds the device open in a process outside ``named`` (every pid the driver names) or cannot walk
-    every process: then its verdict is ``open_elsewhere`` or ``walk_incomplete`` and it stays. A zombie
-    leader whose live threads hold, or cannot show whether they hold (``unknown``), stays; so does any
-    pid that is no zombie (live, or gone from /proc)."""
+    """Spec 04 I92: settle each pid the driver names that the scan could not show holding the device. A zombie whose
+    whole thread group has exited is no holder (``cleared``), unless ``users_outside`` finds the device open in a
+    process outside ``named`` (every pid the driver names) or cannot walk every process: then its verdict is
+    ``open_elsewhere`` or ``walk_incomplete`` and it stays. A zombie leader whose live threads hold, or cannot show
+    whether they hold (``unknown``), stays; so does any pid that is no zombie (live, or gone from /proc)."""
     zombie_of = zombie_of or device_holders.zombie_info
     users_outside = users_outside or device_holders.device_users_outside
     pids = list(pids)
@@ -324,41 +322,37 @@ async def clear_device_readers(
 ) -> PreResetScan:
     """Scan the device holders and remove every reader before a reset (spec 04 I92). Never raises.
 
-    ``tenants_block``: a tenant (``is_tenant``, or a process in ``protected`` or below one, which is
-    the broker's running job) refuses the reset and nothing is signalled. An operator reset passes
-    False: its own reset gate (04 I6/I7) already ruled on tenants, ``force`` included, and they are
-    only recorded here. The broker itself and its process group are never signalled. A broker-internal
-    holder (one the broker already killed, still mid-exit) is a reader whatever its uid.
+    ``tenants_block``: a tenant (``is_tenant``, or a process in ``protected`` or below one, which is the broker's
+    running job) refuses the reset and nothing is signalled. An operator reset passes False: its own reset gate (04
+    I6/I7) already ruled on tenants, ``force`` included, and they are only recorded here. The broker itself and its
+    process group are never signalled. A broker-internal holder (one the broker already killed, still mid-exit) is a
+    reader whatever its uid.
 
-    ``foreign_yield`` (the ladder and sweep before a power cycle, spec 04 I103): a tenant outside every
-    broker job or exec scope, and not in ``protected``, is a reader like any other and is cleared; only a
-    broker job's process still refuses the reset. A gap pid left after the rescan no longer refuses it
-    either when /proc shows the pid here (its stat and cgroup are world-readable even when its fds are
-    not) outside every broker scope and ``protected``: the reset runs past it, unsignalled, and it is
-    recorded in ``gaps_passed``. One inside a broker scope or ``protected`` is a tenant; one stuck in
-    the kernel (``unkillable``: D state or SIGKILL pending) is unkillable (I21/I70 fence); one with no
-    /proc entry here (another pid namespace's process, which the broker can neither read nor signal,
-    the unseen reader this scan exists for) still refuses.
+    ``foreign_yield`` (the ladder and sweep before a power cycle, spec 04 I103): a tenant outside every broker job or
+    exec scope, and not in ``protected``, is a reader like any other and is cleared; only a broker job's process still
+    refuses the reset. A gap pid left after the rescan no longer refuses it either when /proc shows the pid here (its
+    stat and cgroup are world-readable even when its fds are not) outside every broker scope and ``protected``: the
+    reset runs past it, unsignalled, and it is recorded in ``gaps_passed``. One inside a broker scope or ``protected``
+    is a tenant; one stuck in the kernel (``unkillable``: D state or SIGKILL pending) is unkillable (I21/I70 fence); one
+    with no /proc entry here (another pid namespace's process, which the broker can neither read nor signal, the unseen
+    reader this scan exists for) still refuses.
 
-    Before any signal, every chip still bound but off the bus (``offbus_chips``) is detached
-    (``detach_chip``, the one in-flight PCI write, all within ``detach_timeout_sec``); if one fails or the deadline
-    passes, nothing is signalled and the reset is refused (module docstring).
+    Before any signal, every chip still bound but off the bus (``offbus_chips``) is detached (``detach_chip``, the one
+    in-flight PCI write, all within ``detach_timeout_sec``); if one fails or the deadline passes, nothing is signalled
+    and the reset is refused (module docstring).
 
-    ``reset_active`` (the mechanism's ``scope_active``) names a reset already running; with one, or
-    with a holder ``holder_in_reset``, nothing is signalled and the reset is refused. A scan that
-    raises proceeds (a scan bug must not stop a recovery; ``error`` records it). A scan left
-    incomplete by a pid the driver names (after one rescan ``rescan_settle_sec`` later) refuses an
-    automatic reset; an operator reset records it, its own gate having ruled (04 I6/I7). A gap no
-    pid explains (an unprivileged /proc walk) is recorded only: no pid is there to signal or wait for.
-    A gap whose pid is a zombie (``zombie_of``) is classified first, with no wait: one whose whole
-    thread group has exited is no holder and leaves the gaps, unless ``users_outside`` finds the device
-    open in a process the driver does not name or cannot walk every process (then it stays a gap). A
-    zombie leader whose live threads show a device fd or mapping stays a gap: refused after the one
-    rescan. When every gap left is a zombie whose live threads cannot settle it, the scan looks again
-    every ``rescan_settle_sec`` until they do or ``zombie_wait_sec`` passes (the caller's bound: an
-    automatic reset's ends before the hold's 10-min ladder), once per (pid, start time). A gap on a live
-    or unreadable pid gets the one rescan. Nothing is signalled for any of this.
-    """
+    ``reset_active`` (the mechanism's ``scope_active``) names a reset already running; with one, or with a holder
+    ``holder_in_reset``, nothing is signalled and the reset is refused. A scan that raises proceeds (a scan bug must not
+    stop a recovery; ``error`` records it). A scan left incomplete by a pid the driver names (after one rescan
+    ``rescan_settle_sec`` later) refuses an automatic reset; an operator reset records it, its own gate having ruled (04
+    I6/I7). A gap no pid explains (an unprivileged /proc walk) is recorded only: no pid is there to signal or wait for.
+    A gap whose pid is a zombie (``zombie_of``) is classified first, with no wait: one whose whole thread group has
+    exited is no holder and leaves the gaps, unless ``users_outside`` finds the device open in a process the driver does
+    not name or cannot walk every process (then it stays a gap). A zombie leader whose live threads show a device fd or
+    mapping stays a gap: refused after the one rescan. When every gap left is a zombie whose live threads cannot settle
+    it, the scan looks again every ``rescan_settle_sec`` until they do or ``zombie_wait_sec`` passes (the caller's
+    bound: an automatic reset's ends before the hold's 10-min ladder), once per (pid, start time). A gap on a live or
+    unreadable pid gets the one rescan. Nothing is signalled for any of this."""
     read_starttime = read_starttime or device_holders._read_proc_starttime
     unkillable = unkillable or _unkillable
     offbus_chips = offbus_chips or _offbus_bound_chips

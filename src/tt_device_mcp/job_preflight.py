@@ -35,10 +35,9 @@ _ACL_XATTR = "system.posix_acl_access"
 def tt_metal_logs_dir(workspace: str, job_env: Mapping[str, str], inherited_env: Optional[Mapping[str, str]]) -> Path:
     """The dir tt-metal will put ``generated/`` under for this job.
 
-    ``TT_METAL_LOGS_PATH`` from the job's own env first, then from the env the job inherits
-    (``inherited_env``, None when it inherits nothing), else the job's working directory, its
-    workspace. A relative value is taken from the workspace, where the job starts.
-    """
+    ``TT_METAL_LOGS_PATH`` from the job's own env first, then from the env the job inherits (``inherited_env``, None
+    when it inherits nothing), else the job's working directory, its workspace. A relative value is taken from the
+    workspace, where the job starts."""
     raw = job_env.get(LOGS_PATH_ENV) or (inherited_env or {}).get(LOGS_PATH_ENV)
     if not raw:
         return Path(workspace)
@@ -74,10 +73,8 @@ def _has_acl(path: Path) -> bool:
 def _writable_by(path: Path, st: os.stat_result, uid: int, gids: Iterable[int]) -> bool:
     """Whether ``uid`` may create entries in the dir ``path`` (write + search).
 
-    Checked as ourselves, the kernel answers (``access``: ACLs, read-only mounts). Checked for
-    another uid, the mode bits do; a dir with an ACL is taken as writable rather than refuse a
-    job on a rule we do not evaluate.
-    """
+    Checked as ourselves, the kernel answers (``access``: ACLs, read-only mounts). Checked for another uid, the mode
+    bits do; a dir with an ACL is taken as writable rather than refuse a job on a rule we do not evaluate."""
     if uid == 0:
         return True
     if uid == os.geteuid():
@@ -117,9 +114,8 @@ def _nearest_existing(path: Path) -> tuple[Path, Optional[os.stat_result]]:
 def check_dir(path: Path, uid: int, gids: Iterable[int]) -> Optional[str]:
     """Why ``uid`` could not write tt-metal output into ``path``, or None when it can.
 
-    An existing ``path`` must be a dir the uid can write; a missing one must be creatable, so
-    its nearest existing ancestor must be a dir the uid can write.
-    """
+    An existing ``path`` must be a dir the uid can write; a missing one must be creatable, so its nearest existing
+    ancestor must be a dir the uid can write."""
     try:
         st = os.stat(path)
     except (FileNotFoundError, NotADirectoryError):
@@ -148,10 +144,9 @@ def preflight_output_dirs(
 ) -> list[str]:
     """Every reason the job's tt-metal output dirs would refuse the job's uid; empty when fine.
 
-    A missing dir whose ancestor already failed is not reported again: one root-owned
-    ``generated/`` is one problem, not seven. A missing workspace is not checked here: the job
-    cannot start in it, and that fails the job with its own error.
-    """
+    A missing dir whose ancestor already failed is not reported again: one root-owned ``generated/`` is one problem, not
+    seven. A missing workspace is not checked here: the job cannot start in it, and that fails the job with its own
+    error."""
     logs_dir = tt_metal_logs_dir(workspace, job_env, inherited_env)
     if logs_dir == Path(workspace) and not logs_dir.is_dir():
         return []

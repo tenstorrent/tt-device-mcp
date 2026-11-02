@@ -38,9 +38,8 @@ class FabricDebt:
         # Whether any fabric pass has passed since this broker started (spec 04 I29: a boot a 77 host
         # rung brought up has spent that rung until one does).
         self.passed_since_start: bool = False
-        # When the newest healthy fabric verdict came in (time.monotonic(), 0.0 for none, or after a
-        # failed pass): a hold lifts only on one that is fresh and newer than its latest fault (spec 03
-        # I78).
+        # When the newest healthy fabric verdict came in (time.monotonic(), 0.0 for none, or after a failed pass): a
+        # hold lifts only on one that is fresh and newer than its latest fault (spec 03 I78).
         self.pass_monotonic: float = 0.0
         # Run on every settle (owed -> clear): see add_settle_listener.
         self._settle_listeners: "list[Callable[[], None]]" = []

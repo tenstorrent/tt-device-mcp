@@ -68,9 +68,8 @@ class PciSysfsWriter:
         return self._context if t is not None and not t.done() else ""
 
     def _latch(self, reason: str, loop: Optional[asyncio.AbstractEventLoop] = None, **fields: Any) -> None:
-        """Set the latch and tell the broker once. With ``loop`` (a write from another thread), the
-        notice runs on that loop when it is running, since the broker's hold is the loop's state; with
-        no running loop it runs here."""
+        """Set the latch and tell the broker once. With ``loop`` (a write from another thread), the notice runs on that
+        loop when it is running, since the broker's hold is the loop's state; with no running loop it runs here."""
         if self.latched:
             return
         self.latched_at, self.reason = time.time(), reason

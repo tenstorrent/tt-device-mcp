@@ -261,17 +261,14 @@ class ServerFsm:
     # ---- boot-stage construction of the health subsystem ---------------------------------------
 
     def boot(self, deps: RecoveryDeps) -> None:
-        """Construct the health subsystem this FSM roots — the BOOT state's job, run once. Never
-        per gate pass: a second :class:`HealthMonitor` would lose the fabric-verdict latch and the
-        in-flight fabric-process handle, a second :class:`RecoveryMechanism` the reset
-        cooldown/ledger state.
+        """Construct the health subsystem this FSM roots — the BOOT state's job, run once. Never per gate pass: a second
+        :class:`HealthMonitor` would lose the fabric-verdict latch and the in-flight fabric-process handle, a second
+        :class:`RecoveryMechanism` the reset cooldown/ledger state.
 
         ``deps``' four monitor-bound fields (``board_types_provider``, ``glx_board_types_provider``,
-        ``chip_buses_provider``, ``journal_skip_once``) read state that lives on the monitor
-        being built here, so they are wired here rather than demanded of the caller — the
-        chicken-and-egg this method exists to resolve. Bindings the caller supplied itself (a
-        test's own deps bag, aimed at its own monitor) are left untouched.
-        """
+        ``chip_buses_provider``, ``journal_skip_once``) read state that lives on the monitor being built here, so they
+        are wired here rather than demanded of the caller — the chicken-and-egg this method exists to resolve. Bindings
+        the caller supplied itself (a test's own deps bag, aimed at its own monitor) are left untouched."""
         # Measured once here, beside resolve_platform's commit: the two halves of a rung's arming
         # (spec 04 I17) are then the same measurement the boot rung inventory prints.
         privileges.latch()
@@ -351,18 +348,16 @@ class ServerFsm:
         eth_timeout_reset: bool = False,
         recovery: "Optional[Recovery]" = None,
     ) -> tuple[bool, dict]:
-        """Trigger one probe pass of the system — the root's read of the mesh, routed through the
-        platform's ``_verify_device`` seam so a test that replaces that seam governs this too.
-        Returns ``(healthy, evidence)`` and stores the pass on ``monitor.status()``; folds no
-        verdict into the FSM itself — whether a healthy read RELEASES (or an unhealthy one holds,
-        and with which flavour) is the caller's classification, made with context (a runtime-named
-        fault, a foreign holder) no probe pass carries.
+        """Trigger one probe pass of the system — the root's read of the mesh, routed through the platform's
+        ``_verify_device`` seam so a test that replaces that seam governs this too. Returns ``(healthy, evidence)`` and
+        stores the pass on ``monitor.status()``; folds no verdict into the FSM itself — whether a healthy read RELEASES
+        (or an unhealthy one holds, and with which flavour) is the caller's classification, made with context (a
+        runtime-named fault, a foreign holder) no probe pass carries.
 
-        ``recovery`` lets a caller that already chose its pass-scoped platform keep every read of
-        that pass on the same choice; omitted, the platform is selected fresh. ``run_eth`` asks for
-        the passive eth read without the traffic pass (spec 03 I30); it and ``fabric_stale`` (may a
-        link-drop skip of that read buy the traffic pass) are passed on only when ``run_eth`` is
-        set, so a ``_verify_device`` test fake that predates them keeps its signature.
+        ``recovery`` lets a caller that already chose its pass-scoped platform keep every read of that pass on the same
+        choice; omitted, the platform is selected fresh. ``run_eth`` asks for the passive eth read without the traffic
+        pass (spec 03 I30); it and ``fabric_stale`` (may a link-drop skip of that read buy the traffic pass) are passed
+        on only when ``run_eth`` is set, so a ``_verify_device`` test fake that predates them keeps its signature.
         ``eth_timeout_reset`` (spec 03 I61) is passed on only when set, for the same reason."""
         r = recovery if recovery is not None else self.select_recovery()
         if run_eth:
@@ -517,9 +512,8 @@ class ServerFsm:
         return list(self._readopted_jobs) if self._record.state in _READOPT_STATES else []
 
     def set_readopted_jobs(self, job_ids: Iterable[str]) -> None:
-        """Record which re-adopted jobs the startup hold waits on (spec 03 I76), [] once none does.
-        Persists only on a change. Ignored (kept []) outside BOOT/RECOVERING. Report-only: no gate,
-        hold, bound or escalation reads it."""
+        """Record which re-adopted jobs the startup hold waits on (spec 03 I76), [] once none does. Persists only on a
+        change. Ignored (kept []) outside BOOT/RECOVERING. Report-only: no gate, hold, bound or escalation reads it."""
         ids = [str(j) for j in job_ids] if self._record.state in _READOPT_STATES else []
         if ids != self._readopted_jobs:
             self._readopted_jobs = ids
@@ -531,10 +525,9 @@ class ServerFsm:
         return self._startup_check is not None and self._record.state in _READOPT_STATES
 
     def set_startup_check(self, started_at: Optional[str], deadline: Optional[str], *, in_progress: bool) -> None:
-        """Record that the startup check is in progress, when it began and the latest it may end (spec
-        03 I76), or that it no longer is. Persists only on a change. Ignored outside BOOT/RECOVERING;
-        a release, DOWN or a fault hold (on_fault with any other why) clears it. Report-only: no gate,
-        hold, bound or escalation reads it."""
+        """Record that the startup check is in progress, when it began and the latest it may end (spec 03 I76), or that
+        it no longer is. Persists only on a change. Ignored outside BOOT/RECOVERING; a release, DOWN or a fault hold
+        (on_fault with any other why) clears it. Report-only: no gate, hold, bound or escalation reads it."""
         value = {"started_at": started_at, "deadline": deadline} if in_progress else None
         if self._record.state not in _READOPT_STATES:
             value = None
@@ -612,12 +605,11 @@ class ServerFsm:
                     _logger.exception("fsm close listener failed")
 
     def on_next_close(self, callback: "Callable[[FsmRecord], None]") -> None:
-        """Run ``callback(closed_record)`` once, the next time the device reaches HEALTHY from any
-        other state — whichever path lifts it (the startup gate, a reset, the idle relift, a forced
-        escalation). Every route to HEALTHY goes through :meth:`_open_episode`, so a caller that
-        must pair an opening event with its close registers here rather than at each lift site.
-        In memory only: a caller that needs the pairing to survive a restart re-arms it from its own
-        durable rows (``run_startup_tasks`` does, from the health journal)."""
+        """Run ``callback(closed_record)`` once, the next time the device reaches HEALTHY from any other state —
+        whichever path lifts it (the startup gate, a reset, the idle relift, a forced escalation). Every route to
+        HEALTHY goes through :meth:`_open_episode`, so a caller that must pair an opening event with its close registers
+        here rather than at each lift site. In memory only: a caller that needs the pairing to survive a restart re-arms
+        it from its own durable rows (``run_startup_tasks`` does, from the health journal)."""
         self._on_close.append(callback)
 
     def on_readings(self, state: "HealthState") -> None:
@@ -695,17 +687,15 @@ class ServerFsm:
         # OUTCOME_WAITING: hold exactly where we are — see the docstring above.
 
     def reopen_after_boot(self, detail: str = "") -> bool:
-        """Reopen a DOWN episode a previous boot left behind as RECOVERING, once, so this boot's own
-        bounded paths (the idle relift, its backoff and bound) own it again (spec 03 I49).
+        """Reopen a DOWN episode a previous boot left behind as RECOVERING, once, so this boot's own bounded paths (the
+        idle relift, its backoff and bound) own it again (spec 03 I49).
 
-        DOWN is the terminal rung and no idle path re-checks it (bar an off-bus DOWN once every chip is
-        back, spec 03 I52). That is right within one boot, where
-        the ladder that took it there ran on this silicon; a reboot since is itself the biggest reset
-        the ladder has, so a carried DOWN is a verdict about a boot that is gone. Only when the record
-        was loaded from another boot and is still DOWN: ``why`` stays, ``since``
-        starts over (the bound counts from this boot), ``dirty`` clears (the caller has just placed a
-        no-reset hold) and the ``escalated`` latch drops so this boot's ladder is not pre-spent.
-        Returns whether it reopened."""
+        DOWN is the terminal rung and no idle path re-checks it (bar an off-bus DOWN once every chip is back, spec 03
+        I52). That is right within one boot, where the ladder that took it there ran on this silicon; a reboot since is
+        itself the biggest reset the ladder has, so a carried DOWN is a verdict about a boot that is gone. Only when the
+        record was loaded from another boot and is still DOWN: ``why`` stays, ``since`` starts over (the bound counts
+        from this boot), ``dirty`` clears (the caller has just placed a no-reset hold) and the ``escalated`` latch drops
+        so this boot's ladder is not pre-spent. Returns whether it reopened."""
         if self._record.state is not ServerState.DOWN or not self._crossed_boot:
             return False
         self._crossed_boot = False
@@ -720,26 +710,23 @@ class ServerFsm:
         return True
 
     def boot_merge(self, open_episode: Optional[FsmRecord], attributed_boot: Optional[dict] = None) -> ServerState:
-        """Reconcile BOOT into a real state, once, at startup. Always closed: a restart loses the
-        in-memory verification state, and sysfs reads perfectly healthy across a wedged ethernet
-        link, so nothing available at this point is proof the mesh is fit — only the startup
-        gate's own forced probe pass (enum+ARC+eth+fabric, run right after this) can open the
-        door, through the ordinary :meth:`on_readings` a healthy verdict there already goes
-        through. There is no "clean boot, skip the verify" branch here to take that shortcut.
+        """Reconcile BOOT into a real state, once, at startup. Always closed: a restart loses the in-memory verification
+        state, and sysfs reads perfectly healthy across a wedged ethernet link, so nothing available at this point is
+        proof the mesh is fit — only the startup gate's own forced probe pass (enum+ARC+eth+fabric, run right after
+        this) can open the door, through the ordinary :meth:`on_readings` a healthy verdict there already goes through.
+        There is no "clean boot, skip the verify" branch here to take that shortcut.
 
-        ``open_episode`` — an episode still open when this broker last wrote (this FSM's own
-        loaded record, or one reconstructed from the durable health-event journal on the first
-        boot after this file existed) — wins unconditionally when present: the same reasoning
-        that closes a boot with no episode applies doubly to one that was already mid-recovery.
-        With none, the fresh episode is RECOVERING(startup_unverified).
+        ``open_episode`` — an episode still open when this broker last wrote (this FSM's own loaded record, or one
+        reconstructed from the durable health-event journal on the first boot after this file existed) — wins
+        unconditionally when present: the same reasoning that closes a boot with no episode applies doubly to one that
+        was already mid-recovery. With none, the fresh episode is RECOVERING(startup_unverified).
 
-        ``attributed_boot`` — this boot's own auto-recovery ledger entry, if a broker-fired reboot
-        or power cycle brought it up — is not part of the state decision (only the startup gate
-        proves whether that escalation actually worked); it is folded into ``detail`` purely so the
-        FSM's own record names the boot's cause for anyone reading it later. Only on the boot's
-        first broker start: once a broker of this same boot has written the record, this start is a
-        restart (an autoupdate, a crash) the escalation did not cause, and naming it there stamps a
-        weeks-old power cycle onto every later restart's hold."""
+        ``attributed_boot`` — this boot's own auto-recovery ledger entry, if a broker-fired reboot or power cycle
+        brought it up — is not part of the state decision (only the startup gate proves whether that escalation actually
+        worked); it is folded into ``detail`` purely so the FSM's own record names the boot's cause for anyone reading
+        it later. Only on the boot's first broker start: once a broker of this same boot has written the record, this
+        start is a restart (an autoupdate, a crash) the escalation did not cause, and naming it there stamps a weeks-old
+        power cycle onto every later restart's hold."""
         if open_episode is not None and open_episode.state in (ServerState.RECOVERING, ServerState.DOWN):
             self._record = FsmRecord(
                 state=open_episode.state,

@@ -51,27 +51,24 @@ async def run_probe(
 ) -> tuple[Optional[int], bytes]:
     """Run ``argv`` to completion or to ``timeout_sec``, whichever comes first.
 
-    Returns ``(rc, output)``. ``rc`` is ``None`` on timeout — never a sentinel exit code, so a
-    caller cannot mistake "ran out of time" for anything the probe itself returned — and
-    ``terminate`` has already been awaited against the process group by the time this returns.
+    Returns ``(rc, output)``. ``rc`` is ``None`` on timeout — never a sentinel exit code, so a caller cannot mistake
+    "ran out of time" for anything the probe itself returned — and ``terminate`` has already been awaited against the
+    process group by the time this returns.
 
-    ``stream=True`` drains stdout line by line as it arrives instead of waiting for EOF via
-    ``communicate()``. The probe most worth reading is the one that times out, and
-    ``communicate()`` yields nothing once the task awaiting it is cancelled — a streaming drain
-    is what lets a caller still see everything printed up to the moment it gave up.
+    ``stream=True`` drains stdout line by line as it arrives instead of waiting for EOF via ``communicate()``. The probe
+    most worth reading is the one that times out, and ``communicate()`` yields nothing once the task awaiting it is
+    cancelled — a streaming drain is what lets a caller still see everything printed up to the moment it gave up.
 
-    ``track`` registers the live process for the caller's dead-chip kill path for exactly the
-    duration of the call, and is always cleared again before returning, on every exit path.
+    ``track`` registers the live process for the caller's dead-chip kill path for exactly the duration of the call, and
+    is always cleared again before returning, on every exit path.
 
-    ``reap_sec`` > 0 waits up to that long, after ``terminate``, for the killed process to finish
-    exiting. Until it does, the driver can still list its pid while its fd table is already gone,
-    so a holder scan run right after a timed-out probe reads as incomplete and defers a reset the
-    broker's own dead probe should never block.
+    ``reap_sec`` > 0 waits up to that long, after ``terminate``, for the killed process to finish exiting. Until it
+    does, the driver can still list its pid while its fd table is already gone, so a holder scan run right after a
+    timed-out probe reads as incomplete and defers a reset the broker's own dead probe should never block.
 
     A probe that ends by SIGTERM/SIGKILL while the host or the broker is shutting down raises
-    ``shutdown.CheckInterruptedByShutdown`` (``name`` labels it, else ``argv[0]``): the shutdown
-    killed it, it measured nothing, and no caller may count it (spec 03 I63).
-    """
+    ``shutdown.CheckInterruptedByShutdown`` (``name`` labels it, else ``argv[0]``): the shutdown killed it, it measured
+    nothing, and no caller may count it (spec 03 I63)."""
     proc: Optional[asyncio.subprocess.Process] = None
     try:
         proc = await asyncio.create_subprocess_exec(

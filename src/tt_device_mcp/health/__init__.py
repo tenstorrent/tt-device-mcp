@@ -19,11 +19,10 @@ both files) — every name either of them needs from here is either:
 
 from __future__ import annotations
 
-# chip_state: the per-chip lost/recovering gate in front of every poller read of a chip (spec 03 I66).
-# hold_report: the /health hold report (spec 03 I72, spec 04 I75): its pure helpers, plus the read-only probes
-# server.py feeds them (board-type normalising, off-bus chip ids, PCI bus numbers, the UBB tray
-# tables and the whole-tray classifier the power-cycle rung itself uses), so the report names a
-# hold the way the ladder does.
+# chip_state: the per-chip lost/recovering gate in front of every poller read of a chip (spec 03 I66). hold_report: the
+# /health hold report (spec 03 I72, spec 04 I75): its pure helpers, plus the read-only probes server.py feeds them
+# (board-type normalising, off-bus chip ids, PCI bus numbers, the UBB tray tables and the whole-tray classifier the
+# power-cycle rung itself uses), so the report names a hold the way the ladder does.
 from tt_device_mcp.health import chip_state, hold_report
 
 # The shared health vocabulary: HealthMonitor.status() returns a HealthState, and server.py both
@@ -104,11 +103,10 @@ from tt_device_mcp.health.monitors.pci import (
     sysfs_chip_ids,
 )
 
-# The post-reset fabric debt (spec 04 I32): every reset path and broker start marks it owed, and
-# server.py's release funnel and the gate read it to hold fabric-unverified until a pass settles it.
-# The one in-flight PCI sysfs writer and its PCI-wedged latch (spec 04 I76): server.py wires the latch
-# to the hold and the power-cycle request, and clears it only on a verified lift; telemetry.py's
-# dead-chip valve skips chips while it is set and removes chips only through it.
+# The post-reset fabric debt (spec 04 I32): every reset path and broker start marks it owed, and server.py's release
+# funnel and the gate read it to hold fabric-unverified until a pass settles it. The one in-flight PCI sysfs writer and
+# its PCI-wedged latch (spec 04 I76): server.py wires the latch to the hold and the power-cycle request, and clears it
+# only on a verified lift; telemetry.py's dead-chip valve skips chips while it is set and removes chips only through it.
 from tt_device_mcp.health.pci_writer import PCI_WRITER, PciWedged
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (

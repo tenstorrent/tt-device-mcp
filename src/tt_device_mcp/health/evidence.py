@@ -68,10 +68,8 @@ MAX_CHIPS_BYTES = 256 * 1024 * 1024
 def _append_durable(path: Path, rec: dict, max_bytes: int) -> bool:
     """Append one JSON record and fsync it. True only once the fsync returned (spec 03 I95).
 
-    fsync per record is the entire contract: the events worth having are the ones
-    written moments before the machine dies. Never raises — a journal that cannot be
-    written must not take the broker down with it.
-    """
+    fsync per record is the entire contract: the events worth having are the ones written moments before the machine
+    dies. Never raises — a journal that cannot be written must not take the broker down with it."""
     try:
         HEALTH_DIR.mkdir(parents=True, exist_ok=True)
         # Roll before writing, so the cap holds even if the process dies mid-append.
@@ -217,19 +215,17 @@ def _drain_trace() -> None:
 def append_trace(sample: dict, ts: Optional[float] = None) -> bool:
     """Persist one telemetry sample as it is taken.
 
-    Queued for the trace's own writer thread, which does the fsync; this returns at once (spec 03
-    I98). The row carries ``ts`` (the read time; this call's time when omitted), not the write's.
-    False when the row could not be queued (backlog full, or the writer could not start).
+    Queued for the trace's own writer thread, which does the fsync; this returns at once (spec 03 I98). The row carries
+    ``ts`` (the read time; this call's time when omitted), not the write's. False when the row could not be queued
+    (backlog full, or the writer could not start).
 
-    The in-memory ring is enough to explain a failed JOB, because the broker survives to
-    read it. It is worthless for explaining a REBOOT: the host goes down and takes the ring
-    with it, which is why nobody has ever seen the seconds leading into one of these
-    crashes. On disk, the last lines before the machine died are exactly that.
+    The in-memory ring is enough to explain a failed JOB, because the broker survives to read it. It is worthless for
+    explaining a REBOOT: the host goes down and takes the ring with it, which is why nobody has ever seen the seconds
+    leading into one of these crashes. On disk, the last lines before the machine died are exactly that.
 
-    This is what makes the next reboot decisive. If a chip's heartbeat freezes and the box
-    dies moments later, a core stalled on a hung ASIC is the story. If every chip is ticking
-    normally right up to the last sample, it is not — and the CPU erratum is.
-    """
+    This is what makes the next reboot decisive. If a chip's heartbeat freezes and the box dies moments later, a core
+    stalled on a hung ASIC is the story. If every chip is ticking normally right up to the last sample, it is not — and
+    the CPU erratum is."""
     global _trace_writer
     rec = {"ts": time.time() if ts is None else float(ts), "chips": sample}
     try:
@@ -470,21 +466,18 @@ def capture_incident(
 ) -> Optional[Path]:
     """Freeze everything a root-cause investigation will want, at the moment it exists.
 
-    The broker's decision was already being recorded; the evidence behind it was not. The
-    job's own output, the kernel's account of the bus, the reset's full transcript, the
-    fabric validator's full transcript, and the telemetry trace leading into the failure
-    all lived somewhere volatile — a rotating log, a kernel ring buffer an ungraceful
-    reboot erases, a truncated string in a JSON field. Each one is copied here, once,
-    while it still exists.
+    The broker's decision was already being recorded; the evidence behind it was not. The job's own output, the kernel's
+    account of the bus, the reset's full transcript, the fabric validator's full transcript, and the telemetry trace
+    leading into the failure all lived somewhere volatile — a rotating log, a kernel ring buffer an ungraceful reboot
+    erases, a truncated string in a JSON field. Each one is copied here, once, while it still exists.
 
-    ``fabric_since`` is when the calling gate pass began, ``fabric_output_at`` when the run that
-    produced ``fabric_output`` began. With ``fabric_since`` set, output from an earlier pass is
-    stale: it is left out of the bundle, and incident.json says so, so no bundle presents another
-    pass's transcript as this one's; fresh output goes to fabric.log under a header naming its run
-    time (spec 03 I57). Without ``fabric_since`` the output is kept as given.
+    ``fabric_since`` is when the calling gate pass began, ``fabric_output_at`` when the run that produced
+    ``fabric_output`` began. With ``fabric_since`` set, output from an earlier pass is stale: it is left out of the
+    bundle, and incident.json says so, so no bundle presents another pass's transcript as this one's; fresh output goes
+    to fabric.log under a header naming its run time (spec 03 I57). Without ``fabric_since`` the output is kept as
+    given.
 
-    Never raises. Returns the bundle directory.
-    """
+    Never raises. Returns the bundle directory."""
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     jid = (job or {}).get("id", "none")
     root = HEALTH_DIR / INCIDENTS_DIR / f"{stamp}_{label}_{jid}"

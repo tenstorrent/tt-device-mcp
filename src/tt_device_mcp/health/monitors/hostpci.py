@@ -133,11 +133,10 @@ _NO_DEVICE_VENDOR = 0xFFFF
 
 
 def config_vendor_state(bdf: str, devices_dir: Optional[Path] = None) -> str:
-    """:data:`CONFIG_PRESENT` when the first two bytes of ``<bdf>/config`` read 0x1e52 now,
-    :data:`CONFIG_MISSING` when they read 0xffff (nothing answers at that address), else
-    :data:`CONFIG_UNREADABLE` (an OSError, a short read, any other value): no evidence either way,
-    never taken as present or missing. Read-only: no ``/dev/tenstorrent`` open, no config write.
-    One small read; call it only for a chip already suspect, never for every chip between jobs."""
+    """:data:`CONFIG_PRESENT` when the first two bytes of ``<bdf>/config`` read 0x1e52 now, :data:`CONFIG_MISSING` when
+    they read 0xffff (nothing answers at that address), else :data:`CONFIG_UNREADABLE` (an OSError, a short read, any
+    other value): no evidence either way, never taken as present or missing. Read-only: no ``/dev/tenstorrent`` open, no
+    config write. One small read; call it only for a chip already suspect, never for every chip between jobs."""
     try:
         with open((devices_dir or pci.PCI_DEVICES_DIR) / bdf / "config", "rb", buffering=0) as f:
             raw = f.read(2)
@@ -158,12 +157,11 @@ def config_vendor_state(bdf: str, devices_dir: Optional[Path] = None) -> str:
 # ports, so they train x1 by design and the endpoint's own cap alone would hold every one of them.
 # Each link is also judged against the best it has shown on a passing check, banked here.
 PCIE_LINK_BASELINE_FILE = "pcie_link_baseline.json"
-# Device ids whose trained speed is judged as well as their width. ASPM (L0s/L1) changes a link's
-# power state, never the speed it trained at, but a device may still retrain slower on its own while
-# idle (autonomous speed change), and that is a power state, not a fault. Blackhole (0xb140) is
-# listed on evidence: every link on a 32-chip Galaxy read its capped 32 GT/s on every recorded
-# pass, idle or not. Any other device is judged on width only, with its speed kept as evidence,
-# until its links show the same.
+# Device ids whose trained speed is judged as well as their width. ASPM (L0s/L1) changes a link's power state, never the
+# speed it trained at, but a device may still retrain slower on its own while idle (autonomous speed change), and that
+# is a power state, not a fault. Blackhole (0xb140) is listed on evidence: every link on a 32-chip Galaxy read its
+# capped 32 GT/s on every recorded pass, idle or not. Any other device is judged on width only, with its speed kept as
+# evidence, until its links show the same.
 SPEED_JUDGED_DEVICE_IDS = frozenset({"0xb140"})
 
 

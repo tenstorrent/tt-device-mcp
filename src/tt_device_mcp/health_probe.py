@@ -208,9 +208,8 @@ class Probe:
         return total
 
     def device_op_lock(self) -> Optional[str]:
-        """The broker's in-flight device op from its inhibit file or its flock, or None. A file
-        whose pid is gone was left by a killed broker and is ignored, as the auto-updater ignores
-        it. The flock is only tested, never kept."""
+        """The broker's in-flight device op from its inhibit file or its flock, or None. A file whose pid is gone was
+        left by a killed broker and is ignored, as the auto-updater ignores it. The flock is only tested, never kept."""
         try:
             text = device_op_inhibit().read_text().strip()
         except FileNotFoundError:
@@ -361,11 +360,10 @@ class Probe:
         return True
 
     def _check_poller(self, unit: str) -> Optional[str]:
-        """Restart a stopped, enabled poller. Its state, 'absent' when it is not installed, or
-        None when the broker stopped being idle. The episode (spec 08 I17) opens when the probe
-        first has to act and closes after POLLER_OK_LAPS active laps in a row; it pages once,
-        when a start leaves the unit down, when it went down again inside the episode, or when
-        it stays 'activating' for POLLER_ACTIVATING_LAPS laps."""
+        """Restart a stopped, enabled poller. Its state, 'absent' when it is not installed, or None when the broker
+        stopped being idle. The episode (spec 08 I17) opens when the probe first has to act and closes after
+        POLLER_OK_LAPS active laps in a row; it pages once, when a start leaves the unit down, when it went down again
+        inside the episode, or when it stays 'activating' for POLLER_ACTIVATING_LAPS laps."""
         key = f"health_probe_telemetry_down:{unit}"
         rec = self.state.setdefault("pollers", {})
         if self.systemctl("show", "-p", "LoadState", "--value", unit) in ("", "not-found"):
