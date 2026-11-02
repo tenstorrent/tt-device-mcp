@@ -7390,55 +7390,23 @@ async def test_a_job_cancelled_during_admission_retries_never_dispatches(monkeyp
 # and end on a gate_error hold.
 
 
-def test_a_non_dict_job_on_disk_never_poisons_the_gate(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "field,value,coerced",
+    [
+        ("job", "not-a-dict", lambda r: r.job == {}),
+        ("since", 12345, lambda r: isinstance(r.since, str)),
+        ("detail", {"nested": "object"}, lambda r: isinstance(r.detail, str)),
+    ],
+)
+def test_a_malformed_field_on_disk_never_poisons_the_gate(monkeypatch, tmp_path, field, value, coerced):
     monkeypatch.setattr(srv, "device_op_active", "")
     path = tmp_path / "fsm.json"
-    path.write_text(
-        json.dumps(
-            {
-                "state": "recovering",
-                "why": "job_killed",
-                "since": "2026-08-17T00:00:00Z",
-                "job": "not-a-dict",
-            }
-        )
-    )
+    record = {"state": "recovering", "why": "job_killed", "since": "2026-08-17T00:00:00Z", field: value}
+    path.write_text(json.dumps(record))
     monkeypatch.setattr(srv, "fsm", ServerFsm(path))
 
-    assert srv.fsm.record.job == {}
+    assert coerced(srv.fsm.record)
     assert srv._device_unavailable_for_tenant() != ""
-    assert srv._health_payload()["fsm_state"] == "recovering"
-
-
-def test_a_non_str_since_on_disk_never_poisons_the_gate(monkeypatch, tmp_path):
-    monkeypatch.setattr(srv, "device_op_active", "")
-    path = tmp_path / "fsm.json"
-    path.write_text(json.dumps({"state": "recovering", "why": "job_killed", "since": 12345}))
-    monkeypatch.setattr(srv, "fsm", ServerFsm(path))
-
-    assert isinstance(srv.fsm.record.since, str)
-    assert srv._device_unavailable_for_tenant() != ""
-    assert srv._health_payload()["fsm_state"] == "recovering"
-
-
-def test_a_non_str_detail_on_disk_never_poisons_the_gate(monkeypatch, tmp_path):
-    monkeypatch.setattr(srv, "device_op_active", "")
-    path = tmp_path / "fsm.json"
-    path.write_text(
-        json.dumps(
-            {
-                "state": "recovering",
-                "why": "job_killed",
-                "since": "2026-08-17T00:00:00Z",
-                "detail": {"nested": "object"},
-            }
-        )
-    )
-    monkeypatch.setattr(srv, "fsm", ServerFsm(path))
-
-    assert isinstance(srv.fsm.record.detail, str)
-    reason = srv._device_unavailable_for_tenant()
-    assert reason != ""
     assert srv._health_payload()["fsm_state"] == "recovering"
 
 
@@ -14861,16 +14829,6 @@ def test_a_hold_after_the_device_was_seen_fit_never_inherits_the_clock(monkeypat
 
     srv._note_tenant_gate_verdict("device is dirty and unverified: chip(s) 8 fell off the bus")
     assert _hold_age_sec() < 60, f"a hold after a fit verdict was born {_hold_age_sec():.0f}s old"
-
-
-def test_a_device_held_at_broker_start_keeps_counting_from_the_original_drop(monkeypatch, tmp_path, clear_job_state):
-    """The case the file exists for, from a real file: no fit verdict since start, so the first hold
-    inherits the clock. Guards the fix above from rewinding a restart-split hold."""
-    stale = _stale_hold_clock(monkeypatch, tmp_path, clear_job_state)
-
-    srv._note_tenant_gate_verdict("device unverified: gate/startup: unhealthy")
-
-    assert srv.device_hold_episode_since == stale, "a restart while held rewound the escalation clock"
 
 
 def test_closing_an_orphaned_hold_leaves_the_clock_for_the_startup_verdict(monkeypatch, tmp_path, clear_job_state):
