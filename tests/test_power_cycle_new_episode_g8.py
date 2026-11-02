@@ -45,7 +45,6 @@ def g8(monkeypatch, tmp_path):
     clock = {"now": G8_CYCLE_ASKED}
     monkeypatch.setattr(srv, "_current_boot_id", lambda: boot["id"])
     monkeypatch.setattr(recovery_base, "POWER_CYCLE_MIN_INTERVAL_SEC", 1800)
-    monkeypatch.setattr(srv.recovery_mechanism, "_power_cycle_backstop_paged", 0.0)
     monkeypatch.setattr(recovery_base, "time", SimpleNamespace(time=lambda: clock["now"], monotonic=_time.monotonic))
     (d / recovery_base.AUTO_RECOVERY_LEDGER).write_text(
         json.dumps({"action": "power-cycle", "boot_id": "boot-1", "at_epoch": G7_CYCLE}) + "\n"

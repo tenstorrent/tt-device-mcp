@@ -686,9 +686,6 @@ def escalation(os_first, monkeypatch, tmp_path):
     mech = srv.recovery_mechanism
     monkeypatch.setattr(mech, "host_action_requested", None)
     monkeypatch.setattr(mech, "_power_cycle_not_launched_paged", None)
-    # The process-wide mechanism keeps the I72 miss page's throttle: a page an earlier test on this
-    # worker sent would silence this test's page for an hour.
-    monkeypatch.setattr(mech, "_power_cycle_miss_paged", 0.0)
     monkeypatch.setattr(mech, "_device_hold_episode_since", lambda: "held-since-1")
     pages = []
     os_first.update(mech=mech, pages=pages, hevents=hevents)
@@ -1150,7 +1147,7 @@ def test_a_warm_reboot_still_held_under_a_cooldown_or_the_backstop_waits_for_the
     then refuses the cycle (I65 cooldown or I9 backstop) and its own retry at that wait's end is the
     only one left: the missed retry is never armed again in the episode."""
     mech = warm_rebooted["mech"]
-    for attr in ("_power_cycle_backstop_logged", "_power_cycle_backstop_paged", "_ac_power_info"):
+    for attr in ("_power_cycle_backstop_logged", "_ac_power_info"):
         monkeypatch.setattr(mech, attr, getattr(mech, attr))
     _prepend_cycles_that_ran(warm_rebooted, *earlier)
     monkeypatch.setattr(mech, "_device_hold_episode_since", lambda: "held-since-2")

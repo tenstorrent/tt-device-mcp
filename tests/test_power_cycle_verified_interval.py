@@ -31,7 +31,6 @@ def ledger(monkeypatch, tmp_path):
     d = _ledger_dir(monkeypatch, tmp_path)
     monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-B")
     monkeypatch.setattr(recovery_base, "POWER_CYCLE_MIN_INTERVAL_SEC", INTERVAL)
-    monkeypatch.setattr(srv.recovery_mechanism, "_power_cycle_backstop_paged", 0.0)
     path = d / recovery_base.AUTO_RECOVERY_LEDGER
     path.write_text(json.dumps({"action": "power-cycle", "boot_id": "boot-A", "at_epoch": CYCLED_AT}) + "\n")
     return path

@@ -400,7 +400,6 @@ def ladder(monkeypatch, tmp_path, clear_job_state):
     m = g.mechanism
     monkeypatch.setattr(m, "scope_active", lambda: None)
     monkeypatch.setattr(m, "bmc_guard_state", None)
-    monkeypatch.setattr(m, "_bmc_guard_paged", False)
     monkeypatch.setattr(m, "last_reset_failed", False)
 
     async def no_pollers(on, log):

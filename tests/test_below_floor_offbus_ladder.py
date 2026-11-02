@@ -515,7 +515,6 @@ async def test_a_fabric_check_short_of_the_cabled_links_keeps_the_hold(
     missing: the check fails and the hold stands."""
     m, state = topo
     state["first"] = _LOST
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS", raising=False)
     order, events, counters = _rig(monkeypatch, tmp_path, rescan_heals=True)
 
     async def verify(expected, log, run_fabric=True, **k):
@@ -797,7 +796,6 @@ async def test_after_the_sweep_sbr_a_fabric_check_short_of_the_cabled_links_powe
     missing: the check fails, the hold stands and the climb goes on to the power cycle."""
     m, state = topo
     state["first"] = _LOST
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS", raising=False)
     order, events, counters, _killed = _regressed(monkeypatch, tmp_path, heals=True)
 
     async def verify(expected, log, run_fabric=True, **k):
@@ -1328,7 +1326,6 @@ async def test_a_fabric_check_short_of_the_cabled_links_after_the_mesh_reset_bef
     hold stays and the power cycle follows in the same pass."""
     m, state = topo
     state["first"] = _LOST
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS", raising=False)
     order, events, counters, reasons = _b1_sweep(monkeypatch, tmp_path, verdicts=[False, True], mesh_heals=True)
     fabric = []
 

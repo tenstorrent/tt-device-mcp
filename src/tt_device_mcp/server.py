@@ -6139,32 +6139,30 @@ def _watch_idle_foreign_holders(scan: HolderScan, now: float) -> list:
         seen.add(key)
         entry = _idle_holders.get(key)
         if entry is None:
-            _idle_holders[key] = {"ticks": ticks, "since": now, "evented": False, "alerted": False}
+            _idle_holders[key] = {"ticks": ticks, "since": now, "evented": False}
             continue
         if entry["ticks"] != ticks:
             entry["ticks"], entry["since"] = ticks, now
             continue
         idle = now - entry["since"]
-        if idle < threshold or entry["alerted"]:
+        if idle < threshold or entry["evented"]:
             continue
         user = h.username
-        if not entry["evented"]:
-            entry["evented"] = True
-            named.append({"pid": h.pid, "user": user, "idle_sec": int(idle)})
-            if logger:
-                logger.warning(
-                    f"IDLE-HOLDER {user} (pid {h.pid}) holds the device with no CPU time for "
-                    f"{int(idle)}s — named, never signalled"
-                )
-            health_event(
-                "idle_foreign_holder",
-                pid=h.pid,
-                uid=h.uid,
-                user=user,
-                idle_sec=int(idle),
-                threshold_sec=int(threshold),
+        entry["evented"] = True
+        named.append({"pid": h.pid, "user": user, "idle_sec": int(idle)})
+        if logger:
+            logger.warning(
+                f"IDLE-HOLDER {user} (pid {h.pid}) holds the device with no CPU time for "
+                f"{int(idle)}s — named, never signalled"
             )
-        entry["alerted"] = True
+        health_event(
+            "idle_foreign_holder",
+            pid=h.pid,
+            uid=h.uid,
+            user=user,
+            idle_sec=int(idle),
+            threshold_sec=int(threshold),
+        )
     for key in list(_idle_holders):
         if key not in seen:
             del _idle_holders[key]

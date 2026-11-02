@@ -269,7 +269,6 @@ __all__ = [
     # the reset's own systemd scope prefix: the in-flight reader cut never kills it (spec 03 I83)
     "RESET_SCOPE_PREFIX",
     "_declared_reset_mode",
-    # how often a standing hardware-fault hold is paged again (spec 03 I42)
     # how long a requested host reboot/power cycle keeps the forced ladder from resetting
     "host_action_pending_sec",
     # the escalation decision the gate acts on: the evidence it hands next_stage, and every

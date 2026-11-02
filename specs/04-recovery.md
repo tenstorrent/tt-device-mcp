@@ -1339,7 +1339,7 @@ each rung fires only when the gentler one failed or cannot apply.
   at the 77-only early exit any more. The exits that end a hold with no rung below the bound, and
   that the bound overrides: the watchdog's 77-only early return; the I30 no-reset hold
   (`_hold_without_reset`: a topology mismatch or missing cable, a known fabric fault, a 77 with no
-  fault measured), which still pages and then runs the ladder; the I29 77 hold with no host rung
+  fault measured), which still journals and then runs the ladder; the I29 77 hold with no host rung
   after the episode's reset and last-chance sweep, which the bound's ladder reaches and follows with
   the host rung in the same run (the reset and sweep it already ran are not repeated, I36); the I46
   latch; and a killed job's leftover holder (spec 01 I16). That leftover read as a tenant,

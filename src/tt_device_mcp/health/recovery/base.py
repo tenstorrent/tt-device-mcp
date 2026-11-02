@@ -323,7 +323,6 @@ POWER_CYCLE_MISS_PAGE_AFTER = 2
 # Spec 04 I88: written the first time the BMC reports a real restart cause, so a later "unknown" from
 # the same BMC can refute a power cycle; a BMC never seen to report one only leaves it unconfirmed.
 POWER_CYCLE_CAUSE_CAPABLE_FILE = "power_cycle_restart_cause_capable.json"
-POWER_CYCLE_MISS_REPAGE_SEC = 3600
 
 # Spec 04 I73: a whole tray (class A) still off the bus after this many broker power cycles that took
 # the host down, with no verified release since, may need AC removal (no in-band cycle healed some such
@@ -587,18 +586,12 @@ class RecoveryMechanism:
         # Spec 04 I91: the last mesh reset's BMC preflight refusal or legacy-retimer-reset finding,
         # shown in /health as mesh_reset_bmc_guard; None when the last mesh reset showed neither.
         self.bmc_guard_state: Optional[dict] = None
-        self._bmc_guard_paged = False
 
         # Two callers (the auto-recovery reset launcher and the operator-run reset tool) need this
         # sequence and they must build it identically, because the scope name is what every other
         # protection keys on.
         self.reset_scope_seq = 0
-        # The newest power-cycle stamp the backstop already paged for, so a held box pages once per
-        # cap reached, not on every gate pass.
-        self._power_cycle_backstop_paged: float = 0.0
         self._power_cycle_backstop_logged: float = 0.0
-        # Spec 04 I72: when (monotonic) the missed-power-cycle page last went out; 0.0 = never.
-        self._power_cycle_miss_paged: float = 0.0
         # Spec 04 I73: the chips of the whole tray(s) the last class check saw off the bus (None when
         # the off-bus set is not class A), the AC-needed page's monotonic stamp (0.0 = never) and the
         # ledger stamps already journaled as cycles that did not heal.
@@ -1378,13 +1371,12 @@ class RecoveryMechanism:
         """Read a mesh reset's output for the guard (spec 04 I91) and return the rc to report.
 
         A wrapper that could not arm the guard ran no reset: rc None (not fired, no cooldown). A refused
-        0x0, or tt-smi announcing its 0x0 retry, is journaled host_at_risk, paged once per episode,
-        shown in /health, and never reads as a passing reset."""
+        0x0, or tt-smi announcing its 0x0 retry, is journaled host_at_risk, shown in /health, and never
+        reads as a passing reset."""
         found = ipmi_guard.scan_reset_output(text)
         if found is None:
             if rc == 0:
                 self.bmc_guard_state = None
-                self._bmc_guard_paged = False
             return rc
         now = datetime.now().isoformat(timespec="seconds")
         if found["not_armed"] and not (found["refused"] or found["fallback"]):
@@ -1409,8 +1401,6 @@ class RecoveryMechanism:
             "reason": message,
             "at": now,
         }
-        if not self._bmc_guard_paged:
-            self._bmc_guard_paged = True
         return 1 if rc == 0 else rc
 
     async def reset_with_quiesce(
@@ -2305,7 +2295,7 @@ class RecoveryMechanism:
             self._journal_missed_power_cycles(fresh, ledger, now_epoch)
 
     def _journal_missed_power_cycles(self, rows: list[dict], ledger: list[dict], now_epoch: float, **extra) -> None:
-        """One power_cycle_request_missed event per row; the page from the second miss on (I72)."""
+        """One power_cycle_request_missed event per row (I72)."""
         state = self.power_cycle_miss_state(ledger, now_epoch=now_epoch)
         for r in rows:
             health_event(
@@ -2317,10 +2307,6 @@ class RecoveryMechanism:
                 host_at_risk=True,
                 **extra,
             )
-        if state is not None and state["missed"] >= POWER_CYCLE_MISS_PAGE_AFTER:
-            mono = time.monotonic()
-            if not self._power_cycle_miss_paged or mono - self._power_cycle_miss_paged >= POWER_CYCLE_MISS_REPAGE_SEC:
-                self._power_cycle_miss_paged = mono
 
     def _page_power_cycle_not_launched(self, label: str, reason: str, why: str) -> None:
         """Spec 04 I88: a power cycle that could not start with the OS brought down first fired
@@ -2741,7 +2727,6 @@ class RecoveryMechanism:
         self.power_cycle_cooldown_state = None
         with contextlib.suppress(OSError):
             (health_dir() / POWER_CYCLE_DEADLINE_FILE).unlink(missing_ok=True)  # the hold episode is over
-        self._power_cycle_miss_paged = 0.0
         self.whole_tray_off = None
         self._ac_power_paged = 0.0
         self._ac_power_logged = set()
@@ -2941,8 +2926,6 @@ class RecoveryMechanism:
             health_event(
                 "power_cycle_backstop", count=len(stamps), reason=why, allowed_at_epoch=until, host_at_risk=True
             )
-        if newest != self._power_cycle_backstop_paged:
-            self._power_cycle_backstop_paged = newest
         return {
             "until": until,
             "last": newest,

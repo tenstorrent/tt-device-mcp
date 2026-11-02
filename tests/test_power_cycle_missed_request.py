@@ -66,18 +66,10 @@ def _health(monkeypatch, at):
     return srv._health_payload(now=datetime.fromtimestamp(at)).get("power_cycle_cooldown")
 
 
-@pytest.fixture
-def paged(cool, monkeypatch):  # noqa: F811
-    """Pages sent. The mechanism is shared across tests: start with no page sent yet."""
-    sent = []
-    monkeypatch.setattr(cool["g"].mechanism, "_power_cycle_miss_paged", 0.0)
-    return sent
-
-
 # ---- (1) a missed request is asked again as its window ends -----------------------------------------
 
 
-def test_a_request_the_host_never_acted_on_is_asked_again_as_its_window_ends(cool, monkeypatch, paged):  # noqa: F811
+def test_a_request_the_host_never_acted_on_is_asked_again_as_its_window_ends(cool, monkeypatch):  # noqa: F811
     """The request returned, the host never went down: at the end of its window it is marked missed
     on disk and asked again at once, with no backoff on top of the window that already gave the
     cycler its time; not 30 min or 4 h after the request."""
@@ -90,10 +82,9 @@ def test_a_request_the_host_never_acted_on_is_asked_again_as_its_window_ends(coo
     assert _watchdog(cool, monkeypatch, T0 + WINDOW) == [T0 + WINDOW]
     allowed, why = m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=T0 + WINDOW)
     assert allowed, why
-    assert paged == [], "one miss pages no one"
 
 
-def test_later_retries_wait_5_min_after_their_window_and_never_stop(cool, paged):  # noqa: F811
+def test_later_retries_wait_5_min_after_their_window_and_never_stop(cool):  # noqa: F811
     m = cool["g"].mechanism
     at, waits = T0, []
     for _ in range(5):
@@ -172,7 +163,7 @@ async def test_a_whole_tray_drop_still_goes_to_the_power_cycle_after_a_missed_re
 # ---- (2) missed requests do not double the cooldown -----------------------------------------------
 
 
-def test_two_missed_requests_leave_the_interval_at_base_and_page(cool, paged):  # noqa: F811
+def test_two_missed_requests_leave_the_interval_at_base_and_page(cool):  # noqa: F811
     m = cool["g"].mechanism
     _request(cool, T0)
     _window_ends(cool, T0 + WINDOW)
@@ -230,7 +221,7 @@ def test_a_cycle_that_took_the_host_down_still_anchors_the_cooldown_and_doubles(
 
 
 def test_cycles_that_land_after_their_window_still_double_the_cooldown_and_count_for_the_backstop(
-    cool, paged  # noqa: F811
+    cool,  # noqa: F811
 ):
     """The loop guard (spec 04 I65/I72): a slow cycler takes the host down 2 min after each window
     ran out, so each row was marked missed first. The next boot starts within the window plus the
@@ -256,7 +247,6 @@ def test_cycles_that_land_after_their_window_still_double_the_cooldown_and_count
         at = cd["until"]
     assert intervals == [1800, 3600, 7200, 14400, 14400]
     assert all(r.get("late") is True and r.get("took_host_down") is True for r in _rows()[:4])
-    assert paged == []
 
 
 def _broker_starts(monkeypatch, tmp_path):
@@ -271,7 +261,7 @@ def _broker_starts(monkeypatch, tmp_path):
 
 
 def test_a_late_cycle_whose_boot_only_reboots_still_doubles_the_cooldown_on_later_boots(
-    cool, monkeypatch, tmp_path, paged  # noqa: F811
+    cool, monkeypatch, tmp_path  # noqa: F811
 ):
     """The loop guard (spec 04 I65/I72) when the boot a late cycle brought up runs no power-cycle
     gate: it escalates by reboot once the 1 h loop guard allows it. Broker startup writes the late
@@ -308,7 +298,6 @@ def test_a_late_cycle_whose_boot_only_reboots_still_doubles_the_cooldown_on_late
     assert later_backstop == [1, 1, 1, 1]
     cycles = [r for r in _rows() if r["action"] == "power-cycle"]
     assert len(cycles) == 4 and all(r.get("took_host_down") is True and r.get("late") is True for r in cycles)
-    assert paged == []
 
 
 def test_the_startup_mark_leaves_an_unreadable_ledger_as_it_is(cool, monkeypatch, caplog):  # noqa: F811
