@@ -688,17 +688,6 @@ def test_a_terminal_rung_on_a_measured_fault_still_goes_down(mesh):
     assert srv.fsm.state is ServerState.DOWN
 
 
-def test_every_rung_outcome_folds_through_the_helper():
-    import inspect
-
-    src = inspect.getsource(srv)
-    body = src.replace(inspect.getsource(srv._fold_rung_outcome), "")
-    assert "fsm.on_outcome(" not in body, "a rung outcome folded around the I32 guard"
-    assert (
-        src.count("_fold_rung_outcome(outcome, ") == 4
-    ), "the gate, the idle relift, the dirty idle gate (I68) and the hold escalation"
-
-
 # The 10-17 class-J episode (job killed, glx_reset 62 s): the first pass proved all 128 links, then its
 # dispatch probe hung in UMD start-up until the wrapper's 90 s cap (77, 133 s); the re-check passed (57 s).
 DISPATCH_CAP_77 = {

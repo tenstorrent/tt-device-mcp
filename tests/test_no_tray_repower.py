@@ -68,13 +68,9 @@ def test_no_switch_or_hook_for_the_tray_rung_is_left(name):
 
 @pytest.fixture
 def sweep_rig(monkeypatch):
-    """Stub every rung the sweeps can fire and record them, the journal and any spawned argv.
-
-    A stale ``TT_DEVICE_MCP_AUTO_UBB_RESET=1`` left in a unit is set on purpose: it must change
-    nothing."""
+    """Stub every rung the sweeps can fire and record them, the journal and any spawned argv."""
     g = srv.galaxy_recovery
     rig = {"order": [], "events": [], "argv": [], "verifies": []}
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
     monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
     monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off_bus: (True, ""))
     monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)

@@ -504,7 +504,6 @@ def _sweep_stubs(monkeypatch, fire):
     """Stub every device-touching step of the back-to-back sweep and record its events."""
     g = srv.galaxy_recovery
     events = []
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
     monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
     monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))

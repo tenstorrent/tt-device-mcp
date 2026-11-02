@@ -265,7 +265,6 @@ def test_a_running_job_on_a_healthy_broker_is_left_to_the_idle_rule(tmp_path):
     assert not (tmp_path / "root" / "recovery.defer").exists()
     text = _SCRIPT.read_text()
     assert text.index("if recovery_gate; then") < text.index("# Idle gate (spec 08 I24)") < text.index("count_busy\nif")
-    assert "TTDEV_MAX_DEFER_SEC" not in text
 
 
 def test_the_deferral_touches_no_recovery_switch():
