@@ -20,7 +20,7 @@ import httpx2
 import pytest
 
 from tests.conftest import fsm_dirty
-from tests.test_eth_timeout_reset import ADVANCING, OUTAGE_HOLD, mesh  # noqa: F401 (fixture)
+from tests.test_eth_timeout_reset import ADVANCING, mesh  # noqa: F401 (fixture)
 from tt_device_mcp import constants
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
@@ -87,17 +87,6 @@ async def test_a_spent_latch_skips_the_kill_reset_onto_todays_path(killed, monke
     assert "kill_mesh_reset" not in killed["events"] and "kill_reset_skipped" in killed["events"]
     assert killed["fabric"] and killed["fabric"][0] == 0, "the dirty exit's fabric pass ran as before"
     assert srv._kill_reset_debt() == "", "the debt is cleared, not carried"
-
-
-@pytest.mark.asyncio
-async def test_an_outage_hold_skips_the_kill_reset(killed, monkeypatch):
-    for var, value in OUTAGE_HOLD.items():
-        monkeypatch.setenv(var, value)
-    await _gate()
-    assert killed["resets"] == [] and "kill_mesh_reset" not in killed["events"]
-    assert "kill_reset_skipped" in killed["events"]
-    assert killed["fabric"] and killed["fabric"][0] == 0, "the dirty exit's fabric pass ran instead"
-    assert srv._dispatch_reset_spent is False
 
 
 @pytest.mark.asyncio

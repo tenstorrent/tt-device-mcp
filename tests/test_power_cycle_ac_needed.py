@@ -220,7 +220,7 @@ async def test_a_class_a_sweep_a_guard_holds_runs_no_check_and_the_cycle_still_f
     guard,
 ):
     """A live tenant at the 10-min bound holds the sweep (no reset over a tenant) and leaves it due for
-    the bound's next forced run; a sweep the reset gate or the outage hold refuses runs no check. Either
+    the bound's next forced run; a sweep the reset gate refuses runs no check. Either
     way nothing is released, and the power cycle still fires at the cooldown's end."""
     await _two_cycles_that_do_not_heal(cool)
     _full_checks(cool, monkeypatch)

@@ -1281,7 +1281,7 @@ def patch_health_event(monkeypatch, fn) -> None:
     ``from health.evidence import health_event`` binding — an import copies the reference, so
     patching one module's copy never touches another's. A test that wants to see (or silence) an
     event any of these bodies emits has to patch all three, and ``pcie_guard`` (the tray re-power
-    envelope and the tray rung's disable, which the walk reaches), and ``base`` (the outage hold)."""
+    envelope and the tray rung's disable, which the walk reaches), and ``base`` (the re-enumeration rungs)."""
     monkeypatch.setattr(srv, "health_event", fn)
     monkeypatch.setattr(srv, "health_event_detached", fn)
     monkeypatch.setattr(srv, "health_event_flushed", lambda kind, timeout, **f: fn(kind, **f) or True)
