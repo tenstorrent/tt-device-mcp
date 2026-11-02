@@ -447,42 +447,11 @@ async def test_a_reset_adopted_from_a_foreign_scope(mesh, monkeypatch, verdict):
     _assert_settled(released)
 
 
-# ---- a re-power owes the AICLK ceiling too: the next job-door apply runs (spec 03 I35) ----------
-
-
-@pytest.fixture
-def ceiling(monkeypatch):
-    """An armed ceiling verified before the path runs. No real helper runs: every apply is recorded
-    and verifies, as the door's would on a healthy host. Returns the applies, by ``where``."""
-    from tt_device_mcp.health import aiclk_ceiling as ac
-    from tt_device_mcp.health.aiclk_ceiling import CEILING
-
-    monkeypatch.setenv(ac.ENV_MHZ, "900")
-    monkeypatch.setattr(ac, "health_event", lambda kind, **f: None)
-    monkeypatch.setattr(CEILING, "owed", False)
-    monkeypatch.setattr(CEILING, "disarmed", "")
-    applies = []
-
-    async def apply(where, **_):
-        applies.append(where)
-        CEILING.owed = False
-        return True, "ceiling 900 MHz applied", {}
-
-    monkeypatch.setattr(CEILING, "apply", apply)
-    return applies
-
-
-async def _door_applies_the_owed_ceiling(applies):
-    from tt_device_mcp.health.aiclk_ceiling import CEILING
-
-    assert CEILING.owed, "a re-power left the ceiling marked verified: the job door would skip it"
-    assert applies == [], "nothing in the path re-applied it, so only the door can"
-    await srv._ensure_aiclk_ceiling(None)
-    assert applies == ["pre-job"] and not CEILING.owed
+# ---- a bridge reset and an adopted reset settle only through the verified gate ----------------
 
 
 @pytest.mark.asyncio
-async def test_a_real_bridge_reset_owes_the_ceiling(mesh, monkeypatch, verdict, ceiling):
+async def test_a_real_bridge_reset_recovers_and_settles(mesh, monkeypatch, verdict):
     evidence, released = verdict
     fsm_dirty(srv, "gate/post-job: chip 8 off the bus", why="job_killed")
     monkeypatch.setattr(srv, "isolated_chips", {"8"})
@@ -494,11 +463,10 @@ async def test_a_real_bridge_reset_owes_the_ceiling(mesh, monkeypatch, verdict, 
     out = await g._fire_gate_rung("post-job", galaxy.STAGE_BRIDGE_RESET, ["8"], 32, lambda m: None, ev=None, beats=None)
     assert out == galaxy.OUTCOME_RECOVERED
     _assert_settled(released)
-    await _door_applies_the_owed_ceiling(ceiling)
 
 
 @pytest.mark.asyncio
-async def test_an_adopted_reset_owes_the_ceiling(mesh, monkeypatch, verdict, ceiling):
+async def test_an_adopted_reset_verifies_and_settles(mesh, monkeypatch, verdict):
     from tt_device_mcp.health.recovery import base
 
     evidence, released = verdict
@@ -511,7 +479,6 @@ async def test_an_adopted_reset_owes_the_ceiling(mesh, monkeypatch, verdict, cei
     assert await g._reset_and_verify_device([str(i) for i in range(32)], lambda m: None) is True
     srv._clear_device_dirty(verified=True, why="gate/post-job: verified healthy")
     _assert_settled(released)
-    await _door_applies_the_owed_ceiling(ceiling)
 
 
 @pytest.mark.asyncio

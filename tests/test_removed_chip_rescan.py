@@ -288,19 +288,6 @@ async def test_a_gate_refusal_keeps_the_bare_rescan_for_a_chip_the_broker_did_no
 
 
 @pytest.mark.asyncio
-async def test_a_removed_chip_reset_owes_the_aiclk_ceiling(tmp_path, monkeypatch, rung):
-    """Spec 03 I35: an SBR clears the firmware clock cap like any reset, including the batched reset
-    of a removed chip that returns on the pass's one rescan."""
-    owed = []
-    monkeypatch.setattr(recovery_pkg.CEILING, "mark_owed", lambda reason: owed.append(reason))
-    bus = FakeBus(tmp_path, monkeypatch)
-    bus.remove("13")
-    assert await _run({"13"}) is True
-    assert bus.trace[:2] == [("sbr", "0000:40:01.1"), ("rescan",)], bus.trace
-    assert owed == ["bridge reset of chip 13"]
-
-
-@pytest.mark.asyncio
 async def test_the_link_retrains_after_the_last_sbr_before_the_rescan(tmp_path, monkeypatch, rung):
     """PCIe needs the link retrained before config reads: one SBR_RETRAIN_SETTLE_SEC wait follows the
     last SBR release of the batch and precedes the pass's one rescan (not one wait per chip)."""

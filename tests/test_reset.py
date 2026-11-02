@@ -801,7 +801,6 @@ def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
     import re
 
     from tt_device_mcp import constants, pre_reset_scan, telemetry
-    from tt_device_mcp.health import aiclk_ceiling
     from tt_device_mcp.health import monitor as monitor_mod
     from tt_device_mcp.health.monitors import eth, heartbeat
     from tt_device_mcp.health.recovery import ipmi_guard
@@ -839,7 +838,7 @@ def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
     # The other bounded steps reset_with_quiesce runs under the same lock: the BMC check a mesh reset
     # starts with; the pre-reset holder clear (in-flight detach, one rescan settle, the wait for a
     # zombie's release, SIGTERM grace, then the wait after SIGKILL); the post-reset cut of a chip that failed (detach, one stop per
-    # poller service, the reader kill); and the clock-cap re-apply (a run plus its settle retries).
+    # poller service, the reader kill).
     bmc = ipmi_guard.BMC_PREFLIGHT_TIMEOUT_SEC
     clear = pre_reset_scan.clear_device_readers
     holder_clear = (
@@ -850,9 +849,6 @@ def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
         + default(clear, "release_sec")
     )
     cut = telemetry.INFLIGHT_DETACH_TIMEOUT_SEC + pollers / 2 + telemetry.INFLIGHT_KILL_TIMEOUT_SEC
-    aiclk = aiclk_ceiling.DEFAULT_TIMEOUT_SEC + max(
-        aiclk_ceiling.DEFAULT_TIMEOUT_SEC, aiclk_ceiling.DEFAULT_SETTLE_SEC + aiclk_ceiling.SETTLE_RETRY_MARGIN_SEC
-    )
     worst = (
         bmc
         + holder_clear
@@ -860,7 +856,6 @@ def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
         + constants.DEVICE_RESET_TIMEOUT_SEC
         + cut
         + rescan
-        + aiclk
         + retries * (finished_pass + sleep)
         + last_pass
     )
@@ -872,7 +867,6 @@ def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
     assert f"pre-reset holder clear up to {math.ceil(holder_clear)}s" in doc
     assert f"poller stop and restart up to {pollers:.0f}s" in doc
     assert f"post-reset reader cut up to {math.ceil(cut)}s" in doc
-    assert f"clock-cap re-apply up to {math.ceil(aiclk)}s" in doc
     assert f"service in TT_DEVICE_MCP_POLLER_SERVICES adds up to {3 * pollers / (2 * n_services):.0f}s" in doc
     assert f"reset {constants.DEVICE_RESET_TIMEOUT_SEC}s" in doc
     assert f"PCI rescan {rescan:.0f}s" in doc

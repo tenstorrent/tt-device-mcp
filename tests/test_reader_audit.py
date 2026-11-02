@@ -25,9 +25,7 @@ from tests.test_post_reset_gate import mesh  # noqa: F401  (fixture)
 from tt_device_mcp import health_probe, telemetry
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
-from tt_device_mcp.health import aiclk_ceiling as ac
 from tt_device_mcp.health import chip_state, read_health_events
-from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.core import Verdict
 from tt_device_mcp.health.monitors import eth, heartbeat, pci
 from tt_device_mcp.health.pci_writer import PCI_WRITER
@@ -98,7 +96,7 @@ def test_health_reads_no_lost_chip_and_the_probe_stands_back_on_it(
     assert health_probe.idle_verdict({**clean, "lost_chips": []}) is None
 
 
-# --- whole-device readers: the eth-heartbeat probe and the aiclk-ceiling helper --------------------
+# --- whole-device readers: the eth-heartbeat probe -------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -123,37 +121,6 @@ async def test_the_eth_reader_is_not_built_while_a_lost_chip_is_attached(sysfs, 
     (sysfs["dir"] / f"tenstorrent!{LOST}").unlink()  # removed: no longer attached
     await srv.health_monitor._verify_eth_heartbeat_body(60.0)
     assert built == [1, 1]
-    assert _reads_of(sysfs, LOST) == []
-
-
-@pytest.mark.asyncio
-async def test_the_aiclk_ceiling_helper_does_not_run_on_a_lost_attached_chip(sysfs, clock, monkeypatch):  # noqa: F811
-    for k in (ac.ENV_CMD, ac.ENV_TIMEOUT, ac.ENV_PYTHON, ac.ENV_SETTLE):
-        monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv(ac.ENV_MHZ, "900")
-    monkeypatch.setattr(CEILING, "owed", True)
-    monkeypatch.setattr(CEILING, "disarmed", "")
-    monkeypatch.setattr(CEILING, "last", {})
-    monkeypatch.setattr(CEILING, "proc", None)
-    monkeypatch.setattr(ac, "health_event", lambda kind, **f: None)
-    runs = []
-
-    async def run_probe(argv, **_):
-        runs.append(argv)
-        return 0, '{"summary": true, "mhz": 900, "chips": 4, "ok": 4, "sent": 4}'
-
-    monkeypatch.setattr(ac, "run_probe", run_probe)
-    _lose(sysfs)
-    ok, detail, ev = await CEILING.apply("post-job")
-    assert ok is False and ev == {"lost_chips": [LOST]} and "lost and still attached" in detail
-    assert runs == [] and CEILING.owed, "not verified: the ceiling stays owed"
-
-    chip_state.set_recovering("op:test", True)
-    try:
-        await CEILING.apply("post-reset")
-    finally:
-        chip_state.set_recovering("op:test", False)
-    assert len(runs) == 1, "the reset step's own apply runs"
     assert _reads_of(sysfs, LOST) == []
 
 

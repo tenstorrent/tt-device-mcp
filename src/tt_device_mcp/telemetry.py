@@ -1362,7 +1362,7 @@ class TelemetrySampler:
             self._deps.mark_device_dirty(f"chip(s) {','.join(fresh)} fell off the PCIe bus", why="heartbeat")
             return
 
-        # Spec 03 I86: stop the broker's own readers of the mesh (the fabric check, the aiclk ceiling)
+        # Spec 03 I86: stop the broker's own readers of the mesh (the fabric check)
         # first, before the remove's up to DETACH_TIMEOUT_SEC: a SIGSTOP issues no further read and
         # closes no fd, so it is safe while the chip is still attached; the kill below still ends them.
         freeze = getattr(self._deps, "freeze_device_readers", None)

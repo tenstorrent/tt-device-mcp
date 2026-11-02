@@ -33,7 +33,6 @@ from tt_device_mcp.constants import (
 )
 from tt_device_mcp.device_holders import note_broker_internal
 from tt_device_mcp.health import chip_state
-from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.core import HealthState, Observation, Verdict
 from tt_device_mcp.health.evidence import capture_incident, health_dir, health_event
 from tt_device_mcp.health.monitors import eth, fabric, hostpci, pci
@@ -563,17 +562,6 @@ class HealthMonitor:
         if log:
             log(f"snapshot: {'OK' if ok else 'UNHEALTHY'} — {detail}")
         _record("pci", ok, detail)
-        # The operator's AICLK ceiling, re-proven (and re-applied where a chip lost it) on every
-        # pass once the snapshot showed the chips present — a reset, power cycle, boot or job exit
-        # may have cleared it — and before the eth read and the traffic pass, so no load the broker
-        # drives runs above it. ~2 ms per chip. Off (no step, no observation) when unconfigured.
-        if ok and CEILING.armed():
-            self._deps.set_device_op_detail("health check: AICLK ceiling")
-            cok, cdetail, cevidence = await CEILING.apply(phase, log=log, terminate=self._terminate_process_group)
-            if cok is not None:
-                _record("aiclk_ceiling", cok, cdetail, cevidence)
-            if cok is False:
-                return _store()
         fabric_asked = run_fabric or force_fabric
         if ok and (fabric_asked or run_eth):
             # A full pass re-arms a rung a failed self-test left off before it reads (spec 03 I28). A
@@ -1179,14 +1167,13 @@ class HealthMonitor:
 
     async def stop_check_readers(self, reason: str, grace_sec: float) -> list:
         """Spec 04 I97: end the full check's own readers at its deadline. SIGTERM the process group of
-        the fabric pass, the tt-smi snapshot and the AICLK ceiling, SIGKILL any group still alive
+        the fabric pass and the tt-smi snapshot, SIGKILL any group still alive
         ``grace_sec`` later, and mark each killed check no verdict (never a pass). Returns the pids
         signalled. Never raises."""
         stopped = []
         for proc, note in (
             (self.fabric_check_proc, self.note_fabric_check_killed),
             (self.snapshot_proc, self.note_snapshot_killed),
-            (CEILING.proc, None),
         ):
             if proc is None or getattr(proc, "returncode", None) is not None:
                 continue

@@ -2881,7 +2881,7 @@ class GalaxyRecovery(Recovery):
     async def _stop_readers_before_repeat_mesh_reset(self, offbus_chips: set, log, context: str) -> list:
         """Spec 04 I58: the sweep is about to repeat a mesh reset that already failed on exactly these
         chips. A second mesh reset after a failed one once took a Galaxy host down; the broker's own
-        readers (fabric pass, tt-smi snapshot, AICLK ceiling) are ended first, so none is mid-read on a
+        readers (fabric pass, tt-smi snapshot) are ended first, so none is mid-read on a
         chip the reset re-powers. The sweep's SBR then runs before its mesh reset (I86). Never raises."""
         reason = "the last-chance sweep repeats a mesh reset that failed on these chips"
         try:

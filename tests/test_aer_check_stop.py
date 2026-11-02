@@ -61,7 +61,6 @@ def rig(monkeypatch):
     monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", _Reader(FABRIC))
     monkeypatch.setattr(srv.health_monitor, "snapshot_proc", None, raising=False)
     monkeypatch.setattr(srv, "eth_selftest_proc", None, raising=False)
-    monkeypatch.setattr(srv.CEILING, "proc", None)
     monkeypatch.setattr(FABRIC_DEBT, "owed", "")
     log = []
     monkeypatch.setattr(
@@ -332,7 +331,6 @@ def test_a_journal_stalled_in_fsync_delays_neither_signal(monkeypatch):
     monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", _Reader(FABRIC))
     monkeypatch.setattr(srv.health_monitor, "snapshot_proc", None, raising=False)
     monkeypatch.setattr(srv, "eth_selftest_proc", None, raising=False)
-    monkeypatch.setattr(srv.CEILING, "proc", None)
     monkeypatch.setattr(srv, "logger", None)
     monkeypatch.setattr(FABRIC_DEBT, "owed", "")
     monkeypatch.setattr(srv.sampler, "ring", deque(maxlen=8))

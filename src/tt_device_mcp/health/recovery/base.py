@@ -25,8 +25,6 @@ from tt_device_mcp import aio, alert, metrics, pre_reset_scan, privileges
 from tt_device_mcp.constants import DEVICE_RESET_OVERRUN_SEC, DEVICE_RESET_TIMEOUT_SEC
 from tt_device_mcp.health import chip_state
 from tt_device_mcp.health import pci_writer as _pci_writer_mod
-from tt_device_mcp.health.aiclk_ceiling import CEILING
-from tt_device_mcp.health.aiclk_ceiling import settle_sec as aiclk_settle_sec
 from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.monitors import pci
 from tt_device_mcp.health.monitors.heartbeat import returned_chips
@@ -1104,7 +1102,6 @@ class RecoveryMechanism:
         log(f"a reset is already in flight ({unit}); waiting for it rather than starting another")
         health_event("reset_scope_adopted", unit=unit)
         FABRIC_DEBT.note_reset(f"adopted {unit}")
-        CEILING.mark_owed(f"adopted {unit}")
         deadline = time.monotonic() + DEVICE_RESET_TIMEOUT_SEC
         while time.monotonic() < deadline:
             await asyncio.sleep(2)
@@ -1517,9 +1514,7 @@ class RecoveryMechanism:
         # Name the command we are actually running. This was hardcoded to the galaxy's -glx_reset, so on
         # every other machine the queue told operators a command that was not the one executing.
         self._set_device_op_detail(f"device reset: {' '.join(argv)} (~60s)")
-        # Any reset clears a firmware clock cap; owed until a verified re-apply (see aiclk_ceiling).
-        CEILING.mark_owed("reset")
-        # And it leaves the fabric unproven: no release until a fabric pass passes (post_reset).
+        # A reset leaves the fabric unproven: no release until a fabric pass passes (post_reset).
         FABRIC_DEBT.note_reset(" ".join(argv))
         quiesced = await self._set_device_pollers(False, log)
         # With our own pollers stopped, nothing else may map the device either (spec 04 I92).
@@ -1614,8 +1609,6 @@ class RecoveryMechanism:
                         isolated = self._isolated_chips() if self._isolated_chips is not None else None
                         if isolated:
                             await asyncio.to_thread(drop_returned_isolated, isolated, "reset", log)
-                    if rc == 0:
-                        await self._reapply_aiclk_ceiling(log)
                 except (OSError, asyncio.TimeoutError) as e:
                     log(f"PCI rescan after the reset did not complete ({type(e).__name__}: {e})")
                 finally:
@@ -1907,7 +1900,6 @@ class RecoveryMechanism:
             if state.get("disarmed"):
                 break
             FABRIC_DEBT.note_reset(f"bridge reset of chip {idx}")
-            CEILING.mark_owed(f"bridge reset of chip {idx}")
             try:
                 ok = await PCI_WRITER.write(
                     f"bridge reset of isolated chip {idx} in the driver wait",
@@ -1928,21 +1920,6 @@ class RecoveryMechanism:
                 self.sbr_fired_hook(fired)
             await asyncio.sleep(SBR_RETRAIN_SETTLE_SEC)
         return bool(fired)
-
-    async def _reapply_aiclk_ceiling(self, log) -> None:
-        """Put an operator's AICLK ceiling back on the freshly reset chips, before the pollers
-        return and before the caller's verify runs its traffic pass. Only after a completed reset
-        (the chips are back on the bus); a no-op when unconfigured. Never raises: a failure here
-        leaves the ceiling owed, and the verify's probe pass retries it and fails closed. Freshly
-        reset firmware may read its old limit for a few seconds after the cap is sent, so the
-        apply re-reads within the settle window before it calls the ceiling unverified."""
-        if not CEILING.armed():
-            return
-        self._set_device_op_detail("device reset: re-applying the AICLK ceiling")
-        try:
-            await CEILING.apply("post-reset", log=log, settle=aiclk_settle_sec())
-        except Exception as e:  # noqa: BLE001 - the verify that follows owns the verdict
-            log(f"aiclk-ceiling: post-reset apply raised {type(e).__name__}: {e}")
 
     def read_auto_recovery_ledger(self) -> Optional[list[dict]]:
         """Every auto-recovery escalation this host has taken, oldest first — the rate limiter's

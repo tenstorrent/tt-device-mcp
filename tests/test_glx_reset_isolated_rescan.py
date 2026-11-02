@@ -81,9 +81,6 @@ def _real_reset_path(monkeypatch, hw, clock, *, chunks=None):
     async def pollers(active, log):
         return []
 
-    async def no_ceiling(*a, **k):
-        return True, "ok", {}
-
     glx = _fake_glx(hw, clock, real_sleep, chunks=chunks)
 
     async def run_scoped(argv, log, owner="[broker]health-gate", on_output=None):
@@ -98,7 +95,6 @@ def _real_reset_path(monkeypatch, hw, clock, *, chunks=None):
     monkeypatch.setattr(srv.recovery_mechanism, "run_scoped", run_scoped)
     monkeypatch.setattr(srv.asyncio, "to_thread", to_thread)
     monkeypatch.setattr(srv.asyncio, "sleep", no_sleep)
-    monkeypatch.setattr(base.CEILING, "apply", no_ceiling)
 
 
 @pytest.fixture

@@ -189,14 +189,10 @@ async def test_a_reset_drops_a_returned_chip_after_its_rescan(monkeypatch, tmp_p
     async def no_sleep(_):
         return None
 
-    async def no_ceiling(*a, **k):
-        return True, "ok", {}
-
     monkeypatch.setattr(srv, "_set_device_pollers", pollers)
     monkeypatch.setattr(srv.recovery_mechanism, "run_scoped", run)
     monkeypatch.setattr(srv.asyncio, "to_thread", to_thread)
     monkeypatch.setattr(srv.asyncio, "sleep", no_sleep)
-    monkeypatch.setattr(base.CEILING, "apply", no_ceiling)
 
     rc, _ = await srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-r"], lambda m: None)
 

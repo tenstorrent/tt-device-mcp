@@ -267,7 +267,7 @@ def seal(ids: Iterable, why: str) -> list:
 
 
 def unreadable_lost() -> list:
-    """Lost chips a reader that opens the whole device (the aiclk-ceiling helper, the eth-heartbeat
+    """Lost chips a reader that opens the whole device (the eth-heartbeat
     probe) must not reach now: still attached (the node is the one marked), outside this broker's
     own reset step and its grace. Node identity is a stat, no chip read."""
     with _lock:

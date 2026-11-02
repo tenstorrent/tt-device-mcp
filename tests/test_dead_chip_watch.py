@@ -141,7 +141,7 @@ def test_a_drop_during_a_tenant_job_stops_the_job_before_the_remove_and_kills_it
     _held()
 
 
-@pytest.mark.parametrize("check", ["fabric", "snapshot", "eth_selftest", "aiclk_ceiling"])
+@pytest.mark.parametrize("check", ["fabric", "snapshot", "eth_selftest"])
 def test_a_drop_during_each_broker_check_stops_its_reader_before_the_remove(watch, monkeypatch, check):  # noqa: F811
     _w, log, _detach_ok, burst = watch
     reader = 7100
@@ -150,10 +150,8 @@ def test_a_drop_during_each_broker_check_stops_its_reader_before_the_remove(watc
         monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", _Reader(reader))
     elif check == "snapshot":
         monkeypatch.setattr(srv.health_monitor, "snapshot_proc", _Reader(reader))
-    elif check == "eth_selftest":
-        monkeypatch.setattr(srv, "eth_selftest_proc", _Reader(reader))
     else:
-        monkeypatch.setattr(srv.CEILING, "proc", _Reader(reader))
+        monkeypatch.setattr(srv, "eth_selftest_proc", _Reader(reader))
     _sample("13")
     assert burst()
     assert log[0] == ("stop", reader), f"the check's reader is the first stopped: {log}"

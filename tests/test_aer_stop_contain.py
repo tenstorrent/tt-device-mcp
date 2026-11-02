@@ -47,7 +47,6 @@ def watch(valve, monkeypatch):  # noqa: F811
     monkeypatch.setattr(srv.sampler, "ring", deque(maxlen=8))
     monkeypatch.setattr(srv.sampler, "loop", None)
     monkeypatch.setattr(srv.sampler, "aer_containment", None)
-    monkeypatch.setattr(srv.CEILING, "proc", None)
     monkeypatch.setattr(FABRIC_DEBT, "owed", "")
     # A host whose lift needs a passing full check with fabric (03 I78).
     monkeypatch.setattr(FABRIC_DEBT, "runs_here", lambda expected: True)

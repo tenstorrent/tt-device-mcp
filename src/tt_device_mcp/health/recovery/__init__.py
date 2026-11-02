@@ -27,7 +27,6 @@ from typing import Awaitable, Callable, Optional
 
 from tt_device_mcp import constants, metrics
 from tt_device_mcp.device_holders import HolderScan, is_tenant
-from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import FABRIC_KILLED_BY_ISOLATION
 from tt_device_mcp.health.monitors import fabric, pci
@@ -319,7 +318,7 @@ class RecoveryDeps:
     chip_pci_bdf: Optional[Callable[[str], Optional[str]]] = None
     health_event: Optional[Callable[..., None]] = None
     kill_device_holders: Optional[Callable[[str], Awaitable[list]]] = None
-    # Spec 03 I86: SIGSTOP the broker's own device readers (fabric check, aiclk ceiling) before the
+    # Spec 03 I86: SIGSTOP the broker's own device readers (fabric check, snapshot, eth self-test) before the
     # valve's PCI remove; returns the pids stopped (server._freeze_device_readers). None: no stop.
     freeze_device_readers: Optional[Callable[[str], list]] = None
     # Spec 03 I92: the broker's own check readers still running (server._broker_device_readers), and
@@ -643,8 +642,6 @@ class Recovery(ABC):
             for idx in removed:
                 for attempt in range(BRIDGE_RESET_MAX_TRIES):
                     FABRIC_DEBT.note_reset(f"bridge reset of chip {idx}")
-                    # An SBR clears the chip's firmware clock cap like any reset (spec 03 I35).
-                    CEILING.mark_owed(f"bridge reset of chip {idx}")
                     try:
                         fired = await PCI_WRITER.write(
                             f"bridge reset of removed chip {idx}",
@@ -741,8 +738,6 @@ class Recovery(ABC):
                 if idx in reset_this_pass and attempt == 0:
                     await asyncio.sleep(BRIDGE_RESET_SETTLE_SEC)
                 FABRIC_DEBT.note_reset(f"bridge reset of chip {idx}")
-                # A bridge reset clears the chip's firmware clock cap like any reset (spec 03 I35).
-                CEILING.mark_owed(f"bridge reset of chip {idx}")
                 try:
                     # The one in-flight PCI write (spec 04 I76): its rescan waits on the kernel's PCI
                     # rescan/remove lock, which a write blocked in the kernel holds for good. A timeout

@@ -15741,7 +15741,6 @@ def _setup_startup_hold_behind_readopted_job(monkeypatch, tmp_path):
     # The real startup gate task, down to the gate call: it waits on the re-adopted scope.
     monkeypatch.setattr(srv, "readopted_scopes", {"428": "ttdev-job-428.scope"})
     monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
-    monkeypatch.setattr(srv.CEILING, "armed", lambda: False)
     monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)
 
     async def hugepages_ready():

@@ -86,11 +86,6 @@ def _mechanism(monkeypatch, isolated: set, sysfs: FakeSysfs, events: list, *, ev
         local_reset_dir=(lambda: tmp) if tmp is not None else None,
         isolated_chips=lambda: isolated,
     )
-
-    async def no_ceiling(_log):
-        return None
-
-    mechanism._reapply_aiclk_ceiling = no_ceiling
     return mechanism
 
 
@@ -292,7 +287,6 @@ def _arm_sbr(
     monkeypatch.setattr(bridge_reset, "bridge_reset_enabled", lambda: True)
     monkeypatch.setattr(bridge_reset, "reset_removed_chip", reset_removed_chip)
     monkeypatch.setattr(recovery_base.FABRIC_DEBT, "note_reset", lambda why: None)
-    monkeypatch.setattr(recovery_base.CEILING, "mark_owed", lambda why: None)
     return sbrs
 
 

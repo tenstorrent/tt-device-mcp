@@ -136,7 +136,6 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     _HOST_ESCALATION_ACTION,
     BELOW_FLOOR,
     BLOCKED,
-    CEILING,
     CONFIG_UNREADABLE,
     DEFER,
     FABRIC_DEBT,
@@ -4469,9 +4468,7 @@ async def selftest_eth_heartbeat() -> str:
                 + (
                     f" (retried every {ETH_CHECK_REARM_INTERVAL_SEC:.0f}s, idle or at a full health check)"
                     if eth_rearm_no_reader
-                    else " (retried at the next full health check or reset)"
-                    if eth_rearm_retryable
-                    else ""
+                    else " (retried at the next full health check or reset)" if eth_rearm_retryable else ""
                 )
                 + ", so a frozen core is left to the traffic pass, which can knock it off the PCIe bus "
                 "instead of naming it."
@@ -6298,7 +6295,6 @@ def _broker_device_readers() -> list:
         (health_monitor.fabric_check_proc, "[broker]fabric-check"),
         (health_monitor.snapshot_proc, "[broker]tt-smi-snapshot"),
         (eth_selftest_proc, "[broker]eth-selftest"),
-        (CEILING.proc, "[broker]aiclk-ceiling"),
     ):
         if proc is None or getattr(proc, "returncode", None) is not None:
             continue
@@ -6319,8 +6315,8 @@ def _note_reader_killed(who: str, reason: str, journal: Optional[Callable[..., N
 
 def _freeze_device_readers(reason: str) -> list:
     """SIGSTOP the broker's own device readers (spec 03 I86): the fabric check's, the full check's
-    tt-smi snapshot's, the eth self-test's and the aiclk ceiling's process groups. The dead-chip valve calls it the moment it confirms a chip off the
-    bus, before the PCI remove, so no further read of the mesh is issued while the remove runs.
+    tt-smi snapshot's, and the eth self-test's process groups. The dead-chip valve calls it the
+    moment it confirms a chip off the bus, before the PCI remove, so no further read of the mesh is issued while the remove runs.
     A stop closes no fd, so the driver never reaches the still-attached chip, which a kill would
     (spec 03 I84); the SIGKILL after the remove still ends them. A user job is not stopped here:
     its fate is the valve's kill, unchanged. Returns the pids stopped. Never raises."""
@@ -7842,11 +7838,7 @@ async def device_health_gate(
                 (
                     "eth_timeout"
                     if eth_timeout_due
-                    else "job_killed"
-                    if kill_reset_due
-                    else "unhealthy"
-                    if not healthy
-                    else "dirty"
+                    else "job_killed" if kill_reset_due else "unhealthy" if not healthy else "dirty"
                 ),
                 job=dirty_job,
                 job_log=job_log_file,
@@ -9534,9 +9526,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         cont = (
             {"continues_episode": device_hold_episode_since, "prior_reason": str(carry.get("reason") or "")}
             if carry
-            else {"carry_deferred": str(deferred.get("since") or "")}
-            if isinstance(deferred, dict)
-            else {}
+            else {"carry_deferred": str(deferred.get("since") or "")} if isinstance(deferred, dict) else {}
         )
         if carried is not None:
             health_event("device_held", reason=reason, carried_from=carried.get("iso") or carried.get("ts"), **cont)
@@ -12469,37 +12459,6 @@ async def _dispatch_recheck_if_stale(job_log_file: Optional[Path]) -> None:
             _mark_device_dirty(f"dispatch recheck: eth-core heartbeat frozen ({eth_frozen})", why="probe_unhealthy")
 
 
-async def _ensure_aiclk_ceiling(job_log_file: Optional[Path]) -> None:
-    """Door step for an operator's AICLK ceiling: when something since the last verified apply
-    may have cleared it (a job exit, a reset whose verify never reached the ceiling step), re-apply
-    and prove it before the next tenant runs. A no-op when unconfigured or already verified, so a
-    clean queue pays nothing. One retry; still unverified, the device is flagged dirty and the
-    pre-job gate's reset + verify owns it — the ladder is bounded, so this never wedges the queue.
-    Never raises."""
-    if not (CEILING.armed() and CEILING.owed):
-        return
-
-    def _log(line: str) -> None:
-        if logger:
-            logger.info(f"HEALTH-GATE[pre-job] {line}")
-        if job_log_file:
-            try:
-                append_job_log(job_log_file, "broker", f"HEALTH-GATE[pre-job] {line}\n")
-            except OSError:
-                pass
-
-    try:
-        async with get_device_op_lock():
-            ok, detail, _ = await CEILING.apply("pre-job", log=_log)
-            if ok is False:
-                await asyncio.sleep(2)
-                ok, detail, _ = await CEILING.apply("pre-job retry", log=_log)
-    except Exception as e:  # noqa: BLE001 - the door must never block the queue
-        ok, detail = False, f"apply raised {type(e).__name__}: {e}"
-    if ok is False:
-        _mark_device_dirty(f"aiclk ceiling unverified: {detail}", why="probe_unhealthy")
-
-
 async def _ensure_device_clean_for_next_job(job_log_file: Optional[Path]) -> None:
     """Pre-job gate — a cheap safety net only. The post-job gate checks the device at
     the END of every run (the snapshot always, the passive eth read when that rung is
@@ -12517,7 +12476,6 @@ async def _ensure_device_clean_for_next_job(job_log_file: Optional[Path]) -> Non
     # kernel can run. Opt-in per host until the probe is timed there (see _prejob_dispatch_enabled).
     # Pass the job log so the verdict is recorded where the run's history reads back, not only in
     # server.log — the per-job log is the tenant-visible proof the gate actually ran.
-    await _ensure_aiclk_ceiling(job_log_file)
     await _dispatch_probe_ok(job_log_file)
     if fsm.state is ServerState.HEALTHY:
         # A HEALTHY verdict hours old says nothing about the mesh now: re-read it cheaply first
@@ -12568,10 +12526,6 @@ async def _verify_device_after_job(
     device) lets a fresh green pass stand in for the forced one (spec 03 I36).
 
     Never raises."""
-    # A job may set its own clock limits or leave the firmware default behind when it exits; the
-    # gate's probe pass below re-proves the ceiling, and the door re-applies it if this gate never
-    # got that far.
-    CEILING.mark_owed("job end")
     try:
         await _device_health_gate(
             job_log_file,
@@ -15029,9 +14983,7 @@ export {JOB_TAG_ENV}={job_tag}
                     clean_preempt = job.status == JobStatus.PREEMPTED and job.preempt_clean
                     job_failed = (job.status != JobStatus.COMPLETED or job.exit_code != 0) and not clean_preempt
                     if _preempted_exit0_needs_no_check(job):
-                        # Spec 01 I20: a preemption that returned 0 gets no check at all. The
-                        # clock ceiling stays owed, so the next job's door re-applies it.
-                        CEILING.mark_owed("job end")
+                        # Spec 01 I20: a preemption that returned 0 gets no check at all.
                         if logger:
                             logger.info(
                                 f"JOB_RUNNER job_id={job_id} preempted, exit 0: no post-job check (spec 01 I20)"
@@ -16189,15 +16141,6 @@ async def _verify_fabric_on_start() -> None:
         if not await _await_startup_hugepages():
             missing = missing or "hugepages not yet allocated"
         else:
-            # A boot or power cycle cleared any firmware clock cap. Once the hugepage pool is ready,
-            # put the operator's ceiling back before the startup traffic pass, so it never runs above
-            # it. The gate's probe pass re-proves it and owns the verdict; a failure here is only
-            # logged. Short of hugepages there is no pass, and the relift's pass applies it later.
-            if CEILING.armed() and CEILING.owed:
-                async with get_device_op_lock():
-                    await CEILING.apply(
-                        "startup", log=(lambda line: logger.info(f"HEALTH-GATE[startup] {line}")) if logger else None
-                    )
             # On a quiet bus, as every reset already is: see _pollers_quiesced_for.
             async with _pollers_quiesced_for("the startup fabric check", _startup_pollers_log):
                 await _device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
@@ -18350,10 +18293,10 @@ def create_mcp_server() -> MCPServer:
         and is re-checked after a 60s wait. Worst case at the defaults: about 30
         minutes (BMC check 10s + pre-reset holder clear up to 101s + poller stop
         and restart up to 120s + reset 600s + post-reset reader cut up to 105s
-        + PCI rescan 3s + clock-cap re-apply up to 16s + a first verify pass of
-        up to 361s + the 60s wait + a last verify pass of up to 436s, which
-        adds the 75s kill of a timed-out check). Only the last pass can time
-        out: a re-check follows a pass that finished. Each extra
+        + PCI rescan 3s + a first verify pass of up to 361s + the 60s wait + a
+        last verify pass of up to 436s, which adds the 75s kill of a timed-out
+        check). Only the last pass can time out: a re-check follows a pass that
+        finished. Each extra
         TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES adds a wait and a pass;
         TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC lengthens each wait and each
         service in TT_DEVICE_MCP_POLLER_SERVICES adds up to 90s. Not counted:

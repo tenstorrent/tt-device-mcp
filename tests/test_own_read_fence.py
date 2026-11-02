@@ -623,7 +623,6 @@ async def test_the_check_deadline_s_sigkill_of_a_held_reader_waits_for_the_relea
     hm = srv.health_monitor
     monkeypatch.setattr(hm, "fabric_check_proc", _Proc(HUNG))
     monkeypatch.setattr(hm, "snapshot_proc", None, raising=False)
-    monkeypatch.setattr(monitor_mod.CEILING, "proc", None)
     monkeypatch.setattr(hm, "note_fabric_check_killed", lambda reason: None)
     monkeypatch.setattr(monitor_mod, "_group_alive", lambda pid: True)
     sent = []
