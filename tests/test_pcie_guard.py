@@ -592,15 +592,6 @@ def test_a_latch_from_an_ended_boot_never_gates_even_if_the_broker_never_restart
     assert pcie_guard.gate_mode() == pcie_guard.GATE_OFF and pcie_guard.host_reset_gate(1) == (True, "")
 
 
-def test_the_latch_can_be_switched_off(sysfs, monkeypatch):
-    _boot(sysfs, "boot-a")
-    pcie_guard.begin_offbus_reset("tray re-power", 1)
-    _boot(sysfs, "boot-b")
-    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_HANG_LATCH", "0")
-    assert pcie_guard.check_offbus_reset_latch(lambda m: None) is None
-    assert pcie_guard.offbus_reset_latched() is None
-
-
 def _latched(monkeypatch, root, events) -> dict:
     """A host-hang hold latched on boot-b: an off-bus reset on boot-a never finished."""
     monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))

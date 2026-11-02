@@ -638,10 +638,6 @@ def _boot_id() -> str:
         return ""
 
 
-def _latch_enabled() -> bool:
-    return os.environ.get("TT_DEVICE_MCP_OFFBUS_HANG_LATCH", "1").strip() != "0"
-
-
 LATCH_MAX_SEC = 21600.0
 
 
@@ -660,7 +656,7 @@ def begin_offbus_reset(kind: str, off_bus: int) -> None:
     with this boot's id, that it is about to run. :func:`end_offbus_reset` removes the note once the
     reset and its verify are over. A note a later boot finds means the host died in between."""
     global _INTENT_OPEN
-    if off_bus <= 0 or not _latch_enabled():
+    if off_bus <= 0:
         return
     path = health_dir() / INTENT_FILE
     rec = {"kind": kind, "off_bus": off_bus, "boot_id": _boot_id(), "at_epoch": time.time()}
@@ -899,7 +895,7 @@ def check_offbus_reset_latch(log: Callable[[str], None]) -> Optional[dict]:
     except (OSError, ValueError):
         return offbus_reset_latched()
     path.unlink(missing_ok=True)
-    if intent.get("boot_id") == _boot_id() or not _latch_enabled():
+    if intent.get("boot_id") == _boot_id():
         return offbus_reset_latched()
     row = _host_action_after(intent)
     if row is not None:

@@ -284,7 +284,6 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_PDB_CPLD_ADDR` | unset | Site data: the PDB CPLD's I2C address, `0xNN`; unset = PDB reads skipped | 04 |
 | `TT_DEVICE_MCP_PDB_CPLD_REGS` | unset | Site data: the PDB CPLD registers to read, `0xNN,...` (single-register reads); unset = PDB reads skipped | 04 |
 | `TT_DEVICE_MCP_HOST_RESET_GATE` | off | `off`, `guard` (mask AER around automatic resets, refuse during an AER flood) or `hold` (also refuse while a chip is off the bus) | 04 |
-| `TT_DEVICE_MCP_OFFBUS_HANG_LATCH` | 1 | `0` turns off the off-bus reset intent and the host-hang latch (spec 04 I25) | 04 |
 | `TT_DEVICE_MCP_OFFBUS_HANG_LATCH_MAX_SEC` | 21600 | A host-hang latch older than this lifts once every chip is on the bus, even without a clean host-pci look; with a chip off only when `TT_DEVICE_MCP_POWER_CYCLE_CMD` is unset (spec 04 I25) | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_CMD` | unset (off) | The host's own power-cycle command, run to end an off-bus hold the reset gate refuses (spec 04 I27); unset = page and hold | 04 |
 | `TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC` | 120 | Timeout for that command when the I88 fallback unit runs it; the shutdown hook clamps it to 5-15 s per try (3 tries, worst case 86 s, inside systemd-shutdown's 90 s). A malformed value reads as the default | 04 |
