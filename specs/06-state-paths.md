@@ -226,11 +226,6 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_NOOP_FAILURE_FABRIC_FRESH_SEC` | 300 | A failed job that never reached the device skips the forced fabric pass when a green pass is younger than this (I36) | 03 |
 | `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD` | unset (built-in probe) | Operator override for the passive eth-heartbeat read | 03 |
 | `TT_DEVICE_MCP_EXPECTED_CHIPS` | unset (baseline/hwm-derived); a Galaxy install renders 32 (spec 08 I28) | Authoritative chip count for this host | 03 |
-| `TT_DEVICE_MCP_AICLK_CEILING_MHZ` | unset (off) | Per-host AICLK ceiling the broker re-applies and proves before any load; a positive integer arms it | 03 |
-| `TT_DEVICE_MCP_AICLK_CEILING_CMD` | unset (built-in helper) | Operator override for the ceiling apply, judged on exit code alone | 03 |
-| `TT_DEVICE_MCP_AICLK_CEILING_TIMEOUT_SEC` | 8 | Bound on one ceiling apply (min 1) | 03 |
-| `TT_DEVICE_MCP_AICLK_CEILING_SETTLE_SEC` | 3 | Post-reset window in which a ceiling readback still above the cap is re-read every 0.5 s before it is reported unverified (0 off, max 10) | 04 |
-| `TT_DEVICE_MCP_AICLK_CEILING_PYTHON` | broker's interpreter | Interpreter for the built-in ceiling helper (needs tt-umd) | 03 |
 | `TT_DEVICE_MCP_SYSFS_DIR` | `/sys/class/tenstorrent` | Sysfs class dir (test seam) | 03 |
 | `TT_DEVICE_MCP_PCI_DIR` | `/sys/bus/pci/devices` | PCI devices dir (test seam) | 03 |
 | `TT_DEVICE_MCP_SAMPLE_INTERVAL_SEC` | 10 | Telemetry sampler cadence | 03 |
@@ -343,7 +338,7 @@ Behavior).
 | `TTDEV_HEALTH_PROBE` | 1 | Read by `apply-host-config.sh` from the config file: `0` disables `tt-device-health-probe.timer` (spec 08 I17), anything else enables it |
 | `TTDEV_NO_LOCK` | unset | Back-compat: force cooperative (no lock) |
 | `TTDEV_LOCK` | unset (0) | Read by `apply-host-config.sh`: `1` opts the host into the device lock (spec 05 I9) — renders `TT_DEVICE_MCP_DEVICE_GROUP=ttdev` and `TT_DEVICE_MCP_DEVICE_LOCK=1` into the unit, empties `ttdev` of people and installs the udev rule; unset or `0` leaves the host as it was; `tt-device-mcp unlock` sets it to `0` |
-| `TTDEV_RESET_MODE`, `TTDEV_FABRIC_CHECK_CMD`, `TTDEV_ETH_HEARTBEAT_CMD`, `TTDEV_RESET_MIN_DEAD_FRAC`, `TTDEV_SELFHEAL_RELIFT`, `TTDEV_EXPECTED_CHIPS`, `TTDEV_AUTO_POWER_CYCLE`, `TTDEV_PREJOB_DISPATCH`, `TTDEV_AICLK_CEILING_MHZ`, `TTDEV_AICLK_CEILING_CMD`, `TTDEV_POLLER_SERVICES` | unset | Per-host config keys; each renders the same-named `TT_DEVICE_MCP_*` unit env line (values already in the unit survive an update; an unset `TTDEV_EXPECTED_CHIPS` is derived from the machine type, spec 08 I28) |
+| `TTDEV_RESET_MODE`, `TTDEV_FABRIC_CHECK_CMD`, `TTDEV_ETH_HEARTBEAT_CMD`, `TTDEV_RESET_MIN_DEAD_FRAC`, `TTDEV_SELFHEAL_RELIFT`, `TTDEV_EXPECTED_CHIPS`, `TTDEV_AUTO_POWER_CYCLE`, `TTDEV_PREJOB_DISPATCH`, `TTDEV_POLLER_SERVICES` | unset | Per-host config keys; each renders the same-named `TT_DEVICE_MCP_*` unit env line (values already in the unit survive an update; an unset `TTDEV_EXPECTED_CHIPS` is derived from the machine type, spec 08 I28) |
 | `TTDEV_FABRIC_DESCRIPTOR` | galaxy: shipped descriptor; else unset | Cabling descriptor for the fabric check (src, fabric.py) |
 | `TTDEV_FABRIC_BIN` | validator `run_cluster_validation` | Fabric validator binary override (src) |
 | `TTDEV_FABRIC_RUNTIME_ROOT` | validator `current/` | `TT_METAL_HOME` for the fabric check (src) |

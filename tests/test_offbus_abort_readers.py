@@ -6,7 +6,7 @@
 An Advisory Non-Fatal AER error (the ``NonFatalErr`` row of ``aer_dev_correctable``: a completion
 timeout the device downgraded) on a chip's own path is the kernel's first sign of it. With such a
 rise, one all-ones sample of that chip confirms it at once instead of SAMPLE_INTERVAL_SEC later, and
-the valve SIGSTOPs the fabric check and the aiclk ceiling before the PCI remove. The hold stays, and
+the valve SIGSTOPs the fabric check before the PCI remove. The hold stays, and
 the stopped fabric run is no verdict, so only a later full pass can lift it. No device is touched.
 """
 

@@ -321,8 +321,7 @@ the queue and a running job outlive the broker process.
   record of the job's own process shows status 0 (`ExitWitness.exit_status`, which ignores the
   wrapper's TERM-trap 143; `Job.preempt_exit_status`), and the job then reports exit code 0
   (`Job.exit_code`, the job log's `EXIT CODE`), not the wrapper's 143. Its post-job gate is
-  skipped; the clock
-  ceiling stays owed, so the next job's door re-applies it. Only a proven 0 counts: an own status
+  skipped. Only a proven 0 counts: an own status
   the witness cannot state, or any non-zero one, takes the fast check as above. The skip never
   lifts a hold: a device held when the job ends (fsm not HEALTHY) or owing an I69 reset for
   another reason still runs its post-job gate, where only a passing full check releases it.
