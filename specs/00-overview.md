@@ -173,8 +173,8 @@ and the startup gate re-proves the mesh before anything dispatches (01 I6, 03 I4
   orthogonal to the hold's `why`.
 - **Relift** — the idle re-verification that lifts a self-heal hold on proof, on the sampler's
   clock, read-only by default (03 I21).
-- **Rung** — one step of the recovery ladder (PCI rescan → bridge reset → tray reset → mesh
-  reset → warm reboot → power cycle), ordered by blast radius (04).
+- **Rung** — one step of the recovery ladder (PCI rescan → bridge reset → mesh reset →
+  power cycle), ordered by blast radius (04).
 - **Episode** — one open FSM incident: fault → RECOVERING/DOWN → verified HEALTHY close.
 - **Tenant** — a holder with uid ≥ `MIN_TENANT_UID` (1000); infrastructure below that never
   blocks and is never reset over (05).
