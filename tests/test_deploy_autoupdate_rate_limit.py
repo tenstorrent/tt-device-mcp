@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.deploy_helpers import LAP_STAND_INS
+from tests.deploy_helpers import LAP_STAND_INS, _clock
 from tt_device_mcp import server as srv
 from tt_device_mcp.constants import FABRIC_CHECK_TIMEOUT_SEC
 from tt_device_mcp.fsm import ServerFsm
@@ -27,12 +27,6 @@ from tt_device_mcp.fsm import ServerFsm
 pytestmark = pytest.mark.xdist_group("forks")
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "deploy" / "tt-device-autoupdate.sh"
-
-
-def _clock(text):
-    """The script's clock seam (au_now, au_time) as it defines them: the lap reads the real clock."""
-    i = text.index("au_now() {")
-    return text[i : text.index("\n", text.index("au_time() {", i)) + 1]
 
 
 def _cut(text, start, end):

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.deploy_helpers import LAP_STAND_INS
+from tests.deploy_helpers import LAP_STAND_INS, _clock
 
 # Fork-heavy deploy-script laps: one xdist worker runs them all (conftest: --dist loadgroup).
 pytestmark = pytest.mark.xdist_group("forks")
@@ -57,12 +57,6 @@ def test_an_in_flight_device_op_still_bars_the_update():
 # in for the restart that ends an applying lap and records whether the hold was still there.
 
 _UPTIME = 100_000
-
-
-def _clock(text):
-    """The script's clock seam (au_now, au_time) as it defines them: the lap reads the real clock."""
-    i = text.index("au_now() {")
-    return text[i : text.index("\n", text.index("au_time() {", i)) + 1]
 
 
 def _gate(
