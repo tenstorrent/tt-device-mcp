@@ -207,7 +207,17 @@ def _push(box, files):
         cmds.append(b"M %s inline %s\ndata %d\n%s\n" % (mode, rel.encode(), len(data), data))
     env = {**_GIT_ENV, "HOME": str(clone.parent)}
     subprocess.run(
-        ["git", "-C", str(clone), "-c", "fastimport.unpackLimit=1", "fast-import", "--quiet", "--force", f"--export-marks={marks}"],
+        [
+            "git",
+            "-C",
+            str(clone),
+            "-c",
+            "fastimport.unpackLimit=1",
+            "fast-import",
+            "--quiet",
+            "--force",
+            f"--export-marks={marks}",
+        ],
         input=b"".join(cmds),
         capture_output=True,
         env=env,

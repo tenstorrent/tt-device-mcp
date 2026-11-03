@@ -16,7 +16,13 @@ import re
 import pytest
 
 import tt_device_mcp.server as srv
-from tests.test_deploy_autoupdate_no_restart import _base_clone, _installed, _push, _restarts, box  # noqa: F401 - fixture
+from tests.test_deploy_autoupdate_no_restart import (  # noqa: F401 - fixture
+    _base_clone,
+    _installed,
+    _push,
+    _restarts,
+    box,
+)
 from tests.test_deploy_autoupdate_no_restart import _lap as _full_lap
 from tests.test_deploy_autoupdate_rate_limit import _SCRIPT, _lap
 from tests.test_restart_drain import _restart_with_a_held_job

@@ -348,6 +348,23 @@ def pytest_configure_node(node):
     node.workerinput["loadgroup"] = node.config.getvalue("dist") == "loadgroup"
 
 
+# One worker running the fork-heavy group back to back still starts ~200 processes/s for ~20 s. Each of
+# these tests is followed by a pause of FORKS_PACE times its own run time, so the group's start rate stays
+# well under 100 processes/s; the other workers keep running the rest of the suite meanwhile.
+FORKS_PACE = 3
+
+
+@pytest.fixture(autouse=True)
+def pace_fork_heavy_tests(request):
+    mark = request.node.get_closest_marker("xdist_group")
+    if mark is None or "forks" not in (*mark.args, mark.kwargs.get("name")):
+        yield
+        return
+    start = time.monotonic()
+    yield
+    time.sleep(FORKS_PACE * (time.monotonic() - start))
+
+
 # The real /dev/tenstorrent, hardcoded here rather than read from srv.TT_DEV_DIR, because the
 # fixture below sandboxes that module attribute out from under every unmarked test — asking the
 # module would make the marker's own gate answer "no device" on a box that has one.
