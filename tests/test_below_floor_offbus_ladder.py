@@ -189,13 +189,14 @@ async def test_the_bound_runs_every_kept_rung_in_order_then_the_power_cycle(
 async def test_the_bound_rescans_and_sbrs_before_the_cycle_after_a_failed_mesh_reset(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """An earlier forced run below the bound does not stand in for the bound's ladder: the bound runs
-    the rescan and SBR again, and its last-chance sweep runs every rung once more (the SBR and the mesh
-    reset that already failed on the same chips, then the full check) right before the power cycle."""
+    """An earlier forced run below the bound does not stand in for the bound's ladder: the bound runs its full ladder
+    again, the SBR, the rescan and the mesh reset that already failed on the same chips included, each mesh reset
+    followed by its full check, and its last-chance sweep runs every rung once more right before the power cycle. The
+    order is the one an unspent hold gets (test_the_bound_runs_every_kept_rung_in_order_then_the_power_cycle)."""
     sweep = ["mesh reset", "full check", "power cycle"]
     for opt_in, expected_order in (
-        (True, ["rescan", "sbr ['31']", "sbr ['31']", *sweep]),
-        (False, ["rescan", *sweep]),
+        (True, ["sbr ['31']", "rescan", "mesh reset", "full check", "sbr ['31']", *sweep]),
+        (False, ["rescan", "mesh reset", "full check", *sweep]),
     ):
         (tmp_path / str(opt_in)).mkdir()
         order, _events, _counters = _rig(monkeypatch, tmp_path / str(opt_in), opt_in=opt_in)
@@ -224,12 +225,12 @@ async def test_a_forced_run_below_the_bound_repeats_a_failed_mesh_reset_before_t
 async def test_sbr_that_heals_at_the_bound_lifts_on_the_full_check_with_no_mesh_reset(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """Bridged chips only: the gone chip here has the opt-in. The mesh reset is already spent (I87), so
-    the bound's own rescan and SBR run, not the stuck-hold ladder's bridge rung."""
+    """Bridged chips only: the gone chip here has the opt-in. The mesh reset is already spent (I87), yet the bound runs
+    its full ladder from the bottom: the bridge rung's SBR heals, and the full check with fabric lifts the hold."""
     order, _events, counters = _rig(monkeypatch, tmp_path, opt_in=True, sbr_heals=True, verdicts=[True])
     srv.recovery_mechanism.note_rung_failed(srv.device_hold_episode_since, "mesh_reset", {GONE}, {GONE}, rc=1)
     await _bound_ladder()
-    assert order == ["rescan", "sbr ['31']", "full check"], "the shortest path: no mesh reset, no power cycle"
+    assert order == ["sbr ['31']", "full check"], "the shortest path: no mesh reset, no power cycle"
     assert counters["dirty_cleared"] == 1, "lifted once, on the passing full check"
 
 
@@ -266,7 +267,14 @@ async def test_below_the_bound_a_mesh_reset_that_failed_on_the_same_chips_climbs
     order.clear()
     srv.device_hold_episode_since = (datetime.now() - timedelta(minutes=10, seconds=5)).isoformat()
     await _bound_ladder()
-    assert order == ["rescan", "mesh reset", "full check", "power cycle"], "the bound's full ladder (no bridge: no SBR)"
+    assert order == [
+        "rescan",
+        "mesh reset",
+        "full check",
+        "mesh reset",
+        "full check",
+        "power cycle",
+    ], "the bound's full ladder, its failed mesh reset included, then the sweep (no bridge: no SBR)"
 
 
 @pytest.mark.asyncio
@@ -299,8 +307,11 @@ async def test_a_cooldown_denial_at_the_bound_still_runs_the_ladder_and_arms_the
     order.clear()
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
     monkeypatch.setattr(srv, "_bound_tenant_blocker", lambda *a: None)
-    await srv._hold_bound_host_rung(601, lambda m: None)
-    assert order == ["power cycle"], "the cooldown's end goes straight to the power cycle, no second ladder"
+    await srv._hold_bound_host_rung(601, lambda m: None, sweep=True)  # as the watchdog's cooldown-end retry asks it
+    assert order == ["mesh reset", "full check", "power cycle"], (
+        "the cooldown's end runs the last-chance sweep (the mesh reset, then the full check with fabric) and asks for "
+        "the power cycle only when that check fails"
+    )
 
 
 @pytest.mark.asyncio
@@ -1314,10 +1325,17 @@ async def test_a_refused_lift_after_the_mesh_reset_before_the_host_rung_still_po
     age = galaxy._hold_age_sec(srv.device_hold_episode_since)
     clock.shift = (ceiling if bound else ceiling - 60) - age
     await srv.galaxy_recovery.escalate("offbus-forced", [GONE], 32, lambda m: None, bound=bound)
-    assert order.count("mesh reset") <= 2, "no third mesh reset in the hold"
+    if bound:
+        # Spec 04 I89: the 10-min bound runs the full ladder, its spent mesh reset included; I97's runs no second time.
+        assert order.count("mesh reset") == 3, "the bound reran the spent mesh reset once"
+        assert "bound_reruns_spent_rung" in [n for n, _ in events]
+    else:
+        assert order.count("mesh reset") <= 2, "no third mesh reset in the hold"
     assert len(_i97(events)) == 1 or _i97(events)[-1]["fired"] is False, "the I97 reset runs once per hold"
     assert order[-1] == "power cycle" and order.count("power cycle") == 1
-    assert cycled_at[0] <= ceiling + 1, f"power cycle requested at {cycled_at[0]:.0f}s"
+    # I97's deadline (from hold start) is unchanged: its reset does not run again. At the bound the cycle follows the
+    # bound's own ladder, a few seconds of fake reset here (I76: 600 s + ladder time).
+    assert cycled_at[0] <= ceiling + (10 if bound else 1), f"power cycle requested at {cycled_at[0]:.0f}s"
     assert len(lifts) == 1, "the next pass's failed check asks for no lift"
 
 

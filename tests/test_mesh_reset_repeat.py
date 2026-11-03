@@ -231,6 +231,7 @@ async def test_the_bound_runs_the_ladder_and_asks_for_the_power_cycle_at_600s(
     assert "hold_deadline_forced_escalation" in mesh["events"], "the bound's ladder runs at 600 s"
     assert clock["waits"] == [], "the bound never waits for the gap"
     assert mesh["events"].count("last_chance_reset_sweep") == 1
-    assert len(mesh["resets"]) == resets + 1, "the bound's sweep's mesh reset"
+    # I89: the bound runs the full ladder, its spent mesh-reset rung included, then the sweep's own.
+    assert len(mesh["resets"]) == resets + 2, "the bound's ladder rung and its sweep each run a mesh reset"
     assert [f[0] for f in fired] == ["power-cycle"], "the full check still fails: the power cycle is asked"
     assert srv.fsm.state is not ServerState.HEALTHY

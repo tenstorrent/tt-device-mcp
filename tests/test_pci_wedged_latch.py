@@ -144,7 +144,7 @@ def _wedged_hold(monkeypatch, writer, now):
     patch_health_event(monkeypatch, lambda *a, **k: None)
     rungs = []
 
-    async def host_rung(age, log):
+    async def host_rung(age, log, *a, **k):
         rungs.append(age)
 
     monkeypatch.setattr(srv, "_hold_bound_host_rung", host_rung)

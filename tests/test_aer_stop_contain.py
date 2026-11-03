@@ -242,7 +242,7 @@ async def test_the_contained_hold_runs_the_full_ladder_at_the_bound_then_the_hos
         escalations.append(kind)
         return OUTCOME_TERMINAL
 
-    async def host_rung(age, log):
+    async def host_rung(age, log, *a, **k):
         events.append("host_rung")
 
     monkeypatch.setattr(srv.galaxy_recovery, "escalate", ladder)

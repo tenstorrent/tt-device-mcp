@@ -13660,7 +13660,7 @@ def _arm_fabric_only_deadline_hold(monkeypatch, *, why, detail, fabric_output=""
         escalations.append(kind)
         return None
 
-    async def host_rung(age, log):
+    async def host_rung(age, log, *a, **k):
         events.append("host_rung")
 
     monkeypatch.setattr(srv, "_hold_bound_host_rung", host_rung)

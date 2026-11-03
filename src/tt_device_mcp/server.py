@@ -9508,7 +9508,7 @@ async def _force_escalate_stuck_hold() -> None:
                 log("10-min hold bound: the full check after the bound's ladder still has its time")
                 return
             if route == ROUTE_HOST_RUNG:
-                await _hold_bound_host_rung(held_age, log)
+                await _hold_bound_host_rung(held_age, log, sweep=True)
                 return
             leftover = await asyncio.to_thread(_reaped_leftover_reason)
             if _forced_run_route(kind, held_age).action == ROUTE_STAND_DOWN:
@@ -9602,7 +9602,7 @@ async def _force_escalate_stuck_hold() -> None:
             if outcome == OUTCOME_RECOVERED:
                 _note_hold_bound_check_failed(log)
             if outcome != OUTCOME_RECOVERED or _hold_bound_cycle_due(_hold_age_now()):
-                await _hold_bound_host_rung(_hold_age_now(), log)
+                await _hold_bound_host_rung(_hold_age_now(), log, sweep=True)
 
 
 # Spec 04 I76 — the 10-min hold bound. The hold age at which this episode's last forced ladder finished
@@ -9896,14 +9896,18 @@ def _hold_bound_cause(age: float, skipped: str = "", ladder_ran: bool = False) -
     return f"10-min hold bound: held {int(age)}s and the full ladder did not heal it"
 
 
-async def _hold_bound_host_rung(age: float, log, skipped: str = "") -> None:
+async def _hold_bound_host_rung(age: float, log, skipped: str = "", *, sweep: bool = False) -> None:
     """Spec 04 I76: the step after a bound ladder that did not heal the hold — a BMC power cycle, the
     only host rung. A cycle that does not launch keeps the hold, pages, and is asked again on the next
     watchdog tick; there is no reboot fallback. The governor still decides: a live tenant refuses it (paged
     once), and a cooldown denial arms the retry the watchdog fires the moment the cooldown ends. Until the
     rung is requested or such a retry is armed it stays pending, and the watchdog asks again each tick.
     ``skipped`` names why no ladder ran first, for the request's reason (_hold_bound_cause); the
-    episode's own records say whether a bound ladder ran. Neither changes whether or when it is asked."""
+    episode's own records say whether a bound ladder ran. Neither changes whether or when it is asked.
+    ``sweep``: once the cycle is allowed, the last-chance sweep (glx_reset with its post-reset re-init, then the full
+    check with fabric) runs first, unless it already ran in full in this hold phase (spec 04 I58/I87). The cycle is
+    requested only when that check fails; a pass releases the device, and a sweep that could not run keeps the rung
+    pending (I22)."""
     global _hold_bound_cycle_age, _hold_bound_unarmed_paged, _hold_bound_rung_pending, _hold_bound_denied_why
     global _hold_bound_tenant_blocker, _hold_bound_granted_age, _hold_bound_skip
     _hold_bound_sync()
@@ -9956,6 +9960,20 @@ async def _hold_bound_host_rung(age: float, log, skipped: str = "") -> None:
         log(f"10-min hold bound: {action} held off: {why}")
         recovery_mechanism._journal_auto_recovery_denied(action, why)
         return
+    # Spec 04 I79: a 77 climb's own full sweep already ran and read a 77 right before it asked for this cycle; the
+    # cooldown that denied it changed nothing on the device, so no second sweep runs at the cooldown's end.
+    swept_77 = recovery_mechanism.unverified_sweep_77_since == device_hold_episode_since
+    if sweep and not (skipped or _hold_bound_skip or swept_77) and not PCI_WRITER.latched:
+        # Spec 04 I58/I76: the full ladder runs right before every power cycle the bound requests. A cooldown that
+        # deferred the cycle denied it before the climb's sweep, so the sweep runs here, now that the cycle may fire.
+        expected = health_monitor.expected(len(_present_chip_indices()))
+        swept = await galaxy_recovery._settle_and_verify_before_host_rung(
+            expected, log, "idle-escalation", context="10-min hold bound, before the power cycle"
+        )
+        if swept is not False:
+            if swept is None:
+                _hold_bound_rung_pending = True  # the sweep could not run: no cycle without it, asked again next tick
+            return
     # _note_hold_bound_ladder records the bound's ladder (and clears a kept skip) before any post-ladder ask.
     ladder_ran = not _hold_bound_skip and _hold_bound_ladder_age is not None
     cause = _hold_bound_cause(age, skipped or _hold_bound_skip, ladder_ran)

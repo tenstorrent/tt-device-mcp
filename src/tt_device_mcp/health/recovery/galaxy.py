@@ -1813,10 +1813,11 @@ class GalaxyRecovery(Recovery):
         rung (the mesh reset or the power cycle request, as the ladder orders them).
 
         ``sweep``: the last-chance sweep right before the power cycle (spec 04 I58). Every target gets its bridge write
-        there, whatever rounds it had earlier in this hold."""
+        there, whatever rounds it had earlier in this hold. The I76 bound's ladder does the same (spec 04 I89): it runs
+        every rung, spent or not."""
         targets = {str(c) for c in set(self.deps.isolated_chips()) | set(removed_chip_ids())}
         since = self.deps.device_hold_episode_since() or ""
-        spent = [] if sweep else sorted(targets & self._sbr_done(since), key=int)
+        spent = [] if sweep or self._bound else sorted(targets & self._sbr_done(since), key=int)
         # Spec 04 I69: a spent chip no bridge write reached was never reset; a removed one still
         # withholds the rescan, though it gets no second round either (I98).
         unreset = frozenset(spent) & self._sbr_unreset(since)
@@ -2101,6 +2102,9 @@ class GalaxyRecovery(Recovery):
                 "(TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET is off) — SBR skipped"
             )
             health_event("below_floor_sbr_skipped", context=context, chips=gone, reason="no_bridge_without_opt_in")
+        # A gone chip the caller's own bridge rung already tried this pass (and un-queued) is not queued again: no
+        # second SBR runs on it here, so queued it would stay an SBR candidate no rung fires on.
+        queued = [c for c in queued if c not in set(sbr_tried)]
         isolated.update(queued)
         targets = (set(isolated) | set(removed_chip_ids())) - set(sbr_tried)
         fired = sorted(set(isolated) | set(removed_chip_ids()), key=int) if targets else []
@@ -3081,7 +3085,11 @@ class GalaxyRecovery(Recovery):
             # finally ran. Go straight to the last-chance sweep, then the host climb (spec 04 I29).
             await self._sweep_after_unverified_reset(expected, off_bus_before, hold_since, log)
             return True
-        if spent:
+        if spent and self._bound:
+            # Spec 04 I89: the 10-min bound runs the full ladder, a spent mesh reset included.
+            log("this hold's mesh reset already ran and failed — the 10-min bound runs it again (full ladder)")
+            health_event("bound_reruns_spent_rung", rung="mesh_reset", held_since=hold_since, off_bus=off_bus_before)
+        elif spent:
             self.mechanism.spent_climb_since = hold_since or None
             log("this hold's mesh reset already ran and failed — not repeating it; climbing to the next rung")
             health_event("reset_rung_skipped_spent", rung="mesh_reset", held_since=hold_since, off_bus=off_bus_before)
@@ -3090,7 +3098,7 @@ class GalaxyRecovery(Recovery):
             )
             return True
         ids_before = await self._offbus_ids_now(expected)
-        if force and self.mechanism.rung_failed_unchanged(hold_since, "mesh_reset", ids_before):
+        if force and not self._bound and self.mechanism.rung_failed_unchanged(hold_since, "mesh_reset", ids_before):
             # The deadline watchdog's window: a mesh reset already failed on this same off-bus set this
             # boot. A forced window takes the next stronger rung, never the same reset (spec 04 I36, I58).
             await self._climb_past_failed_rung(expected, ids_before, hold_since, log)
@@ -3411,27 +3419,26 @@ class GalaxyRecovery(Recovery):
         ids_now = await self._offbus_ids_now(expected) if off_bus > 0 else None
         # Spec 04 I108: with chips off the bus, only a failed reset that already faced them spends the rung.
         spent = self.mechanism.mesh_reset_spent(hold_since, ids_now)
-        if spent or self.mechanism.rung_failed_unchanged(hold_since, "mesh_reset", ids_now):
+        failed_unchanged = self.mechanism.rung_failed_unchanged(hold_since, "mesh_reset", ids_now)
+        if self._bound and (spent or failed_unchanged):
+            # Spec 04 I89: the 10-min bound runs the full ladder (SBR, rescan, mesh reset) even when this hold already
+            # spent its rungs; a whole-tray or all-off drop still goes straight to the power cycle below.
+            log(
+                f"{off_bus}/{expected} off-bus and this hold's mesh reset already failed — the 10-min bound runs the full ladder again"
+            )
+            health_event("bound_reruns_spent_rung", rung="mesh_reset", held_since=hold_since, off_bus=off_bus)
+        elif spent or failed_unchanged:
             # This episode already ran the ladder to its mesh reset and that reset failed on exactly the chips off the
             # bus now. Re-running it repeats a known failure (one Galaxy host fired six identical 263 s resets in one
             # hold, one per window): take the next stronger rung, whose last-chance sweep still runs every reset once
             # before a power cycle (I22), or hand the hold to an operator when no host rung is available (spec 04 I36).
             # A reset that failed on another set in this hold is spent all the same: one mesh reset per episode (spec 04
-            # I87). Spec 04 I89: at the 10-min bound a below-floor drop still gets its rescan and SBR first; the spent
-            # mesh reset is not repeated (I87), and the climb below takes over if they did not heal.
-            floor_now = _galaxy_reset_min_dead_chips(expected)
-            if (
-                self._bound
-                and ids_now
-                and floor_now is not None
-                and 0 < off_bus < floor_now
-                and await self._below_floor_bound_rungs(set(ids_now), expected, log)
-            ):
-                return True
+            # I87). The 10-min bound is the exception above: it runs the full ladder again (spec 04 I89).
             await self._climb_past_failed_rung(expected, ids_now, hold_since, log, spent=spent)
             return True
         isolated_chips = self.deps.isolated_chips()
         device_pci_map = self.deps.device_pci_map()
+        gone_queued: list = []
         # A chip GONE from the bus entirely — absent from sysfs, not reading all-ones — never entered
         # isolated_chips, so the surgical rung below skips it and it falls to the galaxy reset, which
         # here is unbounded: with the power cycle opted out a galaxy reset that inverts a below-floor
@@ -3475,6 +3482,7 @@ class GalaxyRecovery(Recovery):
                             floor=floor_gone,
                         )
                         isolated_chips.update(gone)
+                        gone_queued = list(gone)
         # A chip the sampler already isolated (reading all-ones) is cut from the kernel and its bridge
         # answers: the surgical per-chip reset brings it back without touching the other 31 or the
         # fabric. Try it first; only fall to the mesh-wide reset if it does not recover. But the bridge
@@ -3487,7 +3495,17 @@ class GalaxyRecovery(Recovery):
         sbr_tried: frozenset = frozenset()
         if isolated_chips and not await asyncio.to_thread(self.mechanism.scope_active):
             sbr_tried = frozenset(isolated_chips) | frozenset(removed_chip_ids())
-        if sbr_tried and await self._sbr(log):
+        sbr_healed = bool(sbr_tried) and await self._sbr(log)
+        if sbr_tried and gone_queued:
+            # Spec 04 I89: a gone chip queued above that the rung could not fire on (no bridge, gated, withheld) is not
+            # an SBR candidate; left queued, every later gate pass would route to a no-op bridge rung.
+            reasons = getattr(self, "last_bridge_reset_reasons", {}) or {}
+            unqueued = [c for c in gone_queued if c in isolated_chips and c in reasons]
+            for c in unqueued:
+                isolated_chips.discard(c)
+            if unqueued:
+                health_event("gone_chip_bridge_reset_unqueued", chips=unqueued, reason="sbr_not_fired")
+        if sbr_healed:
             healthy, evidence = await self._verify_device(expected, log, run_fabric=True)
             FABRIC_DEBT.note_evidence(evidence)
             if healthy:

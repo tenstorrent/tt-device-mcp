@@ -54,7 +54,7 @@ def _arm(monkeypatch, hold, age_sec=10, latched=False):
     if hold == "missing ports":
         monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", False)
 
-    async def host_rung(age, log):
+    async def host_rung(age, log, *a, **k):
         events.append("host_rung")
         srv._hold_bound_rung_pending, srv._hold_bound_cycle_age = False, age
         srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic())
@@ -430,7 +430,7 @@ async def test_a_granted_host_rung_after_the_at_start_ladder_runs_no_second_ladd
     escalations, _alerts, events = _arm(monkeypatch, "topology mismatch")
     _ladder(monkeypatch, escalations, OUTCOME_RECOVERED)
 
-    async def host_rung(age, log):
+    async def host_rung(age, log, *a, **k):
         events.append("host_rung")
         srv._hold_bound_rung_pending, srv._hold_bound_cycle_age = False, age
         srv._hold_bound_granted_age = age  # the power cycle was requested and has not healed it yet
