@@ -1459,6 +1459,12 @@ async def test_a_gate_that_outlives_its_deadline_and_then_raises_is_still_retrie
         assert task.done(), "the background gate task never finished"
         del task
 
+        # done() turns true before asyncio runs the done-callback (it is scheduled via
+        # call_soon), so give the loop a bounded chance to run it before reading its effect.
+        for _ in range(100):
+            if srv.fsm.record.why == "gate_error":
+                break
+            await asyncio.sleep(0.01)
         assert srv.fsm.record.why == "gate_error", (
             f"the done-callback did not mark the device dirty once the background gate raised: "
             f"{srv.fsm.record.why!r}"
