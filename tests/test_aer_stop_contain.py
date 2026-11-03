@@ -398,6 +398,8 @@ def test_a_journal_stalled_in_fsync_bounds_the_wait_and_delays_neither_signal(wa
         release.wait(30)
 
     monkeypatch.setattr(evidence, "_append_durable", fsync_stall)
+    # The valve fixture writes detached records at once; this test needs the real writer thread.
+    monkeypatch.setattr(srv, "health_event_detached", evidence.health_event_detached)
     monkeypatch.setattr(srv, "logger", None)
     try:
         t = threading.Thread(target=burst, daemon=True)
