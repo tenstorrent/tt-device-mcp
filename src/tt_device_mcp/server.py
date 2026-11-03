@@ -11562,7 +11562,6 @@ def _tenant_holder_reason() -> str:
     return f"device held outside the broker by {who}; not dispatching beside it"
 
 
-# How often a job waiting on a process outside the broker re-scans the device's holders.
 _HOLDER_WAIT_POLL_SEC = 5.0
 
 
@@ -12719,7 +12718,6 @@ def _job_record(job_id: str) -> Optional[dict]:
 
 
 def _job_status_from_record(job_id: str, r: dict) -> dict:
-    """A job-status answer built from a durable record (_job_record)."""
     res = {
         "job_id": job_id,
         "owner": r.get("owner", "?"),

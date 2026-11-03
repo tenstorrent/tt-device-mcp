@@ -540,7 +540,6 @@ def removed_chip_ids() -> list:
 
 
 def forget_removed_chip(idx) -> None:
-    """Drop the removal record of a chip that is back on the bus."""
     with _REMOVED_LOCK:
         gone = REMOVED_CHIPS.pop(str(idx), None)
         _BACK_SEQ[str(idx)] = _BACK_SEQ.get(str(idx), 0) + 1

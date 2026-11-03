@@ -247,7 +247,6 @@ def read_holder_identities(
 
 
 def describe_identity(row: dict) -> str:
-    """One log line for a ``holder_identity`` row."""
     if row.get("status") == "gone" and "cmdline" not in row:
         return f"pid {row['pid']} gone before it could be read"
     if row.get("status") == "unread":

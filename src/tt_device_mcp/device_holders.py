@@ -175,7 +175,6 @@ class HolderScan:
     gap_pids: list = field(default_factory=list)
 
     def mark_incomplete(self, why: str, pid: int | None = None) -> None:
-        """Record one blind spot and mark the scan incomplete."""
         self.complete = False
         self.gaps.append(why)
         self.gap_pids.append(pid)
@@ -332,7 +331,6 @@ def enumerate_device_holders() -> HolderScan:
     return _scan_by_walking_proc()
 
 
-# How often wait_device_released re-reads the holder scan.
 RELEASE_POLL_SEC = 0.25
 
 

@@ -120,7 +120,6 @@ POST_KILL_REAP_WAIT_SEC = 30
 # runs. Both waits count inside the hold's 10-min ladder bound (spec 04 I76).
 POST_KILL_SETTLE_SEC = 10
 
-# How often the post-kill wait re-reads the job's processes and the device holders.
 POST_KILL_POLL_SEC = 0.5
 
 # When a device reset has run long enough to be worth saying so (a 6U Galaxy reset is

@@ -105,7 +105,6 @@ def lspci_targets(addrs: list) -> list:
 
 
 def capture_argvs(pci_targets: list, onset_epoch: float) -> list:
-    """Every argv the capture runs."""
     argvs: list = [list(a) for a in _IPMI_FIXED]
     for target in pci_targets:
         argvs.append(["lspci", "-s", target, "-vv"])

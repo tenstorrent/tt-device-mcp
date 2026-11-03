@@ -144,7 +144,6 @@ class Probe:
         self.now: Callable[[], float] = time.time
         self.state: dict = {}
 
-    # --- host seams -------------------------------------------------------------------------
     def health(self) -> Optional[dict]:
         # No connect retry: a refused connect means the broker is down, and the probe must
         # see that at once rather than wait out the client's broker-restart retries.
@@ -242,7 +241,6 @@ class Probe:
         except OSError:
             return ""
 
-    # --- state ------------------------------------------------------------------------------
     def _load_state(self, health_dir: Path) -> None:
         try:
             self.state = json.loads((health_dir / STATE_FILE).read_text())
@@ -295,7 +293,6 @@ class Probe:
             log(f"stopped: {why}")
         return why is None
 
-    # --- the lap ----------------------------------------------------------------------------
     def run(self) -> int:
         for k, v in self.broker_env().items():
             os.environ.setdefault(k, v)  # first: the inhibit file's path is the broker's

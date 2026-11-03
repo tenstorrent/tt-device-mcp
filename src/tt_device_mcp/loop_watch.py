@@ -25,7 +25,6 @@ from typing import Optional
 
 # Loop lag that is worth a warning: well above scheduling noise, well below a client's timeout.
 LOOP_LAG_WARN_SEC = 2.0
-# How often the loop ticks and the thread looks.
 TICK_SEC = 0.25
 
 _log = logging.getLogger("tt_device_mcp.loop_watch")

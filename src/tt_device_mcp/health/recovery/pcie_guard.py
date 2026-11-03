@@ -70,9 +70,6 @@ def _pci_dir() -> Path:
     return SYS_ROOT / "sys/bus/pci/devices"
 
 
-# ---- topology ---------------------------------------------------------------------------------------
-
-
 @dataclass
 class Endpoint:
     bdf: str
@@ -323,9 +320,6 @@ def tray_bus_groups(endpoints: Optional[dict] = None) -> Optional[dict]:
     return None
 
 
-# ---- config space -----------------------------------------------------------------------------------
-
-
 class _Config:
     """Read and write one function's config space through sysfs (root reads all 4 KiB)."""
 
@@ -466,8 +460,6 @@ class AerMask:
         return self.kept_masked
 
 
-# ---- the per-host gate ------------------------------------------------------------------------------
-
 GATE_GUARD, GATE_HOLD = "guard", "hold"
 
 
@@ -509,8 +501,6 @@ def host_reset_gate(off_bus: int) -> tuple:
         )
     return True, ""
 
-
-# ---- the host-hang latch ----------------------------------------------------------------------------
 
 INTENT_FILE = "offbus_reset_intent.json"
 LATCH_FILE = "offbus_reset_hold.json"

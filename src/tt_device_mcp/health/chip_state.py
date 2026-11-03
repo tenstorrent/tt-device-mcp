@@ -87,7 +87,6 @@ _fenced: dict[str, dict] = {}
 _evidence: dict[str, list] = {}
 # pid -> monotonic deadline: readers an AER stop left SIGSTOPped (spec 03 I92), see hold_readers.
 _held: dict[int, float] = {}
-# How often a reader's timeout path looks again whether its hold ended.
 HOLD_POLL_SEC = 0.1
 # Evidence older than this before the next sign starts a new episode.
 EVIDENCE_GAP_SEC = 60.0
@@ -169,9 +168,6 @@ def node_identity(node: Path) -> Optional[tuple]:
         return None
 
 
-# --- recovering ------------------------------------------------------------------------------
-
-
 def set_recovering(owner: str, on: bool) -> None:
     """A reset or recovery step started (``on``) or ended on the chips. The end opens the post-reset
     grace window, so the step's verify reads every lost chip for real."""
@@ -204,9 +200,6 @@ def op_running() -> bool:
     """Whether this broker's own reset or recovery step is running: its reads are its own and ungated."""
     with _lock:
         return any(k.startswith("op:") for k in _recovering)
-
-
-# --- lost ------------------------------------------------------------------------------------
 
 
 def mark_lost(ids: Iterable, reason: str, nodes: Optional[dict] = None, deferred: bool = False) -> list:
@@ -294,9 +287,6 @@ def is_lost(idx) -> bool:
         return str(idx) in _lost
 
 
-# --- fenced ----------------------------------------------------------------------------------
-
-
 def fence(ids: Iterable, reason: str, nodes: Optional[dict] = None) -> list:
     """Stop the broker's own MMIO reads of chips read as dead (spec 03 I92/I97). Fast on purpose: the
     containment calls it before its first step, so it writes no journal line and reads no chip (the
@@ -346,9 +336,6 @@ def read_blocked(idx) -> bool:
         return (idx in _lost or idx in _fenced) and not op_running()
 
 
-# --- first evidence ---------------------------------------------------------------------------
-
-
 def note_evidence(ids: Iterable, kind: str, ts: Optional[float] = None) -> None:
     """A sign that chips are dying (``kind`` "aer_burst" or "all_ones") at wall time ``ts``. Keeps the earliest sign of
     the episode; a sign more than :data:`EVIDENCE_GAP_SEC` after the last one starts a new episode."""
@@ -374,9 +361,6 @@ def first_evidence(ids: Iterable) -> tuple:
             if ev is not None and (best[0] is None or ev[0] < best[0]):
                 best = (ev[0], ev[2])
     return best
-
-
-# --- held readers ----------------------------------------------------------------------------
 
 
 def hold_readers(pids: Iterable, until: float) -> None:
@@ -426,7 +410,6 @@ def wait_reader_release(pid) -> None:
 
 
 async def await_reader_release(pid) -> None:
-    """:func:`wait_reader_release` for the event loop."""
     t0 = time.monotonic()
     while not _hold_over(pid, time.monotonic() - t0):
         await asyncio.sleep(HOLD_POLL_SEC)
@@ -506,9 +489,6 @@ def observe(idx, value) -> None:
             clear_lost(idx, "answering again")
         else:
             unfence(idx, "answering again")
-
-
-# --- publishing ------------------------------------------------------------------------------
 
 
 def snapshot() -> dict:

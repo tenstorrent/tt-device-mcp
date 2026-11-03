@@ -357,7 +357,6 @@ def hold_handoff_status(episode: str) -> Optional[dict]:
 
 
 def end_hold_handoff() -> None:
-    """The hold ended: no hold is handed off any more."""
     _pending.pop("handoff", None)
 
 

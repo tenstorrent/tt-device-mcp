@@ -1189,7 +1189,6 @@ class GalaxyRecovery(Recovery):
         beats: Optional[dict],
         measured_fault: bool,
     ) -> str:
-        """:meth:`escalate`'s body, run with its ``stand_down`` in place."""
         if self.mechanism.host_action_blocks_reset(log, context=f"escalate({phase})"):
             return OUTCOME_WAITING
         rung, _, gate_phase = phase.partition("/")
@@ -2236,7 +2235,6 @@ class GalaxyRecovery(Recovery):
 
     @staticmethod
     def _describe_blocker(blocker: dict) -> str:
-        """The log-line form of a :meth:`_tenant_blocker` result."""
         kind = blocker["blocker"]
         if kind == "job_running":
             return "a broker job is running"
