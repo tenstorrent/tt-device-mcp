@@ -145,6 +145,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     OUTCOME_TERMINAL,
     OUTCOME_WAITING,
     PCI_WRITER,
+    POST_RESET_SETTLE_SEC,
     RELEASE,
     RESET_COOLDOWN_SEC,
     RESET_MODE_GALAXY,
@@ -175,6 +176,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     aer_totals,
     append_trace,
     arc_not_ready_chips,
+    boot_monotonic,
     bridge_reset_enabled,
     bridge_reset_unavailable_reason,
     capture_incident,
@@ -229,7 +231,6 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
-from tt_device_mcp.health.post_reset import POST_RESET_SETTLE_SEC, boot_monotonic
 from tt_device_mcp.holder_identity import describe_identity, read_holder_identities
 from tt_device_mcp.job_log_store import exit_signal, find_job_log, prune_job_logs, read_log_tail
 from tt_device_mcp.job_preflight import preflight_output_dirs

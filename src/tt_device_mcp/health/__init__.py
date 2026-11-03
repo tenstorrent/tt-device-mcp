@@ -108,7 +108,7 @@ from tt_device_mcp.health.monitors.pci import (
 # its PCI-wedged latch (spec 04 I76): server.py wires the latch to the hold and the power-cycle request, and clears it
 # only on a verified lift; telemetry.py's dead-chip valve skips chips while it is set and removes chips only through it.
 from tt_device_mcp.health.pci_writer import PCI_WRITER, PciWedged
-from tt_device_mcp.health.post_reset import FABRIC_DEBT
+from tt_device_mcp.health.post_reset import FABRIC_DEBT, POST_RESET_SETTLE_SEC, boot_monotonic
 from tt_device_mcp.health.recovery import (
     BELOW_FLOOR,
     BLOCKED,
@@ -304,4 +304,7 @@ __all__ = [
     "offbus_power_cycle",
     # the post-reset fabric debt (spec 04 I32): no reset releases until a fabric pass settles it
     "FABRIC_DEBT",
+    # and the settle a multi-tray mesh gets after a reset before that pass runs
+    "POST_RESET_SETTLE_SEC",
+    "boot_monotonic",
 ]
