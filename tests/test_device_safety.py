@@ -6044,24 +6044,6 @@ def test_power_cycle_does_not_escalate_past_a_recent_power_cycle(monkeypatch, tm
     assert "cooldown until" in why and "broker power-cycle" in why
 
 
-def test_choose_escalation_power_cycle_is_the_only_host_rung(monkeypatch, tmp_path):
-    """The power cycle is the one host rung: armed, it is the escalation, with nothing to satisfy
-    first. A leftover reboot setting from an older install arms nothing."""
-    _ledger_dir(monkeypatch, tmp_path)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
-    assert galaxy._choose_recovery_escalation(**srv._host_escalation_kwargs()) == "power-cycle"
-
-
-def test_choose_escalation_none_when_the_power_cycle_is_not_armed(monkeypatch, tmp_path):
-    """The power cycle not armed: no host-level escalation is offered, and a stale reboot setting
-    does not bring one back."""
-    _ledger_dir(monkeypatch, tmp_path)
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
-    assert galaxy._choose_recovery_escalation(**srv._host_escalation_kwargs()) is None
-
-
 @pytest.mark.parametrize("off_bus,expected", [(32, 32), (31, 32), (8, 32), (0, 32), (1, 1)])
 def test_host_escalation_for_drop_is_the_power_cycle_or_a_loud_hold(monkeypatch, tmp_path, off_bus, expected):
     """Every drop, whole-tray, partial or a present mesh, gets the power cycle when it is armed. Not armed, no rung and
@@ -10383,7 +10365,7 @@ async def test_stuck_hold_climb_defers_when_a_reset_is_still_cycling(monkeypatch
 @pytest.mark.asyncio
 async def test_stuck_hold_climb_power_cycles_when_that_is_the_chosen_rung(monkeypatch, clear_job_state):
     """When the host opted into the power cycle alone (a whole-bus wedge a reboot cannot clear), the
-    climb takes _choose_recovery_escalation's power-cycle rung rather than the reboot."""
+    climb takes _host_escalation_for_drop's power-cycle rung rather than the reboot."""
     counters = _arm_stuck_hold(monkeypatch, reset_result=False, beats_after_reset={})
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "0")
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")

@@ -414,17 +414,6 @@ def _offbus_stuck_hold_due(hold_since: str, *, off_bus: int, now: Optional[datet
     return (now - started).total_seconds() >= _stuck_hold_ceiling_sec()
 
 
-def _choose_recovery_escalation(*, auto_power_cycle_enabled: Callable[[], bool]) -> Optional[str]:
-    """The host-level recovery rung to attempt after a reset failed to revive the mesh, or None if
-    the host has none armed. The power cycle is the only host rung: it brings the host OS down
-    before power goes and re-powers the UBBs. There is no warm reboot rung: it never recovered a
-    device a power cycle would not have, and a Galaxy's UBBs stay unpowered-through across it.
-
-    ``auto_power_cycle_enabled`` is injected (server.py's own predicate) rather than read from a
-    module global, so this stays free of a server<->health import cycle."""
-    return "power-cycle" if auto_power_cycle_enabled() else None
-
-
 def _host_escalation_for_drop(
     off_bus: int,
     expected: int,

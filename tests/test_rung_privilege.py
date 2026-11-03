@@ -158,11 +158,11 @@ def test_the_forced_ladder_cannot_fire_a_rung_privilege_denies(monkeypatch):
     """The hold-deadline watchdog's forced escalation bypasses the fail-closed DEFERS, not the
     arming. An unprivileged daemon whose hold outlives the ceiling must still not reach for a
     power cycle it cannot issue — otherwise the bypass would route to a rung that raises."""
-    from tt_device_mcp.health.recovery.galaxy import _choose_recovery_escalation
+    from tt_device_mcp.health.recovery.galaxy import _host_escalation_for_drop
 
-    chosen = _choose_recovery_escalation(auto_power_cycle_enabled=srv._auto_power_cycle_enabled)
+    chosen = _host_escalation_for_drop(32, 32, **srv._host_escalation_kwargs())
 
-    assert chosen is None, "no host rung is reachable unprivileged, forced or not"
+    assert chosen == (None, True), "no host rung is reachable unprivileged, forced or not: hold loudly"
 
 
 @pytest.mark.asyncio
