@@ -261,9 +261,10 @@ class ServerFsm:
     # ---- boot-stage construction of the health subsystem ---------------------------------------
 
     def boot(self, deps: RecoveryDeps) -> None:
-        """Construct the health subsystem this FSM roots — the BOOT state's job, run once. Never per gate pass: a second
-        :class:`HealthMonitor` would lose the fabric-verdict latch and the in-flight fabric-process handle, a second
-        :class:`RecoveryMechanism` the reset cooldown/ledger state.
+        """Construct the health subsystem this FSM roots — the BOOT state's job, run once. Never
+        per gate pass: a second :class:`HealthMonitor` would lose the fabric-verdict latch and the
+        in-flight fabric-process handle, a second :class:`RecoveryMechanism` the reset
+        cooldown/ledger state.
 
         ``deps``' four monitor-bound fields (``board_types_provider``, ``glx_board_types_provider``,
         ``chip_buses_provider``, ``journal_skip_once``) read state that lives on the monitor being built here, so they
@@ -348,11 +349,12 @@ class ServerFsm:
         eth_timeout_reset: bool = False,
         recovery: "Optional[Recovery]" = None,
     ) -> tuple[bool, dict]:
-        """Trigger one probe pass of the system — the root's read of the mesh, routed through the platform's
-        ``_verify_device`` seam so a test that replaces that seam governs this too. Returns ``(healthy, evidence)`` and
-        stores the pass on ``monitor.status()``; folds no verdict into the FSM itself — whether a healthy read RELEASES
-        (or an unhealthy one holds, and with which flavour) is the caller's classification, made with context (a
-        runtime-named fault, a foreign holder) no probe pass carries.
+        """Trigger one probe pass of the system — the root's read of the mesh, routed through the
+        platform's ``_verify_device`` seam so a test that replaces that seam governs this too.
+        Returns ``(healthy, evidence)`` and stores the pass on ``monitor.status()``; folds no
+        verdict into the FSM itself — whether a healthy read RELEASES (or an unhealthy one holds,
+        and with which flavour) is the caller's classification, made with context (a runtime-named
+        fault, a foreign holder) no probe pass carries.
 
         ``recovery`` lets a caller that already chose its pass-scoped platform keep every read of that pass on the same
         choice; omitted, the platform is selected fresh. ``run_eth`` asks for the passive eth read without the traffic
@@ -710,16 +712,18 @@ class ServerFsm:
         return True
 
     def boot_merge(self, open_episode: Optional[FsmRecord], attributed_boot: Optional[dict] = None) -> ServerState:
-        """Reconcile BOOT into a real state, once, at startup. Always closed: a restart loses the in-memory verification
-        state, and sysfs reads perfectly healthy across a wedged ethernet link, so nothing available at this point is
-        proof the mesh is fit — only the startup gate's own forced probe pass (enum+ARC+eth+fabric, run right after
-        this) can open the door, through the ordinary :meth:`on_readings` a healthy verdict there already goes through.
-        There is no "clean boot, skip the verify" branch here to take that shortcut.
+        """Reconcile BOOT into a real state, once, at startup. Always closed: a restart loses the
+        in-memory verification state, and sysfs reads perfectly healthy across a wedged ethernet
+        link, so nothing available at this point is proof the mesh is fit — only the startup
+        gate's own forced probe pass (enum+ARC+eth+fabric, run right after this) can open the
+        door, through the ordinary :meth:`on_readings` a healthy verdict there already goes
+        through. There is no "clean boot, skip the verify" branch here to take that shortcut.
 
-        ``open_episode`` — an episode still open when this broker last wrote (this FSM's own loaded record, or one
-        reconstructed from the durable health-event journal on the first boot after this file existed) — wins
-        unconditionally when present: the same reasoning that closes a boot with no episode applies doubly to one that
-        was already mid-recovery. With none, the fresh episode is RECOVERING(startup_unverified).
+        ``open_episode`` — an episode still open when this broker last wrote (this FSM's own
+        loaded record, or one reconstructed from the durable health-event journal on the first
+        boot after this file existed) — wins unconditionally when present: the same reasoning
+        that closes a boot with no episode applies doubly to one that was already mid-recovery.
+        With none, the fresh episode is RECOVERING(startup_unverified).
 
         ``attributed_boot`` — this boot's own auto-recovery ledger entry, if a broker-fired reboot or power cycle
         brought it up — is not part of the state decision (only the startup gate proves whether that escalation actually

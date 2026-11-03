@@ -51,16 +51,18 @@ def gone_chip_bridge_reset_enabled() -> bool:
 def reset_chip_via_bridge(idx: str, bdf: str) -> Optional[bool]:
     """Reset a chip by writing to its PARENT BRIDGE, never to the chip itself.
 
-    Tri-state so the caller can retry only when a retry can help: ``True`` the chip is back; ``False`` a Secondary Bus
-    Reset was issued (or a setpci call failed mid-attempt) but the endpoint has not re-bound yet, so a settle-and-retry
-    may still land it; ``None`` the rung could not be issued AT ALL — no bridge to write to (the endpoint left the bus)
-    or setpci is gone — so it structurally cannot work here and a retry only re-runs the identical no-op.
+    Tri-state so the caller can retry only when a retry can help: ``True`` the chip is back;
+    ``False`` a Secondary Bus Reset was issued (or a setpci call failed mid-attempt) but the
+    endpoint has not re-bound yet, so a settle-and-retry may still land it; ``None`` the rung
+    could not be issued AT ALL — no bridge to write to (the endpoint left the bus) or setpci is
+    gone — so it structurally cannot work here and a retry only re-runs the identical no-op.
 
-    A dead endpoint cannot answer, so it cannot be reset through its own config space — but it does not have to be. A
-    Secondary Bus Reset is a write to the bridge above it, and the bridge is always alive. That is what lets a chip that
-    has stopped responding be reset at all. On this hardware each Blackhole sits alone behind its own bridge, so the
-    reset is surgical: the other 31 chips never see it, and the inter-chip fabric survives (measured — a traffic pass
-    still passes afterwards).
+    A dead endpoint cannot answer, so it cannot be reset through its own config space — but
+    it does not have to be. A Secondary Bus Reset is a write to the bridge above it, and the
+    bridge is always alive. That is what lets a chip that has stopped responding be reset at
+    all. On this hardware each Blackhole sits alone behind its own bridge, so the reset is
+    surgical: the other 31 chips never see it, and the inter-chip fabric survives (measured
+    — a traffic pass still passes afterwards).
 
     Reaches the bridge three ways. A chip still enumerated has its own sysfs node, so its bridge is the parent of that
     node. A chip the broker removed itself (isolate_chip — the all-ones chips, which is how this rung normally finds
@@ -271,12 +273,14 @@ def find_bridge_by_secondary_bus(bdf: str) -> Optional[str]:
     endpoint. Bus numbers repeat across PCI domains, so the domain must match too. secondary_bus_number is decimal in
     sysfs; a BDF's bus field is hex.
 
-    The address passed here is cached at broker start and never refreshed, so a galaxy reset or rescan that renumbered
-    buses since can leave it pointing at a bus that OTHER live silicon now occupies. A chip that truly left the bus
-    leaves it EMPTY; a device still enumerated ON the target bus means the address is stale and the bridge above it now
-    feeds a different, live chip. Refuse in that case — a Secondary Bus Reset there would knock out silicon that never
-    dropped. The chip then holds and escalates to a heavier reset, which is recoverable; an errant SBR of a live
-    neighbor is not."""
+    The address passed here is cached at broker start and never refreshed, so a galaxy
+    reset or rescan that renumbered buses since can leave it pointing at a bus that OTHER
+    live silicon now occupies. A chip that truly left the bus leaves it EMPTY; a device
+    still enumerated ON the target bus means the address is stale and the bridge above it
+    now feeds a different, live chip. Refuse in that case — a Secondary Bus Reset there
+    would knock out silicon that never dropped. The chip then holds and escalates to a
+    heavier reset, which is recoverable; an errant SBR of a live neighbor is not.
+    """
     m = re.fullmatch(r"([0-9a-f]{4}):([0-9a-f]{2}):[0-9a-f]{2}\.[0-9a-f]", bdf or "")
     if not m:
         return None

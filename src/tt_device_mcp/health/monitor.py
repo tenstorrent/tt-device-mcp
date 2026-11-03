@@ -411,8 +411,8 @@ class HealthMonitor:
         expected: Optional[int] = None,
         log: Optional[Callable[[str], None]] = None,
     ) -> HealthState:
-        """Run one probe pass — heartbeat+pci always, then eth, then the fabric traffic pass when
-        ``run_fabric``/``force_fabric`` — and store it as the new ``readings`` blackboard.
+        """Run one probe pass — heartbeat+pci always, then eth, then the fabric traffic pass
+        when ``run_fabric``/``force_fabric`` — and store it as the new ``readings`` blackboard.
 
         ``run_eth`` asks for the passive eth read WITHOUT the traffic pass: the clean post-job gate on a host whose eth
         rung is armed (spec 03 I30). The read is bounded to ``ETH_POST_JOB_TIMEOUT_SEC`` there. A frozen verdict stops

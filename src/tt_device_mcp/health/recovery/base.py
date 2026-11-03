@@ -1194,12 +1194,14 @@ class RecoveryMechanism:
     ) -> tuple[Optional[int], str]:
         """Run one device reset through the available restart-safe backend.
 
-        Root on a systemd host uses a PID-1 scope. Otherwise the reset uses a new-session child that inherits an
-        exclusive local lock. Both backends survive broker restart and let the next process adopt the in-flight reset.
+        Root on a systemd host uses a PID-1 scope. Otherwise the reset uses a
+        new-session child that inherits an exclusive local lock. Both backends survive
+        broker restart and let the next process adopt the in-flight reset.
 
-        ``owner`` names the jobs-list row this reset leaves. It defaults to the gate — the broker resetting on its own —
-        because that is who calls this for recovery; the reset tool passes the human who asked, so an operator-run reset
-        is one row attributed to them, not the gate's row plus a duplicate.
+        ``owner`` names the jobs-list row this reset leaves. It defaults to the gate — the
+        broker resetting on its own — because that is who calls this for recovery; the reset
+        tool passes the human who asked, so an operator-run reset is one row attributed to
+        them, not the gate's row plus a duplicate.
 
         ``wait_until`` (a ``time.monotonic()`` instant) ends the wait for the reset sooner than
         DEVICE_RESET_TIMEOUT_SEC; the reset is still never killed (spec 04 I102).
@@ -1391,12 +1393,12 @@ class RecoveryMechanism:
         on_output: Optional[Callable[[str], None]] = None,
         wait_until: Optional[float] = None,
     ) -> tuple[Optional[int], str]:
-        """One reset, done safely: quiet the bus, run it where nothing can interrupt it, put the pollers back. Every
-        reset in the broker goes through here — the health gate and the reset tool must not be able to drift apart on
-        what "safe" means.
+        """One reset, done safely: quiet the bus, run it where nothing can interrupt it,
+        put the pollers back. Every reset in the broker goes through here — the health
+        gate and the reset tool must not be able to drift apart on what "safe" means.
 
-        Caller MUST hold ``_device_op`` (this does not take the lock itself, because the caller's critical section
-        usually spans the verification too).
+        Caller MUST hold ``_device_op`` (this does not take the lock itself, because the
+        caller's critical section usually spans the verification too).
 
         ``owner`` is passed straight to the jobs-list row (see ``run_scoped``).
 

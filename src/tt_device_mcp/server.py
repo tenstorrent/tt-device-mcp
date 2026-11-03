@@ -3317,17 +3317,19 @@ async def _terminate_process_group(pid: int, grace_sec: float = GRACEFUL_KILL_GR
     """Stop a job's process group so it RELEASES THE DEVICE: SIGINT, then SIGTERM, then SIGKILL only for a job that is
     genuinely hung.
 
-    Killing a device job without letting it release the chip is how the mesh gets wedged — the eth cores are left
-    mid-transaction and the next job inherits a dead fabric. A ttnn job releases the chip only from its teardown path
-    (pytest fixture teardown, ttnn's atexit), and that path runs only if the interpreter UNWINDS.
+    Killing a device job without letting it release the chip is how the mesh gets
+    wedged — the eth cores are left mid-transaction and the next job inherits a dead
+    fabric. A ttnn job releases the chip only from its teardown path (pytest fixture
+    teardown, ttnn's atexit), and that path runs only if the interpreter UNWINDS.
 
-    SIGINT is the only signal that unwinds it: Python raises KeyboardInterrupt. SIGTERM does NOT — Python installs no
-    handler, so the default action terminates the process outright, atexit never runs, and the mesh is never closed. For
-    a Python job SIGTERM is therefore no gentler than SIGKILL, which is why the ladder leads with SIGINT and why SIGTERM
-    is only a formality on the way to the reap.
+    SIGINT is the only signal that unwinds it: Python raises KeyboardInterrupt.
+    SIGTERM does NOT — Python installs no handler, so the default action terminates
+    the process outright, atexit never runs, and the mesh is never closed. For a
+    Python job SIGTERM is therefore no gentler than SIGKILL, which is why the ladder
+    leads with SIGINT and why SIGTERM is only a formality on the way to the reap.
 
-    Reaching SIGKILL means the job did NOT release the device: log it loudly, because the mesh is probably wedged and
-    the clean-device gate will have to reset it.
+    Reaching SIGKILL means the job did NOT release the device: log it loudly, because
+    the mesh is probably wedged and the clean-device gate will have to reset it.
 
     ``pid`` is the pgid (jobs are spawned with os.setsid, so pid == pgid). Returns the ladder step that ended the group:
     "already gone", "SIGINT", "SIGTERM" or "SIGKILL"."""
@@ -4191,11 +4193,11 @@ def _reset_health_label(verdict: Optional[bool]) -> str:
 ETH_CHECK_SELFTEST_BUDGET_SEC = 10.0
 eth_check_armed: bool = False
 eth_check_disarm_reason: str = "startup self-test has not run yet"
-# A self-test that missed its budget once (a read that hung on a busy box, no device detected at that moment) used to
-# leave the rung off until the next broker restart. An idle broker retries it at this pace instead (see
+# A self-test that missed its budget once (a read that hung on a busy box, no device detected at that moment) would
+# otherwise leave the rung off until the next broker restart. An idle broker retries it at this pace (see
 # _maybe_spawn_eth_rearm). A host with no eth reader yet (eth.build() returned None: no python imports ttexalens, or no
 # probe) is retried too, at this pace only, even inside a fault episode: an eth-venv provisioned after the broker
-# started (an autoupdate that installs it) used to leave the rung off until the next restart. A per-user daemon never
+# started (an autoupdate that installs it) would otherwise stay off until the next restart. A per-user daemon never
 # runs the self-test, so it never retries.
 eth_rearm_retryable: bool = False
 # Whether the last self-test found no reader at all; such a retry stays paced (see
@@ -4239,9 +4241,10 @@ class _EthSelftestKilled(Exception):
 async def selftest_eth_heartbeat() -> str:
     """Time the passive eth read once per broker start; arm the rung only on a fast answer.
 
-    Slow is the dangerous outcome, not failing: past its timeout the gate reads a frozen core and HOLDS the box, so a
-    host that cannot answer well inside the budget keeps the rung off. A frozen verdict still counts as ARMED — the read
-    worked, and it found something. Only a read that never measured (``classify_exit`` -> None) leaves the rung off.
+    Slow is the dangerous outcome, not failing: past its timeout the gate reads a frozen core and
+    HOLDS the box, so a host that cannot answer well inside the budget keeps the rung off. A
+    frozen verdict still counts as ARMED — the read worked, and it found something. Only a read
+    that never measured (``classify_exit`` -> None) leaves the rung off.
 
     An opt-in nobody exercises is not a safe default, it is an absent rung: the read sat inert for weeks — 25 SKIPPED, 0
     verdicts — because "nobody armed it" and "it is broken" look identical from outside. So the box proves the detector
@@ -4766,9 +4769,9 @@ def _generic_hold_escalate_enabled() -> bool:
 
 
 def _idle_relift_armed() -> tuple[bool, bool, bool]:
-    """``(selfheal, fabric, generic)`` — which of the three idle re-verify/escalate categories the CURRENT episode falls
-    into, per the opt-in for each. All False outside RECOVERING: HEALTHY has nothing to lift, and DOWN is the terminal
-    rung — only an operator acts on it from here.
+    """``(selfheal, fabric, generic)`` — which of the three idle re-verify/escalate categories the
+    CURRENT episode falls into, per the opt-in for each. All False outside RECOVERING: HEALTHY has
+    nothing to lift, and DOWN is the terminal rung — only an operator acts on it from here.
 
     A fabric-unverified hold WITHOUT the fabric-relift opt-in (the default) falls into the GENERIC category, exactly as
     the pre-fsm fold did (``generic`` keyed on the unverified marker with ``not fabric``): the perturbing traffic-pass
@@ -6250,9 +6253,10 @@ def _signal_device_holders(reason: str, stopped: tuple = (), journal: Optional[C
         except ProcessLookupError:
             continue  # already gone — its mapping went with it, which is the goal
         except (PermissionError, OSError) as e:
-            # A holder we could NOT kill still maps the dead endpoint, and its next read stalls a core and reboots the
-            # host — the exact outcome this kill exists to prevent. Swallowing it read as "all holders cleared"; name
-            # the survivor so the residual host risk is on the record instead.
+            # A holder we could NOT kill still maps the dead endpoint, and its next read stalls a
+            # core and reboots the host — the exact outcome this kill exists to prevent. Swallowing
+            # it read as "all holders cleared"; name the survivor so the residual host risk is on
+            # the record instead.
             survivors.append({"pid": h.pid, "user": h.username, "error": str(e)})
     # The broker's own device work. A fabric check mid-traffic-pass is the likeliest holder of
     # all — it maps every chip — and it is the one that killed a host, twice.
@@ -6778,10 +6782,11 @@ def _note_poller_to_restore(svc: str, owed: bool) -> None:
 async def _set_device_pollers(active: bool, log) -> list[str]:
     """Stop (or restart) the daemons that continuously poll every chip.
 
-    A reset must land on a quiet bus. These pollers keep issuing MMIO at a chip that is mid-reset or already wedged, and
-    non-completing transactions at a dead endpoint are what drive the root complex past its error threshold — at which
-    point firmware-first RAS resets the whole host. Quiescing them is the difference between a 60s device reset and an
-    ungraceful reboot.
+    A reset must land on a quiet bus. These pollers keep issuing MMIO at a chip
+    that is mid-reset or already wedged, and non-completing transactions at a dead
+    endpoint are what drive the root complex past its error threshold — at which
+    point firmware-first RAS resets the whole host. Quiescing them is the
+    difference between a 60s device reset and an ungraceful reboot.
 
     The restore starts only the pollers the stop found running: a poller an operator stopped on purpose, or one this
     host does not have, is left as it was.
@@ -6994,10 +6999,10 @@ def _auto_power_cycle_enabled() -> bool:
     needs a reachable BMC + ipmitool; where those are absent the fire raises and the ladder reports it rather than
     silently holding. Opt OUT with TT_DEVICE_MCP_AUTO_POWER_CYCLE=0.
 
-    Enabled means ARMED AND FIREABLE. A host with no ipmitool cannot cold-cycle, and reporting the rung as on there
-    would make the ladder look terminating when its last step cannot run — the router would keep choosing a rung that
-    always raises. Reading the binary here instead collapses to the already-loud BLOCKED path: the cascade emits its
-    power-cycle-required event and holds."""
+    Enabled means ARMED AND FIREABLE. A host with no ipmitool cannot cold-cycle, and reporting the
+    rung as on there would make the ladder look terminating when its last step cannot run — the
+    router would keep choosing a rung that always raises. Reading the binary here instead collapses
+    to the already-loud BLOCKED path: the cascade emits its power-cycle-required event and holds."""
     if os.environ.get("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1").strip() == "0":
         return False
     return privileges.can_ipmi()
@@ -7249,11 +7254,14 @@ async def device_health_gate(
 ) -> None:
     """Unified health gate run while the device is IDLE around a job.
 
-    ``phase`` labels the caller ('pre-job', 'post-job', 'startup') in the logs and the device op; it steers nothing.
-    Always (when enabled) runs a tt-smi snapshot (chips + ARC), and runs the configured fabric traffic check when
-    ``run_fabric``. If the device is flagged dirty, or any check finds it unhealthy, it resets + verifies here so no job
-    starts on — and no wedge is left behind by — a half-dead mesh. Logs every step into the job's own log. Never raises;
-    on any error it clears the dirty flag and proceeds (so the queue never stalls).
+    ``phase`` labels the caller ('pre-job', 'post-job', 'startup') in the logs and the
+    device op; it steers nothing. Always (when enabled) runs a tt-smi snapshot (chips +
+    ARC), and runs the configured fabric traffic check when ``run_fabric``. If the device
+    is flagged dirty, or any check finds it
+    unhealthy, it resets + verifies here so no job starts on — and no wedge is left
+    behind by — a half-dead mesh. Logs every step into the job's own log. Never
+    raises; on any error it clears the dirty flag and proceeds (so the queue never
+    stalls).
 
     ``with_recover=False`` runs the pass and records its verdict but never enters the recovery ladder — the read-only
     shape an external scheduler drives before a job, where the ladder's minutes would be paid on the critical path of
@@ -8343,8 +8351,8 @@ def _decision_heartbeats() -> dict:
 
 # Spec 03 I87: the status surfaces (/health, queue status) read the chips' heartbeats off the event
 # loop. Each read is a PCIe read of the chip; one that is slow to answer (AER errors, a chip leaving
-# the bus) used to block every surface of the broker for as long as the reads took, since /health
-# made several full passes per call on the loop itself. The handler reads once in a worker thread,
+# the bus) would block every surface of the broker for as long as the reads take, and /health makes
+# several full passes per call. The handler reads once in a worker thread,
 # at most one such read at a time, waits STATUS_CHIP_READ_WAIT_SEC for it and otherwise answers from
 # the last completed read, saying how old it is. Decision reads (_decision_heartbeats) are unchanged.
 STATUS_CHIP_READ_WAIT_SEC = 0.5
@@ -12701,7 +12709,8 @@ def _job_status_from_record(job_id: str, r: dict) -> dict:
 async def cleanup_finished_jobs():
     """Remove finished jobs older than JOB_RETENTION_SEC from memory.
 
-    Job output is already persisted to log files, so we don't need to keep completed jobs in memory indefinitely.
+    Job output is already persisted to log files, so we don't need to keep
+    completed jobs in memory indefinitely.
 
     Uses lock to prevent race conditions with concurrent job state access.
 
@@ -14880,8 +14889,9 @@ async def _restore_queued_jobs() -> None:
             continue
         fault_reason = _device_fault_failed_reason(job.id)
         if fault_reason:
-            # This job was SIGKILLed by device recovery (a wedge it caused). Re-running the exact job that just took the
-            # device down is how a boot loop starts — drop it: forget its spec + record, do not re-enqueue.
+            # This job was SIGKILLed by device recovery (a wedge it caused). Re-running the exact
+            # job that just took the device down is how a boot loop starts — drop it: forget its
+            # spec + record, do not re-enqueue.
             _forget_queued_job(job.id)
             _clear_device_fault_failed(job.id)
             dropped += 1
@@ -15007,10 +15017,11 @@ async def _record_startup_health() -> None:
                 "completed" if ok else "failed",
                 0 if ok else 1,
             )
-            # A degraded device must not be handed a clean slate by the restart that found it. The durable fsm record
-            # survives a broker restart, but not a degradation that happened while nothing was running to record it (the
-            # box sat degraded across the whole downtime). This live sysfs read catches that case too, so the next
-            # tenant is gated on what is actually there rather than what the FSM last happened to say.
+            # A degraded device must not be handed a clean slate by the restart that found it. The
+            # durable fsm record survives a broker restart, but not a degradation that happened while
+            # nothing was running to record it (the box sat degraded across the whole downtime). This
+            # live sysfs read catches that case too, so the next tenant is gated on what is actually
+            # there rather than what the FSM last happened to say.
             if not ok:
                 _mark_device_dirty(f"broker start: {detail}", why="heartbeat")
             if logger:
@@ -15059,8 +15070,9 @@ def _close_orphaned_hold() -> Optional[dict]:
     except (TypeError, ValueError):
         held_for = 0.0
     reason = held.get("reason") or "reason not recorded"
-    # Stamped at the END like the normal release row: write_action_log would reconstruct a start from the runtime and
-    # file this row at the hold's beginning, where RECENT sorts it above the whole recovery it closes.
+    # Stamped at the END like the normal release row: write_action_log would reconstruct a start
+    # from the runtime and file this row at the hold's beginning, where RECENT sorts it above the
+    # whole recovery it closes.
     _write_action_log_file(
         next_job_id(),
         "[broker]hold",
@@ -15659,11 +15671,12 @@ def _startup_pollers_log(msg: str) -> None:
 async def _verify_fabric_on_start() -> None:
     """Prove the mesh moves data, not merely that every chip answers.
 
-    The startup probe reads sysfs: it costs nothing and catches a chip that is gone or frozen, which is why it runs
-    first and reports immediately. It cannot see a wedged ethernet link — sysfs stays perfectly healthy while the fabric
-    is unusable — and a broker start is exactly when the mesh is least accounted for: whatever the previous broker was
-    doing, it did not finish. So the pass is forced rather than left to the periodic interval, which exists to spare
-    successful jobs and has no vote here.
+    The startup probe reads sysfs: it costs nothing and catches a chip that is gone or
+    frozen, which is why it runs first and reports immediately. It cannot see a wedged
+    ethernet link — sysfs stays perfectly healthy while the fabric is unusable — and a
+    broker start is exactly when the mesh is least accounted for: whatever the previous
+    broker was doing, it did not finish. So the pass is forced rather than left to the
+    periodic interval, which exists to spare successful jobs and has no vote here.
 
     Queued behind any job re-adopted from the previous broker. The pass pushes traffic across every inter-chip link, so
     running it beside a tenant job corrupts their measurements and ours both — and the device is theirs until they are
@@ -17465,8 +17478,8 @@ def create_mcp_server() -> MCPServer:
                 _release_external_step(token)
 
     async def _post_step_impl(data: dict) -> dict:
-        """The recovering pass an external scheduler runs after a job: reclaim the allocation's stragglers, then the
-        full gate — probe, ladder if the evidence justifies it, re-verify.
+        """The recovering pass an external scheduler runs after a job: reclaim the allocation's
+        stragglers, then the full gate — probe, ladder if the evidence justifies it, re-verify.
 
         The reclaim comes first because the gate refuses over a tenant (04 I6/I7) and a straggler is exactly that from
         the scan's side. ``exit_code`` is the finished step's, and forces the fabric traffic pass: a fabric wedge is
@@ -17474,10 +17487,10 @@ def create_mcp_server() -> MCPServer:
         cost. A clean step pays no traffic pass; on a host whose eth rung is armed it gets the passive eth read instead,
         the same as a clean in-broker job (spec 03 I30).
 
-        ``data`` is the raw (already-JSON-decoded) request body, parsed here — after the root and in-flight checks,
-        never before — so a malformed body from a non-root caller is refused for being non-root, not for being
-        malformed, and a malformed body never reaches Python's arg-parsing machinery as an uncaught exception (a step
-        must always return a verdict)."""
+        ``data`` is the raw (already-JSON-decoded) request body, parsed here — after the root and
+        in-flight checks, never before — so a malformed body from a non-root caller is refused for
+        being non-root, not for being malformed, and a malformed body never reaches Python's
+        arg-parsing machinery as an uncaught exception (a step must always return a verdict)."""
         if refusal := _step_caller_is_root():
             return _step_refusal(refusal)
 

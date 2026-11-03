@@ -724,17 +724,20 @@ class TelemetrySampler:
     async def check_for_dead_chips(self, sample: dict, read_ts: Optional[float] = None) -> None:
         """Decide whether all-ones means a chip died — or something else entirely.
 
-        All-ones is only evidence of a dead chip when nothing else can explain it, and two things can:
+        All-ones is only evidence of a dead chip when nothing else can explain it, and two
+        things can:
 
-        A RESET IN FLIGHT. Taking the chips off the bus is what a reset *is*. During one they read all-ones exactly like
-        a dead chip, and isolating them then rips the endpoints out of the kernel halfway through and destroys the
-        reset. This is not hypothetical — it removed all 32 chips from a healthy host and left it with no devices at
-        all. Only a reset is excused; during a fabric check or a probe, chips going all-ones IS a failure and is acted
-        on, which is the case that actually killed a host.
+        A RESET IN FLIGHT. Taking the chips off the bus is what a reset *is*. During one they
+        read all-ones exactly like a dead chip, and isolating them then rips the endpoints out
+        of the kernel halfway through and destroys the reset. This is not hypothetical — it
+        removed all 32 chips from a healthy host and left it with no devices at all. Only a
+        reset is excused; during a fabric check or a probe, chips going all-ones IS a failure
+        and is acted on, which is the case that actually killed a host.
 
-        EVERY CHIP AT ONCE. Thirty-two chips do not fail independently in the same 10ms. That is the driver, the bus, or
-        a reset we did not start — a global event. Amputating every device in response leaves nothing to run on and no
-        way back except a rescan, so it is reported loudly and left alone.
+        EVERY CHIP AT ONCE. Thirty-two chips do not fail independently in the same 10ms. That
+        is the driver, the bus, or a reset we did not start — a global event. Amputating every
+        device in response leaves nothing to run on and no way back except a rescan, so it is
+        reported loudly and left alone.
 
         Otherwise, a chip must read all-ones on two consecutive samples before it is cut out. A genuinely dead chip
         stays dead; a transient does not. Twenty seconds is a rounding error against the ~130s a host survives after a

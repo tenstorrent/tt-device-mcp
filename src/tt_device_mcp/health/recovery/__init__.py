@@ -523,10 +523,11 @@ class Recovery(ABC):
     async def _recover_isolated_chips(self, log, exclude=frozenset(), not_reset=frozenset()) -> bool:
         """Bring back chips that were cut out of the kernel after leaving the PCIe bus.
 
-        Reset through the parent bridge, not the chip: a dead endpoint cannot be reset through its own config space, but
-        it does not need to be, and the bridge above it always answers. Each Blackhole sits alone behind its own bridge
-        here, so this is surgical — measured on live hardware, the other 31 chips keep ticking and a fabric traffic pass
-        still passes afterwards, so no galaxy-wide reset is needed to make the mesh usable again.
+        Reset through the parent bridge, not the chip: a dead endpoint cannot be reset through
+        its own config space, but it does not need to be, and the bridge above it always answers.
+        Each Blackhole sits alone behind its own bridge here, so this is surgical — measured on
+        live hardware, the other 31 chips keep ticking and a fabric traffic pass still passes
+        afterwards, so no galaxy-wide reset is needed to make the mesh usable again.
 
         Caller MUST hold the device lock: this ends with a PCI rescan, and nothing else may be touching the device while
         the endpoint re-enumerates.
@@ -1007,9 +1008,11 @@ class Recovery(ABC):
     async def _reset_and_verify_device(self, indices: list, log) -> Optional[bool]:
         """Recover the device with ONE reset, performed safely, then prove it worked.
 
-        Safety here is structural, not statistical — the reset is exclusive (the caller holds ``device_op_lock``), lands
-        on a bus quiesced of pollers, and runs in its restart-safe systemd or local backend so nothing can interrupt it.
-        A reset done that way is a cheap, routine repair of an idle device, so we do not hesitate to run it.
+        Safety here is structural, not statistical — the reset is exclusive (the caller
+        holds ``device_op_lock``), lands on a bus quiesced of pollers, and runs in its
+        restart-safe systemd or local backend so nothing can interrupt it. A reset done
+        that way is a cheap, routine repair of an idle device, so we do not hesitate to
+        run it.
 
         What we do NOT do is run it twice in a row. A reset that did not revive the mesh will not revive it on an
         immediate retry, and every extra reset is another pass of MMIO at a dead endpoint — the exact traffic that

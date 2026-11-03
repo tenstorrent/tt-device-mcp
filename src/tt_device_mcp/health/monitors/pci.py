@@ -83,14 +83,17 @@ def chip_snapshot() -> dict:
     """Everything the host knows about the chips. The telemetry attributes and link config are PCIe reads of each chip,
     so a chip confirmed lost is listed without them (spec 03 I66).
 
-    This is the record that makes a post-mortem possible. When a chip wedges, the question is always "what was it doing
-    beforehand" — was it hot, was it throttling, was its PCIe link taking errors, was it running different firmware than
-    its neighbours. None of that is recoverable after the fact, and all of it is free right now, so it gets written down
-    on every health decision.
+    This is the record that makes a post-mortem possible. When a chip wedges, the
+    question is always "what was it doing beforehand" — was it hot, was it throttling,
+    was its PCIe link taking errors, was it running different firmware than its
+    neighbours. None of that is recoverable after the fact, and all of it is free right
+    now, so it gets written down on every health decision.
 
-    The PCIe error counters matter most: the documented path from a wedged chip to an ungraceful host reboot runs
-    through the root complex escalating accumulated errors to fatal. If that is what is happening here, these counters
-    are where it shows, and without them the theory can be neither proved nor dropped."""
+    The PCIe error counters matter most: the documented path from a wedged chip to an
+    ungraceful host reboot runs through the root complex escalating accumulated errors
+    to fatal. If that is what is happening here, these counters are where it shows, and
+    without them the theory can be neither proved nor dropped.
+    """
     chips: dict[str, dict] = {}
     try:
         entries = sorted(SYSFS_CLASS_DIR.iterdir())

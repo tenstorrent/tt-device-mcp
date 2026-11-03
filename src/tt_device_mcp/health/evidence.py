@@ -68,8 +68,10 @@ MAX_CHIPS_BYTES = 256 * 1024 * 1024
 def _append_durable(path: Path, rec: dict, max_bytes: int) -> bool:
     """Append one JSON record and fsync it. True only once the fsync returned (spec 03 I95).
 
-    fsync per record is the entire contract: the events worth having are the ones written moments before the machine
-    dies. Never raises — a journal that cannot be written must not take the broker down with it."""
+    fsync per record is the entire contract: the events worth having are the ones
+    written moments before the machine dies. Never raises — a journal that cannot be
+    written must not take the broker down with it.
+    """
     try:
         HEALTH_DIR.mkdir(parents=True, exist_ok=True)
         # Roll before writing, so the cap holds even if the process dies mid-append.
@@ -466,10 +468,12 @@ def capture_incident(
 ) -> Optional[Path]:
     """Freeze everything a root-cause investigation will want, at the moment it exists.
 
-    The broker's decision was already being recorded; the evidence behind it was not. The job's own output, the kernel's
-    account of the bus, the reset's full transcript, the fabric validator's full transcript, and the telemetry trace
-    leading into the failure all lived somewhere volatile — a rotating log, a kernel ring buffer an ungraceful reboot
-    erases, a truncated string in a JSON field. Each one is copied here, once, while it still exists.
+    The broker's decision was already being recorded; the evidence behind it was not. The
+    job's own output, the kernel's account of the bus, the reset's full transcript, the
+    fabric validator's full transcript, and the telemetry trace leading into the failure
+    all lived somewhere volatile — a rotating log, a kernel ring buffer an ungraceful
+    reboot erases, a truncated string in a JSON field. Each one is copied here, once,
+    while it still exists.
 
     ``fabric_since`` is when the calling gate pass began, ``fabric_output_at`` when the run that produced
     ``fabric_output`` began. With ``fabric_since`` set, output from an earlier pass is stale: it is left out of the

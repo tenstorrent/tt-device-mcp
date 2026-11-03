@@ -122,8 +122,9 @@ def _reboot_min_dead_chips(expected: int) -> int:
 
 
 def _galaxy_reset_min_dead_chips(expected: int) -> Optional[int]:
-    """Fewest off-bus chips that justifies the mesh-wide galaxy reset. Defaults to the mass-drop floor; None only when
-    an operator explicitly disables it (frac <= 0), restoring the old reset-any-unhealthy behavior.
+    """Fewest off-bus chips that justifies the mesh-wide galaxy reset. Defaults to the mass-drop
+    floor; None only when an operator explicitly disables it (frac <= 0), restoring the old
+    reset-any-unhealthy behavior.
 
     The galaxy reset is the measured all-chip drop: run against a single/few-chip off-bus wedge it takes the mesh with
     it — one chip off the bus, one -glx_reset, and the other 31 go to 0xFFFFFFFF until a power cycle. That wedge is an
@@ -181,8 +182,9 @@ def _eth_freeze_holds() -> bool:
 
 
 def _stuck_hold_reset_enabled() -> bool:
-    """Whether an idle hold that has stood past the ceiling may escalate to the galaxy reset the gate would run at the
-    next job. ON by default; TT_DEVICE_MCP_STUCK_HOLD_RESET=0 is the operator kill-switch.
+    """Whether an idle hold that has stood past the ceiling may escalate to the galaxy reset the
+    gate would run at the next job. ON by default; TT_DEVICE_MCP_STUCK_HOLD_RESET=0 is the operator
+    kill-switch.
 
     The read-only relift lifts a hold the moment the mesh proves fit, but it cannot lift a present-mesh eth/fault hold
     no read the broker owns can clear (no eth reader), so that hold stands until the next job's gate resets it — and an
@@ -557,8 +559,8 @@ def _route(
     ``galaxy_floor`` is None only when an operator opts out to the old reset-any-unhealthy behavior;
     then any off-bus chip resets. ``host_escalation``/``reboot_blocked`` are the caller's already-
     folded verdict — :func:`_host_escalation_for_drop`'s result (``GalaxyRecovery.next_stage``
-    derives it from ``off_bus_before``/``reset_exit_nonzero``, never this function, which stays pure and
-    side-effect-free: the gate does the acting, this only names the rung)."""
+    derives it from ``off_bus_before``/``reset_exit_nonzero``, never this function, which stays
+    pure and side-effect-free: the gate does the acting, this only names the rung)."""
     if last_action_recovered:
         return RELEASE
     if last_action == STAGE_SMI_RESET and last_action_recovered is False:
@@ -1114,20 +1116,23 @@ class GalaxyRecovery(Recovery):
         stand_down: Optional[Callable[[], bool]] = None,
         bound: bool = False,
     ) -> str:
-        """Run the next justified rung of this ladder and report the outcome, replacing the direct
-        ``_escalate_stuck_hold``/``_escalate_offbus_stuck_hold`` calls the idle relift and the hold-deadline watchdog's
-        forced escalation used to make.
+        """Run the next justified rung of this ladder and report the outcome, replacing the
+        direct ``_escalate_stuck_hold``/``_escalate_offbus_stuck_hold`` calls the idle relift and
+        the hold-deadline watchdog's forced escalation used to make.
 
-        ``phase`` names which ladder to try — ``"present"`` (the present-mesh galaxy-reset ladder) or ``"offbus"`` (the
-        off-bus cascade) — with a ``"-forced"`` suffix for the watchdog's forced pass (bypasses each ladder's guarded
-        defers — due/retry-pacing on the present ladder, the once-per-episode latch and cooldown on the off-bus one, and
-        the unreadable-tenant read on both — exactly as ``force=True`` already did on the direct calls it replaces), or
-        ``"gate/<gate phase>"`` for the between-job gate, whose ladder fires ONE rung its own ``next_stage`` already
-        chose and so takes ``stage``/``ev``/``beats`` with it (see :meth:`_fire_gate_rung`; the two idle ladders choose
-        their own rungs and ignore all three). ``indices``/``expected`` are the caller's OWN single read of the mesh,
-        passed through rather than re-derived here: the caller already used that same read to decide off_bus and journal
-        it, and a second, independent read here could hand the reset a different chip set than the one the decision was
-        made against.
+        ``phase`` names which ladder to try — ``"present"`` (the present-mesh galaxy-reset ladder)
+        or ``"offbus"`` (the off-bus cascade) — with a ``"-forced"`` suffix for the watchdog's
+        forced pass (bypasses each ladder's guarded defers — due/retry-pacing on the present ladder,
+        the once-per-episode latch and cooldown on the off-bus one, and the unreadable-tenant read
+        on both — exactly as ``force=True`` already did on the direct calls it replaces), or
+        ``"gate/<gate phase>"`` for
+        the between-job gate, whose ladder fires ONE rung its own ``next_stage`` already chose and
+        so takes ``stage``/``ev``/``beats`` with it (see :meth:`_fire_gate_rung`; the two idle
+        ladders choose their own rungs and ignore all three). ``indices``/``expected`` are the
+        caller's OWN single read of the mesh, passed through rather than re-derived here: the
+        caller already used that same read to decide off_bus and journal it, and a second,
+        independent read here could hand the reset a different chip set than the one the decision
+        was made against.
 
         Mapping for the two idle ladders, kept to one rule: nothing ran -> WAITING; something ran and the mesh went from
         degraded to not-degraded -> RECOVERED; something ran and the mesh is still degraded (climbed to the host rung,
@@ -1498,11 +1503,12 @@ class GalaxyRecovery(Recovery):
     ) -> str:
         """Fire the one rung ``stage`` names and report whether it recovered the mesh.
 
-        RECOVERED or WAITING only, never TERMINAL. Unlike the idle ladders — the last resort on a box with no next job —
-        a gate pass that could not recover the mesh has not exhausted the ladder: the next job's gate, the idle relift
-        and the hold-deadline watchdog all still own this mesh, so the episode stays exactly as it stood rather than
-        closing into DOWN. That is also what keeps a per-target host, whose gate runs this same ladder, out of DOWN
-        entirely — a state it can reach only through the Galaxy idle ladder.
+        RECOVERED or WAITING only, never TERMINAL. Unlike the idle ladders — the last resort on a
+        box with no next job — a gate pass that could not recover the mesh has not exhausted the
+        ladder: the next job's gate, the idle relift and the hold-deadline watchdog all still own
+        this mesh, so the episode stays exactly as it stood rather than closing into DOWN. That is
+        also what keeps a per-target host, whose gate runs this same ladder, out of DOWN entirely —
+        a state it can reach only through the Galaxy idle ladder.
 
         The verdict reported is the ACTION's own (the re-verify, the bridge reset, the mesh reset), not a degraded->fit
         transition: the gate reaches its ladder whenever THIS pass's probe read unhealthy, which happens on a mesh the
@@ -4142,11 +4148,12 @@ class GalaxyRecovery(Recovery):
         exceptions are holds with no gentler rung left to try (spec 04 I38, I79), which includes a hold whose one mesh
         reset already ran and failed (I87).
 
-        Fires ONLY for a mass drop. The galaxy reset can drop a present-but-eth-unverifiable mesh to all-0xFFFFFFFF,
-        which a reboot/power cycle recovers and self-heal never does; a still-present or few-chip mesh stays below the
-        reboot floor and keeps holding, exactly as the gate refuses to reboot one for a self-healing wedge. Shares the
-        gate's own guards — the reboot floor, the reset-scope check (a reset left cycling reads all-ones like a mass
-        drop, so ask the scope, not the count), the tenant scan (an unreadable /proc counts as a tenant), and
+        Fires ONLY for a mass drop. The galaxy reset can drop a present-but-eth-unverifiable mesh to
+        all-0xFFFFFFFF, which a reboot/power cycle recovers and self-heal never does; a still-present or
+        few-chip mesh stays below the reboot floor and keeps holding, exactly as the gate refuses to
+        reboot one for a self-healing wedge. Shares the gate's own guards — the reboot floor, the
+        reset-scope check (a reset left cycling reads all-ones like a mass drop, so ask the scope, not
+        the count), the tenant scan (an unreadable /proc counts as a tenant), and
         self.mechanism.auto_recovery_allowed's fail-closed rate-limit ledger.
 
         It deliberately does NOT carry the gate's two-strikes was_failing precondition (a PRIOR failed cycle on top of
@@ -4270,9 +4277,8 @@ class GalaxyRecovery(Recovery):
                 reason="reset_regressed_offbus",
             )
         elif reset_spent and hold_age is not None and hold_age < _stuck_hold_ceiling_sec():
-            # This hold's one mesh reset already ran and failed (spec 04 I87). Waiting for the ladder end
-            # used to mean more mesh resets on the ceiling windows; none may run, so the ceiling wait has
-            # nothing left to try. The last-chance sweep below still runs once before the power cycle.
+            # This hold's one mesh reset already ran and failed (spec 04 I87). No more mesh resets may run
+            # on the ceiling windows, so waiting for the ladder end has nothing left to try. The last-chance sweep below still runs once before the power cycle.
             log(
                 f"this {int(hold_age)}s-old hold's mesh reset already ran and failed — not waiting for the "
                 f"{_stuck_hold_ceiling_sec()}s ladder end"
