@@ -532,13 +532,17 @@ class _Stop(Exception):
     pass
 
 
-async def _sample_during_job(monkeypatch, steps):
-    """Run the sampler loop once per (heartbeat, broker reset in flight) step on 32 chips while a live job runs."""
+async def _sample_during_job(monkeypatch, steps, status=None, fresh=True):
+    """Run the sampler loop once per (heartbeat, broker reset in flight) step on 32 chips while a live job runs
+    (or, with ``status``, after it ended)."""
     s, left = srv.sampler, list(steps)
-    monkeypatch.setattr(s, "job_beats", {}, raising=False)
+    if fresh:
+        monkeypatch.setattr(s, "job_beats", {}, raising=False)
+        monkeypatch.setattr(s, "job_window_open", False, raising=False)
     monkeypatch.setattr(s, "prev_beats", {})
     monkeypatch.setattr(s, "scope_seen", False)
-    monkeypatch.setattr(srv, "jobs", {"job-7": SimpleNamespace(id="job-7", status=srv.JobStatus.RUNNING)})
+    job = SimpleNamespace(id="job-7", status=status or srv.JobStatus.RUNNING)
+    monkeypatch.setattr(srv, "jobs", {"job-7": job})
     monkeypatch.setattr(srv, "chip_sample", lambda: {str(i): [left[0][0], 800, 800, 0, 0, 0] for i in range(32)})
     for name in ("_refresh_idle_hold_ledger", "_maybe_spawn_idle_relift", "_maybe_spawn_idle_holder_watch"):
         monkeypatch.setattr(srv, name, lambda: None)
@@ -583,6 +587,47 @@ async def test_a_tenant_jobs_own_reset_owes_the_fabric_pass_at_the_post_job_gate
     await srv._device_health_gate(None, phase="post-job", run_fabric=True)
     assert calls["fabric"] == (1 if owed else 0)
     assert FABRIC_DEBT.owed == "" and srv.fsm.state is ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seen_live", [True, False], ids=["baseline-in-job", "baseline-idle"])
+async def test_a_reset_that_ends_the_job_owes_the_fabric_pass_at_its_post_job_gate(monkeypatch, tmp_path, seen_live):
+    """Spec 04 I32: a job whose last act is its own reset reads nothing while it is live; the post-job gate's one
+    heartbeat read against the baseline (taken in the job, or idle before a job too short to sample) catches it."""
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "true")
+    calls = _clean_post_job_gate(monkeypatch, tmp_path, eth=(True, "all active eth cores advancing"), chips=32)
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    done = srv.JobStatus.COMPLETED
+    if seen_live:
+        await _sample_during_job(monkeypatch, [(17355, False), (None, False)])
+        srv.sampler.job_window_open = True
+    else:
+        await _sample_during_job(monkeypatch, [(17355, False)], status=done)
+        srv.sampler.mark_job_window()
+        await _sample_during_job(monkeypatch, [(None, False)], fresh=False)
+    # The job is gone; the next sample already reads the chips back from the reset: it must not move the baseline.
+    await _sample_during_job(monkeypatch, [(346, False)], status=done, fresh=False)
+    assert FABRIC_DEBT.owed == ""
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 346 for i in range(32)})
+    await srv._verify_device_after_job(None, job_id="job-7")
+    assert [f for k, f in events if k == "tenant_reset_detected"] == [
+        {"chips": [str(i) for i in range(32)], "job": "job-7"}
+    ]
+    assert calls["fabric"] == 1 and calls["resets"] == 0
+    assert FABRIC_DEBT.owed == "" and srv.fsm.state is ServerState.HEALTHY
+    assert srv.sampler.job_window_open is False
+
+
+@pytest.mark.asyncio
+async def test_a_clean_job_end_reads_no_reset_and_runs_no_fabric_pass(monkeypatch, tmp_path):
+    """Spec 04 I32: a job with no reset evidence owes nothing at its post-job gate."""
+    calls = _clean_post_job_gate(monkeypatch, tmp_path, eth=(True, "all active eth cores advancing"), chips=32)
+    await _sample_during_job(monkeypatch, [(17355, False)])
+    srv.sampler.job_window_open = True
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 17480 for i in range(32)})
+    await srv._verify_device_after_job(None, job_id="job-7")
+    assert calls["fabric"] == 0 and FABRIC_DEBT.owed == ""
 
 
 @pytest.mark.asyncio

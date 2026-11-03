@@ -281,9 +281,11 @@ class TelemetrySampler:
         # The hung chips a stop was last deferred for (an all-ones chip not yet detached), journalled once.
         self.pollers_deferred_for: frozenset = frozenset()
         self.prev_beats: dict = {}
-        # Each chip's last real heartbeat while a live job holds the device, and the broker reset it was read after.
+        # Each chip's last real heartbeat since the broker's own last reset (read after job_beats_reset_at): idle and
+        # while a live job holds the device, frozen from the job's end until its post-job gate compares once.
         self.job_beats: dict = {}
         self.job_beats_reset_at: float = 0.0
+        self.job_window_open = False
         # Spec 03 I66: consecutive frozen-heartbeat samples per present chip, and the chips already held.
         self.stall_strikes: dict = {}
         self.hung_held: frozenset = frozenset()
@@ -355,6 +357,7 @@ class TelemetrySampler:
         """Drop samples from before this job, so an incident's trace is this job's run-up and
         not the idle hour before it."""
         self.ring.clear()
+        self.job_window_open = True
 
     async def run(self) -> None:
         """The sampler loop — see the class docstring for why it is always-on and independent."""
@@ -696,18 +699,28 @@ class TelemetrySampler:
 
     def _watch_tenant_reset(self, sample: dict) -> None:
         """A heartbeat that goes back while a live job holds the device is a reset the job ran itself (spec 04 I32).
-        The baseline lives only for that job and since the broker's own last reset, so a broker reset never counts."""
+        The baseline holds only since the broker's own last reset, so a broker reset never counts. It also follows
+        the idle device, so a job that resets before its first sample still has one; from the job's end it is frozen
+        until the post-job gate compares once (tenant_reset_at_job_end), so a reset that was the job's last act is
+        caught there."""
         running = getattr(self._deps, "live_job_running", None)
         note = getattr(self._deps, "note_tenant_reset", None)
         reset_at = getattr(self._mechanism, "last_reset_monotonic", 0.0)
-        live = note is not None and running is not None and running()
-        if not live or reset_at != self.job_beats_reset_at:
-            self.job_beats, self.job_beats_reset_at = {}, reset_at
-        if not live:
+        if note is None or running is None:
             return
+        live = running()
+        if reset_at != self.job_beats_reset_at:
+            self.job_beats, self.job_beats_reset_at = {}, reset_at
+        if not live and self.job_window_open:
+            return
+        back = self._beats_back({i: v[0] if v else None for i, v in sample.items()})
+        if back and live:
+            note(back)
+
+    def _beats_back(self, beats: dict) -> list:
+        """Fold real heartbeats into the baseline; return the chips whose counter went back."""
         back = []
-        for i, v in sample.items():
-            beat = v[0] if v else None
+        for i, beat in beats.items():
             if not isinstance(beat, int) or beat == ALL_ONES:
                 continue
             last = self.job_beats.get(i)
@@ -715,8 +728,15 @@ class TelemetrySampler:
             if last is not None and (beat - last) % 2**32 >= 2**31:
                 back.append(i)
             self.job_beats[i] = beat
-        if back:
-            note(sorted(back, key=int))
+        return sorted(back, key=int)
+
+    def tenant_reset_at_job_end(self, beats: Optional[dict]) -> list:
+        """Spec 04 I32: the post-job gate's one heartbeat read against the frozen baseline: the chips whose counter went
+        back since the job's last sample. Closes the job window either way; a broker reset since voids the compare."""
+        self.job_window_open = False
+        if beats is None or getattr(self._mechanism, "last_reset_monotonic", 0.0) != self.job_beats_reset_at:
+            return []
+        return self._beats_back(beats)
 
     def _hold_for_hung(self, stalled: list, total: int) -> None:
         """Spec 03 I66: a hung chip that is still present (its heartbeat frozen, config space still answering) gets no

@@ -3918,14 +3918,37 @@ def _post_reset_debt() -> str:
     return FABRIC_DEBT.blocks_release(health_monitor.expected(len(_present_chip_indices())))
 
 
-def _note_tenant_reset(chips: list) -> None:
+def _note_tenant_reset(chips: list, job: str = "") -> None:
     """A running job reset its chips itself (spec 04 I32): the fabric it leaves is unproven, so the post-job gate
     owes the full check with fabric exactly as after a broker reset."""
-    job = next((j.id for j in jobs.values() if j.status == JobStatus.RUNNING and j.id not in reset_killed_job_ids), "")
+    job = job or next(
+        (j.id for j in jobs.values() if j.status == JobStatus.RUNNING and j.id not in reset_killed_job_ids), ""
+    )
     if not job:
         return
     health_event_detached("tenant_reset_detected", chips=chips, job=job)
     FABRIC_DEBT.note_reset(f"tenant job {job}", health_event_detached)
+
+
+# Spec 04 I32: the post-job gate's one heartbeat read waits at most this long for sysfs.
+JOB_END_HEARTBEAT_READ_SEC = 5.0
+
+
+async def _check_tenant_reset_at_job_end(job_id: str) -> None:
+    """Spec 04 I32: a reset that was the job's last act reads nothing until the job is gone, so the sampler never saw
+    it while the job was live. One bounded heartbeat read against the sampler's frozen baseline catches it."""
+    s = sampler
+    if s is None or not hasattr(s, "tenant_reset_at_job_end"):
+        return
+    beats = None
+    if job_id and job_id not in reset_killed_job_ids:
+        try:
+            beats = await asyncio.wait_for(asyncio.to_thread(read_heartbeats), JOB_END_HEARTBEAT_READ_SEC)
+        except Exception:  # noqa: BLE001 - an unread chip proves no reset; the gate's own checks still run
+            beats = None
+    back = s.tenant_reset_at_job_end(beats)
+    if back:
+        _note_tenant_reset(back, job=job_id)
 
 
 # Spec 03 I78: how old the passing fabric verdict a hold lifts on may be. The full check ends with the
@@ -12135,7 +12158,7 @@ def _job_never_reached_device(job: "Job") -> bool:
 
 
 async def _verify_device_after_job(
-    job_log_file: Optional[Path], job_failed: bool = False, noop_failure: bool = False
+    job_log_file: Optional[Path], job_failed: bool = False, noop_failure: bool = False, job_id: str = ""
 ) -> None:
     """Post-job gate — runs at the END of every run (the finished job's caller has already been released, so this never
     delays their terminal/result): the enum/ARC snapshot always runs, so a chip that left the bus is flagged here — as
@@ -12153,6 +12176,7 @@ async def _verify_device_after_job(
 
     Never raises."""
     try:
+        await _check_tenant_reset_at_job_end(job_id)
         await _device_health_gate(
             job_log_file,
             phase="post-job",
@@ -14584,6 +14608,7 @@ export {JOB_TAG_ENV}={job_tag}
                             job_log_file,
                             job_failed=job_failed,
                             noop_failure=job_failed and not runner_error and _job_never_reached_device(job),
+                            job_id=job_id,
                         )
                 except Exception as e:  # noqa: BLE001 - never crash the runner
                     if logger:

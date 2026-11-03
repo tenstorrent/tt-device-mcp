@@ -206,9 +206,10 @@ cooldown (spec 04 I65) holds longer.
   is due, and it stops the device pollers on the first hung sample, not the second, unless a chip
   on that sample reads all-ones and its remove is not tried yet: that stop waits for I84's
   detach-first valve, which stops them after the remove whether it worked or not.
-  While a live job holds the device it also keeps each chip's last real heartbeat, reset by every
-  broker reset step: one that goes back is the job's own reset and owes the full check with fabric
-  at the post-job gate (04 I32).
+  It also keeps each chip's last real heartbeat, reset by every broker reset step and frozen from a
+  job's end until its post-job gate compares once: one that goes back while a live job holds the
+  device, or at that compare, is the job's own reset and owes the full check with fabric at the
+  post-job gate (04 I32).
   After the remove and the kill it marks the device dirty at once, before any wait. It then waits
   for the killed pids to drop out of the `/dev/tenstorrent` holder scan, through the spec 01 I67
   helper, for at most `HOLDER_RELEASE_WAIT_SEC` (30 s). The wait runs as its own task, off the
