@@ -9,6 +9,7 @@ pass, that funnel holds the device fabric-unverified instead of releasing it.
 
 import asyncio
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -524,6 +525,63 @@ async def test_a_post_job_gate_owed_a_fabric_pass_runs_it_and_settles(monkeypatc
     await srv._device_health_gate(None, phase="post-job", run_fabric=True)
     assert calls["fabric"] == 1, "a reset with no fabric pass since must pay for one here"
     assert calls["resets"] == 0
+    assert FABRIC_DEBT.owed == "" and srv.fsm.state is ServerState.HEALTHY
+
+
+class _Stop(Exception):
+    pass
+
+
+async def _sample_during_job(monkeypatch, steps):
+    """Run the sampler loop once per (heartbeat, broker reset in flight) step on 32 chips while a live job runs."""
+    s, left = srv.sampler, list(steps)
+    monkeypatch.setattr(s, "job_beats", {}, raising=False)
+    monkeypatch.setattr(s, "prev_beats", {})
+    monkeypatch.setattr(s, "scope_seen", False)
+    monkeypatch.setattr(srv, "jobs", {"job-7": SimpleNamespace(id="job-7", status=srv.JobStatus.RUNNING)})
+    monkeypatch.setattr(srv, "chip_sample", lambda: {str(i): [left[0][0], 800, 800, 0, 0, 0] for i in range(32)})
+    for name in ("_refresh_idle_hold_ledger", "_maybe_spawn_idle_relift", "_maybe_spawn_idle_holder_watch"):
+        monkeypatch.setattr(srv, name, lambda: None)
+    monkeypatch.setattr(srv, "append_trace", lambda *a, **k: None)
+
+    async def next_step():
+        left.pop(0)
+        if not left:
+            raise _Stop()
+        srv.recovery_mechanism.reset_in_flight = left[0][1]
+
+    monkeypatch.setattr(s, "wait_for_next_sample", next_step)
+    monkeypatch.setattr(srv.recovery_mechanism, "reset_in_flight", left[0][1])
+    with pytest.raises(_Stop):
+        await s.run()
+    srv.recovery_mechanism.reset_in_flight = False
+    srv.jobs.clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "steps,owed",
+    [
+        ([(17355, False), (None, False), (None, False), (346, False)], True),
+        ([(17355, False), (17400, False), (17480, False)], False),
+        ([(17355, False), (None, True), (None, True), (346, False)], False),
+        ([(2**32 - 10, False), (5, False), (90, False)], False),
+    ],
+    ids=["tenant-reset", "rising", "broker-reset", "wrap"],
+)
+async def test_a_tenant_jobs_own_reset_owes_the_fabric_pass_at_the_post_job_gate(monkeypatch, tmp_path, steps, owed):
+    """Spec 04 I32: a heartbeat that goes back during a job is the job's own reset."""
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "true")
+    calls = _clean_post_job_gate(monkeypatch, tmp_path, eth=(True, "all active eth cores advancing"), chips=32)
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    await _sample_during_job(monkeypatch, steps)
+    assert FABRIC_DEBT.owed == ("tenant job job-7" if owed else "")
+    assert [f for k, f in events if k == "tenant_reset_detected"] == (
+        [{"chips": [str(i) for i in range(32)], "job": "job-7"}] if owed else []
+    )
+    await srv._device_health_gate(None, phase="post-job", run_fabric=True)
+    assert calls["fabric"] == (1 if owed else 0)
     assert FABRIC_DEBT.owed == "" and srv.fsm.state is ServerState.HEALTHY
 
 

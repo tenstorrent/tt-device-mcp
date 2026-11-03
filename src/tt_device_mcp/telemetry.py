@@ -281,6 +281,9 @@ class TelemetrySampler:
         # The hung chips a stop was last deferred for (an all-ones chip not yet detached), journalled once.
         self.pollers_deferred_for: frozenset = frozenset()
         self.prev_beats: dict = {}
+        # Each chip's last real heartbeat while a live job holds the device, and the broker reset it was read after.
+        self.job_beats: dict = {}
+        self.job_beats_reset_at: float = 0.0
         # Spec 03 I66: consecutive frozen-heartbeat samples per present chip, and the chips already held.
         self.stall_strikes: dict = {}
         self.hung_held: frozenset = frozenset()
@@ -374,6 +377,8 @@ class TelemetrySampler:
                     self._deps.append_trace(sample, read_ts)
 
                     await self.check_for_dead_chips(sample, read_ts)
+                else:
+                    self.job_beats = {}
                 await asyncio.to_thread(chip_state.publish)
                 # The rest keeps the regular cadence while the fast one runs (I79): only the
                 # off-bus check gets faster, never the ledger, the relift or the holder scan.
@@ -655,6 +660,7 @@ class TelemetrySampler:
             if v and isinstance(v[0], int) and v[0] != ALL_ONES and self.prev_beats.get(i) == v[0]
         ]
         self.prev_beats = {i: v[0] for i, v in sample.items() if v and isinstance(v[0], int)}
+        self._watch_tenant_reset(sample)
         self._hold_for_hung(stalled, len(sample))
         hung = frozenset(dead) | frozenset(stalled)
         if not hung or len(hung) >= len(sample):
@@ -687,6 +693,30 @@ class TelemetrySampler:
             "pollers_quiesced_hung_chip", all_ones=sorted(dead, key=int), stalled=sorted(stalled, key=int)
         )
         await self._deps.set_device_pollers(False, lambda m: log.info(f"HUNG-CHIP {m}") if log else None)
+
+    def _watch_tenant_reset(self, sample: dict) -> None:
+        """A heartbeat that goes back while a live job holds the device is a reset the job ran itself (spec 04 I32).
+        The baseline lives only for that job and since the broker's own last reset, so a broker reset never counts."""
+        running = getattr(self._deps, "live_job_running", None)
+        note = getattr(self._deps, "note_tenant_reset", None)
+        reset_at = getattr(self._mechanism, "last_reset_monotonic", 0.0)
+        live = note is not None and running is not None and running()
+        if not live or reset_at != self.job_beats_reset_at:
+            self.job_beats, self.job_beats_reset_at = {}, reset_at
+        if not live:
+            return
+        back = []
+        for i, v in sample.items():
+            beat = v[0] if v else None
+            if not isinstance(beat, int) or beat == ALL_ONES:
+                continue
+            last = self.job_beats.get(i)
+            # The counter wraps at 2^32: only a step back of under half its range is a restart.
+            if last is not None and (beat - last) % 2**32 >= 2**31:
+                back.append(i)
+            self.job_beats[i] = beat
+        if back:
+            note(sorted(back, key=int))
 
     def _hold_for_hung(self, stalled: list, total: int) -> None:
         """Spec 03 I66: a hung chip that is still present (its heartbeat frozen, config space still answering) gets no

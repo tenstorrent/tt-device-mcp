@@ -359,6 +359,8 @@ class RecoveryDeps:
     # Marks the pollers the dead-chip valve stopped as owed a restart (server._owe_device_pollers):
     # that stop has no paired restore, and an idle relift can close the episode with no reset.
     owe_device_pollers: Optional[Callable[[str], None]] = None
+    # Spec 04 I32: a live job's chips whose heartbeat went back (the job reset them itself): owes the fabric pass.
+    note_tenant_reset: Optional[Callable[[list], None]] = None
     # Spec 03 I83: one heartbeat read of only the given chips, after a mesh reset whose POST_RESET
     # failed on them (monitors.heartbeat.read_heartbeats with only). None: the in-flight cut is off.
     read_inflight_heartbeats: Optional[Callable[[frozenset], dict]] = None

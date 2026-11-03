@@ -1254,6 +1254,7 @@ _recovery_deps = RecoveryDeps(
     note_stuck_holders=lambda chips, killed, bdfs: _note_dead_chip_stuck_holders(chips, killed, bdfs),
     stuck_holder_pids=lambda: {f.pid for f in _dead_chip_stuck_leftovers()},
     owe_device_pollers=lambda reason: _owe_device_pollers(reason),
+    note_tenant_reset=lambda chips: _note_tenant_reset(chips),
     read_inflight_heartbeats=lambda only: read_heartbeats(only=only),
     find_inflight_readers=lambda: _find_inflight_readers(),
     cut_inflight_readers=lambda reason: _cut_inflight_readers(reason),
@@ -3915,6 +3916,16 @@ def _post_reset_debt() -> str:
     if not FABRIC_DEBT.owed or health_monitor is None:
         return ""
     return FABRIC_DEBT.blocks_release(health_monitor.expected(len(_present_chip_indices())))
+
+
+def _note_tenant_reset(chips: list) -> None:
+    """A running job reset its chips itself (spec 04 I32): the fabric it leaves is unproven, so the post-job gate
+    owes the full check with fabric exactly as after a broker reset."""
+    job = next((j.id for j in jobs.values() if j.status == JobStatus.RUNNING and j.id not in reset_killed_job_ids), "")
+    if not job:
+        return
+    health_event_detached("tenant_reset_detected", chips=chips, job=job)
+    FABRIC_DEBT.note_reset(f"tenant job {job}", health_event_detached)
 
 
 # Spec 03 I78: how old the passing fabric verdict a hold lifts on may be. The full check ends with the
