@@ -155,6 +155,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     UBB_CHIP_COUNT,
     WAIT,
     Evidence,
+    GalaxyRecovery,
     HealthState,
     RecoveryDeps,
     Verdict,
@@ -228,6 +229,7 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
+from tt_device_mcp.health.post_reset import POST_RESET_SETTLE_SEC, boot_monotonic
 from tt_device_mcp.holder_identity import describe_identity, read_holder_identities
 from tt_device_mcp.job_log_store import exit_signal, find_job_log, prune_job_logs, read_log_tail
 from tt_device_mcp.job_preflight import preflight_output_dirs
@@ -3930,6 +3932,36 @@ def _note_tenant_reset(chips: list, job: str = "") -> None:
     FABRIC_DEBT.note_reset(f"tenant job {job}", health_event_detached)
 
 
+def _post_reset_settle_left(expected: int, recovery) -> float:
+    """Seconds the full check owed by an open post-reset debt waits first (spec 04 I32), 0 for none: what is left of
+    POST_RESET_SETTLE_SEC since the newest owed reset, on a multi-tray Galaxy mesh only, and never past the open hold's
+    10-min bound (04 I76), so the bound's ladder and the power cycle after it keep their time."""
+    if not isinstance(recovery, GalaxyRecovery) or expected < 2 * UBB_CHIP_COUNT or not _post_reset_debt():
+        return 0.0
+    left = FABRIC_DEBT.settle_left(POST_RESET_SETTLE_SEC)
+    if left > 0.0 and fsm.state is not ServerState.HEALTHY and device_hold_episode_since:
+        left = min(left, max(0.0, _hold_bound_sec() - _hold_age_now()))
+    return left
+
+
+async def _post_reset_settle(expected: int, recovery, log) -> float:
+    """Spec 04 I32: a multi-tray mesh settles after a reset before the full check its debt owes. The device stays held
+    throughout (the gate holds the device lock, and the open debt refuses any release); the check after it is
+    unchanged. Each reset is waited for once. Returns the seconds waited."""
+    left = _post_reset_settle_left(expected, recovery)
+    if left <= 0.0:
+        return 0.0
+    FABRIC_DEBT.note_settle_served()
+    age = time.monotonic() - FABRIC_DEBT.reset_monotonic
+    log(
+        f"post-reset settle: waiting {left:.0f}s before the full check ({FABRIC_DEBT.owed} was {age:.0f}s ago; "
+        f"a multi-tray mesh settles {POST_RESET_SETTLE_SEC:.0f}s after a reset)"
+    )
+    health_event("post_reset_settle", reset=FABRIC_DEBT.owed, wait_sec=round(left, 1), reset_age_sec=round(age, 1))
+    await asyncio.sleep(left)
+    return left
+
+
 # Spec 04 I32: the post-job gate's one heartbeat read waits at most this long for sysfs.
 JOB_END_HEARTBEAT_READ_SEC = 5.0
 
@@ -7527,6 +7559,9 @@ async def device_health_gate(
             and not _dispatch_reset_spent
             and not recovery_mechanism.cooling()
         )
+        # Spec 04 I32: a multi-tray mesh settles after the reset the full check is owed for, held.
+        if full:
+            await _post_reset_settle(expected, recovery, _log)
         # Spec 03 I91: per-chip AER and link counts just before and just after this pass, after a job
         # or a step only. Read-only telemetry: the verdict below never reads them.
         pcie_on = phase in ("post-job", "post-step")
@@ -15856,7 +15891,9 @@ async def run_startup_tasks() -> None:
     log_rung_inventory()
     # A broker start is never trusted, whatever the last broker saw: the startup gate's own fabric
     # pass (after hugepages) settles this before anything is released (04 I32).
-    FABRIC_DEBT.note_reset("broker start")
+    # A start right after a boot owes it from the boot: the startup check lets a multi-tray mesh settle
+    # from there (04 I32); a start long after one waits for nothing.
+    FABRIC_DEBT.note_reset("broker start", at=boot_monotonic())
     # A hold the last broker died holding has no row yet; give it one before anything opens
     # a new episode over the top of it.
     carried_hold = None

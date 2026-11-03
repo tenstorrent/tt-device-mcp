@@ -717,7 +717,14 @@ each rung fires only when the gentler one failed or cannot apply.
   The I40 startup-checks release does not apply while a reset owes a pass: that pass climbs the
   present-mesh rung instead (spec 03 I40). The post-job gate runs the full pass while the debt is
   owed and settles it in place; a job boundary that followed no reset adds no time, and the pre-job
-  gate never runs the pass (03 I12). The startup pass runs only once the hugepage pool is ready
+  gate never runs the pass (03 I12). The debt keeps the time of its newest reset (a tenant reset: when
+  it was detected; a broker start: the host's boot). On a multi-tray Galaxy (two or more trays) the full
+  check the debt owes starts no sooner than `POST_RESET_SETTLE_SEC` (90 s) after that reset: the gate
+  waits only the remainder, with the device held, journals `post_reset_settle`, then runs the check
+  unchanged. A full check started 20-40 s after a mesh reset has lost chips that only a power cycle
+  brought back; none started 60 s or more after one has. Each reset is waited for once, the wait counts
+  in the hold clock and ends by the I76 10-min bound, and the ladder's own post-reset verify adds none.
+  Single-tray and non-Galaxy hosts wait nothing. The startup pass runs only once the hugepage pool is ready
   (03 I48). Exempt only where no fabric pass can run at all: a single chip, or no fabric check
   configured on the host. There is no switch that turns it off.
 - **I32a — A reset that ran drops the fabric verdict measured before it.** Once a mesh reset exits 0
@@ -3256,6 +3263,7 @@ sees a silent fabric pass.
 | I32 no rung outcome lifts the funnel's hold: the last-chance sweep on a fabric 77, no verdict or an unavailable check holds fabric-unverified with no host rung; a 77-only hold never goes DOWN | `tests/test_post_reset_gate.py::test_the_gate_ladders_last_chance_sweep`, `::test_no_rung_outcome_lifts_a_fabric_unverified_hold`, `::test_only_the_fold_helper_feeds_a_rung_outcome_to_the_fsm`, `::test_a_terminal_rung_on_a_measured_fault_still_goes_down` |
 | I32a a reset drops the pre-reset fabric FAIL: a post-reset 77 holds RECOVERING (bounded), never DOWN | `tests/test_post_reset_gate.py::test_the_measured_fabric_failure_reset_on_the_first_relift` |
 | I32 the post-job gate runs the pass only while a reset owes one, never pre-job; the I40 fallback climbs instead of releasing an owed reset | `tests/test_post_reset_gate.py::test_a_clean_post_job_gate_with_no_debt_runs_no_fabric_pass`, `::test_a_post_job_gate_owed_a_fabric_pass_runs_it_and_settles`, `::test_a_tenant_jobs_own_reset_owes_the_fabric_pass_at_the_post_job_gate`, `::test_a_reset_that_ends_the_job_owes_the_fabric_pass_at_its_post_job_gate`, `::test_a_clean_job_end_reads_no_reset_and_runs_no_fabric_pass`, `::test_a_pre_job_gate_never_runs_the_owed_pass`, `::test_the_77_fallback_never_releases_a_reset_with_no_passing_fabric_pass` |
+| I32 a multi-tray Galaxy settles `POST_RESET_SETTLE_SEC` after the newest owed reset before the full check: only the remainder, held, once per reset, inside the I76 bound; no wait otherwise | `tests/test_post_reset_settle.py::test_the_debt_stores_the_reset_time_and_keeps_the_latest`, `::test_a_young_tenant_reset_waits_only_the_remainder_then_runs_the_full_check`, `::test_no_wait`, `::test_one_reset_is_waited_for_once`, `::test_a_ladder_reset_inside_the_gate_adds_no_second_wait`, `::test_a_broker_start_owes_from_the_boot`, `::test_the_settle_ends_by_the_hold_bound`, `::test_the_bound_and_the_hold_clock_are_untouched_while_settling` |
 | I33 no power cycle configured: the gated off-bus hold is handed to an operator once per episode (one page, `/health` `operator_handoff` with the operator as owner), which end with the hold; the manual-recovery check's view is named; a reset the gate refuses releases nothing | `tests/test_gated_hold_handoff.py::test_a_latched_hold_is_handed_to_an_operator_once`, `::test_an_operator_at_work_is_named_on_the_handoff`, `::test_a_reset_the_gate_refuses_releases_nothing` |
 | I34 a requested power cycle suppresses every hold-deadline tick and a forced escalation waiting on the lock; the device stays held with the check owed; one line per request | `tests/test_host_action_suppress.py::test_power_cycle_request_suppresses_every_deadline_tick`, `::test_escalation_waiting_on_the_lock_runs_no_rung` |
 | I34 bounded: a refused or failed request never suppresses; an expired one resumes the ladder; the window is always finite | `tests/test_host_action_suppress.py::test_power_cycle_that_fails_to_launch_does_not_suppress`, `::test_power_cycle_refused_by_the_ledger_does_not_suppress`, `::test_a_request_the_host_never_acted_on_expires_and_the_ladder_resumes`, `::test_pending_window_is_always_finite` |
