@@ -15,6 +15,7 @@ to record what ran.
 """
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -82,13 +83,21 @@ _BASE = {
 }
 
 
+@pytest.fixture(scope="module")
+def _base_clone(tmp_path_factory):
+    """The base commit, built once per module: each test copies it rather than re-running git."""
+    clone = tmp_path_factory.mktemp("base") / "src"
+    clone.mkdir()
+    _git(clone, "init", "-q", "-b", "main")
+    return clone, _commit(clone, _BASE)
+
+
 @pytest.fixture
-def box(tmp_path):
+def box(tmp_path, _base_clone):
     """A clone at the installed sha, and the box state around it."""
     clone = tmp_path / "root" / "src"
-    clone.mkdir(parents=True)
-    _git(clone, "init", "-q", "-b", "main")
-    installed = _commit(clone, _BASE)
+    shutil.copytree(_base_clone[0], clone, symlinks=True)
+    installed = _base_clone[1]
     (tmp_path / "root" / "installed.sha").write_text(installed + "\n")
     eth = tmp_path / "root" / "eth-venv" / "bin" / "python"
     eth.parent.mkdir(parents=True)
@@ -187,9 +196,24 @@ def _restarts(lines):
 
 
 def _push(box, files):
-    """A new commit on the branch, the clone left at the installed sha, as a fetch leaves it."""
-    sha = _commit(box["clone"], files)
-    _git(box["clone"], "reset", "-q", "--hard", box["installed"])
+    """A new commit on top of the clone's HEAD, the clone and its worktree left as they were, as a
+    fetch leaves them. One `git fast-import` writes it, not an add/commit/rev-parse/reset each."""
+    clone = box["clone"]
+    marks = clone.parent / "push.marks"
+    cmds = [b"commit refs/test/push\nmark :1\ncommitter t <t@example.com> 1700000000 +0000\ndata 1\nc\nfrom HEAD^0\n"]
+    for rel, body in files.items():
+        data = body.encode()
+        mode = b"100755" if rel.endswith(".sh") else b"100644"
+        cmds.append(b"M %s inline %s\ndata %d\n%s\n" % (mode, rel.encode(), len(data), data))
+    env = {**_GIT_ENV, "HOME": str(clone.parent)}
+    subprocess.run(
+        ["git", "-C", str(clone), "-c", "fastimport.unpackLimit=1", "fast-import", "--quiet", "--force", f"--export-marks={marks}"],
+        input=b"".join(cmds),
+        capture_output=True,
+        env=env,
+        check=True,
+    )
+    (sha,) = [line.split()[1] for line in marks.read_text().splitlines() if line.startswith(":1 ")]
     return sha
 
 

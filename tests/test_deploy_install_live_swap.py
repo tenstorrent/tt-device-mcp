@@ -44,11 +44,11 @@ _HOOK = """check_live() {
 # Venv stubs: bin/python imports succeed once pip installed the repo; tt-smi --help exits TTSMI_HELP_RC.
 _VENV_PY = """#!/bin/bash
 . "$HOOK"; check_live "venv-python $*"
-[ -e "$(dirname "$0")/../.installed" ]
+[ -e "${0%/*}/../.installed" ]
 """
 _VENV_PIP = """#!/bin/bash
 . "$HOOK"; check_live "pip $*"
-d="$(dirname "$0")/.."
+d="${0%/*}/.."
 case "$1" in
     install) case "$*" in *--upgrade*) ;; *) touch "$d/.installed" ;; esac ;;
     wheel) while [ $# -gt 1 ]; do [ "$1" = -w ] && mkdir -p "$2"; shift; done ;;
@@ -108,9 +108,10 @@ def _venv_bindir(tmp: Path) -> Path:
         '#!/bin/bash\n. "$HOOK"; check_live "python3 $*"\n'
         '[ "$1 $2" = "-m venv" ] || exit 99\n'
         f'mkdir -p "$3/bin"; printf "home = /usr/bin\\n" >"$3/pyvenv.cfg"\n'
-        f"cat >\"$3/bin/python\" <<'EOF'\n{_VENV_PY}EOF\n"
-        f"cat >\"$3/bin/pip\" <<'EOF'\n{_VENV_PIP}EOF\n"
-        f"cat >\"$3/bin/tt-smi\" <<'EOF'\n{_VENV_TTSMI}EOF\n"
+        # Each stub written with builtins: a cat per file was three forks per venv build.
+        f"IFS= read -r -d '' t <<'EOF' || true\n{_VENV_PY}EOF\nprintf '%s' \"$t\" >\"$3/bin/python\"\n"
+        f"IFS= read -r -d '' t <<'EOF' || true\n{_VENV_PIP}EOF\nprintf '%s' \"$t\" >\"$3/bin/pip\"\n"
+        f"IFS= read -r -d '' t <<'EOF' || true\n{_VENV_TTSMI}EOF\nprintf '%s' \"$t\" >\"$3/bin/tt-smi\"\n"
         'chmod 755 "$3"/bin/*\ncheck_live "after python3 $*"\n',
     )
     for name in ("rm", "mv", "ln"):
@@ -282,8 +283,9 @@ def _validator_bindir(tmp: Path) -> Path:
         "cmake",
         '#!/bin/bash\n. "$HOOK"; check_live "cmake $*"\n'
         'if [ "$1" = --build ]; then\n'
-        '  p="$(dirname "$2")"\n'
-        f'  for b in {bins}; do mkdir -p "$p/$(dirname $b)"; printf \'#!/bin/sh\\n\' >"$p/$b"; chmod 755 "$p/$b"; done\n'
+        '  p="${2%/*}"; d=(); f=()\n'
+        f'  for b in {bins}; do d+=("$p/${{b%/*}}"); f+=("$p/$b"); done\n'
+        '  mkdir -p "${d[@]}"; for b in "${f[@]}"; do printf \'#!/bin/sh\\n\' >"$b"; done; chmod 755 "${f[@]}"\n'
         "else\n"
         '  while [ $# -gt 0 ]; do [ "$1" = -B ] && mkdir -p "$2"; shift; done\n'
         "fi\n"

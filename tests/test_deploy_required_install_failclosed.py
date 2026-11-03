@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 from tests.deploy_helpers import _statements
-from tests.test_deploy_autoupdate_no_restart import _commit, _git, _installed, _lap, box  # noqa: F401 - fixture
+from tests.test_deploy_autoupdate_no_restart import _base_clone, _commit, _git, _installed, _lap, box  # noqa: F401 - fixture
 
 _DEPLOY = Path(__file__).resolve().parent.parent / "deploy"
 _INSTALLER = _DEPLOY / "install-tt-device-broker.sh"

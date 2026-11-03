@@ -16,7 +16,7 @@ import re
 import pytest
 
 import tt_device_mcp.server as srv
-from tests.test_deploy_autoupdate_no_restart import _installed, _push, _restarts, box  # noqa: F401 - fixture
+from tests.test_deploy_autoupdate_no_restart import _base_clone, _installed, _push, _restarts, box  # noqa: F401 - fixture
 from tests.test_deploy_autoupdate_no_restart import _lap as _full_lap
 from tests.test_deploy_autoupdate_rate_limit import _SCRIPT, _lap
 from tests.test_restart_drain import _restart_with_a_held_job
@@ -64,6 +64,11 @@ def _simulate(tmp_path, moves, *, until, quiet=None, start=T0, skip=False, step=
                         seen.setdefault(f"s{k}", _on_lap(m, start))
             if then == due and not any(now < m <= due for m in moves):
                 owed = (due, "coalescing: head" if "coalescing: head" in done.stderr else "rate-limited:")
+        elif not done.stderr and not (root / "pending-head").exists():
+            # Head at the installed sha and no record: the lap exits before it reads the clock or
+            # writes anything, so every lap up to the next move is this same one.
+            assert (root / "installed.sha").read_text().split() == [sha], done.stderr
+            then = max(then, min([_on_lap(m, start) for m in moves if m > now], default=then))
         now = then
     return restarts, seen
 
