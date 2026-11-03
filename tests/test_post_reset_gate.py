@@ -610,7 +610,8 @@ async def test_a_reset_that_ends_the_job_owes_the_fabric_pass_at_its_post_job_ga
     await _sample_during_job(monkeypatch, [(346, False)], status=done, fresh=False)
     assert FABRIC_DEBT.owed == ""
     monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 346 for i in range(32)})
-    await srv._verify_device_after_job(None, job_id="job-7")
+    await srv._check_tenant_reset_at_job_end("job-7")
+    await srv._verify_device_after_job(None)
     assert [f for k, f in events if k == "tenant_reset_detected"] == [
         {"chips": [str(i) for i in range(32)], "job": "job-7"}
     ]
@@ -626,7 +627,8 @@ async def test_a_clean_job_end_reads_no_reset_and_runs_no_fabric_pass(monkeypatc
     await _sample_during_job(monkeypatch, [(17355, False)])
     srv.sampler.job_window_open = True
     monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 17480 for i in range(32)})
-    await srv._verify_device_after_job(None, job_id="job-7")
+    await srv._check_tenant_reset_at_job_end("job-7")
+    await srv._verify_device_after_job(None)
     assert calls["fabric"] == 0 and FABRIC_DEBT.owed == ""
 
 

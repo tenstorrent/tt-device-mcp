@@ -3943,7 +3943,7 @@ async def _check_tenant_reset_at_job_end(job_id: str) -> None:
     beats = None
     if job_id and job_id not in reset_killed_job_ids:
         try:
-            beats = await asyncio.wait_for(asyncio.to_thread(read_heartbeats), JOB_END_HEARTBEAT_READ_SEC)
+            beats = await aio.wait_for(asyncio.to_thread(read_heartbeats), JOB_END_HEARTBEAT_READ_SEC)
         except Exception:  # noqa: BLE001 - an unread chip proves no reset; the gate's own checks still run
             beats = None
     back = s.tenant_reset_at_job_end(beats)
@@ -12158,7 +12158,7 @@ def _job_never_reached_device(job: "Job") -> bool:
 
 
 async def _verify_device_after_job(
-    job_log_file: Optional[Path], job_failed: bool = False, noop_failure: bool = False, job_id: str = ""
+    job_log_file: Optional[Path], job_failed: bool = False, noop_failure: bool = False
 ) -> None:
     """Post-job gate — runs at the END of every run (the finished job's caller has already been released, so this never
     delays their terminal/result): the enum/ARC snapshot always runs, so a chip that left the bus is flagged here — as
@@ -12176,7 +12176,6 @@ async def _verify_device_after_job(
 
     Never raises."""
     try:
-        await _check_tenant_reset_at_job_end(job_id)
         await _device_health_gate(
             job_log_file,
             phase="post-job",
@@ -14604,11 +14603,11 @@ export {JOB_TAG_ENV}={job_tag}
                                 f"JOB_RUNNER job_id={job_id} preempted, exit 0: no post-job check (spec 01 I20)"
                             )
                     else:
+                        await _check_tenant_reset_at_job_end(job_id)
                         await _verify_device_after_job(
                             job_log_file,
                             job_failed=job_failed,
                             noop_failure=job_failed and not runner_error and _job_never_reached_device(job),
-                            job_id=job_id,
                         )
                 except Exception as e:  # noqa: BLE001 - never crash the runner
                     if logger:
