@@ -166,8 +166,10 @@ Consumed by other subsystems and by tests:
   privsep target.
 - **`device_holders.MIN_TENANT_UID`** (= 1000): the tenant/infrastructure boundary, used by the
   reset gate (spec 04) and the health gate's holder checks (spec 03) through
-  `device_holders.is_tenant`, which also counts a broker-scoped holder and a
-  `TT_DEVICE_MCP_TENANT_UIDS` uid.
+  `device_holders.is_tenant`, which also counts a broker-scoped holder, a holder in a
+  container's cgroup (docker, containerd, podman; any uid) and a `TT_DEVICE_MCP_TENANT_UIDS`
+  uid. A container still holding the device after a job ends holds it (`foreign_holder`) until
+  the 10-min bound's ladder clears it and a full check passes (04 I103).
 - **Lock surface** (`cli.py`): `cmd_lock` / `cmd_unlock` (sudo; `tt-device-mcp lock|unlock`);
   artifacts managed by them: the udev rule (`99-tenstorrent-ttdev.rules`), the
   `TT_DEVICE_MCP_DEVICE_GROUP=ttdev` and `TT_DEVICE_MCP_DEVICE_LOCK=1` lines in the broker unit,

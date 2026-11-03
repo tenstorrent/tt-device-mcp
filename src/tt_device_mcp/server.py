@@ -7341,6 +7341,10 @@ async def device_health_gate(
             _log_foreign_holder_identities, f"HEALTH-GATE[{phase}]", [h.pid for h in foreign]
         )
         _clear_device_dirty_unverified(f"foreign holder present: {who}", fault="foreign_holder", holders=identities)
+        if phase == "post-job" and fsm.state is ServerState.HEALTHY and any(h.contained for h in foreign):
+            # A container the job started outlives its scope (01 I16 reaps only the scope) and left the mesh unchecked.
+            # Hold, so the 10-min bound's ladder clears it (04 I103) and only a passing full check releases the device.
+            fsm.on_fault("foreign_holder", detail=f"device container left after the job: {who}", dirty=False)
         _remember_foreign_holders(identities)
         # A door already held (a startup verify, a prior fault) outlives this skip: the verify
         # cannot run beside a foreign tenant, so the hold waits them out — and reads to the tenant

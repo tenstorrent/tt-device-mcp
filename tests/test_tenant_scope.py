@@ -243,3 +243,108 @@ def test_a_slurm_step_is_not_free_beside_a_scoped_service_account_holder(monkeyp
     monkeypatch.setattr(srv, "_device_degraded_for_tenant", lambda: "")
     verdict = srv._slurm_step_verdict(require_free=True)
     assert [h["pid"] for h in verdict.get("holders", [])] == [4242], verdict
+
+
+# ------------------------------------------------------------------ device containers
+
+
+@pytest.mark.parametrize(
+    "cgroup",
+    [
+        "0::/system.slice/docker-3f2a9c.scope\n",  # docker, systemd driver
+        "12:pids:/docker/3f2a9c\n1:name=systemd:/docker/3f2a9c\n",  # docker, cgroupfs driver (v1)
+        "0::/kubepods.slice/kubepods-pod1.slice/cri-containerd-3f2a9c.scope\n",
+        "0::/user.slice/user-1000.slice/user@1000.service/user.slice/libpod-3f2a9c.scope/container\n",  # rootless
+    ],
+)
+def test_a_process_in_a_container_cgroup_is_contained(scope_proc, cgroup):
+    _stage_cgroup(scope_proc, 4242, cgroup)
+    assert dh.in_container(4242) is True
+    assert dh.in_broker_scope(4242) is False
+
+
+@pytest.mark.parametrize(
+    "cgroup",
+    [
+        "0::/system.slice/docker.service\n",  # dockerd itself
+        "0::/system.slice/tt-telemetry.service\n",
+        "0::/system.slice/ttdev-job-859.scope\n",
+        "0::/user.slice/user-1000.slice/session-3.scope\n",
+    ],
+)
+def test_a_process_outside_a_container_cgroup_is_not_contained(scope_proc, cgroup):
+    _stage_cgroup(scope_proc, 4242, cgroup)
+    assert dh.in_container(4242) is False
+
+
+def test_an_unreadable_cgroup_is_not_contained(scope_proc):
+    assert dh.in_container(4242) is False
+
+
+def test_the_driver_record_marks_a_contained_holder(tmp_path, monkeypatch, scope_proc):
+    driver = tmp_path / "driver"
+    (driver / "0").mkdir(parents=True)
+    (driver / "0" / "pids").write_text("4242\n4343\n")
+    monkeypatch.setattr(dh, "DRIVER_PROC_DIR", str(driver))
+    monkeypatch.setattr(dh, "_proc_uid", lambda pid: 0)
+    monkeypatch.setattr(dh, "_process_holds_device", lambda pid: True)
+    _stage_cgroup(scope_proc, 4242, "0::/system.slice/docker-3f2a9c.scope\n")
+    _stage_cgroup(scope_proc, 4343, "0::/system.slice/tt-telemetry.service\n")
+
+    scan = dh.enumerate_device_holders()
+    assert {h.pid: h.contained for h in scan.holders} == {4242: True, 4343: False}
+    assert [h.pid for h in scan.foreign_holders(None)] == [4242]
+
+
+def test_a_contained_holder_is_a_tenant_whatever_its_uid():
+    assert dh.is_tenant(DeviceHolder(pid=1, uid=0, contained=True)) is True
+    assert dh.is_tenant(DeviceHolder(pid=1, uid=SERVICE_UID, contained=True)) is True
+    assert DeviceHolder(pid=1, uid=0, contained=True) == DeviceHolder(pid=1, uid=0)
+
+
+ROOT_CONTAINER = DeviceHolder(pid=4242, uid=0, contained=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "holder, phase, holds",
+    [
+        (ROOT_CONTAINER, "post-job", True),
+        (DeviceHolder(pid=4242, uid=1000, contained=True), "post-job", True),
+        (ROOT_CONTAINER, "pre-job", False),  # ordinary contention before a job: no hold to invent
+        (DeviceHolder(pid=4242, uid=1000), "post-job", False),  # a user's process, not a container: unchanged
+    ],
+)
+async def test_the_post_job_gate_holds_beside_a_container_left_by_the_job(monkeypatch, holder, phase, holds):
+    """No probe, fabric pass or release runs beside a container; after a job it opens a foreign-holder hold, which the
+    10-min bound then owns (04 I103), even on a device that read HEALTHY."""
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[holder], complete=True))
+    monkeypatch.setattr(srv, "_reaped_leftover_reason", lambda scan: "")
+    monkeypatch.setattr(srv, "_log_foreign_holder_identities", lambda *a: [])
+
+    async def observe(*a, **k):
+        raise AssertionError("no probe beside a tenant")
+
+    monkeypatch.setattr(srv.fsm, "observe", observe)
+    monkeypatch.setattr(srv, "_present_chip_indices", lambda: pytest.fail("no device read beside a tenant"))
+    await srv._device_health_gate(None, phase=phase, run_fabric=True)
+    if holds:
+        assert srv.fsm.state is srv.ServerState.RECOVERING
+        assert srv.fsm.record.why == "foreign_holder" and "pid 4242" in srv.fsm.record.detail
+        assert srv._hold_is_tenant_held()
+    else:
+        assert srv.fsm.state is srv.ServerState.HEALTHY
+
+
+def test_a_container_blocks_resets_until_the_bound_whose_ladder_clears_it(monkeypatch):
+    """Before the 10-min bound a container is a tenant no reset runs under; from the bound on it yields like any holder
+    outside a broker scope (04 I103), so the ladder and its full check run and a failure goes on to the power cycle."""
+    monkeypatch.setattr(srv.galaxy_recovery.deps, "job_running", lambda: False)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[ROOT_CONTAINER], complete=True))
+    monkeypatch.setattr(
+        srv.galaxy_recovery.deps,
+        "enumerate_device_holders",
+        lambda: HolderScan(holders=[ROOT_CONTAINER], complete=True),
+    )
+    assert srv._bound_tenant_holds(False) is True
+    assert srv._bound_tenant_holds(True) is False

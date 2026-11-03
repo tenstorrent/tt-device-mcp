@@ -43,6 +43,11 @@ MIN_TENANT_UID = 1000
 # ttdev-exec-<pid>-<n>.scope. A process cannot leave its scope, so one still holding the device after its job was marked
 # killed or finished is that job's straggler, and a reset under it is a reset under the job, whatever its uid.
 BROKER_SCOPE_PREFIXES = ("ttdev-job-", "ttdev-exec-")
+# A device container (docker, containerd, podman) runs in its own cgroup, outside any broker scope, often as root, and
+# outlives the job that started it. Its cgroup alone says it is tenant work, not infrastructure.
+CONTAINER_SCOPE_PREFIXES = ("docker-", "cri-containerd-", "libpod-")
+# The cgroupfs driver's form: /docker/<id>.
+CONTAINER_CGROUP_PARENTS = ("docker",)
 # Where a holder's cgroup is read from. A module attribute so tests point it at a staged tree.
 SCOPE_PROC_DIR = "/proc"
 # Comma-separated uids or user names that count as tenants even below MIN_TENANT_UID: a service
@@ -59,6 +64,8 @@ class DeviceHolder:
     # Sits in a broker job or exec scope (BROKER_SCOPE_PREFIXES). Read once, at scan time; not part
     # of the holder's identity, so holders from two scans still compare by (pid, uid).
     scoped: bool = field(default=False, compare=False)
+    # Sits in a container's cgroup (CONTAINER_SCOPE_PREFIXES); read like ``scoped``.
+    contained: bool = field(default=False, compare=False)
 
     @property
     def username(self) -> str:
@@ -69,16 +76,25 @@ def in_broker_scope(pid: int, prefixes: tuple = BROKER_SCOPE_PREFIXES) -> bool:
     """True when ``pid`` sits in a broker job or exec scope (or, with ``prefixes``, another broker
     scope such as a reset's). Unreadable reads as False: the uid rule still applies, and
     /proc/<pid>/cgroup is world-readable, so only an exited pid gets here."""
+    return any(part.endswith(".scope") and part.startswith(prefixes) for part in _cgroup_parts(pid))
+
+
+def in_container(pid: int) -> bool:
+    """True when ``pid`` sits in a container's cgroup. Unreadable reads as False, as in ``in_broker_scope``."""
+    return any(
+        p in CONTAINER_CGROUP_PARENTS or (p.endswith(".scope") and p.startswith(CONTAINER_SCOPE_PREFIXES))
+        for p in _cgroup_parts(pid)
+    )
+
+
+def _cgroup_parts(pid: int) -> list[str]:
+    """The path segments of every hierarchy in /proc/<pid>/cgroup; empty when unreadable."""
     try:
         with open(f"{SCOPE_PROC_DIR}/{pid}/cgroup") as f:
             raw = f.read()
     except OSError:
-        return False
-    for line in raw.splitlines():
-        for part in line.rsplit(":", 1)[-1].split("/"):
-            if part.endswith(".scope") and part.startswith(prefixes):
-                return True
-    return False
+        return []
+    return [part for line in raw.splitlines() for part in line.rsplit(":", 1)[-1].split("/")]
 
 
 # Fully resolved TENANT_UIDS_ENV values, keyed by the raw string. A value with a name that did not
@@ -133,9 +149,9 @@ def configured_tenant_uids() -> frozenset:
 
 def is_tenant(holder: DeviceHolder) -> bool:
     """Whether a holder is a tenant the gates must not act under: a real user (uid at or above
-    MIN_TENANT_UID), a process in a broker job or exec scope, or a uid named in TENANT_UIDS_ENV.
-    Everything else below the floor is infrastructure (root, telemetry daemons)."""
-    return holder.uid >= MIN_TENANT_UID or holder.scoped or holder.uid in configured_tenant_uids()
+    MIN_TENANT_UID), a process in a broker job or exec scope or in a container, or a uid named in
+    TENANT_UIDS_ENV. Everything else below the floor is infrastructure (root, telemetry daemons)."""
+    return holder.uid >= MIN_TENANT_UID or holder.scoped or holder.contained or holder.uid in configured_tenant_uids()
 
 
 @dataclass
@@ -298,7 +314,7 @@ def _scan_from_driver_pids(pids: "set[int]", complete: bool) -> HolderScan:
                 pid,
             )
             continue
-        scan.holders.append(DeviceHolder(pid=pid, uid=uid, scoped=in_broker_scope(pid)))
+        scan.holders.append(DeviceHolder(pid=pid, uid=uid, scoped=in_broker_scope(pid), contained=in_container(pid)))
     return scan
 
 
@@ -380,7 +396,9 @@ def _scan_by_walking_proc() -> HolderScan:
             if uid is None:
                 scan.mark_incomplete(f"holder pid {pid} exited before its owner was read", pid)
                 continue
-            scan.holders.append(DeviceHolder(pid=pid, uid=uid, scoped=in_broker_scope(pid)))
+            scan.holders.append(
+                DeviceHolder(pid=pid, uid=uid, scoped=in_broker_scope(pid), contained=in_container(pid))
+            )
 
     if blocked:
         scan.mark_incomplete(f"{blocked} processes' fd tables unreadable")
