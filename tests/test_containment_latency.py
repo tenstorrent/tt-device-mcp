@@ -20,7 +20,6 @@ from tt_device_mcp.health import chip_state, evidence
 from tt_device_mcp.health.monitors import heartbeat
 
 
-
 def _live(t: float) -> list:
     """A live chip's reading: its ARC heartbeat ticks (~10 Hz), so it never reads as hung (I66)."""
     return [100 + int(t * 10), 800, 800, 0, 0, 0]
