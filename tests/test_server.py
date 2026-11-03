@@ -6,6 +6,7 @@
 import asyncio
 import json
 import os
+import signal
 import tempfile
 import venv as venv_module
 from collections import deque
@@ -771,7 +772,13 @@ class TestCleanDeviceGate:
         # interrupted sleep's non-zero exit, so the marker appears only if the grandchild ran to
         # completion — i.e. was NOT reaped.
         monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", f"(sleep 30 && touch {marker}) & echo $!; wait")
-        ok, _ = await srv.health_monitor.verify_fabric_health(timeout_sec=2)
+        # A runner that starts the suite with SIGINT ignored passes that on to the check, and the SIGINT then stops
+        # nothing: give the check the default disposition a broker under systemd starts with.
+        old_int = signal.signal(signal.SIGINT, signal.default_int_handler)
+        try:
+            ok, _ = await srv.health_monitor.verify_fabric_health(timeout_sec=2)
+        finally:
+            signal.signal(signal.SIGINT, old_int)
         assert ok is False
 
         # The grandchild must be gone: _terminate_process_group signals the whole session. The
