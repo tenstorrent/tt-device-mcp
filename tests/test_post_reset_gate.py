@@ -637,6 +637,14 @@ def test_no_rung_outcome_lifts_a_fabric_unverified_hold(mesh, owed, outcome, exp
         assert _held()
 
 
+def test_only_the_fold_helper_feeds_a_rung_outcome_to_the_fsm():
+    """I32: a direct on_outcome call could lift a hold without a just-passed full check with fabric."""
+    import inspect
+
+    src = inspect.getsource(srv).replace(inspect.getsource(srv._fold_rung_outcome), "")
+    assert "fsm.on_outcome(" not in src
+
+
 def test_a_terminal_rung_on_a_measured_fault_still_goes_down(mesh):
     fsm_dirty(srv, "gate/post-job: mesh failed the verify after the reset", why="job_killed")
     srv._fold_rung_outcome(galaxy.OUTCOME_TERMINAL, lambda m: None)
