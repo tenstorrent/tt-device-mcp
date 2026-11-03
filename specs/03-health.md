@@ -987,8 +987,8 @@ cooldown (spec 04 I65) holds longer.
   releases the device; a failed one keeps it held and climbs the bounded ladder like I55. A spent
   latch, a reset cooldown, a dirty exit, an off-bus chip, an
   unhealthy ARC or host-pci keeps today's path (the fabric pass in the same probe). Time to
-  recover for this class drops by one fabric pass (~45-100 s): measured on two production Galaxy
-  hosts since 2026-09-14, 51 of 51 such timeouts were followed by a failed or skipped pass. No wait
+  recover for this class drops by one fabric pass (~45-100 s): 51 of 51 such timeouts measured in production
+  were followed by a failed or skipped pass. No wait
   is added. A rung the gate fires from a clean exit (I55 or I61) first opens the hold episode
   (marked dirty, `probe_unhealthy`), so the door is shut while the reset is unproven.
 - **I69 — A job the broker stopped mid-run is followed by a reset, then the full check.** A job
@@ -1159,8 +1159,7 @@ cooldown (spec 04 I65) holds longer.
   alone releases and ends the latch; a failure climbs to the host rung at once (spec 04 I79), and
   the 10-min bound (spec 04 I76) asks for no second host rung. A fabric-unverified hold with no
   latch (a 77) keeps its owners (I29, I40). Time to recover (class D, dirty latched hold, empty
-  queue): before, the reset waited for the 600 s bound and the host rung came about 4-6 min
-  later; now the reset starts on the first idle tick (at most 10 s), the full check after it takes
+  queue): the reset starts on the first idle tick (at most 10 s), the full check after it takes
   about 5 min, and on failure the host rung follows at once. Paced case: when a mesh reset started
   less than the 120 s present-mesh grace ago, the rung waits (no reset) and that tick does not spend
   the episode's gate, so the next 10 s tick retries and the reset starts at most 120 s (plus one
@@ -1290,10 +1289,8 @@ cooldown (spec 04 I65) holds longer.
   check after it fails, each once. Once the re-adopted jobs end, `/health` `hold_bound` shows
   `next_step` `startup_check` and a deadline of at least their end + `STARTUP_VERIFY_DEFER_MAX_SEC`.
   Time to recover: class S, a re-adopted job's scope outliving the job: the ladder by the job's end
-  + 420 s (or the episode start + 600 s if later), then the power cycle if its full check fails;
-  before, no ladder until the scope exited, open-ended. Class S, a re-adopted job running past its
-  stated end: before, no bound, page or deadline for as long as it ran, open-ended; now the
-  tenant-blocked page at the stated end + one sampler tick, then the startup gate and the ladder
+  + 420 s (or the episode start + 600 s if later), then the power cycle if its full check fails.
+  Class S, a re-adopted job running past its stated end: the tenant-blocked page at the stated end + one sampler tick, then the startup gate and the ladder
   within 420 s of the job leaving, then one power-cycle request, bounded only by the tenant as spec
   04 I76 states. Alerts: no stuck-hold event or alert while a re-adopted job serves (no hold is
   open); one deadline after the jobs' end if the hold stands.

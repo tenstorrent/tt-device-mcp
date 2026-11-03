@@ -1015,9 +1015,7 @@ each rung fires only when the gentler one failed or cannot apply.
   when it is new: the record keeps how many such rows the ledger held when it was fixed. The
   settle is a wait on the cycle only: no reset or release happens in it, and 03 I4's startup gate
   still holds the device until its full check passes. Time to recover, classes A and B1 held across
-  reboots: before, each boot inside the hold restarted the full interval (up to 4 h at the cap), so
-  repeated reboots deferred the cycle without bound (one incident sat about 640 min); after, the
-  cycle fires at the deadline fixed at the first denial (at most one interval after the anchor), or
+  reboots: the cycle fires at the deadline fixed at the first denial (at most one interval after the anchor), or
   at most 300 s after the last boot when that boot came at or after it.
 - **I69 — A chip the broker removed is reset before anything re-enumerates it.** Isolating a dead
   chip (sysfs `remove`) records its parent bridge first, because the remove takes the node and its
@@ -1063,7 +1061,7 @@ each rung fires only when the gentler one failed or cannot apply.
   removed chip, and re-adding it un-reset is what I69 forbids. Recovered chips pass the full check,
   fabric included, before release (03 I4).
   Time to recover, removed all-ones chip: 0.1 s SBR + 1 s settle + rescan + up to 10 s for the
-  driver to re-bind when the first try lands (formerly a 3 s rescan with no reset); at most 3 tries
+  driver to re-bind when the first try lands; at most 3 tries
   with a 4 s settle between and the 3 s closing rescan, 44.3 s of waits, when it never returns. A
   removed chip that cannot be reset holds and reaches the next rung 3 s sooner; a tray-down onset
   with a removed chip skips the prelude's rescan and its 3 s settle. With N removed chips that never
@@ -1106,7 +1104,7 @@ each rung fires only when the gentler one failed or cannot apply.
   unchanged; an unkillable leftover (I70) with every chip present cycles at the end of its budget
   (about 5-8 min with the boot) where it rebooted (3-5 min), about 2-3 min more, inside its 23 min
   bound. Hosts with no power cycle armed (no root or `ipmitool`, or `TT_DEVICE_MCP_AUTO_POWER_CYCLE=0`):
-  every class that used to end in a reboot now holds and pages (`hold_bound_no_host_rung`, the
+  every class whose rung is the power cycle holds and pages (`hold_bound_no_host_rung`, the
   `all_chips_off_bus_power_cycle_required` and `reset_unrecoverable_power_cycle_required` events,
   I70's `no_host_rung` stage) until an operator acts. That is the intended effect of the removal:
   the reboot could not re-power a UBB or bring back an off-bus chip (above), and a hold that pages
@@ -1191,8 +1189,7 @@ each rung fires only when the gentler one failed or cannot apply.
   constant: the runner has already spent its kill ladder (SIGINT 60 s, SIGTERM 15 s, SIGKILL) before
   the fence opens; a kernel wait that does finish (a driver release unpinning its buffers, a slow
   writeback) ends in seconds to about two minutes, and the kernel reports a task blocked past 120 s
-  as hung; 600 s is five such periods and the same as the stuck-hold ceiling, while the motivating
-  incident sat about an hour without clearing. Past the budget the idle sampler asks for the rung at
+  as hung; 600 s is five such periods and the same as the stuck-hold ceiling. Past the budget the idle sampler asks for the rung at
   most once per `LEFTOVER_HOST_RUNG_RETRY_SEC` (60 s); each try first re-scans, and a leftover gone
   by then fires nothing. The rung is the power cycle, the only host rung (I71), which ends every process. No reset or sweep
   runs first (an exception to I22). Guards kept: a host action already pending (I34)
@@ -1218,15 +1215,11 @@ each rung fires only when the gentler one failed or cannot apply.
   pool and passes the full health check, fabric included, before the queue is released (03 I4); a
   failed check keeps the hold and climbs the bounded ladder. The clock lives in memory: a broker
   restart starts it again at its first scan (one more budget at most). Time to recover for this
-  class: before, unbounded (until an operator rebooted the host; about an hour in the incident);
-  after, up to `IDLE_HOLDER_SCAN_SEC` (60 s) while idle before the first scan opens the clock, 600 s
+  class: up to `IDLE_HOLDER_SCAN_SEC` (60 s) while idle before the first scan opens the clock, 600 s
   plus at most one 60 s retry tick to the request, then the power cycle (about 5-8 min) and the startup check (about 3 min): about 19-23 min. Later only while the governor holds the rung, each bounded and
   shown as `held` on `/health`: the I65 cooldown when a cycle or boot fell within its last 30 min.
   With no power cycle opted in the episode goes to an operator (journal stage `no_host_rung`, held
-  and paged). The power cycle replaced the removed warm reboot as this class's rung (I71): with every
-  chip present that costs about 2-3 min more (the cycle's 5-8 min against the reboot's 3-5 min),
-  inside the 23 min bound above; a host with no power cycle armed now holds where the reboot used to
-  clear the leftover. The `gone` stage and the second scan add no wait.
+  and paged). The `gone` stage and the second scan add no wait.
 
 - **I78 — The I81 driver-wait rescan repeats, bounded, until every isolated chip is back.** I81's
   one rescan comes at the start of tt-smi's 100 s driver wait; a chip whose link trains later in that
@@ -1308,12 +1301,11 @@ each rung fires only when the gentler one failed or cannot apply.
   I48 backoff unchanged. Nothing here releases a device: only a full check that passes, fabric
   included, after the last reset releases it (03 I32, goal of I22). Time to recover, from the hold
   opening after the UNKNOWN reset: the host rung fires at about 8 min (120 s re-check plus a sweep of
-  about 5 to 6.5 min), where it used to fire at about 18.5 min (the 600 s ceiling, reached on the
-  next 600 s backoff step). The boot after that cycle asks for the next power cycle about 8 min after its hold
+  about 5 to 6.5 min). The boot after that cycle asks for the next power cycle about 8 min after its hold
   opens, or, if the I65 cooldown ends later, at the cooldown's end (watchdog retry); not paging
   for that cooldown changes neither time. A 77 on the boot a 77 power cycle brought up gets its next
-  cycle at 600 s or the doubling cooldown's end, whichever is later. A present mesh's failed reset climbs about
-  8 min earlier than before; the hold age no longer matters.
+  cycle at 600 s or the doubling cooldown's end, whichever is later. A present mesh's failed reset climbs
+  whatever the hold's age.
 
 - **I76 — No hold goes past 10 min without the full ladder, then the power cycle.** When an open
   hold episode reaches the stuck-hold ceiling (`TT_DEVICE_MCP_STUCK_HOLD_SEC`, 600 s; a larger value
@@ -1684,24 +1676,17 @@ each rung fires only when the gentler one failed or cannot apply.
   it as in I76, and the I65 boot / post-power-cycle cooldown denies it and arms the retry, which
   fires on the first tick after the cooldown ends. Other classes are unchanged: a whole-tray drop goes
   straight to the power cycle, partial off-bus keeps its ladder, a 77-only hold keeps its idle relift
-  until the bound. Evidence: on one Galaxy host on 2026-10-17 a one-missing-port hold got four
-  bound-fired glx_resets (each rc 0, the same port missing after each) and was healed only by a power
-  cycle, after which the startup check counted every link. Time to the power-cycle request for this
-  class: was 10 min plus repeated ladders (open-ended while the post-ladder check passed on the short
-  count), now one ladder plus one full check from hold start, at most 600 s, or the cooldown's end
+  until the bound. Time to the power-cycle request for this
+  class: one ladder plus one full check from hold start, at most 600 s, or the cooldown's end
   when later. With no host rung grantable it adds one ladder plus check at the bound (about 220 s),
-  then I76's cadence; under the I42 latch too (was: no ladder at the 10-min mark, only the denied rung
-  asked each tick until the denial cleared, open-ended). Latched and missing-port holds: were a measured-fault present-mesh glx_reset at
+  then I76's cadence; under the I42 latch too. Latched and missing-port holds: were a measured-fault present-mesh glx_reset at
   once, failed-check relift retries about every 120 s, then the I76 ladder at the bound and the host
   rung (about 11-16 min to the power-cycle request, with 3-4 futile resets); now the same one ladder
   plus one full check from hold start (about 2-5 min to the request), at most 600 s, or the
   cooldown's end when later.
   A non-cooldown denial before the 10-min ladder (all link-short holds): the power cycle waits for
-  the full check after that ladder, at most 300 s more (was: fired at the ladder's end, about
-  600 s, with no verdict); a failed check asks at once, a pass releases with no cycle. A retry
-  armed by a missed request, the per-boot cap or the backstop: the 10-min ladder runs at 600 s
-  (was: deferred to that retry's end, 30 min or more). The cooldown and a cycle that fired:
-  unchanged.
+  the full check after that ladder, at most 300 s more; a failed check asks at once, a pass releases with no cycle. A retry
+  armed by a missed request, the per-boot cap or the backstop: the 10-min ladder runs at 600 s.
   A carried re-hold of another class: the host rung at once instead of a ladder on every tick.
   A run that declines (a heartbeat read once showed a chip off the bus) declines for the whole
   episode, so a link-short hold whose heartbeat glitched once waits for the I76 bound: its ladder at
@@ -1992,8 +1977,7 @@ each rung fires only when the gentler one failed or cannot apply.
 - **I90 — The bridge-reset rung narrates as a device reset, and /status carries a structured
   resetting field.** Every reset step's device-op detail starts with `device reset:`
   (`DEVICE_RESET_DETAIL_PREFIX`): the mesh reset (`device reset: tt-smi -glx_reset ...`), the AICLK
-  re-apply, and now the per-chip bridge reset (`device reset: bridge reset of chip(s) <ids> (~10s)`;
-  it used to read `recovering chip(s) ... via bridge reset`). `/status` (`tt_device_queue_status`) reads that
+  re-apply, and the per-chip bridge reset (`device reset: bridge reset of chip(s) <ids> (~10s)`). `/status` (`tt_device_queue_status`) reads that
   prefix while a device op is active: the `[broker]` op row has `resetting: true` and the top level
   `device_resetting: true`; both are false otherwise, so a reader need not match row text. Narration
   only: no rung, gate, wait or order changes. Time to recover (TTR):
@@ -2270,8 +2254,7 @@ each rung fires only when the gentler one failed or cannot apply.
   bus, isolated or not.** The one-shot (spec 03 I23) and the hold report's next-rung candidate key on
   `isolated_chips | _offbus_hold_chips`. When the gate holds `BELOW_FLOOR` with chips off the bus, it
   sets `_offbus_hold_chips` to the chips still off the bus (`offbus_chip_ids`) by a read taken after
-  its kept rungs, so a chip their rescan brought back does not arm it. Three holds that used to wait
-  for the 600 s bound now get the one-shot on its short clock: a chip that enumerates but whose
+  its kept rungs, so a chip their rescan brought back does not arm it. Three holds get the one-shot on its short clock: a chip that enumerates but whose
   heartbeat read fails (not ENODATA), which is counted off the bus but never isolated; a chip gone
   from the bus (no PCIe node, absent from the heartbeat reads) while
   `TT_DEVICE_MCP_GONE_CHIP_BRIDGE_RESET` is unset, which I89 leaves without an SBR; and any off-bus
@@ -2560,8 +2543,7 @@ each rung fires only when the gentler one failed or cannot apply.
     plus 315 s; with the climb at 5-6 min (after a mesh reset that gave up) that is about 14-15 min,
     and at most about 19 min for a sweep that starts just before the bound.
   - **Hold-deadline expiry at the 10-min bound** (I76): 600 s, the bound's kept rungs and their full
-    check (about 3.5 min), then the sweep as above: about 22 min at most. Before this invariant the
-    sweep's repeat could wait up to 315 s idle for the bound first.
+    check (about 3.5 min), then the sweep as above: about 22 min at most.
   - **With the I102 late-chip step** (only when the sweep's mesh reset is not a repeat, so it runs on
     the plain sweep path, gave up at its driver wait after the tray re-power, and every chip is back
     after the rescan): the sweep's mesh reset (about 263 s), then the step (at most about 458 s: its 380 s
@@ -3008,8 +2990,7 @@ sweep fires no tray step (I23): its resets are the bridge reset and the mesh res
 health check, fabric included, still has to pass after the sweep before anything is released. This
 holds on every road to the power cycle: the gate ladder's own rung, the idle/stuck-hold escalation
 (`_climb_to_host_recovery_after_failed_reset` — the road most measured power cycles actually took)
-and the I29 sweep after an unverified reset. Before this, those roads settled and verified but never re-tried the cheaper rungs, so a
-present-mesh eth wedge could be power-cycled having only ever seen mesh resets. Details: SBR fires only where a chip is actually isolated, so a mass drop is never
+and the I29 sweep after an unverified reset. Otherwise a present-mesh eth wedge could be power-cycled having only ever seen mesh resets. Details: SBR fires only where a chip is actually isolated, so a mass drop is never
 nibbled at with per-chip bridge resets; and the sweep is SKIPPED (the settle and verify still run)
 under the two guards a destructive rung never crosses — a tenant on the mesh, or a reset already
 cycling in its own scope. A sweep that brings the mesh back cancels the host rung outright.
@@ -3018,8 +2999,7 @@ cycling in its own scope. A sweep that brings the mesh back cancels the host run
 device?" goes through one helper (`_tenant_active`), and it consults TWO independent sources: the holder scan (open
 `/dev/tenstorrent` fds) and the broker's own queue (`deps.job_running`). The scan alone is not evidence of idleness —
 a running job spends minutes off the device compiling, loading weights and between opens, and during that window the
-scan is empty. Measured on box B 2026-09-17: the stuck-hold escalation read an empty scan 106 s into a running
-job, fired a mesh reset, and the job died of SIGPIPE the instant the reset released the device. `force` (the
+scan is empty. `force` (the
 hold-deadline backstop) still waives an UNREADABLE scan, because that guard protects against blindness, but it never
 waives a known tenant — fd-held or queue-known.
 
