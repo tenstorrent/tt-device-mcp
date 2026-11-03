@@ -36,9 +36,8 @@ def _wait_saved(timeout: float = 5.0) -> bool:
 
 
 class FakeBus:
-    """Fake /sys/bus/pci/devices and /sys/class/tenstorrent. ``trace`` records ("sbr", bridge) for
-    each Secondary Bus Reset assert and ("rescan",) for each scoped rescan. A rescan brings back
-    every chip whose bridge was reset since its remove (``come_back`` False: none)."""
+    """Fake /sys/bus/pci/devices and /sys/class/tenstorrent. ``trace`` records ("sbr", bridge) for each Secondary Bus
+    Reset assert and ("rescan",) for each scoped rescan."""
 
     def __init__(self, tmp_path, monkeypatch, come_back=True):
         self.devices = tmp_path / "devices"
@@ -171,9 +170,8 @@ async def test_a_removed_chip_that_does_not_return_is_retried_through_the_same_b
 async def test_a_chip_the_bridge_rung_did_not_bring_back_is_not_promised_a_heal_without_a_power_cycle(
     tmp_path, monkeypatch, rung, chips
 ):
-    """The escalation line names what follows honestly: the galaxy reset re-powers the trays, and a chip
-    still off the bus after it goes to the power cycle. It never says no power cycle is needed, for a
-    lone chip or a partial drop of several, and it names every chip the bridge resets left off."""
+    """The escalation line names what follows honestly: the galaxy reset re-powers the trays, and a chip still off the
+    bus after it goes to the power cycle."""
     bus = FakeBus(tmp_path, monkeypatch, come_back=False)
     for idx in chips:
         bus.remove(idx)
@@ -239,9 +237,7 @@ async def test_no_rescan_when_a_removed_chip_has_no_usable_bridge(tmp_path, monk
 async def test_a_partial_round_resets_only_the_new_chip_and_the_spent_one_does_not_withhold_the_rescan(
     tmp_path, monkeypatch, rung
 ):
-    """Spec 04 I98 with I69: chip 13 had its SBR round this hold and is still off the bus; chip 14 drops
-    later. The round writes no bridge reset to 13, resets 14, and the rescan still runs: 13's bridge
-    was already reset this hold, so it does not count as a removed chip left unreset."""
+    """Spec 04 I98 with I69: chip 13 had its SBR round this hold and is still off the bus; chip 14 drops later."""
     monkeypatch.setattr(galaxy, "health_event", lambda kind, **f: rung.append((kind, f)))
     monkeypatch.setattr(srv, "device_hold_episode_since", "2026-01-01T00:00:00")
     bus = FakeBus(tmp_path, monkeypatch)
@@ -639,9 +635,8 @@ def _drop_again(bus, idx):
 
 
 def test_a_chip_whose_record_was_dropped_gets_its_sbr_through_the_banked_port(tmp_path, monkeypatch, rung):
-    """The mesh reset's driver wait asks for the SBR of a chip that an earlier SBR brought back (so its
-    removal record is gone) and that left the bus again. The banked link names its root port, the port
-    still feeds the chip's now-empty bus, so the reset fires there."""
+    """The mesh reset's driver wait asks for the SBR of a chip that an earlier SBR brought back (so its removal record
+    is gone) and that left the bus again."""
     bus = FakeBus(tmp_path, monkeypatch)
     _bank("0000:46:00.0", "0000:47:00.0")
     _drop_again(bus, "13")

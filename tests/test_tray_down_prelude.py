@@ -89,9 +89,7 @@ def _replay_rows():
 
 
 def test_replay_the_prelude_runs_only_on_onsets_that_never_recovered_without_a_power_cycle(bh_map):
-    """Every recorded onset, anonymised to its per-tray counts and outcome. The prelude changes no
-    ladder decision anyway; on top of that, no episode that came back without a power cycle
-    (NO-BOOT) is even classified as tray-down, so none of them gets the extra rescan or capture."""
+    """Every recorded onset, anonymised to its per-tray counts and outcome."""
     tray_down = partial = no_boot = 0
     for per_tray, outcome in _replay_rows():
         if per_tray.startswith("count="):
@@ -116,9 +114,8 @@ def test_replay_the_prelude_runs_only_on_onsets_that_never_recovered_without_a_p
 
 @pytest.fixture
 def rig(monkeypatch, galaxy_trays):
-    """srv.galaxy_recovery with the rescan, the capture, every ladder primitive and the power cycle
-    recorded in ``rig['order']``, and the bus read from ``rig['beats']``. The ladder's dispatch
-    (_fire_gate_rung) is the real one."""
+    """srv.galaxy_recovery with the rescan, the capture, every ladder primitive and the power cycle recorded in
+    ``rig['order']``, and the bus read from ``rig['beats']``."""
     g = srv.galaxy_recovery
     state = {
         "beats": {},
@@ -345,9 +342,8 @@ async def test_a_rescan_recovery_releases_only_on_a_passing_fabric_pass(rig, mon
 
 @pytest.mark.asyncio
 async def test_a_rescan_recovery_keeps_the_runtime_fault_and_un_isolates_the_chips(rig, monkeypatch):
-    """As for the bridge rung: a rescan re-inits no eth core and the verify cannot see a stuck one,
-    so a runtime-reported fault stays set for the next gate's galaxy reset. The chips that came back
-    leave isolated_chips, so that gate fires no bridge reset on them."""
+    """As for the bridge rung: a rescan re-inits no eth core and the verify cannot see a stuck one, so a
+    runtime-reported fault stays set for the next gate's galaxy reset."""
     off = _off(rig["map"], {1: 8})
     rig["beats"] = _beats_without(off)
     rig["after_rescan"] = _beats_without(set())
@@ -485,9 +481,7 @@ async def test_a_restarted_broker_latches_a_tray_still_missing_afresh(rig):
 
 @pytest.mark.asyncio
 async def test_the_gate_runs_the_prelude_then_its_ladder_end_to_end(rig, monkeypatch, tmp_path, clear_job_state):
-    """End to end through server.device_health_gate: tray 3 off the bus after a job, no tenant. The
-    hook in escalate() latches TRAY_DOWN, rescans and captures before the gate's first rung, and the
-    gate's ladder then runs its rung; no power cycle on a first pass."""
+    """End to end through server.device_health_gate: tray 3 off the bus after a job, no tenant."""
     for i in range(24):
         (tmp_path / str(i)).write_text("")
     monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
@@ -620,9 +614,7 @@ def test_the_capture_meets_its_deadline_survives_a_missing_tool_and_fsyncs_the_b
 
 
 def _sysfs_tree(tmp_path):
-    """A /sys/bus/pci/devices look-alike: links into a device tree where each chip sits under its
-    own bridge. Chip 01 is still enumerated; chip 02 has left the bus (its bridge stays, pointing
-    at the empty bus 2); bus 03 has no bridge at all."""
+    """A /sys/bus/pci/devices look-alike: links into a device tree where each chip sits under its own bridge."""
     tree = tmp_path / "tree" / "pci0000:00"
     devices = tmp_path / "devices"
     devices.mkdir()
@@ -636,9 +628,8 @@ def _sysfs_tree(tmp_path):
 
 
 def test_lspci_targets_the_bridge_above_each_off_chip(tmp_path, monkeypatch):
-    """The bridge keeps the link status when the endpoint drops: it is found by the sysfs parent
-    while the endpoint is listed, and by its secondary bus once it is gone. The endpoint is added
-    only while present; an address with no bridge or a malformed one adds nothing."""
+    """The bridge keeps the link status when the endpoint drops: it is found by the sysfs parent while the endpoint is
+    listed, and by its secondary bus once it is gone."""
     monkeypatch.setattr(pci, "PCI_DEVICES_DIR", _sysfs_tree(tmp_path))
     assert bmc_capture.upstream_bridge("0000:01:00.0") == "0000:00:01.1"
     assert bmc_capture.upstream_bridge("0000:02:00.0") == "0000:00:01.2", "found with the endpoint gone"
@@ -667,9 +658,8 @@ def test_the_capture_reads_the_bridge_of_every_off_chip(galaxy_trays, monkeypatc
 @pytest.mark.asyncio
 @pytest.mark.parametrize("removed", [True, False])
 async def test_the_prelude_rescan_never_re_enumerates_a_removed_un_reset_chip(rig, removed):
-    """Spec 04 I69: the prelude resets nothing, so with a chip the broker removed (still hung) its rescan
-    is withheld and journaled, and the ladder follows at once with no added wait. With no removal
-    record the rescan runs as before."""
+    """Spec 04 I69: the prelude resets nothing, so with a chip the broker removed (still hung) its rescan is withheld
+    and journaled, and the ladder follows at once with no added wait."""
     off = _off(rig["map"], {3: 5})
     rig["beats"] = _beats_without(off)
     if removed:

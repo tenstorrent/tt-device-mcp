@@ -149,9 +149,8 @@ def test_tenant_uids_env_never_makes_root_a_tenant(monkeypatch, caplog, entry):
 
 
 def test_an_unresolved_tenant_name_is_retried_not_cached(monkeypatch, caplog):
-    """A lookup that fails at the first scan (the directory service is down) must not leave the
-    account unprotected until a restart: the next scan asks again, and only a fully resolved
-    value is cached. The warning is logged once, not on every scan."""
+    """A lookup that fails at the first scan (the directory service is down) must not leave the account unprotected
+    until a restart: the next scan asks again, and only a fully resolved value is cached."""
     directory = {}
     lookups = []
 

@@ -93,9 +93,8 @@ def _kinds(events):
 async def test_no_bridge_regressed_hold_power_cycles_on_the_first_pass_after_the_kept_rungs(
     monkeypatch, clear_job_state
 ):
-    """Spec 04 I79/I31/I22: no deferral to the ladder end. The kept rungs run once each (the SBR, found
-    inapplicable; the sweep's one mesh reset; the full check with fabric), then the power cycle, on the
-    pass at 96 s. Fails before I79: host_rung_deferred_until_ladder_end, no sweep, no cycle."""
+    """Spec 04 I79/I31/I22: no deferral to the ladder end. The kept rungs run once each (the SBR, found inapplicable;
+    the sweep's one mesh reset; the full check with fabric), then the power cycle, on the pass at 96 s."""
     counters, events, order = _episode(monkeypatch)
     assert await _forced_pass() is True
     kinds = _kinds(events)

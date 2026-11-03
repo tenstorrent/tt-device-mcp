@@ -325,8 +325,7 @@ async def test_a_sweep_that_fails_its_verify_leaves_no_intent_for_the_power_cycl
     sysfs, monkeypatch, tmp_path, clear_job_state
 ):
     """The last-chance sweep, its failed verify, then the broker's own power cycle: when the cycle's command runs, the
-    intent is gone AND that unlink reached the disk (the directory was fsynced after it). An unlink still in the page
-    cache is undone by the power loss, and the next boot latched the broker's own cycle as a host hang (spec 04 I25)."""
+    intent is gone AND that unlink reached the disk (the directory was fsynced after it)."""
     _boot(sysfs, "boot-a")
     monkeypatch.setattr(srv, "job_log_dir", tmp_path)
     g = srv.galaxy_recovery
@@ -402,9 +401,8 @@ def _intent_then_cycle(sysfs, *, row_action, row_boot="boot-a", row_dt=60.0, boo
 
 @pytest.mark.parametrize("action", ["power-cycle", "reboot"])
 def test_an_intent_older_than_the_brokers_own_cycle_does_not_latch(sysfs, monkeypatch, action):
-    """The boot after the broker's own power cycle or reboot: an intent left from before it (an unlink
-    the power loss undid) is not a host hang. No latch, no event, and the mesh reset is not gated, so
-    the off-bus hold's ladder runs at once (spec 04 I25)."""
+    """The boot after the broker's own power cycle or reboot: an intent left from before it (an unlink the power loss
+    undid) is not a host hang."""
     events = []
     monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
     _intent_then_cycle(sysfs, row_action=action)

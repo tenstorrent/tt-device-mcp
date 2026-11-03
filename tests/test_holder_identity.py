@@ -174,9 +174,8 @@ def test_an_at_sign_after_the_host_is_not_userinfo():
 
 
 def test_a_read_stuck_in_the_kernel_is_left_unread_within_the_bound():
-    """A /proc read can block (the target's mmap lock, NSS): the reads share one fixed bound, a read
-    still running at it is recorded unread and never waited for, and the others are kept. A pid whose
-    read is still stuck is not read again, so a holder stuck across scans leaves one thread behind."""
+    """A /proc read can block (the target's mmap lock, NSS): the reads share one fixed bound, a read still running at it
+    is recorded unread and never waited for, and the others are kept."""
     release = threading.Event()
     started = []
 

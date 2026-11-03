@@ -212,9 +212,8 @@ def test_a_hung_shutdown_reaches_the_cycle_once_the_bound_passes(tmp_path):
 
 
 def test_the_fallback_has_the_hook_prepare_ipmi_before_it_fires(tmp_path):
-    """A shutdown that hangs may hang past openipmi's stop (drivers unloaded, /dev/ipmi0 gone): the
-    fallback has the installed hook load them again, bounded, before its cycle command runs. Its unit
-    has DefaultDependencies=no, so no ordering against openipmi could keep them loaded for it."""
+    """A shutdown that hangs may hang past openipmi's stop (drivers unloaded, /dev/ipmi0 gone): the fallback has the
+    installed hook load them again, bounded, before its cycle command runs."""
     out = tmp_path / "fired"
     cmd = ["/bin/sh", "-c", f'cat "{tmp_path / "prepared"}" > "$0"', str(out)]
     _, proc = _run_fallback(tmp_path, 0, cmd)
@@ -802,10 +801,8 @@ def _assert_cycle_names(escalation, written, states, fault_class, off):
 async def test_a_whole_tray_the_gate_sends_to_the_cycle_is_marked_and_journaled_as_whole_tray(
     escalation, monkeypatch, tmp_path, clear_job_state, galaxy_trays
 ):
-    """A whole tray (0-7) off on the hold's first below-floor gate pass, with only the I27 command set:
-    the whole-tray note sends it to the cycle before the gate fills the hold's off-bus set, and no chip
-    is isolated. Both 'possible' markers, the 'requested' one and the trigger line still read class
-    whole_tray with the tray's chips and addresses, from the note (memory only)."""
+    """A whole tray (0-7) off on the hold's first below-floor gate pass, with only the I27 command set: the whole-tray
+    note sends it to the cycle before the gate fills the hold's off-bus set, and no chip is isolated."""
     _below_floor_episode(monkeypatch, tmp_path, cmd=" ".join(CYCLE))
     monkeypatch.setattr(galaxy, "_pci_rescan", lambda: None)  # the tray-down prelude's rescan
     monkeypatch.setattr(opc, "fire_command", _real_fire_command)
@@ -826,8 +823,7 @@ async def test_a_drop_its_class_sends_straight_to_the_cycle_is_marked_and_journa
     escalation, rig, monkeypatch, fault_class, phase  # noqa: F811 - the imported fixture
 ):
     """Spec 04 I37's direct cycle with the auto power cycle on: class A (tray 1 off) at a post-job pass, class C (every
-    chip off, a mesh reset already failed) at the startup gate. It fires on the hold's first pass, before the gate fills
-    the hold's off-bus set: the markers and the trigger line read the class and the chips that cycle was decided on."""
+    chip off, a mesh reset already failed) at the startup gate."""
     monkeypatch.setattr(srv, "_auto_power_cycle_host", _real_auto_power_cycle_host)
     written = _broker_context(escalation, monkeypatch)
     off = set(range(EXPECTED)) if fault_class == "all_off" else _off(rig["map"], {1: 8})
@@ -942,9 +938,7 @@ def _refute_next_boot(s, monkeypatch, boot_id, btime, at):
 
 
 def test_a_refuted_cycle_is_retried_under_i72_and_pages_from_the_second(booted, monkeypatch):
-    """Spec 04 I72/I88: a refuted cycle is the broker's missed attempt. The warm boot it brought up
-    anchors no I65 cooldown; the cycle is asked again at the request's pending window + 0 s, then
-    + 300 s from the second miss on, with the I72 page from the second."""
+    """Spec 04 I72/I88: a refuted cycle is the broker's missed attempt."""
     monkeypatch.setattr(recovery_base, "_last_external_power_cycle", lambda _now: None)
     (booted["tmp"] / recovery_base.POWER_CYCLE_CAUSE_CAPABLE_FILE).write_text("{}\n")
     booted["out"]["restart_cause"] = " 0a 0f"
@@ -1022,9 +1016,8 @@ RAW_RESTART_CAUSES = {
     ],
 )
 def test_restart_cause_names_the_raw_code(os_first, out, want, cycle):
-    """ipmitool's `chassis restart_cause` prints "invalid" for 0xa/0xb: the raw code is read and
-    named per IPMI 2.0 (low nibble of the first byte); reserved codes are unmapped, not a cause.
-    Exactly 0x1, 0x3, 0x6, 0x7, 0x9 and 0xb mean the power went off and on."""
+    """ipmitool's `chassis restart_cause` prints "invalid" for 0xa/0xb: the raw code is read and named per IPMI 2.0 (low
+    nibble of the first byte); reserved codes are unmapped, not a cause."""
     os_first["out"]["restart_cause"] = out
     assert pc.read_restart_cause(CYCLE) == want
     assert os_first["calls"][-1][1] == ["/usr/bin/ipmitool", "raw", "0x00", "0x07"]
@@ -1091,9 +1084,8 @@ def test_a_warm_reboot_that_healed_asks_no_further_cycle(warm_rebooted, monkeypa
 
 
 def test_a_warm_reboot_still_held_asks_the_cycle_again_in_the_new_episode(warm_rebooted, monkeypatch):
-    """Spec 04 I72/I88: the warm boot's startup check failed, so the device is held in a new episode
-    while the retry the old one held was lost with the old broker. The retry is armed for the new
-    episode at the miss's until, once, and the governor then allows the cycle."""
+    """Spec 04 I72/I88: the warm boot's startup check failed, so the device is held in a new episode while the retry the
+    old one held was lost with the old broker."""
     mech = warm_rebooted["mech"]
     monkeypatch.setattr(mech, "_device_hold_episode_since", lambda: "held-since-2")
     until = mech.power_cycle_miss_state(now_epoch=BOOT_NOW)["until"]
@@ -1681,13 +1673,7 @@ def _children(pid):
 @pytest.mark.parametrize("fired", [False, True], ids=["waiting-out-the-bound", "cycle-command-running"])
 def test_hook_stops_the_fallback_and_its_children_before_any_wait(hook, tmp_path, fired):
     """The fallback, run for real: still waiting out its bound, or past it, as `timeout` with the cycle command as its
-    child. The hook stops it and every process it started before the RAID wait (the stub mdadm sees none of them alive),
-    so no orphan can cut power alongside the hook's own tries. A SIGKILL is delivered at once but the kernel tears the
-    process down after kill(2) returns, so a single look can still see a killed process: the stub waits up to 5 s for
-    the processes to go, while the hook is held in the RAID wait, so only what the hook did before that wait can end
-    them (none of them exits on its own within 60 s). The fallback's `sync &` is a stand-in that outlives the cycle's
-    start: the host's sync may sit uninterruptible in a flush for many seconds, where no SIGKILL ends it, and could
-    never cut power."""
+    child."""
     started = [[b"/bin/sleep", b"59"], [b"/bin/sleep", b"60"]]  # the sync stand-in, the cycle command
     pidf, proc = _run_fallback(
         tmp_path, 0 if fired else 300, ["/bin/sleep", "60"], timeout=60, sync="exec /bin/sleep 59"

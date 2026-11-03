@@ -149,9 +149,8 @@ def test_tt_smi_killed_during_shutdown_raises_else_fails(monkeypatch, health_dep
 async def test_post_reset_verify_killed_by_shutdown_requests_no_host_rung_and_releases_nothing(
     mesh, armed_power_cycle  # noqa: F811
 ):
-    """The field sequence: a prior cycle failed, the reset fires, its post-reset verify is killed by
-    the host shutdown. Without I63 this climbs to the host rung (see test_dispatch_failure_reset's
-    test_a_failed_post_reset_check_stays_held_and_climbs, the same setup, which power-cycles once)."""
+    """The field sequence: a prior cycle failed, the reset fires, its post-reset verify is killed by the host
+    shutdown."""
     mesh["reset_heals"] = False
     srv.recovery_mechanism.last_reset_failed = True
     real = srv.galaxy_recovery._verify_device

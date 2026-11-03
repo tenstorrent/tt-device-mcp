@@ -36,9 +36,8 @@ def _contained():
 
 @pytest.mark.parametrize("late", [False, True], ids=["inside the bound", "started past the bound"])
 def test_a_remove_still_running_at_the_hard_bound_latches_pci_wedged(watch, monkeypatch, late):  # noqa: F811
-    """The bound counts from the trigger, not from the stop: a remove blocked in the kernel latches
-    PCI-wedged when it passes. A host stall that started the remove past the bound still gives it the
-    remove budget. Either way nobody is killed and the hold stays."""
+    """The bound counts from the trigger, not from the stop: a remove blocked in the kernel latches PCI-wedged when it
+    passes. A host stall that started the remove past the bound still gives it the remove budget."""
     _w, log, _detach_ok, _burst = watch
     stuck = threading.Event()
     monkeypatch.setattr(srv, "isolate_chip", lambda idx: log.append(("detach", idx)) or stuck.wait(30))

@@ -169,9 +169,8 @@ def test_health_names_the_ports(monkeypatch):
 
 @pytest.fixture
 def lost_mesh(monkeypatch, mesh):  # noqa: F811
-    """The mesh fixture failing on a lost link instead of a dispatch failure. Read-only (no fabric
-    pass) the mesh reads healthy, as a lost link does: every chip present, ARC ticking, the eth read
-    unable to tell. The fabric pass, as in the fixture, fails until a reset heals it."""
+    """The mesh fixture failing on a lost link instead of a dispatch failure. Read-only (no fabric pass) the mesh reads
+    healthy, as a lost link does: every chip present, ARC ticking, the eth read unable to tell."""
     monkeypatch.setattr(dfr, "FABRIC_OUT", LOST_OUT)
     monkeypatch.setattr(dfr, "DISPATCH_LINE", LOST_DETAIL)
     monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
@@ -323,10 +322,9 @@ def latched_mesh(monkeypatch, tmp_path, mesh):  # noqa: F811
 
 @pytest.mark.asyncio
 async def test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs(monkeypatch, latched_mesh):
-    """I42: the idle relift resets the latched hold with no grace; the post-reset check runs the
-    descriptor, the latched mismatch FAILS it (never withheld, never a lift), the last-chance sweep
-    runs and the hold climbs to the host rung at once (spec 04 I79): bounded, never an open-ended
-    hold. A later forced window asks for no second host rung and still releases nothing."""
+    """I42: the idle relift resets the latched hold with no grace; the post-reset check runs the descriptor, the latched
+    mismatch FAILS it (never withheld, never a lift), the last-chance sweep runs and the hold climbs to the host rung at
+    once (spec 04 I79): bounded, never an open-ended hold."""
     from tt_device_mcp.health.recovery import galaxy
 
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
@@ -367,9 +365,7 @@ async def test_a_latched_hold_no_relift_reset_takes_the_ladder_at_the_ceiling(
     monkeypatch, tmp_path, mesh, dirty  # noqa: F811
 ):
     """I42 with the 10-min bound: a real lift leaves the validator's mismatch line in the last fabric output, and its
-    first job latches the fault. When no idle relift reset has run first (the device dirty, a tenant, a host action
-    pending), the watchdog's forced window still runs the present-mesh reset, never a no-reset hold; its full post-reset
-    check fails, and the same window climbs to the host rung. Never released without a passing full check."""
+    first job latches the fault."""
     from tt_device_mcp.health.recovery import galaxy
 
     m = _monitor_fabric(monkeypatch, tmp_path, mesh)
@@ -406,8 +402,7 @@ async def test_replay_a_held_77_whose_bound_ladder_leaves_a_port_missing_power_c
 ):
     """Replay of a held rc 77 (spec 04 I76 with spec 03 I71): the hold reaches the 10-min bound, the bound's ladder runs
     glx_reset and it exits 0, but the full check after it still finds one descriptor port missing while the traffic-only
-    rerun passes. That check FAILS: the device is never released and the broker asks for exactly one power cycle; a
-    later watchdog tick asks for no second one while the first is pending."""
+    rerun passes."""
     from tt_device_mcp.health.recovery import galaxy
 
     m = _monitor_fabric(monkeypatch, tmp_path, mesh)
@@ -485,9 +480,7 @@ async def _idle_tick():
 @pytest.mark.parametrize("heals", [True, False], ids=["reset-heals", "ports-stay-missing"])
 async def test_a_dirty_latched_hold_with_an_empty_queue_takes_the_idle_gate_at_once(monkeypatch, latched_mesh, heals):
     """03 I42 with I68 (class D time to recover): a dirty mark on the latched hold (the failed job's own) keeps its why,
-    so the read-only relift bails on it and, with nothing queued, it waited for the 600 s bound. Now the first idle tick
-    runs the present-mesh rung: the reset with no grace, then the full check with the descriptor. Only its pass releases
-    (and ends the latch); a failed check never releases and the ladder climbs to the host rung at once."""
+    so the read-only relift bails on it and, with nothing queued, it waited for the 600 s bound."""
     _idle_queue(monkeypatch)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = []
@@ -534,10 +527,8 @@ async def test_a_dirty_latched_hold_with_an_empty_queue_takes_the_idle_gate_at_o
 @pytest.mark.asyncio
 @pytest.mark.parametrize("heals", [True, False], ids=["reset-heals", "ports-stay-missing"])
 async def test_a_paced_present_rung_does_not_spend_the_dirty_latched_idle_gate(monkeypatch, latched_mesh, heals):
-    """03 I68 class D, paced: a mesh reset started 60 s ago, so the present-mesh rung waits out its
-    grace (WAITING, no reset). That tick must not spend the episode's one gate, or the hold waits for
-    the 600 s bound. The first tick after the pacing runs exactly one reset and the full check with
-    the descriptor; only its pass releases, and a failure takes exactly one power cycle."""
+    """03 I68 class D, paced: a mesh reset started 60 s ago, so the present-mesh rung waits out its grace (WAITING, no
+    reset). That tick must not spend the episode's one gate, or the hold waits for the 600 s bound."""
     from tt_device_mcp.health.recovery import galaxy
 
     _idle_queue(monkeypatch)
@@ -654,10 +645,7 @@ def _relift_unpaced(monkeypatch):
 @pytest.fixture(params=["missing ports", "latched"])
 def link_short_hold(request, monkeypatch, mesh):  # noqa: F811
     """A fabric link-short hold (spec 04 I83), every chip on the bus and no reset run yet: the post-job gate's measured
-    missing-port FAIL, or the I42 latch. The watchdog starts its episode. Its at-start ladder runs the glx_reset, the
-    full check after it still counts short and the ladder's host rung is deferred by the boot / post-power-cycle
-    cooldown (WAITING: the hold stands); the bound's host rung after it is deferred too (its retry armed, no host action
-    pending), which leaves the idle relift free to run."""
+    missing-port FAIL, or the I42 latch. The watchdog starts its episode."""
     from tests.test_hold_bound import _watchdog
     from tt_device_mcp.health.recovery import OUTCOME_WAITING
 

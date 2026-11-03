@@ -453,9 +453,7 @@ def test_the_allowlist_is_the_one_the_spec_names():
 
 
 def test_a_no_restart_apply_clears_the_recovery_deferral_clock(box):
-    """Spec 08 I23: $ROOT/recovery.defer clocks an update not yet applied. A no-restart apply
-    clears it like a restart does, so a later update in a fresh hold is deferred from its own
-    first deferral, not let through on the stale clock of one already applied."""
+    """Spec 08 I23: $ROOT/recovery.defer clocks an update not yet applied."""
     (box["tmp"] / "venv" / "bin" / "python").symlink_to(sys.executable)  # broker_hold parses /health
     marker = box["tmp"] / "root" / "recovery.defer"
     log = box["tmp"] / "logs" / "autoupdate.log"

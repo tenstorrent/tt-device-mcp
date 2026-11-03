@@ -43,11 +43,10 @@ def _fake_sysfs(
     vendor_ffff=(),
     config_unreadable=(),
 ) -> dict:
-    """32 chips; ``missing`` have no class node, ``unbound`` an endpoint with no driver, ``enodata``
-    (``eio``) a heartbeat read that fails with ENODATA (EIO), ``speed_unknown`` (``width_63``) an
-    endpoint whose link reads down by its speed (width), ``vendor_ffff`` an endpoint whose config
-    space reads all-ones and ``config_unreadable`` one with no readable config (every other endpoint's
-    config starts with the Tenstorrent vendor id). Returns a handle to bring a chip back."""
+    """32 chips; ``missing`` have no class node, ``unbound`` an endpoint with no driver, ``enodata`` (``eio``) a
+    heartbeat read that fails with ENODATA (EIO), ``speed_unknown`` (``width_63``) an endpoint whose link reads down by
+    its speed (width), ``vendor_ffff`` an endpoint whose config space reads all-ones and ``config_unreadable`` one with
+    no readable config (every other endpoint's config starts with the Tenstorrent vendor id)."""
     cls_dir = tmp_path / "sys/class/tenstorrent"
     devs = tmp_path / "sys/bus/pci/devices"
     cls_dir.mkdir(parents=True)
@@ -372,9 +371,8 @@ FOK = {"snapshot": {"ok": True}, "fabric": {"ok": True, "detail": "fabric links 
 
 
 def _mesh_reset_rig(monkeypatch, tmp_path, outcomes, *, missing=(), evidence=FOK):
-    """A 32-chip fake sysfs and a ``tt-smi -glx_reset`` whose n-th run returns ``outcomes[n]`` =
-    ``(rc, chips left ARC-not-ready)``. Every verify is stubbed to enum+ARC healthy with ``evidence``.
-    Returns ``(recovery, resets, verifies, events)``."""
+    """A 32-chip fake sysfs and a ``tt-smi -glx_reset`` whose n-th run returns ``outcomes[n]`` = ``(rc, chips left
+    ARC-not-ready)``. Every verify is stubbed to enum+ARC healthy with ``evidence``."""
     handle = _fake_sysfs(monkeypatch, tmp_path, missing=missing)
     events = []
     patch_health_event(monkeypatch, lambda kind, **f: events.append(kind))

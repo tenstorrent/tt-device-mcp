@@ -79,10 +79,8 @@ def _gate(
     job_age=None,
     broker_state="active",
 ):
-    """`install`: also run the last look before the restart (spec 08 I24), with this shell text
-    standing in for the install between the gate and it; the restart then follows the STATE write.
-    `job_age`: seconds a running job scope has run, from systemd's start record (None: unreadable).
-    `lap_stand_ins=False`: the real mv and rm, for the tests that count the script's own processes."""
+    """`install`: also run the last look before the restart (spec 08 I24), with this shell text standing in for the
+    install between the gate and it; the restart then follows the STATE write."""
     text = _SCRIPT.read_text()
     start = text.index("# Dispatch hold (spec 08 I18")
     end = text.index('echo "autoupdate: applying', start)
@@ -175,12 +173,8 @@ def test_the_hold_appears_whole(tmp_path):
 
 
 def test_a_queued_job_alone_applies_at_once_under_the_hold(tmp_path):
-    """A queued spec is not running work: under the hold it cannot start, so this is a job
-    boundary, and it waits, persisted, for the new broker.
-
-    Nothing here sleeps, so the lap's clock stands still while each poll takes over a second of
-    real time: a slow or loaded host must not read as a drain. (On the real clock, a count that
-    crossed a second boundary under a loaded full-suite run printed "drained after 1s".)"""
+    """A queued spec is not running work: under the hold it cannot start, so this is a job boundary, and it waits,
+    persisted, for the new broker."""
     clock = '\nau_now() { printf -v "$1" %s 1700000000; }\npgrep() { seen pgrep; command sleep 1.05; }\n'
     done, trace, hold = _gate(tmp_path, queued=1, stand_ins=clock)
     assert done.returncode == 0, done.stderr
@@ -356,10 +350,7 @@ def _no_restart(done, trace, hold):
 
 
 def test_a_job_past_its_cap_never_gets_a_restart(tmp_path):
-    """A running ttdev-job scope holds the update at any age. The wait under the hold is bounded by the broker's hard
-    job limit (1500 s + 60 s kill grace) from the scope's start; past it the lap releases dispatch and retries on the
-    next lap until the job ends, never a restart (a capped job by the broker's limit kill; a
-    no-timeout-except-on-contention job only by itself or on contention)."""
+    """A running ttdev-job scope holds the update at any age."""
     # Already past the cap: no wait under the hold, and no restart.
     past = tmp_path / "past"
     past.mkdir()
@@ -498,9 +489,8 @@ systemctl() { case "$*" in *list-units*ttdev-reset-*) echo "ttdev-reset-7.scope 
 
 
 def test_a_down_broker_with_only_a_reset_scope_left_is_restarted(tmp_path):
-    """A down broker runs no op of its own, and a reset scope is its own unit, which the restart does
-    not stop: the new broker's startup waits it out before its queue opens. So the lap applies, as
-    the reconcile it would otherwise block would start the broker over the same scope."""
+    """A down broker runs no op of its own, and a reset scope is its own unit, which the restart does not stop: the new
+    broker's startup waits it out before its queue opens."""
     done, trace, hold = _drain(
         tmp_path, running=10_000, queue=1, scope=True, job_age=1600, broker_state="failed", stand_ins=_RESET_SCOPE
     )
@@ -531,11 +521,8 @@ def test_the_drain_refreshes_the_hold(tmp_path):
 
 
 def test_the_apply_ends_in_a_full_broker_restart():
-    """The update's restart is an ordinary stop and start, so the new broker runs its whole startup
-    check (spec 03 I4) before its queue opens: no reload, no kill, no knob that skips it. That the
-    check runs, fabric included, after the hugepage pool fills, and passes before the queue opens:
-    tests/test_restart_drain.py::test_a_job_held_across_an_update_waits_for_the_startup_fabric_pass
-    and ::test_a_failed_startup_pass_after_an_update_keeps_the_queue_held."""
+    """The update's restart is an ordinary stop and start, so the new broker runs its whole startup check (spec 03 I4)
+    before its queue opens: no reload, no kill, no knob that skips it."""
     text = _SCRIPT.read_text()
     tail = text[text.index('echo "autoupdate: applying') :]
     assert tail.count("systemctl restart tt-device-broker") == 1
@@ -625,9 +612,7 @@ def _last_hold_epoch(trace):
 
 def test_an_op_that_never_ends_at_the_restart_point_is_never_restarted_over(tmp_path):
     """The broker's own op (live-pid lock, in its cgroup: a restart SIGTERMs it) or a reset scope the broker timed out
-    and left running, never ending at the restart point. The wait ends at OP_CAP, the lap restarts nothing and leaves
-    installed.sha on the old sha, so the next lap redoes the install and restarts once the broker is idle (spec 08 I7,
-    I24). The hold is never rewritten past the bound."""
+    and left running, never ending at the restart point."""
     for name, lock in (("lock", True), ("scope", False)):
         d = tmp_path / name
         d.mkdir()
@@ -661,10 +646,8 @@ def test_an_op_with_no_job_holds_dispatch_for_op_cap_not_the_job_cap(tmp_path):
 
 
 def test_a_running_job_holds_the_update_past_every_cap_and_an_idle_broker_applies(tmp_path):
-    """A running broker job always holds the update, past the job cap and past OP_CAP, with a
-    device op in flight beside it too: no cap lets the lap restart over it, before the install or
-    after. The wait under the hold ends at the job cap (never the job cap plus OP_CAP) and the next
-    lap retries. Once the job and the op are gone, the next lap finds the broker idle and applies."""
+    """A running broker job always holds the update, past the job cap and past OP_CAP, with a device op in flight beside
+    it too: no cap lets the lap restart over it, before the install or after."""
     for name, kw, secs in (
         ("drain-lock-past", {"lock": True, "install": False, "job_age": 1600}, 0),
         ("drain-scope-near", {"lock": False, "install": False, "job_age": 1500}, 60),
@@ -841,9 +824,8 @@ def _preemptable(limit_left, ends_after, running=1):
 
 
 def test_a_preemptable_job_past_its_limit_is_drained_by_the_hold(tmp_path):
-    """Nothing queued, the job past its limit and past the job cap: today's lap would let go at
-    once and retry forever. It now keeps the hold for the preempt bound (60 + 10 + 30 s), the
-    broker preempts the job, and the update applies at that boundary."""
+    """Nothing queued, the job past its limit and past the job cap: today's lap would let go at once and retry
+    forever."""
     stub, end = _preemptable(limit_left=0, ends_after=70)
     done, trace, hold = _drain(
         tmp_path, running=10_000, queue=0, scope=True, job_age=1600, stand_ins=stub, on_sleep=end
@@ -869,8 +851,7 @@ def test_a_preemptable_job_before_its_limit_keeps_the_hold_until_the_limit_and_t
 @pytest.mark.parametrize("limit_left", [1461, 1480, 5000])
 def test_a_limit_too_far_off_for_the_job_cap_is_never_held_through(tmp_path, limit_left):
     """limit + 100 s past the job cap: held through, the hold would preempt the job at its limit and still let go at the
-    cap, a kill on a lap that cannot apply. The lap lets go at once, before the limit, so the hold never preempts the
-    job; the model broker SIGTERMs it only under a live hold a minute past its limit, as the broker does."""
+    cap, a kill on a lap that cannot apply."""
     stub, _ = _preemptable(limit_left=limit_left, ends_after=10**9)
     kill = f'read -r t < $M/t; [ -e "$HOLD" ] && [ $t -ge {limit_left + 60} ] && echo "hold-driven kill" >> $M/kills;'
     done, trace, hold = _drain(tmp_path, running=10_000, queue=0, scope=True, job_age=10, stand_ins=stub, on_sleep=kill)
@@ -893,9 +874,8 @@ def test_a_limit_that_just_fits_the_job_cap_is_held_through(tmp_path):
 
 
 def _preempted_then_gate(tmp_path, *, gate_ends, seen_by, jump=None):
-    """The only running job, past its limit, is preempted 70 s in; then the broker's post-job gate
-    (a kill reset, the full check) runs as its child under the device-op lock until `gate_ends`.
-    `seen_by`: how the drain can tell the job ended, its scope or /health."""
+    """The only running job, past its limit, is preempted 70 s in; then the broker's post-job gate (a kill reset, the
+    full check) runs as its child under the device-op lock until `gate_ends`."""
     lock = tmp_path / "device-op.lock"
     unit = "990" if seen_by == "scope" else "428"
     names = 'local r; read -r r < $M/running; [ "$r" -gt 0 ] && echo 1 || echo 0' if seen_by == "health" else ":"
@@ -917,9 +897,8 @@ pgrep() {{ seen pgrep; [ -e $M/gate ] && echo 778; return 0; }}
 
 @pytest.mark.parametrize("seen_by", ["health", "scope"])
 def test_a_preempted_job_whose_post_job_gate_runs_long_still_applies_under_the_same_hold(tmp_path, seen_by):
-    """The hold preempted the job; its post-job gate (op lock live, a broker child) runs to 300 s,
-    past limit + 70 + 30 s. The lap keeps the hold through it and applies at the job boundary, never
-    letting go of dispatch in between (a standby resubmitted then would be killed on every lap)."""
+    """The hold preempted the job; its post-job gate (op lock live, a broker child) runs to 300 s, past limit + 70 + 30
+    s."""
     done, trace, hold = _preempted_then_gate(tmp_path, gate_ends=300, seen_by=seen_by, jump=(75, 290))
     assert done.returncode == 0, done.stderr
     assert "the preemptable job 990 ended after 70s" in done.stderr, done.stderr

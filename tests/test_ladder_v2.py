@@ -341,10 +341,8 @@ async def test_a_sweep_that_recovers_the_mesh_cancels_the_power_cycle(monkeypatc
 
 @pytest.mark.asyncio
 async def test_the_idle_escalation_road_to_a_power_cycle_goes_through_the_sweep():
-    """Wiring test for the host-rung road the gate ladder does not own: the idle/stuck-hold
-    escalation (`stuck_hold_host_escalation` — the road MOST real power cycles took). It must pass
-    through the last-chance sweep; before ladder-v2 it climbed to the host rung having only ever
-    re-tried the mesh reset. There is no post-reboot road: the broker has no reboot rung."""
+    """Wiring test for the host-rung road the gate ladder does not own: the idle/stuck-hold escalation
+    (`stuck_hold_host_escalation` — the road MOST real power cycles took)."""
     src = pathlib.Path(galaxy.__file__).read_text()
     fn = "_climb_to_host_recovery_after_failed_reset"
     start = src.index(f"async def {fn}(")
@@ -402,9 +400,8 @@ def test_force_waives_an_unreadable_scan_but_never_a_running_job(monkeypatch):
 
 
 def test_the_i75_stand_down_blocks_only_inside_the_escalate_that_carries_it(monkeypatch):
-    """Spec 03 I75 (review F3): the caller's stand-down is re-read at the ladder's tenant check, where a
-    re-adopted job that ended mid-run would otherwise let a reset through ahead of the startup gate. A
-    running job still names itself first (job_running), and outside an escalate nothing is blocked."""
+    """Spec 03 I75 (review F3): the caller's stand-down is re-read at the ladder's tenant check, where a re-adopted job
+    that ended mid-run would otherwise let a reset through ahead of the startup gate."""
     g = srv.galaxy_recovery
     monkeypatch.setattr(g, "_stand_down", lambda: True)
     monkeypatch.setattr(g, "startup_verify_deferred", False)

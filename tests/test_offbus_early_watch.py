@@ -348,9 +348,8 @@ async def test_a_transient_aer_with_live_heartbeats_never_flags_the_device(watch
 
 @pytest.mark.asyncio
 async def test_a_blip_shorter_than_the_confirm_bound_is_not_confirmed(watch, monkeypatch):
-    """On the fast cadence two samples come 2 s apart; a chip that reads dead on both and answers
-    on the third must not be isolated, and an empty sample that clears the same way must not
-    dirty the device. The fast cadence never makes the debounce shorter than FAST_CONFIRM_SEC."""
+    """On the fast cadence two samples come 2 s apart; a chip that reads dead on both and answers on the third must not
+    be isolated, and an empty sample that clears the same way must not dirty the device."""
     s, clock, isolated, events = watch
     monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "3")
     monkeypatch.setattr(srv, "device_op_active", "")
@@ -374,9 +373,7 @@ async def test_a_blip_shorter_than_the_confirm_bound_is_not_confirmed(watch, mon
 
 
 def test_the_fast_cadence_leaves_housekeeping_and_relift_on_the_regular_cadence(watch, monkeypatch):
-    """Only the off-bus check gets faster. The idle hold ledger, the idle relift (the only path
-    that re-verifies a hold with no job flowing) and the holder scan keep SAMPLE_INTERVAL_SEC,
-    so the watch adds no lift attempt and no extra full health check."""
+    """Only the off-bus check gets faster."""
     s, clock, _, _ = watch
     samples, ledger, relift = [], [], []
     monkeypatch.setattr(srv, "chip_sample", lambda: samples.append(clock.t) or {"0": LIVE})
@@ -541,9 +538,8 @@ async def test_a_reset_moves_the_baseline_without_arming(watch, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_two_fast_all_ones_samples_mark_a_chip_lost_before_the_confirm_bound(watch):
-    """Under the fast cadence the second all-ones sample marks the chip lost (spec 03 I66), so the
-    poll clock does no full read of it again; only the isolation waits for FAST_CONFIRM_SEC. The
-    next sample reads its heartbeat once for real, so the proof never rests on a value nobody read."""
+    """Under the fast cadence the second all-ones sample marks the chip lost (spec 03 I66), so the poll clock does no
+    full read of it again; only the isolation waits for FAST_CONFIRM_SEC."""
     s, clock, isolated, _ = watch
     s.arm_fast("uncorrectable AER errors on 0000:00:01.1")
     bad = {"0": LIVE, "13": DEAD, "31": LIVE}

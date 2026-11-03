@@ -200,9 +200,8 @@ async def test_the_driver_wait_rescan_starts_only_after_the_bmc_re_power_went_ou
 async def test_a_clean_mesh_reset_still_owes_the_full_check_before_release(
     ladder, monkeypatch, healthy, evidence, released  # noqa: F811
 ):
-    """Full check before any release: the rescan after a re-powered mesh reset releases nothing; the hold lifts only once
-    the full check, fabric included, has passed after it, and a failed or unproven check keeps it.
-    Driven through the gate's own mesh-reset rung and fold, so nothing here clears the hold."""
+    """Full check before any release: the rescan after a re-powered mesh reset releases nothing; the hold lifts only
+    once the full check, fabric included, has passed after it, and a failed or unproven check keeps it."""
     rig = ladder
     pci.REMOVED_CHIPS[REMOVED] = dict(REMOVED_REC)
     srv.isolated_chips = {REMOVED}

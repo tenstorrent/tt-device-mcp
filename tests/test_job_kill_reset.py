@@ -236,11 +236,8 @@ def runner_env(monkeypatch, tmp_path, clear_job_state):
 
 
 def _record_job_groups(monkeypatch) -> list[int]:
-    """Every job the runner spawns here, by its process group (pid == pgid). A test that cancels
-    its runner leaves the job running for re-adoption, as a broker shutdown does; teardown kills it.
-    The job starts with SIGINT at its default, as under the broker's service manager, even when
-    this run inherited SIGINT ignored (a non-interactive ``cmd &``): an ignored SIGINT reaches the
-    job, its ``trap ... INT`` cannot fire, and the reaper's SIGINT step never ends it."""
+    """Every job the runner spawns here, by its process group (pid == pgid). A test that cancels its runner leaves the
+    job running for re-adoption, as a broker shutdown does; teardown kills it."""
     groups = []
     real = asyncio.create_subprocess_shell
 
@@ -298,9 +295,7 @@ async def _until(pred, tries=400):
 
 
 def _runner_done(job) -> bool:
-    """The runner has finished the job's bookkeeping, where it takes the spec 03 I69 debt.
-    ``finished_at`` alone is not that: a requested kill stamps it before the runner sees the exit,
-    and stopping the runner in between reads as a broker shutdown that leaves the job to re-adoption."""
+    """The runner has finished the job's bookkeeping, where it takes the spec 03 I69 debt."""
     return job.finished_at is not None and srv.current_job_id != job.id
 
 
@@ -418,9 +413,8 @@ async def test_a_recovery_kill_is_killed_with_its_cause_before_the_sweep(runner_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("exit_cmd", ["exit 1", "true"], ids=["failed", "exit0"])
 async def test_a_recycled_id_after_a_fault_branch_recovery_kill_owes_its_reset(runner_env, monkeypatch, exit_cmd):
-    """Spec 01 I70 / 03 I69: a recovery-killed job whose log names a device fault takes the fault
-    branch, and that branch drops its reset-killed marker and cause too. Ids recycle (001-999): a
-    leftover marker would end the next job with this id KILLED by recovery and excuse it the reset."""
+    """Spec 01 I70 / 03 I69: a recovery-killed job whose log names a device fault takes the fault branch, and that
+    branch drops its reset-killed marker and cause too."""
     monkeypatch.setattr(srv, "_aiclk_left_busy", lambda *a, **k: {"0": 1350})
     srv._mark_job_device_fault_failed("951", "device recovery kill: chip 3 left the PCIe bus")
     job, runner = await _start("951", f"echo 'fabric router sync: timeout'; {exit_cmd}")
@@ -446,10 +440,7 @@ async def test_a_recycled_id_after_a_fault_branch_recovery_kill_owes_its_reset(r
 
 @pytest.mark.asyncio
 async def test_a_recovery_killed_job_that_exited_0_is_no_clean_job(runner_env, monkeypatch):
-    """Spec 01 I70 decision: a recovery kill is not a preemption (user rule for a preempted exit 0:
-    I20 only). A recovery-killed job that exited 0 reads KILLED to the post-job notes: failed for the
-    I42/I46 fabric notes, and no proof the last release was right, so the hold carry stays (04 I82).
-    It owes no second reset (recovery's own reset and full check stand) and its marker is dropped."""
+    """Spec 01 I70 decision: a recovery kill is not a preemption (user rule for a preempted exit 0: I20 only)."""
     seen = {}
 
     def lift(failed, tail):
@@ -578,10 +569,7 @@ async def test_a_cancel_while_queued_cancels_the_job(runner_env, monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("keep", [False, True], ids=["kill", "keep-running"])
 async def test_a_cancel_while_the_log_prune_runs_still_kills_the_job(runner_env, monkeypatch, keep):
-    """Spec 01 I66: ``_queue_job`` registers the job, then awaits its log pruning thread. A cancel in
-    that await (a slow thread on a loaded host) lands before the handler has a job id: the job must
-    still leave QUEUED, through a kill on its own task, with ``job_run_client_gone`` logged. With
-    ``keep_running_on_disconnect`` the job stays queued and the event is still logged."""
+    """Spec 01 I66: ``_queue_job`` registers the job, then awaits its log pruning thread."""
     rec = _Recorded()
     monkeypatch.setattr(srv, "_client_gone_kills", rec)
     pruning, release = threading.Event(), threading.Event()
@@ -629,9 +617,7 @@ class _Statuses(srv.Job):
 
 @pytest.mark.asyncio
 async def test_a_kill_queued_on_the_lock_ahead_of_the_runner_wins(runner_env, monkeypatch):
-    """Another coroutine holds the lock across an await; a kill queues on it, then the runner does.
-    The kill takes the lock first and cancels the job; the runner must see that under the lock and
-    skip the job, never mark it RUNNING and start it, and go on to the next job."""
+    """Another coroutine holds the lock across an await; a kill queues on it, then the runner does."""
     tmp = runner_env["tmp"]
     at_door, go = asyncio.Event(), asyncio.Event()
     real_hold = srv._wait_out_dispatch_hold
@@ -721,9 +707,8 @@ def _recording_ladder(monkeypatch, graces):
 
 @pytest.mark.asyncio
 async def test_a_hung_reap_gives_sigint_the_short_window(runner_env, monkeypatch):
-    """01 I10: a job silent for HUNG_SILENCE_SEC does not unwind on SIGINT (on a galaxy box both silence
-    reaps ran the full 60 s and ended at SIGTERM), and it owes the reset either way. Its SIGINT
-    window is HUNG_SIGINT_GRACE_SEC, not GRACEFUL_KILL_GRACE_SEC, and the reset debt stays."""
+    """01 I10: a job silent for HUNG_SILENCE_SEC does not unwind on SIGINT (on a galaxy box both silence reaps ran the
+    full 60 s and ended at SIGTERM), and it owes the reset either way."""
     monkeypatch.setattr(srv, "HUNG_SILENCE_SEC", 1)
     monkeypatch.setattr(srv, "HUNG_POLL_SEC", 0.05)
     graces = []
@@ -796,9 +781,8 @@ async def test_a_failed_job_that_left_the_clock_busy_owes_the_reset(runner_env, 
 async def test_the_runner_hands_the_job_end_clock_and_the_gates_fabric_pass_to_the_record(
     runner_env, monkeypatch, at_end
 ):
-    """03 B-post-job clock check: the runner's own read at the job's end, before the gate, decides
-    who the busy clock after the gate is blamed on. Idle then, and the gate's fabric pass killed by
-    dead-chip isolation: the pass. Busy then: the job."""
+    """03 B-post-job clock check: the runner's own read at the job's end, before the gate, decides who the busy clock
+    after the gate is blamed on. Idle then, and the gate's fabric pass killed by dead-chip isolation: the pass."""
     m = srv.health_monitor
     monkeypatch.setattr(m, "_fabric_verdict", {})
     monkeypatch.setattr(m, "_fabric_outcome", (0.0, ""))
@@ -840,9 +824,8 @@ OFF_BUS = 0xFFFFFFFF
     ids=["off-bus-chip", "implausible-clock", "off-bus-beside-a-busy-chip"],
 )
 async def test_an_off_bus_clock_read_is_not_a_busy_clock(runner_env, monkeypatch, clocks, want_debt):
-    """An off-bus chip reads 0xFFFFFFFF for its AI clock. That is not a chip left open: it owes no
-    kill reset and no aiclk_busy_after_job record, and takes the off-bus path instead. A real busy
-    chip beside it still owes the reset, counted and maxed without the off-bus read."""
+    """An off-bus chip reads 0xFFFFFFFF for its AI clock. That is not a chip left open: it owes no kill reset and no
+    aiclk_busy_after_job record, and takes the off-bus path instead."""
     monkeypatch.setattr(srv, "chip_snapshot", lambda: {i: {"tt_aiclk": v} for i, v in clocks.items()})
     job, runner = await _start("938", "exit 1")
     try:
@@ -1085,10 +1068,7 @@ async def test_a_preempt_kill_that_outlives_sigterm_logs_the_process_tree(monkey
 
 @pytest.mark.asyncio
 async def test_every_preemption_kill_owes_the_reset(monkeypatch, caplog, clear_job_state):
-    """Spec 03 I69: a job that had its minute and did not end itself was killed mid-run. Unless the
-    kernel witnessed every process exit by its own code (witness=True, spec 01 I20), even a tree
-    that goes on the first SIGTERM owes the mesh one reset plus the full check. Here nothing
-    witnesses it (the re-adopted path), and SIGTERM's default action is a signal death anyway."""
+    """Spec 03 I69: a job that had its minute and did not end itself was killed mid-run."""
     log = logging.getLogger("tt-device-mcp-test-preempt-term")
     monkeypatch.setattr(srv, "logger", log)
     monkeypatch.setattr(srv, "_scope_active", lambda scope: False)

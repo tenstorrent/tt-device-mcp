@@ -59,9 +59,8 @@ async def _assert_bound_ladder_runs(monkeypatch, count, verdict, resets):
 
 @pytest.mark.asyncio
 async def test_a_dead_arc_chip_back_on_the_rescan_does_not_arm_the_one_shot(mesh, monkeypatch, verdict):
-    """Chip 8 enumerates with a dead ARC; the gate's below-floor rescan brings it back but the full check
-    still fails. The one-shot is not armed by the read from before the rescan: no reset on the next tick.
-    The hold stands and the bound's ladder runs at 10 min."""
+    """Chip 8 enumerates with a dead ARC; the gate's below-floor rescan brings it back but the full check still fails.
+    The one-shot is not armed by the read from before the rescan: no reset on the next tick."""
     _, bridges, count = _below_floor_hold(monkeypatch, mesh, {"now": IDLE})
     monkeypatch.setattr(srv, "_offbus_hold_chips", set(), raising=False)
     _dead_arc_on_bus(monkeypatch)
@@ -80,9 +79,7 @@ async def test_a_dead_arc_chip_back_on_the_rescan_does_not_arm_the_one_shot(mesh
 
 @pytest.mark.asyncio
 async def test_a_chip_back_while_a_tenant_waited_drops_the_one_shot(mesh, monkeypatch, verdict):
-    """A tenant at the first tick keeps the tenant wait; chip 8 comes back meanwhile. On the first idle
-    tick after the wait the one-shot finds no chip off the bus: it is dropped with no reset and no forced
-    escalation, the hold stays, and the 10-min bound's ladder still runs."""
+    """A tenant at the first tick keeps the tenant wait; chip 8 comes back meanwhile."""
     scan = {"now": IDLE}
     _, bridges, count = _below_floor_hold(monkeypatch, mesh, scan)
     monkeypatch.setattr(srv, "_offbus_hold_chips", set(), raising=False)

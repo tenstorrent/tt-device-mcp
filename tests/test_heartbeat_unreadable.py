@@ -135,9 +135,8 @@ def _block(how, idx):
 
 @pytest.mark.parametrize("how", ["fenced", "lost"])
 def test_the_class_a_read_never_reads_a_fenced_chip(unreadable_24, monkeypatch, how):
-    """A chip the broker fenced (or marked lost) is not read by the class A decision read: a read of a
-    dead chip's attribute stalls its PCI remove. It counts as reading all-ones, off the bus: never an
-    on-bus survivor, never healthy."""
+    """A chip the broker fenced (or marked lost) is not read by the class A decision read: a read of a dead chip's
+    attribute stalls its PCI remove."""
     _block(how, "3")
     seen = _reads(monkeypatch)
     out = heartbeat.unreadable_on_bus_chips(ON_BUS)

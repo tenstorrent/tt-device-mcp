@@ -86,9 +86,7 @@ async def test_a_mismatch_reruns_traffic_only_and_an_ok_names_it_and_pages_once(
 
 @pytest.mark.asyncio
 async def test_the_hold_bound_keeps_the_latch_so_a_discovered_links_pass_is_not_a_pass(topo, monkeypatch):
-    """Spec 03 I42 / 04 I76: a moved tray's lift failed its first job. At the bound the latch stands, so
-    the check after the bound ladder passing on the discovered links again must not release (the next job
-    would fail and latch again, never reaching the power cycle): it fails, so the host rung follows."""
+    """Spec 03 I42 / 04 I76: a moved tray's lift failed its first job."""
     m, state = topo
     m.topology_hw_fault = "hardware fault: the first job after a topology-mismatch lift failed on the fabric (x)"
     monkeypatch.setattr(srv, "health_monitor", m)
@@ -132,9 +130,8 @@ async def test_the_lift_is_bounded_by_the_first_job_only(topo):
 
 @pytest.mark.asyncio
 async def test_a_fabric_failure_on_the_first_job_fails_the_next_mismatch_and_never_withholds_the_check(topo):
-    """I42: the latch never withholds the check (that hold could not reset or escalate). It reads the
-    fabric bad, drops the cached mismatch and turns the next mismatch into a FAILED check, so the
-    ladder runs. It pages nobody: the operator is the ladder's end, after a power cycle."""
+    """I42: the latch never withholds the check (that hold could not reset or escalate). It reads the fabric bad, drops
+    the cached mismatch and turns the next mismatch into a FAILED check, so the ladder runs."""
     m, state = topo
     await m._verify_fabric_health_body(60)
     alerts = len(state["alerts"])

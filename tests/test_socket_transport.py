@@ -39,11 +39,7 @@ STOP_DEADLINE_SEC = 10.0
 
 
 async def _stop_server_and_runner(uv_server):
-    """Stop the unix-socket server, then the job runner a submit started on this loop.
-
-    The loop's close cancels every task left and waits for them with no deadline: a runner that
-    drops its cancel (bpo-42130, see aio.wait_for) went back to its queue and that close never
-    returned. Cancel it here, bounded, and fail loudly if it does not end."""
+    """Stop the unix-socket server, then the job runner a submit started on this loop."""
     task = getattr(uv_server, "_tt_serve_task", None)
     uv_server.should_exit = True
     if task is not None:

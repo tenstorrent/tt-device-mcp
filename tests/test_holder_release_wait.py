@@ -101,9 +101,7 @@ async def test_a_holder_still_holding_after_the_window_is_named(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_another_runs_child_of_the_same_test_is_not_a_survivor(monkeypatch):
-    """Two runs of the suite on one host (two checkouts checked at once) spawn the same test's
-    child together. The sweep matches the job tag host-wide, so each run's tag must be its own,
-    or one run names the other's child as its survivor."""
+    """Two runs of the suite on one host (two checkouts checked at once) spawn the same test's child together."""
     _, other = _escaped_child(_unique_tag("t-hold"))  # the other run's child
     tag = _unique_tag("t-hold")
     job_pid, child = _escaped_child(tag)
@@ -432,9 +430,7 @@ async def test_the_device_is_held_before_the_release_wait_starts(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_the_release_wait_runs_off_the_sampler_loop(monkeypatch):
-    """Review fix: the bounded wait does not stall the sampler. The loop keeps ticking and keeps
-    driving the hold deadline (the 10-min ladder, spec 04 I76) and the other chips' dead-chip check
-    while the release wait runs; the wait still runs to its bound."""
+    """Review fix: the bounded wait does not stall the sampler."""
     from tt_device_mcp import telemetry
 
     monkeypatch.setattr(srv, "HOLDER_RELEASE_WAIT_SEC", 1.5)

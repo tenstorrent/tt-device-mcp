@@ -106,9 +106,8 @@ def test_g8_the_loop_bound_stands_for_an_unverified_cycle(g8):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("verified", [True, False], ids=["verified", "unverified"])
 async def test_g8_the_ladder_takes_the_power_cycle_instead_of_holding_for_the_interval(g8, monkeypatch, verified):
-    """(c) End to end on the climb after a failed reset (the governor real, the clock fake): the new
-    episode after a verified cycle fires the power cycle now. In the incident the denial left
-    the hold to repeat the mesh reset and the sweep for the rest of the interval."""
+    """(c) End to end on the climb after a failed reset (the governor real, the clock fake): the new episode after a
+    verified cycle fires the power cycle now."""
     _events, cycles = _wire_failed_climb(monkeypatch, lambda: {})
     g = srv.galaxy_recovery
     monkeypatch.delattr(g.mechanism, "auto_recovery_allowed")  # the real governor reads the ledger

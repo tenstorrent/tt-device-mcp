@@ -171,10 +171,8 @@ def _restart_broker(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_the_i42_latched_hold_after_a_lift_gets_the_ladder_one_tick_in_and_one_cycle(replay):
-    """The sequence's second episode: a release about 2 h into the first, the first job after it fails
-    on the fabric (I42 latch set) and a new hold opens. The latch is no exemption from the bound, and a
-    latched hold is a fabric link-short hold (spec 04 I83): the full ladder runs on the first sampler
-    tick, never later than its one-tick bound, well inside the 10-min bound."""
+    """The sequence's second episode: a release about 2 h into the first, the first job after it fails on the fabric
+    (I42 latch set) and a new hold opens."""
     order = replay["order"]
     _Clock.t = 2 * 3600
     srv.health_monitor.topology_lift_pending = True
@@ -198,10 +196,8 @@ async def test_the_i42_latched_hold_after_a_lift_gets_the_ladder_one_tick_in_and
 
 @pytest.mark.asyncio
 async def test_a_hold_that_spans_a_broker_restart_gets_the_ladder_10_min_after_it_began(replay, monkeypatch):
-    """A hold opens, the broker restarts 8 min in (new code installed): the restored episode keeps its
-    start, so the full ladder runs at 10 min of the hold, not 10 min after the restart. A 77-only hold, so
-    its bound is the 10-min ceiling (an unlatched mismatch is spec 04 I83's link-short class: its ladder
-    runs at hold start, tests/test_fabric_link_short.py)."""
+    """A hold opens, the broker restarts 8 min in (new code installed): the restored episode keeps its start, so the
+    full ladder runs at 10 min of the hold, not 10 min after the restart."""
     order = replay["order"]
     _hold_via_gate(HOLD_77, 0)
     for at in (60, 300):
@@ -218,10 +214,8 @@ async def test_a_hold_that_spans_a_broker_restart_gets_the_ladder_10_min_after_i
 
 @pytest.mark.asyncio
 async def test_lift_and_fail_cycles_never_restart_the_10_min_clock(replay):
-    """A hold lifts, the next job fails the same way, the hold returns; over and over. Each re-hold is
-    the same episode: the full ladder still runs 10 min after the first hold opened. A 77-only hold, so
-    the bound is the 10-min ceiling (a latched hold's one-tick bound, or an unlatched mismatch's spec 04
-    I83 at-start ladder, would run the ladder at once)."""
+    """A hold lifts, the next job fails the same way, the hold returns; over and over. Each re-hold is the same episode:
+    the full ladder still runs 10 min after the first hold opened."""
     order = replay["order"]
     _hold_via_gate(HOLD_77, 0)
     for lift, rehold in ((200, 230), (400, 430)):
@@ -236,10 +230,7 @@ async def test_lift_and_fail_cycles_never_restart_the_10_min_clock(replay):
 
 @pytest.mark.asyncio
 async def test_an_unlatched_mismatch_hold_gets_its_ladder_at_start_and_none_again_across_a_restart(replay, monkeypatch):
-    """Spec 04 I83 on the gate path: an unlatched topology-mismatch hold is the fabric link-short class.
-    Its first tick runs the full ladder, the failed full check after it (fabric included) asks for the
-    power cycle at once; a broker restart keeps the episode's start, and no tick up to the bound runs a
-    second power-cycle request. Nothing is released on a failed check."""
+    """Spec 04 I83 on the gate path: an unlatched topology-mismatch hold is the fabric link-short class."""
     order = replay["order"]
     _hold_via_gate(MISMATCH, 0)
     await _tick(60)

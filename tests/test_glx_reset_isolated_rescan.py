@@ -38,9 +38,8 @@ SETTLE = "\x1b[93mWaiting for 30 seconds: 0\x1b[0m" + "".join(
 
 
 def _fake_glx(hw, clock, real_sleep, *, chunks=None):
-    """`tt-smi -glx_reset` as the broker's backend runs it: the re-power heals the dropped chip's tray,
-    the settle line goes out, and the driver wait finds every chip only if a rescan re-added the
-    isolated endpoint while it ran. ``chunks`` splits the settle line the way a file backend's reads may."""
+    """`tt-smi -glx_reset` as the broker's backend runs it: the re-power heals the dropped chip's tray, the settle line
+    goes out, and the driver wait finds every chip only if a rescan re-added the isolated endpoint while it ran."""
 
     async def run(argv, log, owner="[broker]health-gate", on_output=None):
         emit = on_output or (lambda s: None)
@@ -114,10 +113,7 @@ def _hw():
 
 @pytest.mark.asyncio
 async def test_b1_replay_one_mesh_reset_heals_an_isolated_chip_inside_the_budget(monkeypatch, clear_job_state):
-    """Replay of a B1 episode: chip 31 fell off and was isolated; the 120 s one-shot's mesh reset re-powers its tray.
-    The rescan at tt-smi's driver wait re-adds it, so that ONE reset exits 0 and the full check, fabric included, passes
-    and releases. Before I81 the reset exited 1 at ~263 s, the post-reset rescan brought the chip back, and the I39
-    retry's second reset healed it 60 s later: ONE_SHOT + 263 + 60 + 62 = 505 s against a 360 s budget."""
+    """Replay of a B1 episode: chip 31 fell off and was isolated; the 120 s one-shot's mesh reset re-powers its tray."""
     clock = [ONE_SHOT]
     counters, events, _ = _episode(monkeypatch, power_cycle=True, clock=clock, off_bus=1)
     hw = _hw()
@@ -279,11 +275,8 @@ async def test_a_cancelled_reset_cancels_a_pending_driver_wait_rescan(
 async def test_a_cancel_while_the_driver_wait_rescan_finishes_still_runs_the_reset_cleanup(
     monkeypatch, clear_job_state, instant_reader_scan, rc
 ):
-    """tt-smi has exited but the driver-wait sysfs write is still running when the caller is cancelled
-    (an operator's reset call dropped). The cancel still reaches the caller, but only after the cleanup
-    every reset owes: the in-flight flag clear (or the dead-chip sampler stays blind), the rescan after
-    the reset, the returned chip dropped from the isolated set, and the pollers: back after a completed
-    reset, left stopped and owed to the next HEALTHY after a failed one (spec 03 I66)."""
+    """tt-smi has exited but the driver-wait sysfs write is still running when the caller is cancelled (an operator's
+    reset call dropped)."""
     srv.isolated_chips = {"31"}
     monkeypatch.setattr(base, "health_event", lambda *a, **k: None)
     monkeypatch.setattr(base, "returned_chips", lambda iso: sorted(iso))
@@ -343,9 +336,7 @@ async def test_a_cancel_while_the_driver_wait_rescan_finishes_still_runs_the_res
 async def test_output_after_a_cancelled_reset_starts_no_driver_wait_rescan(
     monkeypatch, clear_job_state, instant_reader_scan
 ):
-    """After a mid-reset cancel the backend's shielded output reader keeps feeding the callback. A driver
-    wait marker that arrives then starts no rescan (it would be nobody's to cancel); the caller's own
-    callback still sees the output."""
+    """After a mid-reset cancel the backend's shielded output reader keeps feeding the callback."""
     srv.isolated_chips = {"31"}
     monkeypatch.setattr(base, "health_event", lambda *a, **k: None)
     rescans, seen, feed = [], [], []

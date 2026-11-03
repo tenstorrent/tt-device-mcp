@@ -275,10 +275,7 @@ async def test_a_wrapped_failure_is_retried_only_if_every_part_says_never_delive
 @pytest.mark.asyncio
 async def test_a_tool_call_longer_than_the_read_timeout_completes_on_keepalives(tmp_path, monkeypatch, clear_job_state):
     """The shim's SSE read timeout bounds the gap between reads, not the call: a reset on a mesh can run for minutes
-    with nothing to send, and the broker's SSE keepalives are what hold the line open. Scaled down: the reset tool takes
-    2x the shim's read timeout and must still return its result. The read timeout is 40 ping intervals: a loaded test
-    host stalls the shared event loop for seconds (over 2 s seen in a full suite run at load 100+), and a tighter margin
-    reads that stall as a lost line."""
+    with nothing to send, and the broker's SSE keepalives are what hold the line open."""
     import sse_starlette
     from mcp import ClientSession
     from mcp.client.streamable_http import streamable_http_client

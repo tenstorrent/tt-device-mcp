@@ -154,10 +154,8 @@ def _full_checks(cool, monkeypatch, *, heals=False):  # noqa: F811
 
 @pytest.mark.asyncio
 async def test_the_full_ladder_runs_at_the_10_min_hold_bound_then_the_cycle(cool, monkeypatch):  # noqa: F811
-    """A hold never passes its 10-min bound inside the cooldown without the full ladder: the bound's
-    run (I76) reaches it, once per cycle or boot. There the sweep runs (SBR, then the mesh reset; there
-    is no tray step), then one full check, fabric included. A failed check keeps the device held, and
-    the cycle fires at the cooldown's end. Any other forced pass inside the cooldown runs no ladder."""
+    """A hold never passes its 10-min bound inside the cooldown without the full ladder: the bound's run (I76) reaches
+    it, once per cycle or boot."""
     await _two_cycles_that_do_not_heal(cool)
     fabric = _full_checks(cool, monkeypatch)
     m = cool["g"].mechanism
@@ -219,9 +217,8 @@ async def test_a_class_a_sweep_a_guard_holds_runs_no_check_and_the_cycle_still_f
     monkeypatch,
     guard,
 ):
-    """A live tenant at the 10-min bound holds the sweep (no reset over a tenant) and leaves it due for
-    the bound's next forced run; a sweep the reset gate refuses runs no check. Either
-    way nothing is released, and the power cycle still fires at the cooldown's end."""
+    """A live tenant at the 10-min bound holds the sweep (no reset over a tenant) and leaves it due for the bound's next
+    forced run; a sweep the reset gate refuses runs no check."""
     await _two_cycles_that_do_not_heal(cool)
     _full_checks(cool, monkeypatch)
     g = cool["g"]
@@ -300,10 +297,7 @@ def _watchdog_run(cool, monkeypatch):  # noqa: F811
 @pytest.mark.asyncio
 async def test_the_watchdog_run_at_the_bound_runs_the_class_a_ladder_once(cool, monkeypatch):  # noqa: F811
     """End to end through _force_escalate_stuck_hold, the run the watchdog starts: a whole tray off and the cycle in
-    cooldown. Below the bound no forced run reaches the ladder. At the bound the cooldown refuses the cycle, the sweep
-    runs once (SBR, then the mesh reset) and one full check (fabric included) follows; it fails, so the bound asks for
-    the host rung, whose cooldown denial arms the retry at the cooldown's end, where the cycle fires. A later bound
-    window on the same anchor runs no second ladder (spec 04 I73/I76)."""
+    cooldown. Below the bound no forced run reaches the ladder."""
     await _two_cycles_that_do_not_heal(cool)
     m = cool["g"].mechanism
     monkeypatch.setattr(m, "_class_a_ladder_anchor", None)  # the shared mechanism may carry an earlier anchor
@@ -343,9 +337,8 @@ async def test_the_watchdog_run_at_the_bound_runs_the_class_a_ladder_once(cool, 
 
 @pytest.mark.asyncio
 async def test_at_the_10_min_mark_a_failed_bound_check_keeps_the_power_cycle_step(cool, monkeypatch):  # noqa: F811
-    """Spec 04 I73 with I76: on a tick where the bound's ladder already ran and its full check failed,
-    the watchdog's one run is the bound's host rung (the power cycle, which the cooldown then gates),
-    not a second ladder. The AC-needed state stops neither."""
+    """Spec 04 I73 with I76: on a tick where the bound's ladder already ran and its full check failed, the watchdog's
+    one run is the bound's host rung (the power cycle, which the cooldown then gates), not a second ladder."""
     m = cool["g"].mechanism
     monkeypatch.setattr(m, "_class_a_ladder_anchor", None)  # the shared mechanism may carry an earlier anchor
     await _two_cycles_that_do_not_heal(cool)

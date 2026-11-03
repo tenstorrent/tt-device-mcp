@@ -53,9 +53,8 @@ def _gone_chip(monkeypatch):
     ids=["fabric-ok", "fabric-77", "no-fabric-verdict", "fabric-link-short"],
 )
 async def test_a_gone_chip_arms_the_one_shot_without_an_sbr(mesh, monkeypatch, evidence, healthy, released):
-    """The gate holds the gone chip below the floor and arms the one-shot; the next sampler tick runs its
-    mesh reset. No bridge reset or gone-chip SBR runs without the opt-in. Only a full check that passes
-    with the fabric on every cabled link frees the device; anything less keeps the hold."""
+    """The gate holds the gone chip below the floor and arms the one-shot; the next sampler tick runs its mesh reset. No
+    bridge reset or gone-chip SBR runs without the opt-in."""
     _, bridges, count = _below_floor_hold(monkeypatch, mesh, {"now": IDLE})
     monkeypatch.setattr(srv, "_offbus_hold_chips", set(), raising=False)
     _gone_chip(monkeypatch)

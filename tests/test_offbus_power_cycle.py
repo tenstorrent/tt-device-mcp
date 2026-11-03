@@ -34,8 +34,7 @@ _REAL_GATE = pcie_guard.host_reset_gate
 def _gated(monkeypatch, tmp_path, *, held_sec=600, cmd="/usr/local/sbin/host-power-cycle --now", manual="exit 1"):
     """An idle off-bus hold the gate refuses to reset, held ``held_sec``, with the power-cycle command set (``cmd=None``
     leaves it unset) and a manual-recovery check running ``manual`` (default: a clean "none seen"; ``None`` leaves it
-    unset, and conftest's TTDEV_ROOT has none installed). Returns (hold_since, rec) where rec collects the fake fires
-    (each with the state file as it stood when the command ran), alerts and journal events."""
+    unset, and conftest's TTDEV_ROOT has none installed)."""
     _arm_offbus_stuck_hold(monkeypatch, off_bus=OFF_BUS, isolated=set(), reset_result=False)
     monkeypatch.delenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", raising=False)
     if cmd is None:
@@ -234,9 +233,7 @@ async def test_a_blocked_power_cycle_pages_once_past_its_bound(monkeypatch, tmp_
 async def test_a_latch_never_blocks_a_rung_after_its_boot_nor_the_power_cycle_on_it(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """The I25 latch is scoped to its boot. After a later boot the real gate allows resets again and
-    the drop goes back to the ladder (no hold, no cycle); on the latched boot the gate refuses every
-    reset, and that refusal is exactly what the bounded power cycle answers."""
+    """The I25 latch is scoped to its boot."""
     hold_since, rec = _gated(monkeypatch, tmp_path)
     monkeypatch.setattr(pcie_guard, "host_reset_gate", _REAL_GATE)
     (pcie_guard.health_dir() / pcie_guard.LATCH_FILE).write_text(
@@ -580,9 +577,8 @@ def test_the_manual_recovery_check_never_globs_an_auth_log_line(tmp_path, monkey
 
 
 def _below_floor_episode(monkeypatch, tmp_path, *, cmd="/usr/local/sbin/host-power-cycle --now"):
-    """The 10-14 replay: chips 0-7 (tray 1) off the bus and isolated, below the 16-chip floor, the gate
-    allowing resets and the bridge rung not bringing them back. There is no tray re-power rung (spec 04
-    I23). Returns (hold_since, rec, counters, state)."""
+    """The 10-14 replay: chips 0-7 (tray 1) off the bus and isolated, below the 16-chip floor, the gate allowing resets
+    and the bridge rung not bringing them back. There is no tray re-power rung (spec 04 I23)."""
     hold_since, rec = _gated(monkeypatch, tmp_path, cmd=cmd)
     counters = _arm_offbus_stuck_hold(
         monkeypatch, off_bus=8, isolated={str(c) for c in range(8)}, sbr_recovers=False, reset_result=False
@@ -626,10 +622,8 @@ def _spy_gated_power_cycle(monkeypatch) -> list:
 async def test_the_idle_escalation_hands_a_whole_tray_drop_to_the_power_cycle(
     monkeypatch, tmp_path, clear_job_state, galaxy_trays
 ):
-    """The 10-14 drop (chips 0-7, all of tray 1, below the floor) on the idle escalation: a whole tray
-    off the bus goes through ``_offbus_gated_power_cycle`` to the power cycle with no grace (I37). No
-    tray is re-powered (I23), so the other trays stay on the bus, and no mesh reset runs. The device
-    stays held: every verify ran the fabric pass and none passed."""
+    """The 10-14 drop (chips 0-7, all of tray 1, below the floor) on the idle escalation: a whole tray off the bus goes
+    through ``_offbus_gated_power_cycle`` to the power cycle with no grace (I37)."""
     hold_since, rec, counters, state = _below_floor_episode(monkeypatch, tmp_path)
     calls = _spy_gated_power_cycle(monkeypatch)
     await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], EXPECTED, lambda m: None, force=True)
@@ -661,9 +655,8 @@ async def _gate_below_floor(off):
 async def test_the_post_job_gate_hands_a_whole_tray_drop_to_the_power_cycle(
     monkeypatch, tmp_path, clear_job_state, galaxy_trays
 ):
-    """The 10-15 replay through the post-job gate's BELOW_FLOOR branch: all of tray 1 (0-7) and four
-    chips of tray 4 off, below the floor. A whole tray off the bus goes through
-    ``_offbus_gated_power_cycle`` to the power cycle at once (no grace) and the device stays held."""
+    """The 10-15 replay through the post-job gate's BELOW_FLOOR branch: all of tray 1 (0-7) and four chips of tray 4
+    off, below the floor."""
     hold_since, rec, counters, state = _below_floor_episode(monkeypatch, tmp_path)
     calls = _spy_gated_power_cycle(monkeypatch)
     state["off"] = set(range(8)) | {24, 25, 28, 29}
@@ -713,9 +706,7 @@ def _tray_back_before_the_cycle(monkeypatch, state, back):
 async def test_a_whole_tray_that_comes_back_in_part_is_not_cycled_at_grace_0(
     monkeypatch, tmp_path, clear_job_state, galaxy_trays
 ):
-    """Tray 1 (0-7) is wholly off when the gate records it, then chips 0-3 come back before the cycle.
-    The re-read before the cycle sees no whole tray off any more: no grace-0 cycle, the whole-tray clock
-    is cleared (journaled ``whole_tray_back``) and the device stays held for the ladder."""
+    """Tray 1 (0-7) is wholly off when the gate records it, then chips 0-3 come back before the cycle."""
     hold_since, rec, counters, state = _below_floor_episode(monkeypatch, tmp_path)
     state["off"] = set(range(8)) | {24, 25, 28, 29}
     _tray_back_before_the_cycle(monkeypatch, state, range(4))
@@ -751,9 +742,7 @@ async def test_a_flapping_whole_tray_still_reaches_the_power_cycle(
     monkeypatch, tmp_path, clear_job_state, galaxy_trays, path
 ):
     """Chip 0 of tray 1 flickers, so each whole-tray read is followed by a partial re-read before the cycle. The
-    re-check holds the cycle back once per episode; the next pass that sees the whole tray off fires at grace 0. Before,
-    every pass cleared the whole-tray clock and held, so the hold never ended (6 forced passes: 0 cycles). No tray step
-    and no reset runs, and the device stays held."""
+    re-check holds the cycle back once per episode; the next pass that sees the whole tray off fires at grace 0."""
     hold_since, rec, counters, state = _below_floor_episode(monkeypatch, tmp_path)
     state["off"] = set(range(8))
     _flapping_tray(monkeypatch, state, 0)
@@ -838,9 +827,8 @@ async def test_a_re_read_the_tray_map_cannot_place_keeps_the_whole_tray_verdict(
 async def test_a_partial_drop_below_the_floor_holds_with_no_tray_step(
     monkeypatch, tmp_path, clear_job_state, galaxy_trays
 ):
-    """Four chips each of trays 1 and 4 off, no whole tray, below the floor: the gate's BELOW_FLOOR branch
-    re-powers no tray (I23), runs no reset and no power cycle, and holds. Nothing releases the device: the
-    I76 bound runs the full ladder at 10 min, and only a passing full check lifts the hold."""
+    """Four chips each of trays 1 and 4 off, no whole tray, below the floor: the gate's BELOW_FLOOR branch re-powers no
+    tray (I23), runs no reset and no power cycle, and holds."""
     hold_since, rec, counters, state = _below_floor_episode(monkeypatch, tmp_path)
     calls = _spy_gated_power_cycle(monkeypatch)
     state["off"] = {0, 1, 2, 3, 24, 25, 26, 27}

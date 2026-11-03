@@ -50,9 +50,8 @@ def held(monkeypatch, clear_job_state, tmp_path):
 
 
 def test_health_stays_held_while_a_forced_rung_runs(held, monkeypatch):
-    """/health read held:false, status ok, while the forced glx_reset of a hold ran, then held:true again once it ended.
-    The op inside an open hold episode is the recovery of THAT hold: the device is still refused, and a watcher that
-    reads ``held`` must not see it lifted until the full gate, fabric included, passes."""
+    """/health read held:false, status ok, while the forced glx_reset of a hold ran, then held:true again once it
+    ended."""
     srv._note_tenant_gate_verdict(f"device unverified: {REASON}")
     before = srv._health_payload(now=held + timedelta(seconds=30))
     assert before["held"] is True
@@ -137,10 +136,9 @@ def _release_inside_an_op(held, monkeypatch):
 
 
 def test_a_closed_episodes_held_since_never_carries_into_the_next_hold(held, monkeypatch):
-    """The in-op latch outlived its episode: the gate passed inside the op and closed the hold, but no
-    status read landed while the device was fit, so the next hold opened inside an op reported the
-    previous episode's start (days old) as its held_since. Each episode keeps its own clock. The next
-    hold here comes after the spec 04 I82 carry window, so it is a new episode."""
+    """The in-op latch outlived its episode: the gate passed inside the op and closed the hold, but no status read
+    landed while the device was fit, so the next hold opened inside an op reported the previous episode's start (days
+    old) as its held_since."""
     _release_inside_an_op(held, monkeypatch)
     srv._hold_carry["released"] = time.time() - srv._HOLD_CARRY_SEC - 1
 
@@ -154,9 +152,7 @@ def test_a_closed_episodes_held_since_never_carries_into_the_next_hold(held, mon
 
 
 def test_a_rehold_inside_the_carry_window_reports_the_carried_start_in_and_after_the_op(held, monkeypatch):
-    """Spec 04 I82 with I80: a release followed within _HOLD_CARRY_SEC by a new hold continues the
-    episode. Opened inside an op, that hold reports the carried start as held_since, during the op
-    and after it, and the 10-min clock keeps it: a lift/fail cycle never restarts the clock."""
+    """Spec 04 I82 with I80: a release followed within _HOLD_CARRY_SEC by a new hold continues the episode."""
     _release_inside_an_op(held, monkeypatch)
 
     monkeypatch.setattr(srv, "device_op_active", "health-gate/post-job")

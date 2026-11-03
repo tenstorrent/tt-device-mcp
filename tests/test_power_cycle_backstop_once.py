@@ -67,9 +67,8 @@ def _ledger_cycles(tmp_path):
 
 @pytest.mark.asyncio
 async def test_one_gate_pass_on_all_off_counts_its_cycle_once(monkeypatch, tmp_path, clear_job_state):
-    """Two cycles already in the window: the pass requests exactly one cycle (the third), journals no
-    backstop denial, pages nobody and arms no retry. Before the fix the host-rung step counted the
-    cycle just requested as the third, denied, paged and armed the retry."""
+    """Two cycles already in the window: the pass requests exactly one cycle (the third), journals no backstop denial,
+    pages nobody and arms no retry."""
     cycles, alerts, events, _ = _arm_all_off_with_two_cycles(monkeypatch, tmp_path)
     rm = srv.recovery_mechanism
 

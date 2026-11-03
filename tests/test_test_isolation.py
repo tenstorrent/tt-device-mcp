@@ -121,9 +121,8 @@ class _HostHoldsTheRealDevice:
 
 
 def test_a_real_device_holder_on_the_host_is_not_a_holder_in_a_test(monkeypatch):
-    """Spec 09 I1 (holder scan): a real job holding the host's own /dev/tenstorrent does not read as
-    a tenant in an unmarked test. Unsealed, it kept a runner test's job waiting on the holder and
-    blocked a hold-bound test's host rung, only while the host ran device work."""
+    """Spec 09 I1 (holder scan): a real job holding the host's own /dev/tenstorrent does not read as a tenant in an
+    unmarked test."""
     monkeypatch.setattr(dh, "os", _HostHoldsTheRealDevice())
     monkeypatch.setattr(dh, "_iter_pids", lambda: [os.getpid()])
     monkeypatch.setattr(srv, "_present_chip_indices", lambda: ["0"])

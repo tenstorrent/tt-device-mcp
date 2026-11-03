@@ -127,11 +127,7 @@ async def test_a_cycle_that_does_not_launch_holds_pages_and_retries(monkeypatch,
 
 @pytest.mark.asyncio
 async def test_a_cycle_that_cannot_launch_os_first_never_reboots_and_holds(monkeypatch, clear_job_state, tmp_path):
-    """Spec 04 I88/I71: the real escalation, with no shutdown hook installed, raises
-    PowerCycleNotLaunched. No reboot is asked for and no step runs (no warm-reboot fallback), the ledger
-    keeps no row, the hold stays (fault and dirty flags untouched), and the next pass asks for the
-    power cycle again, never another host action. The episode gets one page (power_cycle_not_launched,
-    naming why), not a second launch-failure page; the hourly re-page still follows while it fails."""
+    """Spec 04 I88/I71: the real escalation, with no shutdown hook installed, raises PowerCycleNotLaunched."""
     counters = _arm_partial_drop(monkeypatch, 8)
     _ledger_dir(monkeypatch, tmp_path)
     asked = _deny(monkeypatch)
@@ -168,9 +164,7 @@ async def test_a_cycle_that_cannot_launch_os_first_never_reboots_and_holds(monke
 
 @pytest.mark.asyncio
 async def test_two_failed_launches_in_one_episode_page_once_and_retry_each_pass(monkeypatch, clear_job_state):
-    """Spec 04 I71: an unreachable BMC fails every launch. Each pass journals the failure and asks for the cycle again,
-    but the operator is paged once per hold episode, then at most once per CYCLE_LAUNCH_REPAGE_SEC while it keeps
-    failing; a new episode pages again. The hold stays and the fault is never cleared."""
+    """Spec 04 I71: an unreachable BMC fails every launch."""
     counters = _arm_partial_drop(monkeypatch, 8)
     _deny(monkeypatch)
     cycles = _cycle_never_launches(monkeypatch)

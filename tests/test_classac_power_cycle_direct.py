@@ -42,9 +42,8 @@ def _beats_without(off: set) -> dict:
 
 @pytest.fixture
 def rig(monkeypatch, tmp_path, galaxy_trays):
-    """srv.galaxy_recovery with the rescan, the capture, the mesh reset, the sweep's resets and the
-    power cycle recorded in ``rig['order']`` and timed on ``rig['clock']``; the bus is read from
-    ``rig['beats']``. The gate's dispatch, the I37 hook and the last-chance sweep are the real ones."""
+    """srv.galaxy_recovery with the rescan, the capture, the mesh reset, the sweep's resets and the power cycle recorded
+    in ``rig['order']`` and timed on ``rig['clock']``; the bus is read from ``rig['beats']``."""
     g = srv.galaxy_recovery
     state = {
         "beats": {},
@@ -194,8 +193,7 @@ async def test_the_deadline_climb_cycles_past_an_unreadable_scan_but_never_a_ten
     rig, monkeypatch, phase, blocker, cycled
 ):
     """A class A cycle is never held by an unreadable holder scan or by a holder outside every broker job scope (spec 04
-    I103), before or at the deadline; a running job or a broker job's holder still holds it. Nothing is released here:
-    the boot after the cycle runs the startup gate's full check, fabric included (03 I4)."""
+    I103), before or at the deadline; a running job or a broker job's holder still holds it."""
     rig["scan"] = HolderScan(holders=[], complete=False)
     if blocker == "job_running":
         monkeypatch.setattr(rig["g"].deps, "job_running", lambda: True)
@@ -339,10 +337,8 @@ async def test_with_no_power_cycle_opted_in_the_ladder_runs(rig, monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["whole_tray", "all_off"])
 async def test_a_and_c_on_a_set_whose_reset_failed_in_an_earlier_hold_still_cycle_directly(rig, case):
-    """The mesh reset already failed on exactly this off-bus set this boot, in an earlier hold (I58),
-    so the gate's reset stage would skip it. Class A and C do not reach that skip: the reset stage
-    requests the power cycle directly, and the host rung's sweep skips itself, so neither fires a mesh
-    reset, a tray re-power or the sweep (I37). The record alone makes an all-off set class C."""
+    """The mesh reset already failed on exactly this off-bus set this boot, in an earlier hold (I58), so the gate's
+    reset stage would skip it."""
     off = _off(rig["map"], {3: 8}) if case == "whole_tray" else set(range(EXPECTED))
     mech = rig["g"].mechanism
     earlier = (datetime.now() - timedelta(hours=1)).isoformat()
@@ -420,10 +416,8 @@ async def test_a_failed_startup_check_after_the_cycle_keeps_the_hold(rig):
 
 @pytest.mark.asyncio
 async def test_time_to_recover_on_a_fake_clock(rig):
-    """When the cycle is requested, on the clock each failed reset (262 s) and sweep (323 s) advance.
-    Class A: at once. Class C, at startup as at run time: after its one reset. The partial-tray
-    ladder (B2): after its one reset and the last-chance sweep, which repeats it right before the
-    power cycle (I58/I100): a repeat that did not run never counts as run."""
+    """When the cycle is requested, on the clock each failed reset (262 s) and sweep (323 s) advance. Class A: at once.
+    Class C, at startup as at run time: after its one reset."""
 
     async def episode(beats, stages, phase="post-job"):
         g = rig["g"]
@@ -667,9 +661,8 @@ def _lingering_link_down(monkeypatch, tmp_path, *, gone=(), eio=(), down=()):
 
 @pytest.mark.asyncio
 async def test_lingering_link_down_nodes_leave_an_all_off_bus_its_mesh_reset(rig, monkeypatch, tmp_path):
-    """Spec 03 I9 and 04 I37: one tray's nodes are gone and the other trays' linger, bound, with an EIO
-    read and the link down. Every chip is off the bus, so the one mesh reset still runs; the lingering
-    nodes are not survivors that make the drop look like class A."""
+    """Spec 03 I9 and 04 I37: one tray's nodes are gone and the other trays' linger, bound, with an EIO read and the
+    link down."""
     gone = set(rig["map"][max(rig["map"])])
     lingering = set(range(EXPECTED)) - gone
     _lingering_link_down(monkeypatch, tmp_path, gone=gone, eio=lingering, down=lingering)
@@ -695,9 +688,7 @@ async def test_a_tray_of_link_down_nodes_with_one_eio_survivor_is_class_a(rig, m
 
 @pytest.mark.asyncio
 async def test_an_enodata_tray_reading_ffff_is_class_a(rig, monkeypatch, tmp_path):
-    """Spec 04 I24: a tray that lost power right after a reset reads ENODATA on bound endpoints with
-    their links up. Its config space reads 0xffff, so it is off the bus, not ARC-not-ready: class A,
-    straight to the power cycle with no mesh reset."""
+    """Spec 04 I24: a tray that lost power right after a reset reads ENODATA on bound endpoints with their links up."""
     tray = set(rig["map"][3])
     _fake_sysfs(monkeypatch, tmp_path, enodata=tray, vendor_ffff=tray)
     monkeypatch.setattr(galaxy, "unreadable_on_bus_chips", heartbeat.unreadable_on_bus_chips)
@@ -788,9 +779,7 @@ async def test_a_listed_node_whose_link_is_down_does_not_fill_a_tray(short_boot)
 
 
 async def _gate_in_cooldown(rig, monkeypatch, tmp_path, off: set, argv=("tt-smi", "-glx_reset")):
-    """A failed operator reset arms the cooldown, then a post-job gate runs end to end on ``off``.
-    An all-off set keeps its device nodes (lingering): with none at all the gate holds and leaves the
-    climb to the idle off-bus escalation."""
+    """A failed operator reset arms the cooldown, then a post-job gate runs end to end on ``off``."""
     (tmp_path / "dev").mkdir()
     for i in range(EXPECTED):
         if i not in off or len(off) == EXPECTED:

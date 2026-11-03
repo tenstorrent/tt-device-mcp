@@ -97,8 +97,7 @@ async def test_replay_a_release_after_the_bound_ladder_then_a_failed_first_job_g
     monkeypatch, tmp_path, clear_job_state, hold
 ):
     """A Galaxy host, 2026-10-17: a missing-port hold reached the bound; its ladder's check passed on the discovered
-    links and released the device; the first job died on the same missing link about 40 s later. The new hold started a
-    new clock, so the host rung after the ladder was never due and the loop ran every ~13 min for an hour."""
+    links and released the device; the first job died on the same missing link about 40 s later."""
     _isolate(monkeypatch, tmp_path)
     _watchdog(monkeypatch)
     escalations, events, detail = _open_hold(monkeypatch, hold, BOUND + 5)
@@ -460,8 +459,7 @@ async def test_replay_a_hold_after_a_verified_release_and_a_long_first_job_is_a_
     monkeypatch, tmp_path, clear_job_state
 ):
     """A Galaxy host: a 138 s hold was released on a full check whose fabric pass found every cabled link; the next job
-    ran 29 min, was killed for its time limit, and the reset after it held the device again. That hold took the released
-    episode's start, was born 32 min old ('held 1929s past 1200s bound') and escalated at once."""
+    ran 29 min, was killed for its time limit, and the reset after it held the device again."""
     _isolate(monkeypatch, tmp_path)
     _watchdog(monkeypatch)
     escalations, events, _detail = _open_hold(monkeypatch, "generic", 138)
@@ -627,9 +625,8 @@ async def test_replay_a_restart_whose_startup_check_releases_then_a_failed_first
 async def test_replay_a_restart_whose_real_startup_gate_releases_keeps_the_carry(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """The 09:02 replay through the real startup gate: its full check releases the hold the dead broker left
-    open and saves the carry; the same pass must not end it. Fails on eb54d67: the gate's own full-check
-    drop ended that carry, so the first job's re-hold was seconds old and the host rung never due."""
+    """The 09:02 replay through the real startup gate: its full check releases the hold the dead broker left open and
+    saves the carry; the same pass must not end it."""
     _isolate(monkeypatch, tmp_path)
     _watchdog(monkeypatch)
     _escalations, _events, detail = _open_hold(monkeypatch, "missing port (topology mismatch)", BOUND + 5)
@@ -741,10 +738,7 @@ def _record_events(monkeypatch):
 @pytest.mark.asyncio
 async def test_a_startup_hold_after_a_released_episode_starts_its_own_clock(monkeypatch, tmp_path, clear_job_state):
     """A job timed out, its reset and full check (fabric included) released the hold about 130 s later, and the next job
-    started inside the carry window. A broker restart about 26 min later re-adopted that live job and opened the startup
-    hold, which took the released episode's start: it was born about 1700 s old, so the deadline flag, a forced
-    escalation and a tenant-blocked page fired on a device whose job was healthy. The startup hold neither takes nor
-    spends the carry: the fault it may turn into still takes it."""
+    started inside the carry window."""
     _isolate(monkeypatch, tmp_path)
     _watchdog(monkeypatch)
     escalations, _events, detail = _open_hold(monkeypatch, "generic", 130)
@@ -865,10 +859,8 @@ async def test_a_startup_hold_that_deferred_a_carry_lifts_only_on_a_full_check_p
 async def test_replay_a_restart_during_the_first_job_after_the_bound_ladder_then_a_failed_check_goes_to_the_host_rung(
     monkeypatch, tmp_path, clear_job_state, hold
 ):
-    """The bound's ladder released the device; the first job was still running when the broker restarted and
-    re-adopted it; it then failed on the same fault (the startup hold turns into that fault's hold). The
-    episode continues: the host rung is due at once, with no second ladder and no fresh 10-min clock. Fails
-    when the startup hold spends the carry: the clock restarts, and the cycle waits another ladder."""
+    """The bound's ladder released the device; the first job was still running when the broker restarted and re-adopted
+    it; it then failed on the same fault (the startup hold turns into that fault's hold)."""
     _isolate(monkeypatch, tmp_path)
     _watchdog(monkeypatch)
     escalations, events, _detail = _open_hold(monkeypatch, hold, BOUND + 5)
@@ -1031,11 +1023,9 @@ def _gate_ran_for(seconds):
 async def test_a_readopted_first_job_that_fails_keeps_the_carry_through_a_slow_startup_gate(
     monkeypatch, tmp_path, clear_job_state, hold, end, gate_sec
 ):
-    """The re-adopted first job's failure does not change the startup hold's `why`, so the hold names its
-    fault only when the startup gate's reset and full check fail, which can come more than _HOLD_CARRY_SEC
-    after the job's end (a failing reset plus the fabric check and its retry). The episode still continues:
-    the host rung is due at once, no second ladder, no fresh 10-min clock. Fails when the carry window keeps
-    counting from the job's end under the startup hold: the clock restarts and the cycle waits a ladder."""
+    """The re-adopted first job's failure does not change the startup hold's `why`, so the hold names its fault only
+    when the startup gate's reset and full check fail, which can come more than _HOLD_CARRY_SEC after the job's end (a
+    failing reset plus the fabric check and its retry)."""
     escalations, events, since, mark = await _readopted_first_job_ends(monkeypatch, tmp_path, hold, end)
     assert srv.fsm.record.why == "startup_unverified"
     _gate_ran_for(gate_sec)

@@ -364,9 +364,7 @@ def test_a_reset_step_drops_a_pending_stop_and_its_check_is_never_killed_for_it(
 
 @pytest.mark.parametrize("seen", ["no sample", "ARC not ready", "sample from before the stop"])
 def test_a_pending_stop_with_no_proof_ends_in_containment_within_its_cap(watch, monkeypatch, seen):  # noqa: F811
-    """Chips that neither answer nor read all-ones: the stop does not wait for the readers' own
-    timeouts. At PENDING_STOP_CAP_SEC the still-attached chip is contained, the remove before any
-    kill (I96), and the hold stays on its bounded recovery: only a full pass with fabric lifts it."""
+    """Chips that neither answer nor read all-ones: the stop does not wait for the readers' own timeouts."""
     w, log, _detach_ok, burst = watch
     if seen == "sample from before the stop":
         _sample(age=1.0)
@@ -424,9 +422,7 @@ def _shared_burst(w, monkeypatch, log):
 
 
 def test_the_cap_removes_only_the_unproven_chip_never_its_answering_sibling(watch, monkeypatch):  # noqa: F811
-    """A burst on a shared root port lists both chips; 13's heartbeat is not ready, 14 answers in
-    every fresh sample. At the cap only 13 is contained (remove before the kill, I96): 14 is never
-    removed, so a one-chip event does not become a multi-chip off-bus. The hold stays (I78)."""
+    """A burst on a shared root port lists both chips; 13's heartbeat is not ready, 14 answers in every fresh sample."""
     w, log, _detach_ok, _burst = watch
     _shared_burst(w, monkeypatch, log)
     acted = _cap_poll(w, monkeypatch, log, [{"13": [None], "14": [100]}])
@@ -550,9 +546,7 @@ async def _probe_timeout(monkeypatch):
 
 
 async def test_a_held_reader_s_own_timeout_kills_it_only_once_the_watch_released_it(monkeypatch):
-    """Spec 03 I92: the AER watch stopped this reader while a chip it may read is attached. Its own
-    timeout fires at 50 ms; the kill (which closes its fds, and the close reaches the chip) waits for
-    the watch's release after the remove."""
+    """Spec 03 I92: the AER watch stopped this reader while a chip it may read is attached."""
     chip_state.hold_readers([HUNG], time.monotonic() + 30)
     asyncio.get_running_loop().call_later(0.5, chip_state.release_readers, [HUNG])
     took, held = await _probe_timeout(monkeypatch)

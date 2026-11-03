@@ -36,9 +36,7 @@ class _Logger:
 
 @pytest.fixture
 def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
-    """A 32-chip Galaxy, every chip on the bus and ARC healthy, after a clean job exit whose eth read
-    times out. ``fabric`` records how many resets had run when each fabric pass ran; a reset makes the
-    eth read advance and, unless ``reset_heals`` is False, the fabric pass green."""
+    """A 32-chip Galaxy, every chip on the bus and ARC healthy, after a clean job exit whose eth read times out."""
     st = {
         "eth": TIMED_OUT,
         "fabric_bad": False,

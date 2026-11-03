@@ -253,9 +253,8 @@ def _gate_event(events):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["post-job", "startup"])
 async def test_the_gate_never_logs_healthy_nor_clears_dirty_while_a_chip_is_isolated(gate, monkeypatch, phase):
-    """The field case: chip 15 left the bus, the isolation killed the fabric pass, and the next gate
-    read enum+ARC healthy. It logged healthy=true and swapped the dirty hold for a clean
-    fabric-unverified one (device_dirty_cleared). The record must stay dirty and unhealthy."""
+    """The field case: chip 15 left the bus, the isolation killed the fabric pass, and the next gate read enum+ARC
+    healthy."""
     events, _ = gate
     monkeypatch.setattr(srv, "isolated_chips", {"15"})
     fsm_dirty(srv, REASON, why="heartbeat")

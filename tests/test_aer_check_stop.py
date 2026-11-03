@@ -243,10 +243,9 @@ def test_a_slow_rise_another_path_or_one_below_the_count_never_stops(rig):
 
 
 def test_an_idle_watch_reads_only_kernel_memory_and_signals_nobody(rig, monkeypatch):
-    """Always on (03 I96): with no check reader running the watch still reads I79's counters and the
-    node list every tick, but nothing that reaches a chip: no config-space read unless
-    WATCH_CONFIG_CONFIRM, no DLLLA read unless WATCH_DLLLA. A burst with every chip answering stops
-    nobody (no broker reader runs, and a tenant is never touched for it)."""
+    """Always on (03 I96): with no check reader running the watch still reads I79's counters and the node list every
+    tick, but nothing that reaches a chip: no config-space read unless WATCH_CONFIG_CONFIRM, no DLLLA read unless
+    WATCH_DLLLA."""
     w, clock, log, feed = rig
     monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", None)
     config = []

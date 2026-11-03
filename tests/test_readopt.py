@@ -594,8 +594,7 @@ def _no_ladder(monkeypatch) -> list:
 @pytest.mark.asyncio
 async def test_a_per_user_daemon_start_on_a_bad_device_stays_recovering(monkeypatch, clear_job_state, tmp_path):
     """The hole: a per-user daemon restarted onto a device whose ARC stopped ticking read HEALTHY and admitted its first
-    job onto it. A failing start pass must hold the door — a self-heal hold, not a dirty mark, see the next test —
-    journal the verdict, and never climb the ladder itself."""
+    job onto it."""
     events = _per_user_start(monkeypatch, tmp_path)
     _probe(monkeypatch, healthy=False)
     ladder = _no_ladder(monkeypatch)
@@ -614,9 +613,8 @@ async def test_a_per_user_daemon_start_on_a_bad_device_stays_recovering(monkeypa
 
 @pytest.mark.asyncio
 async def test_a_failed_per_user_start_reopens_once_the_device_reads_healthy(monkeypatch, clear_job_state, tmp_path):
-    """A dirty mark would strand this: a dirty per-user device that later reads healthy routes to
-    HOLD_FABRIC_UNVERIFIED (no validator to give a verdict), which nothing lifts by default. The start
-    hold must instead be lifted by the idle relift's read-only re-read."""
+    """A dirty mark would strand this: a dirty per-user device that later reads healthy routes to HOLD_FABRIC_UNVERIFIED
+    (no validator to give a verdict), which nothing lifts by default."""
     _per_user_start(monkeypatch, tmp_path)
     _probe(monkeypatch, healthy=False)
     _no_ladder(monkeypatch)
@@ -679,9 +677,8 @@ async def test_a_per_user_restart_keeps_a_loaded_open_episode(monkeypatch, clear
 
 @pytest.mark.asyncio
 async def test_a_per_user_daemon_start_beside_a_holder_stays_healthy(monkeypatch, clear_job_state, tmp_path):
-    """The gate never probes beside a foreign holder. At a per-user start that is often the user's own
-    process; holding on it would leave a foreign_holder hold nothing lifts short of the stuck-hold
-    escalation. Skip and stay as before."""
+    """The gate never probes beside a foreign holder. At a per-user start that is often the user's own process; holding
+    on it would leave a foreign_holder hold nothing lifts short of the stuck-hold escalation."""
     _per_user_start(monkeypatch, tmp_path, holders=[DeviceHolder(pid=4242, uid=2000)])
     passes = _probe(monkeypatch, healthy=False)
 

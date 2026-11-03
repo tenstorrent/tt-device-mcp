@@ -89,9 +89,8 @@ def _reads_of(sysfs, idx):
 
 
 def test_a_lost_chip_is_never_read_on_the_poll_clock(sysfs, clock):
-    """Once lost, read_heartbeats and chip_sample report the chip all-ones without a read, however long
-    the poll clock runs (no periodic backstop: the chip is still attached). A decision read reads it
-    once; the pollers stay off it afterwards."""
+    """Once lost, read_heartbeats and chip_sample report the chip all-ones without a read, however long the poll clock
+    runs (no periodic backstop: the chip is still attached)."""
     sysfs["node"](2, ALL_ONES)
     chip_state.mark_lost(["2"], "test", {"2": sysfs["dir"] / "tenstorrent!2"})
     sysfs["reads"].clear()
@@ -248,9 +247,8 @@ def test_the_sampler_reads_no_chip_while_a_reset_owns_them(monkeypatch, sysfs, o
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["all-ones", "stalled heartbeat"])
 async def test_the_first_hung_sample_stops_the_pollers(monkeypatch, kind):
-    """A present chip whose heartbeat did not move since the last sample stops the pollers on that first
-    sample (isolation still waits for its second); once per episode. A chip reading all-ones may be off
-    the bus and is not detached yet, so its stop is deferred to the dead-chip valve (I84), journalled once."""
+    """A present chip whose heartbeat did not move since the last sample stops the pollers on that first sample
+    (isolation still waits for its second); once per episode."""
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv.sampler, "isolate_dead_chips", lambda d: asyncio.sleep(0))
     events = []
@@ -316,9 +314,8 @@ def _reset_seams(monkeypatch, order, rc):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("rc, restored", [(0, True), (1, False)])
 async def test_a_failed_reset_leaves_the_pollers_stopped(monkeypatch, rc, restored):
-    """A reset that exited non-zero leaves chips that may still be off the bus or hung, and the device
-    held: the pollers stay down, owed to the next HEALTHY (04 I12). A completed one restores them. The
-    step is published as recovering while it runs."""
+    """A reset that exited non-zero leaves chips that may still be off the bus or hung, and the device held: the pollers
+    stay down, owed to the next HEALTHY (04 I12). A completed one restores them."""
     order = []
     events = []
     patch_health_event(monkeypatch, lambda k, **f: events.append((k, f)))
@@ -335,9 +332,7 @@ async def test_a_failed_reset_leaves_the_pollers_stopped(monkeypatch, rc, restor
 
 
 def test_the_post_reset_grace_reads_lost_chips_for_real(sysfs, clock, monkeypatch):
-    """A blackout marks every chip lost. While the reset step runs its own reads go through; once it
-    ends, the verify's heartbeat_verdict reads every chip for real (at most once a second each) instead
-    of waiting out the backstop, so the post-reset check judges the chips as they are."""
+    """A blackout marks every chip lost."""
     chip_state.mark_lost(
         [str(i) for i in range(N)], "blackout", {str(i): sysfs["dir"] / f"tenstorrent!{i}" for i in range(N)}
     )
@@ -426,10 +421,9 @@ def _ticking(monkeypatch, sysfs, ids):
 
 
 def test_a_lost_chip_that_answers_again_passes_the_health_check_inside_the_reprobe_window(sysfs, clock, monkeypatch):
-    """A chip marked lost (a whole-mesh blackout, a failed isolation) that answers again on the same node
-    must not be judged off the bus on a value nobody read: the gate's heartbeat verdict reads it for real,
-    at once, so it passes and the mark clears. Before, the gated all-ones failed every check (gate, dispatch
-    recheck, idle relift) as 'FELL OFF THE PCIe BUS' for up to the 30 s backstop."""
+    """A chip marked lost (a whole-mesh blackout, a failed isolation) that answers again on the same node must not be
+    judged off the bus on a value nobody read: the gate's heartbeat verdict reads it for real, at once, so it passes and
+    the mark clears."""
     sysfs["node"](2, ALL_ONES)
     chip_state.mark_lost(["2"], "all-ones on two samples", chip_state.chip_nodes(["2"]))
     clock.now += 1.0  # well inside the reprobe window
@@ -488,10 +482,9 @@ def _lost_and_back(sysfs, clock, idx="2"):
 
 
 def test_a_decision_read_judges_a_lost_chip_on_a_real_read_and_reads_a_dead_one_once(sysfs, clock):
-    """The broker's other decision reads (the DOWN off-bus recheck, the hold-deadline escalation, the
-    gate's rung counts, the recovery ladder's reads) go through _decision_heartbeats: a lost chip that
-    answers again is read and cleared, not counted off the bus on the mark. A chip still dead is read
-    once however many decisions run back to back, again only PROBE_MIN_SEC later, and polls stay gated."""
+    """The broker's other decision reads (the DOWN off-bus recheck, the hold-deadline escalation, the gate's rung
+    counts, the recovery ladder's reads) go through _decision_heartbeats: a lost chip that answers again is read and
+    cleared, not counted off the bus on the mark."""
     _lost_and_back(sysfs, clock)
     assert heartbeat.read_heartbeats()["2"] == ALL_ONES and _reads_of(sysfs, 2) == [], "polls stay gated"
     beats = srv._decision_heartbeats()
@@ -520,9 +513,8 @@ def test_the_recovery_ladder_reads_lost_chips_for_real(sysfs, clock):
 
 
 def test_admission_and_exec_probe_a_lost_chip_status_does_not(sysfs, clock, monkeypatch):
-    """Job admission, exec and a Slurm step decide whether a tenant gets the device: a lost chip that
-    answers again is not refused as 'fell off the PCIe bus' on an all-ones nobody read. Status and
-    /health polls keep the gated answer and read nothing."""
+    """Job admission, exec and a Slurm step decide whether a tenant gets the device: a lost chip that answers again is
+    not refused as 'fell off the PCIe bus' on an all-ones nobody read."""
     monkeypatch.setattr(srv, "heartbeat_supported", lambda: True)
     monkeypatch.setattr(srv, "_device_unavailable_for_tenant", lambda: "")
     monkeypatch.setattr(srv, "health_monitor", None)
@@ -699,9 +691,8 @@ async def test_the_galaxy_reset_sweep_clears_recovering_on_every_exit(sysfs, clo
 
 
 def test_a_fresh_broker_publishes_clean_state_over_a_stale_file(monkeypatch):
-    """A broker that died mid-recovery leaves chip-state.json saying recovering (a per-user daemon's state
-    dir outlives the process). The next broker starts with no lost or recovering chip and rewrites the
-    file at boot, before any sampler tick."""
+    """A broker that died mid-recovery leaves chip-state.json saying recovering (a per-user daemon's state dir outlives
+    the process)."""
     path = chip_state.state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"version": 1, "pid": 1, "recovering": True, "lost": ["2"], "chips": {}}))

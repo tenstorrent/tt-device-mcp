@@ -60,9 +60,7 @@ def _below_floor_hold(monkeypatch, mesh, scan):
 
 @pytest.mark.asyncio
 async def test_an_idle_below_floor_offbus_hold_escalates_within_two_sampler_ticks(mesh, monkeypatch, verdict):
-    """Replay: one chip drops, the gate holds it below the reset floor, no tenant. The first escalation
-    starts within two sampler ticks (it waited the full tenant wait before), and its reset releases only
-    through the full post-reset check, fabric included (goal: no release over an unproven fabric)."""
+    """Replay: one chip drops, the gate holds it below the reset floor, no tenant."""
     evidence, released = verdict
     scan = {"now": IDLE}
     tick, bridges, count = _below_floor_hold(monkeypatch, mesh, scan)
@@ -84,9 +82,8 @@ async def test_an_idle_below_floor_offbus_hold_escalates_within_two_sampler_tick
 
 @pytest.mark.asyncio
 async def test_a_live_tenant_keeps_the_offbus_tenant_wait(mesh, monkeypatch):
-    """A tenant on the device at the early tick: the run gives the one-shot back quietly (no device op,
-    no forced-escalation event, no rung) and the hold keeps the tenant wait. At that wait the existing
-    stand-down (spec 04 I7) applies; the reset runs on the first idle tick after it."""
+    """A tenant on the device at the early tick: the run gives the one-shot back quietly (no device op, no
+    forced-escalation event, no rung) and the hold keeps the tenant wait."""
     scan = {"now": TENANT}
     tick, bridges, count = _below_floor_hold(monkeypatch, mesh, scan)
     _verify_returning(monkeypatch, {"snapshot": {"ok": True}, "fabric": {"ok": True}})

@@ -107,9 +107,8 @@ async def _gate():
 
 @pytest.mark.asyncio
 async def test_dispatch_failure_on_a_present_mesh_resets_once_then_runs_the_full_check(mesh):
-    """Base held this mesh for a self-heal that never comes (a 100-min eth_frozen hold measured):
-    below the galaxy-reset floor with every chip present, no rung fired. Now one glx_reset fires,
-    the post-reset check runs the fabric pass, and only its pass releases the device."""
+    """Base held this mesh for a self-heal that never comes (a 100-min eth_frozen hold measured): below the galaxy-reset
+    floor with every chip present, no rung fired."""
     await _gate()
     assert mesh["resets"] == [["tt-smi", "-glx_reset"]], "one present-mesh reset"
     assert "dispatch_failure_mesh_reset" in mesh["events"]

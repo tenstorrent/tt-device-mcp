@@ -116,9 +116,7 @@ def test_no_env_or_config_knob_changes_the_gap():
 async def test_a_failed_first_reset_spaces_the_sweeps_mesh_reset_then_asks_for_the_power_cycle(
     mesh, clock, monkeypatch  # noqa: F811
 ):
-    """The gate opens the hold; its mesh reset (120 s) and full check (60 s) fail. The climb's sweep
-    waits until 200 s after the first reset ended, runs the second mesh reset well before the bound,
-    its full check fails, and the power cycle is asked. Two mesh resets, never a third."""
+    """The gate opens the hold; its mesh reset (120 s) and full check (60 s) fail."""
     mesh["reset_heals"] = False
     srv.recovery_mechanism.last_reset_failed = True  # a prior cycle failed: the gate climbs this pass
     fired = _arm_power_cycle(monkeypatch)

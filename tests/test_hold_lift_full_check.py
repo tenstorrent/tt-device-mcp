@@ -164,11 +164,8 @@ async def test_a_down_off_bus_recheck_lifts_only_on_a_passing_full_check(
 async def test_a_handed_off_hold_with_no_power_cycle_lifts_only_on_a_passing_full_check(
     monkeypatch, tmp_path, clear_job_state, verdict
 ):
-    """No power cycle is opted in, the hold's one mesh reset ran and failed, and the hold went to an
-    operator, latched and paged once (spec 04 I33, I87), past the 10-min bound (I76). The hand-off
-    neither blocks nor loosens the lift: once the chips are back, the relift lifts it only on a full
-    check whose fabric passed on every cabled link. A failed check or a link short of the cabling keeps
-    the hold, its episode and its hand-off, fires no rung, and pages no more."""
+    """No power cycle is opted in, the hold's one mesh reset ran and failed, and the hold went to an operator, latched
+    and paged once (spec 04 I33, I87), past the 10-min bound (I76)."""
     _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
     fsm_dirty(srv, "gate/post-job: 4/32 off-bus below the reset floor — held, not reset", why="off_bus")
     monkeypatch.delenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", raising=False)
@@ -242,10 +239,8 @@ async def test_an_operator_reset_releases_only_on_a_passing_full_check(mesh, mon
 async def test_replay_a_missing_link_hold_survives_every_lift_attempt_until_a_full_pass(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """Replay: an rc-77 topology-mismatch hold whose link stays missing. The I40 bound, an operator
-    reset and the bound ladder's fold each try to lift it; none releases a job, and the hold keeps its
-    episode and clock. Only a full check that passes on the whole cabling then lifts it. Fails on a
-    branch where the I40 bound releases on the startup checks and an advancing eth read."""
+    """Replay: an rc-77 topology-mismatch hold whose link stays missing. The I40 bound, an operator reset and the bound
+    ladder's fold each try to lift it; none releases a job, and the hold keeps its episode and clock."""
     rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
     monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "true")
     monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRY_SLEEP_SEC", 0)
@@ -300,10 +295,8 @@ RELEASES = ("device_dirty_cleared", "device_released", "startup_fabric_released"
 
 @pytest.fixture
 def wrapper(monkeypatch, tmp_path, eth_mesh):  # noqa: F811
-    """The eth-timeout tests' mesh (the real probe pass, leaf probes stubbed) whose fabric pass is the
-    monitor's own, on an operator wrapper that always exits 0. While ``fabric_bad`` (a reset sets it to
-    ``not reset_heals``) its output carries the topology marker of one lost port and nothing extra, so
-    the pass FAILS (spec 03 I71). ``fields`` keeps every broker event with its fields."""
+    """The eth-timeout tests' mesh (the real probe pass, leaf probes stubbed) whose fabric pass is the monitor's own, on
+    an operator wrapper that always exits 0."""
     st = eth_mesh
     st.update(eth=ADVANCING, fabric_bad=True, fields=[])
     m = srv.health_monitor
@@ -381,9 +374,7 @@ async def test_a_post_job_wrapper_pass_with_a_port_missing_holds_and_admits_no_j
 @pytest.mark.asyncio
 async def test_a_kill_reset_whose_full_check_still_finds_the_port_missing_never_releases(wrapper, monkeypatch):
     """(b) A job the broker stopped mid-run owes one reset (spec 03 I69): the kill mesh reset runs glx_reset, and the
-    full check after it still finds the cabled port missing. That is reset_ineffective: the hold stays and no second
-    reset runs at the door. At the 10-min bound (spec 04 I76) the ladder runs once more, its full check fails the same
-    way, and the broker asks for exactly one power cycle. Nothing releases the device at any step."""
+    full check after it still finds the cabled port missing."""
     wrapper["reset_heals"] = False
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = _stub_power_cycle(monkeypatch)
@@ -408,9 +399,7 @@ async def test_a_latched_topology_hold_whose_bound_ladder_leaves_the_port_missin
     wrapper, monkeypatch
 ):
     """(c) The lift's first job failed on the fabric, so the I42 latch (``topology_hw_fault``) is set and the device is
-    held. At the 10-min bound (spec 04 I76) the ladder runs, the full check after each reset still finds the cabled port
-    missing, and the broker asks for exactly one power cycle. A second bound tick adds no reset, check or cycle. The
-    bound keeps the latch (it clears only ``fabric_known_fault``) and nothing releases the device."""
+    held."""
     mon = srv.health_monitor
     wrapper["reset_heals"] = False
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
@@ -484,11 +473,8 @@ def _verdict_events(monkeypatch, r) -> list:
 async def test_every_release_event_carries_the_passing_fabric_verdict_and_a_short_link_releases_nothing(
     rig, monkeypatch, tmp_path, path, short  # noqa: F811
 ):
-    """Spec 03 I78 on every reset path (spec 03 I77's list). On a pass every release event carries
-    ``fabric`` with result pass and no link short. With a cabled link missing nothing releases, and
-    each refusal carries the failing verdict with ``links_short`` True. The idle off-bus escalation's
-    reset releases through reset_verified/device_dirty_cleared, and the start after a broker restart
-    closes its hold with startup_fabric_released, each through ``_full_check_gate``'s full check."""
+    """Spec 03 I78 on every reset path (spec 03 I77's list). On a pass every release event carries ``fabric`` with
+    result pass and no link short."""
     if short:
         rig.fabric = SHORT
     fields = _verdict_events(monkeypatch, rig)

@@ -122,9 +122,8 @@ def test_a_queued_job_never_started_reads_abandoned_not_lost(restarted, clear_jo
 
 
 def test_a_truncated_or_unflushed_log_still_reads(restarted, clear_job_state):
-    """A log cut mid-write: a footer stopped after FINISHED:, a last line with no newline that ends
-    inside a multibyte character, and binary output. Read back with bad bytes replaced, never an
-    exception, and the half footer is not a final status."""
+    """A log cut mid-write: a footer stopped after FINISHED:, a last line with no newline that ends inside a multibyte
+    character, and binary output."""
     log = restarted / "2026-10-25_221655_034.log"
     body = _header("034").encode() + b"bin \xff\xfe\x00 out\n" + RULE.encode() + b"FINISHED:    2026-10-25T22:20:00\n"
     log.write_bytes(body + "[22:20:00] [stdout] café".encode()[:-1])

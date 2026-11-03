@@ -451,9 +451,8 @@ def _running_job(monkeypatch, job_id="41"):
 
 
 async def test_the_dead_chip_victim_job_still_running_does_not_hold_the_rung(stuck, monkeypatch):
-    """The dead-chip path SIGKILLed the running job's process and marked the job its own kill; the
-    process is stuck in D, so the job stays RUNNING. That victim is not a running job to the I70
-    rung's guard: the request still comes at 120 s (one sampler tick at most), not never."""
+    """The dead-chip path SIGKILLed the running job's process and marked the job its own kill; the process is stuck in
+    D, so the job stays RUNNING."""
     stuck["rig"]["beats"] = {str(i): 100 for i in range(EXPECTED) if i != int(CHIP)}
     job = _running_job(monkeypatch)
     srv.reset_killed_job_ids.add(job.id)  # what _kill_device_holders' victim marking does
@@ -578,9 +577,8 @@ async def test_the_broker_start_restores_before_anything_else(stuck, monkeypatch
 
 
 def test_a_concurrent_save_never_puts_back_a_registry_a_later_one_emptied(stuck, monkeypatch):
-    """Two saves race: the first snapshots the holder and is about to rename its write into place
-    when the holder is pruned and a second save runs. The second waits for the first, so the record
-    ends as the registry is (gone), never as the first one's stale snapshot."""
+    """Two saves race: the first snapshots the holder and is about to rename its write into place when the holder is
+    pruned and a second save runs."""
     _note(stuck)
     path = srv.health_dir() / srv.DEAD_CHIP_STUCK_FILE
     real_replace = os.replace
@@ -644,11 +642,8 @@ async def _broker_restart(stuck, monkeypatch, elapsed, scopes):
 async def test_a_second_restart_readopts_the_victim_and_the_rung_still_fires(
     stuck, monkeypatch, tmp_path, elapsed, other_job
 ):
-    """The dead-chip path SIGKILLed job 41's process, which stays stuck in D in the job's scope, so
-    the scope stays active. The first restart skips it (its device-fault record) and drops the record;
-    the second re-adopts it as RUNNING with no in-memory kill marker. The victim still does not hold
-    the rung: the request comes by the original episode's 120 s + one tick, or at once when that has
-    passed. A re-adopted job with a live process of its own still holds it."""
+    """The dead-chip path SIGKILLed job 41's process, which stays stuck in D in the job's scope, so the scope stays
+    active."""
     proc = stuck["proc"]
     _gone(stuck)
     _stage_holder(proc, job_id=VICTIM)

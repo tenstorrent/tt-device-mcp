@@ -38,9 +38,8 @@ def _skipped(events):
 
 
 def _episode(monkeypatch, *, power_cycle=False, clock=None, off_bus=OFF_BUS):
-    """An idle off-bus hold past the ceiling whose mesh reset runs and exits non-zero, leaving the same
-    chips off the bus. ``clock`` (a one-item list of hold-age seconds) drives the hold's age and is
-    advanced by each reset and sweep. Returns (counters, events, alerts)."""
+    """An idle off-bus hold past the ceiling whose mesh reset runs and exits non-zero, leaving the same chips off the
+    bus."""
     counters = _arm_offbus_stuck_hold(monkeypatch, off_bus=off_bus, isolated=set(), reset_result=False)
     events, alerts = [], []
     patch_health_event(monkeypatch, lambda kind, **f: events.append(kind))
@@ -299,9 +298,8 @@ async def _false():
 
 
 async def _replay(monkeypatch, *, old: bool, power_cycle: bool, windows: int):
-    """Drive one off-bus episode through hold-deadline windows at hold age 0 (the early one-shot) and
-    then every 600 s ceiling window. Returns (hold age when the power cycle fired or None, resets).
-    Its patches are scoped to the replay, so conftest's own pins stay."""
+    """Drive one off-bus episode through hold-deadline windows at hold age 0 (the early one-shot) and then every 600 s
+    ceiling window. Returns (hold age when the power cycle fired or None, resets)."""
     with monkeypatch.context() as mp:
         return await _replay_in(mp, old=old, power_cycle=power_cycle, windows=windows)
 
@@ -330,9 +328,8 @@ async def _replay_in(monkeypatch, *, old: bool, power_cycle: bool, windows: int)
 
 @pytest.mark.asyncio
 async def test_replay_the_power_cycle_fires_right_after_the_failed_reset(monkeypatch, clear_job_state):
-    """Partial off-bus drop, power cycle armed. Old: 0 reset, 263 defer; 600 reset again, 863 sweep,
-    1186 cycle. With I36 alone: 600 skip, sweep, 923 cycle. New (I36 + I38): the sweep runs right
-    after the one failed reset and the cycle fires at 586, at the sweep's end."""
+    """Partial off-bus drop, power cycle armed. Old: 0 reset, 263 defer; 600 reset again, 863 sweep, 1186 cycle. With
+    I36 alone: 600 skip, sweep, 923 cycle."""
     old_at, old_resets = await _replay(monkeypatch, old=True, power_cycle=True, windows=4)
     new_at, new_resets = await _replay(monkeypatch, old=False, power_cycle=True, windows=4)
     assert (old_at, old_resets) == (1186.0, 2)
@@ -355,9 +352,8 @@ ONE_SHOT = 120.0  # the off-bus one-shot: the first forced window after the drop
 
 
 async def _replay_from_onset(monkeypatch, *, old: bool, off_bus: int, reset_sec: int):
-    """One partial off-bus drop timed from its onset: the one-shot window at 120 s, then a window every
-    600 s ceiling. The reset runs ``reset_sec`` and exits 1 with the same chips off; the sweep costs one
-    more reset plus its 60 s settle. Returns (onset age when the power cycle fired, resets)."""
+    """One partial off-bus drop timed from its onset: the one-shot window at 120 s, then a window every 600 s
+    ceiling."""
     with monkeypatch.context() as mp:
         mp.setattr(__import__(__name__, fromlist=["_"]), "RESET_SEC", reset_sec)
         mp.setattr(__import__(__name__, fromlist=["_"]), "SWEEP_SEC", reset_sec + 60)
@@ -424,11 +420,7 @@ async def test_a_denied_power_cycle_after_the_failed_reset_is_retried_next_windo
 async def test_partial_offbus_after_the_failed_reset_waits_only_for_the_power_cycle_cooldown(
     monkeypatch, clear_job_state
 ):
-    """I38 with I65: the host booted 3 min ago and one chip stays off after the failed mesh reset. The
-    climb still skips the ceiling wait (I38); the sweep runs only once the cycle may fire, and the power cycle waits out the cooldown
-    counted from that boot, with its deadline set for the watchdog; no reset fires meanwhile (I36,
-    I58). /health shows the deadline while it waits, the watchdog asks again at that deadline, and the
-    cycle fires once the cooldown has run out: bounded, never open-ended. Nothing releases the hold."""
+    """I38 with I65: the host booted 3 min ago and one chip stays off after the failed mesh reset."""
     clock = [ONE_SHOT]
     counters, events, _ = _episode(monkeypatch, power_cycle=True, clock=clock, off_bus=1)
     mech = srv.recovery_mechanism
@@ -501,10 +493,9 @@ def _record_cycle_order(monkeypatch, counters):
 @pytest.mark.parametrize("power_cycle", [True, False], ids=["power-cycle", "no-host-rung"])
 @pytest.mark.parametrize("off_bus", [1, 2, 4], ids=["b1-one-chip", "b1-two-chips", "b2-four-chips"])
 async def test_e3_offbus_classes_reset_once_then_take_the_next_rung(monkeypatch, clear_job_state, off_bus, power_cycle):
-    """B1 (one or two chips off) and B2 (four), with and without a power cycle, over six forced
-    windows: the mesh reset runs first and once on the unchanged set, the next rung follows in that
-    same window (the power cycle, or one operator hand-off), and no later window repeats the reset.
-    Nothing releases the hold: release waits for the full check after a reset that heals."""
+    """B1 (one or two chips off) and B2 (four), with and without a power cycle, over six forced windows: the mesh reset
+    runs first and once on the unchanged set, the next rung follows in that same window (the power cycle, or one
+    operator hand-off), and no later window repeats the reset."""
     clock = [ONE_SHOT]
     counters, events, alerts = _episode(monkeypatch, power_cycle=power_cycle, clock=clock, off_bus=off_bus)
     order = _record_cycle_order(monkeypatch, counters)
@@ -560,9 +551,7 @@ def _beats_with_off(off):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("power_cycle", [True, False], ids=["power-cycle", "no-host-rung"])
 async def test_a_failed_reset_that_shrank_the_set_is_not_repeated_and_climbs(monkeypatch, clear_job_state, power_cycle):
-    """The one mesh reset fails but brings a chip back (2 -> 1 off). No path runs a second mesh reset in
-    the episode, on the new set or any other (spec 04 I87): the power cycle fires in that window, or with
-    no host rung the hold goes to an operator once. Nothing releases the hold."""
+    """The one mesh reset fails but brings a chip back (2 -> 1 off)."""
     clock = [ONE_SHOT]
     counters, events, alerts = _episode(monkeypatch, power_cycle=power_cycle, clock=clock, off_bus=2)
     state = {"off": {"30", "31"}}
@@ -617,10 +606,8 @@ async def test_the_failed_reset_survives_a_broker_restart_but_not_a_new_boot(mon
 
 
 def _drop_after_a_verified_reset(monkeypatch, *, off_before=(), present_after=True, off_after=("27",)):
-    """Replay a job timeout's post-kill mesh reset in this hold: it ran with ``off_before`` off the bus,
-    exited 0 and failed its verify, then chip 27 is off the bus. ``present_after``: its own enum+ARC
-    check read every chip present, so 27 dropped later, under the fabric check. Returns the sequence
-    list the ladder's mesh reset, the last-chance sweep and the power cycle append to, and the events."""
+    """Replay a job timeout's post-kill mesh reset in this hold: it ran with ``off_before`` off the bus, exited 0 and
+    failed its verify, then chip 27 is off the bus."""
     clock = [ONE_SHOT]
     counters, events, _ = _episode(monkeypatch, power_cycle=True, clock=clock, off_bus=1)
     state = {"off": set(off_after)}
@@ -659,8 +646,7 @@ async def test_a_reset_that_ran_before_the_drop_does_not_spend_the_offbus_mesh_r
     monkeypatch, clear_job_state, restart
 ):
     """A post-kill mesh reset ran with every chip present and passed its own enum+ARC check; chip 27 dropped later,
-    under its fabric check. That reset never faced the drop, so the off-bus ladder runs its own mesh reset first, then
-    the last-chance sweep, then asks for the power cycle (goal: the full ladder right before every power cycle)."""
+    under its fabric check."""
     seq, events, counters, hold_since, before = _drop_after_a_verified_reset(monkeypatch)
     await srv.galaxy_recovery._note_mesh_reset_failed(False, hold_since, before, EXPECTED)
     entry = srv.recovery_mechanism._reset_record()["failed"][-1]

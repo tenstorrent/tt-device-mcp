@@ -32,16 +32,7 @@ T0 = 1_700_000_000
 
 def _simulate(tmp_path, moves, *, until, quiet=None, start=T0, skip=False, step=0):
     """Laps every 60 s from `start` to `until` while the branch head moves at the times in `moves` (sha `s<n>` after the
-    n-th move). The box applied `s0` long before. Returns the restarts as (time, sha) and, for every sha, when it was
-    first seen. Once the last sha is installed and one more lap found it current, it stops: with the head at rest every
-    later lap is that same exit. `skip`: after a lap that defers and says when it applies, the next lap run is the first
-    one at or past that time or the next move, whichever comes first; the laps between are the same deferral. A lap
-    reached at the time a deferral named, with no move since, must not defer for that reason again. The lone-push test
-    runs every lap, and so checks that a deferral applies when it says. `step` (with `skip`): a deferring lap jumps
-    straight to the last move lap within `step` seconds and before the time it named. The laps it passes would each see
-    a newer head and defer again: the record keeps its first-seen time, and the last move sets the quiet clock as it
-    would have. With coalescing on, `step` stays at or under the quiet, so no quiet ends between the moves it passes;
-    every passed sha is counted seen at its own move lap, as a lap run there would have."""
+    n-th move). The box applied `s0` long before."""
     root = tmp_path / "root"
     root.mkdir(exist_ok=True)
     (root / "installed.sha").write_text("s0\n")

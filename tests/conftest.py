@@ -54,17 +54,15 @@ srv.boot_broker()
 
 @pytest.fixture(autouse=True)
 def old_host_boot(monkeypatch):
-    """Pin this host's boot time to a day ago around every test: the power-cycle cooldown counts from
-    the host's boot (spec 04 I65), and a suite run soon after the runner's own reboot must not see
-    every power cycle in cooldown. A test that needs another boot patches ``srv._boot_btime_id``."""
+    """Pin this host's boot time to a day ago around every test: the power-cycle cooldown counts from the host's boot
+    (spec 04 I65), and a suite run soon after the runner's own reboot must not see every power cycle in cooldown."""
     monkeypatch.setattr(srv, "_boot_btime_id", lambda: str(int(time.time()) - 86400))
 
 
 @pytest.fixture(autouse=True)
 def quick_post_kill_settle(monkeypatch):
-    """The post-kill wait and settle (spec 03 I89) take no wall time unless a test sets them: a
-    32-chip kill test would otherwise sleep the settle, and wait out a real holder on a device host.
-    The job record behind the debt never outlives a test."""
+    """The post-kill wait and settle (spec 03 I89) take no wall time unless a test sets them: a 32-chip kill test would
+    otherwise sleep the settle, and wait out a real holder on a device host."""
     monkeypatch.setattr(srv, "POST_KILL_REAP_WAIT_SEC", 0)
     monkeypatch.setattr(srv, "POST_KILL_SETTLE_SEC", 0)
     monkeypatch.setattr(srv, "POST_KILL_POLL_SEC", 0.01)
@@ -240,11 +238,7 @@ def _thread_stat_fields(pid: int, tid: str) -> "list[str] | None":
 
 
 def _exited(pid: int) -> bool:
-    """pid has exited or is exiting (no thread of it can act on a signal any more), or is gone. Once do_exit drops a
-    process's mm its /proc environ is empty and, once its parent exits first, its ppid is init, so it no longer reads as
-    this run's; a SIGKILL to a killed job's group can meet its `sleep` there, mid-exit (PF_EXITING) or a zombie, and
-    init can reap it during these reads. A leader that left its live threads behind also reads 'Z', so every thread
-    counts, listed again after the reads: only a live thread makes a new one."""
+    """pid has exited or is exiting (no thread of it can act on a signal any more), or is gone."""
     try:
         tids = os.listdir(f"/proc/{pid}/task")
         for tid in tids:
@@ -269,9 +263,8 @@ def _group_members(pgid: int) -> list:
 
 
 class _SignalGuard:
-    """Refuses (EPERM, nothing delivered) a signal aimed at a process this run did not spawn, and
-    records it so the test fails. Signal 0 delivers nothing and passes; so does a pid that does not
-    exist (the call raises ESRCH as it would anyway)."""
+    """Refuses (EPERM, nothing delivered) a signal aimed at a process this run did not spawn, and records it so the test
+    fails."""
 
     def __init__(self):
         self.refused: list = []
@@ -391,12 +384,7 @@ def device_marked(request) -> bool:
 
 
 class _FlatTmpDirs:
-    """A fresh empty dir per call, made in one session dir without listing it.
-
-    `tmp_path_factory.mktemp()` lists its whole base dir to pick the next number, so its cost grows with every dir the
-    run has made. The isolation below makes about 20 dirs per test; through `mktemp` that made each test slower than the
-    last (about 1 s each by the end of a CI run, and the job hit its time limit). `tempfile.mkdtemp` picks a random name
-    instead: constant cost."""
+    """A fresh empty dir per call, made in one session dir without listing it."""
 
     def __init__(self, root: Path):
         self._root = root
@@ -1227,8 +1215,7 @@ def galaxy_trays(monkeypatch):
 
 def stub_device_pollers(monkeypatch, stopped=()) -> list:
     """Replace the poller stop/start (a real `systemctl stop`, which the spawn tripwire refuses) with a recorder: the
-    per-tray walk quiesces the pollers across its re-powers. ``stopped`` is what the stop reports it touched (empty:
-    nothing to restore). Returns the list of `active` flags it was called with."""
+    per-tray walk quiesces the pollers across its re-powers."""
     calls: list = []
 
     async def pollers(active, log):
@@ -1240,12 +1227,7 @@ def stub_device_pollers(monkeypatch, stopped=()) -> list:
 
 
 def step_sampler_clock(monkeypatch) -> None:
-    """Put the sampler on a clock that also moves FAST_CONFIRM_SEC before each check_for_dead_chips.
-
-    A chip's first all-ones read arms the early off-bus watch (spec 03 I79), so its second-sample proof must also have
-    lasted FAST_CONFIRM_SEC. A test that shows only the samples that decide would otherwise take them microseconds apart
-    on the real clock; each step stands for the fast samples the cadence takes in between. The clock still follows real
-    time between steps, so the sampler loop's own waits end. Nothing else in the proof is changed."""
+    """Put the sampler on a clock that also moves FAST_CONFIRM_SEC before each check_for_dead_chips."""
     from tt_device_mcp import telemetry
 
     skew = [1000.0]

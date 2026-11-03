@@ -55,9 +55,7 @@ def fence(leftover, rig, monkeypatch):  # noqa: F811 - the imported fixtures
 
 
 def _open(fence):
-    """The first scan opens the episode; returns its monotonic start, pinned to a whole second.
-    A fractional start makes the tick arithmetic inexact: ``(t0 + 600) - t0`` can come out just
-    under 600, and the try at the budget would read as one before it."""
+    """The first scan opens the episode; returns its monotonic start, pinned to a whole second."""
     srv._reaped_leftovers()
     assert srv._leftover_unkillable_mono is not None
     srv._leftover_unkillable_mono = float(int(srv._leftover_unkillable_mono))
@@ -341,10 +339,9 @@ async def test_time_to_request_is_bounded_and_nothing_releases_the_device(fence)
 
 @pytest.fixture
 def both(fence, monkeypatch, clear_job_state):  # noqa: F811 - the imported fixtures
-    """A killed job's unkillable leftover AND its hold, both at 600 s, with only the power cycle opted
-    in (so both paths pick it), the REAL governor (ledger, I65 cooldown, per-boot cap), the real
-    request marker (I34) and the real power-cycle request with only its ``fire`` stubbed.
-    ``both['fires']`` counts the cycler launches; ``both['outcome']`` sets how each launch ends."""
+    """A killed job's unkillable leftover AND its hold, both at 600 s, with only the power cycle opted in (so both paths
+    pick it), the REAL governor (ledger, I65 cooldown, per-boot cap), the real request marker (I34) and the real
+    power-cycle request with only its ``fire`` stubbed."""
     r = fence["rig"]
     m = srv.recovery_mechanism
     _present_hold_at_the_bound(r, monkeypatch, why="job_killed", detail="job 7 killed: device left dirty")
@@ -375,12 +372,7 @@ async def _bound(both):
 @pytest.mark.parametrize("order", ["bound-first", "leftover-first", "leftover-try-spawned-before-the-bound"])
 async def test_replay_the_bound_and_the_leftover_budget_request_one_power_cycle(fence, both, order, outcome):
     """Replay: a killed job's process stuck in the kernel keeps the device; the hold it left reaches the 10-min bound
-    (I76, ``hold_bound_leftover``) as the leftover reaches its 600 s budget (I70). Both paths ask for the host rung, and
-    here both would pick the power cycle. Whichever asks first, and however its cycler launch ends, the cycler is
-    launched once: the request marker (I34) and the governor's ledger stop the other. The last order is the race: a
-    leftover try the sampler spawned before the bound's request, which reaches the device lock after it. A launch that
-    timed out retracts its ledger record but stays pending, so only the marker stops that try. Nothing releases the
-    device: it stays held with the full check, fabric included, owed."""
+    (I76, ``hold_bound_leftover``) as the leftover reaches its 600 s budget (I70)."""
     both["outcome"] = outcome
     t0 = _open(fence)
     if order == "bound-first":

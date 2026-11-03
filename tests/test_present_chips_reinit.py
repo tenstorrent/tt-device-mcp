@@ -125,9 +125,8 @@ def _reinit_ends(monkeypatch, order, *, raises=False, scope="tt-device-reset-3.s
 async def test_a_reinit_still_cycling_at_its_bound_gets_no_check_and_the_power_cycle(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """The re-init's wait ends at its bound (rc None) with its scope still cycling: no settle and no full
-    check over it. The verify counts as failed, nothing lifts, and the power cycle follows in the same
-    pass. The step's end is journalled with rc None and the chips on the bus."""
+    """The re-init's wait ends at its bound (rc None) with its scope still cycling: no settle and no full check over it.
+    The verify counts as failed, nothing lifts, and the power cycle follows in the same pass."""
     order, events, counters = _late(monkeypatch, tmp_path, back=1, reinit_back=True, verdicts=[False, True])
     state = _reinit_ends(monkeypatch, order)
     assert await _bound_ladder() == OUTCOME_TERMINAL
@@ -221,10 +220,8 @@ async def test_no_reinit_after_a_mesh_reset_that_ended_clean(monkeypatch, tmp_pa
 async def test_under_an_i97_deadline_the_reinit_runs_only_when_the_check_still_fits(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """The wait for the step is PRESENT_REINIT_SEC, cut so the step's tail, the settle and the full
-    check end by the deadline. Less than PRESENT_REINIT_MIN_SEC left: no reader stop and no re-init.
-    The measured case: the sweep's reset gave up at a hold age of 374 s against the 585 s deadline,
-    which leaves the step 16 s and the check its full allowance."""
+    """The wait for the step is PRESENT_REINIT_SEC, cut so the step's tail, the settle and the full check end by the
+    deadline. Less than PRESENT_REINIT_MIN_SEC left: no reader stop and no re-init."""
     assert (galaxy.PRESENT_REINIT_SEC, galaxy.PRESENT_REINIT_MIN_SEC, galaxy.PRESENT_REINIT_TAIL_SEC) == (30, 10, 5)
     order, events, counters = _late(monkeypatch, tmp_path, back=1)
     gr, mech, log = srv.galaxy_recovery, srv.recovery_mechanism, lambda m: None

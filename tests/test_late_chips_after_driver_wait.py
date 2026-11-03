@@ -51,16 +51,7 @@ def _late(
     reinit_rc=0,
     held_sec=None,
 ):
-    """The 10-min bound on a 32-chip mesh holding with chip 31 off the bus. The sweep's mesh reset is a glx_reset whose
-    tt-smi gave up at its driver wait with chips 30 and 31 out (after the tray re-power when ``repower``); the late-chip
-    rescan brings ``back`` of the two back. A second mesh reset ends clean, or gives up again (``second_gives_up``).
-    ``i97``: the sweep's repeated mesh reset runs as the I97 one under its deadline (I100); otherwise as a plain sweep
-    reset. ``gives_up_sec``: how far the first reset moves galaxy's clock. Returns (order, events, counters): events are
-    (name, fields); ``counters["waits"]`` holds each mesh reset's ``wait_until`` (None when not given) and
-    ``counters["rescanned_at"]`` the monotonic time of each rescan. The I104 re-init of the chips present (``present
-    reinit`` in ``order``) ends with ``reinit_rc``; when ``reinit_back`` the reset path's rescan after it finds the
-    missing chips back. Its waits are in ``counters["reinit_waits"]``. ``held_sec``: the hold's age when the ladder
-    starts (the rig's 21 min when None)."""
+    """The 10-min bound on a 32-chip mesh holding with chip 31 off the bus."""
     held = {} if held_sec is None else {"held_min": held_sec / 60}
     order, _names, counters = _rig(monkeypatch, tmp_path, verdicts=verdicts, **held)
     if not i97:
@@ -159,9 +150,7 @@ async def test_a_failed_full_check_after_the_second_mesh_reset_keeps_the_hold_an
 async def test_one_chip_still_out_goes_to_the_check_and_the_power_cycle_with_no_wait(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """Only chip 30 is back after the rescan: no second mesh reset and no settle of the step's own. The
-    chips present get POST_RESET and board re-init (I104), the full check runs, and its failure
-    requests the power cycle in the same pass."""
+    """Only chip 30 is back after the rescan: no second mesh reset and no settle of the step's own."""
     order, events, counters = _late(monkeypatch, tmp_path, back=1)
     sleeps = []
     real_sleep = galaxy.asyncio.sleep
@@ -200,9 +189,8 @@ async def test_the_late_chip_step_alone_is_quick_when_a_chip_is_missing(monkeypa
 async def test_no_late_chip_step_without_the_repower_or_when_the_rescan_was_withheld(
     monkeypatch, tmp_path, clear_job_state, repower, withheld
 ):
-    """A glx_reset that gave up with no tray re-power did not run (reset_did_not_run, unchanged), and a
-    reset whose rescan I69 withheld keeps its chips out: neither gets the rescan or a second mesh reset.
-    The full check, then the power cycle, as before."""
+    """A glx_reset that gave up with no tray re-power did not run (reset_did_not_run, unchanged), and a reset whose
+    rescan I69 withheld keeps its chips out: neither gets the rescan or a second mesh reset."""
     order, events, counters = _late(monkeypatch, tmp_path, back=2, repower=repower, withheld=withheld)
     assert await _bound_ladder() == OUTCOME_TERMINAL
     assert _after_sweep_mesh(order) == ["mesh reset", "full check", "power cycle"]
@@ -231,12 +219,8 @@ async def test_the_second_mesh_reset_runs_once_per_hold(monkeypatch, tmp_path, c
 async def test_under_an_i97_deadline_the_rescan_runs_when_the_reinit_and_check_fit_the_reset_when_it_does(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """The step's bound: the rescan, the readers' grace, the BMC preflight, the wait for a dying holder
-    and a reset that gives up (380 s), then the settle and the full check's allowance (570 s in all).
-    I106 splits the gate. A deadline short of the rescan, the re-init of the chips present and the check
-    (GAVE_UP_TAIL_SEC, 255 s) stops the step before its rescan, with no time added. One with room for
-    those but not for the second reset runs the rescan only and leaves the chips to the re-init. One with
-    room for all runs it in full, its reset's wait ending by the step's start plus 380 s."""
+    """The step's bound: the rescan, the readers' grace, the BMC preflight, the wait for a dying holder and a reset that
+    gives up (380 s), then the settle and the full check's allowance (570 s in all). I106 splits the gate."""
     assert galaxy.LATE_CHIP_STEP_SEC == 30 + 10 + 10 + 30 + 300 == 380
     assert galaxy.GAVE_UP_TAIL_SEC == 30 + 30 + 5 + 10 + 180 == 255
     order, events, counters = _late(monkeypatch, tmp_path, back=2)
@@ -279,10 +263,7 @@ async def test_on_the_i100_repeat_a_give_up_gets_the_rescan_the_reinit_and_the_c
     monkeypatch, tmp_path, clear_job_state
 ):
     """The sweep's repeated mesh reset runs as the I97 one (I100) under a deadline of its start plus 300 s. Its tt-smi
-    gives up at the driver wait after 263 s with both chips back. I106: the give-up moves that deadline on by
-    GAVE_UP_TAIL_SEC, so the rescan runs; a second mesh reset no longer fits, so the chips present get their POST_RESET
-    and re-init (I104) instead, and the full check with fabric decides. It fails: the hold stays and the power cycle is
-    requested by the repeat's start plus its allowance, the tail, the kill grace and the reap."""
+    gives up at the driver wait after 263 s with both chips back."""
     order, events, counters = _late(monkeypatch, tmp_path, back=2, i97=True, gives_up_sec=263)
     cycled_at = []
 
@@ -317,10 +298,7 @@ async def test_on_the_i97_path_a_give_up_gets_the_rescan_the_reinit_and_the_chec
     monkeypatch, tmp_path, clear_job_state
 ):
     """Class B1: the SBR has every chip back, the check fails on ARC-not-ready chips, and the sweep's repeated mesh
-    reset starts at the latest hold age the I97 deadline allows. Its tt-smi gives up at the driver wait after 263 s with
-    the trays re-powered and chip 31 out again. I106: the rescan, the POST_RESET and re-init of the chips present and
-    the full check with fabric still run, in that order. The check fails, the hold stays, and the power cycle is
-    requested by the repeat's start plus its allowance, the give-up tail, the kill grace and the reap."""
+    reset starts at the latest hold age the I97 deadline allows."""
     deadline = galaxy._mesh_reset_before_host_rung_deadline_sec()
     order, events, counters, _reasons = _b1_sweep(
         monkeypatch, tmp_path, verdicts=[False, False], held_sec=deadline - NEEDS - 10
@@ -364,9 +342,8 @@ async def test_on_the_i97_path_a_give_up_gets_the_rescan_the_reinit_and_the_chec
 
 @pytest.mark.asyncio
 async def test_the_class_a_cooldown_sweep_takes_no_late_chip_step(monkeypatch, tmp_path, clear_job_state):
-    """A whole tray off with the power cycle in cooldown: the 10-min sweep's mesh reset gives up at its
-    driver wait after the re-power, yet no rescan and no second mesh reset follow (late_chips=False).
-    Its one full check fails and the cycle follows at the cooldown's end."""
+    """A whole tray off with the power cycle in cooldown: the 10-min sweep's mesh reset gives up at its driver wait
+    after the re-power, yet no rescan and no second mesh reset follow (late_chips=False)."""
     order, events, counters = _late(monkeypatch, tmp_path, back=2)
     gr = srv.galaxy_recovery
     monkeypatch.setattr(gr.mechanism, "class_a_ladder_due", lambda *a, **k: True)
@@ -385,8 +362,7 @@ async def test_a_second_give_up_on_the_plain_sweep_is_checked_and_power_cycles_w
     monkeypatch, tmp_path, clear_job_state
 ):
     """Both chips are back, the second mesh reset runs and gives up at its driver wait too: the full check still runs
-    (it decides) after the I104 re-init of the chips present, fails, nothing lifts and the power cycle is requested. The
-    wait for that reset ended by the step's start plus LATE_CHIP_STEP_SEC; the sweep's own reset had no such bound."""
+    (it decides) after the I104 re-init of the chips present, fails, nothing lifts and the power cycle is requested."""
     order, events, counters = _late(monkeypatch, tmp_path, back=2, second_gives_up=True)
     assert await _bound_ladder() == OUTCOME_TERMINAL
     tail = ["mesh reset", "rescan", "readers stopped", "mesh reset", "readers stopped", "present reinit"]
@@ -446,9 +422,8 @@ def _second_reset_outlives_its_wait(monkeypatch, order, scope="tt-device-reset-2
 async def test_a_second_reset_still_cycling_at_its_bound_gets_no_check_and_the_power_cycle(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """The second mesh reset outlives the step's wait_until and its scope still runs: no settle, no full
-    check and no chip read over it (each would map chips it may have off the bus). The verify counts as
-    failed: nothing lifts, the hold stays, and the broker's own power cycle is requested."""
+    """The second mesh reset outlives the step's wait_until and its scope still runs: no settle, no full check and no
+    chip read over it (each would map chips it may have off the bus)."""
     order, events, counters = _late(monkeypatch, tmp_path, back=2, verdicts=[False, True])
     _second_reset_outlives_its_wait(monkeypatch, order)
     assert await _bound_ladder() == OUTCOME_TERMINAL
@@ -480,13 +455,9 @@ JOB_PID = 4404  # the running job's own process, outside any scope the scan can 
 
 
 def _scanned_late(monkeypatch, tmp_path, *, i97, holders, late_holder=None, running_job=False):
-    """``_late`` (both chips back, every full check fails) where each mesh reset first runs the broker's
-    real pre-reset holder scan, as ``reset_with_quiesce`` does (``clear_readers_before_reset`` ->
-    ``_pre_reset_holder_scan`` -> ``clear_device_readers``; only its signal and /proc seams are stubbed).
-    A refused scan runs no reset. ``late_holder`` (and ``running_job``) appear once the sweep's first
-    reset ended, so only the second one meets them. The power cycle is the broker's real request with
-    its fire stubbed, so it writes its foreign-holder journal line. Returns (order, events, counters,
-    box); ``counters["scans"]`` holds (foreign holders yielding, refusal) per mesh reset."""
+    """``_late`` (both chips back, every full check fails) where each mesh reset first runs the broker's real pre-reset
+    holder scan, as ``reset_with_quiesce`` does (``clear_readers_before_reset`` -> ``_pre_reset_holder_scan`` ->
+    ``clear_device_readers``; only its signal and /proc seams are stubbed)."""
     order, events, counters = _late(monkeypatch, tmp_path, back=2, i97=i97, verdicts=[False, False])
     if i97:  # an early hold: the I97 deadline leaves the step and its check room
         srv.device_hold_episode_since = datetime.now().isoformat()
@@ -557,9 +528,7 @@ async def test_the_late_chip_second_reset_clears_a_foreign_holder_and_keeps_its_
     monkeypatch, tmp_path, clear_job_state, i97, bound
 ):
     """Spec 04 I102 under I103: the second mesh reset runs inside the last-chance sweep right before the power cycle, so
-    its pre-reset scan runs with foreign holders yielding. A holder outside every broker scope is TERMed like a reader
-    and refuses neither reset; the second reset's wait still ends at the step's start plus LATE_CHIP_STEP_SEC. Its full
-    check fails, so nothing lifts and the power cycle follows, journaling the holder."""
+    its pre-reset scan runs with foreign holders yielding."""
     order, events, counters, box = _scanned_late(
         monkeypatch, tmp_path, i97=i97, holders=[FOREIGN] if bound else [], late_holder=None if bound else FOREIGN
     )
@@ -585,9 +554,8 @@ async def test_the_late_chip_second_reset_clears_a_foreign_holder_and_keeps_its_
 async def test_a_job_holder_still_refuses_the_late_chip_second_reset_and_the_hold_goes_on_to_the_cycle(
     monkeypatch, tmp_path, clear_job_state, i97, who
 ):
-    """The yield covers only holders outside every broker scope: a process inside a broker job's scope,
-    or the running job's own process, that holds the device when the second mesh reset comes still
-    refuses it. Nothing lifts (no full check passed), and the hold goes on to the power cycle."""
+    """The yield covers only holders outside every broker scope: a process inside a broker job's scope, or the running
+    job's own process, that holds the device when the second mesh reset comes still refuses it."""
     late = IN_JOB if who == "in-job-scope" else DeviceHolder(pid=JOB_PID, uid=1000)
     order, events, counters, box = _scanned_late(
         monkeypatch, tmp_path, i97=i97, holders=[], late_holder=late, running_job=who == "running-job"
@@ -605,8 +573,7 @@ async def test_a_job_holder_still_refuses_the_late_chip_second_reset_and_the_hol
 def _replay(monkeypatch, tmp_path, **kw):
     """The replayed Galaxy hold: chip 31 off the bus, the climb's sweep repeats the failed mesh reset at a hold age of
     about 459 s (under a deadline of its start plus 300 s, the I97 one being too close), and its tt-smi gives up at the
-    driver wait after 133 s with chip 30 back on the rescan and chip 31 still out. Before I106 the broker requested the
-    power cycle at about 592 s with no rescan, no re-init and no check. Returns (order, events, counters, cycled_at)."""
+    driver wait after 133 s with chip 30 back on the rescan and chip 31 still out."""
     order, events, counters = _late(monkeypatch, tmp_path, back=1, i97=True, gives_up_sec=133, held_sec=459, **kw)
     cycled_at = []
 
@@ -622,10 +589,8 @@ def _replay(monkeypatch, tmp_path, **kw):
 async def test_the_replayed_give_up_gets_the_rescan_the_reinit_and_the_check_before_the_power_cycle(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """I106 on the replayed hold: after the repeated mesh reset gives up, the late-chip rescan, the
-    POST_RESET and re-init of the 31 chips present and the full check with fabric run, in that order.
-    Chip 31 stays out, the check fails: nothing lifts and the power cycle is requested within the
-    repeat's start plus its allowance, the give-up tail, the kill grace and the reap."""
+    """I106 on the replayed hold: after the repeated mesh reset gives up, the late-chip rescan, the POST_RESET and
+    re-init of the 31 chips present and the full check with fabric run, in that order."""
     order, events, counters, cycled_at = _replay(monkeypatch, tmp_path)
     assert await srv.galaxy_recovery.escalate("offbus-forced", [GONE], 32, lambda m: None) == OUTCOME_TERMINAL
     tail = ["mesh reset", "rescan", "readers stopped", "present reinit", "full check", "power cycle"]

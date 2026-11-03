@@ -254,9 +254,7 @@ def _reset_world(monkeypatch, hw, lines, rc, during=None, cut=None):
 
 @pytest.mark.asyncio
 async def test_enodata_in_the_driver_wait_reads_as_absent_and_cuts_nothing(monkeypatch, tmp_path):
-    """The driver wait, as tt-kmd really answers it: every heartbeat read fails with ENODATA
-    (needs_hw_init). The read omits the chip, never reports all-ones, and with no POST_RESET failure
-    line the reset cuts nothing; its journal says so."""
+    """The driver wait, as tt-kmd really answers it: every heartbeat read fails with ENODATA (needs_hw_init)."""
     for i in ("30", "31"):
         (tmp_path / f"tenstorrent!{i}").mkdir()
     monkeypatch.setattr(pci, "SYSFS_CLASS_DIR", tmp_path)
@@ -345,9 +343,7 @@ async def test_a_closing_rescan_that_blocks_is_bounded(monkeypatch):
 @pytest.mark.parametrize("rc", [1, 0])
 @pytest.mark.asyncio
 async def test_a_cancel_during_the_cut_still_settles_the_pollers(monkeypatch, rc):
-    """The cut runs after tt-smi exits and can take about 45 s. A cancel that lands in it must still
-    reach the pollers' restore step: they stay stopped (the cut's chips are undecided) and are owed to
-    the next close to HEALTHY, never left stopped and owed to nobody."""
+    """The cut runs after tt-smi exits and can take about 45 s."""
     hw = _hw()
     started = asyncio.Event()
     never = asyncio.Event()

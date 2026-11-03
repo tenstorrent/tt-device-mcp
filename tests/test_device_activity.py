@@ -309,9 +309,8 @@ async def test_job_status_tool_shows_idle_while_running_and_the_total_after(monk
 
 @pytest.mark.asyncio
 async def test_job_status_tool_keeps_the_idle_total_for_a_finished_job_only(monkeypatch, clear_job_state):
-    """The end-of-run total is a finished job's field: in the window after _stop_job_activity set it
-    and before the runner marks the job finished, the status shows no total (spec 03 I54). The
-    re-adopted job fields (spec 03 I76) sit beside this pairing, not inside it."""
+    """The end-of-run total is a finished job's field: in the window after _stop_job_activity set it and before the
+    runner marks the job finished, the status shows no total (spec 03 I54)."""
     from tt_device_mcp.socket_transport import current_peer_uid, current_via_mcp
 
     job = _running_idle_job(monkeypatch)

@@ -188,9 +188,8 @@ def _client(monkeypatch, dev_dir, holders=None):
 
 @pytest.mark.parametrize("keepalive", [True, False])
 def test_a_silent_reset_stream_sends_keepalives_when_asked(monkeypatch, tmp_path, keepalive):
-    """The CLI reads the stream with a per-read socket timeout. A reset that prints nothing
-    for longer than that must still put bytes on the wire, or the CLI calls a live reset dead.
-    Older CLIs print every line, so only a client that asks gets the sentinel."""
+    """The CLI reads the stream with a per-read socket timeout. A reset that prints nothing for longer than that must
+    still put bytes on the wire, or the CLI calls a live reset dead."""
     (tmp_path / "0").write_text("")
     monkeypatch.setattr(srv, "RESET_STREAM_KEEPALIVE_SEC", 0.02)
 
@@ -221,10 +220,7 @@ def test_a_silent_reset_stream_sends_keepalives_when_asked(monkeypatch, tmp_path
 
 @pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
 def test_a_client_that_leaves_a_silent_reset_does_not_stop_it(monkeypatch, tmp_path, spec_version):
-    """The CLI can go away (Ctrl-C, a dropped socket) while the keepalive wrapper waits on a reset step. The reset must
-    still run to the end, the step must be closed, not left pending, and cleanup must not race it ("already running") or
-    drop it ("destroyed"). Starlette has two disconnect paths: under ASGI 2.3 (uvicorn) a cancel scope cancels the
-    stream; under 2.4 the send fails and the wrapper is left for the loop to finalize."""
+    """The CLI can go away (Ctrl-C, a dropped socket) while the keepalive wrapper waits on a reset step."""
     (tmp_path / "0").write_text("")
     monkeypatch.setattr(srv, "RESET_STREAM_KEEPALIVE_SEC", 0.02)
     monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
@@ -924,9 +920,8 @@ def test_a_failed_operator_reset_arms_the_cooldown_and_the_two_strikes(
 def test_a_failed_operator_mesh_reset_spends_the_episodes_mesh_reset(
     monkeypatch, tmp_path, route, rc, fabric_ok, spent
 ):
-    """A failed operator -glx_reset is marked as the broker marks its own failed mesh reset, so an
-    all-off mesh after it is class C and no path fires a second mesh reset in the episode (spec 04
-    I37, I87). A persistent 77, a verified reset or one that never finished marks nothing."""
+    """A failed operator -glx_reset is marked as the broker marks its own failed mesh reset, so an all-off mesh after it
+    is class C and no path fires a second mesh reset in the episode (spec 04 I37, I87)."""
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
     _mesh_with_fabric_check(monkeypatch, tmp_path)
     monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)
@@ -1731,9 +1726,8 @@ def test_forced_reset_stops_a_readopted_job_seen_only_by_the_recheck(monkeypatch
 
 
 def _readopted_job_killed_by_its_owner(monkeypatch, tmp_path, events, *, job_id="905-1"):
-    """A re-adopted job its owner killed: KILLED at once, its scope still unwinding (up to
-    GRACEFUL_KILL_GRACE_SEC) with its `readopted_scopes` entry kept until the monitor drops it.
-    A forced reset's wait for that scope records ("wait", interrupt) and ends it 0.3 s later."""
+    """A re-adopted job its owner killed: KILLED at once, its scope still unwinding (up to GRACEFUL_KILL_GRACE_SEC) with
+    its `readopted_scopes` entry kept until the monitor drops it."""
     job = _readopted_job(monkeypatch, job_id=job_id)
     monkeypatch.setattr(srv, "READOPTED_FINALIZE_WAIT_SEC", 5)
     monkeypatch.setattr(srv, "_scope_active", lambda scope: True)
@@ -1868,10 +1862,8 @@ async def _assert_held_until_a_full_fabric_pass(monkeypatch, tmp_path):
 def test_a_forced_reset_that_kills_a_readopted_job_and_ends_early_keeps_the_hold(
     monkeypatch, tmp_path, clear_job_state, path
 ):
-    """After the reset claims a re-adopted job it can end without a reset or a verify: another
-    reset in flight, no chips, a failed reset, or (in every case here) the wait for the job's
-    record expired and the reset went on. The job's end then owes no kill reset, so nothing on
-    these paths may lift the startup hold: only the gate's full check with fabric does."""
+    """After the reset claims a re-adopted job it can end without a reset or a verify: another reset in flight, no
+    chips, a failed reset, or (in every case here) the wait for the job's record expired and the reset went on."""
     monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
     monkeypatch.setattr(srv, "reset_killed_job_ids", set())
     fsm_dirty(srv, "startup: not verified yet", why="startup_unverified", dirty=False)
@@ -1920,9 +1912,8 @@ def test_a_forced_reset_that_kills_a_readopted_job_and_ends_early_keeps_the_hold
 async def test_a_readopted_job_killed_by_a_forced_reset_does_not_flag_the_device(
     monkeypatch, tmp_path, clear_job_state, held
 ):
-    """The monitor finalizes the job once its scope ends. KILLED is a wedge-risk end, but this kill
-    was the reset's own: flagging the device for it would make the reset its own justification.
-    It owes no kill reset either, so a hold already standing still needs the full check to lift."""
+    """The monitor finalizes the job once its scope ends. KILLED is a wedge-risk end, but this kill was the reset's own:
+    flagging the device for it would make the reset its own justification."""
     monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
     monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
     monkeypatch.setattr(srv, "device_fault_reported", "")
@@ -1987,9 +1978,7 @@ async def test_a_readopted_job_recovery_killed_ends_killed_with_its_cause(monkey
 
 
 def test_killing_a_readopted_job_holds_the_device_until_its_scope_ends(monkeypatch, tmp_path):
-    """A kill marks the job KILLED at once, but its scope gets up to GRACEFUL_KILL_GRACE_SEC to exit.
-    Its `readopted_scopes` entry is what keeps the runner from dispatching and a reset from running
-    over it meanwhile, so the kill must leave it for the monitor to drop when the scope ends (#7)."""
+    """A kill marks the job KILLED at once, but its scope gets up to GRACEFUL_KILL_GRACE_SEC to exit."""
     job = _readopted_job(monkeypatch)
     during_stop = []
 

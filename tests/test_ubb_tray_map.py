@@ -319,10 +319,8 @@ def _event_map(chip_buses):
 
 
 def test_a_renumbered_full_read_re_banks_the_map_and_journals_old_and_new(monkeypatch, tmp_path, galaxy_seen):
-    """tt-kmd can give a chip another index after a drop, a rescan or a tray reset, without tt-smi's
-    PCI-ordered list changing at all. A full read that sysfs and tt-smi agree on is the kernel's
-    numbering now, so it replaces the banked map in the same pass and the journal carries both maps.
-    Fails on 2bb8128: the drift was journaled and the stale map kept."""
+    """tt-kmd can give a chip another index after a drop, a rescan or a tray reset, without tt-smi's PCI-ordered list
+    changing at all."""
     events = _recording_events(monkeypatch)
     _seed_sysfs(tmp_path, RENUMBERED_CHIP_BUSES)
 
@@ -354,9 +352,7 @@ def test_a_renumbered_full_read_re_banks_the_map_and_journals_old_and_new(monkey
 def test_a_short_or_disagreeing_read_never_overwrites_the_banked_map(
     monkeypatch, tmp_path, galaxy_seen, smi_off_bus, sysfs, mismatch
 ):
-    """Only a trusted full read moves the map. A chip off the bus has no node, so a short read
-    cannot place it, and a read tt-smi disagrees with raced the bus: the last trusted map stands
-    even when the chips that are readable look renumbered."""
+    """Only a trusted full read moves the map."""
     events = _recording_events(monkeypatch)
     snapshot = _galaxy_snapshot()
     snapshot["device_info"] = [d for d in snapshot["device_info"] if d["board_info"]["bus_id"] != smi_off_bus]

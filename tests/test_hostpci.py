@@ -368,9 +368,7 @@ GEN5 = "32.0 GT/s PCIe"
 
 
 def _ports(tmp_path, monkeypatch, links):
-    """Stage endpoints nested under their upstream ports, the way real sysfs nests them, so ``..``
-    is the port. ``links`` maps endpoint BDF -> dict(port=, port_width=, port_speed=, width=, speed=,
-    max_width=, max_speed=, device=); a port attribute left out is not written (unreadable)."""
+    """Stage endpoints nested under their upstream ports, the way real sysfs nests them, so ``..`` is the port."""
     root = tmp_path / "pcidevices"
     root.mkdir(exist_ok=True)
     tree = tmp_path / "devices"

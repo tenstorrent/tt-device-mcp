@@ -174,9 +174,8 @@ async def _operator_reset_on_a_healthy_mesh(monkeypatch, evidence):
 
 @pytest.mark.asyncio
 async def test_an_operator_reset_starts_the_pollers_only_once_its_fabric_verify_passes(mesh, monkeypatch):
-    """An operator reset leaves the FSM HEALTHY, so its restore started the pollers before the I13
-    fabric verify, which then ran beside their MMIO. The restore waits for the post-reset debt, and
-    the passing fabric pass that settles it starts them, once."""
+    """An operator reset leaves the FSM HEALTHY, so its restore started the pollers before the I13 fabric verify, which
+    then ran beside their MMIO."""
     calls, seen = await _operator_reset_on_a_healthy_mesh(monkeypatch, FOK)
 
     assert seen == [], "the pollers ran during the fabric verify"
@@ -264,10 +263,7 @@ async def test_the_idle_off_bus_bridge_reset(mesh, monkeypatch, verdict):
 
 @pytest.mark.asyncio
 async def test_a_tenant_deferred_off_bus_one_shot_runs_on_the_next_idle_tick(mesh, monkeypatch, verdict):
-    """Spec 03 I23: the off-bus one-shot that stood down on a live tenant is given back, not spent. The
-    first sampler tick with no tenant runs it, and its reset still releases only through the full
-    post-reset check, fabric included (spec 04 I32). Spending it left a one-chip drop held until the
-    general ceiling window, eight minutes after the tenant had gone."""
+    """Spec 03 I23: the off-bus one-shot that stood down on a live tenant is given back, not spent."""
     evidence, released = verdict
     _arm_offbus_stuck_hold(monkeypatch, isolated={"8"})
     patch_health_event(monkeypatch, lambda kind, **f: mesh.append((kind, f)))
@@ -326,10 +322,7 @@ async def test_a_tenant_deferred_off_bus_one_shot_runs_on_the_next_idle_tick(mes
 
 @pytest.mark.parametrize("given_back", [True, False], ids=["given-back", "spent"])
 def test_a_given_back_one_shot_gives_back_the_ceiling_window_it_claimed(monkeypatch, given_back):
-    """Spec 03 I23: a one-shot that waited out a tenant past the ceiling claims that ceiling window as
-    its own run. Given back (it stood down on the tenant), the window goes back with it: when the chips
-    return meanwhile (no one-shot left to retry), the ceiling window runs on the next tick, not one
-    whole window (600 s) later. A one-shot that ran keeps the claim: one forced climb, not two."""
+    """Spec 03 I23: a one-shot that waited out a tenant past the ceiling claims that ceiling window as its own run."""
     spawned = []
     monkeypatch.setattr(srv, "health_event", lambda kind, **f: None)
     monkeypatch.setattr(
@@ -365,9 +358,7 @@ def test_a_given_back_one_shot_gives_back_the_ceiling_window_it_claimed(monkeypa
 
 @pytest.mark.asyncio
 async def test_the_measured_fabric_failure_reset_on_the_first_relift(mesh, monkeypatch, tmp_path, verdict):
-    """Spec 03 I56: a post-job hold on a measured fabric FAIL resets on the first idle relift, with no
-    grace. The real reset-and-verify path runs (only the reset command and the verify are stubbed): its
-    verify runs the fabric pass, and the hold clears only on a healthy fabric verdict."""
+    """Spec 03 I56: a post-job hold on a measured fabric FAIL resets on the first idle relift, with no grace."""
     evidence, released = verdict
     monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRY_SLEEP_SEC", 0)
     _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
@@ -605,9 +596,7 @@ def _assert_no_release(mesh):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", [galaxy.STAGE_POWER_CYCLE])
 async def test_the_gate_ladders_last_chance_sweep(mesh, monkeypatch, galaxy_trays, sweep_verdict, stage):
-    """The gate's host rung runs the sweep; its verify passes enum+ARC. Folded into the FSM the way the
-    gate's ``_fire`` does, the device is released only on a passing fabric pass; otherwise it stays
-    held fabric-unverified (the relift owns it), and no host rung fires on a verify that passed."""
+    """The gate's host rung runs the sweep; its verify passes enum+ARC."""
     evidence, released = sweep_verdict
     fsm_dirty(srv, "gate/post-job: mesh failed the verify after the reset", why="job_killed")
     g, host = _arm_last_chance_sweep(monkeypatch, mesh, evidence)
@@ -693,9 +682,8 @@ async def _replay_post_reset_verify(monkeypatch, passes):
 
 @pytest.mark.asyncio
 async def test_a_dispatch_cap_77_after_a_reset_rechecks_at_once_and_class_j_fits_its_budget(mesh, monkeypatch):
-    """Spec 04 I84. The validator had moved traffic across every link, so the links were trained: the
-    eth-training wait cannot help, and the re-check runs at once. Class J (budget 300 s) replayed: kill to
-    reset 1 s + glx_reset 62 s + rescan settle 3 s + the verify + release 5 s took 321 s with the wait."""
+    """Spec 04 I84. The validator had moved traffic across every link, so the links were trained: the eth-training wait
+    cannot help, and the re-check runs at once."""
     healthy, spent, sleeps, fabric_asked = await _replay_post_reset_verify(
         monkeypatch, [(133.0, DISPATCH_CAP_77), (57.0, FOK)]
     )

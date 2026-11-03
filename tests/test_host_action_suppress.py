@@ -301,9 +301,8 @@ def test_an_operator_reset_is_refused_while_a_host_action_is_pending(monkeypatch
 
 @pytest.mark.asyncio
 async def test_a_power_cycle_command_that_timed_out_stays_pending(held, monkeypatch):
-    """A cycler that timed out may already have started its detached cycle: the mark stays, with
-    its normal bound, so no reset starts under it. A cycle that never launched (spec 04 I88) is no
-    timeout: it never runs the command under a live OS."""
+    """A cycler that timed out may already have started its detached cycle: the mark stays, with its normal bound, so no
+    reset starts under it."""
     from tt_device_mcp.health.recovery.stages import power_cycle as pc
 
     monkeypatch.setattr(pc, "os_first_unavailable", lambda: "no hook")
@@ -336,9 +335,7 @@ async def test_a_power_cycle_command_that_timed_out_stays_pending(held, monkeypa
 async def test_a_shrinking_offbus_set_gets_no_second_reset_when_the_power_cycle_cannot_fire(
     monkeypatch, clear_job_state, cold_rung
 ):
-    """A reset ran, failed and left chips off the bus; the power cycle is denied by its rate limit or not opted in. A
-    chip came back by the next forced window, but the episode's one mesh reset is spent (spec 04 I87): no later window
-    resets again, and the device stays held for the power cycle or an operator."""
+    """A reset ran, failed and left chips off the bus; the power cycle is denied by its rate limit or not opted in."""
     from tests import test_no_repeat_failed_rung as nr
 
     counters, events, _ = nr._episode(monkeypatch, power_cycle=cold_rung == "refused")
@@ -361,10 +358,7 @@ async def test_a_shrinking_offbus_set_gets_no_second_reset_when_the_power_cycle_
 async def test_the_gate_runs_one_reset_per_episode_when_the_power_cycle_is_not_opted_in(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """The gate's reset ran, hard-failed and left the drop needing the cold rung, with none opted in.
-    The next gate pass, once the reset cooldown ran out, does not run the mesh reset again: the hold's
-    one reset is spent (spec 04 I87), so the gate reports the spent rung and keeps the hold for the
-    power cycle or the operator. No host rung fires in its place."""
+    """The gate's reset ran, hard-failed and left the drop needing the cold rung, with none opted in."""
     from tests.test_device_safety import _reach_reboot_rung_with_regressing_reset
 
     monkeypatch.setattr(srv, "device_hold_episode_since", datetime.now().isoformat(timespec="seconds"))

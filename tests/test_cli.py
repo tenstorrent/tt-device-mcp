@@ -449,9 +449,8 @@ _UNIT_WITH_GROUP = _UNIT_NO_GROUP.replace("PRIVSEP=1\n", "PRIVSEP=1\nEnvironment
 
 
 def _stub_lock_restart_env(monkeypatch, cli, tmp_path, unit_text, main_pid="4242", live_env=None):
-    """Like _stub_lock_env (deny probe refused), but keeps the real unit/env logic:
-    the unit lives in tmp_path, `systemctl show` reports ``main_pid`` and the broker's
-    /proc environ holds ``live_env``. Returns (issued argv lists, unit path)."""
+    """Like _stub_lock_env (deny probe refused), but keeps the real unit/env logic: the unit lives in tmp_path,
+    `systemctl show` reports ``main_pid`` and the broker's /proc environ holds ``live_env``."""
     from types import SimpleNamespace
 
     real_set = cli._set_service_device_group

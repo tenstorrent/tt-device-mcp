@@ -373,8 +373,7 @@ def road(request, monkeypatch, tmp_path, held, clear_job_state):  # noqa: F811
 @pytest.mark.parametrize("road", ["auto", "offbus-gated"], indirect=True)
 async def test_every_power_cycle_road_journals_the_foreign_holder_and_not_a_scoped_one(monkeypatch, tmp_path, road):
     """Spec 04 I103: the auto power cycle and the off-bus gated cycle each journal ``power_cycle_foreign_holders``
-    naming the unscoped holder (pid, uid, comm, redacted command line); a scoped holder is not listed. (On the off-bus
-    road a scoped holder is a tenant that holds the cycle, so that road's scan finds the foreign holder only.)"""
+    naming the unscoped holder (pid, uid, comm, redacted command line); a scoped holder is not listed."""
     events: list = []
     holders = [FOREIGN_FD, SCOPED_FD] if road.road == "auto" else [FOREIGN_FD]
     fired = await road(

@@ -139,8 +139,7 @@ async def test_an_all_ones_burst_chip_is_removed_before_any_reader_is_killed(wat
 )
 def test_with_no_all_ones_burst_chip_the_stop_kills_only_once_the_chips_answer(watch, case):
     """No contained chip: the I92 stop, SIGSTOP, no remove. The burst chip is still attached, so no SIGKILL until a
-    sample after the stop reads it answering (a killed reader's fd close would reach it). A blackout (every chip
-    all-ones, the class A/C fault) is never contained here: its direct power cycle path stands."""
+    sample after the stop reads it answering (a killed reader's fd close would reach it)."""
     w, log, _detach_ok, burst = watch
     if case == "every chip answers":
         _sample()
@@ -232,9 +231,7 @@ async def test_a_contained_chip_is_contained_once(watch):
 
 @pytest.mark.asyncio
 async def test_the_contained_hold_runs_the_full_ladder_at_the_bound_then_the_host_rung(watch, monkeypatch):
-    """Goals of spec 04 I76 on this path: the hold the containment opens is a hold like any other.
-    At 10 min the broker's own full ladder runs, and a ladder that does not heal goes on to the
-    host rung; nothing before it lifts the hold."""
+    """Goals of spec 04 I76 on this path: the hold the containment opens is a hold like any other."""
     _w, _log, _detach_ok, burst = watch
     _sample("13")
     await _contain(burst)
@@ -279,11 +276,9 @@ async def test_the_contained_hold_fails_the_full_check_gate_into_the_bounded_rec
 @pytest.mark.asyncio
 @pytest.mark.parametrize("first", ["containment", "sampler"])
 async def test_overlapping_valve_runs_kill_nobody_before_every_all_ones_chip_is_removed(watch, monkeypatch, first):
-    """The containment of chip 13 and the sampler's own valve run for chip 14 overlap on one loop,
-    either one first, each remove held until the test lets it end: the first one's until the second
-    run's remove is queued, the second one's until the first run has decided. No run clears or replaces the other's all-ones
-    chips: while either chip is attached nobody is killed and no poller stops; once both are removed
-    the valve kills as usual, and the hold stays."""
+    """The containment of chip 13 and the sampler's own valve run for chip 14 overlap on one loop, either one first,
+    each remove held until the test lets it end: the first one's until the second run's remove is queued, the second
+    one's until the first run has decided."""
     import threading
 
     _w, log, _detach_ok, _burst = watch

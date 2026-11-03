@@ -78,9 +78,7 @@ def test_arc_not_ready_after_a_failed_mesh_reset_does_not_loop_the_reset(monkeyp
 
 
 def _gate(monkeypatch, tmp_path, *, enodata, reset_ok, verdict=None):
-    """The post-job gate on a fake 32-chip sysfs with ``enodata`` chips ARC-not-ready. Verify fails as
-    enum+ARC does on such a mesh unless ``verdict`` is given; the mesh reset is stubbed to return
-    ``reset_ok`` (its own full check, fabric included). Returns (resets, events)."""
+    """The post-job gate on a fake 32-chip sysfs with ``enodata`` chips ARC-not-ready."""
     _fake_sysfs(monkeypatch, tmp_path, enodata=enodata)
     _live_health(monkeypatch)
     dev = tmp_path / "dev"

@@ -161,9 +161,8 @@ async def test_with_no_detach_wired_nobody_is_killed(valve, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_hung_detach_is_bounded_and_the_loop_stays_responsive(valve, monkeypatch):
-    """The remove runs in a worker thread with one bound for all chips: a remove that hangs is not
-    detached, kills nobody, and the next chip is not tried behind it, while the event loop runs on.
-    The pollers are stopped once after it, as after a failed remove."""
+    """The remove runs in a worker thread with one bound for all chips: a remove that hangs is not detached, kills
+    nobody, and the next chip is not tried behind it, while the event loop runs on."""
     log, _ = valve
     monkeypatch.setattr(telemetry, "DETACH_TIMEOUT_SEC", 0.3)
     release = threading.Event()
@@ -273,9 +272,8 @@ def _stops(log):
 
 @pytest.mark.asyncio
 async def test_the_first_all_ones_sample_leaves_the_poller_stop_to_the_detach(valve):
-    """Chip 13 reads all-ones on one sample: it may be off the bus and is still attached, so the
-    pollers are not stopped then (their fd close would make the driver message it). The second
-    sample detaches it, and only then are the pollers stopped."""
+    """Chip 13 reads all-ones on one sample: it may be off the bus and is still attached, so the pollers are not stopped
+    then (their fd close would make the driver message it)."""
     log, _ = valve
     await srv.sampler.check_for_dead_chips({"0": _live(1), "13": _live(2), "14": _live(3)})
     await srv.sampler.check_for_dead_chips({"0": _live(2), "13": _live(ALL_ONES), "14": _live(4)})
@@ -305,10 +303,7 @@ async def test_a_stalled_chip_beside_an_all_ones_chip_does_not_stop_the_pollers(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ["failed", "timed out"])
 async def test_a_failed_or_timed_out_detach_stops_the_pollers_once_and_kills_nobody(valve, monkeypatch, fault):
-    """A remove that fails or hangs leaves chip 13 attached, and nothing retries it. Left running, the
-    pollers would read it on every later sample until the hold's first reset, so the valve stops them
-    once, after the hold is marked; later samples with 13 still all-ones stop nothing again. Nobody is
-    killed, the refusal is journalled and the device stays held."""
+    """A remove that fails or hangs leaves chip 13 attached, and nothing retries it."""
     log, detach_ok = valve
     release = threading.Event()
     if fault == "failed":
@@ -349,9 +344,8 @@ async def test_a_failed_or_timed_out_detach_stops_the_pollers_once_and_kills_nob
 
 @pytest.mark.asyncio
 async def test_a_failed_remove_beside_an_untried_chip_stops_the_pollers_on_the_next_sample(valve):
-    """Chip 13's remove fails while chip 14 is on its first strike: the pollers wait for 14 (its remove
-    is not tried yet). On the next sample 14 answers again, 13 is the only all-ones chip, and its
-    remove already failed: the sampler stops the pollers then, one sample later, without a retry."""
+    """Chip 13's remove fails while chip 14 is on its first strike: the pollers wait for 14 (its remove is not tried
+    yet)."""
     log, detach_ok = valve
     detach_ok["13"] = False
     await srv.sampler.check_for_dead_chips({"0": _live(1), "13": _live(ALL_ONES), "14": _live(1)})

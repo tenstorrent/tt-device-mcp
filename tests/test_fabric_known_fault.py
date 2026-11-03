@@ -106,10 +106,8 @@ def test_the_known_fault_is_bounded_and_rearms_one_short(mon, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_the_runner_holds_a_known_fabric_fault_without_the_dirty_reset(monkeypatch, clear_job_state, tmp_path):
-    """A failed job normally marks the device dirty, and the post-job gate then resets it: on the field
-    host that was a galaxy reset per job, each ending in another 77 (24 resets in 2.5 h). Once the
-    fault is known the job's end holds the device fabric-unverified with the reason and marks nothing
-    dirty. Fails without the guard: the job is flagged dirty."""
+    """A failed job normally marks the device dirty, and the post-job gate then resets it: on the field host that was a
+    galaxy reset per job, each ending in another 77 (24 resets in 2.5 h)."""
     _free_device_lock(monkeypatch)
     _no_workspace_activation(monkeypatch)
     monkeypatch.setattr(srv, "device_fault_reported", "")

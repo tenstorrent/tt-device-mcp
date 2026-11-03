@@ -47,9 +47,8 @@ def test_the_rule_assigns_group_and_mode_final():
 
 
 def _udev_resolve(rules_dir: Path, kernel: str = "tenstorrent!0") -> dict:
-    """A model of udev's rule evaluation for one tenstorrent node: files in lexical order of their
-    names, each matching line's GROUP/MODE applied in order; ``=`` sets unless a ``:=`` already
-    made the key final. Stands in for udevadm on a box with no device."""
+    """A model of udev's rule evaluation for one tenstorrent node: files in lexical order of their names, each matching
+    line's GROUP/MODE applied in order; ``=`` sets unless a ``:=`` already made the key final."""
     out = {"GROUP": "root", "MODE": "0600"}
     final: set = set()
     for path in sorted(rules_dir.iterdir(), key=lambda p: p.name):

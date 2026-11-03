@@ -533,9 +533,8 @@ def test_cooldown_candidate_and_next_rung():
 
 
 def test_a_class_a_hold_in_the_cooldown_has_no_second_10_min_trigger(held, monkeypatch):
-    """Spec 04 I73/I76: a whole tray whose cycle the cooldown refuses gets its full ladder only in the
-    10-min hold bound's run. No separate class-A start exists: with the first ceiling window spent, the
-    report names the next window, and no class-A kind fires 10 min after the last cycle or boot."""
+    """Spec 04 I73/I76: a whole tray whose cycle the cooldown refuses gets its full ladder only in the 10-min hold
+    bound's run."""
     held["off"] = set(TRAY_CHIPS[0x40])
     monkeypatch.setattr(held["m"], "whole_tray_off", list(TRAY_CHIPS[0x40]))
     monkeypatch.setattr(held["m"], "_class_a_ladder_anchor", None)
@@ -575,9 +574,8 @@ _ROUTE_RUNG = {srv.ROUTE_LADDER: "forced ladder", srv.ROUTE_HOST_RUNG: "power cy
 
 
 def _acts_at(t: float, monkeypatch, read_at: float):
-    """What the watchdog really does at epoch ``t``: the first kind its tick spawns, routed by the
-    forced run's own routing (the monotonic clock moved on by ``t - read_at``). None when no spawn
-    acts: nothing fires, or the run returns on a pending post-ladder check or a startup stand-down."""
+    """What the watchdog really does at epoch ``t``: the first kind its tick spawns, routed by the forced run's own
+    routing (the monotonic clock moved on by ``t - read_at``)."""
     kinds = _fires(t, monkeypatch)
     if not kinds:
         return None
@@ -615,9 +613,7 @@ def _bound_ladder_ran(monkeypatch, lad: float, recovered: bool) -> None:
     [(True, 1300, "hold bound host rung"), (False, 1200, "hold bound host rung at hold ceiling window 2")],
 )
 def test_the_report_names_the_rung_the_forced_run_routes_to(held, monkeypatch, recovered, at, source):
-    """A bound ladder ran at 1000 s. Window 2 (1200 s) is then no ladder: while its post-ladder check is pending the run
-    returns, so the host rung follows at the check's end (1300 s); when that ladder did not bring the mesh back, window
-    2 itself goes to the host rung. The report answers what the watchdog's own routing does, at the same time."""
+    """A bound ladder ran at 1000 s."""
     held["off"] = {3, 4, 5, 6}
     monkeypatch.setattr(srv, "device_hold_escalate_bucket", 1)
     _bound_ladder_ran(monkeypatch, 1000.0, recovered)

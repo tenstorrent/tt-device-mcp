@@ -45,9 +45,7 @@ async def test_probe_no_bridge_spent_chip_must_still_withhold_rescan(tmp_path, m
 async def test_a_no_bridge_spent_chip_withholds_the_rescan_and_gets_no_second_round(
     tmp_path, monkeypatch, rung  # noqa: F811
 ):
-    """Chip 13 drops later (removed too). The round may reset 13 through its bridge, but runs no rescan
-    while never-reset 14 is removed; 14 gets no second try (I98) and is named un-reset; both stay
-    isolated and the rung is not recovered, so the hold climbs to the next rung."""
+    """Chip 13 drops later (removed too)."""
     bus = _spend_14_with_no_bridge(tmp_path, monkeypatch, rung)
     await srv.galaxy_recovery._sbr(lambda m: None)
     bus.trace.clear()
