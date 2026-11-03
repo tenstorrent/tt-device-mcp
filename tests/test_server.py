@@ -6,7 +6,6 @@
 import asyncio
 import json
 import os
-import signal
 import tempfile
 import venv as venv_module
 from collections import deque
@@ -767,18 +766,15 @@ class TestCleanDeviceGate:
         # Per test, never a fixed /tmp path: suite runs in parallel worktrees shared one, and an
         # orphan of a killed run touched it inside this test's window.
         marker = tmp_path / "fabric_orphan_probe"
-        # `&&`, not `;`: the timeout now stops the check with SIGINT (so a real validator unwinds and
-        # releases the mesh), which would leave a `; touch` to still run. `&&` short-circuits on the
-        # interrupted sleep's non-zero exit, so the marker appears only if the grandchild ran to
-        # completion — i.e. was NOT reaped.
-        monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", f"(sleep 30 && touch {marker}) & echo $!; wait")
-        # A runner that starts the suite with SIGINT ignored passes that on to the check, and the SIGINT then stops
-        # nothing: give the check the default disposition a broker under systemd starts with.
-        old_int = signal.signal(signal.SIGINT, signal.default_int_handler)
-        try:
-            ok, _ = await srv.health_monitor.verify_fabric_health(timeout_sec=2)
-        finally:
-            signal.signal(signal.SIGINT, old_int)
+        # The grandchild ignores SIGINT, as a `&` child of bash 5.2 does when job control is off, so only the
+        # ladder's SIGTERM step stops it. A 1 s SIGINT window reaches that step well inside the sleep; the
+        # marker appears only if the grandchild ran to completion, i.e. was NOT reaped.
+        monkeypatch.setenv(
+            "TT_DEVICE_MCP_FABRIC_CHECK_CMD", f"(trap '' INT; sleep 30 && touch {marker}) & echo $!; wait"
+        )
+        terminate = srv._terminate_process_group
+        monkeypatch.setattr(srv, "_terminate_process_group", lambda pid: terminate(pid, grace_sec=1))
+        ok, _ = await srv.health_monitor.verify_fabric_health(timeout_sec=2)
         assert ok is False
 
         # The grandchild must be gone: _terminate_process_group signals the whole session. The
