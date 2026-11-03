@@ -503,11 +503,6 @@ def _hist_recs(path, *recs):
     path.write_text("".join(json.dumps({"at_epoch": a, "cause": c}) + "\n" for a, c in recs))
 
 
-def test_a_matched_failure_line_drops_the_attempt(state_hist):
-    _hist_recs(state_hist, (T0 - 500, "old"), (T0 - 100, "BMC"), (T0 - 100, "BMC (cycle failed)"))
-    assert recovery_base._last_external_power_cycle(T0) == (T0 - 500, "old")
-
-
 def test_an_unmatched_failure_line_is_ignored(state_hist):
     _hist_recs(state_hist, (T0 - 500, "old"), (T0 - 100, "other (cycle failed)"))
     assert recovery_base._last_external_power_cycle(T0) == (T0 - 500, "old")

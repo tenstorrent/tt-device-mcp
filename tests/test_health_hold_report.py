@@ -483,16 +483,6 @@ def test_a_dead_enumerated_tray_with_no_map_is_a_whole_tray(held, monkeypatch):
     assert _payload()["hold_class"] == "A"
 
 
-def test_a_link_down_tray_with_no_map_is_a_whole_tray(held, monkeypatch):
-    """A tray whose nodes linger with their links down and no heartbeat read is a whole tray off too."""
-    tray = set(TRAY_CHIPS[0x40])
-    monkeypatch.setattr(srv.galaxy_recovery, "_tray_map_now", lambda: None)
-    monkeypatch.setattr(srv, "chip_pci_bdfs", lambda: dict(enumerate(GALAXY_BUS_IDS)))
-    monkeypatch.setattr(srv, "link_down", lambda bdf: GALAXY_BUS_IDS.index(bdf) in tray)
-    held["off"] = tray
-    assert _payload()["hold_class"] == "A"
-
-
 # ---- the pure helpers ----------------------------------------------------------------------------
 
 

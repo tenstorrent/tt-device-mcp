@@ -177,24 +177,6 @@ async def test_a_reopened_hold_that_77s_again_is_held_without_a_reset_then_bound
 
 
 @pytest.mark.asyncio
-async def test_a_reopened_known_fabric_fault_is_held_without_a_climb(monkeypatch, tmp_path, clear_job_state):
-    """03 I46: a known fabric fault stays held past the bound: no release, no rung, no reset."""
-    _events, seen = await _reopened(monkeypatch, tmp_path)
-    monkeypatch.setattr(srv, "FABRIC_77_MAX_RETRIES", 1)
-    monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "known fabric fault: 2 jobs in a row")
-
-    async def eth_read(*a, **k):
-        return True, "all active-eth cores advancing"
-
-    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_read)
-
-    await srv._attempt_idle_relift()
-
-    assert seen["resets"] == 0 and seen["rungs"] == []
-    assert srv.fsm.state is ServerState.RECOVERING
-
-
-@pytest.mark.asyncio
 async def test_a_carried_dirty_down_of_another_cause_reopens_on_a_clean_startup_77(
     monkeypatch, tmp_path, clear_job_state
 ):

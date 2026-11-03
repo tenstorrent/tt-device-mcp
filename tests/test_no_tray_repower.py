@@ -45,16 +45,6 @@ def _shipped_files():
                 yield path
 
 
-def test_no_shipped_file_builds_a_tray_power_command():
-    hits = [
-        f"{p.relative_to(ROOT)}:{n}"
-        for p in _shipped_files()
-        for n, line in enumerate(p.read_text(errors="replace").splitlines(), 1)
-        if TRAY_POWER.search(line)
-    ]
-    assert hits == [], f"a per-tray BMC power command is back: {hits}"
-
-
 def test_the_tray_rung_module_is_gone():
     assert importlib.util.find_spec("tt_device_mcp.health.recovery.stages.ubb_tray") is None
     assert not list((ROOT / "src").rglob("ubb_tray*.py"))

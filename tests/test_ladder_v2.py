@@ -90,10 +90,6 @@ def _wire_failed_climb(monkeypatch, read_heartbeats, *, allowed=True):
     return events, cycles
 
 
-def _raise_oserror():
-    raise OSError("sysfs read failed")
-
-
 # ----------------------------------------------------------- (c) settle + verify before a host rung
 
 

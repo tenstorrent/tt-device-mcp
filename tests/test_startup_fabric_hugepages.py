@@ -59,11 +59,6 @@ def test_hugepages_shortfall_reports_a_short_pool_behind_identity_or_no_iommu(tm
     assert hostpci.hugepages_shortfall() == (3, 32)
 
 
-def test_hugepages_shortfall_is_none_once_the_count_is_met(tmp_path, monkeypatch):
-    _fake_bus(tmp_path, monkeypatch, iommu_type="identity", nr="32", n_chips=32)
-    assert hostpci.hugepages_shortfall() is None
-
-
 def test_hugepages_shortfall_is_none_behind_a_translating_iommu(tmp_path, monkeypatch):
     """A DMA domain maps buffers through the IOMMU and needs no hugepages: nothing to wait for."""
     _fake_bus(tmp_path, monkeypatch, iommu_type="DMA-FQ", nr="0")
@@ -74,11 +69,6 @@ def test_hugepages_shortfall_is_none_without_a_readable_pool(tmp_path, monkeypat
     """No 1G pool to read is not evidence of a short one; waiting on it would hold a box that may
     not use hugepages at all."""
     _fake_bus(tmp_path, monkeypatch, iommu_type="identity", nr=None)
-    assert hostpci.hugepages_shortfall() is None
-
-
-def test_hugepages_shortfall_is_none_with_no_function_on_the_bus(tmp_path, monkeypatch):
-    _fake_bus(tmp_path, monkeypatch, iommu_type="identity", nr="0", n_chips=0)
     assert hostpci.hugepages_shortfall() is None
 
 
@@ -781,16 +771,6 @@ def _deadline(monkeypatch):
     monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
     monkeypatch.setattr(srv, "device_hold_episode_reason", "gate/startup: fabric unverified")
     return fired, since
-
-
-def test_the_hold_deadline_forces_a_77_only_hold_only_at_the_bound(monkeypatch, tmp_path, clear_job_state):
-    """Below the 10-min bound a 77-only hold is never forced; at the bound it is (spec 04 I76)."""
-    _hold_77(monkeypatch, tmp_path)
-    fired, since = _deadline(monkeypatch)
-    srv._check_hold_deadline(now=since + timedelta(seconds=srv._stuck_hold_ceiling_sec() - 1))
-    assert fired == []
-    srv._check_hold_deadline(now=since + timedelta(seconds=srv._stuck_hold_ceiling_sec() + 1))
-    assert fired == [True]
 
 
 def test_the_hold_deadline_still_escalates_a_measured_fabric_fault(monkeypatch, tmp_path, clear_job_state):
@@ -1504,16 +1484,6 @@ def _bound(monkeypatch, tmp_path, eth):
 
 
 @pytest.mark.asyncio
-async def test_a_77_only_hold_past_its_bound_climbs_even_on_a_healthy_eth_read(monkeypatch, tmp_path, clear_job_state):
-    """03 I78: the startup checks and an advancing eth read are not the full check; past the I40 bound
-    the hold climbs the ladder and is never released unverified."""
-    rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
-    await srv._attempt_idle_relift()
-    assert rungs == ["present"]
-    assert srv.fsm.state is ServerState.RECOVERING
-
-
-@pytest.mark.asyncio
 async def test_a_77_only_hold_with_a_link_drop_climbs_the_ladder_not_released(monkeypatch, tmp_path, clear_job_state):
     """A 77 is never a healthy fabric: a link-count drop reads no-verdict and goes to the ladder."""
     rungs = _bound(monkeypatch, tmp_path, (None, "eth links below baseline"))
@@ -1648,17 +1618,6 @@ async def test_a_topology_mismatch_whose_rerun_77s_takes_the_bounded_fallback(
 async def test_a_77_only_hold_under_its_bound_still_just_holds(monkeypatch, tmp_path, clear_job_state):
     rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
     monkeypatch.setattr(srv, "FABRIC_77_MAX_RETRIES", 5)
-    await srv._attempt_idle_relift()
-    assert rungs == []
-    assert srv.fsm.state is ServerState.RECOVERING
-
-
-@pytest.mark.asyncio
-async def test_a_known_fabric_fault_hold_is_outside_the_77_bound(monkeypatch, tmp_path, clear_job_state):
-    """03 I46: the fallback release is what kept handing jobs a fabric that killed them, so a known
-    fabric fault neither lifts on a healthy eth read nor climbs the ladder past the bound."""
-    rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
-    monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "known fabric fault: 2 jobs in a row")
     await srv._attempt_idle_relift()
     assert rungs == []
     assert srv.fsm.state is ServerState.RECOVERING

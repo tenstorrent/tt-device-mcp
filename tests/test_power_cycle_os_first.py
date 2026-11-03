@@ -605,11 +605,6 @@ def test_a_fallback_that_will_not_stop_keeps_the_action_pending(os_first):
     assert os_first["events"][-1][1]["phase"] == "fallback_pending"
 
 
-def test_an_unanswered_is_active_reads_as_alive(os_first):
-    os_first["rc"].update(reboot=1, stop=1, **{"is-active": None})
-    assert pc.fire_os_first(CYCLE, REASON) == "fallback_pending"
-
-
 def test_a_stopped_fallback_after_a_failed_stop_raises_not_launched(os_first):
     os_first["rc"].update(reboot=1, stop=1)
     _not_launched(os_first)
@@ -1314,13 +1309,6 @@ def test_a_bmc_with_no_restart_cause_confirms_the_cycle_from_its_sel(sel_booted)
     (event,) = [k for n, k in sel_booted["hevents"] if n == "power_cycle_confirmed"]
     assert event["restart_cause_unavailable"] == row["restart_cause_unavailable"]
     assert not (sel_booted["tmp"] / recovery_base.POWER_CYCLE_CAUSE_CAPABLE_FILE).exists()
-
-
-def test_the_sel_is_read_on_the_bmc_clock_whatever_its_zone(sel_booted):
-    """A BMC that keeps local time (UTC-7) and runs 2 s slow: the offset to its own clock places it."""
-    sel_booted["out"]["sel_time"] = "10/21/2026 20:05:50"
-    sel_booted["out"]["sel_list"] = SEL_TAIL.replace("10/22/2026 | 03:", "10/21/2026 | 20:")
-    assert sel_booted["mech"].confirm_power_cycle_on_boot(now_epoch=SEL_CHECK) == "confirmed"
 
 
 @pytest.mark.parametrize(

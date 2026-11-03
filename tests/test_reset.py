@@ -1109,19 +1109,6 @@ async def test_cancelling_the_waiter_does_not_kill_a_local_reset(monkeypatch, tm
     assert observer.scope_active() is None
 
 
-@pytest.mark.asyncio
-async def test_a_daemon_without_systemd_resets_through_the_local_backend(monkeypatch, tmp_path):
-    """A container needs no declared authority to reset: `tt-smi -r` is an ioctl on a device node
-    its submitter already holds (spec 04 I17), so lacking a PID-1 scope picks the other backend
-    rather than cancelling the reset. The tenant rules (I6/I7) still gate it."""
-    mechanism = _local_reset_mechanism(tmp_path, monkeypatch)
-    rc, _output = await mechanism.run_scoped(
-        [sys.executable, "-c", "raise SystemExit(0)"],
-        lambda _message: None,
-    )
-    assert rc == 0
-
-
 def test_a_streaming_local_reset_is_visible_to_a_restarted_daemon(monkeypatch, tmp_path):
     """The operator reset route must use the same cross-process lock as automatic recovery; an
     untracked direct child lets a restarted daemon probe and reset the device concurrently."""

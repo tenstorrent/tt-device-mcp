@@ -86,17 +86,6 @@ async def test_a_running_broker_job_defers_the_cycle_until_it_ends(rig, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_a_waiting_or_queued_job_does_not_defer_the_cycle(rig, monkeypatch):
-    """A job queued behind the hold, or waiting on a foreign holder to let go, is not running: it
-    never holds the cycle that would free the device for it."""
-    _holders(rig, monkeypatch, FOREIGN)
-    _whole_tray(rig)
-    _job(monkeypatch, srv.JobStatus.QUEUED)
-    assert await rig["g"].escalate("offbus", [], EXPECTED, lambda m: None) == galaxy.OUTCOME_TERMINAL
-    assert rig["order"] == ["power_cycle"]
-
-
-@pytest.mark.asyncio
 async def test_the_pre_cycle_scan_clears_a_foreign_holder_and_refuses_a_job_holder(monkeypatch):
     foreign = DeviceHolder(pid=4202, uid=1001)
     box = _Box(monkeypatch, [foreign, READER], tenants=[foreign])

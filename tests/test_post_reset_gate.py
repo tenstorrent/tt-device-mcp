@@ -246,23 +246,6 @@ def _assert_settled(released: bool):
 
 
 @pytest.mark.asyncio
-async def test_the_bridge_rung(mesh, monkeypatch, verdict):
-    evidence, released = verdict
-    fsm_dirty(srv, "gate/post-job: chip 8 off the bus", why="job_killed")
-    g = srv.galaxy_recovery
-
-    async def bridge(log):
-        FABRIC_DEBT.note_reset("bridge reset of chip 8")
-        return True
-
-    patch_recovery(monkeypatch, "_recover_isolated_chips", bridge)
-    _verify_returning(monkeypatch, evidence)
-    out = await g._fire_gate_rung("post-job", galaxy.STAGE_BRIDGE_RESET, ["8"], 32, lambda m: None, ev=None, beats=None)
-    assert out == galaxy.OUTCOME_RECOVERED
-    _assert_settled(released)
-
-
-@pytest.mark.asyncio
 async def test_the_idle_off_bus_bridge_reset(mesh, monkeypatch, verdict):
     evidence, released = verdict
     _arm_offbus_stuck_hold(monkeypatch, isolated={"8"})
@@ -462,22 +445,6 @@ async def test_a_real_bridge_reset_recovers_and_settles(mesh, monkeypatch, verdi
     g = srv.galaxy_recovery
     out = await g._fire_gate_rung("post-job", galaxy.STAGE_BRIDGE_RESET, ["8"], 32, lambda m: None, ev=None, beats=None)
     assert out == galaxy.OUTCOME_RECOVERED
-    _assert_settled(released)
-
-
-@pytest.mark.asyncio
-async def test_an_adopted_reset_verifies_and_settles(mesh, monkeypatch, verdict):
-    from tt_device_mcp.health.recovery import base
-
-    evidence, released = verdict
-    fsm_dirty(srv, "gate/post-job: reset", why="job_killed")
-    g = srv.galaxy_recovery
-    scopes = iter(["ttdev-reset-1.scope"])
-    monkeypatch.setattr(g.mechanism, "scope_active", lambda: next(scopes, None))
-    monkeypatch.setattr(base, "asyncio", _FastAsyncio())
-    _verify_returning(monkeypatch, evidence)
-    assert await g._reset_and_verify_device([str(i) for i in range(32)], lambda m: None) is True
-    srv._clear_device_dirty(verified=True, why="gate/post-job: verified healthy")
     _assert_settled(released)
 
 

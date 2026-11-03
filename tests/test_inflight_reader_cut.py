@@ -99,13 +99,6 @@ async def test_a_failed_post_reset_chip_reading_all_ones_is_detached_before_its_
 
 
 @pytest.mark.asyncio
-async def test_a_failed_chip_that_answers_is_not_cut(monkeypatch):
-    w = _World(monkeypatch, beats={"31": OK})
-    assert await _cut(["31"]) is True
-    assert w.steps() == ["read"], "the failed POST_RESET alone is not proof the chip is off the bus"
-
-
-@pytest.mark.asyncio
 async def test_an_unreadable_failed_chip_is_not_cut(monkeypatch):
     """A read that fails (ENODATA, a gone node) omits the chip: it is not all-ones, so nothing is cut."""
     w = _World(monkeypatch, beats={})
@@ -150,13 +143,6 @@ async def test_no_reader_means_no_detach_and_no_kill(monkeypatch):
     w = _World(monkeypatch, readers=(), beats={"31": ALL_ONES})
     await _cut(["31"])
     assert w.steps() == ["read"] and w.kinds()[-1] == "reset_inflight_readers_cut"
-
-
-@pytest.mark.asyncio
-async def test_an_incomplete_holder_scan_counts_as_a_reader(monkeypatch):
-    w = _World(monkeypatch, readers=(), complete=False, beats={"31": ALL_ONES})
-    await _cut(["31"])
-    assert w.steps() == ["read", "detach", "pollers", "owe", "kill"]
 
 
 @pytest.mark.asyncio

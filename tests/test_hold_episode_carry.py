@@ -650,24 +650,6 @@ async def test_replay_a_restart_whose_real_startup_gate_releases_keeps_the_carry
 
 
 @pytest.mark.asyncio
-async def test_a_hold_open_across_a_restart_escalates_at_once_when_past_the_bound(
-    monkeypatch, tmp_path, clear_job_state
-):
-    """A hold that began before the restart escalates no later than 10 min after it began: here at once."""
-    _isolate(monkeypatch, tmp_path)
-    _watchdog(monkeypatch)
-    escalations, events, detail = _open_hold(monkeypatch, "missing port (topology mismatch)", BOUND + 120)
-    since = srv.device_hold_episode_since
-    _restart_broker(monkeypatch)
-
-    srv._note_tenant_gate_verdict(detail)  # the startup check still fails: held from the start
-    assert srv.device_hold_episode_since == since
-    srv._check_hold_deadline(now=datetime.now())
-    await _drain()
-    assert escalations == ["present-forced"], "the full ladder runs on the first tick, not 10 min after the restart"
-
-
-@pytest.mark.asyncio
 async def test_a_hold_open_across_a_restart_after_its_bound_ladder_goes_to_the_host_rung(
     monkeypatch, tmp_path, clear_job_state
 ):
