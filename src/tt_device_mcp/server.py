@@ -9968,7 +9968,7 @@ async def _hold_bound_host_rung(age: float, log, skipped: str = "", *, sweep: bo
         # deferred the cycle denied it before the climb's sweep, so the sweep runs here, now that the cycle may fire.
         expected = health_monitor.expected(len(_present_chip_indices()))
         swept = await galaxy_recovery._settle_and_verify_before_host_rung(
-            expected, log, "idle-escalation", context="10-min hold bound, before the power cycle"
+            expected, log, "idle-escalation", context="10-min hold bound, before the power cycle", at_bound=True
         )
         if swept is not False:
             if swept is None:

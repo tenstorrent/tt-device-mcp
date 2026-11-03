@@ -24,13 +24,14 @@ from tt_device_mcp.health.recovery import galaxy
 COOLDOWN_SEC = 900
 
 
-def _cooldown_deferred(monkeypatch, tmp_path, *, verdicts=()):
+def _cooldown_deferred(monkeypatch, tmp_path, *, verdicts=(), high_water=True):
     """A below-floor hold 300 s old whose mesh reset already failed on chip 31, and an I65 cooldown that denies every
     power cycle until ``state['cooling']`` is cleared."""
     order, events, counters = _rig(monkeypatch, tmp_path, held_min=5, verdicts=verdicts)
     # The host's high-water mark of 32 chips, as on a real box: without it ``expected`` is the 31 still present and
     # chip 31 drops out of the off-bus set the sweep reads.
-    monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
+    if high_water:
+        monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
     clock = _clock(monkeypatch)
     rm = srv.recovery_mechanism
     srv.recovery_mechanism.note_rung_failed(srv.device_hold_episode_since, "mesh_reset", {GONE}, {GONE}, rc=1)
@@ -100,6 +101,43 @@ async def test_a_sweep_that_passes_at_the_cooldown_end_lifts_the_hold_and_cycles
     await _cooldown_end(order, clock, state)
     assert order == ["mesh reset", "full check"], "no power cycle on a check that passed"
     assert counters["dirty_cleared"] == 1, "lifted once, on the just-passed full check with fabric"
+
+
+async def _hung_check_at_the_cooldown_end(monkeypatch, order, events, counters, clock, state):
+    """The cooldown-end sweep with a full check that never ends: it is cut at the deadline and the cycle fires."""
+    monkeypatch.setattr(galaxy, "MESH_RESET_BEFORE_HOST_RUNG_SEC", 0.5)
+    monkeypatch.setattr(galaxy, "MESH_RESET_BEFORE_HOST_RUNG_GAVE_UP_SEC", 0.5)
+    monkeypatch.setattr(galaxy, "MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC", 1)
+    monkeypatch.setattr(galaxy, "MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC", 0.2)
+    monkeypatch.setattr(galaxy, "MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC", 0.2)
+    hung = asyncio.Event()
+
+    async def verify(expected, log, run_fabric=True, **k):
+        order.append("full check" if run_fabric else "check without fabric")
+        await hung.wait()  # never set: a check that does not end
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    started = datetime.now()
+    await asyncio.wait_for(_cooldown_end(order, clock, state), 30)
+    took = (datetime.now() - started).total_seconds()
+    assert order == ["mesh reset", "full check", "power cycle"], "the cut check counts as failed: the cycle fires"
+    assert took < 10, f"bounded by the deadline, not by the check: {took:.1f}s"
+    cut = [e for e in events if e == "whole_mesh_reset_before_host_rung_unverified"]
+    assert cut, "the cut check is journaled"
+    assert counters["dirty_cleared"] == 0, "a cut check lifts nothing"
+
+
+@pytest.mark.asyncio
+async def test_a_present_mesh_sweep_check_cut_at_its_deadline_at_the_cooldown_end_still_power_cycles(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 04 I65/I100: a hold with every expected chip on the bus (no off-bus set, so no failed reset on it to
+    repeat) whose bound cycle the cooldown denied: the cooldown-end sweep's mesh reset and full check still run under
+    the deadline, and a check that never ends is cut there and the cycle fires, within the bound."""
+    order, events, counters, clock, state = _cooldown_deferred(monkeypatch, tmp_path, high_water=False)
+    await _at_the_bound(order, events, clock)
+    assert not galaxy._offbus_chip_ids(srv.read_heartbeats(), srv.health_monitor.expected(31)), "a present mesh"
+    await _hung_check_at_the_cooldown_end(monkeypatch, order, events, counters, clock, state)
 
 
 @pytest.mark.asyncio

@@ -2587,6 +2587,7 @@ class GalaxyRecovery(Recovery):
         offbus_chips: Optional[set] = None,
         context: str = "",
         fabric_77_unverified: bool = False,
+        at_bound: bool = False,
     ) -> Optional[bool]:
         """The LAST-CHANCE gate the power cycle passes through: fire every reset type once more, back-to-back, then ONE
         settle and ONE verify — and only if the mesh is still bad does the caller power-cycle. True iff the mesh came
@@ -2663,7 +2664,10 @@ class GalaxyRecovery(Recovery):
         # Spec 04 I100: the repeated mesh reset and its full check run at once, under the I97 deadline or,
         # when that is too close, under one taken from the repeat's own start: never an idle wait for the
         # 10-min bound, and the power cycle request stays bounded.
-        bounded = repeat_failed and self._repeat_runs_under_deadline(expected)
+        # ``at_bound``: the sweep the 10-min bound runs before its power cycle (a cooldown-end retry included). Its mesh
+        # reset and full check run under that deadline too, whatever the off-bus set: a present mesh, or a set that
+        # changed since the failed reset, never gets a check bounded only by its probes' timeouts (I65).
+        bounded = (repeat_failed or at_bound) and self._repeat_runs_under_deadline(expected)
         trays = _affected_trays(offbus_chips, expected, tray_map) or []
         placement = _offbus_placement(offbus_chips, self._chip_buses_now(), tray_map)
         swept = False
@@ -2701,7 +2705,9 @@ class GalaxyRecovery(Recovery):
                     swept = await self._issue_all_resets_back_to_back(
                         trays, expected, log, do_sbr=True, mesh_reset=False
                     )
-                    if swept and await asyncio.to_thread(self._bus_whole_now, expected, log):
+                    if swept and bounded and at_bound:
+                        bounded_left = True  # the deadline-bounded mesh reset's own full check decides
+                    elif swept and await asyncio.to_thread(self._bus_whole_now, expected, log):
                         mesh_reset_left = True
                         log(
                             "every expected chip is back on the bus after SBR — the full check runs before the mesh reset"
