@@ -1189,6 +1189,7 @@ class GalaxyRecovery(Recovery):
         beats: Optional[dict],
         measured_fault: bool,
     ) -> str:
+        # escalate's body: it runs only with escalate's stand_down in place.
         if self.mechanism.host_action_blocks_reset(log, context=f"escalate({phase})"):
             return OUTCOME_WAITING
         rung, _, gate_phase = phase.partition("/")
