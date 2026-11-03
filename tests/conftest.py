@@ -348,16 +348,21 @@ def pytest_configure_node(node):
     node.workerinput["loadgroup"] = node.config.getvalue("dist") == "loadgroup"
 
 
-# One worker running the fork-heavy group back to back still starts ~200 processes/s for ~20 s. Each of
-# these tests is followed by a pause of FORKS_PACE times its own run time, so the group's start rate stays
-# well under 100 processes/s; the other workers keep running the rest of the suite meanwhile.
-FORKS_PACE = 3
+# One worker running the fork-heavy group back to back starts ~400 processes/s while a test runs. Under
+# -n, each of these tests is followed by a pause of FORKS_PACE times its own run time, so the group starts
+# about 400 / (1 + FORKS_PACE) processes/s, which leaves room for the other workers' share of the
+# under-100/s budget while they keep running the rest of the suite. A serial run (no xdist, or
+# -p no:xdist) has no other workers to make room for and does not pause.
+FORKS_PACE = 6
 
 
 @pytest.fixture(autouse=True)
 def pace_fork_heavy_tests(request):
     mark = request.node.get_closest_marker("xdist_group")
-    if mark is None or "forks" not in (*mark.args, mark.kwargs.get("name")):
+    paced = getattr(request.config, "workerinput", None) is not None and getattr(
+        request.config.option, "loadgroup", False
+    )
+    if not paced or mark is None or "forks" not in (*mark.args, mark.kwargs.get("name")):
         yield
         return
     start = time.monotonic()
