@@ -78,10 +78,12 @@ echo {_OLD} > "$STATE"
 HOLD={tmp_path}/dispatch-hold
 {_clock(_SCRIPT.read_text())}curl() {{
     {"return 22" if curl_fails else ""}
-    n=$(cat {calls}); n=$((n+1)); echo "$n" > {calls}
-    total=$(wc -l < {answers})
-    [ "$n" -le "$total" ] || n=$total
-    sed -n "${{n}}p" {answers}
+    local n a  # builtins only: a cat, wc and sed per call were three forks
+    read -r n < {calls}; n=$((n+1)); echo "$n" > {calls}
+    mapfile -t a < {answers}
+    [ "$n" -le "${{#a[@]}}" ] || n=${{#a[@]}}
+    [ "$n" -ge 1 ] || return 1
+    printf '%s\n' "${{a[n-1]}}"
 }}
 logger() {{ echo "logger $*" >> {trace}; }}
 sleep() {{ echo "sleep $*" >> {trace}; }}
@@ -359,7 +361,10 @@ def test_no_recovery_deferral_comes_after_the_install_starts():
 def test_a_device_op_at_restart_time_is_waited_out(tmp_path):
     # The op ends after three 5 s polls.
     trace = tmp_path / "trace"
-    stand_in = f'op_in_flight() {{ [ "$(cat {trace} 2>/dev/null | grep -c "^sleep")" -lt 3 ]; }}'
+    stand_in = (
+        f"op_in_flight() {{ local c=0 l; if [ -f {trace} ]; then while IFS= read -r l; do "
+        f'[[ $l == sleep* ]] && c=$((c + 1)); done < {trace}; fi; [ "$c" -lt 3 ]; }}'
+    )
     done, trace, log = _apply(tmp_path, health=[_health()], stand_ins=stand_in)
     assert done.returncode == 0, done.stderr
     steps = [t for t in trace if not t.startswith("logger ")]

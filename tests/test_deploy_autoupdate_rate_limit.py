@@ -49,6 +49,7 @@ def _lap(
     root = tmp_path / "root"
     root.mkdir(exist_ok=True)
     restarts = tmp_path / "restarts"
+    (tmp_path / "logs").mkdir(exist_ok=True)  # made here, not by a mkdir fork in each test's first lap
     stub = "" if now is None else f'date() {{ echo {now}; }}\nau_now() {{ printf -v "$1" %s {now}; }}\n'
     prelude = f"""set -u
 ROOT={root}; STATE={root}/installed.sha; VENV={tmp_path}/venv; BR=main; src_desc=test
@@ -57,7 +58,7 @@ remote_sha={sha}
 {_clock(text)}{stub}chmod() {{ :; }}
 systemctl() {{
     case "$*" in
-        restart*) echo "{now} $(cat "$STATE")" >> {restarts} ;;
+        restart*) local s=""; read -r s < "$STATE"; echo "{now} $s" >> {restarts} ;;
         is-active*) echo '{active}'; [ '{active}' = active ] ;;
         show*NRestarts*) echo '{nrestarts}' ;;
     esac
