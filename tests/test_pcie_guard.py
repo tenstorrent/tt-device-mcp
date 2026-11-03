@@ -86,6 +86,13 @@ def _cfg(root, bdf, off, size):
     return int.from_bytes(data[off : off + size], "little")
 
 
+def _set_cfg(root, bdf, off, size, value):
+    p = root / "sys/bus/pci/devices" / bdf / "config"
+    data = bytearray(p.read_bytes())
+    data[off : off + size] = value.to_bytes(size, "little")
+    p.write_bytes(bytes(data))
+
+
 def _masked(root, bdf) -> bool:
     return (
         _cfg(root, bdf, PCIE + 8, 2) & 0xF == 0
@@ -104,6 +111,11 @@ def _restored(root, bdf) -> bool:
         and _cfg(root, bdf, AER + 0x14, 4) == 0x2000
         and _cfg(root, bdf, DPC + 6, 2) == 0xB
     )
+
+
+def _rescanned(root) -> list:
+    """The root ports whose bus below was rescanned on its own."""
+    return sorted(rp for rp in PORTS if any((root / "sys/bus/pci/devices" / rp / "pci_bus").glob("*/rescan")))
 
 
 # ---------------------------------------------------------------- tray map cross-check (issue #27)
@@ -552,6 +564,19 @@ def test_the_hold_message_names_both_boots(sysfs, monkeypatch, capsys):
     assert not allowed
     assert "the mesh reset on boot boot-a did not finish before the host went down; held on boot boot-b until" in why
     assert "ceiling" in why, "with no power cycle the ceiling is one of the ends"
+
+
+def test_a_latch_from_an_ended_boot_never_gates_even_if_the_broker_never_restarted(sysfs, monkeypatch):
+    """Field record: the reset sweep ran on boot A, the hold latched on boot B, the host is now on
+    boot C and the broker has not dropped the file. Its boot has ended, so no rung is gated by it."""
+    rec = {"kind": "reset sweep", "off_bus": 8, "boot_id": "boot-a", "at_epoch": time.time() - 90000}
+    rec.update(latched_on_boot="boot-b", latched_at_epoch=time.time() - 89500)
+    pcie_guard.health_dir().mkdir(parents=True, exist_ok=True)
+    (pcie_guard.health_dir() / pcie_guard.LATCH_FILE).write_text(json.dumps(rec))
+    _boot(sysfs, "boot-c")
+    _take_off_bus(sysfs, 0)
+    assert pcie_guard.offbus_reset_latched() is None
+    assert pcie_guard.gate_mode() == pcie_guard.GATE_GUARD and pcie_guard.host_reset_gate(1) == (True, "")
 
 
 def _latched(monkeypatch, root, events) -> dict:

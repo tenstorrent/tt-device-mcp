@@ -497,12 +497,16 @@ def _hist_recs(path, *recs):
 
 
 @pytest.mark.parametrize(
-    "line,want",
-    [("other (cycle failed)", (T0 - 500, "old")), ("BMC", (T0 - 100, "BMC"))],
-    ids=["unmatched-failure-line-ignored", "attempt-without-failure-line-counts"],
+    "recs,want",
+    [
+        ([(T0 - 100, "BMC"), (T0 - 100, "BMC (cycle failed)")], (T0 - 500, "old")),
+        ([(T0 - 100, "other (cycle failed)")], (T0 - 500, "old")),
+        ([(T0 - 100, "BMC")], (T0 - 100, "BMC")),
+    ],
+    ids=["matched-failure-line-drops-attempt", "unmatched-failure-line-ignored", "attempt-without-failure-line-counts"],
 )
-def test_a_failure_line_voids_only_its_own_attempt(state_hist, line, want):
-    _hist_recs(state_hist, (T0 - 500, "old"), (T0 - 100, line))
+def test_a_failure_line_voids_only_its_own_attempt(state_hist, recs, want):
+    _hist_recs(state_hist, (T0 - 500, "old"), *recs)
     assert recovery_base._last_external_power_cycle(T0) == want
 
 

@@ -261,6 +261,25 @@ async def test_a_check_still_waiting_on_hugepages_is_bounded_by_the_check_window
 
 
 @pytest.mark.asyncio
+async def test_another_run_inside_the_check_bound_does_not_cut_the_full_check_short(monkeypatch, clear_job_state):
+    """A forced run of another kind (a progress retry, an off-bus one-shot) inside the check bound
+    after a bound ladder that brought the mesh back neither re-runs the ladder nor fires the host rung."""
+    escalations, _alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why="eth_frozen", detail="gate/post-job: eth/fabric fault on a present mesh", age_min=10.1
+    )
+
+    async def recovered_ladder(kind, indices, expected, log, **_):
+        escalations.append(kind)
+        return OUTCOME_RECOVERED
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", recovered_ladder)
+    monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: True)  # the check has no verdict yet
+    monkeypatch.setattr(srv, "device_hold_escalation_kind", "ceiling_window")
+    await srv._force_escalate_stuck_hold()
+    assert escalations == ["present-forced"] and "host_rung" not in events
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("hold", ["77-only", "topology mismatch", "known fabric fault", "generic"])
 async def test_a_failed_check_after_the_bound_ladder_asks_for_the_host_rung_at_once(monkeypatch, clear_job_state, hold):
     """The ladder brings the mesh back but its full check (fabric included) ends with no pass: the

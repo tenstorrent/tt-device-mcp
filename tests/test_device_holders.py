@@ -219,6 +219,20 @@ def test_reclaim_does_not_report_a_permission_denied_pid_as_signalled():
     assert [h.pid for h in res.survivors] == [4242], "the never-signalled holder must still show up as a survivor"
 
 
+def test_reclaim_carries_the_rescan_completeness():
+    """A blind re-scan cannot prove the device is free; the caller has to fail closed on it."""
+    from tt_device_mcp.device_holders import HolderScan, reclaim_foreign_holders
+
+    res = reclaim_foreign_holders(
+        **_NOT_SELF,
+        grace_sec=0,
+        kill=lambda p, s: None,
+        sleep=lambda _: None,
+        rescan=lambda: HolderScan(holders=[], complete=False),
+    )
+    assert res.scan_complete is False, "reclaim reported a blind re-scan as complete"
+
+
 def test_reclaim_never_retargets_onto_a_new_holder_that_appears_after_it_began():
     """The reclaim's authority is over the allocation that just ended, not over the device in
     general. If the original target dies to SIGTERM but a DIFFERENT tenant opens the device

@@ -77,6 +77,15 @@ def _script(tmp_path, name, body):
 
 
 @pytest.mark.asyncio
+async def test_a_gate_that_allows_resets_hands_back_to_the_ladder(monkeypatch, tmp_path, clear_job_state):
+    hold_since, rec = _gated(monkeypatch, tmp_path)
+    monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off_bus: (True, ""))
+    _ladder_ran(hold_since)
+    assert await _pass(hold_since) is None
+    assert rec["fires"] == [] and rec["alerts"] == []
+
+
+@pytest.mark.asyncio
 async def test_no_power_cycle_before_the_safe_rungs_ran(monkeypatch, tmp_path, clear_job_state):
     """The ladder's safe rungs run once first: the first gated pass arms and hands back."""
     hold_since, rec = _gated(monkeypatch, tmp_path, held_sec=3600)
@@ -168,6 +177,15 @@ async def test_a_foreign_holder_or_an_unreadable_scan_never_holds(monkeypatch, t
     _ladder_ran(hold_since)
     assert await _pass(hold_since) is True
     assert len(rec["fires"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_reset_in_its_own_scope_holds(monkeypatch, tmp_path, clear_job_state):
+    hold_since, rec = _gated(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: "tt-reset@1.scope")
+    _ladder_ran(hold_since)
+    assert await _pass(hold_since) is False
+    assert rec["fires"] == []
 
 
 @pytest.mark.asyncio
@@ -323,6 +341,19 @@ async def test_a_manual_recovery_check_that_cannot_answer_holds_until_the_bound(
     assert rec["fires"] == [] and opc.load_state() == {}
     standing = [f["why"] for k, f in rec["events"] if f.get("phase") == "standing_back"]
     assert standing and all(why in w for w in standing)
+
+
+@pytest.mark.asyncio
+async def test_a_clean_manual_recovery_template_lets_it_fire(monkeypatch, tmp_path, clear_job_state):
+    """The shipped template reading a readable journal with no recovery and no auth.log says none,
+    and the cycle runs."""
+    hold_since, rec = _gated(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_JOURNALCTL", _journal(tmp_path, ["-- No entries --"]))
+    monkeypatch.setenv("TT_MANUAL_RECOVERY_AUTHLOG", str(tmp_path / "no-auth.log"))
+    monkeypatch.setenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", f"bash {_CHECK}")
+    _ladder_ran(hold_since)
+    assert await _pass(hold_since) is True
+    assert len(rec["fires"]) == 1
 
 
 @pytest.mark.asyncio

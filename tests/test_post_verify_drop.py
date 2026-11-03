@@ -185,3 +185,10 @@ async def test_post_verify_drop_not_regressed_on_the_idle_path(monkeypatch, clea
     await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
     assert "reset_regressed_offbus" not in events
     assert srv.recovery_mechanism.regressed_reset_since is None
+
+
+@pytest.mark.asyncio
+async def test_real_regression_still_flagged_on_the_idle_path(monkeypatch, clear_job_state):
+    events = _idle_reset(monkeypatch, verified_present=False)
+    await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], 32, lambda m: None)
+    assert "reset_regressed_offbus" in events

@@ -81,6 +81,14 @@ async def test_a_silent_idle_job_is_reaped_at_the_limit(fast, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_unreadable_io_is_no_signal_and_the_silent_job_is_reaped(fast, monkeypatch):
+    monkeypatch.setattr(srv, "job_io_bytes", lambda *a, **k: None)
+    job, runner = await _start("962", "sleep 600")
+    await _run(job, runner)
+    assert job.status is srv.JobStatus.HUNG
+
+
+@pytest.mark.asyncio
 async def test_a_silent_job_spinning_the_cpu_without_io_is_reaped(fast):
     """The real /proc read: a busy-polling process (what a tt-metal host process does on a hung
     device) burns CPU and moves no storage bytes, so it is reaped at the limit."""

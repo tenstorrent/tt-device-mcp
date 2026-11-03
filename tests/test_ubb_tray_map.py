@@ -17,8 +17,9 @@ import subprocess
 
 import pytest
 
-from tests.conftest import patch_health_event, stub_device_pollers
+from tests.conftest import patch_health_event, patch_recovery, stub_device_pollers
 from tt_device_mcp import server as srv
+from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.health.monitors import pci
 from tt_device_mcp.health.recovery import galaxy
 
@@ -486,6 +487,31 @@ def test_a_degraded_first_normal_snapshot_cannot_freeze_the_map(monkeypatch):
 
 
 # --- the back-to-back sweep journals the mask it fired -----------------------------------------
+
+
+def _sweep_stubs(monkeypatch, fire):
+    """Stub every device-touching step of the back-to-back sweep and record its events."""
+    g = srv.galaxy_recovery
+    events = []
+    monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
+    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    patch_health_event(monkeypatch, lambda kind, **fields: events.append((kind, fields)))
+
+    async def sbr(log):
+        return False
+
+    async def mesh(argv, log, *a, **k):
+        return 0, ""
+
+    async def healthy(expected, log, run_fabric=True, **_):
+        return True, {"snapshot": {"ok": True}}
+
+    patch_recovery(monkeypatch, "_recover_isolated_chips", sbr)
+    patch_recovery(monkeypatch, "_verify_device", healthy)
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", mesh)
+    monkeypatch.setattr(galaxy, "_fire_ubb_reset", fire)
+    return g, events
 
 
 def test_the_off_bus_placement_marks_what_the_map_cannot_place():

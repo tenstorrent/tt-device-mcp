@@ -3489,6 +3489,17 @@ async def test_pollers_restore_covers_a_poller_whose_stop_outlasts_its_bound(mon
 
 
 @pytest.mark.asyncio
+async def test_pollers_restore_covers_a_poller_whose_stop_fails(monkeypatch):
+    """A running poller whose stop returns non-zero is still restored."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service",))
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_scripted(calls, stop=(1, 0.0)))
+
+    await srv._set_device_pollers(False, lambda m: None)
+    assert await srv._set_device_pollers(True, lambda m: None) == ["tt-telemetry.service"]
+
+
+@pytest.mark.asyncio
 async def test_pollers_restore_counts_a_poller_whose_state_cannot_be_read_as_running(monkeypatch):
     """A state probe that outlasts the bound, or prints nothing, says nothing: the unit is restored,
     as every unit was before the restore record existed."""
@@ -8425,6 +8436,19 @@ async def test_galaxy_reset_floor_holds_just_below_the_floor(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_galaxy_reset_floor_resets_exactly_at_the_floor(monkeypatch, tmp_path, clear_job_state):
+    """The other side of the boundary: 16 of 32 off the bus is AT the floor — a mass drop, resets."""
+    _reach_reboot_rung(monkeypatch, tmp_path, n_present=31)
+    monkeypatch.setattr(srv, "read_heartbeats", lambda: {str(i): 100 + i for i in range(16)})  # 16 off
+    resets = _count_galaxy_resets(monkeypatch)
+    monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
+
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False)
+
+    assert resets["n"] == 1, "16 off-bus is at the floor and must reset, not hold"
+
+
+@pytest.mark.asyncio
 async def test_galaxy_reset_floor_holds_a_zero_off_bus_wedge_but_needs_eth_to_lift(
     monkeypatch, tmp_path, clear_job_state
 ):
@@ -8576,6 +8600,42 @@ async def test_eth_heartbeat_hang_reads_as_frozen_not_skipped(monkeypatch):
     monkeypatch.setenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", "sleep 5")
     ok, detail = await srv.health_monitor.verify_eth_heartbeat(timeout_sec=0.3)
     assert ok is False, f"a hung eth read must read as frozen/False, got {ok!r}: {detail}"
+
+
+@pytest.mark.asyncio
+async def test_eth_heartbeat_hang_kills_the_process_group(tmp_path, monkeypatch):
+    """The test above only asserts the VERDICT, and it passed while leaking: asyncio.wait_for's
+    own cancellation of eth.check() raises CancelledError, which does not match run_probe's
+    `except asyncio.TimeoutError` (subproc.py) — run_probe's `finally` only clears tracking
+    (track(None)) and never kills the group in that path. Left unfixed, a frozen core hangs the
+    read, the outer bound fires, the gate HOLDs (which by design never reaches
+    _kill_device_holders), and the reader stays attached to the wedged mesh forever — the exact
+    "nested subprocess holds the device" class CLAUDE.md's process-group doctrine exists to
+    prevent. Proven by actually checking the process group is dead, not just the return value."""
+    pgidfile = tmp_path / "pgid"
+    # Armed so the override actually runs; arming itself is pinned in tests/test_rung_arming.py.
+    monkeypatch.setenv("TTDEV_ETH_CHECK_ARMED", "1")
+    # start_new_session=True (subproc.run_probe) makes the spawned bash's own pid its pgid, so
+    # `echo $$` from inside it names the group to check afterward.
+    monkeypatch.setenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", f"echo $$ > {pgidfile}; sleep 5")
+
+    ok, _ = await srv.health_monitor.verify_eth_heartbeat(timeout_sec=0.3)
+    assert ok is False
+
+    for _ in range(40):
+        if pgidfile.exists() and pgidfile.read_text().strip():
+            break
+        time.sleep(0.05)
+    pgid = int(pgidfile.read_text().strip())
+
+    for _ in range(40):
+        try:
+            os.killpg(pgid, 0)  # signal 0: probe existence, kill nothing
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail(f"process group {pgid} ('sleep 5') is still alive after the outer timeout — leaked")
 
 
 @pytest.mark.asyncio
@@ -9500,6 +9560,32 @@ async def test_idle_relift_never_lifts_an_eth_hold_onto_a_failed_fabric_verdict(
 
 
 @pytest.mark.asyncio
+async def test_idle_relift_escalates_an_eth_hold_with_a_failed_fabric_to_the_present_reset(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """The escalation half: the fabric-failed eth hold above is a FULLY PRESENT mesh — exactly the
+    state the present-mesh galaxy reset cures by re-initing every eth core — so past the grace on
+    an idle, tenant-free mesh the relift runs that reset (riding its guards) instead of standing
+    until a broker restart's startup gate."""
+    _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
+    counters = _arm_stuck_hold(monkeypatch)
+    srv.health_monitor.last_fabric_ok = False
+
+    async def healthy(expected, log, run_fabric=True, **_):
+        return True, {"snapshot": {"ok": True}}
+
+    async def eth_advancing(timeout_sec=60.0):
+        return True, "every active-eth-core heartbeat advancing"
+
+    patch_recovery(monkeypatch, "_verify_device", healthy)
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_advancing)
+
+    await srv._attempt_idle_relift()
+
+    assert counters["resets"] == 1, "past the grace, the fabric-failed present mesh must escalate to the galaxy reset"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("eth", [None, True])
 async def test_idle_relift_resets_a_measured_fabric_failure_without_the_grace(
     monkeypatch, tmp_path, clear_job_state, eth
@@ -9675,6 +9761,26 @@ async def test_idle_relift_bails_if_a_chip_drops_during_the_verify(monkeypatch, 
 
     assert srv.fsm.state is not ServerState.HEALTHY, "the relift must not reopen the door over a fresh dead-chip drop"
     assert srv.fsm.record.why in srv.SELFHEAL_WHYS, "nothing was verified-cleared, so the self-heal hold stands"
+
+
+@pytest.mark.asyncio
+async def test_idle_relift_is_inert_when_kill_switched(monkeypatch, tmp_path, clear_job_state):
+    """The kill switch (SELFHEAL_RELIFT=0) restores the old wait: the relift never touches the
+    device, and the hold stands until a job or a broker restart reopens it."""
+    _setup_selfheal_hold(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_SELFHEAL_RELIFT", "0")
+    verify_called = {"n": 0}
+
+    async def verify(expected, log, run_fabric=True, **_):
+        verify_called["n"] += 1
+        return True, {}
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+
+    await srv._attempt_idle_relift()
+
+    assert verify_called["n"] == 0, "kill-switched: the relift must not probe the device"
+    assert srv.fsm.state is not ServerState.HEALTHY, "and the hold must stand under the kill switch"
 
 
 @pytest.mark.asyncio
@@ -10227,6 +10333,28 @@ async def test_stuck_hold_escalation_re_arms_for_a_new_episode(monkeypatch, clea
     srv.device_hold_episode_since = (datetime.now() - timedelta(minutes=21)).isoformat()
     ran = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
     assert ran is True and counters["resets"] == 2
+
+
+@pytest.mark.asyncio
+async def test_stuck_hold_failed_reset_all_off_bus_holds_loudly_never_reboots(monkeypatch, clear_job_state):
+    """The idle galaxy reset drops the present mesh to all-off-bus (present==0), which self-heal never
+    recovers — but a warm reboot cannot re-enumerate dropped Galaxy ASICs either (32/32 came back off
+    the bus in the incident; only a cold power cycle recovered them). With only the reboot opted in,
+    the climb fires NO rung: it emits the loud power-cycle-required event and keeps holding. Fails on
+    base, which warm-reboots the whole-bus wedge and lands right back in the dead state."""
+    events = []
+    counters = _arm_stuck_hold(monkeypatch, reset_result=False, beats_after_reset={})  # reset bricked it
+    patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
+    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "0")
+    ran = await srv.galaxy_recovery._escalate_stuck_hold(["0", "1"], 32, lambda m: None)
+    assert ran is True and counters["resets"] == 1
+    assert (
+        counters["reboots"] == 0 and counters["power_cycles"] == 0
+    ), "an all-off-bus mesh must never warm-reboot — the reboot cannot re-enumerate dropped ASICs"
+    assert (
+        "all_chips_off_bus_power_cycle_required" in events
+    ), "a whole-bus wedge with no power cycle opted in must emit the loud actionable event"
 
 
 @pytest.mark.asyncio
@@ -11467,6 +11595,10 @@ def _beats_without(off):
     return {str(i): 100 for i in range(32) if i not in off}
 
 
+def _tray_of(tray_map, chip):
+    return next(t for t, chips in tray_map.items() if chip in {int(c) for c in chips})
+
+
 @pytest.mark.asyncio
 async def test_gate_holds_a_one_chip_drop_below_the_floor(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
     """At a job boundary a one-chip drop (chip 18) on a 32/32 Galaxy is below the reset floor. The gate must not run the
@@ -11773,6 +11905,16 @@ async def test_the_foreign_holder_verify_names_the_holder_the_gate_saw(monkeypat
     assert verify["lifted"] is healthy and verify["holders"] == [row]
     assert verify["holders_since"] == srv._foreign_holders_seen[0]
     assert counters["dirty_cleared"] == (1 if healthy else 0)
+
+
+@pytest.mark.asyncio
+async def test_the_foreign_holder_verify_never_names_another_holds_holder(monkeypatch, tmp_path, clear_job_state):
+    counters, calls, events = _fast_verify_setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv, "_foreign_holders_seen", ("2000-01-01T00:00:00", [{"pid": 1, "status": "live"}]))
+
+    await srv._attempt_idle_relift()
+
+    assert ("foreign_holder_verify", {"lifted": True, "healthy": True, "reason": "holder gone"}) in events
 
 
 @pytest.mark.asyncio
@@ -14534,6 +14676,16 @@ def test_a_tenant_holds_clock_is_not_restored_after_a_restart(monkeypatch, tmp_p
     monkeypatch.setattr(srv, "device_hold_logged", False)
     monkeypatch.setattr(srv, "_hold_episode_restorable", True)
     assert srv._restore_hold_episode() == "", "a tenant hold's clock carried into the next process"
+
+
+def test_a_foreign_holder_fault_marks_the_clock_as_a_tenant_hold(monkeypatch, tmp_path, clear_job_state):
+    _stale_hold_clock(monkeypatch, tmp_path, clear_job_state)
+    monkeypatch.setattr(srv, "_hold_episode_restorable", False)
+    srv.fsm.on_fault("foreign_holder", detail="foreign holder present: alice(pid 7)", dirty=False)
+
+    srv._note_tenant_gate_verdict("device unverified: foreign holder present: alice(pid 7)")
+
+    assert srv._restore_hold_episode() == ""
 
 
 @pytest.mark.parametrize("hours_before_boot, restored", [(1, False), (-1, True)])

@@ -68,6 +68,11 @@ def test_hugepages_shortfall_is_none_when_nothing_says_the_pool_is_short(tmp_pat
     assert hostpci.hugepages_shortfall() is None
 
 
+def test_hugepages_shortfall_is_none_with_no_function_on_the_bus(tmp_path, monkeypatch):
+    _fake_bus(tmp_path, monkeypatch, iommu_type="identity", nr="0", n_chips=0)
+    assert hostpci.hugepages_shortfall() is None
+
+
 def test_hugepages_shortfall_counts_pci_functions_not_chips(tmp_path, monkeypatch):
     """UMD pins one 1G page per PCI function, and the vendor setup allocates per function."""
     _fake_bus(tmp_path, monkeypatch, iommu_type="identity", nr="4", n_chips=4)
@@ -767,6 +772,16 @@ def _deadline(monkeypatch):
     monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
     monkeypatch.setattr(srv, "device_hold_episode_reason", "gate/startup: fabric unverified")
     return fired, since
+
+
+def test_the_hold_deadline_forces_a_77_only_hold_only_at_the_bound(monkeypatch, tmp_path, clear_job_state):
+    """Below the 10-min bound a 77-only hold is never forced; at the bound it is (spec 04 I76)."""
+    _hold_77(monkeypatch, tmp_path)
+    fired, since = _deadline(monkeypatch)
+    srv._check_hold_deadline(now=since + timedelta(seconds=srv._stuck_hold_ceiling_sec() - 1))
+    assert fired == []
+    srv._check_hold_deadline(now=since + timedelta(seconds=srv._stuck_hold_ceiling_sec() + 1))
+    assert fired == [True]
 
 
 def test_the_hold_deadline_still_escalates_a_measured_fabric_fault(monkeypatch, tmp_path, clear_job_state):
@@ -1476,6 +1491,16 @@ def _bound(monkeypatch, tmp_path, eth):
 
 
 @pytest.mark.asyncio
+async def test_a_77_only_hold_past_its_bound_climbs_even_on_a_healthy_eth_read(monkeypatch, tmp_path, clear_job_state):
+    """03 I78: the startup checks and an advancing eth read are not the full check; past the I40 bound
+    the hold climbs the ladder and is never released unverified."""
+    rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
+    await srv._attempt_idle_relift()
+    assert rungs == ["present"]
+    assert srv.fsm.state is ServerState.RECOVERING
+
+
+@pytest.mark.asyncio
 async def test_a_77_only_hold_with_a_link_drop_climbs_the_ladder_not_released(monkeypatch, tmp_path, clear_job_state):
     """A 77 is never a healthy fabric: a link-count drop reads no-verdict and goes to the ladder."""
     rungs = _bound(monkeypatch, tmp_path, (None, "eth links below baseline"))
@@ -1605,6 +1630,17 @@ async def test_a_topology_mismatch_whose_rerun_77s_takes_the_bounded_fallback(
 async def test_a_77_only_hold_under_its_bound_still_just_holds(monkeypatch, tmp_path, clear_job_state):
     rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
     monkeypatch.setattr(srv, "FABRIC_77_MAX_RETRIES", 5)
+    await srv._attempt_idle_relift()
+    assert rungs == []
+    assert srv.fsm.state is ServerState.RECOVERING
+
+
+@pytest.mark.asyncio
+async def test_a_known_fabric_fault_hold_is_outside_the_77_bound(monkeypatch, tmp_path, clear_job_state):
+    """03 I46: the fallback release is what kept handing jobs a fabric that killed them, so a known
+    fabric fault neither lifts on a healthy eth read nor climbs the ladder past the bound."""
+    rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
+    monkeypatch.setattr(srv.health_monitor, "known_fabric_fault", lambda: "known fabric fault: 2 jobs in a row")
     await srv._attempt_idle_relift()
     assert rungs == []
     assert srv.fsm.state is ServerState.RECOVERING

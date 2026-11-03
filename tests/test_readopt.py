@@ -592,6 +592,21 @@ def _no_ladder(monkeypatch) -> list:
 
 
 @pytest.mark.asyncio
+async def test_a_per_user_daemon_start_runs_a_light_probe_and_a_pass_reads_healthy(
+    monkeypatch, clear_job_state, tmp_path
+):
+    """A per-user daemon used to go BOOT -> HEALTHY on trust. It now probes first — the light pass
+    only, no fabric — and a healthy pass leaves it HEALTHY. Fails on base: no probe ran."""
+    _per_user_start(monkeypatch, tmp_path)
+    passes = _probe(monkeypatch, healthy=True)
+
+    await srv.run_startup_tasks()
+
+    assert passes == [False], "the per-user start must run exactly one light pass, with no fabric"
+    assert srv.fsm.state is ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
 async def test_a_per_user_daemon_start_on_a_bad_device_stays_recovering(monkeypatch, clear_job_state, tmp_path):
     """The hole: a per-user daemon restarted onto a device whose ARC stopped ticking read HEALTHY and admitted its first
     job onto it."""
