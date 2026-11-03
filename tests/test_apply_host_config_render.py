@@ -15,6 +15,8 @@ case is pinned alongside so the wiring cannot start rendering a line by accident
 import subprocess
 from pathlib import Path
 
+import pytest
+
 _SCRIPT = Path(__file__).resolve().parent.parent / "deploy" / "apply-host-config.sh"
 _REPO = _SCRIPT.parent.parent
 
@@ -171,13 +173,22 @@ def test_a_stale_reboot_setting_renders_no_line(tmp_path):
     assert "POST_REBOOT_VERIFY" not in unit
 
 
-def test_prejob_dispatch_unset_renders_no_line(tmp_path):
-    # Default: the pre-job dispatch probe is opted out. server.py's _prejob_dispatch_enabled() reads
-    # "0", so the gate never runs the probe and admits exactly as before this wiring. Pinned so the
-    # seam cannot start arming an untimed probe by accident — an untimed probe that runs slow reads as
-    # a false wedge and holds the box, the reboot-class failure the opt-in default exists to prevent.
+@pytest.mark.parametrize(
+    "name",
+    [
+        # Default: the pre-job dispatch probe is opted out. server.py's _prejob_dispatch_enabled() reads
+        # "0", so the gate never runs the probe and admits exactly as before this wiring. Pinned so the
+        # seam cannot start arming an untimed probe by accident — an untimed probe that runs slow reads as
+        # a false wedge and holds the box, the reboot-class failure the opt-in default exists to prevent.
+        "TT_DEVICE_MCP_PREJOB_DISPATCH",
+        # Default: no line, so server.py's built-in poller list (no clock-cap keeper) rules.
+        "TT_DEVICE_MCP_POLLER_SERVICES",
+        "TTDEV_ETH_CHECK_PYTHON",
+    ],
+)
+def test_an_unset_knob_renders_no_line(tmp_path, name):
     unit = _render(tmp_path, _GALAXY)
-    assert "TT_DEVICE_MCP_PREJOB_DISPATCH" not in unit
+    assert name not in unit
 
 
 def test_prejob_dispatch_set_reaches_the_unit(tmp_path):
@@ -190,12 +201,6 @@ def test_prejob_dispatch_set_reaches_the_unit(tmp_path):
     line = "Environment=TT_DEVICE_MCP_PREJOB_DISPATCH=1"
     assert line in unit
     assert unit.index(line) < unit.index("ExecStart=")
-
-
-def test_poller_services_unset_renders_no_line(tmp_path):
-    # Default: no line, so server.py's built-in poller list (no clock-cap keeper) rules.
-    unit = _render(tmp_path, _GALAXY)
-    assert "TT_DEVICE_MCP_POLLER_SERVICES" not in unit
 
 
 def test_poller_services_set_reaches_the_unit(tmp_path):
@@ -217,11 +222,6 @@ def test_eth_check_python_reaches_the_unit(tmp_path):
     line = "Environment=TTDEV_ETH_CHECK_PYTHON=/opt/tt/python_env/bin/python"
     assert line in unit
     assert unit.index(line) < unit.index("ExecStart=")
-
-
-def test_eth_check_python_unset_renders_no_line(tmp_path):
-    unit = _render(tmp_path, _GALAXY)
-    assert "TTDEV_ETH_CHECK_PYTHON" not in unit
 
 
 def test_the_unit_never_orders_after_the_vendor_hugepages_service(tmp_path):
