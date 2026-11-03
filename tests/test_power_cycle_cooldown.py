@@ -496,14 +496,14 @@ def _hist_recs(path, *recs):
     path.write_text("".join(json.dumps({"at_epoch": a, "cause": c}) + "\n" for a, c in recs))
 
 
-def test_an_unmatched_failure_line_is_ignored(state_hist):
-    _hist_recs(state_hist, (T0 - 500, "old"), (T0 - 100, "other (cycle failed)"))
-    assert recovery_base._last_external_power_cycle(T0) == (T0 - 500, "old")
-
-
-def test_an_attempt_without_a_failure_line_still_counts(state_hist):
-    _hist_recs(state_hist, (T0 - 500, "old"), (T0 - 100, "BMC"))
-    assert recovery_base._last_external_power_cycle(T0) == (T0 - 100, "BMC")
+@pytest.mark.parametrize(
+    "line,want",
+    [("other (cycle failed)", (T0 - 500, "old")), ("BMC", (T0 - 100, "BMC"))],
+    ids=["unmatched-failure-line-ignored", "attempt-without-failure-line-counts"],
+)
+def test_a_failure_line_voids_only_its_own_attempt(state_hist, line, want):
+    _hist_recs(state_hist, (T0 - 500, "old"), (T0 - 100, line))
+    assert recovery_base._last_external_power_cycle(T0) == want
 
 
 # ---- (i) one hold episode's deadline never moves later ------------------------------------------

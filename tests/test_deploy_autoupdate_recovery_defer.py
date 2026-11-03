@@ -178,8 +178,16 @@ def test_the_bound_is_capped_at_30_minutes_and_0_turns_it_off(tmp_path):
     assert "GATE PASSED" in done.stdout, done.stderr
 
 
-def test_the_default_bound_is_20_minutes():
-    assert 'RECOVERY_DEFER="${TTDEV_RECOVERY_DEFER_SEC:-1200}"' in _SCRIPT.read_text()
+@pytest.mark.parametrize(
+    "line",
+    [
+        'RECOVERY_DEFER="${TTDEV_RECOVERY_DEFER_SEC:-1200}"',
+        'AU_LOG="${TTDEV_LOG_DIR:-/var/log/tt-device-broker}/autoupdate.log"',
+    ],
+    ids=["default-bound-20-min", "log-in-broker-log-dir"],
+)
+def test_the_script_defaults(line):
+    assert line in _SCRIPT.read_text()
 
 
 def test_the_device_op_bar_still_comes_first_and_is_logged(tmp_path):
@@ -412,7 +420,3 @@ def test_the_log_is_kept_to_about_a_mebibyte(tmp_path):
     done, _, log = _gate(tmp_path, health=[_health(held=True, age=60)])
     assert len(log) == 1 and "decision=deferred" in log[0]
     assert (logs / "autoupdate.log.1").stat().st_size == 1048576
-
-
-def test_the_log_lives_in_the_broker_log_dir():
-    assert 'AU_LOG="${TTDEV_LOG_DIR:-/var/log/tt-device-broker}/autoupdate.log"' in _SCRIPT.read_text()

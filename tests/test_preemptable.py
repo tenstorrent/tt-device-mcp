@@ -1497,15 +1497,13 @@ def test_no_kill_instant_before_the_limit_even_with_a_waiter(clear_job_state):
     assert job.contention_since_monotonic is None
 
 
-def test_a_waiter_after_the_limit_starts_the_minute_at_its_arrival(clear_job_state):
-    # Limit at 100; the waiter arrived at 107; noticed late, at 110: the minute still runs from 107.
-    _queued_at("961", 107.0)
-    assert srv._preempt_kill_at(_pjob(), 100.0, now=110.0) == 107.0 + srv.PREEMPT_GRACE_SEC
-
-
-def test_a_waiter_before_the_limit_starts_the_minute_at_the_limit(clear_job_state):
-    _queued_at("962", 80.0)
-    assert srv._preempt_kill_at(_pjob(), 100.0, now=110.0) == 100.0 + srv.PREEMPT_GRACE_SEC
+@pytest.mark.parametrize(
+    "job_id,arrived,start", [("961", 107.0, 107.0), ("962", 80.0, 100.0)], ids=["after-limit", "before-limit"]
+)
+def test_the_grace_minute_starts_at_the_later_of_the_limit_and_the_waiter(clear_job_state, job_id, arrived, start):
+    # Limit at 100, noticed late at 110: the minute runs from the waiter's arrival or the limit, whichever is later.
+    _queued_at(job_id, arrived)
+    assert srv._preempt_kill_at(_pjob(), 100.0, now=110.0) == start + srv.PREEMPT_GRACE_SEC
 
 
 def test_the_earliest_waiter_sets_the_minute(clear_job_state):

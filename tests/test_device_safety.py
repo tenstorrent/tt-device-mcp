@@ -4954,15 +4954,10 @@ def test_the_brokers_own_child_probe_does_not_block_dispatch(monkeypatch):
     assert srv._tenant_holder_reason() == ""
 
 
-def test_a_leftover_reparented_away_from_the_broker_still_blocks_dispatch(monkeypatch):
-    """A daemonized leftover reparented to init is no longer the broker's child: it still counts."""
-    _patch_device_holders(monkeypatch, HolderScan(holders=[DeviceHolder(pid=5001, uid=1234)]), ppids={5001: 1})
-    assert "pid 5001" in srv._tenant_holder_reason()
-
-
-def test_a_holder_that_exits_mid_walk_does_not_break_the_scan(monkeypatch):
-    """The holder's parent is gone before its stat is read: no crash, and it is not exempted."""
-    _patch_device_holders(monkeypatch, HolderScan(holders=[DeviceHolder(pid=5001, uid=1234)]), ppids={5001: 5000})
+@pytest.mark.parametrize("ppid", [1, 5000], ids=["reparented-to-init", "parent-gone-mid-walk"])
+def test_a_holder_that_is_not_the_brokers_child_still_blocks_dispatch(monkeypatch, ppid):
+    """Reparented to init, or its parent gone before its stat is read: no crash, and it still counts."""
+    _patch_device_holders(monkeypatch, HolderScan(holders=[DeviceHolder(pid=5001, uid=1234)]), ppids={5001: ppid})
     assert "pid 5001" in srv._tenant_holder_reason()
 
 

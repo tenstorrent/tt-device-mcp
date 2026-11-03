@@ -59,16 +59,12 @@ def test_hugepages_shortfall_reports_a_short_pool_behind_identity_or_no_iommu(tm
     assert hostpci.hugepages_shortfall() == (3, 32)
 
 
-def test_hugepages_shortfall_is_none_behind_a_translating_iommu(tmp_path, monkeypatch):
-    """A DMA domain maps buffers through the IOMMU and needs no hugepages: nothing to wait for."""
-    _fake_bus(tmp_path, monkeypatch, iommu_type="DMA-FQ", nr="0")
-    assert hostpci.hugepages_shortfall() is None
-
-
-def test_hugepages_shortfall_is_none_without_a_readable_pool(tmp_path, monkeypatch):
-    """No 1G pool to read is not evidence of a short one; waiting on it would hold a box that may
-    not use hugepages at all."""
-    _fake_bus(tmp_path, monkeypatch, iommu_type="identity", nr=None)
+@pytest.mark.parametrize(
+    "iommu_type,nr", [("DMA-FQ", "0"), ("identity", None)], ids=["translating-iommu", "no-readable-pool"]
+)
+def test_hugepages_shortfall_is_none_when_nothing_says_the_pool_is_short(tmp_path, monkeypatch, iommu_type, nr):
+    """A DMA domain needs no hugepages; no 1G pool to read is not evidence of a short one. Nothing to wait for."""
+    _fake_bus(tmp_path, monkeypatch, iommu_type=iommu_type, nr=nr)
     assert hostpci.hugepages_shortfall() is None
 
 
@@ -110,21 +106,25 @@ def test_the_broker_waits_only_when_the_expected_chip_count_is_set(monkeypatch):
 # --- the fabric wrapper's reason and the action-log output -------------------------------------
 
 
-def test_override_reason_prefers_the_cause_over_the_terminate_banner():
-    text = (
-        "fabric-check: validating 32 chips\n"
-        "terminate called after throwing an instance of 'std::runtime_error'\n"
-        "  what():  Failed to allocate 32 hugepages\n"
-        "fabric-check: no link was tested\n"
-    )
-    assert health_monitor_mod._override_reason(text) == "what():  Failed to allocate 32 hugepages"
-
-
-def test_override_reason_finds_a_filesystem_error():
-    text = "banner\nfilesystem error: cannot create directory: No space left on device\nlast line\n"
-    assert health_monitor_mod._override_reason(text) == (
-        "filesystem error: cannot create directory: No space left on device"
-    )
+@pytest.mark.parametrize(
+    "text,want",
+    [
+        (
+            "fabric-check: validating 32 chips\n"
+            "terminate called after throwing an instance of 'std::runtime_error'\n"
+            "  what():  Failed to allocate 32 hugepages\n"
+            "fabric-check: no link was tested\n",
+            "what():  Failed to allocate 32 hugepages",
+        ),
+        (
+            "banner\nfilesystem error: cannot create directory: No space left on device\nlast line\n",
+            "filesystem error: cannot create directory: No space left on device",
+        ),
+    ],
+    ids=["cause-over-terminate-banner", "filesystem-error"],
+)
+def test_override_reason_finds_the_cause(text, want):
+    assert health_monitor_mod._override_reason(text) == want
 
 
 def test_override_reason_falls_back_to_the_wrappers_final_line():

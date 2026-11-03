@@ -790,12 +790,13 @@ def _recorded_lap(tmp_path, **kw):
     return rec.read_text().strip()
 
 
-def test_an_idle_lap_reports_idle_and_no_drain(tmp_path):
-    assert _recorded_lap(tmp_path, running=0, queue=0, install="") == "idle=true drained_s=0"
-
-
-def test_a_lap_that_drains_reports_busy_and_its_drain_time(tmp_path):
-    assert _recorded_lap(tmp_path, running=4, queue=2, install="") == "idle=false drained_s=10"
+@pytest.mark.parametrize(
+    "running,queue,want",
+    [(0, 0, "idle=true drained_s=0"), (4, 2, "idle=false drained_s=10")],
+    ids=["idle-no-drain", "busy-drain-time"],
+)
+def test_a_lap_reports_idle_and_its_drain_time(tmp_path, running, queue, want):
+    assert _recorded_lap(tmp_path, running=running, queue=queue, install="") == want
 
 
 def test_a_wait_at_the_restart_point_adds_to_the_drain_time(tmp_path):
