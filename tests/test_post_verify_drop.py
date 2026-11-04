@@ -41,7 +41,7 @@ async def test_killed_check_no_sleep(monkeypatch):
     healthy, spent, sleeps, fabric_asked = await _replay_post_reset_verify(monkeypatch, [(70.0, KILLED)])
     assert healthy is False, "a check a lost chip ended is a failed verify, never a pass or a 77"
     assert sleeps == [] and spent == 70.0, "no eth-training wait"
-    assert fabric_asked == [True], "one full pass with fabric (goal 8), no retry"
+    assert fabric_asked == [True], "one full pass with fabric, no retry"
     assert "post_reset_verify_chip_lost" in events
     assert srv.recovery_mechanism.last_reset_verified_present()
 
@@ -75,7 +75,7 @@ async def test_a_plain_no_trained_link_77_still_waits(monkeypatch):
     """Nothing lost: the 77 is eth training, and the wait stays (spec 04 I84)."""
     srv.isolated_chips = set()
     healthy, _, sleeps, _ = await _replay_post_reset_verify(monkeypatch, [(40.0, NO_TRAINED_LINK_77)] * 2)
-    assert healthy is None and sleeps == [60.0], "a persistent 77 is UNKNOWN, held (goal 11)"
+    assert healthy is None and sleeps == [60.0], "a persistent 77 is UNKNOWN, held"
 
 
 # -- gate path ------------------------------------------------------------------------------------
@@ -111,9 +111,8 @@ def _gate_reset_whose_verify_reads(monkeypatch, tmp_path, evidence):
 
 @pytest.mark.asyncio
 async def test_post_verify_drop_not_regressed(monkeypatch, tmp_path, clear_job_state):
-    """The reset's own check read all 32 chips; a chip dropped under its fabric pass (the check was
-    killed). That is a new drop, not a regression: no latch and no reset_regressed_offbus. The failed
-    verify still arms the failed-reset cooldown, so the next gate runs no second reset inside it."""
+    """The reset's own check read all 32 chips; a chip dropped under its fabric pass (the check was killed). That is a
+    new drop, not a regression: no latch and no reset_regressed_offbus."""
     events, resets = _gate_reset_whose_verify_reads(monkeypatch, tmp_path, KILLED)
     await srv._device_health_gate(None, phase="post-job", run_fabric=False)
     assert resets["n"] == 1

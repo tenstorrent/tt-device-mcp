@@ -43,11 +43,10 @@ def _fake_sysfs(
     vendor_ffff=(),
     config_unreadable=(),
 ) -> dict:
-    """32 chips; ``missing`` have no class node, ``unbound`` an endpoint with no driver, ``enodata``
-    (``eio``) a heartbeat read that fails with ENODATA (EIO), ``speed_unknown`` (``width_63``) an
-    endpoint whose link reads down by its speed (width), ``vendor_ffff`` an endpoint whose config
-    space reads all-ones and ``config_unreadable`` one with no readable config (every other endpoint's
-    config starts with the Tenstorrent vendor id). Returns a handle to bring a chip back."""
+    """32 chips; ``missing`` have no class node, ``unbound`` an endpoint with no driver, ``enodata`` (``eio``) a
+    heartbeat read that fails with ENODATA (EIO), ``speed_unknown`` (``width_63``) an endpoint whose link reads down by
+    its speed (width), ``vendor_ffff`` an endpoint whose config space reads all-ones and ``config_unreadable`` one with
+    no readable config (every other endpoint's config starts with the Tenstorrent vendor id)."""
     cls_dir = tmp_path / "sys/class/tenstorrent"
     devs = tmp_path / "sys/bus/pci/devices"
     cls_dir.mkdir(parents=True)
@@ -189,14 +188,10 @@ async def test_a_reset_drops_a_returned_chip_after_its_rescan(monkeypatch, tmp_p
     async def no_sleep(_):
         return None
 
-    async def no_ceiling(*a, **k):
-        return True, "ok", {}
-
     monkeypatch.setattr(srv, "_set_device_pollers", pollers)
     monkeypatch.setattr(srv.recovery_mechanism, "run_scoped", run)
     monkeypatch.setattr(srv.asyncio, "to_thread", to_thread)
     monkeypatch.setattr(srv.asyncio, "sleep", no_sleep)
-    monkeypatch.setattr(base.CEILING, "apply", no_ceiling)
 
     rc, _ = await srv.recovery_mechanism.reset_with_quiesce(["tt-smi", "-r"], lambda m: None)
 
@@ -204,7 +199,7 @@ async def test_a_reset_drops_a_returned_chip_after_its_rescan(monkeypatch, tmp_p
     assert srv.isolated_chips == {"9"}
 
 
-# ---------------------------------------------------------------- goal 8: nothing here releases
+# ---------------------------------------------------------------- full check after every reset: nothing here releases
 
 
 @pytest.mark.asyncio
@@ -248,10 +243,9 @@ def test_dropping_a_returned_chip_never_clears_the_hold(monkeypatch, tmp_path, c
 
 
 def test_unreadable_on_bus_chips_names_bound_eio_chips_only(monkeypatch, tmp_path):
-    """A bound, enumerated chip whose heartbeat read fails with EIO is on the bus (unhealthy) for the
-    class A read; ENODATA has its own path (vendor 0x1e52: ARC not ready; 0xffff: off), and a missing
-    or unbound chip stays off the bus. An ENODATA chip whose config read fails is the one ENODATA
-    shape that joins them (spec 04 I24)."""
+    """A bound, enumerated chip whose heartbeat read fails with EIO is on the bus (unhealthy) for the class A read;
+    ENODATA has its own path (vendor 0x1e52: ARC not ready; 0xffff: off), and a missing or unbound chip stays off the
+    bus. An ENODATA chip whose config read fails is the one ENODATA shape that joins them (spec 04 I24)."""
     _fake_sysfs(
         monkeypatch,
         tmp_path,
@@ -377,9 +371,8 @@ FOK = {"snapshot": {"ok": True}, "fabric": {"ok": True, "detail": "fabric links 
 
 
 def _mesh_reset_rig(monkeypatch, tmp_path, outcomes, *, missing=(), evidence=FOK):
-    """A 32-chip fake sysfs and a ``tt-smi -glx_reset`` whose n-th run returns ``outcomes[n]`` =
-    ``(rc, chips left ARC-not-ready)``. Every verify is stubbed to enum+ARC healthy with ``evidence``.
-    Returns ``(recovery, resets, verifies, events)``."""
+    """A 32-chip fake sysfs and a ``tt-smi -glx_reset`` whose n-th run returns ``outcomes[n]`` = ``(rc, chips left
+    ARC-not-ready)``. Every verify is stubbed to enum+ARC healthy with ``evidence``."""
     handle = _fake_sysfs(monkeypatch, tmp_path, missing=missing)
     events = []
     patch_health_event(monkeypatch, lambda kind, **f: events.append(kind))
@@ -458,9 +451,8 @@ async def test_a_retry_whose_fabric_fails_is_not_a_recovery(monkeypatch, tmp_pat
     ["chip-still-off-bus", "arc-all-ready", "job-running", "tenant-holder", "scan-incomplete", "per-target-reset"],
 )
 async def test_no_retry_outside_the_bus_back_arc_not_ready_idle_shape(monkeypatch, tmp_path, clear_job_state, case):
-    """Every other failed reset keeps the no-repeat rule: a chip still off the bus (a dead endpoint),
-    nothing ARC-not-ready, a running job or a tenant (or a scan that cannot rule one out), or a
-    per-target ``-r``."""
+    """Every other failed reset keeps the no-repeat rule: a chip still off the bus (a dead endpoint), nothing
+    ARC-not-ready, a running job or a tenant (or a scan that cannot rule one out), or a per-target ``-r``."""
     missing = (0,) if case == "chip-still-off-bus" else ()
     not_ready = () if case == "arc-all-ready" else ALL_BUT_0
     g, resets, verifies, events = _mesh_reset_rig(monkeypatch, tmp_path, [(1, not_ready), (0, ())], missing=missing)

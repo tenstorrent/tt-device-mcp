@@ -200,9 +200,8 @@ async def test_the_driver_wait_rescan_starts_only_after_the_bmc_re_power_went_ou
 async def test_a_clean_mesh_reset_still_owes_the_full_check_before_release(
     ladder, monkeypatch, healthy, evidence, released  # noqa: F811
 ):
-    """Goals 8/11: the rescan after a re-powered mesh reset releases nothing; the hold lifts only once
-    the full check, fabric included, has passed after it, and a failed or unproven check keeps it.
-    Driven through the gate's own mesh-reset rung and fold, so nothing here clears the hold."""
+    """Full check before any release: the rescan after a re-powered mesh reset releases nothing; the hold lifts only
+    once the full check, fabric included, has passed after it, and a failed or unproven check keeps it."""
     rig = ladder
     pci.REMOVED_CHIPS[REMOVED] = dict(REMOVED_REC)
     srv.isolated_chips = {REMOVED}
@@ -235,7 +234,7 @@ async def test_a_clean_mesh_reset_still_owes_the_full_check_before_release(
 
 @pytest.mark.asyncio
 async def test_a_withheld_rescan_does_not_stop_the_ten_minute_ladder(monkeypatch, clear_job_state):
-    """Goal 10: a hold left by a failed mesh reset, its removed chip still isolated, runs the full
+    """10-min ladder: a hold left by a failed mesh reset, its removed chip still isolated, runs the full
     ladder at the 10-min bound and then asks for the host rung."""
     why, detail, output, beats, ladder_kind = _KINDS["off-bus"]
     escalations, _alerts, events = _arm_fabric_only_deadline_hold(

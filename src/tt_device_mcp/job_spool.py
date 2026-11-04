@@ -70,10 +70,8 @@ def _private_dir(d: Path) -> bool:
 def open_job_spool(job_id: str) -> Optional[dict]:
     """Create the job's spool files; return {"stdout": fd, "stderr": fd} for the child to write.
 
-    None when the spool cannot be had (no such dir and no right to make it, a dir that is not
-    private, a full filesystem): the caller then falls back to pipes, as before. A job is never
-    refused for want of a spool.
-    """
+    None when the spool cannot be had (no such dir and no right to make it, a dir that is not private, a full
+    filesystem): the caller then falls back to pipes, as before. A job is never refused for want of a spool."""
     d = job_spool_dir()
     try:
         d.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -250,10 +248,9 @@ def remove_job_spool(job_id: str) -> None:
 
 
 def read_unread_tail(job_id: str, max_bytes: Optional[int] = None) -> dict:
-    """What each stream holds past the recorded offsets: output no broker copied into the job log.
-    Returns {name: (skipped, data)} for each stream with any; past ``max_bytes`` (default
-    SPOOL_SALVAGE_MAX_BYTES) only the last ``max_bytes`` are read and ``skipped`` counts the rest.
-    A stream that cannot be read is left out."""
+    """What each stream holds past the recorded offsets: output no broker copied into the job log. Returns {name:
+    (skipped, data)} for each stream with any; past ``max_bytes`` (default SPOOL_SALVAGE_MAX_BYTES) only the last
+    ``max_bytes`` are read and ``skipped`` counts the rest. A stream that cannot be read is left out."""
     limit = SPOOL_SALVAGE_MAX_BYTES if max_bytes is None else max_bytes
     paths = spool_paths(job_id)
     start = read_offsets(job_id)
@@ -284,9 +281,8 @@ def read_unread_tail(job_id: str, max_bytes: Optional[int] = None) -> dict:
 
 
 def sweep_job_spools(keep: Callable[[str], bool], salvage: Optional[Callable[[str], None]] = None) -> list:
-    """Remove the spools of every job ``keep`` does not claim. ``salvage(job_id)`` runs first, once per
-    such job, while its spool is still there (an exception in it never stops the removal). Returns the
-    job ids removed."""
+    """Remove the spools of every job ``keep`` does not claim. ``salvage(job_id)`` runs first, once per such job, while
+    its spool is still there (an exception in it never stops the removal). Returns the job ids removed."""
     d = job_spool_dir()
     if not _private_dir(d):
         return []

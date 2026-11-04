@@ -57,14 +57,13 @@ DEFAULT_ETH_VENV_PYTHON = "/opt/tt-device-broker/eth-venv/bin/python"
 # an unsandboxed test would resolve to the real probe script instead of a scripted stand-in.
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 
-# resolve_python() spawns up to three `python -c "import ttexalens"` checks (10s each), and on an
-# armed host build() calls it on every clean post-job gate — outside the read's own bound. So the
-# answer is cached per process, keyed on the candidate list and where the validator's `current`
-# symlink points: re-pointing `current`, or changing any candidate env var, re-resolves. A hit is
-# re-checked with cheap stat calls only (the python still executable, its tree still there). A
-# miss (None) is cached for NEGATIVE_TTL_SEC only, and not at all when an import check timed out,
-# so a venv provisioned later is picked up without a restart. forget_python() drops the entry
-# when a read crashes. One slot: (key, answer, monotonic time it was stored), or None.
+# resolve_python() spawns up to three `python -c "import ttexalens"` checks (10s each), and on an armed host build()
+# calls it on every clean post-job gate — outside the read's own bound. So the answer is cached per process, keyed on
+# the candidate list and where the validator's `current` symlink points: re-pointing `current`, or changing any
+# candidate env var, re-resolves. A hit is re-checked with cheap stat calls only (the python still executable, its tree
+# still there). A miss (None) is cached for NEGATIVE_TTL_SEC only, and not at all when an import check timed out, so a
+# venv provisioned later is picked up without a restart. forget_python() drops the entry when a read crashes. One slot:
+# (key, answer, monotonic time it was stored), or None.
 NEGATIVE_TTL_SEC = 60.0
 _python_cache: Optional[tuple[tuple, Optional[tuple[str, str]], float]] = None
 _python_cache_lock = threading.Lock()
@@ -261,10 +260,9 @@ def build() -> Optional[tuple[list[str], dict[str, str]]]:
     exactly the forgery the sentinel exists to prevent. Use
     ``TTDEV_ETH_CHECK_ALLOW_KNOWN_BROKEN=1`` (below) to run the probe itself, laundered.
 
-    Spawns nothing and does no I/O beyond ``os.access`` checks EXCEPT ``resolve_python()``,
-    which can shell out up to three candidate pythons on a cache miss — callers on an event
-    loop should run this off it (e.g. ``asyncio.to_thread``), see
-    ``monitor.verify_eth_heartbeat``.
+    Spawns nothing and does no I/O beyond ``os.access`` checks EXCEPT ``resolve_python()``, which can shell out up to
+    three candidate pythons on a cache miss — callers on an event loop should run this off it (e.g.
+    ``asyncio.to_thread``), see ``monitor.verify_eth_heartbeat``.
 
     The built-in path is ``None`` — unavailable, same as no override and no validator
     installed for fabric — until ALL of: the rung is armed on this host (the broker's startup
@@ -412,11 +410,9 @@ async def check(
 ) -> tuple[Optional[int], str]:
     """Run an already-built eth-heartbeat command (see ``build()``) and return ``(rc, output)``.
 
-    ``terminate`` is deliberately left at ``run_probe``'s own default (a hard ``killpg``): a
-    hung register read has no graceful unwind worth waiting for, unlike the fabric traffic
-    pass's own escalation ladder — it is either measuring or already wedged. ``reap_sec`` is
-    ``run_probe``'s bounded wait for the killed reader to finish exiting.
-    """
+    ``terminate`` is deliberately left at ``run_probe``'s own default (a hard ``killpg``): a hung register read has no
+    graceful unwind worth waiting for, unlike the fabric traffic pass's own escalation ladder — it is either measuring
+    or already wedged. ``reap_sec`` is ``run_probe``'s bounded wait for the killed reader to finish exiting."""
     rc, raw = await run_probe(
         argv,
         timeout_sec=timeout_sec,

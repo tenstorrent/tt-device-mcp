@@ -142,10 +142,18 @@ def _run_block(tmp_path, python_body: str):
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30, env=dict(os.environ))
 
 
-def test_the_installer_prints_the_warning_and_carries_on(tmp_path):
-    r = _run_block(tmp_path, "echo 'pool missing: 8 pages'")
+@pytest.mark.parametrize(
+    "preflight,warning",
+    [
+        ("echo 'pool missing: 8 pages'", "warn: pool missing: 8 pages"),
+        ("exit 1", "warn: the 1G hugepage preflight could not run"),
+    ],
+    ids=["warning", "cannot-run"],
+)
+def test_the_installer_warns_and_carries_on(tmp_path, preflight, warning):
+    r = _run_block(tmp_path, preflight)
     assert r.returncode == 0, r.stderr
-    assert "warn: pool missing: 8 pages" in r.stderr
+    assert warning in r.stderr
     assert "reached-end" in r.stdout
 
 
@@ -153,13 +161,6 @@ def test_the_installer_is_silent_when_no_page_is_needed(tmp_path):
     r = _run_block(tmp_path, "echo ''")
     assert r.returncode == 0, r.stderr
     assert "warn:" not in r.stderr and "reached-end" in r.stdout
-
-
-def test_a_preflight_that_cannot_run_is_loud_but_not_fatal(tmp_path):
-    r = _run_block(tmp_path, "exit 1")
-    assert r.returncode == 0, r.stderr
-    assert "warn: the 1G hugepage preflight could not run" in r.stderr
-    assert "reached-end" in r.stdout
 
 
 def test_the_installer_calls_the_brokers_own_rule_from_the_new_venv(tmp_path):

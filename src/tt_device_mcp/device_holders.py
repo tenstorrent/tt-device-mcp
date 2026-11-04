@@ -38,12 +38,16 @@ DRIVER_PROC_DIR = "/proc/driver/tenstorrent"
 # Only real logged-in users (uid >= this) count as foreign holders to protect.
 MIN_TENANT_UID = 1000
 
-# The uid floor alone misses tenant work run under a service account. Work the broker itself
-# launched runs (under privsep) in one of these transient scopes: a queued job in
-# ttdev-job-<id>.scope, a direct exec in ttdev-exec-<pid>-<n>.scope. A process cannot leave its
-# scope, so one still holding the device after its job was marked killed or finished is that job's
-# straggler, and a reset under it is a reset under the job, whatever its uid.
+# The uid floor alone misses tenant work run under a service account. Work the broker itself launched runs (under
+# privsep) in one of these transient scopes: a queued job in ttdev-job-<id>.scope, a direct exec in
+# ttdev-exec-<pid>-<n>.scope. A process cannot leave its scope, so one still holding the device after its job was marked
+# killed or finished is that job's straggler, and a reset under it is a reset under the job, whatever its uid.
 BROKER_SCOPE_PREFIXES = ("ttdev-job-", "ttdev-exec-")
+# A device container (docker, containerd, podman) runs in its own cgroup, outside any broker scope, often as root, and
+# outlives the job that started it. Its cgroup alone says it is tenant work, not infrastructure.
+CONTAINER_SCOPE_PREFIXES = ("docker-", "cri-containerd-", "libpod-")
+# The cgroupfs driver's form: /docker/<id>.
+CONTAINER_CGROUP_PARENTS = ("docker",)
 # Where a holder's cgroup is read from. A module attribute so tests point it at a staged tree.
 SCOPE_PROC_DIR = "/proc"
 # Comma-separated uids or user names that count as tenants even below MIN_TENANT_UID: a service
@@ -60,6 +64,8 @@ class DeviceHolder:
     # Sits in a broker job or exec scope (BROKER_SCOPE_PREFIXES). Read once, at scan time; not part
     # of the holder's identity, so holders from two scans still compare by (pid, uid).
     scoped: bool = field(default=False, compare=False)
+    # Sits in a container's cgroup (CONTAINER_SCOPE_PREFIXES); read like ``scoped``.
+    contained: bool = field(default=False, compare=False)
 
     @property
     def username(self) -> str:
@@ -70,16 +76,25 @@ def in_broker_scope(pid: int, prefixes: tuple = BROKER_SCOPE_PREFIXES) -> bool:
     """True when ``pid`` sits in a broker job or exec scope (or, with ``prefixes``, another broker
     scope such as a reset's). Unreadable reads as False: the uid rule still applies, and
     /proc/<pid>/cgroup is world-readable, so only an exited pid gets here."""
+    return any(part.endswith(".scope") and part.startswith(prefixes) for part in _cgroup_parts(pid))
+
+
+def in_container(pid: int) -> bool:
+    """True when ``pid`` sits in a container's cgroup. Unreadable reads as False, as in ``in_broker_scope``."""
+    return any(
+        p in CONTAINER_CGROUP_PARENTS or (p.endswith(".scope") and p.startswith(CONTAINER_SCOPE_PREFIXES))
+        for p in _cgroup_parts(pid)
+    )
+
+
+def _cgroup_parts(pid: int) -> list[str]:
+    """The path segments of every hierarchy in /proc/<pid>/cgroup; empty when unreadable."""
     try:
         with open(f"{SCOPE_PROC_DIR}/{pid}/cgroup") as f:
             raw = f.read()
     except OSError:
-        return False
-    for line in raw.splitlines():
-        for part in line.rsplit(":", 1)[-1].split("/"):
-            if part.endswith(".scope") and part.startswith(prefixes):
-                return True
-    return False
+        return []
+    return [part for line in raw.splitlines() for part in line.rsplit(":", 1)[-1].split("/")]
 
 
 # Fully resolved TENANT_UIDS_ENV values, keyed by the raw string. A value with a name that did not
@@ -95,12 +110,11 @@ def _warn_tenant_uids_once(message: str) -> None:
 
 
 def _parse_tenant_uids(raw: str) -> frozenset:
-    """Resolve TENANT_UIDS_ENV, cached per distinct value: a name lookup can go to a directory
-    service, and the gate runs on every scan. Only a value whose names all resolved is cached: a
-    lookup that failed (an unknown name, or the directory service down at the first scan) is
-    retried on the next scan rather than leaving a configured tenant unprotected until a restart.
-    Root is ignored: its daemons hold the device permanently, so as a tenant it would block every
-    gate, reset and reclaim for good."""
+    """Resolve TENANT_UIDS_ENV, cached per distinct value: a name lookup can go to a directory service, and the gate
+    runs on every scan. Only a value whose names all resolved is cached: a lookup that failed (an unknown name, or the
+    directory service down at the first scan) is retried on the next scan rather than leaving a configured tenant
+    unprotected until a restart. Root is ignored: its daemons hold the device permanently, so as a tenant it would block
+    every gate, reset and reclaim for good."""
     cached = _tenant_uid_cache.get(raw)
     if cached is not None:
         return cached
@@ -128,12 +142,6 @@ def _parse_tenant_uids(raw: str) -> frozenset:
     return result
 
 
-def _clear_tenant_uid_cache() -> None:
-    """Forget resolved values and warnings (tests)."""
-    _tenant_uid_cache.clear()
-    _tenant_uid_warned.clear()
-
-
 def configured_tenant_uids() -> frozenset:
     """The extra tenant uids named by TENANT_UIDS_ENV (empty when unset)."""
     return _parse_tenant_uids(os.environ.get(TENANT_UIDS_ENV, ""))
@@ -141,9 +149,9 @@ def configured_tenant_uids() -> frozenset:
 
 def is_tenant(holder: DeviceHolder) -> bool:
     """Whether a holder is a tenant the gates must not act under: a real user (uid at or above
-    MIN_TENANT_UID), a process in a broker job or exec scope, or a uid named in TENANT_UIDS_ENV.
-    Everything else below the floor is infrastructure (root, telemetry daemons)."""
-    return holder.uid >= MIN_TENANT_UID or holder.scoped or holder.uid in configured_tenant_uids()
+    MIN_TENANT_UID), a process in a broker job or exec scope or in a container, or a uid named in
+    TENANT_UIDS_ENV. Everything else below the floor is infrastructure (root, telemetry daemons)."""
+    return holder.uid >= MIN_TENANT_UID or holder.scoped or holder.contained or holder.uid in configured_tenant_uids()
 
 
 @dataclass
@@ -167,7 +175,6 @@ class HolderScan:
     gap_pids: list = field(default_factory=list)
 
     def mark_incomplete(self, why: str, pid: int | None = None) -> None:
-        """Record one blind spot and mark the scan incomplete."""
         self.complete = False
         self.gaps.append(why)
         self.gap_pids.append(pid)
@@ -306,7 +313,7 @@ def _scan_from_driver_pids(pids: "set[int]", complete: bool) -> HolderScan:
                 pid,
             )
             continue
-        scan.holders.append(DeviceHolder(pid=pid, uid=uid, scoped=in_broker_scope(pid)))
+        scan.holders.append(DeviceHolder(pid=pid, uid=uid, scoped=in_broker_scope(pid), contained=in_container(pid)))
     return scan
 
 
@@ -324,7 +331,6 @@ def enumerate_device_holders() -> HolderScan:
     return _scan_by_walking_proc()
 
 
-# How often wait_device_released re-reads the holder scan.
 RELEASE_POLL_SEC = 0.25
 
 
@@ -333,11 +339,10 @@ async def wait_device_released(
 ) -> set[int]:
     """Poll the holder scan until none of ``pids`` holds a device node, for at most ``timeout_sec``.
 
-    Returns the pids still listed as holders when it stopped: empty once all let go. For a caller
-    that just SIGKILLed device holders and must know they let go before it acts on the device
-    (spec 01 I67): an exit can sit in the driver's release for seconds after the signal. Bounded
-    and polling, so a set already gone costs one scan. A scan that raises leaves the set as it
-    was (it may still hold), so the caller's own check decides. Never raises."""
+    Returns the pids still listed as holders when it stopped: empty once all let go. For a caller that just SIGKILLed
+    device holders and must know they let go before it acts on the device (spec 01 I67): an exit can sit in the driver's
+    release for seconds after the signal. Bounded and polling, so a set already gone costs one scan. A scan that raises
+    leaves the set as it was (it may still hold), so the caller's own check decides. Never raises."""
     waiting = set(pids)
     if not waiting:
         return waiting
@@ -389,7 +394,9 @@ def _scan_by_walking_proc() -> HolderScan:
             if uid is None:
                 scan.mark_incomplete(f"holder pid {pid} exited before its owner was read", pid)
                 continue
-            scan.holders.append(DeviceHolder(pid=pid, uid=uid, scoped=in_broker_scope(pid)))
+            scan.holders.append(
+                DeviceHolder(pid=pid, uid=uid, scoped=in_broker_scope(pid), contained=in_container(pid))
+            )
 
     if blocked:
         scan.mark_incomplete(f"{blocked} processes' fd tables unreadable")
@@ -546,14 +553,13 @@ class ZombieInfo:
 def zombie_info(pid: int) -> ZombieInfo | None:
     """Classify ``pid`` when it is a zombie (state Z, or X while being reaped); None for any other state.
 
-    Linux releases a task's files and memory before it becomes a zombie. In do_exit() (kernel/exit.c),
-    exit_mm() and exit_files() drop the task's references to its mm and fd table; fput() of a last
-    reference queues the file's release as task work (fs/file_table.c), which exit_task_work() runs
-    (the driver's release() included) before exit_notify() sets EXIT_ZOMBIE. So a zombie whose whole
-    thread group has exited holds no fd and no mapping. A thread-group leader that exits first stays a
-    zombie while its other threads live (delay_group_leader() in kernel/exit.c), and those threads share
-    the fd table and mm (CLONE_FILES, CLONE_VM): the leader's exit dropped only its own references, so
-    the live threads are where a holder can still be, read through /proc/<pid>/task/<tid>/."""
+    Linux releases a task's files and memory before it becomes a zombie. In do_exit() (kernel/exit.c), exit_mm() and
+    exit_files() drop the task's references to its mm and fd table; fput() of a last reference queues the file's release
+    as task work (fs/file_table.c), which exit_task_work() runs (the driver's release() included) before exit_notify()
+    sets EXIT_ZOMBIE. So a zombie whose whole thread group has exited holds no fd and no mapping. A thread-group leader
+    that exits first stays a zombie while its other threads live (delay_group_leader() in kernel/exit.c), and those
+    threads share the fd table and mm (CLONE_FILES, CLONE_VM): the leader's exit dropped only its own references, so the
+    live threads are where a holder can still be, read through /proc/<pid>/task/<tid>/."""
     state = holder_state(pid)
     if state not in ("Z", "X"):
         return None
@@ -661,13 +667,12 @@ def _read_proc_pgid(pid: int) -> int | None:
         return None
 
 
-# The broker's own device work: every probe it spawns (the fabric check, the health probes, each in
-# its own session, so its pid is its process group) and each non-tenant holder it SIGKILLed when a
-# chip left the bus. Such a process can sit for seconds mid-exit, still named by the driver with its
-# fd table already gone, and a holder scan then reads incomplete: the host rung was denied as "a
-# tenant holds the device" over the broker's own killed fabric check (spec 04 I59). pid -> (starttime
-# at registration, monotonic expiry). A pid no longer in /proc matches by number alone, since a gone
-# pid cannot have been handed to anyone else yet; a live one must keep its starttime.
+# The broker's own device work: every probe it spawns (the fabric check, the health probes, each in its own session, so
+# its pid is its process group) and each non-tenant holder it SIGKILLed when a chip left the bus. Such a process can sit
+# for seconds mid-exit, still named by the driver with its fd table already gone, and a holder scan then reads
+# incomplete: the host rung was denied as "a tenant holds the device" over the broker's own killed fabric check (spec 04
+# I59). pid -> (starttime at registration, monotonic expiry). A pid no longer in /proc matches by number alone, since a
+# gone pid cannot have been handed to anyone else yet; a live one must keep its starttime.
 BROKER_INTERNAL_TTL_SEC = 600.0
 _broker_internal: dict[int, tuple] = {}
 
@@ -676,11 +681,6 @@ def note_broker_internal(pid: int, *, now: float | None = None) -> None:
     """Record ``pid`` (and the process group it leads) as the broker's own device work."""
     now = time.monotonic() if now is None else now
     _broker_internal[pid] = (_read_proc_starttime(pid), now + BROKER_INTERNAL_TTL_SEC)
-
-
-def _clear_broker_internal() -> None:
-    """Forget every registered broker-internal pid (tests)."""
-    _broker_internal.clear()
 
 
 def is_broker_internal(pid: int, *, now: float | None = None) -> bool:
@@ -721,9 +721,8 @@ def discount_broker_internal(scan):
 def _read_proc_ppid(pid: int) -> int | None:
     """Read field 4 (ppid) from /proc/<pid>/stat; None if the process is gone or unreadable.
 
-    Same parsing rule as `_read_proc_starttime`: comm may contain ')' or spaces, so split on
-    the last ')'. Field 4 is index 1 of the remainder.
-    """
+    Same parsing rule as `_read_proc_starttime`: comm may contain ')' or spaces, so split on the last ')'. Field 4 is
+    index 1 of the remainder."""
     try:
         with open(f"/proc/{pid}/stat") as f:
             raw = f.read()
@@ -738,11 +737,10 @@ def _read_proc_ppid(pid: int) -> int | None:
 def read_proc_cpu(pid: int) -> tuple[int, str] | None:
     """Read ``(cpu_ticks, starttime)`` from one /proc/<pid>/stat read; None if gone or unreadable.
 
-    cpu_ticks is utime+stime+cutime+cstime (fields 14-17): the process's own CPU plus that of the
-    children it has reaped, so a parent that farms work out to short-lived children still reads as
-    busy. starttime (field 22) comes from the same read, so the pair names one process even if the
-    pid is reused between reads. Same parsing rule as `_read_proc_starttime`.
-    """
+    cpu_ticks is utime+stime+cutime+cstime (fields 14-17): the process's own CPU plus that of the children it has
+    reaped, so a parent that farms work out to short-lived children still reads as busy. starttime (field 22) comes from
+    the same read, so the pair names one process even if the pid is reused between reads. Same parsing rule as
+    `_read_proc_starttime`."""
     try:
         with open(f"/proc/{pid}/stat") as f:
             raw = f.read()
@@ -763,10 +761,9 @@ _MAX_PARENT_DEPTH = 64
 def descends_from(pid: int, ancestor: int) -> bool:
     """True if ``pid`` is ``ancestor`` or its parent chain reaches ``ancestor``.
 
-    Walks /proc/<pid>/stat ppid links up to pid 1, bounded by _MAX_PARENT_DEPTH. A process
-    that exits mid-walk (or a chain that cannot be read) is not a descendant: a leftover
-    that daemonized and was reparented away from ``ancestor`` does not count as its child.
-    """
+    Walks /proc/<pid>/stat ppid links up to pid 1, bounded by _MAX_PARENT_DEPTH. A process that exits mid-walk (or a
+    chain that cannot be read) is not a descendant: a leftover that daemonized and was reparented away from ``ancestor``
+    does not count as its child."""
     for _ in range(_MAX_PARENT_DEPTH):
         if pid == ancestor:
             return True
@@ -801,25 +798,22 @@ def reclaim_foreign_holders(
 ) -> ReclaimResult:
     """Signal every tenant process still holding the device, then re-scan.
 
-    ``select`` replaces the tenant rule for the targets (and the survivors reported): a caller
-    that must also clear infrastructure, such as the in-flight cut of spec 03 I83, says so itself.
-    This process and its group stay excluded either way.
+    ``select`` replaces the tenant rule for the targets (and the survivors reported): a caller that must also clear
+    infrastructure, such as the in-flight cut of spec 03 I83, says so itself. This process and its group stay excluded
+    either way.
 
-    This does NOT relax the reset gate: it removes the tenant so the gate's ordinary rule
-    (04 I6/I7) passes on its own. A survivor or a blind re-scan leaves the gate's fail-closed
-    refusal exactly where it was — nothing here may be read as license to reset over a holder.
-    Only a caller with the authority to declare the allocation over may run it (spec 05).
+    This does NOT relax the reset gate: it removes the tenant so the gate's ordinary rule (04 I6/I7) passes on its own.
+    A survivor or a blind re-scan leaves the gate's fail-closed refusal exactly where it was — nothing here may be read
+    as license to reset over a holder. Only a caller with the authority to declare the allocation over may run it (spec
+    05).
 
-    Two exclusions are structural, enforced here regardless of what the scan reports:
-    infrastructure (a holder `is_tenant` does not count: it survives a board reset and is not a
-    competing tenant), and this process itself along with its own process group (a defensive belt in
-    case a scan or a uid check upstream ever miscounted the broker as a holder — the caller
-    already runs as this process, so signalling it would be self-inflicted). Neither the uid
-    floor nor self-exclusion has any notion of "a job the broker submitted" — a broker-owned
-    job runs as its submitter's uid under privsep and looks like any other tenant holder here.
-    Keeping this reclaim off a live broker job is the in-flight guard's job (server.py), not
-    this function's.
-    """
+    Two exclusions are structural, enforced here regardless of what the scan reports: infrastructure (a holder
+    `is_tenant` does not count: it survives a board reset and is not a competing tenant), and this process itself along
+    with its own process group (a defensive belt in case a scan or a uid check upstream ever miscounted the broker as a
+    holder — the caller already runs as this process, so signalling it would be self-inflicted). Neither the uid floor
+    nor self-exclusion has any notion of "a job the broker submitted" — a broker-owned job runs as its submitter's uid
+    under privsep and looks like any other tenant holder here. Keeping this reclaim off a live broker job is the
+    in-flight guard's job (server.py), not this function's."""
     rescan = rescan or enumerate_device_holders
     # Late-bound the same way `rescan` is, not a direct default-argument reference: a default of
     # `read_starttime=_read_proc_starttime` would bind to that function object once, at import

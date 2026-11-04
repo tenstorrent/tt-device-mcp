@@ -109,10 +109,8 @@ def _bound_watchdog(r, monkeypatch, at):
 
 @pytest.mark.asyncio
 async def test_a_boot_3_min_before_startup_holds_to_a_deadline_then_cycles_once(cool, monkeypatch):
-    """The box came up 3 min ago from a cycle the broker did not fire (manual, BMC, datacenter): a
-    whole tray is off at startup. The hold stays with its deadline on /health; no ladder rung runs
-    before the 10-min hold bound, whose forced run (spec 04 I76) is the one that runs the full ladder
-    (I73); at the deadline the watchdog asks once more and exactly one cycle fires."""
+    """The box came up 3 min ago from a cycle the broker did not fire (manual, BMC, datacenter): a whole tray is off at
+    startup."""
     cool["boot"]["btime"] = T0 - 180
     _tray_off(cool)
     assert await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup") == galaxy.OUTCOME_WAITING
@@ -234,9 +232,8 @@ def test_a_future_or_unreadable_ledger_record_does_not_hide_a_past_broker_cycle(
 
 
 def test_a_future_this_boot_stamp_holds_only_to_the_stated_gap_and_shows_on_health(cool, monkeypatch):
-    """a this-boot ledger stamp 6 h ahead (the clock stepped back) held the cycle until
-    stamp + interval, 6.5 h, with nothing on /health. It now anchors nothing: the cooldown runs from
-    the host boot, the denial is on /health, and the cycle is allowed at the boot's cooldown end."""
+    """a this-boot ledger stamp 6 h ahead (the clock stepped back) held the cycle until stamp + interval, 6.5 h, with
+    nothing on /health."""
     m = cool["g"].mechanism
     cool["boot"]["btime"] = T0 - 600
     _ledger({"action": "power-cycle", "boot_id": "boot-A", "at_epoch": T0 + 6 * 3600, "at": "x"})
@@ -255,9 +252,8 @@ def test_a_future_this_boot_stamp_holds_only_to_the_stated_gap_and_shows_on_heal
 @pytest.mark.parametrize("action", ["reboot", "power-cycle"])
 @pytest.mark.parametrize("stamp", [None, "garbage", "NaN"])
 def test_an_unreadable_this_boot_stamp_holds_the_cycle_to_a_fixed_end(cool, action, stamp):
-    """an unreadable stamp counted as now, so its end moved forward on every ask and the
-    cycle was held for the whole boot. It now ends at the boot's start plus the interval, a fixed
-    time; a power-cycle record no longer refuses the rung for good either."""
+    """an unreadable stamp counted as now, so its end moved forward on every ask and the cycle was held for the whole
+    boot."""
     m = cool["g"].mechanism
     cool["boot"]["btime"] = T0 - 600
     _ledger({"action": action, "boot_id": "boot-A", "at_epoch": stamp, "at": "x"})
@@ -292,9 +288,8 @@ def test_the_backoff_doubles_after_two_failed_cycles_and_caps_at_4h():
 
 
 def test_cycles_that_heal_nothing_back_off_and_a_verified_release_resets_it(cool):
-    """A fault no cycle heals (a tray with a dead power feed): each cycle fires at its cooldown's
-    end, each boot 2 min after it. The gaps grow 30 min, 1 h, 2 h, then stay at 4 h: about six
-    cycles a day at most, never a 30-min boot loop. A verified release ends the streak."""
+    """A fault no cycle heals (a tray with a dead power feed): each cycle fires at its cooldown's end, each boot 2 min
+    after it."""
     m = cool["g"].mechanism
     at, fired = T0, []
     for n in range(6):
@@ -316,9 +311,8 @@ def test_cycles_that_heal_nothing_back_off_and_a_verified_release_resets_it(cool
 
 
 def test_a_future_record_does_not_keep_the_streak_past_a_verified_release(cool):
-    """a power-cycle record stamped later than now stayed 'after the heal', so a verified
-    release did not end the backoff streak. A heal file stamped later than now does not hide the
-    cycles after it either (it reads as no heal: the longer, capped cooldown)."""
+    """a power-cycle record stamped later than now stayed 'after the heal', so a verified release did not end the
+    backoff streak."""
     m = cool["g"].mechanism
     _ledger(
         {"action": "power-cycle", "boot_id": "b1", "at_epoch": T0 - 7200, "at": "x"},
@@ -367,13 +361,12 @@ async def test_with_no_recent_cycle_or_boot_the_cycle_fires_at_once(cool):
     assert cool["g"].mechanism.power_cycle_cooldown_state is None
 
 
-# ---- (f) goal 8: only a passing full check ends the streak ---------------------------------------
+# ---- (f) full check after every reset: only a passing full check ends the streak ---------------------------------------
 
 
 def test_only_a_verified_release_with_no_fabric_debt_ends_the_streak(monkeypatch, tmp_path):
-    """The heal marker is written in ``_clear_device_dirty(verified=True)`` after its fabric-debt
-    check (spec 04 I32): a release refused for a missing fabric pass keeps the hold and the streak.
-    The startup pass that precedes it waits for hugepages (test_classac_power_cycle_direct)."""
+    """The heal marker is written in ``_clear_device_dirty(verified=True)`` after its fabric-debt check (spec 04 I32): a
+    release refused for a missing fabric pass keeps the hold and the streak."""
     monkeypatch.setattr(srv, "health_dir", lambda: tmp_path)
     monkeypatch.setattr(recovery_base, "health_dir", lambda: tmp_path)
     m = srv.recovery_mechanism
@@ -503,19 +496,18 @@ def _hist_recs(path, *recs):
     path.write_text("".join(json.dumps({"at_epoch": a, "cause": c}) + "\n" for a, c in recs))
 
 
-def test_a_matched_failure_line_drops_the_attempt(state_hist):
-    _hist_recs(state_hist, (T0 - 500, "old"), (T0 - 100, "BMC"), (T0 - 100, "BMC (cycle failed)"))
-    assert recovery_base._last_external_power_cycle(T0) == (T0 - 500, "old")
-
-
-def test_an_unmatched_failure_line_is_ignored(state_hist):
-    _hist_recs(state_hist, (T0 - 500, "old"), (T0 - 100, "other (cycle failed)"))
-    assert recovery_base._last_external_power_cycle(T0) == (T0 - 500, "old")
-
-
-def test_an_attempt_without_a_failure_line_still_counts(state_hist):
-    _hist_recs(state_hist, (T0 - 500, "old"), (T0 - 100, "BMC"))
-    assert recovery_base._last_external_power_cycle(T0) == (T0 - 100, "BMC")
+@pytest.mark.parametrize(
+    "recs,want",
+    [
+        ([(T0 - 100, "BMC"), (T0 - 100, "BMC (cycle failed)")], (T0 - 500, "old")),
+        ([(T0 - 100, "other (cycle failed)")], (T0 - 500, "old")),
+        ([(T0 - 100, "BMC")], (T0 - 100, "BMC")),
+    ],
+    ids=["matched-failure-line-drops-attempt", "unmatched-failure-line-ignored", "attempt-without-failure-line-counts"],
+)
+def test_a_failure_line_voids_only_its_own_attempt(state_hist, recs, want):
+    _hist_recs(state_hist, (T0 - 500, "old"), *recs)
+    assert recovery_base._last_external_power_cycle(T0) == want
 
 
 # ---- (i) one hold episode's deadline never moves later ------------------------------------------
@@ -530,10 +522,7 @@ def _ask(m, at):
 
 
 def test_reboots_inside_one_hold_never_move_its_power_cycle_deadline_later(cool, monkeypatch):
-    """The broker's power cycle at T healed nothing and the hold stands. Boots at T+20, T+40 and
-    T+60 min (an operator shutdown, an external cycle, a warm reboot: none heals a whole tray) each
-    restarted the full interval, so the cycle never came. Now the deadline the first denial fixed
-    holds; only a boot right at it adds the stated post-boot settle."""
+    """The broker's power cycle at T healed nothing and the hold stands."""
     monkeypatch.setattr(recovery_base, "POWER_CYCLE_MIN_INTERVAL_SEC", 3600)
     settle = recovery_base.POWER_CYCLE_POST_BOOT_SETTLE_SEC
     m = cool["g"].mechanism
@@ -556,9 +545,7 @@ def test_reboots_inside_one_hold_never_move_its_power_cycle_deadline_later(cool,
 
 @pytest.mark.asyncio
 async def test_an_operator_shutdown_inside_the_hold_keeps_the_deadline_and_the_cycle_fires_at_it(cool, monkeypatch):
-    """Gate level: a whole tray off after the broker's cycle at T; the first pass fixes the deadline.
-    A shutdown brings a new boot 20 min in: the startup gate still holds (no reset, no release),
-    /health shows the same deadline, and the cycle fires at it, not a full interval after the boot."""
+    """Gate level: a whole tray off after the broker's cycle at T; the first pass fixes the deadline."""
     _ledger({"action": "power-cycle", "boot_id": "boot-A", "at_epoch": T0, "at": "x"})
     _tray_off(cool)
     cool["clk"][0] = T0 + 60

@@ -34,9 +34,7 @@ LEFT = 252  # four eth links down: one QSFP_DD port connection's worth on the de
 
 @pytest.fixture
 def replay(monkeypatch, tmp_path, mesh):  # noqa: F811
-    """``mesh`` from the eth-timeout tests, with the monitor's own eth read and fabric check put back.
-    The eth probe measures ``links`` up links; the descriptor run reports one missing port while
-    ``lost`` (a reset does not bring it back); the traffic-only rerun always passes."""
+    """``mesh`` from the eth-timeout tests, with the monitor's own eth read and fabric check put back."""
     mon = srv.health_monitor
     hdir = tmp_path / "health"
     hdir.mkdir()
@@ -46,9 +44,9 @@ def replay(monkeypatch, tmp_path, mesh):  # noqa: F811
     monkeypatch.setattr(monitor_mod, "health_dir", lambda: hdir)
     monkeypatch.setattr(monitor_mod, "_asic_bus_map", lambda: {"a": 0xC1})
     monkeypatch.setattr(monitor_mod, "health_event", lambda ev, **f: mesh["mon_events"].append((ev, f)))
-    monkeypatch.setattr(monitor_mod.alert, "send_alert", lambda ev, log=None: object())
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS", raising=False)
     monkeypatch.setattr(srv, "last_relift_monotonic", srv.last_relift_monotonic)
+    # The replayed resets take no time, so their settle is skipped here; spec 04 I32's settle has its own tests.
+    monkeypatch.setattr(srv, "POST_RESET_SETTLE_SEC", 0.0)
     for attr, value in (
         ("verify_eth_heartbeat", HealthMonitor.verify_eth_heartbeat.__get__(mon)),
         ("verify_fabric_health", HealthMonitor.verify_fabric_health.__get__(mon)),
@@ -107,9 +105,8 @@ def _mon_events(st) -> list[str]:
 
 
 async def _hold_then_reset(st, resets=1):
-    """The post-job gate measures the lost port and holds (no reset on a present mesh below the
-    floor); the idle relift resets the held mesh with no grace (03 I56) and runs the full check.
-    A check that still fails runs the last-chance sweep too (spec 04 I79): two resets."""
+    """The post-job gate measures the lost port and holds (no reset on a present mesh below the floor); the idle relift
+    resets the held mesh with no grace (03 I56) and runs the full check."""
     fsm_dirty(srv, "job 7 crashed: could not find any forwarding direction", why="job_killed")
     await etr._gate()
     assert st["resets"] == [] and srv.fsm.state is ServerState.RECOVERING
@@ -126,11 +123,8 @@ def _post_reset_descriptor_runs(st) -> list[bool]:
 
 @pytest.mark.asyncio
 async def test_a_post_reset_link_drop_skip_with_a_missing_port_stays_held(replay, armed_power_cycle):
-    """03 I71 with a full check after every reset: the eth read's link-count-drop skip (252 of 256)
-    reaches no verdict, the descriptor run finds one port missing and none extra, and the
-    traffic-only rerun passes. The post-reset check fails, the device stays held, the eth mark
-    stays at 256, and the next between-jobs gate fails the same way instead of lifting. With the
-    power cycle armed, the last-chance sweep runs before it (spec 04 I79)."""
+    """03 I71 with a full check after every reset: the eth read's link-count-drop skip (252 of 256) reaches no verdict,
+    the descriptor run finds one port missing and none extra, and the traffic-only rerun passes."""
     await _hold_then_reset(replay, resets=2)
     said = replay["log"].text()
     assert f"eth-heartbeat: SKIPPED — {ETH_LINK_DROP_SKIP}: {LEFT} of {HIGH_WATER}" in said, "the real skip verdict"
@@ -163,9 +157,8 @@ async def test_a_post_reset_link_drop_skip_with_a_missing_port_stays_held(replay
 @pytest.mark.asyncio
 @pytest.mark.parametrize("links_after", [LEFT, HIGH_WATER], ids=["eth-skip-stays", "all-links-back"])
 async def test_the_same_sequence_with_no_missing_port_releases(replay, links_after):
-    """Control: the reset brings the port back, so the post-reset descriptor run is clean and the
-    full check releases the device, whether or not the eth read still skips on the link count. The
-    mark stays at the high-water mark either way."""
+    """Control: the reset brings the port back, so the post-reset descriptor run is clean and the full check releases
+    the device, whether or not the eth read still skips on the link count."""
     replay.update(heals=True, links_after=links_after)
     await _hold_then_reset(replay)
     assert _post_reset_descriptor_runs(replay) == [False], "a clean descriptor run after the reset"
@@ -192,10 +185,7 @@ async def _no_reset_hold_then_second_gate(st):
 
 @pytest.mark.asyncio
 async def test_a_failed_fabric_pass_is_never_cover_for_a_link_drop_skip(replay):
-    """03 I30/I71: the link-drop skip's rate limit leans on a recent PASSING fabric pass only. A hold
-    on a missing port with no reset yet failed its fabric pass; a second post-job gate inside the
-    1200 s window must run the pass again (and fail on the same port) rather than release on the
-    strength of the failed one."""
+    """03 I30/I71: the link-drop skip's rate limit leans on a recent PASSING fabric pass only."""
     first, said = await _no_reset_hold_then_second_gate(replay)
     assert "a recent passing fabric pass covers it" not in said, "a failed pass was taken as cover"
     assert len(replay["fabric_out"]) > first and replay["fabric_out"][first][1:] == (True, True)
@@ -218,9 +208,7 @@ async def test_a_passing_fabric_pass_still_covers_a_link_drop_skip(replay):
 
 @pytest.mark.asyncio
 async def test_a_skipped_fabric_pass_after_a_green_one_is_not_logged_as_cover(replay, monkeypatch):
-    """03 I30: a green pass, then a forced pass that exits 77, then a gate whose eth read takes the
-    link-drop skip. The 77 reached no verdict, so the log must not claim a passing pass covers the
-    skip, and the fabric-unverified hold stands until a pass returns healthy."""
+    """03 I30: a green pass, then a forced pass that exits 77, then a gate whose eth read takes the link-drop skip."""
     replay["lost"] = False
     fsm_dirty(srv, "job 7 crashed: could not find any forwarding direction", why="job_killed")
     await etr._gate()

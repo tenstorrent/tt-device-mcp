@@ -122,9 +122,8 @@ def test_a_queued_job_never_started_reads_abandoned_not_lost(restarted, clear_jo
 
 
 def test_a_truncated_or_unflushed_log_still_reads(restarted, clear_job_state):
-    """A log cut mid-write: a footer stopped after FINISHED:, a last line with no newline that ends
-    inside a multibyte character, and binary output. Read back with bad bytes replaced, never an
-    exception, and the half footer is not a final status."""
+    """A log cut mid-write: a footer stopped after FINISHED:, a last line with no newline that ends inside a multibyte
+    character, and binary output."""
     log = restarted / "2026-10-25_221655_034.log"
     body = _header("034").encode() + b"bin \xff\xfe\x00 out\n" + RULE.encode() + b"FINISHED:    2026-10-25T22:20:00\n"
     log.write_bytes(body + "[22:20:00] [stdout] café".encode()[:-1])
@@ -219,17 +218,6 @@ def test_retention_never_prunes_a_tracked_or_fresh_log(tmp_path):
     _old_log(tmp_path, "2026-10-23_000000_004.log")
     gone = store.prune_job_logs(tmp_path, keep_ids={"001"}, max_count=1, max_bytes=1 << 30)
     assert [p.name[-7:] for p in gone] == ["003.log"]
-
-
-def test_retention_defaults_and_overrides(monkeypatch):
-    monkeypatch.delenv("TT_DEVICE_MCP_JOB_LOG_KEEP", raising=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_JOB_LOG_MAX_MB", raising=False)
-    assert store.job_log_limits() == (store.JOB_LOG_KEEP_DEFAULT, store.JOB_LOG_MAX_MB_DEFAULT << 20)
-    monkeypatch.setenv("TT_DEVICE_MCP_JOB_LOG_KEEP", "50")
-    monkeypatch.setenv("TT_DEVICE_MCP_JOB_LOG_MAX_MB", "junk")
-    assert store.job_log_limits() == (50, store.JOB_LOG_MAX_MB_DEFAULT << 20)
-    monkeypatch.setenv("TT_DEVICE_MCP_JOB_LOG_KEEP", "0")
-    assert store.job_log_limits()[0] == store.JOB_LOG_KEEP_DEFAULT
 
 
 def test_read_log_tail_edge_cases(tmp_path):

@@ -144,7 +144,7 @@ def _wedged_hold(monkeypatch, writer, now):
     patch_health_event(monkeypatch, lambda *a, **k: None)
     rungs = []
 
-    async def host_rung(age, log):
+    async def host_rung(age, log, *a, **k):
         rungs.append(age)
 
     monkeypatch.setattr(srv, "_hold_bound_host_rung", host_rung)
@@ -216,9 +216,8 @@ async def test_e_no_hold_lifts_while_pci_wedged_without_a_just_passed_full_check
 
 @pytest.mark.asyncio
 async def test_the_wedged_power_cycle_request_names_the_wedge_not_a_failed_ladder(monkeypatch):
-    """A PCI-wedged hold asks for the power cycle seconds in, with no ladder run: every rung needs the
-    PCI lock the blocked write holds. The request's reason must say the ladder was skipped and why,
-    never that the full ladder ran and did not heal the hold."""
+    """A PCI-wedged hold asks for the power cycle seconds in, with no ladder run: every rung needs the PCI lock the
+    blocked write holds."""
     writer = _writer(monkeypatch)
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
     monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_retry", None)

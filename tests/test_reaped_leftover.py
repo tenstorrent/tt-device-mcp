@@ -42,10 +42,7 @@ def _stage(proc_dir, pid, *, job_id="7", state="D", sigpnd=SIGKILL_PENDING, wcha
 
 @pytest.fixture
 def leftover(monkeypatch, tmp_path):
-    """A staged reaped-job leftover holding the device, and the events the broker emits.
-
-    Returns a dict: ``scan`` is the live holder scan (assign ``scan["holders"]`` to change it),
-    ``events`` the (kind, fields) pairs emitted."""
+    """A staged reaped-job leftover holding the device, and the events the broker emits."""
     proc = tmp_path / "proc"
     proc.mkdir()
     _stage(proc, LEFTOVER_PID)

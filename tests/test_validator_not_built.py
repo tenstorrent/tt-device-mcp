@@ -63,9 +63,9 @@ async def test_a_post_reset_77_with_the_validator_not_built_takes_no_eth_trainin
     monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", _WRAPPER)
     _not_built(monkeypatch)
     healthy, spent, sleeps, fabric_asked = await _replay_post_reset_verify(monkeypatch, [(5.0, NO_TRAINED_LINK_77)])
-    assert healthy is None, "UNKNOWN: not a recovery (goal 11) and not a failed reset (no host rung)"
+    assert healthy is None, "UNKNOWN: not a recovery (lift only on a fresh pass) and not a failed reset (no host rung)"
     assert sleeps == [], "no 60 s eth-training wait for a validator that is not on disk"
-    assert fabric_asked == [True], "the one full check ran, fabric included (goal 8); no retry"
+    assert fabric_asked == [True], "the one full check ran, fabric included; no retry"
     assert spent == 5.0
 
 
@@ -222,7 +222,7 @@ async def test_the_watch_requests_the_build_then_lifts_only_on_a_passing_full_ch
 
     assert seen == [True], "the owed pass is the full check, fabric included"
     assert rungs == [], "never a reset"
-    assert (srv.fsm.state is ServerState.HEALTHY) is passes, "only a passing check lifts (goal 11)"
+    assert (srv.fsm.state is ServerState.HEALTHY) is passes, "only a passing check lifts"
 
 
 @pytest.mark.asyncio
@@ -251,7 +251,7 @@ async def test_an_idle_relift_on_a_not_built_validator_never_resets_or_lifts(mon
 
 
 def test_the_10_min_bound_still_forces_a_not_built_hold(monkeypatch, tmp_path, clear_job_state):
-    """Goal 10 is unchanged: a validator still missing at the 10-min mark gets the I76 ladder."""
+    """The 10-min ladder is unchanged: a validator still missing at the 10-min mark gets the I76 ladder."""
     _hold_77(monkeypatch, tmp_path)
     _not_built(monkeypatch)
     fired, since = _deadline(monkeypatch)

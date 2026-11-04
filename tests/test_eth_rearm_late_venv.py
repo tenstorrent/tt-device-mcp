@@ -202,7 +202,7 @@ def _stub_fabric(monkeypatch, ok, detail):
 
 @pytest.mark.asyncio
 async def test_a_missing_reader_never_delays_a_post_reset_release_and_fabric_still_decides(late_venv, monkeypatch):
-    """Goal 8/11: with no reader at all the post-reset verify still runs the full check, fabric
+    """Full check before any release: with no reader at all the post-reset verify still runs the full check, fabric
     included, and only its verdict decides; the eth rung adds no retry and no wait."""
     await srv.selftest_eth_heartbeat()
     runs = srv._eth_selftest_runs

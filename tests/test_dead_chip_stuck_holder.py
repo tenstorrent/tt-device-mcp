@@ -17,6 +17,7 @@ import time
 
 import pytest
 
+from tests.conftest import settle_isolations
 from tests.test_classac_power_cycle_direct import EXPECTED, rig  # noqa: F401 - the fixture
 from tests.test_reaped_leftover import SIGKILL_PENDING, _stage
 from tests.test_ubb_tray_map import galaxy_seen  # noqa: F401 - the fixture
@@ -61,7 +62,7 @@ def _stage_holder(proc, pid=PID, *, state="D", sigpnd="0" * 16, fds=(f"{NODE_DIR
 @pytest.fixture
 def stuck(rig, monkeypatch, tmp_path):  # noqa: F811 - the imported fixture
     """A staged pid stuck in D on chip 3's node, on the rig's 32-chip host with every chip present.
-    ``s['pages']`` records the alert hook, ``s['order']`` the rig's rungs, ``s['events']`` the journal."""
+    ``s['order']`` records the rig's rungs, ``s['events']`` the journal."""
     proc = tmp_path / "proc"
     proc.mkdir()
     _stage_holder(proc)
@@ -86,12 +87,7 @@ def stuck(rig, monkeypatch, tmp_path):  # noqa: F811 - the imported fixture
         fired.append("power_cycle")
 
     monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
-    pages = []
-    s = {"proc": proc, "pages": pages, "order": rig["order"], "events": rig["events"], "rig": rig, "deliver": True}
-    monkeypatch.setattr(srv.alert, "alert_argv", lambda: ["page"])
-    monkeypatch.setattr(
-        srv.alert, "send_alert", lambda e, log=None: (pages.append(e), object())[1] if s["deliver"] else None
-    )
+    s = {"proc": proc, "order": rig["order"], "events": rig["events"], "rig": rig}
     return s
 
 
@@ -189,36 +185,23 @@ def test_a_maps_read_that_blocks_is_bounded_and_fds_still_count(tmp_path, monkey
         release.set()
 
 
-# --- journal, page, I70 episode -------------------------------------------------------------------
+# --- journal, I70 episode -------------------------------------------------------------------------
 
 
-def test_a_stuck_holder_is_journaled_host_at_risk_paged_once_and_opens_the_episode(stuck):
+def test_a_stuck_holder_is_journaled_host_at_risk_once_and_opens_the_episode(stuck):
     assert _note(stuck) == [PID]
 
     (ev,) = _events(stuck, "dead_chip_holder_stuck")
     assert ev["host_at_risk"] is True and ev["severity"] == "high"
     assert ev["fault_class"] == "J-dead-chip-stuck-holder" and ev["budget_sec"] == BUDGET
     assert ev["chips"] == [CHIP] and ev["holders"][0]["pid"] == PID and ev["holders"][0]["state"] == "D"
-    (page,) = stuck["pages"]
-    assert page["kind"] == "dead_chip_holder_stuck" and page["host_at_risk"] is True
     srv._reaped_leftovers()
     srv._reaped_leftovers()
-    assert len(stuck["pages"]) == 1, "paged once, not once per scan"
+    assert len(_events(stuck, "dead_chip_holder_stuck")) == 1, "journaled once, not once per scan"
     assert srv._leftover_unkillable_mono is not None
     fenced = srv._health_payload()["leftover_fence"]
     assert fenced["fault_class"] == "J-dead-chip-stuck-holder" and fenced["budget_sec"] == BUDGET
     assert f"killed holder of chip(s) 3 pid {PID}" in fenced["leftovers"]
-
-
-def test_a_dropped_page_is_sent_on_the_next_scan(stuck):
-    stuck["deliver"] = False
-    _note(stuck)
-    assert stuck["pages"] == []
-
-    stuck["deliver"] = True
-    srv._reaped_leftovers()
-    srv._reaped_leftovers()
-    assert [p["kind"] for p in stuck["pages"]] == ["dead_chip_holder_stuck"]
 
 
 def test_a_killed_holder_that_exited_or_is_not_stuck_names_nothing(stuck):
@@ -227,7 +210,7 @@ def test_a_killed_holder_that_exited_or_is_not_stuck_names_nothing(stuck):
     killed = KILLED + [{"pid": 6301}, {"pid": None}, "junk"]
 
     assert srv._note_dead_chip_stuck_holders([CHIP], killed) == []
-    assert _events(stuck, "dead_chip_holder_stuck") == [] and stuck["pages"] == []
+    assert _events(stuck, "dead_chip_holder_stuck") == []
     assert srv._dead_chip_stuck == {} and srv._dead_chip_stuck_reason() == ""
     assert srv._leftover_unkillable_mono is None
 
@@ -468,9 +451,8 @@ def _running_job(monkeypatch, job_id="41"):
 
 
 async def test_the_dead_chip_victim_job_still_running_does_not_hold_the_rung(stuck, monkeypatch):
-    """The dead-chip path SIGKILLed the running job's process and marked the job its own kill; the
-    process is stuck in D, so the job stays RUNNING. That victim is not a running job to the I70
-    rung's guard: the request still comes at 120 s (one sampler tick at most), not never."""
+    """The dead-chip path SIGKILLed the running job's process and marked the job its own kill; the process is stuck in
+    D, so the job stays RUNNING."""
     stuck["rig"]["beats"] = {str(i): 100 for i in range(EXPECTED) if i != int(CHIP)}
     job = _running_job(monkeypatch)
     srv.reset_killed_job_ids.add(job.id)  # what _kill_device_holders' victim marking does
@@ -595,9 +577,8 @@ async def test_the_broker_start_restores_before_anything_else(stuck, monkeypatch
 
 
 def test_a_concurrent_save_never_puts_back_a_registry_a_later_one_emptied(stuck, monkeypatch):
-    """Two saves race: the first snapshots the holder and is about to rename its write into place
-    when the holder is pruned and a second save runs. The second waits for the first, so the record
-    ends as the registry is (gone), never as the first one's stale snapshot."""
+    """Two saves race: the first snapshots the holder and is about to rename its write into place when the holder is
+    pruned and a second save runs."""
     _note(stuck)
     path = srv.health_dir() / srv.DEAD_CHIP_STUCK_FILE
     real_replace = os.replace
@@ -661,11 +642,8 @@ async def _broker_restart(stuck, monkeypatch, elapsed, scopes):
 async def test_a_second_restart_readopts_the_victim_and_the_rung_still_fires(
     stuck, monkeypatch, tmp_path, elapsed, other_job
 ):
-    """The dead-chip path SIGKILLed job 41's process, which stays stuck in D in the job's scope, so
-    the scope stays active. The first restart skips it (its device-fault record) and drops the record;
-    the second re-adopts it as RUNNING with no in-memory kill marker. The victim still does not hold
-    the rung: the request comes by the original episode's 120 s + one tick, or at once when that has
-    passed. A re-adopted job with a live process of its own still holds it."""
+    """The dead-chip path SIGKILLed job 41's process, which stays stuck in D in the job's scope, so the scope stays
+    active."""
     proc = stuck["proc"]
     _gone(stuck)
     _stage_holder(proc, job_id=VICTIM)
@@ -776,7 +754,7 @@ async def test_the_dead_chip_path_notes_stuck_holders_and_says_the_host_is_still
     monkeypatch.setattr(srv.sampler._deps, "logger", lambda: log)
 
     await srv.sampler.isolate_dead_chips(["13"])
-    await srv.sampler.settle_isolations()
+    await settle_isolations(srv.sampler)
 
     assert noted and noted[0][0] == ["13"] and [k["pid"] for k in noted[0][1]] == [4242]
     assert noted[0][2] == (BDF,)

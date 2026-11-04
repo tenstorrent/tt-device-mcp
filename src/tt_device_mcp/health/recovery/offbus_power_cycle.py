@@ -4,14 +4,11 @@
 
 With the host reset gate refusing every reset because a chip is off the bus (I24), the ladder below
 the power cycle cannot run, so before this the hold stood until a human power-cycled the box. Here
-the hold is bounded: once the episode has stood ``TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC`` (default
-300 s) and the ladder's safe rungs have run once, the broker runs the host's own power-cycle command
+the hold is bounded: once the episode has stood ``GRACE_SEC`` (300 s) and the ladder's safe rungs have run once, the broker runs the host's own power-cycle command
 ``TT_DEVICE_MCP_POWER_CYCLE_CMD`` — but only on a tenant-free box, with no operator recovery in
-progress and no stand-back marker or command active, and spaced by the power cycle's cooldown (spec 04
-I65). ``TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC`` (unset by default) adds a spacing between
-attempts on top of it, never above the I65 backoff cap; either wait is stated on /health and the cycle
-is asked again the moment it ends. With the command unset it pages instead and the hold stands as
-before; a cycle blocked ``TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC`` (default 1800 s) past
+progress, and spaced by the power cycle's cooldown (spec 04
+I65), a wait stated on /health after which the cycle is asked again at once. With the command unset it pages instead and the hold stands as
+before; a cycle blocked ``BLOCKED_PAGE_SEC`` (1800 s) past
 the grace pages too.
 
 A below-floor drop that takes a whole UBB tray off the bus goes to the command at once, with no grace
@@ -31,33 +28,28 @@ import json
 import os
 import shlex
 import signal
-import socket
 import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from tt_device_mcp import alert, metrics
 from tt_device_mcp.health.evidence import health_dir, health_event
 
 STATE_FILE = "offbus_power_cycle.json"
-GRACE_DEFAULT_SEC = 300
-MIN_INTERVAL_DEFAULT_SEC = 0  # no spacing beyond the I65 cooldown unless an operator sets one
+GRACE_SEC = 300
 CHECK_TIMEOUT_DEFAULT_SEC = 10.0
 FIRE_TIMEOUT_DEFAULT_SEC = 120.0
-BLOCKED_PAGE_DEFAULT_SEC = 1800
-HOLD_HANDOFF_DEFAULT_SEC = 1200  # two 600 s ceiling windows
+BLOCKED_PAGE_SEC = 1800
 # Where the installer stages deploy/tt-manual-recovery-check.sh; the manual-recovery check when
 # TT_DEVICE_MCP_MANUAL_RECOVERY_CMD is unset.
 MANUAL_RECOVERY_CHECK = "manual-recovery-check.sh"
 # Attempts kept in the state file: enough to read the rate limit, never a growing log.
 MAX_ATTEMPTS_KEPT = 8
 
-# In-memory, per broker process: the episode whose off-bus hold the gate is refusing (or that holds a
-# whole tray down), and whether the ladder's safe rungs have run in it. A
-# restart starts empty: the next idle pass re-arms it and the ladder runs its safe rungs once more,
-# both harmless.
+# In-memory, per broker process: the episode whose off-bus hold the gate is refusing (or that holds a whole tray down),
+# and whether the ladder's safe rungs have run in it. A restart starts empty: the next idle pass re-arms it and the
+# ladder runs its safe rungs once more, both harmless.
 _pending: dict = {}
 
 
@@ -67,23 +59,6 @@ def _int_env(name: str, default: int) -> int:
     except ValueError:
         return default
     return v if v > 0 else default
-
-
-def grace_sec() -> int:
-    """Seconds an off-bus hold the gate refuses to reset stands before the power cycle may fire,
-    counted from the start of the hold episode. A non-positive or malformed value reads as 300."""
-    return _int_env("TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC", GRACE_DEFAULT_SEC)
-
-
-def min_interval_sec() -> int:
-    """Seconds an attempt holds the next one off, on top of the I65 cooldown; 0 (the default) adds
-    none. Never above the I65 backoff cap: a wait with no stated, bounded end is an open-ended hold."""
-    from tt_device_mcp.health.recovery.base import POWER_CYCLE_BACKOFF_CAP_SEC
-
-    return min(
-        _int_env("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", MIN_INTERVAL_DEFAULT_SEC),
-        POWER_CYCLE_BACKOFF_CAP_SEC,
-    )
 
 
 def _argv(name: str) -> Optional[list]:
@@ -139,14 +114,10 @@ def manual_recovery_argv() -> Optional[list]:
 def standback_reason(timeout: Optional[float] = None, *, require_manual_check: bool = True) -> str:
     """Why the broker must stand back from the power cycle now, or "" when nothing objects.
 
-    * ``TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE``: paths separated by ``os.pathsep``; any that
-      exists is a stand-back marker.
-    * the manual-recovery check (:func:`manual_recovery_argv`): exit 0 means an operator is
-      recovering the host. No check configured or installed stands back.
-    * ``TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_CMD``: exit 0 means stand back (e.g. a workload is
-      starting that the device-holder scan cannot see yet).
+    The manual-recovery check (:func:`manual_recovery_argv`): exit 0 means an operator is
+    recovering the host. No check configured or installed stands back.
 
-    Exit 1 clears a check. Any other exit, a timeout, a command that cannot start or a check that
+    Exit 1 clears the check. Any other exit, a timeout, a command that cannot start or a check that
     raises stands back: a check that cannot answer is not a yes. ``require_manual_check=False`` (the
     I33 lifted mesh reset, not a power cycle) does not stand back for a check that is not configured."""
     try:
@@ -156,25 +127,14 @@ def standback_reason(timeout: Optional[float] = None, *, require_manual_check: b
 
 
 def _standback_reason(timeout: float, require_manual_check: bool = True) -> str:
-    for path in filter(None, os.environ.get("TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE", "").split(os.pathsep)):
-        if Path(path).exists():
-            return f"stand-back marker {path} is present"
     name = "TT_DEVICE_MCP_MANUAL_RECOVERY_CMD"
     argv = manual_recovery_argv()
     if argv is None:
         if require_manual_check:
             return f"no manual-recovery check ({name} unset or unparseable, none installed) — standing back"
     else:
-        why = _check(name, argv, "an operator recovery is in progress", timeout)
-        if why:
-            return why
-    name = "TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_CMD"
-    if not os.environ.get(name, "").strip():
-        return ""
-    argv = _argv(name)
-    if argv is None:
-        return f"{name} does not parse"
-    return _check(name, argv, "the stand-back check says stand back", timeout)
+        return _check(name, argv, "an operator recovery is in progress", timeout)
+    return ""
 
 
 def _check(name: str, argv: list, what: str, timeout: float) -> str:
@@ -210,20 +170,6 @@ def save_state(state: dict) -> None:
     os.replace(tmp, path)
 
 
-def last_attempt_within(state: dict, now: float, interval: int, healed=None) -> Optional[float]:
-    """Epoch of an attempt younger than ``interval``, or None. An unreadable stamp counts as now. An
-    attempt ``healed(rec)`` says a later boot verified healthy is skipped: the hold after it is a new
-    episode, not a loop (spec 04 I9); the ledger's backstop still caps every cycle."""
-    for rec in state.get("attempts") or []:
-        try:
-            at = float(rec.get("at_epoch"))
-        except (AttributeError, TypeError, ValueError):
-            return now
-        if now - at < interval and not (healed and healed(rec)):
-            return at
-    return None
-
-
 def record_attempt(state: dict, now: float, episode: str, reason: str, boot_id: str = "") -> None:
     attempts = list(state.get("attempts") or [])
     attempts.insert(0, {"at_epoch": now, "episode": episode, "reason": reason, "boot_id": boot_id})
@@ -240,8 +186,6 @@ def episode_age_sec(episode: str, now: Optional[datetime] = None) -> Optional[fl
 
 def _track(episode: str) -> None:
     if _pending.get("episode") != episode:
-        if _pending.get("handoff"):
-            metrics.offbus_operator_deadline(0)
         _pending.clear()
         _pending.update(episode=episode, ladder_ran=False, paged=set(), journaled=set(), spawned=False)
 
@@ -251,7 +195,7 @@ def arm(episode: str) -> None:
     _track(episode)
     if not _pending.get("gated"):
         _pending["gated"] = True
-        health_event("offbus_gated_hold", phase="grace", held_since=episode, grace_sec=grace_sec())
+        health_event("offbus_gated_hold", phase="grace", held_since=episode, grace_sec=GRACE_SEC)
 
 
 def note_whole_tray_down(episode: str, detail: str, now: Optional[datetime] = None, chips=()) -> None:
@@ -349,161 +293,71 @@ def direct_cycle_now() -> Optional[tuple]:
 
 
 def note_ladder_ran(episode: str) -> None:
-    """The safe rungs ran for this episode. Tracks it even when nothing armed it yet (tracking alone
-    forces no pass)."""
+    """The safe rungs ran for this episode. Tracks it even when nothing armed it yet (tracking alone forces no pass)."""
     if not episode:
         return
     _track(episode)
     _pending["ladder_ran"] = True
-    if _PARTIAL_PASS.get() == episode:
-        _pending["partial_reset"] = True  # the lifted pass reached its rungs: spent, whatever its outcome
 
 
 def ladder_ran(episode: str) -> bool:
     return _pending.get("episode") == episode and bool(_pending.get("ladder_ran"))
 
 
-def partial_reset_due(episode: str, now: Optional[datetime] = None) -> bool:
-    """True once per episode when, with the power cycle configured, a gated hold has run its ladder and
-    outlived its grace and has not had its one lifted pass yet: a partial off-bus drop then gets the
-    ladder's own rungs (the mesh reset included) with the gate lifted before the power cycle (spec 04
-    I27). A whole tray down never gets it; the caller decides that."""
-    if not episode or _pending.get("episode") != episode or _pending.get("partial_reset"):
-        return False
-    if not (_pending.get("gated") and _pending.get("ladder_ran")):
-        return False
-    age = episode_age_sec(episode, now)
-    return age is not None and age >= grace_sec()
-
-
-_PARTIAL_PASS: contextvars.ContextVar = contextvars.ContextVar("tt_device_mcp_partial_pass", default="")
-
-
-@contextlib.contextmanager
-def partial_pass(episode: str):
-    """Scope this episode's one lifted pass (spec 04 I27). It is spent only once its climb has passed
-    the climb's own guards (ceiling, latch, reset scope, tenant, cooldown) and reaches the rungs
-    (:func:`note_ladder_ran`): a climb those guards decline leaves it due, so the mesh reset is never
-    skipped on the way to the power cycle. A spent pass that leaves the hold standing re-arms the
-    watchdog once (:func:`rearm_after_partial_reset`). With no power cycle configured the lift is the
-    I33 operator hand-off's, not this pass: nothing is tracked."""
-    if power_cycle_argv() is None:
-        yield
-        return
-    token = _PARTIAL_PASS.set(episode)
-    try:
-        yield
-    finally:
-        _PARTIAL_PASS.reset(token)
-        rearm_after_partial_reset(episode)
-
-
-def rearm_after_partial_reset(episode: str) -> None:
-    """The lifted pass ran and ended with the hold still standing: the watchdog forces one more pass,
-    which fires the power cycle, instead of waiting for the next ceiling window (once per episode). A
-    pass that never reached its rungs re-arms nothing."""
-    if _pending.get("episode") == episode and _pending.get("partial_reset") and not _pending.get("partial_rearmed"):
-        _pending["partial_rearmed"] = True
-        _pending["spawned"] = False
-
-
-def hold_handoff_sec() -> Optional[int]:
-    """Seconds, from the episode start, an off-bus hold the gate refuses with no power cycle configured
-    stands for an operator before the broker lifts the gate for its own ladder (spec 04 I33). A
-    non-positive or malformed value reads as 1200; ``off`` is the operator's latch: None, never lifted."""
-    if os.environ.get("TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC", "").strip().lower() == "off":
-        return None
-    return _int_env("TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC", HOLD_HANDOFF_DEFAULT_SEC)
-
-
-def _handoff_deadline(episode: str) -> Optional[float]:
-    sec = hold_handoff_sec()
-    try:
-        return None if sec is None else datetime.fromisoformat(episode).timestamp() + sec
-    except (TypeError, ValueError):
-        return None
-
-
 def note_hold_handoff(
     episode: str, off_bus: int, expected: int, why: str, log, *, latched: str = "", cause: str = ""
 ) -> None:
-    """The gate refuses every reset of this episode's off-bus hold and no power cycle is configured: hand
-    the hold to an operator with a deadline, once per episode (spec 04 I33). The manual-recovery check
-    runs once here, so the page says whether an operator is already on it. ``latched`` names an operator
-    gate (the I25 latch) that keeps the gate shut past the deadline. ``cause`` replaces the page's
+    """The I25 host-hang latch refuses every reset of this episode's off-bus hold, or no power cycle is configured: hand
+    the hold to an operator, once per episode (spec 04 I33). The manual-recovery check runs once here, so the page says
+    whether an operator is already on it. ``latched`` names what keeps the hold standing. ``cause`` replaces the page's
     default reason (no power-cycle command) when another path hands the hold off (spec 04 I36)."""
     if not episode:
         return
     _track(episode)
     if not _pending.get("handoff"):
-        deadline = None if latched else _handoff_deadline(episode)
         argv = manual_recovery_argv()
         seen = standback_reason(require_manual_check=False) if argv is not None else ""
         _pending["handoff"] = {
-            "deadline": deadline,
             "why": why,
-            "latched": latched or ("" if deadline else "TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC=off"),
+            "latched": latched,
             "operator_seen": seen or ("none seen" if argv is not None else "no manual-recovery check configured"),
         }
-        metrics.offbus_operator_deadline(deadline or 0)
         health_event(
             "offbus_gated_hold",
             phase="operator_handoff",
             held_since=episode,
-            deadline_epoch=deadline,
-            latched=_pending["handoff"]["latched"],
+            latched=latched,
             operator_seen=_pending["handoff"]["operator_seen"],
         )
     h = _pending["handoff"]
-    if h["deadline"]:
-        then = (
-            f"an operator must recover the host by {datetime.fromtimestamp(h['deadline']).isoformat(timespec='seconds')}; "
-            f"after that the broker lifts the gate for this hold and runs its own reset ladder (bridge reset, "
-            f"then the mesh reset), the full health check, fabric included, before any release"
-        )
-    else:
-        then = f"the hold stands until an operator recovers the host ({h['latched']})"
     page_once(
         "offbus_gated_hold_page",
         log,
         f"{off_bus}/{expected} chip(s) off the bus and no reset can end the hold ({why}); "
-        f"{cause or 'TT_DEVICE_MCP_POWER_CYCLE_CMD is not set'}, so {then}; manual-recovery check: {h['operator_seen']}",
+        f"{cause or 'TT_DEVICE_MCP_POWER_CYCLE_CMD is not set'}, so the hold stands until an operator "
+        f"recovers the host ({h['latched']}); manual-recovery check: {h['operator_seen']}",
         held_since=episode,
         off_bus=off_bus,
         expected=expected,
-        deadline_epoch=h["deadline"],
     )
 
 
-def hold_handoff_due(episode: str, now: Optional[float] = None) -> bool:
-    """True once this episode's operator hand-off deadline has passed (never for a latched one)."""
-    h = _pending.get("handoff") if _pending.get("episode") == episode else None
-    return bool(h and h["deadline"] and (now_epoch() if now is None else now) >= h["deadline"])
-
-
-def hold_handoff_status(episode: str, now: Optional[float] = None) -> Optional[dict]:
-    """The /health ``operator_handoff`` field while this episode's hold is handed off: who must act and by
-    when, or None."""
+def hold_handoff_status(episode: str) -> Optional[dict]:
+    """The /health ``operator_handoff`` field while this episode's hold is handed off: who must act, or None."""
     h = _pending.get("handoff") if episode and _pending.get("episode") == episode else None
     if not h:
         return None
-    out = {"reason": h["why"], "operator_seen": h["operator_seen"]}
-    if not h["deadline"]:
-        return {**out, "owner": "operator", "act_by": None, "then": f"hold ({h['latched']})"}
-    due = hold_handoff_due(episode, now)
     return {
-        **out,
-        "owner": "broker" if due else "operator",
-        "act_by": datetime.fromtimestamp(h["deadline"]).isoformat(timespec="seconds"),
-        "act_by_epoch": h["deadline"],
-        "then": "the broker runs its reset ladder with the gate lifted, then the full health check",
+        "reason": h["why"],
+        "operator_seen": h["operator_seen"],
+        "owner": "operator",
+        "act_by": None,
+        "then": f"hold ({h['latched']})",
     }
 
 
 def end_hold_handoff() -> None:
-    """The hold ended: the deadline metric goes back to 0."""
-    if _pending.pop("handoff", None):
-        metrics.offbus_operator_deadline(0)
+    _pending.pop("handoff", None)
 
 
 def due_for_watchdog(episode: str, now: Optional[datetime] = None) -> bool:
@@ -511,12 +365,10 @@ def due_for_watchdog(episode: str, now: Optional[datetime] = None) -> bool:
     cycle fires at the bound, not at the next ceiling window."""
     if not episode or _pending.get("episode") != episode or _pending.get("spawned"):
         return False
-    if power_cycle_argv() is None:
-        return hold_handoff_due(episode, None if now is None else now.timestamp())
-    if not _pending.get("ladder_ran"):
+    if power_cycle_argv() is None or not _pending.get("ladder_ran"):
         return False
     age = episode_age_sec(episode, now)
-    return bool(_pending.get("gated")) and age is not None and age >= grace_sec()
+    return bool(_pending.get("gated")) and age is not None and age >= GRACE_SEC
 
 
 def watchdog_due_at(episode: str) -> Optional[tuple[float, str]]:
@@ -526,15 +378,12 @@ def watchdog_due_at(episode: str) -> Optional[tuple[float, str]]:
     Read-only, for the /health hold report (spec 04 I75): moves no clock."""
     if not episode or _pending.get("episode") != episode or _pending.get("spawned"):
         return None
-    if power_cycle_argv() is None:
-        h = _pending.get("handoff")
-        return (float(h["deadline"]), "gated_hold_handoff_bound") if h and h["deadline"] else None
-    if not _pending.get("ladder_ran"):
+    if power_cycle_argv() is None or not _pending.get("ladder_ran"):
         return None
     out = []
     if _pending.get("gated"):
         try:
-            out.append((datetime.fromisoformat(episode).timestamp() + grace_sec(), "gated_offbus_grace"))
+            out.append((datetime.fromisoformat(episode).timestamp() + GRACE_SEC, "gated_offbus_grace"))
         except (TypeError, ValueError):
             pass
     return min(out) if out else None
@@ -545,40 +394,20 @@ def mark_spawned(episode: str) -> None:
         _pending["spawned"] = True
 
 
-def blocked_page_sec() -> int:
-    """Seconds past the grace a power cycle may stand blocked (a tenant, a reset in its own scope, a
-    stand-back) before the broker pages that the hold is not ending (default 1800)."""
-    return _int_env("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC", BLOCKED_PAGE_DEFAULT_SEC)
-
-
 def page_once(kind: str, log, message: str, **fields) -> None:
-    """Journal, log and alert ``kind`` once per episode (the journal line is the kill-safe record).
-    A page the alert hook drops (a previous run still in flight) is sent again on the next pass."""
+    """Journal and log ``kind`` once per episode (the journal line is the kill-safe record)."""
     journaled = _pending.setdefault("journaled", set())
-    paged = _pending.setdefault("paged", set())
-    if kind in paged:
+    if kind in journaled:
         return
-    if kind not in journaled:
-        journaled.add(kind)
-        log(message)
-        health_event(kind, message=message, host_at_risk=True, severity="high", **fields)
-    event = {
-        "kind": kind,
-        "message": message,
-        "host": socket.gethostname(),
-        "host_at_risk": True,
-        "severity": "high",
-        **fields,
-    }
-    if alert.send_alert(event) is not None or alert.alert_argv() is None:
-        paged.add(kind)
+    journaled.add(kind)
+    log(message)
+    health_event(kind, message=message, host_at_risk=True, severity="high", **fields)
 
 
 def page_if_blocked(episode: str, age: float, log, why: str, *, bound: Optional[int] = None, **fields) -> None:
-    """Hold for ``why`` past the grace (or ``bound``, the clock ``age`` counts against); once it has
-    blocked the power cycle for :func:`blocked_page_sec` more, page once: the hold ends in a cycle or a
-    page, never silence."""
-    limit = (grace_sec() if bound is None else bound) + blocked_page_sec()
+    """Hold for ``why`` past the grace (or ``bound``, the clock ``age`` counts against); once it has blocked the power
+    cycle for ``BLOCKED_PAGE_SEC`` more, page once: the hold ends in a cycle or a page, never silence."""
+    limit = (GRACE_SEC if bound is None else bound) + BLOCKED_PAGE_SEC
     if age >= limit:
         page_once(
             "offbus_power_cycle_blocked",
@@ -592,12 +421,11 @@ def page_if_blocked(episode: str, age: float, log, why: str, *, bound: Optional[
 
 
 def fire_command(argv: list, reason: str, timeout: float = FIRE_TIMEOUT_DEFAULT_SEC) -> None:
-    """Run the host's power-cycle command with the host OS brought down cleanly first (spec 04 I88):
-    the shutdown hook runs ``argv`` once the filesystems are read-only, with the reason in
-    ``TT_DEVICE_MCP_POWER_CYCLE_REASON`` and ``TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC`` per try
-    (clamped to fit systemd-shutdown). Never runs it under a live OS: where the clean path cannot
-    start it raises PowerCycleNotLaunched, and the caller retracts, holds and pages. Tests replace it:
-    no test may cycle the host."""
+    """Run the host's power-cycle command with the host OS brought down cleanly first (spec 04 I88): the shutdown hook
+    runs ``argv`` once the filesystems are read-only, with the reason in ``TT_DEVICE_MCP_POWER_CYCLE_REASON`` and
+    ``TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC`` per try (clamped to fit systemd-shutdown). Never runs it under a live
+    OS: where the clean path cannot start it raises PowerCycleNotLaunched, and the caller retracts, holds and pages.
+    Tests replace it: no test may cycle the host."""
     from tt_device_mcp.health.recovery.stages.power_cycle import fire_os_first
 
     fire_os_first(argv, reason, _int_env("TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC", int(timeout)))

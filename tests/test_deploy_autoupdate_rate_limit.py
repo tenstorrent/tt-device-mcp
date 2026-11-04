@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.deploy_helpers import LAP_STAND_INS
+from tests.deploy_helpers import LAP_STAND_INS, _clock
 from tt_device_mcp import server as srv
 from tt_device_mcp.constants import FABRIC_CHECK_TIMEOUT_SEC
 from tt_device_mcp.fsm import ServerFsm
@@ -27,12 +27,6 @@ from tt_device_mcp.fsm import ServerFsm
 pytestmark = pytest.mark.xdist_group("forks")
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "deploy" / "tt-device-autoupdate.sh"
-
-
-def _clock(text):
-    """The script's clock seam (au_now, au_time) as it defines them: the lap reads the real clock."""
-    i = text.index("au_now() {")
-    return text[i : text.index("\n", text.index("au_time() {", i)) + 1]
 
 
 def _cut(text, start, end):
@@ -46,13 +40,8 @@ _HEALTHY = '{"status":"ok","held":false,"fsm_state":"healthy","fsm_why":null}'
 def _lap(
     tmp_path, *, now, sha, interval=None, quiet=0, active="active", nrestarts="0", health=_HEALTHY, stand_ins=True
 ):
-    """One lap at fake time `now` that has just resolved `sha`: the already-current check, burst
-        coalescing and the rate limit, then (as if every gate passed) the tail that marks the sha
-        current and restarts. `active`, `nrestarts` and `health` are what systemd and the broker's
-        /health report. `quiet` is TTDEV_APPLY_QUIET_SEC: 0 (coalescing off) for the rate-limit tests
-        here, None for the script's default (tests/test_deploy_autoupdate_coalesce.py). `now=None`: the
-        lap reads the real clock, through the script's own seam. `stand_ins=False`: the real mv and rm,
-    for the tests that pin the rename itself or count the script's own processes."""
+    """One lap at fake time `now` that has just resolved `sha`: the already-current check, burst coalescing and the rate
+    limit, then (as if every gate passed) the tail that marks the sha current and restarts."""
     quoted_health = health.replace("'", "'\\''")  # a /health body may carry single quotes
     text = _SCRIPT.read_text()
     head = _cut(text, "# Read as $(cat) would", "INHIBIT=/run/")
@@ -60,6 +49,7 @@ def _lap(
     root = tmp_path / "root"
     root.mkdir(exist_ok=True)
     restarts = tmp_path / "restarts"
+    (tmp_path / "logs").mkdir(exist_ok=True)  # made here, not by a mkdir fork in each test's first lap
     stub = "" if now is None else f'date() {{ echo {now}; }}\nau_now() {{ printf -v "$1" %s {now}; }}\n'
     prelude = f"""set -u
 ROOT={root}; STATE={root}/installed.sha; VENV={tmp_path}/venv; BR=main; src_desc=test
@@ -68,7 +58,7 @@ remote_sha={sha}
 {_clock(text)}{stub}chmod() {{ :; }}
 systemctl() {{
     case "$*" in
-        restart*) echo "{now} $(cat "$STATE")" >> {restarts} ;;
+        restart*) local s=""; read -r s < "$STATE"; echo "{now} $s" >> {restarts} ;;
         is-active*) echo '{active}'; [ '{active}' = active ] ;;
         show*NRestarts*) echo '{nrestarts}' ;;
     esac
@@ -243,11 +233,8 @@ def test_a_healthy_broker_stays_rate_limited(tmp_path, broker):
 
 
 def _startup_health(tmp_path, monkeypatch, *, op=False, fault=None, dirty=False):
-    """The /health body the broker itself serves right after a start: the real _health_payload()
-    once fsm.boot_merge() has opened RECOVERING(startup_unverified). `op` is the startup gate
-    running (a broker device op); `fault` is a failed startup check holding for its fault; `dirty` is a
-    fault found during the startup check (a dead chip, say), which keeps the why and marks the episode
-    dirty: held for that fault, not for the check."""
+    """The /health body the broker itself serves right after a start: the real _health_payload() once fsm.boot_merge()
+    has opened RECOVERING(startup_unverified)."""
     f = ServerFsm(tmp_path / "fsm.json")
     monkeypatch.setattr(srv, "fsm", f)
     f.boot_merge(open_episode=None)

@@ -55,9 +55,8 @@ def _kill_quietly(pid: int) -> None:
 
 
 def _unique_tag(name: str) -> str:
-    """A job tag no other run shares. The sweep matches the tag host-wide, so a fixed one would
-    also find the child of a second test run of the same test on the host (the real runner's
-    tags carry a random suffix too)."""
+    """A job tag no other run shares. The sweep matches the tag host-wide, so a fixed one would also find the child of a
+    second test run of the same test on the host (the real runner's tags carry a random suffix too)."""
     return f"{name}-{os.getpid()}-{os.urandom(4).hex()}"
 
 
@@ -72,11 +71,7 @@ def _escaped_child(tag: str) -> tuple[int, int]:
 
 
 def _wait_escaped(child: int, tag: str, timeout: float = 5.0) -> None:
-    """The job shell exits as soon as it has forked, before the child has run setsid and exec'd
-    sleep. A sweep that ran then would test a race, not the escape: before setsid the job's
-    group still reaches the child, and while it execs sleep its environment reads empty, so for
-    that instant no route finds it (seen about 1 in 100 in a PID namespace, whose short /proc
-    scan lands inside the exec). Wait until it is in its own session and carries the tag."""
+    """The job shell exits as soon as it has forked, before the child has run setsid and exec'd sleep."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         info = job_reap._read_stat(child)
@@ -102,9 +97,8 @@ def test_an_escaped_child_is_found_by_the_first_scan():
 
 @pytest.mark.asyncio
 async def test_a_child_that_left_the_session_is_found_by_its_tag_and_ended():
-    """The common escape on a host without privsep: the ladder and the final killpg reach only
-    the job's process group, and a child that called setsid is not in it. Its parent has exited,
-    so no parent chain leads to it either; only the job's tag in its environment does."""
+    """The common escape on a host without privsep: the ladder and the final killpg reach only the job's process group,
+    and a child that called setsid is not in it."""
     tag = _unique_tag("t-escaped-1")
     job_pid, child = _escaped_child(tag)
     try:
@@ -125,8 +119,7 @@ async def test_a_child_that_left_the_session_is_found_by_its_tag_and_ended():
 
 @pytest.mark.asyncio
 async def test_a_descendant_that_left_the_session_is_found_through_its_parent():
-    """No tag (a child that scrubbed its environment): while its parent is still alive the
-    parent chain leads to it."""
+    """No tag (a child that scrubbed its environment): while its parent is still alive the parent chain leads to it."""
     job = _spawn_job("setsid sleep 60 >/dev/null 2>&1 < /dev/null & echo $!; wait")
     child = int(job.stdout.readline().strip())
     try:
@@ -257,9 +250,8 @@ def _stage_proc(root, pid: int, environ: bytes = b"", state: str = "S", flags: i
 
 
 def test_a_child_scanned_inside_execve_is_still_found_by_its_tag(tmp_path, monkeypatch):
-    """A process inside execve reads an empty environ until the new image's is mapped (seen as
-    comm 'sleep' with 0 environ bytes when the sweep missed a just-spawned setsid child). Ruled
-    out on that one read, it would outlive the sweep and touch the device under the next job."""
+    """A process inside execve reads an empty environ until the new image's is mapped (seen as comm 'sleep' with 0
+    environ bytes when the sweep missed a just-spawned setsid child)."""
     tag = _unique_tag("t-exec")
     monkeypatch.setattr(job_reap, "PROC_DIR", str(tmp_path))
     _stage_proc(tmp_path, 3999001)
@@ -300,9 +292,8 @@ def test_empty_environs_that_stay_empty_cost_one_bounded_window_per_scan(tmp_pat
 
 @pytest.mark.asyncio
 async def test_the_sweep_ends_a_child_its_first_scan_caught_inside_execve(tmp_path, monkeypatch):
-    """The sweep returns at once when its first scan finds nothing, so that scan must not miss an
-    escaped child (own session, parent gone) caught inside execve: it is signalled, not left
-    behind to outlive the job."""
+    """The sweep returns at once when its first scan finds nothing, so that scan must not miss an escaped child (own
+    session, parent gone) caught inside execve: it is signalled, not left behind to outlive the job."""
     tag = _unique_tag("t-exec-sweep")
     monkeypatch.setattr(job_reap, "PROC_DIR", str(tmp_path))
     _stage_proc(tmp_path, 3999050)
@@ -323,9 +314,8 @@ async def test_the_sweep_ends_a_child_its_first_scan_caught_inside_execve(tmp_pa
 
 @pytest.mark.asyncio
 async def test_a_found_process_whose_tag_stops_reading_is_still_a_survivor(monkeypatch):
-    """Past exit_mm (a SIGKILLed process stuck in the driver's release) a process's environ
-    reads empty, so the rescan's tag match no longer finds it. It is the same live process the
-    first scan found, so it is still named, and the device stays held."""
+    """Past exit_mm (a SIGKILLed process stuck in the driver's release) a process's environ reads empty, so the rescan's
+    tag match no longer finds it."""
     proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
     try:
         info = job_reap._read_stat(proc.pid)

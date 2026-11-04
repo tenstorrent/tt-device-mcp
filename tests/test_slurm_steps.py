@@ -302,10 +302,8 @@ class _PeerUidShim:
 
 @pytest.fixture(autouse=True)
 def _startup_already_ran(monkeypatch):
-    """The first TestClient lifespan in a process runs run_startup_tasks(), whose startup gate
-    pass calls the same patched _verify_device the step tests count. Run alone, a test would then
-    see that startup call as its own step's gate pass. Mark startup done, as it already is for
-    every test after the first in a full run, so only the step route's own calls are recorded."""
+    """The first TestClient lifespan in a process runs run_startup_tasks(), whose startup gate pass calls the same
+    patched _verify_device the step tests count."""
     monkeypatch.setattr(srv, "_startup_tasks_done", True)
 
 
@@ -405,10 +403,8 @@ def test_the_in_flight_guard_catches_a_hung_jobs_teardown_window(monkeypatch, cl
 
 @pytest.mark.parametrize("status", ["KILLED", "RUNNING", None])
 def test_the_in_flight_guard_catches_a_readopted_jobs_scope_until_it_ends(monkeypatch, clear_job_state, status):
-    """A job re-adopted after a broker restart has no `current_job_id`. A kill or a forced reset
-    marks it KILLED before its scope has wound down; its `readopted_scopes` entry stays until the
-    scope ends. A step in that window would read the device as idle, and post-step's reclaim would
-    SIGTERM the scope's processes mid-teardown."""
+    """A job re-adopted after a broker restart has no `current_job_id`. A kill or a forced reset marks it KILLED before
+    its scope has wound down; its `readopted_scopes` entry stays until the scope ends."""
     _no_holders(monkeypatch)
     _quiet_gate(monkeypatch)
     fsm_healthy(srv)
@@ -885,9 +881,8 @@ def test_post_step_malformed_exit_code_does_not_500(monkeypatch, clear_job_state
 def test_a_clean_post_step_on_an_armed_host_asks_for_the_eth_read(
     monkeypatch, clear_job_state, tmp_path, armed, exit_code, want_eth, want_fabric
 ):
-    """Spec 03 I30. A Slurm step that exits 0 hands the next job a mesh only enum+ARC looked at,
-    the same hole the in-broker post-job gate closed. Through the real route, a clean step on an
-    armed host asks the probe pass for the eth read and no traffic pass."""
+    """Spec 03 I30. A Slurm step that exits 0 hands the next job a mesh only enum+ARC looked at, the same hole the
+    in-broker post-job gate closed."""
     _present_chips(monkeypatch, tmp_path)
     _quiet_gate(monkeypatch)
     _no_holders(monkeypatch)
@@ -1045,7 +1040,7 @@ def _noop_post_job_gate(monkeypatch):
     runner off the device once its dispatched job finishes so nothing here depends on the real
     post-job gate's own timing."""
 
-    async def _noop(job_log_file, job_failed=False, noop_failure=False, exit1_failure=False):
+    async def _noop(job_log_file, job_failed=False, noop_failure=False):
         return None
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _noop)
@@ -1650,9 +1645,7 @@ def test_a_runner_test_cancelled_mid_job_leaves_its_job_current():
 
 
 def test_the_next_test_starts_with_no_current_job_or_readopted_scope():
-    """Second of the pair: the fixtures must hand every test an idle device. A leaked
-    current_job_id or readopted scope made _broker_work_in_flight refuse every step, so a pre-step
-    test waiting for its gate to start timed out instead (seen only in a full-suite run)."""
+    """Second of the pair: the fixtures must hand every test an idle device."""
     assert srv.current_job_id is None, srv.current_job_id
     assert srv.readopted_scopes == {}, srv.readopted_scopes
 

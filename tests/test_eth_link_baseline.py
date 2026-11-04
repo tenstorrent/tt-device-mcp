@@ -109,9 +109,8 @@ async def test_an_override_is_judged_on_its_exit_code_alone(monkeypatch):
 async def test_the_eth_read_reaps_its_killed_reader_within_the_outer_bound(
     monkeypatch, timeout_sec, override, reap_sec
 ):
-    """The built-in read waits up to ETH_REAP_SEC for a killed reader, capped at half the slack
-    under the caller's bound: 2.0 s at 60 s/probe 45 s, 0.5 s at the 10 s post-job bound. The
-    override runs at the caller's own bound and has no slack, so it does not wait (spec 03 I16)."""
+    """The built-in read waits up to ETH_REAP_SEC for a killed reader, capped at half the slack under the caller's
+    bound: 2.0 s at 60 s/probe 45 s, 0.5 s at the 10 s post-job bound."""
     seen = {}
     if override:
         monkeypatch.setenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", "exit 0")
@@ -132,10 +131,8 @@ async def test_the_eth_read_reaps_its_killed_reader_within_the_outer_bound(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("measured, verdict", [(11, Verdict.SKIPPED), (12, Verdict.HEALTHY)])
 async def test_a_link_drop_is_recorded_as_skipped_and_the_traffic_pass_still_runs(monkeypatch, measured, verdict):
-    """Beside an asked-for traffic pass, the pass runs on a skip as on a pass. What the drop changes
-    there is the record: SKIPPED, not a HEALTHY eth reading. The verdict that a drop does change is
-    the idle relift's eth_frozen check (test_device_safety). A clean exit's eth read alone runs the
-    pass on a drop at most once per interval (test_device_safety, spec 03 I30)."""
+    """Beside an asked-for traffic pass, the pass runs on a skip as on a pass. What the drop changes there is the
+    record: SKIPPED, not a HEALTHY eth reading."""
     srv.health_monitor.eth_link_drop(12)
     _stub_probe(monkeypatch, 0, f"{_count(measured)}\nall {measured} active-eth core heartbeat(s) advancing")
     mon = srv.health_monitor

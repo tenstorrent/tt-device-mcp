@@ -28,7 +28,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 GONE_NAMES = (
     "TT_DEVICE_MCP_AUTO_REBOOT",
     "TT_DEVICE_MCP_POST_REBOOT_VERIFY",
-    "TT_DEVICE_MCP_PROGRESS_RETRY_SEC",
+    "TT_DEVICE_MCP_AUTO_RECOVERY_INTERVAL_SEC",
     "STAGE_HOST_REBOOT",
 )
 REBOOT_ARGV = re.compile(r"""["']systemctl["']\s*,\s*["']reboot["']|/sbin/reboot|shutdown\s+-r""")
@@ -36,7 +36,6 @@ STALE_SWITCHES = {
     "TT_DEVICE_MCP_AUTO_REBOOT": "1",
     "TT_DEVICE_MCP_POST_REBOOT_VERIFY": "1",
     "TT_DEVICE_MCP_AUTO_UBB_RESET": "1",
-    "TT_DEVICE_MCP_PROGRESS_RETRY_SEC": "1",
     "TTDEV_AUTO_REBOOT": "1",
 }
 

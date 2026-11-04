@@ -11,7 +11,7 @@ import os
 import pytest
 
 from tests.conftest import patch_health_event
-from tt_device_mcp import alert, device_holders
+from tt_device_mcp import device_holders
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan, read_proc_cpu
 
@@ -23,15 +23,12 @@ def watch(monkeypatch):
     """Fake /proc CPU reads and record events, alerts and any signal. Returns a namespace whose
     ``cpu`` dict maps pid -> (ticks, starttime)."""
     monkeypatch.setattr(srv, "_idle_holders", {})
-    monkeypatch.delenv("TT_DEVICE_MCP_IDLE_HOLDER_SEC", raising=False)
     monkeypatch.setattr(device_holders, "username_for_uid", lambda uid: f"user{uid}")
     cpu: dict = {}
     monkeypatch.setattr(srv, "read_proc_cpu", lambda pid: cpu.get(pid))
     monkeypatch.setattr(srv, "descends_from", lambda pid, ancestor: False)
     events, alerts, signals = [], [], []
     patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
-    monkeypatch.setattr(alert, "alert_argv", lambda: ["/bin/true"])
-    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: alerts.append(event) or object())
     monkeypatch.setattr(os, "kill", lambda *a: signals.append(a))
 
     class NS:
@@ -59,9 +56,6 @@ def test_a_flat_holder_past_the_threshold_is_named_once_and_never_signalled(watc
     kinds = [k for k, _ in watch.events]
     assert kinds == ["idle_foreign_holder"], "one event for the holder's lifetime"
     assert watch.events[0][1]["pid"] == 4242 and watch.events[0][1]["user"] == f"user{TENANT_UID}"
-    assert len(watch.alerts) == 1, "one alert"
-    assert watch.alerts[0]["kind"] == "idle_foreign_holder"
-    assert (watch.alerts[0]["pid"], watch.alerts[0]["user"]) == (4242, f"user{TENANT_UID}")
     assert watch.signals == [], "never killed or signalled"
 
 
@@ -106,41 +100,12 @@ def test_a_reused_pid_is_a_new_process(watch):
     assert srv._watch_idle_foreign_holders(_scan(h), 1800.0) != []
 
 
-def test_a_busy_alert_hook_is_retried_without_a_second_event(watch, monkeypatch):
-    h = DeviceHolder(pid=4242, uid=TENANT_UID)
-    watch.cpu[4242] = (100, "555")
-    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: None)  # hook still busy
-    srv._watch_idle_foreign_holders(_scan(h), 0.0)
-    srv._watch_idle_foreign_holders(_scan(h), 900.0)
-    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: watch.alerts.append(event) or object())
-    srv._watch_idle_foreign_holders(_scan(h), 960.0)
-    srv._watch_idle_foreign_holders(_scan(h), 1020.0)
-
-    assert [k for k, _ in watch.events] == ["idle_foreign_holder"]
-    assert len(watch.alerts) == 1, "sent once the hook is free, then never again"
-
-
 def test_a_gone_holder_is_forgotten(watch):
     h = DeviceHolder(pid=4242, uid=TENANT_UID)
     watch.cpu[4242] = (100, "555")
     srv._watch_idle_foreign_holders(_scan(h), 0.0)
     srv._watch_idle_foreign_holders(_scan(), 100.0)
     assert srv._idle_holders == {}
-
-
-@pytest.mark.parametrize("raw,expected", [("60", 60.0), ("", 900.0), ("junk", 900.0), ("0", 0.0)])
-def test_threshold_is_configurable(monkeypatch, raw, expected):
-    monkeypatch.setenv("TT_DEVICE_MCP_IDLE_HOLDER_SEC", raw)
-    assert srv._idle_holder_sec() == expected
-
-
-def test_threshold_zero_turns_the_detector_off(watch, monkeypatch):
-    monkeypatch.setenv("TT_DEVICE_MCP_IDLE_HOLDER_SEC", "0")
-    h = DeviceHolder(pid=4242, uid=TENANT_UID)
-    watch.cpu[4242] = (100, "555")
-    for t in (0.0, 900.0, 5000.0):
-        assert srv._watch_idle_foreign_holders(_scan(h), t) == []
-    assert watch.events == []
 
 
 def test_read_proc_cpu_reads_this_process_and_none_for_a_gone_pid():
@@ -153,7 +118,6 @@ def test_read_proc_cpu_reads_this_process_and_none_for_a_gone_pid():
 
 @pytest.mark.asyncio
 async def test_the_sampler_spawn_is_rate_limited(monkeypatch):
-    monkeypatch.delenv("TT_DEVICE_MCP_IDLE_HOLDER_SEC", raising=False)
     monkeypatch.setattr(srv, "_idle_holder_task", None)
     monkeypatch.setattr(srv, "_idle_holder_last_scan", 0.0)
     passes = []

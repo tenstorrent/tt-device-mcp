@@ -70,11 +70,6 @@ def _redacted(argv: Iterable[str]):
         yield _NAMED_VALUE.sub(rf"\1\2{REDACTED}", arg)
 
 
-def redact_argv(argv: Iterable[str]) -> list[str]:
-    """``argv`` with the values of arguments named like a secret, and URL userinfo, replaced."""
-    return list(_redacted(argv))
-
-
 def _cut_arg(arg: str, limit: int) -> str:
     """``arg`` cut to ``limit`` chars. A cut that may fall inside URL userinfo (a '://' with no '/'
     after it) redacts all after the '://', since the '@' that ends the userinfo may be cut off."""
@@ -252,7 +247,6 @@ def read_holder_identities(
 
 
 def describe_identity(row: dict) -> str:
-    """One log line for a ``holder_identity`` row."""
     if row.get("status") == "gone" and "cmdline" not in row:
         return f"pid {row['pid']} gone before it could be read"
     if row.get("status") == "unread":

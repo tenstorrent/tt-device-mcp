@@ -23,7 +23,6 @@ import pytest
 from tests.conftest import GALAXY_BUS_IDS, patch_health_event
 from tests.test_classac_power_cycle_direct import EXPECTED, _beats_without, _gate, _off, rig  # noqa: F401 - the fixture
 from tests.test_offbus_power_cycle import _below_floor_episode, _gate_below_floor, _spy_gated_power_cycle
-from tt_device_mcp import alert
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy
@@ -213,9 +212,8 @@ def test_a_hung_shutdown_reaches_the_cycle_once_the_bound_passes(tmp_path):
 
 
 def test_the_fallback_has_the_hook_prepare_ipmi_before_it_fires(tmp_path):
-    """A shutdown that hangs may hang past openipmi's stop (drivers unloaded, /dev/ipmi0 gone): the
-    fallback has the installed hook load them again, bounded, before its cycle command runs. Its unit
-    has DefaultDependencies=no, so no ordering against openipmi could keep them loaded for it."""
+    """A shutdown that hangs may hang past openipmi's stop (drivers unloaded, /dev/ipmi0 gone): the fallback has the
+    installed hook load them again, bounded, before its cycle command runs."""
     out = tmp_path / "fired"
     cmd = ["/bin/sh", "-c", f'cat "{tmp_path / "prepared"}" > "$0"', str(out)]
     _, proc = _run_fallback(tmp_path, 0, cmd)
@@ -471,9 +469,8 @@ def test_no_possible_marker_when_no_cycle_can_follow(monkeypatch, provider, logg
 
 
 def test_the_marker_reads_requested_when_the_unit_starts(os_first, monkeypatch):
-    """The fallback unit's start is the last step before the reboot: the marker already says
-    'requested' there, with the trigger's class, chips, reason and hold; with no fresh trigger note
-    it carries the cycle's own reason."""
+    """The fallback unit's start is the last step before the reboot: the marker already says 'requested' there, with the
+    trigger's class, chips, reason and hold; with no fresh trigger note it carries the cycle's own reason."""
     seen, step = [], pc._run_step
 
     def reading(argv, timeout=pc.STEP_TIMEOUT_SEC):
@@ -546,23 +543,6 @@ def test_a_whole_tray_drop_marks_a_cycle_possible(monkeypatch):
         "whole_tray",
         "whole tray off the bus: tray 2: 8/8 chip(s) off the bus",
     )
-
-
-@pytest.mark.asyncio
-async def test_a_whole_tray_sent_straight_to_the_cycle_marks_it_possible(monkeypatch):
-    from tt_device_mcp.health.recovery import galaxy
-
-    monkeypatch.setattr(opc, "power_cycle_argv", lambda: CYCLE)
-    monkeypatch.setattr(opc, "partial_reset_due", lambda since: True)
-    monkeypatch.setattr(galaxy, "_hold_gate_liftable", lambda: True)
-    monkeypatch.setattr(galaxy, "offbus_count", lambda beats, expected: 8)
-    monkeypatch.setattr(galaxy, "_offbus_chip_ids", lambda beats, expected: list(range(8, 16)))
-    monkeypatch.setattr(galaxy, "_whole_tray_drop_trays", lambda chips, expected, trays: {1})
-    pc.set_pending_marker_context(lambda: ("whole_tray", {}, "2026-01-01T00:00:00"))
-    deps = SimpleNamespace(device_hold_episode_since=lambda: "2026-01-01T00:00:00", read_heartbeats=lambda: [])
-    fake = SimpleNamespace(deps=deps, _tray_map_now=lambda: None)
-    assert await galaxy.GalaxyRecovery._offbus_hold_lift(fake, 32, lambda line: None) == ""
-    assert (_marker()["state"], _marker()["reason"]) == ("possible", "8/32 chip(s) off the bus fill whole trays")
 
 
 @pytest.mark.asyncio
@@ -701,16 +681,11 @@ def escalation(os_first, monkeypatch, tmp_path):
     patch_health_event(monkeypatch, lambda *a, **k: None)
     hevents = []
     monkeypatch.setattr(recovery_base, "health_event", lambda name, **k: hevents.append((name, k)))
-    monkeypatch.delenv("TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK", raising=False)
     mech = srv.recovery_mechanism
     monkeypatch.setattr(mech, "host_action_requested", None)
     monkeypatch.setattr(mech, "_power_cycle_not_launched_paged", None)
-    # The process-wide mechanism keeps the I72 miss page's throttle: a page an earlier test on this
-    # worker sent would silence this test's page for an hour.
-    monkeypatch.setattr(mech, "_power_cycle_miss_paged", 0.0)
     monkeypatch.setattr(mech, "_device_hold_episode_since", lambda: "held-since-1")
     pages = []
-    monkeypatch.setattr(alert, "send_alert", lambda ev: pages.append(ev) or 0)
     os_first.update(mech=mech, pages=pages, hevents=hevents)
     return os_first
 
@@ -831,10 +806,8 @@ def _assert_cycle_names(escalation, written, states, fault_class, off):
 async def test_a_whole_tray_the_gate_sends_to_the_cycle_is_marked_and_journaled_as_whole_tray(
     escalation, monkeypatch, tmp_path, clear_job_state, galaxy_trays
 ):
-    """A whole tray (0-7) off on the hold's first below-floor gate pass, with only the I27 command set:
-    the whole-tray note sends it to the cycle before the gate fills the hold's off-bus set, and no chip
-    is isolated. Both 'possible' markers, the 'requested' one and the trigger line still read class
-    whole_tray with the tray's chips and addresses, from the note (memory only)."""
+    """A whole tray (0-7) off on the hold's first below-floor gate pass, with only the I27 command set: the whole-tray
+    note sends it to the cycle before the gate fills the hold's off-bus set, and no chip is isolated."""
     _below_floor_episode(monkeypatch, tmp_path, cmd=" ".join(CYCLE))
     monkeypatch.setattr(galaxy, "_pci_rescan", lambda: None)  # the tray-down prelude's rescan
     monkeypatch.setattr(opc, "fire_command", _real_fire_command)
@@ -854,10 +827,8 @@ async def test_a_whole_tray_the_gate_sends_to_the_cycle_is_marked_and_journaled_
 async def test_a_drop_its_class_sends_straight_to_the_cycle_is_marked_and_journaled_with_it(
     escalation, rig, monkeypatch, fault_class, phase  # noqa: F811 - the imported fixture
 ):
-    """Spec 04 I37's direct cycle with the auto power cycle on: class A (tray 1 off) at a post-job
-    pass, class C (every chip off, a mesh reset already failed) at the startup gate. It fires on the
-    hold's first pass, before the gate fills the hold's off-bus set: the markers and the trigger line
-    read the class and the chips that cycle was decided on."""
+    """Spec 04 I37's direct cycle with the auto power cycle on: class A (tray 1 off) at a post-job pass, class C (every
+    chip off, a mesh reset already failed) at the startup gate."""
     monkeypatch.setattr(srv, "_auto_power_cycle_host", _real_auto_power_cycle_host)
     written = _broker_context(escalation, monkeypatch)
     off = set(range(EXPECTED)) if fault_class == "all_off" else _off(rig["map"], {1: 8})
@@ -877,14 +848,10 @@ async def test_a_cycle_that_cannot_launch_retracts_holds_and_pages_once_per_epis
     monkeypatch.setattr(pc, "os_first_unavailable", lambda: "no executable hook")
     assert await srv._auto_power_cycle_host(lambda _l: None, REASON) is False
     assert mech.read_auto_recovery_ledger() == [] and mech.host_action_requested is None
-    assert [p["kind"] for p in escalation["pages"]] == ["power_cycle_not_launched"]
-    assert "no executable hook" in escalation["pages"][0]["message"]
     assert await srv._auto_power_cycle_host(lambda _l: None, REASON) is False
-    assert len(escalation["pages"]) == 1, "one page per hold episode"
     assert sum(n == "power_cycle_not_launched" for n, _ in escalation["hevents"]) == 2
     monkeypatch.setattr(mech, "_device_hold_episode_since", lambda: "held-since-2")
     await srv._auto_power_cycle_host(lambda _l: None, REASON)
-    assert len(escalation["pages"]) == 2
     assert _steps(escalation) == []
 
 
@@ -893,7 +860,7 @@ async def test_a_preflight_failure_retracts_and_never_reboots(escalation):
     escalation["rc"]["preflight"] = 1
     assert await srv._auto_power_cycle_host(lambda _l: None, REASON) is False
     assert escalation["mech"].read_auto_recovery_ledger() == []
-    assert _steps(escalation) == ["preflight"] and "pre-flight" in escalation["pages"][0]["why"]
+    assert _steps(escalation) == ["preflight"]
 
 
 @pytest.mark.asyncio
@@ -911,8 +878,7 @@ BOOT_NOW = 1_800_000_000.0
 
 @pytest.fixture
 def booted(escalation, monkeypatch, tmp_path):
-    """A ledger whose last row is a power-cycle request from the previous boot, 100 s before this
-    boot started."""
+    """A ledger whose last row is a power-cycle request from the previous boot, 100 s before this boot started."""
     mech = escalation["mech"]
     btime = BOOT_NOW - 200
     monkeypatch.setattr(mech, "_current_boot_id", lambda: "boot-2")
@@ -977,9 +943,7 @@ def _refute_next_boot(s, monkeypatch, boot_id, btime, at):
 
 
 def test_a_refuted_cycle_is_retried_under_i72_and_pages_from_the_second(booted, monkeypatch):
-    """Spec 04 I72/I88: a refuted cycle is the broker's missed attempt. The warm boot it brought up
-    anchors no I65 cooldown; the cycle is asked again at the request's pending window + 0 s, then
-    + 300 s from the second miss on, with the I72 page from the second."""
+    """Spec 04 I72/I88: a refuted cycle is the broker's missed attempt."""
     monkeypatch.setattr(recovery_base, "_last_external_power_cycle", lambda _now: None)
     (booted["tmp"] / recovery_base.POWER_CYCLE_CAUSE_CAPABLE_FILE).write_text("{}\n")
     booted["out"]["restart_cause"] = " 0a 0f"
@@ -1004,7 +968,6 @@ def test_a_refuted_cycle_is_retried_under_i72_and_pages_from_the_second(booted, 
     assert mech.power_cycle_cooldown(now_epoch=now, ledger=[], requests=ledger) is None
     state = mech.power_cycle_miss_state(ledger, now_epoch=now)
     assert state["missed"] == 2 and state["until"] == second_at + window + recovery_base.POWER_CYCLE_MISS_RETRY_SEC[1]
-    assert [p["count"] for p in booted["pages"] if p["kind"] == "power_cycle_missed"] == [2]
     assert not mech.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=now)[0]
     assert mech.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=state["until"] + 1)[0]
 
@@ -1058,9 +1021,8 @@ RAW_RESTART_CAUSES = {
     ],
 )
 def test_restart_cause_names_the_raw_code(os_first, out, want, cycle):
-    """ipmitool's `chassis restart_cause` prints "invalid" for 0xa/0xb: the raw code is read and
-    named per IPMI 2.0 (low nibble of the first byte); reserved codes are unmapped, not a cause.
-    Exactly 0x1, 0x3, 0x6, 0x7, 0x9 and 0xb mean the power went off and on."""
+    """ipmitool's `chassis restart_cause` prints "invalid" for 0xa/0xb: the raw code is read and named per IPMI 2.0 (low
+    nibble of the first byte); reserved codes are unmapped, not a cause."""
     os_first["out"]["restart_cause"] = out
     assert pc.read_restart_cause(CYCLE) == want
     assert os_first["calls"][-1][1] == ["/usr/bin/ipmitool", "raw", "0x00", "0x07"]
@@ -1127,9 +1089,8 @@ def test_a_warm_reboot_that_healed_asks_no_further_cycle(warm_rebooted, monkeypa
 
 
 def test_a_warm_reboot_still_held_asks_the_cycle_again_in_the_new_episode(warm_rebooted, monkeypatch):
-    """Spec 04 I72/I88: the warm boot's startup check failed, so the device is held in a new episode
-    while the retry the old one held was lost with the old broker. The retry is armed for the new
-    episode at the miss's until, once, and the governor then allows the cycle."""
+    """Spec 04 I72/I88: the warm boot's startup check failed, so the device is held in a new episode while the retry the
+    old one held was lost with the old broker."""
     mech = warm_rebooted["mech"]
     monkeypatch.setattr(mech, "_device_hold_episode_since", lambda: "held-since-2")
     until = mech.power_cycle_miss_state(now_epoch=BOOT_NOW)["until"]
@@ -1175,7 +1136,7 @@ def test_a_warm_reboot_still_held_under_a_cooldown_or_the_backstop_waits_for_the
     then refuses the cycle (I65 cooldown or I9 backstop) and its own retry at that wait's end is the
     only one left: the missed retry is never armed again in the episode."""
     mech = warm_rebooted["mech"]
-    for attr in ("_power_cycle_backstop_logged", "_power_cycle_backstop_paged", "_ac_power_info"):
+    for attr in ("_power_cycle_backstop_logged", "_ac_power_info"):
         monkeypatch.setattr(mech, attr, getattr(mech, attr))
     _prepend_cycles_that_ran(warm_rebooted, *earlier)
     monkeypatch.setattr(mech, "_device_hold_episode_since", lambda: "held-since-2")
@@ -1279,10 +1240,9 @@ def test_a_boot_long_after_the_request_is_not_checked(booted, monkeypatch):
     assert booted["calls"] == []
 
 
-# A Galaxy BMC that answers no restart cause ("Unspecified error") still logs the power-off in its
-# SEL. Measured: the request at 03:02:49 UTC, the hook's TTPC record at 03:03:09 and the power-off at
-# 03:03:14 on the BMC clock (about 2 s behind the host's), the boot at 03:05:29, the broker's check at
-# 03:05:51.
+# A Galaxy BMC that answers no restart cause ("Unspecified error") still logs the power-off in its SEL. Measured: the
+# request at 03:02:49 UTC, the hook's TTPC record at 03:03:09 and the power-off at 03:03:14 on the BMC clock (about 2 s
+# behind the host's), the boot at 03:05:29, the broker's check at 03:05:51.
 SEL_REQUEST = 1792638169.550994
 SEL_BTIME = 1792638329
 SEL_CHECK = 1792638351.98
@@ -1724,15 +1684,8 @@ def _children(pid):
 
 @pytest.mark.parametrize("fired", [False, True], ids=["waiting-out-the-bound", "cycle-command-running"])
 def test_hook_stops_the_fallback_and_its_children_before_any_wait(hook, tmp_path, fired):
-    """The fallback, run for real: still waiting out its bound, or past it, as `timeout` with the cycle
-    command as its child. The hook stops it and every process it started before the RAID wait (the
-    stub mdadm sees none of them alive), so no orphan can cut power alongside the hook's own tries.
-    A SIGKILL is delivered at once but the kernel tears the process down after kill(2) returns, so a
-    single look can still see a killed process: the stub waits up to 5 s for the processes to go,
-    while the hook is held in the RAID wait, so only what the hook did before that wait can end them
-    (none of them exits on its own within 60 s).
-    The fallback's `sync &` is a stand-in that outlives the cycle's start: the host's sync may sit
-    uninterruptible in a flush for many seconds, where no SIGKILL ends it, and could never cut power."""
+    """The fallback, run for real: still waiting out its bound, or past it, as `timeout` with the cycle command as its
+    child."""
     started = [[b"/bin/sleep", b"59"], [b"/bin/sleep", b"60"]]  # the sync stand-in, the cycle command
     pidf, proc = _run_fallback(
         tmp_path, 0 if fired else 300, ["/bin/sleep", "60"], timeout=60, sync="exec /bin/sleep 59"

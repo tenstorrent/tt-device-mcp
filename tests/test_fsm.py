@@ -302,10 +302,7 @@ def test_boot_merge_reattributes_only_the_current_boot(tmp_path):
 
 
 def test_boot_merge_attributes_the_escalation_only_on_the_boots_first_broker_start(tmp_path):
-    """The ledger names the escalation that brought THIS boot up, and stays adjacent to it for the
-    whole boot. A broker restarted later in that boot (an autoupdate, a crash) was not caused by
-    it: stamping it there labels every later hold with a weeks-old power cycle. Fails on base,
-    where every start of the boot re-attributes."""
+    """The ledger names the escalation that brought THIS boot up, and stays adjacent to it for the whole boot."""
     path = tmp_path / "fsm.json"
     escalation = {"action": "power-cycle", "at": "2026-09-16T05:21:11"}
     first = ServerFsm(path, current_boot_id="boot-A")
@@ -349,9 +346,8 @@ OFF_BUS = "gate/pre-job: 1/32 chip(s) off the bus, below the reset floor — hel
 
 
 def test_a_hold_carried_into_a_power_cycled_boot_reads_as_its_pending_startup_check(tmp_path):
-    """Spec 03 I90: after the power cycle the old off-bus count describes the boot that is gone; the
-    carried hold reads as the pending startup check first, the old detail kept inside it, the hold
-    itself (state, why, dirty) unchanged. Fails on base, where the hold still leads with "1/32"."""
+    """Spec 03 I90: after the power cycle the old off-bus count describes the boot that is gone; the carried hold reads
+    as the pending startup check first, the old detail kept inside it, the hold itself (state, why, dirty) unchanged."""
     open_ep = FsmRecord(state=ServerState.RECOVERING, why="chips_off_bus", detail=OFF_BUS, dirty=True)
     f = ServerFsm(tmp_path / "fsm.json", current_boot_id="boot-B")
     f.boot_merge(open_episode=open_ep, attributed_boot={"action": "power-cycle", "at": "T1"})
@@ -471,9 +467,8 @@ def test_readopted_jobs_clear_when_the_job_ends(tmp_path):
 
 
 def test_startup_check_in_progress_is_set_while_the_check_runs_and_cleared_by_its_end(tmp_path):
-    """Spec 03 I76: fsm.json says plainly whether the startup check is in progress, with its start and
-    deadline, so a client that reads the file keeps its queued job through the check. True from the
-    check's start until it passes (release) or the hold becomes a fault hold; state/why stay as they are."""
+    """Spec 03 I76: fsm.json says plainly whether the startup check is in progress, with its start and deadline, so a
+    client that reads the file keeps its queued job through the check."""
     path = tmp_path / "fsm.json"
 
     def disk():

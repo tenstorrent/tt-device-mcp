@@ -64,15 +64,13 @@ def reset_chip_via_bridge(idx: str, bdf: str) -> Optional[bool]:
     surgical: the other 31 chips never see it, and the inter-chip fabric survives (measured
     — a traffic pass still passes afterwards).
 
-    Reaches the bridge three ways. A chip still enumerated has its own sysfs node, so its bridge
-    is the parent of that node. A chip the broker removed itself (isolate_chip — the all-ones
-    chips, which is how this rung normally finds them) has no node any more: its bridge is the one
-    isolate_chip recorded before the remove, used only while that record still holds (spec 04
-    I69, recorded_bridge). One that left the bus on its own has no node and no record — so, WHEN
-    OPTED IN, fall back to finding the bridge by the secondary bus it still points at. With the
-    opt-in off such an endpoint yields no bridge and this returns without firing a reset. Rescans
-    the bus afterwards to bring the endpoint back.
-    """
+    Reaches the bridge three ways. A chip still enumerated has its own sysfs node, so its bridge is the parent of that
+    node. A chip the broker removed itself (isolate_chip — the all-ones chips, which is how this rung normally finds
+    them) has no node any more: its bridge is the one isolate_chip recorded before the remove, used only while that
+    record still holds (spec 04 I69, recorded_bridge). One that left the bus on its own has no node and no record — so,
+    WHEN OPTED IN, fall back to finding the bridge by the secondary bus it still points at. With the opt-in off such an
+    endpoint yields no bridge and this returns without firing a reset. Rescans the bus afterwards to bring the endpoint
+    back."""
     bridge = pci.parent_bridge(bdf)
     if not bridge and pci.removed_chip(idx):
         bridge = recorded_bridge(idx)
@@ -108,15 +106,14 @@ def reset_chip_via_bridge(idx: str, bdf: str) -> Optional[bool]:
 
 
 def reset_removed_chip(idx: str, bdf: Optional[str] = None) -> Optional[bool]:
-    """Fire the Secondary Bus Reset of a chip the broker removed, through its recorded bridge, and
-    do NOT rescan: the caller resets every removed chip of the pass first, waits
-    SBR_RETRAIN_SETTLE_SEC once and rescans once, so no rescan re-enumerates a removed chip that is
-    still hung (spec 04 I69). ``True`` the reset fired,
-    ``False`` a setpci write failed, ``None`` no usable bridge or no setpci.
+    """Fire the Secondary Bus Reset of a chip the broker removed, through its recorded bridge, and do NOT rescan: the
+    caller resets every removed chip of the pass first, waits SBR_RETRAIN_SETTLE_SEC once and rescans once, so no rescan
+    re-enumerates a removed chip that is still hung (spec 04 I69). ``True`` the reset fired, ``False`` a setpci write
+    failed, ``None`` no usable bridge or no setpci.
 
-    ``bdf``, the chip's address from the broker's startup map, lets a chip with no usable record
-    (it came back after an earlier reset and left the bus again, so its record was dropped) reach
-    its bridge through the banked link baseline instead (spec 04 I101, saved_topology_bridge)."""
+    ``bdf``, the chip's address from the broker's startup map, lets a chip with no usable record (it came back after an
+    earlier reset and left the bus again, so its record was dropped) reach its bridge through the banked link baseline
+    instead (spec 04 I101, saved_topology_bridge)."""
     bridge = recorded_bridge(idx)
     rec = pci.removed_chip(idx) or {}
     if not bridge and (rec.get("bdf") or bdf):
@@ -128,16 +125,14 @@ def reset_removed_chip(idx: str, bdf: Optional[str] = None) -> Optional[bool]:
 
 
 def saved_topology_bridge(idx: str, bdf: str) -> Optional[str]:
-    """The bridge above chip ``idx`` at ``bdf`` as the banked link baseline names it, or None (spec 04
-    I101).
+    """The bridge above chip ``idx`` at ``bdf`` as the banked link baseline names it, or None (spec 04 I101).
 
-    A chip whose own node is gone has no parent link to walk, and one the broker did not remove (or
-    whose removal record was dropped when an earlier reset brought it back) has no recorded bridge
-    either. Every passing check banks each Tenstorrent link with the port above it
-    (pcie_link_baseline.json), so that port is still known. It is used only under the same proof as
-    a recorded bridge: still enumerated, its secondary bus is the chip's bus, and nothing is
-    enumerated on that bus. A mapping that fails the proof is journaled and refused; a chip with no
-    banked mapping returns None quietly, as before."""
+    A chip whose own node is gone has no parent link to walk, and one the broker did not remove (or whose removal record
+    was dropped when an earlier reset brought it back) has no recorded bridge either. Every passing check banks each
+    Tenstorrent link with the port above it (pcie_link_baseline.json), so that port is still known. It is used only
+    under the same proof as a recorded bridge: still enumerated, its secondary bus is the chip's bus, and nothing is
+    enumerated on that bus. A mapping that fails the proof is journaled and refused; a chip with no banked mapping
+    returns None quietly, as before."""
     link = hostpci._load_link_baseline().get(bdf)
     bridge = link.get("port") if isinstance(link, dict) else None
     if not bridge:
@@ -153,12 +148,10 @@ def saved_topology_bridge(idx: str, bdf: str) -> Optional[str]:
 def recorded_bridge(idx: str) -> Optional[str]:
     """The bridge isolate_chip recorded for chip ``idx`` before removing it, or None.
 
-    Used only while the record still describes the bus: the bridge is still enumerated, its
-    secondary bus is the removed chip's bus and nothing is enumerated on that bus. A galaxy reset or
-    rescan since the remove can renumber buses, and a Secondary Bus Reset through a bridge that now
-    feeds live silicon would knock out a chip that never dropped — the same refusal as
-    find_bridge_by_secondary_bus. A refused record is journaled; the chip then holds and escalates.
-    """
+    Used only while the record still describes the bus: the bridge is still enumerated, its secondary bus is the removed
+    chip's bus and nothing is enumerated on that bus. A galaxy reset or rescan since the remove can renumber buses, and
+    a Secondary Bus Reset through a bridge that now feeds live silicon would knock out a chip that never dropped — the
+    same refusal as find_bridge_by_secondary_bus. A refused record is journaled; the chip then holds and escalates."""
     rec = pci.removed_chip(idx)
     if not rec:
         return None
@@ -273,13 +266,12 @@ def secondary_bus_reset(idx: str, bridge: str) -> Optional[bool]:
 def find_bridge_by_secondary_bus(bdf: str) -> Optional[str]:
     """The BDF of the PCI bridge whose secondary bus is this chip's bus, or None.
 
-    reset_chip_via_bridge() reaches the bridge by walking the chip's own sysfs node up
-    to its parent. A chip still enumerated HAS that node; one that has fully left the
-    bus (or that the broker removed) does not, and the parent link is gone with it. The bridge above
-    it never moves — it stays enumerated with secondary_bus_number still pointing at the
-    now-empty bus — so matching that attribute finds the bridge to reset without ever
-    touching the vanished endpoint. Bus numbers repeat across PCI domains, so the domain
-    must match too. secondary_bus_number is decimal in sysfs; a BDF's bus field is hex.
+    reset_chip_via_bridge() reaches the bridge by walking the chip's own sysfs node up to its parent. A chip still
+    enumerated HAS that node; one that has fully left the bus (or that the broker removed) does not, and the parent link
+    is gone with it. The bridge above it never moves — it stays enumerated with secondary_bus_number still pointing at
+    the now-empty bus — so matching that attribute finds the bridge to reset without ever touching the vanished
+    endpoint. Bus numbers repeat across PCI domains, so the domain must match too. secondary_bus_number is decimal in
+    sysfs; a BDF's bus field is hex.
 
     The address passed here is cached at broker start and never refreshed, so a galaxy
     reset or rescan that renumbered buses since can leave it pointing at a bus that OTHER

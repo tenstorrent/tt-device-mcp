@@ -32,9 +32,8 @@ _MISMATCH = "Connection mismatch detected\nfound 2 missing port/cable connection
 
 @pytest.fixture(params=["wrapper", "built-in"])
 def fab(request, monkeypatch, health_deps):
-    """Both fabric paths: an operator wrapper (its exit code is the verdict, so a bare -9 reads
-    UNHEALTHY) and the built-in validator (its output is classified, here a partial run that already
-    printed bad links)."""
+    """Both fabric paths: an operator wrapper (its exit code is the verdict, so a bare -9 reads UNHEALTHY) and the
+    built-in validator (its output is classified, here a partial run that already printed bad links)."""
     m = HealthMonitor(health_deps)
     state = {"rc": -signal.SIGKILL, "kill": True, "text": _BAD_LINKS}
 
@@ -159,7 +158,7 @@ async def test_a_kill_during_the_descriptor_run_starts_no_rerun(mismatch):
 @pytest.mark.asyncio
 async def test_dead_chip_isolation_marks_the_fabric_check_killed_and_no_lift_follows(monkeypatch, health_deps):
     """server._kill_device_holders, the one place that kills the in-flight fabric pass, marks it, and the
-    hold it leaves cannot lift without a fresh passing full check (goal 11, I78), while the 10-min
+    hold it leaves cannot lift without a fresh passing full check (I78), while the 10-min
     bound (04 I76) runs on the hold's age, not on a fabric verdict."""
     monkeypatch.setattr(srv, "health_monitor", HealthMonitor(health_deps))
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
@@ -226,7 +225,6 @@ def gate(monkeypatch, tmp_path, clear_job_state):
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 0.0)
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_failed", False)
-    monkeypatch.setattr(srv.alert, "send_alert", lambda *a, **k: None)
     events = []
     patch_health_event(monkeypatch, lambda kind, *a, **f: events.append((kind, f)))
     seen = {"resets": 0, "rungs": []}
@@ -255,9 +253,8 @@ def _gate_event(events):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["post-job", "startup"])
 async def test_the_gate_never_logs_healthy_nor_clears_dirty_while_a_chip_is_isolated(gate, monkeypatch, phase):
-    """The field case: chip 15 left the bus, the isolation killed the fabric pass, and the next gate
-    read enum+ARC healthy. It logged healthy=true and swapped the dirty hold for a clean
-    fabric-unverified one (device_dirty_cleared). The record must stay dirty and unhealthy."""
+    """The field case: chip 15 left the bus, the isolation killed the fabric pass, and the next gate read enum+ARC
+    healthy."""
     events, _ = gate
     monkeypatch.setattr(srv, "isolated_chips", {"15"})
     fsm_dirty(srv, REASON, why="heartbeat")

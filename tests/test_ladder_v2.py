@@ -1,12 +1,11 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""ladder-v2: the two named hold branches, the power-cycle cooldown, the settle-before-host-rung,
-and the device-fault job rule.
+"""ladder-v2: the last-chance sweep before every host rung, the power-cycle cooldown, the
+settle-before-host-rung, and the device-fault job rule.
 
-Behaviour under test (user decisions 2026-09-16/17):
-- TRAY_DOWN_NO_WINDOW fires every reset type back-to-back (SBR -> per-tray re-power -> mesh reset),
-  ONE settle, ONE verify, then the power cycle — no retries, no per-rung verify.
-- GENERIC keeps the verify-between shape and retries the mesh reset up to the 600s ceiling.
+Behaviour under test:
+- Every road to a power cycle first re-issues the resets (SBR, then the mesh reset), settles once and
+  runs one full check; only a mesh still bad after that gets the power cycle.
 - A power cycle is spaced by a 30-min (1800s) cooldown, the only per-box rate limit; the boot-loop
   denial (per-boot cap, unreadable-ledger fail-closed) is kept.
 - A job SIGKILLed by device recovery falls off the queue: restore and scope reconciliation drop it.
@@ -27,9 +26,8 @@ async def _async_true(*a, **k):
 
 
 def _ev(**over):
-    """A minimal gate Evidence for the below-floor dispatch tests. Only ``off_bus`` matters to the
-    BELOW_FLOOR rung; everything else takes an inert default so a test names just the field it
-    exercises."""
+    """A minimal gate Evidence for the below-floor dispatch tests. Only ``off_bus`` matters to the BELOW_FLOOR rung;
+    everything else takes an inert default so a test names just the field it exercises."""
     base = dict(
         off_bus=0,
         frozen_chips=0,
@@ -55,16 +53,7 @@ def _ev(**over):
     return Evidence(**base)
 
 
-# --------------------------------------------------------------------------- _classify_hold
-
-
-# ------------------------------------------ the branch is LIVE: escalate()'s gate path classifies + fires
-
-
-# ------------------------------------------------------- (a) TRAY_DOWN_NO_WINDOW back-to-back sweep
-
-
-def _wire_failed_tray_down_sweep(monkeypatch, read_heartbeats, *, allowed=True):
+def _wire_failed_climb(monkeypatch, read_heartbeats, *, allowed=True):
     """Wire the climb after a failed reset so the one verify fails and the power cycle is opted in.
     Returns the recorded health events and the power-cycle counter."""
     g = srv.galaxy_recovery
@@ -196,17 +185,14 @@ def test_power_cycle_cooldown_keeps_the_boot_loop_denial(monkeypatch):
     assert not allowed2 and "tenant" in why2, "a tenant on the device is absolute"
 
 
-def test_reboot_interval_is_unchanged_by_the_power_cycle_cooldown(monkeypatch):
-    """Only the power cycle's spacing changed. A reboot is still gated by the general 3600s interval,
-    so a reboot 1900s ago still denies a reboot (a power cycle at the same age would be allowed)."""
+@pytest.mark.parametrize("action", ["reboot", "", "power cycle"])
+def test_only_the_power_cycle_is_an_automatic_action(monkeypatch, action):
+    """The power cycle is the only host rung (spec 04 I71): any other action is refused, fail closed,
+    even on an empty ledger."""
     rm = srv.recovery_mechanism
-    now = 1_000_000.0
-    monkeypatch.setattr(rm, "_current_boot_id", lambda: "this-boot")
-    monkeypatch.setattr(
-        rm, "read_auto_recovery_ledger", lambda: [{"action": "reboot", "boot_id": "prior-boot", "at_epoch": now - 1900}]
-    )
-    allowed, why = rm.auto_recovery_allowed("reboot", tenant_active=False, now_epoch=now)
-    assert not allowed and "3600" in why, "a reboot still uses the 3600s interval, unchanged by ladder-v2"
+    monkeypatch.setattr(rm, "read_auto_recovery_ledger", lambda: [])
+    allowed, why = rm.auto_recovery_allowed(action, tenant_active=False, now_epoch=1_000_000.0)
+    assert not allowed and "only the power cycle" in why
 
 
 # --------------------------------------------------------- (e) a device-fault-killed job falls off
@@ -268,11 +254,8 @@ def test_no_fabricated_self_heal_timing_left_in_src():
 
 
 # --------------------------------------- (c2) the last-chance reset sweep gates EVERY host rung
-# User, 2026-09-17: "SBR -> tray re-power -> mesh reset back-to-back should be called always before
-# any power cycle. We always need to give the resets one last chance before power cycle."
-# Before this, only TRAY_DOWN_NO_WINDOW swept; the gate ladder's ceiling, the idle/stuck-hold
-# escalation (the road most real power cycles took) and the post-reboot cold climb settled and
-# verified but never re-issued the rungs.
+# Every road to a power cycle (the gate ladder's ceiling, the idle/stuck-hold escalation, the cold
+# climb) gives the resets one last chance first.
 
 
 def _arm_sweep(monkeypatch, *, verify_healthy=False, tenant=False, scoped=True):
@@ -362,10 +345,8 @@ async def test_a_sweep_that_recovers_the_mesh_cancels_the_power_cycle(monkeypatc
 
 @pytest.mark.asyncio
 async def test_the_idle_escalation_road_to_a_power_cycle_goes_through_the_sweep():
-    """Wiring test for the host-rung road the gate ladder does not own: the idle/stuck-hold
-    escalation (`stuck_hold_host_escalation` — the road MOST real power cycles took). It must pass
-    through the last-chance sweep; before ladder-v2 it climbed to the host rung having only ever
-    re-tried the mesh reset. There is no post-reboot road: the broker has no reboot rung."""
+    """Wiring test for the host-rung road the gate ladder does not own: the idle/stuck-hold escalation
+    (`stuck_hold_host_escalation` — the road MOST real power cycles took)."""
     src = pathlib.Path(galaxy.__file__).read_text()
     fn = "_climb_to_host_recovery_after_failed_reset"
     start = src.index(f"async def {fn}(")
@@ -373,7 +354,7 @@ async def test_the_idle_escalation_road_to_a_power_cycle_goes_through_the_sweep(
     body = src[start : min(nxt) if nxt else len(src)]
     assert "_settle_and_verify_before_host_rung" in body, (
         f"{fn} must call the last-chance sweep before its host rung — every road to a power cycle "
-        f"gives the resets one more try (user, 2026-09-17)"
+        f"gives the resets one more try"
     )
     # and the sweep is reached BEFORE the rung fires, not after it
     assert body.index("_settle_and_verify_before_host_rung") < body.index(
@@ -423,9 +404,8 @@ def test_force_waives_an_unreadable_scan_but_never_a_running_job(monkeypatch):
 
 
 def test_the_i75_stand_down_blocks_only_inside_the_escalate_that_carries_it(monkeypatch):
-    """Spec 03 I75 (review F3): the caller's stand-down is re-read at the ladder's tenant check, where a
-    re-adopted job that ended mid-run would otherwise let a reset through ahead of the startup gate. A
-    running job still names itself first (job_running), and outside an escalate nothing is blocked."""
+    """Spec 03 I75 (review F3): the caller's stand-down is re-read at the ladder's tenant check, where a re-adopted job
+    that ended mid-run would otherwise let a reset through ahead of the startup gate."""
     g = srv.galaxy_recovery
     monkeypatch.setattr(g, "_stand_down", lambda: True)
     monkeypatch.setattr(g, "startup_verify_deferred", False)

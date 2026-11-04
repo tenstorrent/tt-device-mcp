@@ -87,7 +87,6 @@ _fenced: dict[str, dict] = {}
 _evidence: dict[str, list] = {}
 # pid -> monotonic deadline: readers an AER stop left SIGSTOPped (spec 03 I92), see hold_readers.
 _held: dict[int, float] = {}
-# How often a reader's timeout path looks again whether its hold ended.
 HOLD_POLL_SEC = 0.1
 # Evidence older than this before the next sign starts a new episode.
 EVIDENCE_GAP_SEC = 60.0
@@ -169,9 +168,6 @@ def node_identity(node: Path) -> Optional[tuple]:
         return None
 
 
-# --- recovering ------------------------------------------------------------------------------
-
-
 def set_recovering(owner: str, on: bool) -> None:
     """A reset or recovery step started (``on``) or ended on the chips. The end opens the post-reset
     grace window, so the step's verify reads every lost chip for real."""
@@ -204,9 +200,6 @@ def op_running() -> bool:
     """Whether this broker's own reset or recovery step is running: its reads are its own and ungated."""
     with _lock:
         return any(k.startswith("op:") for k in _recovering)
-
-
-# --- lost ------------------------------------------------------------------------------------
 
 
 def mark_lost(ids: Iterable, reason: str, nodes: Optional[dict] = None, deferred: bool = False) -> list:
@@ -267,7 +260,7 @@ def seal(ids: Iterable, why: str) -> list:
 
 
 def unreadable_lost() -> list:
-    """Lost chips a reader that opens the whole device (the aiclk-ceiling helper, the eth-heartbeat
+    """Lost chips a reader that opens the whole device (the eth-heartbeat
     probe) must not reach now: still attached (the node is the one marked), outside this broker's
     own reset step and its grace. Node identity is a stat, no chip read."""
     with _lock:
@@ -292,9 +285,6 @@ def lost_chips() -> list:
 def is_lost(idx) -> bool:
     with _lock:
         return str(idx) in _lost
-
-
-# --- fenced ----------------------------------------------------------------------------------
 
 
 def fence(ids: Iterable, reason: str, nodes: Optional[dict] = None) -> list:
@@ -337,11 +327,6 @@ def is_fenced(idx) -> bool:
         return str(idx) in _fenced
 
 
-def fenced_chips() -> list:
-    with _lock:
-        return sorted(_fenced, key=int)
-
-
 def read_blocked(idx) -> bool:
     """Whether an in-process reader must skip chip ``idx``'s MMIO-backed attributes now: lost or
     fenced, outside this broker's own reset step. Checked before EACH attribute read, so a fence
@@ -351,13 +336,9 @@ def read_blocked(idx) -> bool:
         return (idx in _lost or idx in _fenced) and not op_running()
 
 
-# --- first evidence ---------------------------------------------------------------------------
-
-
 def note_evidence(ids: Iterable, kind: str, ts: Optional[float] = None) -> None:
-    """A sign that chips are dying (``kind`` "aer_burst" or "all_ones") at wall time ``ts``. Keeps
-    the earliest sign of the episode; a sign more than :data:`EVIDENCE_GAP_SEC` after the last one
-    starts a new episode."""
+    """A sign that chips are dying (``kind`` "aer_burst" or "all_ones") at wall time ``ts``. Keeps the earliest sign of
+    the episode; a sign more than :data:`EVIDENCE_GAP_SEC` after the last one starts a new episode."""
     ts = time.time() if ts is None else float(ts)
     with _lock:
         for i in ids:
@@ -372,8 +353,7 @@ def note_evidence(ids: Iterable, kind: str, ts: Optional[float] = None) -> None:
 
 
 def first_evidence(ids: Iterable) -> tuple:
-    """(wall ts, kind) of the earliest sign of the current episode across ``ids``; (None, None) when
-    none was seen."""
+    """(wall ts, kind) of the earliest sign of the current episode across ``ids``; (None, None) when none was seen."""
     best = (None, None)
     with _lock:
         for i in ids:
@@ -381,9 +361,6 @@ def first_evidence(ids: Iterable) -> tuple:
             if ev is not None and (best[0] is None or ev[0] < best[0]):
                 best = (ev[0], ev[2])
     return best
-
-
-# --- held readers ----------------------------------------------------------------------------
 
 
 def hold_readers(pids: Iterable, until: float) -> None:
@@ -433,25 +410,22 @@ def wait_reader_release(pid) -> None:
 
 
 async def await_reader_release(pid) -> None:
-    """:func:`wait_reader_release` for the event loop."""
     t0 = time.monotonic()
     while not _hold_over(pid, time.monotonic() - t0):
         await asyncio.sleep(HOLD_POLL_SEC)
 
 
 def may_read(idx, node: Path, *, probe: bool = False) -> bool:
-    """Whether a broker read of chip ``idx`` (sysfs node ``node``) may go to the chip now. True for a
-    chip not marked lost, and for every read while this broker's own reset step runs. For a lost chip:
-    True once its node was re-created (and the mark is cleared), or when a re-read is due (one per
-    :data:`GRACE_REPROBE_SEC` right after a reset step, or one a decision read asked for while the
-    chip's remove is still to come); False otherwise, and the caller reports the chip as all-ones
-    without reading it. No poll clock makes a re-read due, and a sealed chip (:func:`seal`) is read
+    """Whether a broker read of chip ``idx`` (sysfs node ``node``) may go to the chip now. True for a chip not marked
+    lost, and for every read while this broker's own reset step runs. For a lost chip: True once its node was re-created
+    (and the mark is cleared), or when a re-read is due (one per :data:`GRACE_REPROBE_SEC` right after a reset step, or
+    one a decision read asked for while the chip's remove is still to come); False otherwise, and the caller reports the
+    chip as all-ones without reading it. No poll clock makes a re-read due, and a sealed chip (:func:`seal`) is read
     only in the grace.
 
-    ``probe`` is a decision read (see :func:`reprobe_due`), not a poll: the re-read is due once the
-    last real read is :data:`PROBE_MIN_SEC` old, so a chip that answers again on the same node is seen
-    by the check that judges it and never judged off the bus on a value nobody read. It restarts the
-    reprobe clock."""
+    ``probe`` is a decision read (see :func:`reprobe_due`), not a poll: the re-read is due once the last real read is
+    :data:`PROBE_MIN_SEC` old, so a chip that answers again on the same node is seen by the check that judges it and
+    never judged off the bus on a value nobody read. It restarts the reprobe clock."""
     idx = str(idx)
     with _lock:
         rec = _lost.get(idx)
@@ -496,12 +470,11 @@ def may_read(idx, node: Path, *, probe: bool = False) -> bool:
 
 
 def reprobe_due(ids: Optional[Iterable] = None) -> None:
-    """Make each lost chip's next read real for a decision read through a plain reader (spec 03 I66):
-    the reset gate's and the recovery ladder's off-bus counts, the DOWN off-bus recheck, the
-    hold-deadline escalation, and job admission, exec and a Slurm step's verdict. A read already due
-    stays due; one whose last real read is younger than :data:`PROBE_MIN_SEC` stays gated, so
-    back-to-back decisions read a dead chip once. ``ids`` limits it to those chips (the sampler's
-    pending FAST_CONFIRM_SEC proof, I79)."""
+    """Make each lost chip's next read real for a decision read through a plain reader (spec 03 I66): the reset gate's
+    and the recovery ladder's off-bus counts, the DOWN off-bus recheck, the hold-deadline escalation, and job admission,
+    exec and a Slurm step's verdict. A read already due stays due; one whose last real read is younger than
+    :data:`PROBE_MIN_SEC` stays gated, so back-to-back decisions read a dead chip once. ``ids`` limits it to those chips
+    (the sampler's pending FAST_CONFIRM_SEC proof, I79)."""
     want = None if ids is None else {str(i) for i in ids}
     with _lock:
         for idx, rec in list(_lost.items()) + [(k, v) for k, v in _fenced.items() if k not in _lost]:
@@ -516,9 +489,6 @@ def observe(idx, value) -> None:
             clear_lost(idx, "answering again")
         else:
             unfence(idx, "answering again")
-
-
-# --- publishing ------------------------------------------------------------------------------
 
 
 def snapshot() -> dict:

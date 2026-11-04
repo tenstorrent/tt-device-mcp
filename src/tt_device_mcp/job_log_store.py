@@ -20,8 +20,7 @@ from typing import Iterable, Optional
 # A job log is `<YYYY-MM-DD>_<HHMMSS>_<id>.log`; name order is time order. Nothing else in the
 # dir (server.log, its rotations, the queued-spec subdir) matches.
 JOB_LOG_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}_([0-9A-Za-z-]+)\.log$")
-# What a client may pass as a job id: no glob or path characters, so a lookup can only ever
-# match that one id's logs.
+# What a client may pass as a job id: no glob or path characters, so a lookup can only ever match that one id's logs.
 _JOB_ID_RE = re.compile(r"[0-9A-Za-z-]{1,32}")
 
 # Retention defaults: the newest logs are kept until either bound is reached. Both keep the disk
@@ -51,10 +50,9 @@ def find_job_log(log_dir, job_id) -> Optional[Path]:
 
 
 def read_log_tail(path, n: int, block: int = 65536) -> str:
-    """The last ``n`` lines of ``path``, read from the end in blocks (a job log can be
-    gigabytes). Bytes that do not decode (binary output, a multibyte character cut by a
-    truncated or unflushed write) come back replaced, never raised; a last line with no newline
-    is returned as it stands. "" when the file cannot be read."""
+    """The last ``n`` lines of ``path``, read from the end in blocks (a job log can be gigabytes). Bytes that do not
+    decode (binary output, a multibyte character cut by a truncated or unflushed write) come back replaced, never
+    raised; a last line with no newline is returned as it stands. "" when the file cannot be read."""
     if n <= 0:
         return ""
     try:
@@ -94,21 +92,6 @@ def exit_signal(exit_code) -> Optional[str]:
     return f"{name} (from exit code {rc} = 128+{num})" if derived else name
 
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        v = int(os.environ.get(name, "").strip() or default)
-    except ValueError:
-        return default
-    return v if v > 0 else default
-
-
-def job_log_limits() -> tuple[int, int]:
-    """(most logs kept, most bytes kept). Read per call, like the spool dir."""
-    keep = _env_int("TT_DEVICE_MCP_JOB_LOG_KEEP", JOB_LOG_KEEP_DEFAULT)
-    max_mb = _env_int("TT_DEVICE_MCP_JOB_LOG_MAX_MB", JOB_LOG_MAX_MB_DEFAULT)
-    return keep, max_mb << 20
-
-
 def prune_job_logs(
     log_dir,
     keep_ids: Iterable[str] = (),
@@ -124,10 +107,8 @@ def prune_job_logs(
     bound. Best effort: a file that cannot be read or deleted is left as it is."""
     if not log_dir:
         return []
-    if max_count is None or max_bytes is None:
-        dflt_count, dflt_bytes = job_log_limits()
-        max_count = dflt_count if max_count is None else max_count
-        max_bytes = dflt_bytes if max_bytes is None else max_bytes
+    max_count = JOB_LOG_KEEP_DEFAULT if max_count is None else max_count
+    max_bytes = JOB_LOG_MAX_MB_DEFAULT << 20 if max_bytes is None else max_bytes
     now = time.time() if now is None else now
     keep_ids = set(keep_ids)
     try:

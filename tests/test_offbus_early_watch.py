@@ -3,8 +3,9 @@
 """The sampler's early off-bus watch (spec 03 I79): kernel AER counters and the chip node list,
 read every second between samples, bring the next sample forward and keep a fast cadence for a
 while. The signal decides nothing on its own: the two-sample proof still confirms, and on the
-fast cadence the bad reading must also have lasted FAST_CONFIRM_SEC. Everything here runs on a
-fake sysfs tree and an injected clock; no device is touched."""
+fast cadence the bad reading must also have lasted its bound: CONTAIN_CONFIRM_SEC (the second fast
+sample) for a lone chip's containment, FAST_CONFIRM_SEC for a whole-mesh verdict or right after a
+reset step. Everything here runs on a fake sysfs tree and an injected clock; no device is touched."""
 
 from __future__ import annotations
 
@@ -193,19 +194,36 @@ async def test_a_failing_signal_read_never_stops_the_sampler(watch, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_an_armed_watch_confirms_a_dead_chip_after_the_confirm_bound(watch):
-    """Class B1 (one chip off the bus): with the watch armed, samples 2 s apart confirm the dead
-    chip once it has read dead for FAST_CONFIRM_SEC, instead of a full regular interval later."""
+async def test_an_armed_watch_confirms_a_dead_chip_at_the_second_fast_sample(watch):
+    """Class B1 (one chip off the bus): with the watch armed, the second sample 2 s on confirms the
+    dead chip (it has read dead for CONTAIN_CONFIRM_SEC), instead of a full regular interval later."""
     s, clock, isolated, _ = watch
     s.arm_fast("uncorrectable AER errors on 0000:00:01.1")
     bad = {"0": LIVE, "13": DEAD, "31": LIVE}
 
     await s.check_for_dead_chips(bad)  # t=0: strike 1
+    assert isolated == [], "one sample is not the proof"
     clock.t += telemetry.FAST_SAMPLE_SEC
-    await s.check_for_dead_chips(bad)  # t=2: two samples, but not FAST_CONFIRM_SEC yet
-    assert isolated == [], "two fast samples 2 s apart are not the debounce"
+    await s.check_for_dead_chips(bad)  # t=2: two samples, lasted CONTAIN_CONFIRM_SEC
+    assert isolated == ["13"]
+    assert telemetry.CONTAIN_CONFIRM_SEC < telemetry.FAST_SAMPLE_SEC, "two reads, never one, FAST_SAMPLE_SEC apart"
+
+
+@pytest.mark.asyncio
+async def test_a_reading_that_began_right_after_a_reset_step_keeps_the_longer_bound(watch):
+    """A step's own re-init may still be settling just after it ends (I86's POST_STEP_AER_QUIET_SEC): an all-ones
+    reading that began then keeps FAST_CONFIRM_SEC, so two fast samples 2 s apart do not contain it."""
+    s, clock, isolated, _ = watch
+    s.arm_fast("uncorrectable AER errors on 0000:00:01.1")
+    s._step_seen_at = clock.t
+    bad = {"0": LIVE, "13": DEAD, "31": LIVE}
+
+    await s.check_for_dead_chips(bad)
     clock.t += telemetry.FAST_SAMPLE_SEC
-    await s.check_for_dead_chips(bad)  # t=4: lasted the bound
+    await s.check_for_dead_chips(bad)
+    assert isolated == [], "two fast samples 2 s apart right after a step are not the proof"
+    clock.t += telemetry.FAST_SAMPLE_SEC
+    await s.check_for_dead_chips(bad)
     assert isolated == ["13"]
 
 
@@ -233,7 +251,7 @@ async def test_an_armed_watch_confirms_a_whole_mesh_drop_after_the_confirm_bound
 async def test_a_lone_chip_s_first_all_ones_read_arms_the_watch_and_confirms_at_the_bound(watch):
     """Class B1 with only correctable AER on its path (nothing arms the watch): the chip's own first
     all-ones read arms the fast cadence, so the next sample comes FAST_SAMPLE_SEC later and the chip
-    is isolated once it has read dead for FAST_CONFIRM_SEC, not a whole SAMPLE_INTERVAL_SEC on."""
+    is isolated on it (it has read dead for CONTAIN_CONFIRM_SEC), not a whole SAMPLE_INTERVAL_SEC on."""
     s, clock, isolated, events = watch
     bad = {"0": DEAD, "13": LIVE, "31": LIVE}
     assert not s.fast_active()
@@ -242,12 +260,9 @@ async def test_a_lone_chip_s_first_all_ones_read_arms_the_watch_and_confirms_at_
     assert s.fast_active(), "the first all-ones read arms the fast cadence"
     assert [f["reason"] for k, f in events if k == "offbus_watch_armed"] == ["chip(s) 0 read all-ones"]
     clock.t += telemetry.FAST_SAMPLE_SEC
-    await s.check_for_dead_chips(bad)  # t=2: two samples, the bound not yet
-    assert isolated == [], "two fast samples 2 s apart are not the debounce"
+    await s.check_for_dead_chips(bad)  # t=2: two samples, lasted the bound
+    assert isolated == ["0"], "contained at the second fast sample, not SAMPLE_INTERVAL_SEC"
     assert chip_state.is_lost("0")
-    clock.t += telemetry.FAST_SAMPLE_SEC
-    await s.check_for_dead_chips(bad)  # t=4: lasted the bound
-    assert isolated == ["0"], "contained at FAST_CONFIRM_SEC, not SAMPLE_INTERVAL_SEC"
     assert _kinds(events).count("offbus_watch_armed") == 1, "a chip already struck arms nothing again"
 
 
@@ -268,8 +283,8 @@ async def test_a_lone_chip_that_answers_again_after_its_first_all_ones_read_is_n
 @pytest.mark.asyncio
 async def test_a_lone_chip_s_first_all_ones_read_at_a_window_s_tail_still_confirms_at_the_bound(watch):
     """A first all-ones read less than FAST_CONFIRM_SEC before a running window ends extends it, so
-    the sample after the second one is still a fast one and the chip is contained at
-    FAST_CONFIRM_SEC, not a whole SAMPLE_INTERVAL_SEC after the window lapsed. The proof is unchanged."""
+    the next sample is still a fast one and the chip is contained on it, not a whole
+    SAMPLE_INTERVAL_SEC after the window lapsed. The proof is unchanged."""
     s, clock, isolated, events = watch
     bad = {"0": DEAD, "13": LIVE, "31": LIVE}
     assert s.arm_fast("an AER rise")
@@ -277,20 +292,17 @@ async def test_a_lone_chip_s_first_all_ones_read_at_a_window_s_tail_still_confir
     first = clock.t
 
     await s.check_for_dead_chips(bad)  # strike 1, the window about to end
+    assert s.fast_active() and s.fast_until > first + 1, "the window outlives its own last second"
     clock.t += telemetry.FAST_SAMPLE_SEC
-    await s.check_for_dead_chips(bad)  # +2 s: two samples, the bound not yet
-    assert isolated == [], "two fast samples 2 s apart are not the debounce"
-    assert s.fast_active(), "the next sample must come FAST_SAMPLE_SEC on, not SAMPLE_INTERVAL_SEC"
-    clock.t += telemetry.FAST_SAMPLE_SEC
-    await s.check_for_dead_chips(bad)  # +4 s: lasted the bound
-    assert isolated == ["0"] and clock.t - first == telemetry.FAST_CONFIRM_SEC
+    await s.check_for_dead_chips(bad)  # +2 s: two samples, lasted the bound
+    assert isolated == ["0"] and clock.t - first == telemetry.FAST_SAMPLE_SEC
     assert _kinds(events).count("offbus_watch_armed") == 1, "extending a live window journals nothing"
 
 
 @pytest.mark.asyncio
 async def test_a_first_all_ones_read_at_a_capped_storm_s_tail_never_stretches_the_cap(watch):
     """The extension stays inside the storm cap: at FAST_MAX_SEC the window ends regardless, and the
-    chip then keeps the regular cadence and its FAST_CONFIRM_SEC proof (never a shorter one)."""
+    chip then keeps the regular cadence, and its next sample, SAMPLE_INTERVAL_SEC on, is the proof."""
     s, clock, isolated, _ = watch
     start = clock.t
     s.arm_fast("an AER rise")
@@ -302,10 +314,9 @@ async def test_a_first_all_ones_read_at_a_capped_storm_s_tail_never_stretches_th
     bad = {"0": DEAD, "13": LIVE, "31": LIVE}
     await s.check_for_dead_chips(bad)
     assert s.fast_until == start + telemetry.FAST_MAX_SEC, "the cap still bounds the window"
-    clock.t += telemetry.FAST_SAMPLE_SEC
-    await s.check_for_dead_chips(bad)
-    assert not s.fast_active() and isolated == []
+    assert isolated == []
     clock.t += telemetry.SAMPLE_INTERVAL_SEC  # the regular cadence's next sample
+    assert not s.fast_active()
     await s.check_for_dead_chips(bad)
     assert isolated == ["0"]
 
@@ -348,9 +359,8 @@ async def test_a_transient_aer_with_live_heartbeats_never_flags_the_device(watch
 
 @pytest.mark.asyncio
 async def test_a_blip_shorter_than_the_confirm_bound_is_not_confirmed(watch, monkeypatch):
-    """On the fast cadence two samples come 2 s apart; a chip that reads dead on both and answers
-    on the third must not be isolated, and an empty sample that clears the same way must not
-    dirty the device. The fast cadence never makes the debounce shorter than FAST_CONFIRM_SEC."""
+    """On the fast cadence samples come 2 s apart; a chip that reads dead on one and answers on the next must not be
+    isolated, and an empty sample on two that clears on the third must not dirty the device (FAST_CONFIRM_SEC)."""
     s, clock, isolated, events = watch
     monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "3")
     monkeypatch.setattr(srv, "device_op_active", "")
@@ -358,7 +368,7 @@ async def test_a_blip_shorter_than_the_confirm_bound_is_not_confirmed(watch, mon
     bad = {"0": LIVE, "13": DEAD, "31": LIVE}
     healthy = {"0": LIVE, "13": LIVE, "31": LIVE}
 
-    for n, sample in enumerate((bad, bad, healthy, {}, {}, healthy)):
+    for n, sample in enumerate((bad, healthy, {}, {}, healthy)):
         # The answering chips' heartbeats tick between samples, as a live ARC's does (~10 Hz).
         sample = {i: [v[0] + n, *v[1:]] if v is LIVE else v for i, v in sample.items()}
         await s.check_for_dead_chips(sample)
@@ -374,9 +384,7 @@ async def test_a_blip_shorter_than_the_confirm_bound_is_not_confirmed(watch, mon
 
 
 def test_the_fast_cadence_leaves_housekeeping_and_relift_on_the_regular_cadence(watch, monkeypatch):
-    """Only the off-bus check gets faster. The idle hold ledger, the idle relift (the only path
-    that re-verifies a hold with no job flowing) and the holder scan keep SAMPLE_INTERVAL_SEC,
-    so the watch adds no lift attempt and no extra full health check."""
+    """Only the off-bus check gets faster."""
     s, clock, _, _ = watch
     samples, ledger, relift = [], [], []
     monkeypatch.setattr(srv, "chip_sample", lambda: samples.append(clock.t) or {"0": LIVE})
@@ -541,11 +549,11 @@ async def test_a_reset_moves_the_baseline_without_arming(watch, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_two_fast_all_ones_samples_mark_a_chip_lost_before_the_confirm_bound(watch):
-    """Under the fast cadence the second all-ones sample marks the chip lost (spec 03 I66), so the
-    poll clock does no full read of it again; only the isolation waits for FAST_CONFIRM_SEC. The
-    next sample reads its heartbeat once for real, so the proof never rests on a value nobody read."""
+    """Under the fast cadence the second all-ones sample marks the chip lost (spec 03 I66), so the poll clock does no
+    full read of it again; only the isolation waits for its bound (FAST_CONFIRM_SEC right after a reset step)."""
     s, clock, isolated, _ = watch
     s.arm_fast("uncorrectable AER errors on 0000:00:01.1")
+    s._step_seen_at = clock.t
     bad = {"0": LIVE, "13": DEAD, "31": LIVE}
 
     await s.check_for_dead_chips(bad)
@@ -553,7 +561,7 @@ async def test_two_fast_all_ones_samples_mark_a_chip_lost_before_the_confirm_bou
     clock.t += telemetry.FAST_SAMPLE_SEC
     await s.check_for_dead_chips(bad)
     assert chip_state.is_lost("13"), "the second all-ones sample marks it lost"
-    assert isolated == [], "the isolation still waits for FAST_CONFIRM_SEC"
+    assert isolated == [], "the isolation still waits for its bound"
     rec = chip_state._lost["13"]
     assert rec["next"] <= rec["read"] + chip_state.PROBE_MIN_SEC, "the next sample reads it for real"
     clock.t += telemetry.FAST_SAMPLE_SEC
@@ -608,9 +616,10 @@ _PATHS = {
 @pytest.mark.parametrize("capped", [False, True], ids=["window-end", "storm-cap"])
 @pytest.mark.parametrize("path", list(_PATHS))
 async def test_the_confirm_bound_holds_across_the_end_of_a_fast_window(watch, monkeypatch, path, capped):
-    """A bad reading that began on a fast sample keeps the FAST_CONFIRM_SEC bound after the window
-    ends: the sample after the last fast one still comes FAST_SAMPLE_SEC later, and two samples 2 s
-    apart are never the debounce, whatever ended the window (I79: it never goes lower than 4 s)."""
+    """A bad reading that began on a fast sample keeps its bound after the window ends: the sample
+    after the last fast one still comes FAST_SAMPLE_SEC later, and two samples 2 s apart reach no
+    whole-mesh verdict, whatever ended the window (I79: FAST_CONFIRM_SEC never goes lower than 4 s).
+    A lone chip's containment stands at CONTAIN_CONFIRM_SEC, two reads 2 s apart, either way."""
     s, clock, isolated, events = watch
     expected, bad, verdict = _PATHS[path]
     monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", str(expected))
@@ -623,24 +632,25 @@ async def test_the_confirm_bound_holds_across_the_end_of_a_fast_window(watch, mo
     # inside the storm cap; every other case runs the next sample with the window over.
     assert s.fast_active() == (path == "per-chip" and not capped)
     await s.check_for_dead_chips(bad)  # 2 s later
+    if path == "per-chip":
+        assert isolated == ["13"], "the second read 2 s on contains a lone chip"
+        return
     assert isolated == [], "two samples 2 s apart isolated a chip"
     assert verdict not in _kinds(events), "two samples 2 s apart reached a verdict"
     assert srv.fsm.state is ServerState.HEALTHY
     clock.t += telemetry.FAST_SAMPLE_SEC
     await s.check_for_dead_chips(bad)  # lasted FAST_CONFIRM_SEC
-    if path == "per-chip":
-        assert isolated == ["13"]
-    else:
-        assert verdict in _kinds(events)
-        assert srv.fsm.state is not ServerState.HEALTHY
+    assert verdict in _kinds(events)
+    assert srv.fsm.state is not ServerState.HEALTHY
 
 
 @pytest.mark.asyncio
 async def test_a_pending_chip_past_the_window_still_gets_its_real_read(watch):
     """A chip still inside the bound when the window ends is lost and owes one real heartbeat read,
-    as it would inside the window (I66)."""
+    as it would inside the window (I66). The longer bound, right after a reset step, keeps it inside."""
     s, clock, isolated, _ = watch
     _end_window(s, clock, capped=False)
+    s._step_seen_at = clock.t
     bad = {"0": LIVE, "13": DEAD, "31": LIVE}
     await s.check_for_dead_chips(bad)
     clock.t += telemetry.FAST_SAMPLE_SEC

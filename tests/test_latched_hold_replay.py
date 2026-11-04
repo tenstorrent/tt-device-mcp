@@ -60,14 +60,13 @@ def replay(rig, monkeypatch, clear_job_state):  # noqa: F811
     monkeypatch.setattr(mon, "last_fabric_ok", None)
     monkeypatch.setattr(mon, "topology_hw_fault", "")
     monkeypatch.setattr(mon, "topology_lift_pending", False)
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
     monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
     monkeypatch.setattr(srv, "device_hold_job_bound_escalated", False)
     monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
     _watchdog(monkeypatch)
 
     async def full_check(expected, log, run_fabric=True, **k):
-        assert run_fabric, "every check after a reset includes the fabric (goal 8)"
+        assert run_fabric, "every check after a reset includes the fabric"
         rig["checks"].append(rig["fabric_ok"])
         order.append(("check", rig["fabric_ok"]))
         detail = "all links ok" if rig["fabric_ok"] else (MISMATCH if mon.topology_hw_fault else "rc=77")
@@ -172,10 +171,8 @@ def _restart_broker(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_the_i42_latched_hold_after_a_lift_gets_the_ladder_one_tick_in_and_one_cycle(replay):
-    """The sequence's second episode: a release about 2 h into the first, the first job after it fails
-    on the fabric (I42 latch set) and a new hold opens. The latch is no exemption from the bound, and a
-    latched hold is a fabric link-short hold (spec 04 I83): the full ladder runs on the first sampler
-    tick, never later than its one-tick bound, well inside the 10-min bound."""
+    """The sequence's second episode: a release about 2 h into the first, the first job after it fails on the fabric
+    (I42 latch set) and a new hold opens."""
     order = replay["order"]
     _Clock.t = 2 * 3600
     srv.health_monitor.topology_lift_pending = True
@@ -199,10 +196,8 @@ async def test_the_i42_latched_hold_after_a_lift_gets_the_ladder_one_tick_in_and
 
 @pytest.mark.asyncio
 async def test_a_hold_that_spans_a_broker_restart_gets_the_ladder_10_min_after_it_began(replay, monkeypatch):
-    """A hold opens, the broker restarts 8 min in (new code installed): the restored episode keeps its
-    start, so the full ladder runs at 10 min of the hold, not 10 min after the restart. A 77-only hold, so
-    its bound is the 10-min ceiling (an unlatched mismatch is spec 04 I83's link-short class: its ladder
-    runs at hold start, tests/test_fabric_link_short.py)."""
+    """A hold opens, the broker restarts 8 min in (new code installed): the restored episode keeps its start, so the
+    full ladder runs at 10 min of the hold, not 10 min after the restart."""
     order = replay["order"]
     _hold_via_gate(HOLD_77, 0)
     for at in (60, 300):
@@ -219,10 +214,8 @@ async def test_a_hold_that_spans_a_broker_restart_gets_the_ladder_10_min_after_i
 
 @pytest.mark.asyncio
 async def test_lift_and_fail_cycles_never_restart_the_10_min_clock(replay):
-    """A hold lifts, the next job fails the same way, the hold returns; over and over. Each re-hold is
-    the same episode: the full ladder still runs 10 min after the first hold opened. A 77-only hold, so
-    the bound is the 10-min ceiling (a latched hold's one-tick bound, or an unlatched mismatch's spec 04
-    I83 at-start ladder, would run the ladder at once)."""
+    """A hold lifts, the next job fails the same way, the hold returns; over and over. Each re-hold is the same episode:
+    the full ladder still runs 10 min after the first hold opened."""
     order = replay["order"]
     _hold_via_gate(HOLD_77, 0)
     for lift, rehold in ((200, 230), (400, 430)):
@@ -237,10 +230,7 @@ async def test_lift_and_fail_cycles_never_restart_the_10_min_clock(replay):
 
 @pytest.mark.asyncio
 async def test_an_unlatched_mismatch_hold_gets_its_ladder_at_start_and_none_again_across_a_restart(replay, monkeypatch):
-    """Spec 04 I83 on the gate path: an unlatched topology-mismatch hold is the fabric link-short class.
-    Its first tick runs the full ladder, the failed full check after it (fabric included) asks for the
-    power cycle at once; a broker restart keeps the episode's start, and no tick up to the bound runs a
-    second power-cycle request. Nothing is released on a failed check."""
+    """Spec 04 I83 on the gate path: an unlatched topology-mismatch hold is the fabric link-short class."""
     order = replay["order"]
     _hold_via_gate(MISMATCH, 0)
     await _tick(60)
@@ -257,9 +247,6 @@ async def test_an_unlatched_mismatch_hold_gets_its_ladder_at_start_and_none_agai
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True, reason="pending fix: the fabric-unrunnable fallback lifts a hold with no passing fabric"
-)
 async def test_a_latched_topology_hold_is_not_lifted_while_the_link_is_still_missing(replay, monkeypatch):
     """The I40 fallback (fabric pass could not run past its bound, eth heartbeat healthy) must not
     lift a hold whose cause is a missing fabric link: only a passing full check, fabric included,
@@ -277,18 +264,16 @@ async def test_a_latched_topology_hold_is_not_lifted_while_the_link_is_still_mis
 
     monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_ok)
     monkeypatch.setattr(srv, "_post_reset_debt", lambda: "")
-    monkeypatch.setattr(srv, "_fabric_77_fallback_release_monotonic", 0.0)
     monkeypatch.setattr(srv, "_clear_device_dirty", lambda **k: lifted.append(k) or True)
     evidence = {"fabric": {"ok": None, "detail": "rc 77"}}
-    await srv._fabric_77_fallback(evidence, lambda m: None, escalate, retried=True)
+    await srv._fabric_77_fallback(evidence, lambda m: None, escalate)
     assert lifted == [], "a hold on a missing link is not lifted without a passing fabric check"
 
 
 @pytest.mark.asyncio
 async def test_a_latched_hold_inside_the_post_cycle_cooldown_cycles_the_moment_it_ends(replay, monkeypatch):
-    """The I42-latched hold opens right after a power cycle: its ladder still runs at 10 min, the
-    cooldown refuses the cycle (the only wait allowed past the bound) and the cycle fires on the first
-    tick after the cooldown ends, once."""
+    """The I42-latched hold opens right after a power cycle: its ladder still runs at 10 min, the cooldown refuses the
+    cycle (the only wait allowed past the bound) and the cycle fires on the first tick after the cooldown ends, once."""
     order, g = replay["order"], replay["g"]
     srv.health_monitor.topology_hw_fault = MISMATCH
     cooldown_end = 1800

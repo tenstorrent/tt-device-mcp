@@ -78,9 +78,7 @@ def test_arc_not_ready_after_a_failed_mesh_reset_does_not_loop_the_reset(monkeyp
 
 
 def _gate(monkeypatch, tmp_path, *, enodata, reset_ok, verdict=None):
-    """The post-job gate on a fake 32-chip sysfs with ``enodata`` chips ARC-not-ready. Verify fails as
-    enum+ARC does on such a mesh unless ``verdict`` is given; the mesh reset is stubbed to return
-    ``reset_ok`` (its own full check, fabric included). Returns (resets, events)."""
+    """The post-job gate on a fake 32-chip sysfs with ``enodata`` chips ARC-not-ready."""
     _fake_sysfs(monkeypatch, tmp_path, enodata=enodata)
     _live_health(monkeypatch)
     dev = tmp_path / "dev"
@@ -158,7 +156,6 @@ async def test_a_failed_check_after_that_reset_keeps_the_hold_and_the_bound_stil
     monkeypatch.setattr(srv, "_forced_escalation_task", None)
     monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_retry", None)
     monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_cooldown_state", None)
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
     monkeypatch.setattr(srv.fsm, "on_outcome", lambda outcome: None)
     ladders = []
 
@@ -166,7 +163,7 @@ async def test_a_failed_check_after_that_reset_keeps_the_hold_and_the_bound_stil
         ladders.append(kind)
         return OUTCOME_TERMINAL
 
-    async def host_rung(age, log):
+    async def host_rung(age, log, *a, **k):
         events.append("host_rung")
 
     monkeypatch.setattr(srv.galaxy_recovery, "escalate", failed_ladder)
@@ -181,8 +178,7 @@ async def test_a_failed_check_after_that_reset_keeps_the_hold_and_the_bound_stil
 
 @pytest.mark.asyncio
 async def test_the_gate_still_holds_a_fabric_wedge_with_every_arc_ticking(monkeypatch, tmp_path, clear_job_state):
-    """(c) Every chip on the bus with a ready ARC, the fabric failing: today's below-floor hold, no
-    reset."""
+    """(c) Every chip on the bus with a ready ARC, the fabric failing: today's below-floor hold, no reset."""
     fabric_bad = (
         False,
         {

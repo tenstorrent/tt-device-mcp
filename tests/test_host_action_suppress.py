@@ -23,7 +23,7 @@ from tt_device_mcp.health.recovery.offbus_power_cycle import (
     fire_command as _real_fire_command,  # before the conftest tripwire
 )
 
-REASON = "tray-down-no-window: every reset type ran back-to-back and the mesh did not verify"
+REASON = "last-chance sweep: every reset ran and the mesh did not verify"
 SINCE = datetime(2026, 10, 15, 11, 50, 0)
 
 
@@ -37,7 +37,6 @@ def held(monkeypatch, tmp_path):
     events = []
     patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
     monkeypatch.setattr(recovery_base, "health_event", lambda kind, **f: events.append((kind, f)))
-    monkeypatch.delenv("TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK", raising=False)
     monkeypatch.delenv("TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC", raising=False)
     monkeypatch.delenv("TT_DEVICE_MCP_FORCE_ESCALATE", raising=False)
     fired = []
@@ -57,8 +56,6 @@ def held(monkeypatch, tmp_path):
     monkeypatch.setattr(srv, "device_hold_episode_reason", "chip(s) 6,7 fell off the PCIe bus")
     monkeypatch.setattr(srv, "device_hold_episode_since", SINCE.isoformat())
     fsm_dirty(srv, "chip(s) 6,7 fell off the PCIe bus", why="heartbeat")
-    # A fabric pass that passed before the cycle: the request must void it, so the check stays owed.
-    monkeypatch.setattr(srv, "last_fabric_ok_monotonic", time.monotonic())
     return {"events": events, "fired": fired, "spawned": spawned}
 
 
@@ -77,12 +74,11 @@ def _ceiling_tick():
 def _assert_held_with_check_owed():
     assert srv._recovery_degraded(), "the device must stay held"
     assert srv._device_unavailable_for_tenant(), "a held device stays refused to tenants"
-    assert srv._fabric_ok_age() is None, "the full health check (fabric included) is still owed"
 
 
 @pytest.mark.asyncio
 async def test_power_cycle_request_suppresses_every_deadline_tick(held):
-    """The 11:54 replay: the tray-down sweep asked for a power cycle, then the off-bus one-shot and
+    """The 11:54 replay: the last-chance sweep asked for a power cycle, then the off-bus one-shot and
     the ceiling window fired. Neither may start a reset, and neither spends its window latch."""
     await srv._auto_power_cycle_host(lambda m: None, REASON)
     assert held["fired"] == ["power-cycle"]
@@ -305,9 +301,8 @@ def test_an_operator_reset_is_refused_while_a_host_action_is_pending(monkeypatch
 
 @pytest.mark.asyncio
 async def test_a_power_cycle_command_that_timed_out_stays_pending(held, monkeypatch):
-    """A cycler that timed out may already have started its detached cycle: the mark stays, with
-    its normal bound, so no reset starts under it. A cycle that never launched (spec 04 I88) is no
-    timeout: it never runs the command under a live OS."""
+    """A cycler that timed out may already have started its detached cycle: the mark stays, with its normal bound, so no
+    reset starts under it."""
     from tt_device_mcp.health.recovery.stages import power_cycle as pc
 
     monkeypatch.setattr(pc, "os_first_unavailable", lambda: "no hook")
@@ -340,10 +335,7 @@ async def test_a_power_cycle_command_that_timed_out_stays_pending(held, monkeypa
 async def test_a_shrinking_offbus_set_gets_no_second_reset_when_the_power_cycle_cannot_fire(
     monkeypatch, clear_job_state, cold_rung
 ):
-    """A reset ran, failed and left chips off the bus; the power cycle is denied by its rate limit or
-    not opted in. A chip came back by the next forced window, but the episode's one mesh reset is spent
-    (spec 04 I87): no later window resets again, and the device stays held for the power cycle or an
-    operator."""
+    """A reset ran, failed and left chips off the bus; the power cycle is denied by its rate limit or not opted in."""
     from tests import test_no_repeat_failed_rung as nr
 
     counters, events, _ = nr._episode(monkeypatch, power_cycle=cold_rung == "refused")
@@ -366,10 +358,7 @@ async def test_a_shrinking_offbus_set_gets_no_second_reset_when_the_power_cycle_
 async def test_the_gate_runs_one_reset_per_episode_when_the_power_cycle_is_not_opted_in(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """The gate's reset ran, hard-failed and left the drop needing the cold rung, with none opted in.
-    The next gate pass, once the reset cooldown ran out, does not run the mesh reset again: the hold's
-    one reset is spent (spec 04 I87), so the gate reports the spent rung and keeps the hold for the
-    power cycle or the operator. No host rung fires in its place."""
+    """The gate's reset ran, hard-failed and left the drop needing the cold rung, with none opted in."""
     from tests.test_device_safety import _reach_reboot_rung_with_regressing_reset
 
     monkeypatch.setattr(srv, "device_hold_episode_since", datetime.now().isoformat(timespec="seconds"))

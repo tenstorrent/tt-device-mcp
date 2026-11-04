@@ -34,7 +34,6 @@ from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy
 from tt_device_mcp.health.recovery.base import (
-    AC_POWER_REPAGE_SEC,
     POWER_CYCLE_AC_NEEDED_AFTER,
     POWER_CYCLE_MIN_INTERVAL_SEC,
 )
@@ -46,7 +45,6 @@ BOUND = 600  # the 10-min hold bound (spec 04 I76)
 @pytest.fixture
 def paged(cool, monkeypatch):  # noqa: F811
     sent = []
-    monkeypatch.setattr(recovery_base.alert, "send_alert", lambda event, log=None: sent.append(event) or object())
     return sent
 
 
@@ -134,7 +132,6 @@ async def test_cycles_continue_at_cooldown_spacing_past_the_ac_needed_state(cool
         await _gate(cool, galaxy.STAGE_SMI_RESET, phase="startup")
         assert m.power_cycle_cooldown_state["ac_power_needed"]["attempts"] == n
     assert gaps == sorted(gaps) and gaps[-1] <= 4 * 3600, "spaced by the doubling cooldown, capped at 4 h"
-    assert any(e["kind"] == "power_cycle_ac_power_needed" for e in paged), "the AC page still goes out"
 
 
 def _full_checks(cool, monkeypatch, *, heals=False):  # noqa: F811
@@ -157,10 +154,8 @@ def _full_checks(cool, monkeypatch, *, heals=False):  # noqa: F811
 
 @pytest.mark.asyncio
 async def test_the_full_ladder_runs_at_the_10_min_hold_bound_then_the_cycle(cool, monkeypatch):  # noqa: F811
-    """A hold never passes its 10-min bound inside the cooldown without the full ladder: the bound's
-    run (I76) reaches it, once per cycle or boot. There the sweep runs (SBR, then the mesh reset; there
-    is no tray step), then one full check, fabric included. A failed check keeps the device held, and
-    the cycle fires at the cooldown's end. Any other forced pass inside the cooldown runs no ladder."""
+    """A hold never passes its 10-min bound inside the cooldown without the full ladder: the bound's run (I76) reaches
+    it, once per cycle or boot."""
     await _two_cycles_that_do_not_heal(cool)
     fabric = _full_checks(cool, monkeypatch)
     m = cool["g"].mechanism
@@ -222,9 +217,8 @@ async def test_a_class_a_sweep_a_guard_holds_runs_no_check_and_the_cycle_still_f
     monkeypatch,
     guard,
 ):
-    """A live tenant at the 10-min bound holds the sweep (no reset over a tenant) and leaves it due for
-    the bound's next forced run; a sweep the reset gate or the outage hold refuses runs no check. Either
-    way nothing is released, and the power cycle still fires at the cooldown's end."""
+    """A live tenant at the 10-min bound holds the sweep (no reset over a tenant) and leaves it due for the bound's next
+    forced run; a sweep the reset gate refuses runs no check."""
     await _two_cycles_that_do_not_heal(cool)
     _full_checks(cool, monkeypatch)
     g = cool["g"]
@@ -302,12 +296,8 @@ def _watchdog_run(cool, monkeypatch):  # noqa: F811
 
 @pytest.mark.asyncio
 async def test_the_watchdog_run_at_the_bound_runs_the_class_a_ladder_once(cool, monkeypatch):  # noqa: F811
-    """End to end through _force_escalate_stuck_hold, the run the watchdog starts: a whole tray off and
-    the cycle in cooldown. Below the bound no forced run reaches the ladder. At the bound the cooldown
-    refuses the cycle, the sweep runs once (SBR, then the mesh reset) and one full check (fabric
-    included) follows; it fails, so the bound asks for the host rung, whose cooldown denial arms the retry at the
-    cooldown's end, where the cycle fires. A later bound window on the same anchor runs no second
-    ladder (spec 04 I73/I76)."""
+    """End to end through _force_escalate_stuck_hold, the run the watchdog starts: a whole tray off and the cycle in
+    cooldown. Below the bound no forced run reaches the ladder."""
     await _two_cycles_that_do_not_heal(cool)
     m = cool["g"].mechanism
     monkeypatch.setattr(m, "_class_a_ladder_anchor", None)  # the shared mechanism may carry an earlier anchor
@@ -346,26 +336,9 @@ async def test_the_watchdog_run_at_the_bound_runs_the_class_a_ladder_once(cool, 
 
 
 @pytest.mark.asyncio
-async def test_the_ac_hold_pages_once_then_hourly(cool, monkeypatch, paged):  # noqa: F811
-    mono = [1000.0]
-    monkeypatch.setattr(recovery_base.time, "monotonic", lambda: mono[0])
-    await _two_cycles_that_do_not_heal(cool)
-    pages = lambda: [e for e in paged if e["kind"] == "power_cycle_ac_power_needed"]  # noqa: E731
-    assert len(pages()) == 1
-    for step in (60, AC_POWER_REPAGE_SEC - 120):
-        mono[0] += step
-        await cool["g"].escalate("offbus-forced", [], EXPECTED, lambda msg: None)
-    assert len(pages()) == 1, "no page inside the hour"
-    mono[0] += 120
-    await cool["g"].escalate("offbus-forced", [], EXPECTED, lambda msg: None)
-    assert len(pages()) == 2, "paged again after an hour"
-
-
-@pytest.mark.asyncio
 async def test_at_the_10_min_mark_a_failed_bound_check_keeps_the_power_cycle_step(cool, monkeypatch):  # noqa: F811
-    """Spec 04 I73 with I76: on a tick where the bound's ladder already ran and its full check failed,
-    the watchdog's one run is the bound's host rung (the power cycle, which the cooldown then gates),
-    not a second ladder. The AC-needed state stops neither."""
+    """Spec 04 I73 with I76: on a tick where the bound's ladder already ran and its full check failed, the watchdog's
+    one run is the bound's host rung (the power cycle, which the cooldown then gates), not a second ladder."""
     m = cool["g"].mechanism
     monkeypatch.setattr(m, "_class_a_ladder_anchor", None)  # the shared mechanism may carry an earlier anchor
     await _two_cycles_that_do_not_heal(cool)

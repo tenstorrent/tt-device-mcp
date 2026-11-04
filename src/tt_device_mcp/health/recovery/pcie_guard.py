@@ -12,8 +12,8 @@ getting there:
 * :class:`AerMask` — mask AER and DPC on root ports for the reset window, then clear their status,
   watch them for a moment and restore only the quiet ones. A port that keeps erroring stays masked
   and is reported, so a flood cannot take the host down.
-* :func:`host_reset_gate` — the per-host switch (``TT_DEVICE_MCP_HOST_RESET_GATE``) that refuses an
-  automatic reset while chips are off the bus or AER errors are flooding.
+* :func:`host_reset_gate` — refuses an automatic reset while chips are off the bus under the
+  host-hang latch.
 * The host-hang latch — :func:`begin_offbus_reset` writes an intent before an automatic reset with
   chips off the bus, and :func:`check_offbus_reset_latch` reads one left by an earlier boot as a
   reset that hung the host, and holds every later off-bus reset on this boot until every chip is
@@ -24,20 +24,16 @@ Everything reads and writes through :data:`SYS_ROOT` so tests run against a fake
 
 from __future__ import annotations
 
-import contextlib
-import contextvars
 import json
 import logging
 import os
 import re
-import socket
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from tt_device_mcp import alert
 from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.monitors.heartbeat import dead_chips, read_heartbeats
 from tt_device_mcp.health.monitors.hostpci import link_down
@@ -66,20 +62,12 @@ _DPC_CTL = 0x06  # DPC Control: bits 0-1 trigger enable, bit 3 interrupt enable
 # Every defined uncorrectable (bits 4-5, 12-26) and correctable (0, 6-8, 12-15) error bit.
 _UE_ALL = 0x07FFF030
 _CE_ALL = 0xF1C1
-
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, default))
-    except ValueError:
-        return default
+# How long a root port must stay error-free before its AER settings are restored.
+AER_QUIET_CHECK_SEC = 2.0
 
 
 def _pci_dir() -> Path:
     return SYS_ROOT / "sys/bus/pci/devices"
-
-
-# ---- topology ---------------------------------------------------------------------------------------
 
 
 @dataclass
@@ -208,11 +196,10 @@ def _scan_endpoints() -> dict:
 
 
 def tt_endpoints() -> Optional[dict]:
-    """``{bdf: Endpoint}`` for every Tenstorrent function the kernel lists, or None when sysfs cannot
-    be read (never ``{}``, which means every chip is off the bus). The root port is the first PCI
-    function on the device's sysfs path; the chip id comes from the tenstorrent class device that
-    links to it. Each look is remembered (root ports, architectures) for when the chips are off the
-    bus."""
+    """``{bdf: Endpoint}`` for every Tenstorrent function the kernel lists, or None when sysfs cannot be read (never
+    ``{}``, which means every chip is off the bus). The root port is the first PCI function on the device's sysfs path;
+    the chip id comes from the tenstorrent class device that links to it. Each look is remembered (root ports,
+    architectures) for when the chips are off the bus."""
     try:
         out = _scan_endpoints()
     except SysfsUnreadable:
@@ -253,9 +240,8 @@ _PCI_CLASS_BRIDGE = 0x0604
 
 
 def _non_tt_function_below(port: str) -> Optional[str]:
-    """The first function below ``port`` now that is neither a Tenstorrent function nor a PCI bridge
-    (class 0x0604), or None. A function whose vendor cannot be read is not counted; one whose class
-    cannot be read counts as no bridge."""
+    """The first function below ``port`` now that is neither a Tenstorrent function nor a PCI bridge (class 0x0604), or
+    None. A function whose vendor cannot be read is not counted; one whose class cannot be read counts as no bridge."""
     stack = [Path(os.path.realpath(_pci_dir() / port))]
     while stack:
         try:
@@ -282,12 +268,11 @@ def _non_tt_function_below(port: str) -> Optional[str]:
 def rescan_tt_root_ports() -> list:
     """The PCI rescan every tt-device-mcp path makes: only the bus below each Tenstorrent root port
     (:func:`tt_root_ports`), through the kernel's ``<port>/pci_bus/<bus>/rescan``, never the global
-    ``/sys/bus/pci/rescan``. A global rescan walks every root bus, and has reassigned the resources of
-    unrelated root ports (a host's NVMe drives). Blocking: callers run it through the one in-flight
-    PCI writer. Returns the ports rescanned. Raises :class:`NoTtRootPort` (an OSError, so the calling
-    rung fails and recovery goes on to its next step) when no port is known or none could be
-    rescanned; there is no global fallback. A port that is only remembered (no Tenstorrent function
-    below it now) is trusted only while no other device sits below it: its slot may since hold
+    ``/sys/bus/pci/rescan``. A global rescan walks every root bus, and has reassigned the resources of unrelated root
+    ports (a host's NVMe drives). Blocking: callers run it through the one in-flight PCI writer. Returns the ports
+    rescanned. Raises :class:`NoTtRootPort` (an OSError, so the calling rung fails and recovery goes on to its next
+    step) when no port is known or none could be rescanned; there is no global fallback. A port that is only remembered
+    (no Tenstorrent function below it now) is trusted only while no other device sits below it: its slot may since hold
     another card, whose bus a rescan would resize, so it is skipped."""
     eps = tt_endpoints()
     present = {e.root_port for e in (eps or {}).values() if e.root_port}
@@ -319,10 +304,9 @@ def rescan_tt_root_ports() -> list:
 
 
 def tray_bus_groups(endpoints: Optional[dict] = None) -> Optional[dict]:
-    """tt-smi's ``{tray: bus group}`` table for this host's architecture, or None when it cannot be
-    known (tt-smi missing, an unreadable or mixed architecture, or no Tenstorrent function now or
-    ever seen). With every chip off the bus the architecture an earlier look saw stands. Imported,
-    never copied: the numbering is tt-smi's to define."""
+    """tt-smi's ``{tray: bus group}`` table for this host's architecture, or None when it cannot be known (tt-smi
+    missing, an unreadable or mixed architecture, or no Tenstorrent function now or ever seen). With every chip off the
+    bus the architecture an earlier look saw stands. Imported, never copied: the numbering is tt-smi's to define."""
     try:
         from tt_smi.constants import BH_UBB_BUS_IDS, WH_UBB_BUS_IDS
     except Exception:  # noqa: BLE001 - a native extension failing here must not raise into recovery
@@ -334,9 +318,6 @@ def tray_bus_groups(endpoints: Optional[dict] = None) -> Optional[dict]:
     if archs == {0x401E}:
         return dict(WH_UBB_BUS_IDS)
     return None
-
-
-# ---- config space -----------------------------------------------------------------------------------
 
 
 class _Config:
@@ -449,7 +430,7 @@ class AerMask:
     def restore(self, quiet_sec: Optional[float] = None, sleep: Callable[[float], None] = time.sleep) -> list:
         """Clear each port's error flags, wait ``quiet_sec`` and restore the ports that stayed quiet.
         Returns (and records in ``kept_masked``) the ports that errored again."""
-        quiet = _env_float("TT_DEVICE_MCP_AER_QUIET_CHECK_SEC", 2.0) if quiet_sec is None else quiet_sec
+        quiet = AER_QUIET_CHECK_SEC if quiet_sec is None else quiet_sec
         for bdf, s in self.saved.items():
             try:
                 _clear_error_status(_Config(bdf), s)
@@ -475,112 +456,32 @@ class AerMask:
                 self.kept_masked.append(bdf)
         self.saved.clear()
         if self.kept_masked:
-            _note_flood()
             health_event("aer_ports_kept_masked", ports=self.kept_masked, host_at_risk=True)
         return self.kept_masked
 
 
-# ---- the per-host gate ------------------------------------------------------------------------------
-
-_FLOOD_UNTIL = 0.0
-_LAST_AER_SAMPLE: Optional[tuple] = None
-
-
-def _note_flood() -> None:
-    global _FLOOD_UNTIL
-    _FLOOD_UNTIL = time.monotonic() + _env_float("TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC", 1800)
-
-
-def flood_window_open() -> bool:
-    """A flood was seen within ``TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC``: by :func:`aer_flooding`, or
-    by a re-power or reset whose root port kept erroring and stayed masked."""
-    return time.monotonic() < _FLOOD_UNTIL
-
-
-def _aer_total(ports: list) -> int:
-    total = 0
-    for bdf in ports:
-        for name in ("aer_rootport_total_err_cor", "aer_rootport_total_err_nonfatal", "aer_rootport_total_err_fatal"):
-            try:
-                total += int((_pci_dir() / bdf / name).read_text().split()[0])
-            except (OSError, ValueError, IndexError):
-                continue
-    return total
-
-
-def _uptime_sec() -> Optional[float]:
-    try:
-        return float((SYS_ROOT / "proc/uptime").read_text().split()[0])
-    except (OSError, ValueError, IndexError):
-        return None
-
-
-def aer_flooding(ports: Optional[list] = None) -> bool:
-    """True while the Tenstorrent root ports are flooding AER errors, or within the flood window
-    (``TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC``, default 1800) after one was seen. A flood is a rate:
-    ``TT_DEVICE_MCP_AER_FLOOD_THRESHOLD`` (default 50) new errors per
-    ``TT_DEVICE_MCP_AER_FLOOD_PERIOD_SEC`` (default 60) since the previous look, so a steady trickle
-    between looks hours apart is not one. The first look after a boot inside the window counts from
-    zero over the uptime, so errors that carried on through a reboot are seen."""
-    global _LAST_AER_SAMPLE
-    ports = tt_root_ports() if ports is None else ports
-    now = time.monotonic()
-    total = _aer_total(ports)
-    prev = _LAST_AER_SAMPLE
-    if prev is None:
-        up = _uptime_sec()
-        if up is not None and up < _env_float("TT_DEVICE_MCP_AER_FLOOD_WINDOW_SEC", 1800):
-            prev = (now - up, 0)
-    _LAST_AER_SAMPLE = (now, total)
-    if prev is not None:
-        period = max(_env_float("TT_DEVICE_MCP_AER_FLOOD_PERIOD_SEC", 60), 1.0)
-        per_period = (total - prev[1]) * period / max(now - prev[0], period)
-        if per_period >= _env_float("TT_DEVICE_MCP_AER_FLOOD_THRESHOLD", 50):
-            _note_flood()
-    return flood_window_open()
-
-
-GATE_OFF, GATE_GUARD, GATE_HOLD = "off", "guard", "hold"
+GATE_GUARD, GATE_HOLD = "guard", "hold"
 
 
 def gate_mode() -> str:
-    """``TT_DEVICE_MCP_HOST_RESET_GATE``: ``off`` (default) keeps the old reset behaviour, except
-    while a port that kept erroring after a re-power or reset holds the flood window open; ``guard``
-    masks AER on every Tenstorrent root port around each automatic mesh reset and refuses one while
-    AER errors flood; ``hold`` also refuses one while any chip is off the bus. Set per host. A latched
-    host-hang hold (:func:`check_offbus_reset_latch`) reads as ``hold`` whatever the setting."""
+    """``guard`` masks AER on every Tenstorrent root port around each automatic mesh reset; ``hold``
+    also refuses one while any chip is off the bus, and is in force only while the host-hang latch
+    (:func:`check_offbus_reset_latch`) stands."""
     if offbus_reset_latched() is not None:
         return GATE_HOLD  # the last off-bus reset hung this host: hold until the chips are back (I25)
-    mode = os.environ.get("TT_DEVICE_MCP_HOST_RESET_GATE", GATE_OFF).strip().lower()
-    return mode if mode in (GATE_GUARD, GATE_HOLD) else GATE_OFF
+    return GATE_GUARD
 
 
 def chips_off_bus(expected: int) -> int:
-    """How many of ``expected`` chips have no PCI function in sysfs right now. Sysfs that is there
-    but cannot be read counts every chip as off, so a ``hold`` gate holds; with no PCI sysfs at all
-    it is 0 (the gate then decides on the AER evidence alone). A chip still in sysfs whose ARC
-    heartbeat reads all-ones has left the bus too (its BAR reads return nothing), so it counts: a
-    ``hold`` box never fires a mesh reset or a sweep over it (spec 04 I24)."""
+    """How many of ``expected`` chips have no PCI function in sysfs right now. Sysfs that is there but cannot be read
+    counts every chip as off, so a ``hold`` gate holds; with no PCI sysfs at all it is 0 (the gate then decides on the
+    AER evidence alone). A chip still in sysfs whose ARC heartbeat reads all-ones has left the bus too (its BAR reads
+    return nothing), so it counts: a ``hold`` box never fires a mesh reset or a sweep over it (spec 04 I24)."""
     eps = tt_endpoints()
     if eps is None:
         return expected if _pci_dir().is_dir() else 0
     # A decision read, not a poll: a lost chip that answers again must not hold a reset (spec 03 I66).
     return max(0, expected - len(eps)) + len(dead_chips(read_heartbeats(probe_lost=True)))
-
-
-_HOLD_LIFTED: contextvars.ContextVar = contextvars.ContextVar("tt_device_mcp_hold_lifted", default="")
-
-
-@contextlib.contextmanager
-def hold_lifted(why: str):
-    """Inside this scope (and the threads it starts) a configured ``hold`` gate reads as ``guard`` for a
-    chip off the bus: the AER flood checks still refuse, the I25 host-hang latch still holds. Scoped to
-    one escalation pass, so nothing outlives it (spec 04 I33)."""
-    token = _HOLD_LIFTED.set(why)
-    try:
-        yield
-    finally:
-        _HOLD_LIFTED.reset(token)
 
 
 def host_reset_gate(off_bus: int) -> tuple:
@@ -591,34 +492,18 @@ def host_reset_gate(off_bus: int) -> tuple:
         expire_offbus_reset_latch(None, None, lambda m: None)  # only the ceiling: no host-pci look here
     elif not _power_cycle_bounds_latch():
         expire_offbus_reset_latch(None, None, _logger.warning, off_bus=off_bus)  # no I27 cycle to end it
-    mode = gate_mode()
-    if mode == GATE_OFF:
-        if flood_window_open():
-            # Set by a port the envelope had to leave masked: the next reset is the one that, in the
-            # incident, followed a tray re-power into a dead host. Holds whatever the gate's mode.
-            return False, "a root port kept erroring AER after the last re-power or reset (flood window open)"
-        return True, ""
-    if mode == GATE_HOLD and off_bus > 0:
-        latch = offbus_reset_latched()
-        if latch is not None:
-            ceiling = "" if _power_cycle_bounds_latch() else f", it reaches its {latch_max_sec():.0f} s ceiling"
-            return False, (
-                f"{off_bus} chip(s) off the bus and {_latch_boots(latch)} until every chip is back on the "
-                f"bus, the host boots again{ceiling} or an operator runs `{clear_latch_cmd()}`"
-            )
-        if not _HOLD_LIFTED.get():
-            return False, f"{off_bus} chip(s) off the bus and TT_DEVICE_MCP_HOST_RESET_GATE=hold"
-        # The off-bus hold's operator hand-off ran out (spec 04 I33): this pass reads `hold` as `guard`.
-    if aer_flooding():
-        return False, f"AER errors are flooding the Tenstorrent root ports (TT_DEVICE_MCP_HOST_RESET_GATE={mode})"
+    latch = offbus_reset_latched() if off_bus > 0 else None
+    if latch is not None:
+        ceiling = "" if _power_cycle_bounds_latch() else f", it reaches its {LATCH_MAX_SEC:.0f} s ceiling"
+        return False, (
+            f"{off_bus} chip(s) off the bus and {_latch_boots(latch)} until every chip is back on the "
+            f"bus, the host boots again{ceiling} or an operator runs `{clear_latch_cmd()}`"
+        )
     return True, ""
 
 
-# ---- the host-hang latch ----------------------------------------------------------------------------
-
 INTENT_FILE = "offbus_reset_intent.json"
 LATCH_FILE = "offbus_reset_hold.json"
-CLEAR_LATCH_CMD = "python -m tt_device_mcp.health.recovery.pcie_guard --clear-hang-latch"
 _INTENT_OPEN = False
 
 
@@ -639,21 +524,7 @@ def _boot_id() -> str:
         return ""
 
 
-def _latch_enabled() -> bool:
-    return os.environ.get("TT_DEVICE_MCP_OFFBUS_HANG_LATCH", "1").strip() != "0"
-
-
 LATCH_MAX_SEC = 21600.0
-
-
-def latch_max_sec() -> float:
-    """``TT_DEVICE_MCP_OFFBUS_HANG_LATCH_MAX_SEC`` (default 21600 s, 6 h): the oldest a host-hang
-    hold may grow with every chip on the bus before it lifts without a clean host-pci look, or with
-    chips off the bus when no I27 power cycle is configured. The same 6 h as one I27 power-cycle
-    interval, so the latch never outlives the next cycle it would allow. Zero, negative or not a
-    number reads as the default: the hold is always bounded."""
-    v = _env_float("TT_DEVICE_MCP_OFFBUS_HANG_LATCH_MAX_SEC", LATCH_MAX_SEC)
-    return v if 0 < v < float("inf") else LATCH_MAX_SEC
 
 
 def begin_offbus_reset(kind: str, off_bus: int) -> None:
@@ -661,7 +532,7 @@ def begin_offbus_reset(kind: str, off_bus: int) -> None:
     with this boot's id, that it is about to run. :func:`end_offbus_reset` removes the note once the
     reset and its verify are over. A note a later boot finds means the host died in between."""
     global _INTENT_OPEN
-    if off_bus <= 0 or not _latch_enabled():
+    if off_bus <= 0:
         return
     path = health_dir() / INTENT_FILE
     rec = {"kind": kind, "off_bus": off_bus, "boot_id": _boot_id(), "at_epoch": time.time()}
@@ -701,11 +572,10 @@ def end_offbus_reset() -> None:
 
 
 def close_offbus_reset_before_host_action(action: str, log: Callable[[str], None]) -> None:
-    """The broker is about to reboot or power-cycle the host itself: no off-bus reset is in flight
-    (the gate is serialized), so an intent still on disk is not a reset the host may die in. Remove it
-    durably, whoever wrote it, so the next boot does not latch the broker's own cycle as a host hang
-    (spec 04 I25). Never raises and never stops the action: the next boot's ledger check covers a
-    removal that failed."""
+    """The broker is about to reboot or power-cycle the host itself: no off-bus reset is in flight (the gate is
+    serialized), so an intent still on disk is not a reset the host may die in. Remove it durably, whoever wrote it, so
+    the next boot does not latch the broker's own cycle as a host hang (spec 04 I25). Never raises and never stops the
+    action: the next boot's ledger check covers a removal that failed."""
     global _INTENT_OPEN
     _INTENT_OPEN = False
     try:
@@ -729,13 +599,12 @@ def _boot_btime() -> Optional[float]:
 
 
 def _host_action_after(intent: dict) -> Optional[dict]:
-    """The newest reboot or power cycle the broker recorded in its auto-recovery ledger at or after
-    ``intent`` was written, on the intent's boot when both name one, that brought this boot up, or
-    None. Such a row means the broker took the host down itself after that reset: the intent is not a
-    host hang. The row brought this boot up only when this boot started within the attribution window
-    after it (plus the pending window for a request marked missed or late, spec 04 I72), the rule
-    boot attribution uses everywhere: a request the cycler missed, followed by a real hang and an
-    outside power-off later, is no broker action. An unreadable btime attributes nothing."""
+    """The newest reboot or power cycle the broker recorded in its auto-recovery ledger at or after ``intent`` was
+    written, on the intent's boot when both name one, that brought this boot up, or None. Such a row means the broker
+    took the host down itself after that reset: the intent is not a host hang. The row brought this boot up only when
+    this boot started within the attribution window after it (plus the pending window for a request marked missed or
+    late, spec 04 I72), the rule boot attribution uses everywhere: a request the cycler missed, followed by a real hang
+    and an outside power-off later, is no broker action. An unreadable btime attributes nothing."""
     from tt_device_mcp.health.recovery.base import (  # lazy: base is heavy
         AUTO_RECOVERY_LEDGER,
         AUTO_RECOVERY_RANK,
@@ -778,9 +647,8 @@ def _read_latch() -> Optional[dict]:
 
 
 def _latch_is_this_boots(rec: dict) -> bool:
-    """A latch holds only on the boot it was written in (``latched_on_boot``). One from an earlier
-    boot, or one that does not say, never holds a rung; with this boot's id unreadable it cannot be
-    shown stale, so it holds."""
+    """A latch holds only on the boot it was written in (``latched_on_boot``). One from an earlier boot, or one that
+    does not say, never holds a rung; with this boot's id unreadable it cannot be shown stale, so it holds."""
     current = _boot_id()
     return not current or rec.get("latched_on_boot") == current
 
@@ -823,13 +691,12 @@ def _latch_age(rec: dict) -> float:
 def expire_offbus_reset_latch(
     expected: Optional[int], host_pci_ok: Optional[bool], log: Callable[[str], None], off_bus: int = 0
 ) -> Optional[str]:
-    """Lift this boot's host-hang hold once it guards nothing (spec 04 I25): every one of ``expected``
-    chips is on the bus and host-pci is OK, or every chip is on the bus and the latch is older than
-    :func:`latch_max_sec`. ``expected`` None means the caller already counted no chip off the bus,
-    unless it names ``off_bus`` chips off. While a chip is off the bus or sysfs cannot be read, the
-    hold is bounded by the I27 power cycle (the boot after it drops the latch); with no power cycle
-    configured it lifts at the same ceiling, paged once, and the gate falls back to its configured
-    mode. Returns why it lifted, or None."""
+    """Lift this boot's host-hang hold once it guards nothing (spec 04 I25): every one of ``expected`` chips is on the
+    bus and host-pci is OK, or every chip is on the bus and the latch is older than ``LATCH_MAX_SEC``. ``expected`` None
+    means the caller already counted no chip off the bus, unless it names ``off_bus`` chips off. While a chip is off the
+    bus or sysfs cannot be read, the hold is bounded by the I27 power cycle (the boot after it drops the latch); with no
+    power cycle configured it lifts at the same ceiling, paged once, and the gate falls back to its configured mode.
+    Returns why it lifted, or None."""
     rec = offbus_reset_latched()
     if rec is None:
         return None
@@ -842,13 +709,13 @@ def expire_offbus_reset_latch(
         return None
     if host_pci_ok is True and expected is not None and not off:
         reason = f"all {expected} chip(s) are back on the bus and host-pci is OK"
-    elif _latch_age(rec) >= latch_max_sec():
-        reason = f"every chip is on the bus and the hold reached its {latch_max_sec():.0f} s ceiling"
+    elif _latch_age(rec) >= LATCH_MAX_SEC:
+        reason = f"every chip is on the bus and the hold reached its {LATCH_MAX_SEC:.0f} s ceiling"
         if off:
             reason = (
                 f"chips are still off the bus (or sysfs cannot be read), TT_DEVICE_MCP_POWER_CYCLE_CMD is "
-                f"not set, so no power cycle would end the hold, and it reached its {latch_max_sec():.0f} s "
-                f"ceiling; automatic resets follow TT_DEVICE_MCP_HOST_RESET_GATE again"
+                f"not set, so no power cycle would end the hold, and it reached its {LATCH_MAX_SEC:.0f} s "
+                f"ceiling; automatic resets fire again"
             )
     else:
         return None
@@ -860,17 +727,6 @@ def expire_offbus_reset_latch(
         return None
     log(f"the host-hang hold latched on boot {rec.get('latched_on_boot') or '(unknown)'} lifted: {reason}")
     health_event("offbus_reset_hold_expired", latch=rec, boot_id=_boot_id(), reason=reason, chips_off_bus=off)
-    if off:  # the latch file is gone, so this pages once per latch
-        alert.send_alert(
-            {
-                "kind": "offbus_reset_hold_expired_off_bus",
-                "message": f"{_latch_boots(rec)}; lifted: {reason}",
-                "host": socket.gethostname(),
-                "host_at_risk": True,
-                "severity": "high",
-            },
-            _logger,
-        )
     return reason
 
 
@@ -889,10 +745,9 @@ def _expire_stale_latch(log: Callable[[str], None]) -> None:
 
 
 def check_offbus_reset_latch(log: Callable[[str], None]) -> Optional[dict]:
-    """At broker start: an intent left by another boot is an off-bus reset the host did not survive.
-    Latch the gate to ``hold`` for off-bus resets, report it, and return the record. An intent from
-    this same boot (the broker restarted, the host did not) is dropped. A latch an earlier boot
-    wrote is dropped first: it is scoped to its own boot."""
+    """At broker start: an intent left by another boot is an off-bus reset the host did not survive. Latch the gate to
+    ``hold`` for off-bus resets, report it, and return the record. An intent from this same boot (the broker restarted,
+    the host did not) is dropped. A latch an earlier boot wrote is dropped first: it is scoped to its own boot."""
     _expire_stale_latch(log)
     path = health_dir() / INTENT_FILE
     try:
@@ -900,7 +755,7 @@ def check_offbus_reset_latch(log: Callable[[str], None]) -> Optional[dict]:
     except (OSError, ValueError):
         return offbus_reset_latched()
     path.unlink(missing_ok=True)
-    if intent.get("boot_id") == _boot_id() or not _latch_enabled():
+    if intent.get("boot_id") == _boot_id():
         return offbus_reset_latched()
     row = _host_action_after(intent)
     if row is not None:
@@ -918,7 +773,7 @@ def check_offbus_reset_latch(log: Callable[[str], None]) -> Optional[dict]:
     log(
         f"the {intent.get('kind')} that ran with {intent.get('off_bus')} chip(s) off the bus did not finish "
         f"before the host went down: automatic resets over off-bus chips are HELD until every chip is back "
-        f"on the bus with host-pci OK (or for {latch_max_sec():.0f} s with every chip back), the host boots "
+        f"on the bus with host-pci OK (or for {LATCH_MAX_SEC:.0f} s with every chip back), the host boots "
         f"again or an operator runs `{clear_latch_cmd()}`"
     )
     health_event("offbus_reset_hold_latched", intent=intent, clear=clear_latch_cmd(), host_at_risk=True)
@@ -935,9 +790,8 @@ def pcie_guard_at_start(log: Callable[[str], None]) -> Optional[dict]:
 
 
 def latch_dirs(health_dir_arg: Optional[str] = None) -> list:
-    """Where a broker's latch can be: ``--health-dir`` when given, else this process's health dir
-    and the system broker's (``/var/lib/tt-device-broker/health``), which a non-root shell does not
-    resolve to on its own."""
+    """Where a broker's latch can be: ``--health-dir`` when given, else this process's health dir and the system
+    broker's (``/var/lib/tt-device-broker/health``), which a non-root shell does not resolve to on its own."""
     if health_dir_arg:
         return [Path(health_dir_arg)]
     out = [health_dir()]
@@ -960,11 +814,9 @@ def clear_offbus_reset_latch(dirs: Optional[list] = None) -> list:
 
 
 def mask_for_mesh_reset(log) -> Optional[AerMask]:
-    """Mask every Tenstorrent root port before a mesh reset when the gate is on, else None. A port
+    """Mask every Tenstorrent root port before a mesh reset, or None when that fails. A port
     that cannot be masked is logged and the reset goes ahead unmasked, as before the gate. Sysfs that
     cannot be read is logged the same way, and only the recorded root ports are masked."""
-    if gate_mode() == GATE_OFF:
-        return None
     try:
         eps = _scan_endpoints()
         _remember(eps)

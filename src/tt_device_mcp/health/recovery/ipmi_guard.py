@@ -84,9 +84,8 @@ def _ipmi_byte(token: str) -> Optional[int]:
 def refusal(args: list[str]) -> Optional[str]:
     """Why the guard refuses ``ipmitool <args>``, or None when the real binary may run it.
 
-    Refused: the UBB reset (``raw`` with OEM netfn 0x30, UBB reset cmd 0x8B) whose op_mode byte
-    (the 5th after ``raw``) is zero in any format or cannot be read, and ``exec`` / ``shell``,
-    which read commands the guard cannot see."""
+    Refused: the UBB reset (``raw`` with OEM netfn 0x30, UBB reset cmd 0x8B) whose op_mode byte (the 5th after ``raw``)
+    is zero in any format or cannot be read, and ``exec`` / ``shell``, which read commands the guard cannot see."""
     low = [str(a).strip().lower() for a in args]
     for verb in ("exec", "shell"):
         if verb in low:

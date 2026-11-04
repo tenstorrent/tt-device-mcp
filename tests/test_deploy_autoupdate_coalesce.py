@@ -16,7 +16,13 @@ import re
 import pytest
 
 import tt_device_mcp.server as srv
-from tests.test_deploy_autoupdate_no_restart import _installed, _push, _restarts, box  # noqa: F401 - fixture
+from tests.test_deploy_autoupdate_no_restart import (  # noqa: F401 - fixture
+    _base_clone,
+    _installed,
+    _push,
+    _restarts,
+    box,
+)
 from tests.test_deploy_autoupdate_no_restart import _lap as _full_lap
 from tests.test_deploy_autoupdate_rate_limit import _SCRIPT, _lap
 from tests.test_restart_drain import _restart_with_a_held_job
@@ -31,19 +37,8 @@ T0 = 1_700_000_000
 
 
 def _simulate(tmp_path, moves, *, until, quiet=None, start=T0, skip=False, step=0):
-    """Laps every 60 s from `start` to `until` while the branch head moves at the times in `moves`
-    (sha `s<n>` after the n-th move). The box applied `s0` long before. Returns the restarts as
-    (time, sha) and, for every sha, when it was first seen. Once the last sha is installed and one
-    more lap found it current, it stops: with the head at rest every later lap is that same exit.
-    `skip`: after a lap that defers and says when it applies, the next lap run is the first one at
-    or past that time or the next move, whichever comes first; the laps between are the same deferral.
-    A lap reached at the time a deferral named, with no move since, must not defer for that reason
-    again. The lone-push test runs every lap, and so checks that a deferral applies when it says.
-    `step` (with `skip`): a deferring lap jumps straight to the last move lap within `step` seconds
-    and before the time it named. The laps it passes would each see a newer head and defer again:
-    the record keeps its first-seen time, and the last move sets the quiet clock as it would have.
-    With coalescing on, `step` stays at or under the quiet, so no quiet ends between the moves it
-    passes; every passed sha is counted seen at its own move lap, as a lap run there would have."""
+    """Laps every 60 s from `start` to `until` while the branch head moves at the times in `moves` (sha `s<n>` after the
+    n-th move). The box applied `s0` long before."""
     root = tmp_path / "root"
     root.mkdir(exist_ok=True)
     (root / "installed.sha").write_text("s0\n")
@@ -75,6 +70,11 @@ def _simulate(tmp_path, moves, *, until, quiet=None, start=T0, skip=False, step=
                         seen.setdefault(f"s{k}", _on_lap(m, start))
             if then == due and not any(now < m <= due for m in moves):
                 owed = (due, "coalescing: head" if "coalescing: head" in done.stderr else "rate-limited:")
+        elif not done.stderr and not (root / "pending-head").exists():
+            # Head at the installed sha and no record: the lap exits before it reads the clock or
+            # writes anything, so every lap up to the next move is this same one.
+            assert (root / "installed.sha").read_text().split() == [sha], done.stderr
+            then = max(then, min([_on_lap(m, start) for m in moves if m > now], default=then))
         now = then
     return restarts, seen
 

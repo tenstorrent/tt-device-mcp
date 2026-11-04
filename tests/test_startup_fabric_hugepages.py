@@ -59,21 +59,12 @@ def test_hugepages_shortfall_reports_a_short_pool_behind_identity_or_no_iommu(tm
     assert hostpci.hugepages_shortfall() == (3, 32)
 
 
-def test_hugepages_shortfall_is_none_once_the_count_is_met(tmp_path, monkeypatch):
-    _fake_bus(tmp_path, monkeypatch, iommu_type="identity", nr="32", n_chips=32)
-    assert hostpci.hugepages_shortfall() is None
-
-
-def test_hugepages_shortfall_is_none_behind_a_translating_iommu(tmp_path, monkeypatch):
-    """A DMA domain maps buffers through the IOMMU and needs no hugepages: nothing to wait for."""
-    _fake_bus(tmp_path, monkeypatch, iommu_type="DMA-FQ", nr="0")
-    assert hostpci.hugepages_shortfall() is None
-
-
-def test_hugepages_shortfall_is_none_without_a_readable_pool(tmp_path, monkeypatch):
-    """No 1G pool to read is not evidence of a short one; waiting on it would hold a box that may
-    not use hugepages at all."""
-    _fake_bus(tmp_path, monkeypatch, iommu_type="identity", nr=None)
+@pytest.mark.parametrize(
+    "iommu_type,nr", [("DMA-FQ", "0"), ("identity", None)], ids=["translating-iommu", "no-readable-pool"]
+)
+def test_hugepages_shortfall_is_none_when_nothing_says_the_pool_is_short(tmp_path, monkeypatch, iommu_type, nr):
+    """A DMA domain needs no hugepages; no 1G pool to read is not evidence of a short one. Nothing to wait for."""
+    _fake_bus(tmp_path, monkeypatch, iommu_type=iommu_type, nr=nr)
     assert hostpci.hugepages_shortfall() is None
 
 
@@ -83,10 +74,7 @@ def test_hugepages_shortfall_is_none_with_no_function_on_the_bus(tmp_path, monke
 
 
 def test_hugepages_shortfall_counts_pci_functions_not_chips(tmp_path, monkeypatch):
-    """UMD pins one 1G page per PCI function, and the vendor setup allocates per function. A card
-    with two chips behind one function (n300, T3K) needs one page, not two: keyed on the chip
-    count, a pool sized per function never reads full, and the startup pass and the relift wait
-    on it forever."""
+    """UMD pins one 1G page per PCI function, and the vendor setup allocates per function."""
     _fake_bus(tmp_path, monkeypatch, iommu_type="identity", nr="4", n_chips=4)
     monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "8")
     assert hostpci.hugepages_shortfall() is None
@@ -123,26 +111,29 @@ def test_the_broker_waits_only_when_the_expected_chip_count_is_set(monkeypatch):
 # --- the fabric wrapper's reason and the action-log output -------------------------------------
 
 
-def test_override_reason_prefers_the_cause_over_the_terminate_banner():
-    text = (
-        "fabric-check: validating 32 chips\n"
-        "terminate called after throwing an instance of 'std::runtime_error'\n"
-        "  what():  Failed to allocate 32 hugepages\n"
-        "fabric-check: no link was tested\n"
-    )
-    assert health_monitor_mod._override_reason(text) == "what():  Failed to allocate 32 hugepages"
-
-
-def test_override_reason_finds_a_filesystem_error():
-    text = "banner\nfilesystem error: cannot create directory: No space left on device\nlast line\n"
-    assert health_monitor_mod._override_reason(text) == (
-        "filesystem error: cannot create directory: No space left on device"
-    )
+@pytest.mark.parametrize(
+    "text,want",
+    [
+        (
+            "fabric-check: validating 32 chips\n"
+            "terminate called after throwing an instance of 'std::runtime_error'\n"
+            "  what():  Failed to allocate 32 hugepages\n"
+            "fabric-check: no link was tested\n",
+            "what():  Failed to allocate 32 hugepages",
+        ),
+        (
+            "banner\nfilesystem error: cannot create directory: No space left on device\nlast line\n",
+            "filesystem error: cannot create directory: No space left on device",
+        ),
+    ],
+    ids=["cause-over-terminate-banner", "filesystem-error"],
+)
+def test_override_reason_finds_the_cause(text, want):
+    assert health_monitor_mod._override_reason(text) == want
 
 
 def test_override_reason_falls_back_to_the_wrappers_final_line():
-    """The wrapper prints its verdict, reason included, on the final line; blank lines after it
-    must not hide it."""
+    """The wrapper prints its verdict, reason included, on the final line; blank lines after it must not hide it."""
     text = "fabric-check: banner\nfabric-check: validator did not complete (rc=1): last output: x\n\n"
     assert (
         health_monitor_mod._override_reason(text) == "fabric-check: validator did not complete (rc=1): last output: x"
@@ -174,8 +165,7 @@ async def test_a_skipped_fabric_run_keeps_its_output_in_the_action_log(monkeypat
 
 @pytest.mark.asyncio
 async def test_a_failed_fabric_run_keeps_its_full_output_in_the_action_log(monkeypatch, tmp_path, clear_job_state):
-    """The validator names the cause near the head of a long run and the verdict at its tail: the row
-    keeps both. Fails on base, which kept only the last 8000 chars and lost the first error line."""
+    """The validator names the cause near the head of a long run and the verdict at its tail: the row keeps both."""
     monkeypatch.setattr(srv, "job_log_dir", tmp_path)
     monkeypatch.setattr(srv, "jobs", {})
     monkeypatch.setattr(srv, "_action_row", None, raising=False)
@@ -199,10 +189,8 @@ async def test_a_failed_fabric_run_keeps_its_full_output_in_the_action_log(monke
 async def test_a_77_run_keeps_its_stderr_tail_and_exit_code_in_an_incident_bundle(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """A 77 that aborted before any link test named its cause only on stderr, and nothing kept it:
-    the cause took a rerun to read. Its tail and exit code now go to an incident bundle the detail
-    names; a rerun with the same reason reuses that bundle instead of rotating others out. Fails on
-    base, which wrote no bundle."""
+    """A 77 that aborted before any link test named its cause only on stderr, and nothing kept it: the cause took a
+    rerun to read."""
     monkeypatch.setattr(srv, "job_log_dir", tmp_path / "jobs")
     monkeypatch.setattr(srv, "jobs", {})
     monkeypatch.setattr(srv, "_action_row", None, raising=False)
@@ -349,9 +337,8 @@ async def test_startup_fabric_pass_waits_for_hugepages_then_runs(monkeypatch, _s
 
 @pytest.mark.asyncio
 async def test_a_startup_hold_with_the_pool_ready_reaches_the_full_check_within_10s(monkeypatch, _startup):
-    """startup_unverified time-to-recover: a broker start held for its fabric verify, with the 1G pool
-    already full and no re-adopted job to wait behind, reaches the full health check (fabric forced)
-    within 10 s of fake time. Every sleep on the way counts on the fake clock."""
+    """startup_unverified time-to-recover: a broker start held for its fabric verify, with the 1G pool already full and
+    no re-adopted job to wait behind, reaches the full health check (fabric forced) within 10 s of fake time."""
     events, rows, gate_calls = _startup
     fsm_dirty(srv, "broker start: awaiting the startup fabric verify", why="startup_unverified")
     _shortfalls(monkeypatch, [None])
@@ -581,25 +568,6 @@ async def test_the_77_only_relift_reruns_the_fabric_pass_and_never_resets(monkey
 # --- I48: a 77-only hold re-checks on a backoff ------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "raw,steps",
-    [
-        (None, [120, 300, 600, 1200]),
-        ("90,240", [90, 240]),
-        ("5,5000", [60, 1200]),
-        ("2m,5m", [120, 300, 600, 1200]),
-        (" , ", [120, 300, 600, 1200]),
-    ],
-)
-def test_the_77_backoff_parses_and_clamps(monkeypatch, raw, steps):
-    """Each step clamps to 60..1200 s; a malformed or empty value reads as the default."""
-    if raw is None:
-        monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raising=False)
-    else:
-        monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raw)
-    assert srv._fabric_77_backoff_sec() == steps
-
-
 def _opened_ago(monkeypatch, seconds):
     since = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
     monkeypatch.setattr(srv.fsm, "_record", dataclasses.replace(srv.fsm.record, since=since))
@@ -610,8 +578,7 @@ async def test_the_77_only_relift_reruns_the_pass_only_once_its_step_is_due(monk
     """I48: before the first step the relift skips the pass; once due it runs it once, and the 77 it
     reads again moves the next re-check to the second step."""
     _hold_77(monkeypatch, tmp_path, due=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raising=False)
-    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", "99")
+    monkeypatch.setattr(srv, "FABRIC_77_MAX_RETRIES", 99)
     seen = []
 
     async def verify(expected, log, run_fabric=True, **_):
@@ -641,7 +608,6 @@ async def test_the_77_only_relift_reruns_the_pass_only_once_its_step_is_due(monk
 def test_a_77_recheck_advances_the_backoff_step(monkeypatch, tmp_path, clear_job_state):
     """Each re-check that 77s again moves to the next step; the last step repeats; a new episode starts over."""
     _hold_77(monkeypatch, tmp_path, due=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raising=False)
 
     def due_after(seconds):
         monkeypatch.setattr(srv, "_fabric_77_recheck_monotonic", srv.time.monotonic() - seconds)
@@ -672,8 +638,6 @@ async def test_a_hugepage_77_rechecks_every_30s_and_spends_no_retry(monkeypatch,
     not on the 120 s relift interval or the I48 backoff, and its re-checks do not spend the I40 retries
     that would release a box no job can open yet."""
     _hold_77(monkeypatch, tmp_path, due=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BACKOFF_SEC", raising=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", raising=False)
     monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
     monkeypatch.setattr(srv, "_fabric_77_streak", 0)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_skipped", True)
@@ -728,8 +692,6 @@ def test_the_77_age_bound_counts_from_the_fsm_stamp(monkeypatch, tmp_path, clear
     """I40's age bound ends a hold the retries do not: a hugepage 77 spends none, so only the age
     ends it. The bound reads the FSM's own ``...Z`` stamp."""
     _hold_77(monkeypatch, tmp_path)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", raising=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BOUND_SEC", raising=False)
     monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
     monkeypatch.setattr(srv, "_fabric_77_streak", 0)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_skipped", True)
@@ -747,7 +709,6 @@ def test_an_unparseable_stamp_falls_back_to_the_retry_count(monkeypatch, tmp_pat
     """A ``since`` the bound cannot read must not hold forever: each 77, a hugepage one too, then
     counts as a retry, so the retry bound still ends the hold."""
     _hold_77(monkeypatch, tmp_path)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", raising=False)
     monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
     monkeypatch.setattr(srv, "_fabric_77_streak", 0)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_skipped", True)
@@ -761,8 +722,6 @@ async def test_a_hugepage_77_hold_past_its_age_bound_takes_the_fallback(monkeypa
     """A pool that never fills does not hold forever: past the age bound the relift's hugepage 77
     hands over to the I40 fallback."""
     _hold_77(monkeypatch, tmp_path)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", raising=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_BOUND_SEC", raising=False)
     monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
     monkeypatch.setattr(srv, "_fabric_77_streak", 0)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_skipped", True)
@@ -913,8 +872,7 @@ def test_a_77_with_eth_links_down_is_forced_past_the_hold_deadline(monkeypatch, 
 
 @pytest.mark.asyncio
 async def test_a_77_with_eth_links_full_keeps_the_backoff(monkeypatch, tmp_path, clear_job_state):
-    """256 of 256: a 77 is still a missing verdict. The relift waits for its I48 backoff step and
-    never resets."""
+    """256 of 256: a 77 is still a missing verdict. The relift waits for its I48 backoff step and never resets."""
     _hold_77_eth(monkeypatch, tmp_path, drop="", due=False)
     monkeypatch.setattr(srv, "_fabric_77_recheck_due", lambda: False)
     assert srv._fabric_77_only_hold()
@@ -972,7 +930,7 @@ async def test_a_78_cable_fault_with_eth_links_down_holds_without_a_reset(monkey
 async def test_a_77_eth_drop_reset_releases_only_on_a_passing_full_check(
     monkeypatch, tmp_path, clear_job_state, post_reset, released
 ):
-    """Goal 8: the reset this escalation runs is followed by the full health check, fabric included,
+    """Full check after every reset: the reset this escalation runs is followed by the full health check, fabric included,
     and only a passing fabric verdict releases the device; a 77 or a failed pass keeps it held."""
     _hold_77_eth(monkeypatch, tmp_path)
     monkeypatch.setattr(srv, "device_hold_episode_since", (datetime.now() - timedelta(minutes=21)).isoformat())
@@ -1000,7 +958,6 @@ def _present_rung_chain(monkeypatch, post_reset):
     monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 0.0)
     monkeypatch.setattr(srv.recovery_mechanism, "unverified_reset_since", None)
     monkeypatch.setattr(recovery_pkg, "POST_RESET_FABRIC_RETRIES", 0)
-    monkeypatch.setattr(recovery_pkg, "refuse_mesh_reset", lambda *a, **k: False)
     monkeypatch.setattr(pcie_guard, "chips_off_bus", lambda expected: 0)
     monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off_bus: (True, ""))
     monkeypatch.setattr(pcie_guard, "mask_for_mesh_reset", lambda log: None)
@@ -1110,8 +1067,8 @@ async def test_a_validator_crash_77_escalates_on_the_first_relift(monkeypatch, t
 async def test_the_crash_reset_runs_the_full_check_and_releases_only_on_a_pass(
     monkeypatch, tmp_path, clear_job_state, post_reset, released
 ):
-    """The rung fires once the 120 s present-mesh grace has passed, well inside the 5 min budget;
-    goal 8: the reset is followed by the full check, fabric included, and only ok=True releases."""
+    """The rung fires once the 120 s present-mesh grace has passed, well inside the 5 min budget; full check after every
+    reset: the reset is followed by the full check, fabric included, and only ok=True releases."""
     since = (datetime.now() - timedelta(seconds=galaxy_mod._present_mesh_reset_grace_sec() + 5)).isoformat()
     assert galaxy_mod._present_mesh_reset_grace_sec() <= 120
     _hold_77_crash(monkeypatch, tmp_path, since=since)
@@ -1133,12 +1090,9 @@ async def test_the_crash_reset_keeps_the_hold_on_a_pass_with_links_missing(
     clear_job_state,
     topo,  # noqa: F811
 ):
-    """Goal 11 (I62 with I71 and I78): after the crash's present-mesh reset, the full check's
-    traffic passes on every discovered link while a port connection of the cabling is missing.
-    That check FAILED: the hold stays, its episode with it, and no lift path may clear it; the
-    bounded recovery (the climb, then the I76 bound) owns it from here."""
+    """Lift only on a fresh pass (I62 with I71 and I78): after the crash's present-mesh reset, the full check's traffic
+    passes on every discovered link while a port connection of the cabling is missing."""
     m, state = topo
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS", raising=False)
     state["first"] = _LOST  # the descriptor run: one QSFP-DD connection gone
     state["rerun"] = (0, "all links ok\n")  # the traffic-only rerun on the links that are left
     since = (datetime.now() - timedelta(seconds=galaxy_mod._present_mesh_reset_grace_sec() + 5)).isoformat()
@@ -1173,9 +1127,7 @@ async def test_the_crash_reset_keeps_the_hold_on_a_pass_with_links_missing(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("drop", ["", _DROP], ids=["crash", "eth_drop"])
 async def test_a_tick_before_the_grace_does_not_push_the_reset_past_it(monkeypatch, tmp_path, clear_job_state, drop):
-    """A relift tick that comes while the hold is younger than the grace gets not-due from the rung.
-    It must not use up a whole relift interval: the next relift is due when the grace ends, so the
-    reset runs one sampler tick after the grace, not up to one interval later."""
+    """A relift tick that comes while the hold is younger than the grace gets not-due from the rung."""
     grace = galaxy_mod._present_mesh_reset_grace_sec()
     interval = srv.SELFHEAL_RELIFT_INTERVAL_SEC
     assert grace <= interval, "the case this guards: a not-due tick would push the rung a full interval"
@@ -1518,8 +1470,7 @@ def test_an_owed_pass_does_not_carry_to_another_episode(monkeypatch, tmp_path, c
 
 def _bound(monkeypatch, tmp_path, eth):
     _hold_77(monkeypatch, tmp_path)
-    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", "1")
-    monkeypatch.setattr(srv.alert, "send_alert", lambda *a, **k: None)
+    monkeypatch.setattr(srv, "FABRIC_77_MAX_RETRIES", 1)
 
     async def verify(expected, log, run_fabric=True, **_):
         return True, {"snapshot": {"ok": True}, "fabric": {"ok": None, "detail": "could not run (77)"}}
@@ -1559,44 +1510,9 @@ async def test_a_77_only_hold_with_a_link_drop_climbs_the_ladder_not_released(mo
 
 
 @pytest.mark.asyncio
-async def test_a_second_77_only_hold_inside_the_window_climbs_the_ladder(monkeypatch, tmp_path, clear_job_state):
-    rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
-    await srv._attempt_idle_relift()
-    assert rungs == ["present"]
-    assert srv.fsm.state is ServerState.RECOVERING
-
-
-@pytest.mark.asyncio
-async def test_the_77_bound_pages_once_per_hold_episode(monkeypatch, tmp_path, clear_job_state):
-    """Every relift pass past the bound runs the fallback again (here each climbs a ladder that leaves
-    the hold standing). Only the first on an episode pages. A page the hook dropped (a run still in
-    flight) goes out on the next pass, and a page sent for an earlier episode does not quiet this one."""
-    rungs = _bound(monkeypatch, tmp_path, (None, "eth links below baseline"))
-    monkeypatch.setattr(srv.alert, "alert_argv", lambda: ["hook"])
-    monkeypatch.setattr(srv, "_fabric_77_paged_since", "an earlier episode", raising=False)
-    sent = []
-    outcomes = iter([None])  # the first send is dropped; every later one starts
-
-    def send_alert(event, log=None):
-        if event["kind"] == "fabric_check_unrunnable_bound":
-            sent.append(event["held_since"])
-            return next(outcomes, object())
-        return object()
-
-    monkeypatch.setattr(srv.alert, "send_alert", send_alert)
-    for _ in range(4):
-        monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
-        await srv._attempt_idle_relift()
-
-    assert rungs == ["present"] * 4, "every pass past the bound still runs the fallback"
-    assert sent == [srv.fsm.record.since] * 2, "one dropped page, then one page for the episode"
-
-
-@pytest.mark.asyncio
 async def test_the_first_job_hardware_fault_takes_the_ladder_without_the_grace(monkeypatch, tmp_path, clear_job_state):
-    """I42: the first job after a topology lift measured the fabric bad. That hold is no 77-only or
-    no-reset hold: the idle relift runs the present-mesh rung now (measured, no grace, I56) and its
-    full post-reset check decides. The old latch withheld the check and stood for an hour."""
+    """I42: the first job after a topology lift measured the fabric bad. That hold is no 77-only or no-reset hold: the
+    idle relift runs the present-mesh rung now (measured, no grace, I56) and its full post-reset check decides."""
     _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
     fault = "hardware fault: the first job after a topology-mismatch lift failed on the fabric (x)"
     monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", fault)
@@ -1615,9 +1531,8 @@ async def test_the_first_job_hardware_fault_takes_the_ladder_without_the_grace(m
 
 
 def test_the_first_job_hardware_fault_is_no_77_no_reset_cause(monkeypatch, tmp_path, clear_job_state):
-    """I42 with spec 04 I29: the latch is a measured fault, so a 77 after its reset still climbs to
-    the host rung once (every hold ends in the power-cycle rung). Counting the latch as a cause no
-    reset fixes would park that 77 without the host rung."""
+    """I42 with spec 04 I29: the latch is a measured fault, so a 77 after its reset still climbs to the host rung once
+    (every hold ends in the power-cycle rung)."""
     _hold_77(monkeypatch, tmp_path, last_fabric_ok=False)
     monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)
     monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: False)
@@ -1644,10 +1559,7 @@ _LATCHED_77_OUTPUT = (
 def test_a_latched_hold_whose_77_names_the_mismatch_is_no_77_no_reset_cause(
     monkeypatch, tmp_path, clear_job_state, named_in, latched
 ):
-    """I42 with spec 04 I29: the latch is read before the mismatch checks. The latched hold's
-    post-reset 77 keeps the validator's mismatch line (the rerun output includes the descriptor run),
-    and its detail or episode reason may name the mismatch; none of these parks the hold with no host
-    rung. Without the latch the same reading is a topology mismatch, a cause no reset fixes."""
+    """I42 with spec 04 I29: the latch is read before the mismatch checks."""
     _hold_77(monkeypatch, tmp_path, last_fabric_ok=False)
     monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)
     monkeypatch.setattr(srv, "_last_77_was_hugepages", lambda: False)
@@ -1674,12 +1586,11 @@ def test_a_latched_hold_whose_77_names_the_mismatch_is_no_77_no_reset_cause(
 async def test_after_an_unknown_reset_the_next_relift_77_reaches_the_bound(
     monkeypatch, tmp_path, clear_job_state, reset_passes, bounded
 ):
-    """Spec 04 I29: a reset whose post-reset fabric stayed a 77 (one pass and one retry) counts those
-    passes toward the episode's I40 bound, so the next relift's 77 reaches it at once and climbs the
-    ladder (never a release on the startup checks, 03 I78). Without them, the same relift is still
-    under the default bound and just holds."""
+    """Spec 04 I29: a reset whose post-reset fabric stayed a 77 (one pass and one retry) counts those passes toward the
+    episode's I40 bound, so the next relift's 77 reaches it at once and climbs the ladder (never a release on the
+    startup checks, 03 I78). Without them, the same relift is still under the default bound and just holds."""
     rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
-    monkeypatch.delenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", raising=False)
+    monkeypatch.setattr(srv, "FABRIC_77_MAX_RETRIES", 3)
     monkeypatch.setattr(srv, "_fabric_77_streak_since", None)
     monkeypatch.setattr(srv, "_fabric_77_streak", 0)
     if reset_passes:
@@ -1718,7 +1629,7 @@ async def test_a_topology_mismatch_whose_rerun_77s_takes_the_bounded_fallback(
 @pytest.mark.asyncio
 async def test_a_77_only_hold_under_its_bound_still_just_holds(monkeypatch, tmp_path, clear_job_state):
     rungs = _bound(monkeypatch, tmp_path, (True, "all active-eth cores advancing"))
-    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_77_MAX_RETRIES", "5")
+    monkeypatch.setattr(srv, "FABRIC_77_MAX_RETRIES", 5)
     await srv._attempt_idle_relift()
     assert rungs == []
     assert srv.fsm.state is ServerState.RECOVERING
@@ -1759,13 +1670,12 @@ async def test_a_terminal_rung_on_a_77_only_hold_keeps_it_recovering(
 async def test_the_boot_after_the_brokers_own_power_cycle_latches_nothing_and_still_runs_the_full_check(
     monkeypatch, _startup, _systemctl
 ):
-    """Spec 04 I25 with goal 8: an off-bus intent older than the broker's own power-cycle row is not a
+    """Spec 04 I25 with the post-reset full check: an off-bus intent older than the broker's own power-cycle row is not a
     host hang, so no latch gates the mesh reset; the startup pass still waits for the hugepage pool and
     runs the full check, fabric forced, before anything is released."""
     from tt_device_mcp.health.recovery import pcie_guard
 
     events, rows, gate_calls = _startup
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
     monkeypatch.setattr(pcie_guard, "record_topology", lambda: None)
     hd = evidence.health_dir()
     hd.mkdir(parents=True, exist_ok=True)

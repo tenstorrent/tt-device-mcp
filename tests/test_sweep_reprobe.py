@@ -19,10 +19,8 @@ PARTIAL = {"16", "17", "18"}
 
 
 def _arm(monkeypatch, *, heals_after_sbr: bool, verdicts: list, isolated=PARTIAL):
-    """A 32-chip mesh with ``isolated`` chips off the bus (fake sysfs: the off-bus count the probe
-    reads). SBR brings them back when ``heals_after_sbr``; the mesh reset always does. ``verdicts``
-    are the full checks' results in order. Returns (g, rec) where rec records the rungs, the full
-    checks, the releases and the power cycles."""
+    """A 32-chip mesh with ``isolated`` chips off the bus (fake sysfs: the off-bus count the probe reads). SBR brings
+    them back when ``heals_after_sbr``; the mesh reset always does."""
     g = srv.galaxy_recovery
     bus = {"off": len(isolated), "isolated": set(isolated)}
     rec = {"rungs": [], "checks": [], "released": [], "cycles": 0, "events": []}
@@ -33,7 +31,6 @@ def _arm(monkeypatch, *, heals_after_sbr: bool, verdicts: list, isolated=PARTIAL
     monkeypatch.setattr(g.deps, "isolated_chips", lambda: set(bus["isolated"]))
     monkeypatch.setattr(pcie_guard, "chips_off_bus", lambda expected: bus["off"])
     monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off_bus: (True, ""))
-    monkeypatch.setattr(galaxy, "refuse_mesh_reset", lambda *a, **k: False)
     monkeypatch.setattr(pcie_guard, "mask_for_mesh_reset", lambda log: None)
 
     async def sbr(log):

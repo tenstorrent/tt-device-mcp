@@ -252,9 +252,8 @@ def test_the_app_serves_the_shims_synthetic_socket_host():
 async def test_a_blocking_job_run_reports_progress_through_the_mcp_layer(monkeypatch, tmp_path, clear_job_state):
     """Drives the tool over a real MCP session so the SDK has to inject the `Context`.
 
-    job_run/job_wait are the only tools taking one, and calling them directly skips the
-    injection entirely. `ctx.info` is deprecated (SEP-2577), so this fails on its removal.
-    """
+    job_run/job_wait are the only tools taking one, and calling them directly skips the injection entirely. `ctx.info`
+    is deprecated (MCP SEP 2577), so this fails on its removal."""
     from mcp.client import Client
 
     import tt_device_mcp.server as srv
@@ -767,11 +766,14 @@ class TestCleanDeviceGate:
         # Per test, never a fixed /tmp path: suite runs in parallel worktrees shared one, and an
         # orphan of a killed run touched it inside this test's window.
         marker = tmp_path / "fabric_orphan_probe"
-        # `&&`, not `;`: the timeout now stops the check with SIGINT (so a real validator unwinds and
-        # releases the mesh), which would leave a `; touch` to still run. `&&` short-circuits on the
-        # interrupted sleep's non-zero exit, so the marker appears only if the grandchild ran to
-        # completion — i.e. was NOT reaped.
-        monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", f"(sleep 30 && touch {marker}) & echo $!; wait")
+        # The grandchild ignores SIGINT, as a `&` child of bash 5.2 does when job control is off, so only the
+        # ladder's SIGTERM step stops it. A 1 s SIGINT window reaches that step well inside the sleep; the
+        # marker appears only if the grandchild ran to completion, i.e. was NOT reaped.
+        monkeypatch.setenv(
+            "TT_DEVICE_MCP_FABRIC_CHECK_CMD", f"(trap '' INT; sleep 30 && touch {marker}) & echo $!; wait"
+        )
+        terminate = srv._terminate_process_group
+        monkeypatch.setattr(srv, "_terminate_process_group", lambda pid: terminate(pid, grace_sec=1))
         ok, _ = await srv.health_monitor.verify_fabric_health(timeout_sec=2)
         assert ok is False
 

@@ -6,7 +6,7 @@
 An Advisory Non-Fatal AER error (the ``NonFatalErr`` row of ``aer_dev_correctable``: a completion
 timeout the device downgraded) on a chip's own path is the kernel's first sign of it. With such a
 rise, one all-ones sample of that chip confirms it at once instead of SAMPLE_INTERVAL_SEC later, and
-the valve SIGSTOPs the fabric check and the aiclk ceiling before the PCI remove. The hold stays, and
+the valve SIGSTOPs the fabric check before the PCI remove. The hold stays, and
 the stopped fabric run is no verdict, so only a later full pass can lift it. No device is touched.
 """
 
@@ -117,37 +117,27 @@ async def test_drop_during_a_hold_escalation_check_stops_it_and_the_hold_stays(v
     assert FABRIC_DEBT.owed
 
 
-class _Ceiling:
+class _FinishedProc:
     pid = 4242
     returncode = None
 
 
 @pytest.mark.asyncio
-async def test_drop_during_the_aiclk_ceiling_stops_it_before_the_remove(valve, monkeypatch):
-    log, _ = valve
-    monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", None)
-    monkeypatch.setattr(srv.CEILING, "proc", _Ceiling())
-    await srv.sampler.isolate_dead_chips(["13"])
-    assert log.index(("stop", _Ceiling.pid)) < log.index(("detach", "13")), log
-    assert ("pollers", False) in log, "telemetry and health probes stop reading too"
-
-
-@pytest.mark.asyncio
 async def test_a_finished_reader_is_not_signalled(valve, monkeypatch):
     log, _ = valve
-    done = _Ceiling()
+    done = _FinishedProc()
     done.returncode = 0
     monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", None)
-    monkeypatch.setattr(srv.CEILING, "proc", done)
+    monkeypatch.setattr(srv, "eth_selftest_proc", done)
     monkeypatch.setattr(FABRIC_DEBT, "owed", "")
     await srv.sampler.isolate_dead_chips(["13"])
-    assert ("stop", _Ceiling.pid) not in log
+    assert ("stop", _FinishedProc.pid) not in log
     assert not FABRIC_DEBT.owed, "no fabric run was stopped, so none is marked killed"
 
 
 @pytest.mark.asyncio
 async def test_after_the_abort_only_a_fresh_full_fabric_pass_lets_the_hold_lift(valve, monkeypatch):
-    """Goal 11: the stopped run is no verdict; the hold lifts only on a full pass that came after it."""
+    """Lift only on a fresh pass: the stopped run is no verdict; the hold lifts only on a full pass that came after it."""
     monkeypatch.setattr(FABRIC_DEBT, "owed", "")
     monkeypatch.setattr(FABRIC_DEBT, "runs_here", lambda expected: True)
     FABRIC_DEBT.note_fabric(True)  # a pass from before the drop
@@ -265,7 +255,6 @@ def _live_snapshot(monkeypatch, during):
     monkeypatch.setattr(m, "fabric_check_proc", None)
     monkeypatch.setattr(m, "snapshot_proc", None, raising=False)
     monkeypatch.setattr(srv, "eth_selftest_proc", None, raising=False)
-    monkeypatch.setattr(srv.CEILING, "proc", None)
     monkeypatch.setattr(FABRIC_DEBT, "owed", "")
     real_popen = subprocess.Popen
 

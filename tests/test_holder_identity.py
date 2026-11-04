@@ -143,9 +143,16 @@ def test_secrets_are_redacted(argv, leaked, kept):
     assert kept in line
 
 
-def test_harmless_arguments_survive_redaction():
-    line = hi.format_cmdline(b"python3\0-m\0pytest\0tests/test_x.py\0-k\0mesh\0")
-    assert line == "python3 -m pytest tests/test_x.py -k mesh"
+@pytest.mark.parametrize(
+    "raw,want",
+    [
+        (b"python3\0-m\0pytest\0tests/test_x.py\0-k\0mesh\0", "python3 -m pytest tests/test_x.py -k mesh"),
+        (b"curl\0https://example.com/x?to=a@b\0https://h?q=a@b\0", "curl https://example.com/x?to=a@b https://h?q=a@b"),
+    ],
+    ids=["harmless-arguments", "at-sign-after-host"],
+)
+def test_arguments_with_no_secret_survive_redaction(raw, want):
+    assert hi.format_cmdline(raw) == want
 
 
 def test_a_long_cmdline_is_cut_after_redaction():
@@ -168,15 +175,9 @@ def test_identities_are_deduplicated_in_order(proc):
     assert rows[1]["status"] == "gone"
 
 
-def test_an_at_sign_after_the_host_is_not_userinfo():
-    line = hi.format_cmdline(b"curl\0https://example.com/x?to=a@b\0https://h?q=a@b\0")
-    assert line == "curl https://example.com/x?to=a@b https://h?q=a@b"
-
-
 def test_a_read_stuck_in_the_kernel_is_left_unread_within_the_bound():
-    """A /proc read can block (the target's mmap lock, NSS): the reads share one fixed bound, a read
-    still running at it is recorded unread and never waited for, and the others are kept. A pid whose
-    read is still stuck is not read again, so a holder stuck across scans leaves one thread behind."""
+    """A /proc read can block (the target's mmap lock, NSS): the reads share one fixed bound, a read still running at it
+    is recorded unread and never waited for, and the others are kept."""
     release = threading.Event()
     started = []
 
@@ -251,7 +252,7 @@ def test_a_longest_argument_is_redacted_in_linear_bounded_time(prefix):
     assert time.perf_counter() - t0 < 0.05
     assert len(line) <= hi.CMDLINE_MAX_CHARS
     t0 = time.perf_counter()
-    hi.redact_argv(["tool", _long_arg(prefix).decode()])  # the whole argument, no cut
+    list(hi._redacted(["tool", _long_arg(prefix).decode()]))  # the whole argument, no cut
     assert time.perf_counter() - t0 < 0.25
 
 

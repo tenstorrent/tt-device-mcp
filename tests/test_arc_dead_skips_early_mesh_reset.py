@@ -109,7 +109,7 @@ async def test_arc_dead_healed_by_the_bridge_reset_lifts_only_on_the_full_check_
 async def test_the_pre_cycle_ladder_still_runs_the_mesh_reset_and_the_last_chance_sweep(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """(c) Goal 12: right before the power cycle request the sweep runs its SBR, the mesh reset
+    """(c) Full ladder before every power cycle: right before the power cycle request the sweep runs its SBR, the mesh reset
     (glx_reset, with its POST_RESET and board re-init) and the full check with fabric."""
     order, events, _counters, _state = _arc_rig(monkeypatch, tmp_path, held_min=1)
     argvs = []
@@ -131,7 +131,7 @@ async def test_the_pre_cycle_ladder_still_runs_the_mesh_reset_and_the_last_chanc
 async def test_the_10_min_bound_ladder_is_unchanged_and_still_runs_the_mesh_reset(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """(d) Goal 10: an arc-dead record does not touch the bound's ladder: rescan, its mesh reset with
+    """(d) 10-min ladder: an arc-dead record does not touch the bound's ladder: rescan, its mesh reset with
     the full check, then the sweep's, then the power cycle."""
     order, events, _counters, _state = _arc_rig(monkeypatch, tmp_path)
     await srv.galaxy_recovery._sbr(lambda m: None)
@@ -146,7 +146,7 @@ async def test_the_10_min_bound_ladder_is_unchanged_and_still_runs_the_mesh_rese
 async def test_a_failed_full_check_after_the_ladder_keeps_the_hold_and_requests_the_cycle(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """(e) Goals 8/11: the sweep's full check fails, so the hold stays and the power cycle is
+    """(e) Full check before any release: the sweep's full check fails, so the hold stays and the power cycle is
     requested; nothing lifts it."""
     order, _events, counters, _state = _arc_rig(monkeypatch, tmp_path, held_min=1, verdicts=[False])
     await _gate_sbr_then_forced_run(order)
@@ -202,9 +202,8 @@ def _record_handoff(monkeypatch, order):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("why", ["I65 cooldown: a power cycle 300s ago", "backstop reached", "ledger unreadable"])
 async def test_a_denied_power_cycle_keeps_the_early_mesh_reset(monkeypatch, tmp_path, clear_job_state, why):
-    """A power cycle the ledger denies (the I65 cooldown, the backstop, an unreadable ledger) would
-    return from the climb before its sweep: the early mesh reset and its full check run as before,
-    and a failing check lifts nothing."""
+    """A power cycle the ledger denies (the I65 cooldown, the backstop, an unreadable ledger) would return from the
+    climb before its sweep: the early mesh reset and its full check run as before, and a failing check lifts nothing."""
     order, events, counters, _state = _arc_rig(monkeypatch, tmp_path, held_min=1, verdicts=[False])
     _deny_power_cycle(monkeypatch, [(False, why)])
     await _gate_sbr_then_forced_run(order)
@@ -218,7 +217,7 @@ async def test_a_denied_power_cycle_keeps_the_early_mesh_reset(monkeypatch, tmp_
 async def test_a_denied_power_cycle_lifts_only_on_the_mesh_resets_passing_full_check(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """Goals 8/11: the early mesh reset run because the cycle is denied lifts the hold only after its
+    """Full check before any release: the early mesh reset run because the cycle is denied lifts the hold only after its
     full check with fabric has passed."""
     order, _events, counters, _state = _arc_rig(monkeypatch, tmp_path, held_min=1, verdicts=[True])
     _deny_power_cycle(monkeypatch, [(False, "I65 cooldown")])

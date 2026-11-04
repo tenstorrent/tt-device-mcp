@@ -230,7 +230,6 @@ def _runner_setup(monkeypatch, tmp_path):
     _free_device_lock(monkeypatch)
     _no_workspace_activation(monkeypatch)
     monkeypatch.setattr(srv, "job_log_dir", tmp_path)
-    monkeypatch.setattr(srv.alert, "send_alert", lambda *a, **k: None)
     monkeypatch.setattr(srv, "TENANT_HOLD_POLL_SEC", 0.02)
 
     async def _free(job_log_file):
@@ -239,7 +238,7 @@ def _runner_setup(monkeypatch, tmp_path):
     async def _admission(job, job_log_file):
         return "" if srv.fsm.state is ServerState.HEALTHY else _HOLD
 
-    async def _gate(job_log_file, job_failed=False, noop_failure=False, exit1_failure=False):
+    async def _gate(job_log_file, job_failed=False, noop_failure=False):
         return None
 
     monkeypatch.setattr(srv, "_await_device_free_for_tenant", _free)
@@ -259,10 +258,8 @@ def _queue(job, tmp_path):
 async def test_a_held_tenant_yields_to_a_verification_job_that_lifts_the_hold(
     monkeypatch, tmp_path, clear_job_state, broker_root, fabric_hold, enum_arc, events
 ):
-    """The whole path: a tenant job held on a fabric-only hold, an operator fabric check queued
-    behind it. The tenant hands the runner back, the check runs through the hold, its pass lifts
-    the hold, and the tenant then dispatches. Without the class the check waited behind the
-    tenant until the hold bound refused it."""
+    """The whole path: a tenant job held on a fabric-only hold, an operator fabric check queued behind it. The tenant
+    hands the runner back, the check runs through the hold, its pass lifts the hold, and the tenant then dispatches."""
     _runner_setup(monkeypatch, tmp_path)
     tenant = _job("201", "echo tenant-ran", peer_uid=1000)
     check = _job("202", f"{broker_root}/fabric-check.sh", peer_uid=0)
@@ -366,9 +363,7 @@ def debt_owed(monkeypatch):
 async def test_a_passing_check_settles_the_post_reset_debt_and_lifts(
     monkeypatch, broker_root, fabric_hold, enum_arc, events, debt_owed
 ):
-    """After a broker start or a reset the release is refused until a fabric pass settles the debt
-    (04 I32). The verification job's pass, with no reset since it started, is that pass: it settles
-    the debt and ends a known fabric fault, as the monitor's own pass would, and the hold lifts."""
+    """After a broker start or a reset the release is refused until a fabric pass settles the debt (04 I32)."""
     monkeypatch.setattr(srv.health_monitor, "fabric_known_fault", "known fabric fault: 2 jobs in a row")
     job = _finished(_job("507", f"{broker_root}/fabric-check.sh", peer_uid=0))
     assert await srv._settle_verification_job(job)

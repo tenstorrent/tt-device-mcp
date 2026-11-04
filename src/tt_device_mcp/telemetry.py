@@ -30,58 +30,57 @@ from tt_device_mcp.health import ALL_ONES, PCI_WRITER, SAMPLE_INTERVAL_SEC, SAMP
 if TYPE_CHECKING:
     from tt_device_mcp.health import HealthMonitor, RecoveryDeps, RecoveryMechanism
 
-# The early off-bus watch (spec 03 I79). Between samples the loop reads the kernel's own PCIe
-# record (pci.link_signals: AER counters and the KMD node list, kernel memory only) every
-# LINK_WATCH_SEC. A rise in an uncorrectable AER counter on a chip's path, or a chip node leaving
-# sysfs, arms a fast cadence: the next sample comes FAST_SAMPLE_SEC after the last one (never
-# sooner), and samples stay FAST_SAMPLE_SEC apart for FAST_WINDOW_SEC after the last such signal.
-# One storm (signals less than FAST_WINDOW_SEC apart) keeps the fast cadence at most FAST_MAX_SEC
-# from its first signal; after that the regular cadence runs until the link has been quiet for
-# FAST_WINDOW_SEC. The signal itself decides nothing: the off-bus verdict is still
-# check_for_dead_chips on real samples, with the same two-sample proof, and a bad reading that
-# began under the fast cadence must also have lasted FAST_CONFIRM_SEC, even past the window's end,
-# so a transient that clears in under 4 s never isolates a chip or dirties the device.
+# The early off-bus watch (spec 03 I79). Between samples the loop reads the kernel's own PCIe record (pci.link_signals:
+# AER counters and the KMD node list, kernel memory only) every LINK_WATCH_SEC. A rise in an uncorrectable AER counter
+# on a chip's path, or a chip node leaving sysfs, arms a fast cadence: the next sample comes FAST_SAMPLE_SEC after the
+# last one (never sooner, except at once when the edge is an uncorrectable AER rise pinned to a chip's own path, whose
+# all-ones read then proves itself on that sample, I86), and samples stay FAST_SAMPLE_SEC apart for FAST_WINDOW_SEC after the last such signal. One
+# storm (signals less than FAST_WINDOW_SEC apart) keeps the fast cadence at most FAST_MAX_SEC from its first signal;
+# after that the regular cadence runs until the link has been quiet for FAST_WINDOW_SEC. The signal itself decides
+# nothing: the off-bus verdict is still check_for_dead_chips on real samples, with the same two-sample proof, and a bad
+# reading that began under the fast cadence must also have lasted FAST_CONFIRM_SEC, even past the window's end, so a
+# transient that clears in under 4 s never dirties the device. A lone chip's all-ones reading (the containment, spec 03
+# I99's 5 s from first evidence to remove) stands at CONTAIN_CONFIRM_SEC instead: the second fast sample, with margin
+# for jitter, so it still takes two reads at least FAST_SAMPLE_SEC apart, never one.
 LINK_WATCH_SEC = 1.0
 FAST_SAMPLE_SEC = 2.0
 FAST_WINDOW_SEC = 30.0
 FAST_MAX_SEC = 60.0
 FAST_CONFIRM_SEC = 4.0
-# Spec 03 I86: an AER rise read this soon after a reset or recovery step last owned the chips
-# corroborates no all-ones read. The firmware-first (GHES) path can post the step's own errors a
-# poll or two after it ends; such a rise still arms the fast cadence, and a real drop in the window
-# is proved by I79's FAST_CONFIRM_SEC instead of the first sample.
+CONTAIN_CONFIRM_SEC = 1.5
+# Spec 03 I86: an AER rise read this soon after a reset or recovery step last owned the chips corroborates no all-ones
+# read. The firmware-first (GHES) path can post the step's own errors a poll or two after it ends; such a rise still
+# arms the fast cadence, and a real drop in the window is proved by I79's FAST_CONFIRM_SEC instead of the first sample
+# (not the shorter CONTAIN_CONFIRM_SEC: the step's own re-init may still be settling).
 POST_STEP_AER_QUIET_SEC = 5.0
 
-# Spec 03 I92: an AER burst on a chip's path while the broker's own check runs stops that check's
-# readers. On a firmware-first host each uncorrectable (or advisory non-fatal) AER record is a
-# system-management interrupt, and a storm of them steals enough CPU time to trip the hardware
-# watchdog within seconds while something keeps reading the chip. The count is what link_signals
-# reads (the same counters as I79), per PCI function, over AER_STOP_WINDOW_SEC. Basis: in the
-# kernel's per-record AER log over several hundred fabric checks on three galaxy hosts, a storm that
-# went on to a chip drop or a host lockup posted 9-14 records on one function in its first firmware
-# flush and repeated every 4-5 s; outside a storm no function counted more than 2 in any 2 s. Four
-# is twice that and below the smallest first flush, so the first poll after a storm's first flush
-# stops the check. One passing check in about 300 had a storm of the same shape that ended with it:
-# that run is stopped too, and a later full pass decides (a stop is never a fail of the links).
+# Spec 03 I92: an AER burst on a chip's path while the broker's own check runs stops that check's readers. On a
+# firmware-first host each uncorrectable (or advisory non-fatal) AER record is a system-management interrupt, and a
+# storm of them steals enough CPU time to trip the hardware watchdog within seconds while something keeps reading the
+# chip. The count is what link_signals reads (the same counters as I79), per PCI function, over AER_STOP_WINDOW_SEC.
+# Basis: in the kernel's per-record AER log over several hundred fabric checks on three galaxy hosts, a storm that went
+# on to a chip drop or a host lockup posted 9-14 records on one function in its first firmware flush and repeated every
+# 4-5 s; outside a storm no function counted more than 2 in any 2 s. Four is twice that and below the smallest first
+# flush, so the first poll after a storm's first flush stops the check. One passing check in about 300 had a storm of
+# the same shape that ended with it: that run is stopped too, and a later full pass decides (a stop is never a fail of
+# the links).
 AER_STOP_COUNT = 4
 AER_STOP_WINDOW_SEC = 2.0
 # The watch polls every LINK_WATCH_SEC plus the poll's own time, so the read two polls back is just
 # over AER_STOP_WINDOW_SEC old. Half a poll of slack keeps it as the baseline; the read three polls
 # back (at least 3 s old) is always out, so a rise spread over three polls never stops a check.
 AER_STOP_WINDOW_SLACK_SEC = LINK_WATCH_SEC / 2
-# Spec 03 I95: how long the AER watch waits, after its stop, for the stop record's fsync. The
-# record is what shows the stop if the host is lost after it; a storm has stalled one fsync for 12 s
-# and another for 48 s, so the wait is bounded and only the watch thread waits (the signals are
-# already sent and the event loop never waits on it).
+# Spec 03 I95: how long the AER watch waits, after its stop, for the stop record's fsync. The record is what shows the
+# stop if the host is lost after it; a storm has stalled one fsync for 12 s and another for 48 s, so the wait is bounded
+# and only the watch thread waits (the signals are already sent and the event loop never waits on it).
 AER_STOP_JOURNAL_WAIT_SEC = 15.0
-# Spec 03 I92: the longest an AER stop stays pending (readers SIGSTOPped, a burst chip attached, no
-# proof either way), on the watch's clock from the stop. Within a storm's first FAST_MAX_SEC the
-# burst keeps the fast cadence (I79), so this is three samples: one that reads a chip all-ones
-# contains it, one that reads every chip answering ends the readers; past it a sample may not come
-# in time. With neither by then, the chips still attached that no newer sample read answering are
-# contained (stop, PCI remove, then the kill, I96): no kill without the remove, never a chip that
-# answered, and no stop left to the readers' own timeouts (180 s and more for a fabric run).
-# Faster per-class paths are unchanged.
+# Spec 03 I92: the longest an AER stop stays pending (readers SIGSTOPped, a burst chip attached, no proof either way),
+# on the watch's clock from the stop. Within a storm's first FAST_MAX_SEC the burst keeps the fast cadence (I79), so
+# this is three samples: one that reads a chip all-ones contains it, one that reads every chip answering ends the
+# readers; past it a sample may not come in time. With neither by then, the chips still attached that no newer sample
+# read answering are contained (stop, PCI remove, then the kill, I96): no kill without the remove, never a chip that
+# answered, and no stop left to the readers' own timeouts (180 s and more for a fabric run). Faster per-class paths are
+# unchanged.
 PENDING_STOP_CAP_SEC = 3 * FAST_SAMPLE_SEC
 
 # Spec 03 I83's cut after a failed POST_RESET: all PCI removes together get at most this long (a
@@ -89,21 +88,19 @@ PENDING_STOP_CAP_SEC = 3 * FAST_SAMPLE_SEC
 # reader kill (SIGTERM, SIGKILL 10 s later) at most this long.
 INFLIGHT_DETACH_TIMEOUT_SEC = 15.0
 
-# Spec 03 I96: the dead-chip watch. The AER watch thread reads link_signals (kernel memory only) every
-# LINK_WATCH_SEC whether or not anything runs, and an AER burst on a chip's path or a KMD node that
-# vanished outside any reset is a trigger. On a trigger it decides from: the node gone, I94's ring
-# rule (the latest sample read the chip all-ones), and, each behind its constant, one config-space
-# vendor-ID read of the chip (0xFFFF) and the Link Status DLLLA bit of its root port (0). Both reach
-# config space, so both stay off until a device proof shows them safe on a dying link.
+# Spec 03 I96: the dead-chip watch. The AER watch thread reads link_signals (kernel memory only) every LINK_WATCH_SEC
+# whether or not anything runs, and an AER burst on a chip's path or a KMD node that vanished outside any reset is a
+# trigger. On a trigger it decides from: the node gone, I94's ring rule (the latest sample read the chip all-ones), and,
+# each behind its constant, one config-space vendor-ID read of the chip (0xFFFF) and the Link Status DLLLA bit of its
+# root port (0). Both reach config space, so both stay off until a device proof shows them safe on a dying link.
 WATCH_CONFIG_CONFIRM = False
 WATCH_DLLLA = False
-# Latency budget, counted from the trigger read (spec 03 I96, I99): every user of the chip SIGSTOPped
-# within WATCH_STOP_BUDGET_SEC, the PCI remove done within WATCH_REMOVE_BUDGET_SEC typically and
-# never later than WATCH_HARD_BOUND_SEC after the trigger (a remove still running then latches
-# PCI-wedged and asks for the power cycle). A host stall that delays the start past the bound
-# still gets WATCH_REMOVE_BUDGET_SEC for the remove. On the hosts this guards, the first SMI stall
-# of a storm came about 4 s after its first AER record. The containment row journals the measured
-# times against these.
+# Latency budget, counted from the trigger read (spec 03 I96, I99): every user of the chip SIGSTOPped within
+# WATCH_STOP_BUDGET_SEC, the PCI remove done within WATCH_REMOVE_BUDGET_SEC typically and never later than
+# WATCH_HARD_BOUND_SEC after the trigger (a remove still running then latches PCI-wedged and asks for the power cycle).
+# A host stall that delays the start past the bound still gets WATCH_REMOVE_BUDGET_SEC for the remove. On the hosts this
+# guards, the first SMI stall of a storm came about 4 s after its first AER record. The containment row journals the
+# measured times against these.
 WATCH_STOP_BUDGET_SEC = 1.0
 WATCH_REMOVE_BUDGET_SEC = 5.0
 WATCH_HARD_BOUND_SEC = 15.0
@@ -289,6 +286,11 @@ class TelemetrySampler:
         # The hung chips a stop was last deferred for (an all-ones chip not yet detached), journalled once.
         self.pollers_deferred_for: frozenset = frozenset()
         self.prev_beats: dict = {}
+        # Each chip's last real heartbeat since the broker's own last reset (read after job_beats_reset_at): idle and
+        # while a live job holds the device, frozen from the job's end until its post-job gate compares once.
+        self.job_beats: dict = {}
+        self.job_beats_reset_at: float = 0.0
+        self.job_window_open = False
         # Spec 03 I66: consecutive frozen-heartbeat samples per present chip, and the chips already held.
         self.stall_strikes: dict = {}
         self.hung_held: frozenset = frozenset()
@@ -335,6 +337,7 @@ class TelemetrySampler:
         # outside any reset, and the chips the latest link_signals read pinned a rise to.
         self.aer_at: dict = {}
         self._aer_rose_chips: list = []
+        self._aer_edge: bool = False
         self._step_seen_at: Optional[float] = None
         # The event loop the sampler runs on: the AER watch thread hands it the containment of an
         # all-ones burst chip (spec 03 I94), since the PCI remove is bound to this loop.
@@ -360,6 +363,7 @@ class TelemetrySampler:
         """Drop samples from before this job, so an incident's trace is this job's run-up and
         not the idle hour before it."""
         self.ring.clear()
+        self.job_window_open = True
 
     async def run(self) -> None:
         """The sampler loop — see the class docstring for why it is always-on and independent."""
@@ -382,6 +386,8 @@ class TelemetrySampler:
                     self._deps.append_trace(sample, read_ts)
 
                     await self.check_for_dead_chips(sample, read_ts)
+                else:
+                    self.job_beats = {}
                 await asyncio.to_thread(chip_state.publish)
                 # The rest keeps the regular cadence while the fast one runs (I79): only the
                 # off-bus check gets faster, never the ledger, the relift or the holder scan.
@@ -494,15 +500,20 @@ class TelemetrySampler:
         if reason is None:
             return False
         now = self._clock()
+        self._aer_edge = False
         if self._step_seen_at is None or now - self._step_seen_at > POST_STEP_AER_QUIET_SEC:
             for idx in self._aer_rose_chips:
                 self.aer_at[idx] = now
+            self._aer_edge = bool(self._aer_rose_chips)
         return self.arm_fast(reason)
 
     async def wait_for_next_sample(self) -> None:
         """Sleep until the next sample: SAMPLE_INTERVAL_SEC, or FAST_SAMPLE_SEC while the fast
         cadence runs. Only the arming edge of the early watch cuts the wait short (I79), and never
-        to less than FAST_SAMPLE_SEC after the last cycle began: a storm's later signals do not."""
+        to less than FAST_SAMPLE_SEC after the last cycle began: a storm's later signals do not. An
+        edge that is an uncorrectable AER rise on a chip's own path samples at once: an all-ones
+        read of that chip proves itself on that one sample (I86), so waiting out the floor only
+        delays its containment."""
         interval = FAST_SAMPLE_SEC if self.fast_active() else SAMPLE_INTERVAL_SEC
         if getattr(self._deps, "link_signals", None) is None:
             await asyncio.sleep(interval)
@@ -514,18 +525,26 @@ class TelemetrySampler:
                 return
             await asyncio.sleep(min(LINK_WATCH_SEC, left))
             if await self.poll_link():
-                deadline = min(deadline, self._cycle_at + FAST_SAMPLE_SEC)
+                deadline = min(deadline, self._clock() if self._aer_edge else self._cycle_at + FAST_SAMPLE_SEC)
 
-    def _lasted(self, key: str) -> bool:
-        """The second-sample proof may stand (I79). A bad reading that began on the regular cadence
-        is already proved by samples SAMPLE_INTERVAL_SEC apart. One that began under the fast
-        cadence must also have lasted FAST_CONFIRM_SEC, even once the window has ended: the sample
-        after the last fast one still comes FAST_SAMPLE_SEC later, so the bound follows the
-        reading, not the mode, and a faster cadence never shortens the debounce below it."""
+    def _lasted(self, key: str, bound: float = FAST_CONFIRM_SEC) -> bool:
+        """The second-sample proof may stand (I79). A bad reading that began on the regular cadence is already proved by
+        samples SAMPLE_INTERVAL_SEC apart. One that began under the fast cadence must also have lasted ``bound``,
+        even once the window has ended: the sample after the last fast one still comes FAST_SAMPLE_SEC later, so the
+        bound follows the reading, not the mode, and a faster cadence never shortens the debounce below it."""
         since = self.bad_since.get(key)
         if not self.fast_active() and (since is None or since >= self.fast_until):
             return True
-        return since is not None and self._clock() - since >= FAST_CONFIRM_SEC
+        return since is not None and self._clock() - since >= bound
+
+    def _contain_bound(self, key: str) -> float:
+        """How long a lone chip's all-ones reading must last before its containment (I79, I99): CONTAIN_CONFIRM_SEC, the
+        second fast sample. One that began this soon after a reset or recovery step owned the chips may be the step's own
+        re-init, so it keeps FAST_CONFIRM_SEC, as the step's AER rise corroborates nothing then (I86)."""
+        since, step = self.bad_since.get(key), self._step_seen_at
+        if since is not None and step is not None and since - step <= POST_STEP_AER_QUIET_SEC:
+            return FAST_CONFIRM_SEC
+        return CONTAIN_CONFIRM_SEC
 
     def _mark_bad(self, key: str) -> None:
         self.bad_since.setdefault(key, self._clock())
@@ -644,28 +663,27 @@ class TelemetrySampler:
         return True
 
     async def stop_pollers_for_hung(self, sample: dict, dead: list) -> None:
-        """Stop the device pollers at the FIRST sample that shows a present chip hung — reading
-        all-ones, or a heartbeat that did not move since the previous sample — not at the second
-        (spec 03 I66). Their reads to it are the MMIO a hung endpoint never completes. Isolation
-        still waits for its two-sample proof; the pollers are cheap to bring back (the health probe
-        re-arms them once the device is idle and healthy). Every chip at once is the re-init blip
+        """Stop the device pollers at the FIRST sample that shows a present chip hung — reading all-ones, or a heartbeat
+        that did not move since the previous sample — not at the second (spec 03 I66). Their reads to it are the MMIO a
+        hung endpoint never completes. Isolation still waits for its two-sample proof; the pollers are cheap to bring
+        back (the health probe re-arms them once the device is idle and healthy). Every chip at once is the re-init blip
         the blackout path already proves on two samples, so it does not count here.
 
-        A stopped poller closes its fds, and tt-kmd's close path sends each chip it had open a
-        power-state message (an ARC queue write, then reads polled for up to 1 s) unless the
-        device is detached. A frozen heartbeat was just read back, so that chip completes those
-        reads; an all-ones chip may be off the bus, and only its PCI remove marks it detached. So
-        while a chip on the sample reads all-ones and its remove has not been tried yet (its first
-        strike, or inside the fast cadence's confirm gate), the stop waits for the dead-chip valve,
-        at most one more sample: the valve stops them after its remove, whether the remove worked
-        or not (spec 03 I66, I84). A chip whose remove already failed is never retried, so waiting
-        for it would leave the pollers reading it until the hold's first reset; it stops them here."""
+        A stopped poller closes its fds, and tt-kmd's close path sends each chip it had open a power-state message (an
+        ARC queue write, then reads polled for up to 1 s) unless the device is detached. A frozen heartbeat was just
+        read back, so that chip completes those reads; an all-ones chip may be off the bus, and only its PCI remove
+        marks it detached. So while a chip on the sample reads all-ones and its remove has not been tried yet (its first
+        strike, or inside the fast cadence's confirm gate), the stop waits for the dead-chip valve, at most one more
+        sample: the valve stops them after its remove, whether the remove worked or not (spec 03 I66, I84). A chip whose
+        remove already failed is never retried, so waiting for it would leave the pollers reading it until the hold's
+        first reset; it stops them here."""
         stalled = [
             i
             for i, v in sample.items()
             if v and isinstance(v[0], int) and v[0] != ALL_ONES and self.prev_beats.get(i) == v[0]
         ]
         self.prev_beats = {i: v[0] for i, v in sample.items() if v and isinstance(v[0], int)}
+        self._watch_tenant_reset(sample)
         self._hold_for_hung(stalled, len(sample))
         hung = frozenset(dead) | frozenset(stalled)
         if not hung or len(hung) >= len(sample):
@@ -680,7 +698,10 @@ class TelemetrySampler:
         if untried:
             if hung > self.pollers_deferred_for:
                 self.pollers_deferred_for = hung
-                self._deps.health_event(
+                # Through the journal's writer thread: this sample may be the containment's trigger, and no fsync
+                # sits between first evidence and the remove (I99).
+                journal = getattr(self._deps, "health_event_detached", None) or self._deps.health_event
+                journal(
                     "pollers_quiesce_deferred",
                     reason="chip_not_detached",
                     all_ones=sorted(untried, key=int),
@@ -699,13 +720,53 @@ class TelemetrySampler:
         )
         await self._deps.set_device_pollers(False, lambda m: log.info(f"HUNG-CHIP {m}") if log else None)
 
+    def _watch_tenant_reset(self, sample: dict) -> None:
+        """A heartbeat that goes back while a live job holds the device is a reset the job ran itself (spec 04 I32).
+        The baseline holds only since the broker's own last reset, so a broker reset never counts. It also follows
+        the idle device, so a job that resets before its first sample still has one; from the job's end it is frozen
+        until the post-job gate compares once (tenant_reset_at_job_end), so a reset that was the job's last act is
+        caught there."""
+        running = getattr(self._deps, "live_job_running", None)
+        note = getattr(self._deps, "note_tenant_reset", None)
+        reset_at = getattr(self._mechanism, "last_reset_monotonic", 0.0)
+        if note is None or running is None:
+            return
+        live = running()
+        if reset_at != self.job_beats_reset_at:
+            self.job_beats, self.job_beats_reset_at = {}, reset_at
+        if not live and self.job_window_open:
+            return
+        back = self._beats_back({i: v[0] if v else None for i, v in sample.items()})
+        if back and live:
+            note(back)
+
+    def _beats_back(self, beats: dict) -> list:
+        """Fold real heartbeats into the baseline; return the chips whose counter went back."""
+        back = []
+        for i, beat in beats.items():
+            if not isinstance(beat, int) or beat == ALL_ONES:
+                continue
+            last = self.job_beats.get(i)
+            # The counter wraps at 2^32: only a step back of under half its range is a restart.
+            if last is not None and (beat - last) % 2**32 >= 2**31:
+                back.append(i)
+            self.job_beats[i] = beat
+        return sorted(back, key=int)
+
+    def tenant_reset_at_job_end(self, beats: Optional[dict]) -> list:
+        """Spec 04 I32: the post-job gate's one heartbeat read against the frozen baseline: the chips whose counter went
+        back since the job's last sample. Closes the job window either way; a broker reset since voids the compare."""
+        self.job_window_open = False
+        if beats is None or getattr(self._mechanism, "last_reset_monotonic", 0.0) != self.job_beats_reset_at:
+            return []
+        return self._beats_back(beats)
+
     def _hold_for_hung(self, stalled: list, total: int) -> None:
-        """Spec 03 I66: a hung chip that is still present (its heartbeat frozen, config space still
-        answering) gets no PCI remove: tt-kmd's remove runs its MMIO cleanup on any chip whose vendor
-        ID reads, the very access a hung endpoint never completes. Its heartbeat frozen on two
-        samples in a row holds the device instead, and the hold's ladder heals it (only a full check
-        with fabric lifts it, I78). The pollers already stopped at the first frozen sample. Every chip
-        at once is the re-init blip, and a reset step's own stall is excused, as for the pollers."""
+        """Spec 03 I66: a hung chip that is still present (its heartbeat frozen, config space still answering) gets no
+        PCI remove: tt-kmd's remove runs its MMIO cleanup on any chip whose vendor ID reads, the very access a hung
+        endpoint never completes. Its heartbeat frozen on two samples in a row holds the device instead, and the hold's
+        ladder heals it (only a full check with fabric lifts it, I78). The pollers already stopped at the first frozen
+        sample. Every chip at once is the re-init blip, and a reset step's own stall is excused, as for the pollers."""
         self.stall_strikes = {i: self.stall_strikes.get(i, 0) + 1 for i in stalled}
         self.hung_held = frozenset(i for i in self.hung_held if i in self.stall_strikes)
         if not stalled or len(stalled) >= total:
@@ -726,10 +787,9 @@ class TelemetrySampler:
         self._deps.mark_device_dirty(f"chip(s) {','.join(fresh)} heartbeat frozen", why="heartbeat")
 
     def _remove_failed(self, chips) -> list:
-        """The chips of ``chips`` the dead-chip valve already tried to remove and could not (spec 03
-        I84): it adds a chip to ``isolated_chips`` before the remove, and a removed chip leaves
-        sysfs, so one still sampled is still attached. Nothing retries that remove; only the hold's
-        recovery heals the chip."""
+        """The chips of ``chips`` the dead-chip valve already tried to remove and could not (spec 03 I84): it adds a
+        chip to ``isolated_chips`` before the remove, and a removed chip leaves sysfs, so one still sampled is still
+        attached. Nothing retries that remove; only the hold's recovery heals the chip."""
         isolated = getattr(self._deps, "isolated_chips", None)
         ours = set(isolated() if isolated is not None else ())
         return [i for i in chips if i in ours]
@@ -752,19 +812,17 @@ class TelemetrySampler:
         device in response leaves nothing to run on and no way back except a rescan, so it is
         reported loudly and left alone.
 
-        Otherwise, a chip must read all-ones on two consecutive samples before it is cut out.
-        A genuinely dead chip stays dead; a transient does not. Twenty seconds is a rounding
-        error against the ~130s a host survives after a chip drops, and it buys immunity to a
-        whole class of false positives — the kind that just took a working box offline.
+        Otherwise, a chip must read all-ones on two consecutive samples before it is cut out. A genuinely dead chip
+        stays dead; a transient does not. Twenty seconds is a rounding error against the ~130s a host survives after a
+        chip drops, and it buys immunity to a whole class of false positives — the kind that just took a working box
+        offline.
 
-        FEWER CHIPS THAN THE BASELINE. A chip whose node left sysfs is simply absent from the
-        sample, so 24 answering chips on a 32-chip host look healthy chip by chip. The count is
-        held to the same baseline heartbeat_verdict uses, on the same two-sample proof; a host
-        with no baseline yet is never short.
+        FEWER CHIPS THAN THE BASELINE. A chip whose node left sysfs is simply absent from the sample, so 24 answering
+        chips on a 32-chip host look healthy chip by chip. The count is held to the same baseline heartbeat_verdict
+        uses, on the same two-sample proof; a host with no baseline yet is never short.
 
-        ``read_ts`` is the sample's read time: an all-ones chip's evidence is stamped with it, not
-        with the time this check runs (spec 03 I98).
-        """
+        ``read_ts`` is the sample's read time: an all-ones chip's evidence is stamped with it, not with the time this
+        check runs (spec 03 I98)."""
         log = self._deps.logger()
         dead = sorted((i for i, v in sample.items() if v and v[0] == ALL_ONES), key=int)
         self.last_sample_all_ones = dead
@@ -890,28 +948,30 @@ class TelemetrySampler:
             return
 
         # Two strikes: a dead chip stays dead, a blip does not.
-        # Under the fast cadence (I79) the reading must also have lasted FAST_CONFIRM_SEC.
+        # Under the fast cadence (I79) the reading must also have lasted CONTAIN_CONFIRM_SEC (the second fast sample),
+        # or FAST_CONFIRM_SEC right after a step.
         seen_twice = [i for i in dead if self.dead_chip_strikes.get(i, 0) >= 1]
-        confirmed = [i for i in seen_twice if self._lasted(f"chip:{i}")]
+        confirmed = [i for i in seen_twice if self._lasted(f"chip:{i}", self._contain_bound(f"chip:{i}"))]
         # Spec 03 I86: an all-ones read on a chip whose own path just counted an AER error is the
         # chip leaving the bus with reads in flight, not a re-init blip, so one sample proves it: the
         # second sample (SAMPLE_INTERVAL_SEC later) is time every reader of the mesh keeps issuing
         # reads at an endpoint that no longer answers, which is what stalls a core.
         corroborated = [i for i in dead if i not in confirmed and self.aer_recent(i)]
+        journal = getattr(self._deps, "health_event_detached", None) or self._deps.health_event
         if corroborated:
             confirmed = sorted(set(confirmed) | set(corroborated), key=int)
-            self._deps.health_event("offbus_aer_confirmed", chips=corroborated)
+            # Through the journal's writer thread: no fsync between first evidence and the remove (I99).
+            journal("offbus_aer_confirmed", chips=corroborated)
             if log:
                 log.error(
                     f"chip(s) {corroborated} read all-ones right after an AER error on their own PCIe "
                     f"path — off the bus; isolating on this sample"
                 )
-        # Spec 03 I79: a chip's first all-ones read arms the fast cadence, so its proof stands at
-        # FAST_CONFIRM_SEC and its containment follows, not a whole SAMPLE_INTERVAL_SEC on while a
-        # tenant still reads it; a drop with only correctable AER on its path arms nothing else. It
-        # arms after this sample's verdicts, so it changes only the next sample. A running window
-        # that ends before this reading's FAST_CONFIRM_SEC proof can stand is extended too (the
-        # storm cap, FAST_MAX_SEC, still bounds it); one with that much left is left alone.
+        # Spec 03 I79: a chip's first all-ones read arms the fast cadence, so its proof stands at CONTAIN_CONFIRM_SEC and
+        # its containment follows, not a whole SAMPLE_INTERVAL_SEC on while a tenant still reads it; a drop with only
+        # correctable AER on its path arms nothing else. It arms after this sample's verdicts, so it changes only the
+        # next sample. A running window that ends before this reading's FAST_CONFIRM_SEC proof can stand is extended too
+        # (the storm cap, FAST_MAX_SEC, still bounds it); one with that much left is left alone.
         first = [i for i in dead if not self.dead_chip_strikes.get(i) and i not in confirmed]
         if first and self.fast_until - self._clock() < FAST_CONFIRM_SEC and not chip_state.recovering():
             self.arm_fast(f"chip(s) {', '.join(first)} read all-ones")
@@ -926,16 +986,23 @@ class TelemetrySampler:
         lost = sorted(set(seen_twice) | set(corroborated), key=int)
         if lost:
             # Lost on the second sample (or the AER-corroborated first, I86), before the isolation runs and apart from the fast cadence's
-            # FAST_CONFIRM_SEC gate: a chip the kernel will not let go of, or one still inside that
+            # CONTAIN_CONFIRM_SEC gate: a chip the kernel will not let go of, or one still inside that
             # gate, is never read on the poll clock again (spec 03 I66). One still inside the gate
             # gets its heartbeat read once for real at the next sample, so the proof rests on reads.
-            chip_state.mark_lost(lost, "all-ones on two samples or after AER", self._nodes(lost))
+            # Before a remove the mark does no blocking I/O; isolate_dead_chips publishes the state after it (I99).
+            chip_state.mark_lost(
+                lost, "all-ones on two samples or after AER", self._nodes(lost), deferred=bool(confirmed)
+            )
             pending = [i for i in lost if i not in confirmed]
             if pending:
                 chip_state.reprobe_due(pending)
         if confirmed:
-            with self._valve_run(dead):
-                await self.isolate_dead_chips(confirmed)
+            try:
+                with self._valve_run(dead):
+                    await self.isolate_dead_chips(confirmed)
+            finally:
+                # The deferred mark's state file, on every way out of the containment (a skipped or no-op one too).
+                chip_state.publish()
 
     @contextmanager
     def _valve_run(self, all_ones):
@@ -984,11 +1051,10 @@ class TelemetrySampler:
             )
 
     async def _detach_chips(self, chips: list) -> tuple:
-        """PCI-remove each chip, every write the one in-flight PCI write (spec 04 I76) and all of them
-        inside one DETACH_TIMEOUT_SEC budget (spec 03 I84). Returns ``(removed, stuck)``. A remove still
-        running at the bound, or refused behind an earlier blocked write, latches PCI-wedged and is
-        stuck, and no further chip is tried: a hung remove keeps the kernel's remove path busy, so the
-        next write would hang behind it."""
+        """PCI-remove each chip, every write the one in-flight PCI write (spec 04 I76) and all of them inside one
+        DETACH_TIMEOUT_SEC budget (spec 03 I84). Returns ``(removed, stuck)``. A remove still running at the bound, or
+        refused behind an earlier blocked write, latches PCI-wedged and is stuck, and no further chip is tried: a hung
+        remove keeps the kernel's remove path busy, so the next write would hang behind it."""
         removed: list = []
         if self._deps.isolate_chip is None:
             return removed, list(chips)
@@ -1052,11 +1118,6 @@ class TelemetrySampler:
             return [], []
         return sorted((str(c) for c in chips if str(c) in ones), key=int), ones
 
-    def contain_from_thread(self, chips: list, all_ones: list, reason: str, readers: Optional[list] = None) -> bool:
-        """Contain ``chips`` from the AER watch thread (spec 03 I94, I96): :meth:`contain_on_thread`.
-        True when a containment ran (or was refused because a reset owns the chips)."""
-        return self.contain_on_thread(chips, all_ones, reason, readers=readers) is not None
-
     def _to_loop(self, coro) -> None:
         """Run ``coro`` on the sampler's loop, without waiting; with no running loop, here."""
         loop = self.loop
@@ -1094,15 +1155,14 @@ class TelemetrySampler:
         readers: Optional[list] = None,
         pci: Optional[dict] = None,
     ) -> Optional[dict]:
-        """Spec 03 I96: contain dead ``chips`` on the calling thread, with no event loop, in order:
-        SIGSTOP the broker's readers and every user of the device (the job's process groups, any other
-        holder); mark the chips lost; PCI-remove each through the one PCI writer (``vanished`` chips
-        are already gone), all within WATCH_HARD_BOUND_SEC of the trigger (I99); the I84 kill, only once every all-ones chip
-        is detached; the hold, the pollers and the incident handed to the loop; then the
-        ``chip_contained`` record, fsynced (I95). A remove that times out or fails latches PCI-wedged,
-        which asks for the power cycle (spec 04 I76, I65), and kills nobody: the stopped stay stopped.
-        A reset or recovery step that owns the chips refuses it (I66). ``readers``: the broker readers
-        the caller already stopped. Returns the record, or None when no chip was fresh."""
+        """Spec 03 I96: contain dead ``chips`` on the calling thread, with no event loop, in order: SIGSTOP the broker's
+        readers and every user of the device (the job's process groups, any other holder); mark the chips lost;
+        PCI-remove each through the one PCI writer (``vanished`` chips are already gone), all within
+        WATCH_HARD_BOUND_SEC of the trigger (I99); the I84 kill, only once every all-ones chip is detached; the hold,
+        the pollers and the incident handed to the loop; then the ``chip_contained`` record, fsynced (I95). A remove
+        that times out or fails latches PCI-wedged, which asks for the power cycle (spec 04 I76, I65), and kills nobody:
+        the stopped stay stopped. A reset or recovery step that owns the chips refuses it (I66). ``readers``: the broker
+        readers the caller already stopped. Returns the record, or None when no chip was fresh."""
         deps = self._deps
         log = deps.logger()
         now = time.monotonic()
@@ -1317,48 +1377,21 @@ class TelemetrySampler:
         pids = [k["pid"] for k in killed if isinstance(k.get("pid"), int)]
         await self._finish_holder_release(fresh, removed, killed, pids if self._deps.wait_device_released else [], pci)
 
-    async def contain_after_aer_stop(self, chips: list, all_ones: list, reason: str) -> None:
-        """Spec 03 I94: contain the chips an AER stop found reading all-ones, through the dead-chip
-        valve (I84: freeze, PCI remove, then the kill), before any reader of them is killed. The
-        stop left the broker's readers SIGSTOPped, unkilled, for this. The chips are lost first, so
-        no poll reads them again. A reset that has taken the chips since the stop refuses it: the
-        reset's own fence owns them. Every path keeps the device held; none lifts a hold."""
-        log = self._deps.logger()
-        fresh = [i for i in chips if i not in self._deps.isolated_chips()]
-        if not fresh:
-            return
-        why = f"chip(s) {','.join(fresh)} read all-ones under an AER burst ({reason})"
-        if self._mechanism.reset_in_flight or await asyncio.to_thread(self._mechanism.scope_active):
-            self._deps.health_event("check_aer_contain_refused", chips=fresh, reason="reset_in_flight", burst=reason)
-            if log:
-                log.error(f"AER WATCH containment refused, a reset owns the chips — {why}; holding the device")
-            self._deps.mark_device_dirty(why, why="heartbeat")
-            return
-        chip_state.mark_lost(fresh, "all-ones under an AER burst", self._nodes(fresh))
-        self._deps.health_event("check_aer_contain", chips=fresh, all_ones=all_ones, burst=reason)
-        with self._valve_run(all_ones):
-            await self.isolate_dead_chips(fresh)
-
     async def isolate_dead_chips(self, dead: list) -> None:
         """Cut chips that have left the PCIe bus out of the kernel, immediately.
 
-        Every other chip that any valve run in flight or the latest sample read all-ones
-        (``valve_runs``, ``last_sample_all_ones``) and that is not removed keeps every holder alive
-        (spec 03 I84, I94).
+        Every other chip that any valve run in flight or the latest sample read all-ones (``valve_runs``,
+        ``last_sample_all_ones``) and that is not removed keeps every holder alive (spec 03 I84, I94).
 
-        This does NOT take the device lock, and that is deliberate. Every other device
-        operation waits its turn because two of them at once is dangerous; this one cannot
-        wait, because the danger is the waiting. From the moment a chip starts returning
-        all-ones the host has perhaps a couple of minutes before some core stalls on a read
-        that never completes and the machine is gone — and the thing holding the lock may be
-        the very fabric check that is hung on the dead chip. Removing the endpoint is what
-        makes further MMIO to it impossible; nothing else can, and nothing else matters until
-        it is done.
+        This does NOT take the device lock, and that is deliberate. Every other device operation waits its turn because
+        two of them at once is dangerous; this one cannot wait, because the danger is the waiting. From the moment a
+        chip starts returning all-ones the host has perhaps a couple of minutes before some core stalls on a read that
+        never completes and the machine is gone — and the thing holding the lock may be the very fabric check that is
+        hung on the dead chip. Removing the endpoint is what makes further MMIO to it impossible; nothing else can, and
+        nothing else matters until it is done.
 
-        A job holding the device will fault when its mapping disappears. It was already lost —
-        its chip is gone — and a failed job is a far better outcome than a reboot that
-        destroys every other tenant's work as well.
-        """
+        A job holding the device will fault when its mapping disappears. It was already lost — its chip is gone — and a
+        failed job is a far better outcome than a reboot that destroys every other tenant's work as well."""
         log = self._deps.logger()
         t0 = time.monotonic()
         wall0 = time.time()
@@ -1373,11 +1406,10 @@ class TelemetrySampler:
         self._fence(fresh, "isolating")
 
         if PCI_WRITER.latched:
-            # Spec 04 I76: a PCI write is blocked in the kernel. A remove would only queue behind it on
-            # the same lock (or start a second blocked thread), and killing a holder or stopping a poller
-            # of a chip that is off the bus but still attached makes the driver touch that chip on the fd
-            # close. So skip the chip: no remove, no kill; the device is held and the power cycle, already
-            # requested by the latch, is the recovery.
+            # Spec 04 I76: a PCI write is blocked in the kernel. A remove would only queue behind it on the same lock
+            # (or start a second blocked thread), and killing a holder or stopping a poller of a chip that is off the
+            # bus but still attached makes the driver touch that chip on the fd close. So skip the chip: no remove, no
+            # kill; the device is held and the power cycle, already requested by the latch, is the recovery.
             if log:
                 log.error(
                     f"DEAD CHIP(S) {fresh}: isolation skipped, PCI-wedged ({PCI_WRITER.reason}); "
@@ -1389,19 +1421,21 @@ class TelemetrySampler:
             self._deps.mark_device_dirty(f"chip(s) {','.join(fresh)} fell off the PCIe bus", why="heartbeat")
             return
 
-        # Spec 03 I86: stop the broker's own readers of the mesh (the fabric check, the aiclk ceiling)
+        # Spec 03 I86: stop the broker's own readers of the mesh (the fabric check)
         # first, before the remove's up to DETACH_TIMEOUT_SEC: a SIGSTOP issues no further read and
         # closes no fd, so it is safe while the chip is still attached; the kill below still ends them.
         freeze = getattr(self._deps, "freeze_device_readers", None)
+        # Spec 03 I99: no fsync between the stop and the remove; the journal's writer thread does it.
+        journal = getattr(self._deps, "health_event_detached", None) or self._deps.health_event
         stopped: list = []
         if freeze is not None:
             try:
                 stopped = freeze(f"chip(s) {','.join(fresh)} fell off the PCIe bus")
             except Exception:  # noqa: BLE001 - a failed stop must not stop the remove
                 stopped = []
-            if stopped:
-                self._deps.health_event("device_readers_stopped", chips=fresh, readers=stopped)
         t_stop = time.monotonic()
+        if stopped:
+            journal("device_readers_stopped", chips=fresh, readers=stopped)
 
         if log:
             log.error(
@@ -1412,7 +1446,7 @@ class TelemetrySampler:
         # Read the PCI addresses now: once removed, a chip's sysfs link is gone and resolves to none,
         # and the stuck-holder check after the kill matches BAR mappings by them (spec 04 I77).
         pci = {i: self._deps.chip_pci_bdf(i) for i in fresh}
-        self._deps.health_event("chip_dead", chips=fresh, pci=pci)
+        journal("chip_dead", chips=fresh, pci=pci)
 
         # Detach first, then kill (spec 03 I84). The PCI remove is the only step that marks the
         # driver's device detached, and tt-kmd's fd-close path sends the chip a power-state message
@@ -1425,6 +1459,7 @@ class TelemetrySampler:
             self.valve_detaching.difference_update(fresh)
         t_remove = time.monotonic()
         self.valve_removed.update(removed)
+        chip_state.publish()
         if stuck:
             # A dead chip that could not be removed is still on the bus and still
             # MMIO-reachable — the host is NOT out of danger, whatever the removed ones did.
@@ -1479,9 +1514,8 @@ class TelemetrySampler:
         else:
             killed = await self._deps.kill_device_holders(reason) or []
             await self._deps.set_device_pollers(False, lambda m: log.info(f"DEAD-CHIP {m}") if log else None)
-            # No reset pairs this stop with a restore, and an idle relift may close the episode
-            # without one: owe the restart, so the next close to HEALTHY (a passing full check)
-            # starts them.
+            # No reset pairs this stop with a restore, and an idle relift may close the episode without one: owe the
+            # restart, so the next close to HEALTHY (a passing full check) starts them.
             if self._deps.owe_device_pollers is not None:
                 self._deps.owe_device_pollers(reason)
         t_kill = time.monotonic()
@@ -1542,11 +1576,6 @@ class TelemetrySampler:
             return
         await self._finish_holder_release(fresh, removed, killed, [], pci)
 
-    async def settle_isolations(self) -> None:
-        """Wait for every detached holder release wait to finish."""
-        while self.isolations:
-            await asyncio.gather(*list(self.isolations), return_exceptions=True)
-
     async def _detached_holder_release(self, fresh: list, removed: list, killed: list, pids: list, pci: dict) -> None:
         try:
             await self._finish_holder_release(fresh, removed, killed, pids, pci)
@@ -1556,10 +1585,9 @@ class TelemetrySampler:
                 log.error(f"DEAD-CHIP holder release wait for chip(s) {fresh} failed: {e}")
 
     async def _finish_holder_release(self, fresh: list, removed: list, killed: list, pids: list, pci: dict) -> None:
-        """The release wait for ``pids`` (none: no wait), then the stuck-holder record (spec 04 I77)
-        with the chips' PCI addresses ``pci``, read before the removal.
-        The device is already dirty, so it stays held until recovery's reset and full post-reset
-        check, fabric included, pass."""
+        """The release wait for ``pids`` (none: no wait), then the stuck-holder record (spec 04 I77) with the chips' PCI
+        addresses ``pci``, read before the removal. The device is already dirty, so it stays held until recovery's reset
+        and full post-reset check, fabric included, pass."""
         log = self._deps.logger()
         if pids:
             lingering = sorted(await self._deps.wait_device_released(pids))
@@ -1568,10 +1596,9 @@ class TelemetrySampler:
                     log.error(f"DEAD-CHIP killed holder(s) {lingering} still hold the device at the release bound")
                 self._deps.health_event("dead_chip_holders_lingering", chips=fresh, pids=lingering)
 
-        # A killed holder that is still alive past the bound is stuck in the kernel, most often
-        # reading the dead BAR (state D) — it never acts on its SIGKILL. Name it, page, and fence
-        # every rung that would re-enumerate PCI under it (spec 04 I77); the broker's bounded
-        # escalation takes the host rung if it outlives its budget.
+        # A killed holder that is still alive past the bound is stuck in the kernel, most often reading the dead BAR
+        # (state D) — it never acts on its SIGKILL. Name it, page, and fence every rung that would re-enumerate PCI
+        # under it (spec 04 I77); the broker's bounded escalation takes the host rung if it outlives its budget.
         note = self._deps.note_stuck_holders
         if note is None or not killed:
             return
@@ -1621,15 +1648,12 @@ class CheckAerWatch:
         self._paths: dict = {}
         self._halt = threading.Event()
         self.thread: Optional[threading.Thread] = None
-        self.last_stop: str = ""
         # The chips on whose path the last burst rose, for the stop's containment (I94).
         self.last_chips: list = []
         # Readers an I92 stop left SIGSTOPped, not killed, while a burst chip was still attached:
         # {"chips", "reason", "since" (wall), "at" (watch clock), "readers"}; resolved by a later poll
         # within PENDING_STOP_CAP_SEC, or dropped once its readers are gone or a reset step starts (I92).
         self.pending_stop: Optional[dict] = None
-        # The latest containment record (I96).
-        self.last_contained: Optional[dict] = None
         # The confirm reads, one each per trigger chip (I96); replaced in tests.
         from tt_device_mcp.health import config_vendor_id, link_active
 
@@ -1800,15 +1824,13 @@ class CheckAerWatch:
             finally:
                 self._release(stopped)
                 self._release(vanished_pend)
-            self.last_contained = row
             stopped = stopped if stopped is not None else (row or {}).get("readers_stopped") or []
             contained = (row or {}).get("chips") or []
         elif checking and reason:
-            # No dead chip (or the blackout the gate takes to the power cycle): the broker's own check
-            # readers only (I92); no tenant is touched. SIGSTOP, and SIGKILL only once no burst chip is
-            # attached: a killed reader's fd close makes the driver reach a chip that may be off the bus
-            # (I84). Without that proof the readers stay stopped until a later poll shows the chips
-            # detached, proven off the bus (contained) or answering again.
+            # No dead chip (or the blackout the gate takes to the power cycle): the broker's own check readers only
+            # (I92); no tenant is touched. SIGSTOP, and SIGKILL only once no burst chip is attached: a killed reader's
+            # fd close makes the driver reach a chip that may be off the bus (I84). Without that proof the readers stay
+            # stopped until a later poll shows the chips detached, proven off the bus (contained) or answering again.
             attached = self._attached(chips, nodes)
             stopped = stop(reason, kill=not offbus and not attached)
             if attached and not offbus:
@@ -1831,12 +1853,10 @@ class CheckAerWatch:
             self._reads.clear()
             return None
         self._reads.clear()
-        self.last_stop = trigger
         if not checking:
             return trigger
         fields = {"reason": trigger, "chips": chips, "stopped": stopped, "offbus": offbus, "contained": contained}
-        # The record is on disk before the stop returns (I95), bounded: a host lost right after the
-        # stop still shows it.
+        # The record is on disk before the stop returns (I95), bounded: a host lost right after the stop still shows it.
         flushed = self._journal_flushed("check_aer_stop", **fields)
         log = self._deps.logger()
         if log:
@@ -1899,21 +1919,19 @@ class CheckAerWatch:
         return seen
 
     def _resolve_pending(self, nodes: set, read_at: float, now: float) -> Optional[str]:
-        """Spec 03 I92: settle readers an earlier stop left SIGSTOPped. Chips proven off the bus by the
-        latest sample are contained (stop, remove, then the kill). Once none of the stopped readers
-        still runs, the stop is dropped: no reader started after it is ever signalled for it. Once no
-        burst chip is attached, or a sample newer than the stop reads every one of them answering, the
-        stopped readers still running are killed. At PENDING_STOP_CAP_SEC with neither proof, the
-        chips still attached that no sample newer than the stop read answering are contained (the
-        kill after their remove); a chip that answered is never removed. Returns the reason when it
-        acted."""
+        """Spec 03 I92: settle readers an earlier stop left SIGSTOPped. Chips proven off the bus by the latest sample
+        are contained (stop, remove, then the kill). Once none of the stopped readers still runs, the stop is dropped:
+        no reader started after it is ever signalled for it. Once no burst chip is attached, or a sample newer than the
+        stop reads every one of them answering, the stopped readers still running are killed. At PENDING_STOP_CAP_SEC
+        with neither proof, the chips still attached that no sample newer than the stop read answering are contained
+        (the kill after their remove); a chip that answered is never removed. Returns the reason when it acted."""
         pend = self.pending_stop or {}
         chips = list(pend.get("chips") or [])
         offbus, all_ones = self._sampler.aer_stop_offbus(chips)
         if offbus:
             self.pending_stop = None
             try:
-                row = self._sampler.contain_on_thread(
+                self._sampler.contain_on_thread(
                     offbus,
                     sorted(set(all_ones) | set(offbus), key=int),
                     pend.get("reason", ""),
@@ -1922,7 +1940,6 @@ class CheckAerWatch:
                 )
             finally:
                 self._release(pend.get("readers"))
-            self.last_contained = row
             return pend.get("reason")
         alive = self._pending_alive(pend)
         if not alive:
@@ -1953,10 +1970,9 @@ class CheckAerWatch:
                     f"{pend.get('reason', '')}: chip(s) {', '.join(unproven)} unproven after {PENDING_STOP_CAP_SEC:g}s"
                 )
                 try:
-                    row = self._sampler.contain_on_thread(unproven, unproven, why, trigger_at=read_at, readers=alive)
+                    self._sampler.contain_on_thread(unproven, unproven, why, trigger_at=read_at, readers=alive)
                 finally:
                     self._release(pend.get("readers"))
-                self.last_contained = row
                 return why
             answering = True
         self.pending_stop = None

@@ -299,10 +299,9 @@ def test_the_health_probe_with_no_tenstorrent_root_port_writes_nothing(no_tt_sys
 async def test_the_10_min_ladders_rescan_is_scoped_and_a_failed_one_still_reaches_the_power_cycle(
     monkeypatch, tmp_path, clear_job_state, tt_port
 ):
-    """The bound ladder (goal 10) with the real rescan: it writes only the Tenstorrent root port, or,
-    with none to rescan, fails that rung and still climbs to the mesh reset, the full check, the
-    last-chance sweep (the failed mesh reset again, its full check) and the power cycle. A failed check
-    never lifts the hold."""
+    """The 10-min bound ladder with the real rescan: it writes only the Tenstorrent root port, or, with none to rescan,
+    fails that rung and still climbs to the mesh reset, the full check, the last-chance sweep (the failed mesh reset
+    again, its full check) and the power cycle. A failed check never lifts the hold."""
     order, _events, counters = _rig(monkeypatch, tmp_path)
     fake = FakeSysfs(tmp_path / "root", tt_port=tt_port)
     monkeypatch.setattr(pcie_guard, "SYS_ROOT", fake.root)

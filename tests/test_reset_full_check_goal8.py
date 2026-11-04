@@ -1,12 +1,10 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""An armed AICLK ceiling never stands in for the health check (spec 03 I35, 04 I32).
+"""Every reset path runs the full health check before release (spec 04 I32).
 
-With a ceiling configured, every reset path still runs reset -> ceiling -> the full probe pass,
-fabric included -> release, and a fabric FAIL keeps the hold. The startup ceiling waits for the
-hugepage pool; a disarmed ceiling still runs the full pass; a job's own fmax restore is capped
-again before the post-job traffic pass; the added time stays within ~10 s per pass.
+Every reset path runs reset -> the full probe pass, fabric included -> release, and a fabric FAIL
+keeps the hold. The startup check waits for the hugepage pool.
 """
 
 import asyncio
@@ -20,11 +18,9 @@ from tests.test_post_reset_gate import _REAL_CLEAR_DIRTY
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.fsm import ServerState
-from tt_device_mcp.health import aiclk_ceiling as ac
 from tt_device_mcp.health import monitor as monitor_mod
 from tt_device_mcp.health import post_reset
 from tt_device_mcp.health import recovery as recovery_pkg
-from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import base
 
@@ -33,25 +29,13 @@ FABRIC_OK = (True, "fabric links healthy")
 FABRIC_FAIL = (False, "chip 17: 2 eth links down")
 
 
-@pytest.fixture(autouse=True)
-def _fresh_ceiling(monkeypatch):
-    for k in (ac.ENV_MHZ, ac.ENV_CMD, ac.ENV_TIMEOUT, ac.ENV_PYTHON, ac.ENV_SETTLE):
-        monkeypatch.delenv(k, raising=False)
-    monkeypatch.setattr(CEILING, "owed", True)
-    monkeypatch.setattr(CEILING, "disarmed", "")
-    monkeypatch.setattr(CEILING, "last", {})
-    monkeypatch.setattr(CEILING, "proc", None)
-    monkeypatch.setattr(ac, "health_event", lambda kind, **f: None)
-
-
 class _Rig:
-    """One armed 32-chip host: the real probe pass (HealthMonitor.update) and the real
+    """One 32-chip host: the real probe pass (HealthMonitor.update) and the real
     reset_with_quiesce, with every probe and the reset command stubbed to record their order."""
 
     def __init__(self):
         self.order: list[str] = []
         self.fabric = FABRIC_OK
-        self.ceiling: list = []  # canned apply verdicts (True/False/None), then True
 
     def released(self, _record=None):
         self.order.append("release")
@@ -72,7 +56,6 @@ def rig(monkeypatch, tmp_path, clear_job_state):
     monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
     monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "true")
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
-    monkeypatch.setenv(ac.ENV_MHZ, "800")
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
     monkeypatch.setattr(srv, "device_op_lock", None)
     monkeypatch.setattr(srv, "device_op_active", "")
@@ -105,16 +88,6 @@ def rig(monkeypatch, tmp_path, clear_job_state):
     monkeypatch.setattr(srv.health_monitor, "_verify_device", snapshot)
     monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth)
     monkeypatch.setattr(srv.health_monitor, "verify_fabric_health", fabric_pass)
-
-    async def apply(where, *, log=None, terminate=None, settle=0.0):
-        r.order.append(f"ceiling:{where}")
-        ok = r.ceiling.pop(0) if r.ceiling else True
-        if ok:
-            CEILING.owed = False
-        detail = {True: "ceiling 800 MHz applied to 32/32", False: "NOT verified", None: "not armed"}[ok]
-        return ok, detail, {}
-
-    monkeypatch.setattr(CEILING, "apply", apply)
 
     # The reset command and the rescan after it: recorded, instant.
     async def run_scoped(argv, log, owner="[broker]health-gate", on_output=None):
@@ -248,12 +221,10 @@ async def _drive(path, r, monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", list(PATHS))
-async def test_every_reset_path_runs_ceiling_then_full_fabric_pass_then_releases(rig, monkeypatch, tmp_path, path):
+async def test_every_reset_path_runs_the_full_fabric_pass_then_releases(rig, monkeypatch, tmp_path, path):
     await _drive(path, rig, monkeypatch, tmp_path)
     after = rig.after_last_reset()
     assert "fabric" in after, f"no fabric pass after the reset: {rig.order}"
-    ceilings = [i for i, e in enumerate(after) if e.startswith("ceiling:")]
-    assert ceilings and ceilings[0] < after.index("fabric"), f"traffic ran before the ceiling: {rig.order}"
     assert after[-1] == "release" and after.index("fabric") < after.index("release"), rig.order
     assert srv.fsm.state is ServerState.HEALTHY and FABRIC_DEBT.owed == ""
 
@@ -261,7 +232,7 @@ async def test_every_reset_path_runs_ceiling_then_full_fabric_pass_then_releases
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", list(PATHS))
 async def test_fabric_fail_after_any_reset_keeps_the_hold_and_enters_bounded_recovery(rig, monkeypatch, tmp_path, path):
-    """A fabric FAIL after the reset (and its ceiling) never releases: the device stays held with the
+    """A fabric FAIL after the reset never releases: the device stays held with the
     fabric still owed, and the hold-deadline watchdog forces the recovery ladder past its ceiling."""
     rig.fabric = FABRIC_FAIL
     await _drive(path, rig, monkeypatch, tmp_path)
@@ -283,7 +254,6 @@ async def test_fabric_fail_after_any_reset_keeps_the_hold_and_enters_bounded_rec
     monkeypatch.setattr(srv, "device_hold_deadline_bucket", 0)
     monkeypatch.setattr(srv, "device_hold_offbus_escalated", False)
     monkeypatch.setattr(srv, "_hold_episode_tenant", "")
-    monkeypatch.setattr(srv, "_maybe_alert_stuck_hold", lambda *a: None)
     since = datetime.now() - timedelta(seconds=srv._stuck_hold_ceiling_sec() + 60)
     monkeypatch.setattr(srv, "device_hold_episode_since", since.isoformat())
     srv._check_hold_deadline()
@@ -291,7 +261,7 @@ async def test_fabric_fail_after_any_reset_keeps_the_hold_and_enters_bounded_rec
     assert forced, "a held box past the ceiling must get the forced recovery ladder"
 
 
-# --- startup waits for the hugepage pool before the ceiling ---------------------------------
+# --- startup waits for the hugepage pool before the fabric pass -----------------------------
 
 
 def _hugepages(monkeypatch, r, seq):
@@ -307,8 +277,8 @@ def _hugepages(monkeypatch, r, seq):
 
 
 @pytest.mark.asyncio
-async def test_startup_waits_for_hugepages_then_ceiling_then_full_fabric_pass(rig, monkeypatch, tmp_path):
-    """Startup before the 1G pool is ready: hugepage wait -> ceiling -> full fabric pass, with the
+async def test_startup_waits_for_hugepages_then_full_fabric_pass(rig, monkeypatch, tmp_path):
+    """Startup before the 1G pool is ready: hugepage wait -> full fabric pass, with the
     queue closed (startup hold) until that pass has passed."""
     await _restart_broker(monkeypatch, tmp_path / "fsm.json")
     assert srv.fsm.state is ServerState.RECOVERING  # the startup hold: the door is closed
@@ -328,15 +298,14 @@ async def test_startup_waits_for_hugepages_then_ceiling_then_full_fabric_pass(ri
 
     o = rig.order
     ready = o.index("hugepages-ready")
-    assert "ceiling:startup" in o and ready < o.index("ceiling:startup"), f"ceiling before hugepages: {o}"
-    assert not any(e.startswith("ceiling:") or e == "fabric" for e in o[:ready]), o
-    assert o.index("ceiling:startup") < o.index("fabric") < o.index("release"), o
+    assert "fabric" not in o[:ready], f"fabric pass before hugepages: {o}"
+    assert ready < o.index("fabric") < o.index("release"), o
     assert door == [ServerState.RECOVERING], "the queue opened before the startup fabric pass passed"
     assert srv.fsm.state is ServerState.HEALTHY
 
 
 @pytest.mark.asyncio
-async def test_startup_without_hugepages_applies_no_ceiling_and_stays_held(rig, monkeypatch, tmp_path):
+async def test_startup_without_hugepages_stays_held(rig, monkeypatch, tmp_path):
     await _restart_broker(monkeypatch, tmp_path / "fsm.json")
     monkeypatch.setattr(srv, "readopted_scopes", {})
     monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)
@@ -344,7 +313,7 @@ async def test_startup_without_hugepages_applies_no_ceiling_and_stays_held(rig, 
     monkeypatch.setattr(srv, "_await_startup_prerequisites", lambda missing: asyncio.sleep(0))
     _hugepages(monkeypatch, rig, [(0, 32)])
     await _REAL_VERIFY_ON_START()
-    assert not any(e.startswith("ceiling:") or e == "fabric" for e in rig.order), rig.order
+    assert "fabric" not in rig.order, rig.order
     assert srv.fsm.state is ServerState.RECOVERING
 
 
@@ -445,135 +414,3 @@ async def test_startup_hugepages_short_with_a_dirty_episode_is_recorded_and_runs
     assert ev["outcome"] == "short_dirty" and (ev["have"], ev["need"]) == (0, 32), ev
     assert "fabric_check_unavailable" not in [k for k, _ in events]
     assert srv.fsm.record.dirty, "the owed reset is not dropped"
-
-
-# --- a disarmed ceiling still runs the full pass ---------------------------------------------
-
-
-def _helper_cannot_run_here(monkeypatch, r):
-    """The real CEILING.apply against a helper that exits 77 (wrong architecture, no tt-umd)."""
-    monkeypatch.delattr(CEILING, "apply")
-    clock = [100.0]
-
-    async def run_probe(argv, *, timeout_sec, track, stream, env, terminate, name=""):
-        r.order.append("ceiling-helper")
-        return ac.UNSUPPORTED_RC, b"cannot run here"
-
-    async def sleep(d):
-        clock[0] += d
-
-    monkeypatch.setattr(ac, "run_probe", run_probe)
-    monkeypatch.setattr(ac, "_now", lambda: clock[0])
-    monkeypatch.setattr(ac, "_sleep", sleep)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("fabric", [FABRIC_OK, FABRIC_FAIL], ids=["fabric-ok", "fabric-fail"])
-@pytest.mark.parametrize("path", list(PATHS))
-async def test_disarmed_ceiling_still_runs_the_full_fabric_pass(rig, monkeypatch, tmp_path, path, fabric):
-    """A ceiling that disarms itself (helper exit 77) is a skipped probe, never a skipped check:
-    the full pass runs uncapped after the reset and releases only on a fabric OK."""
-    _helper_cannot_run_here(monkeypatch, rig)
-    rig.fabric = fabric
-    await _drive(path, rig, monkeypatch, tmp_path)
-    assert CEILING.disarmed == "cannot run here" and not CEILING.armed()
-    after = rig.after_last_reset()
-    assert "fabric" in after, f"a disarmed ceiling skipped the fabric pass: {rig.order}"
-    if fabric == FABRIC_OK:
-        assert after[-1] == "release" and after.index("fabric") < after.index("release"), rig.order
-        assert srv.fsm.state is ServerState.HEALTHY and FABRIC_DEBT.owed == ""
-    else:
-        assert "release" not in rig.order, rig.order
-        assert srv.fsm.state is ServerState.RECOVERING
-        assert FABRIC_DEBT.blocks_release(32)
-
-
-# --- a job that restores fmax at exit is capped again before the post-job traffic -----------
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("forced", ["job-failed", "reset-debt"])
-async def test_job_restoring_fmax_is_capped_again_before_post_job_traffic(rig, monkeypatch, forced):
-    monkeypatch.delattr(CEILING, "apply")
-    fmax = {"mhz": 800}
-
-    async def run_probe(argv, *, timeout_sec, track, stream, env, terminate, name=""):
-        rig.order.append("ceiling-helper")
-        fmax["mhz"] = int(env[ac.ENV_MHZ])
-        return 0, b'{"summary": true, "mhz": 800, "chips": 32, "ok": 32, "sent": 32}\n'
-
-    async def fabric_pass(*a, **k):
-        rig.order.append("fabric")
-        assert fmax["mhz"] == 800, "fabric traffic ran with the job's restored 1350 MHz"
-        return FABRIC_OK
-
-    monkeypatch.setattr(ac, "run_probe", run_probe)
-    monkeypatch.setattr(srv.health_monitor, "verify_fabric_health", fabric_pass)
-    CEILING.owed = False
-    fmax["mhz"] = 1350  # the job's exit restores the firmware default
-    if forced == "reset-debt":
-        FABRIC_DEBT.note_reset("job-internal reset")
-    await srv._verify_device_after_job(None, job_failed=forced == "job-failed")
-    o = rig.order
-    assert "fabric" in o, f"no forced traffic pass: {o}"
-    assert "ceiling-helper" in o and o.index("ceiling-helper") < o.index("fabric"), o
-    assert fmax["mhz"] == 800 and CEILING.owed is False
-
-
-# --- time bound: the ceiling adds <= ~10 s per pass ------------------------------------------
-
-_OVER = b'{"summary": true, "mhz": 800, "chips": 32, "ok": 0, "sent": 32, "over": [0]}\n'
-_AT = b'{"summary": true, "mhz": 800, "chips": 32, "ok": 32, "sent": 0}\n'
-_HUNG = (None, b"", ac.DEFAULT_TIMEOUT_SEC)  # killed at the helper timeout
-
-
-def _timed_helper(monkeypatch, run):
-    """Fake clock and helper: ``run(offset)`` gives (rc, output, seconds) for a run that starts
-    ``offset`` seconds into the apply. Returns the clock."""
-    clock = [100.0]
-
-    async def run_probe(argv, *, timeout_sec, track, stream, env, terminate, name=""):
-        rc, out, sec = run(clock[0] - 100.0)
-        clock[0] += sec
-        return rc, out
-
-    async def sleep(d):
-        clock[0] += d
-
-    monkeypatch.setenv(ac.ENV_MHZ, "800")
-    monkeypatch.setattr(ac, "run_probe", run_probe)
-    monkeypatch.setattr(ac, "_now", lambda: clock[0])
-    monkeypatch.setattr(ac, "_sleep", sleep)
-    return clock
-
-
-_TIME_CASES = {
-    "gate-pass-hung": (0.0, lambda t: _HUNG),
-    "gate-pass-realistic": (0.0, lambda t: (0, _AT, 0.4)),
-    "post-reset-realistic-over": (ac.DEFAULT_SETTLE_SEC, lambda t: (1, _OVER, 0.4)),
-    "post-reset-realistic-settles": (ac.DEFAULT_SETTLE_SEC, lambda t: (1, _OVER, 0.4) if t < 2 else (0, _AT, 0.4)),
-    "post-reset-first-run-hung": (ac.DEFAULT_SETTLE_SEC, lambda t: _HUNG),
-}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("settle", "run"),
-    [pytest.param(*v, id=k) for k, v in _TIME_CASES.items()]
-    + [
-        pytest.param(
-            ac.DEFAULT_SETTLE_SEC,
-            lambda t: _HUNG if t >= ac.DEFAULT_SETTLE_SEC - ac.SETTLE_POLL_SEC else (1, _OVER, 0.0),
-            id="post-reset-late-retry-hung",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="known corner: a settle retry started at the window end (3 s) that hangs to the "
-                "8 s helper timeout makes the post-reset apply ~11 s; fixed separately",
-            ),
-        )
-    ],
-)
-async def test_ceiling_apply_adds_at_most_10s(monkeypatch, settle, run):
-    clock = _timed_helper(monkeypatch, run)
-    await CEILING.apply("post-reset" if settle else "pre-job", settle=settle)
-    assert clock[0] - 100.0 <= 10.0, f"the ceiling added {clock[0] - 100.0:.1f}s"

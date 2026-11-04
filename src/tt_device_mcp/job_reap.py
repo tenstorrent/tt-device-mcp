@@ -40,10 +40,9 @@ logger = logging.getLogger("tt-device-mcp")
 PROC_DIR = "/proc"
 # Exported into every job's shell with a value unique to that run; children inherit it.
 JOB_TAG_ENV = "TT_DEVICE_MCP_JOB_TAG"
-# An empty /proc/<pid>/environ does not prove the tag absent: a process inside execve reads empty
-# until the new image's environment is mapped, and one past exit_mm reads empty for good. Such a
-# process (not a kernel thread or zombie, which never have one) is re-read, bounded for the whole
-# scan, before it is ruled out.
+# An empty /proc/<pid>/environ does not prove the tag absent: a process inside execve reads empty until the new image's
+# environment is mapped, and one past exit_mm reads empty for good. Such a process (not a kernel thread or zombie, which
+# never have one) is re-read, bounded for the whole scan, before it is ruled out.
 TAG_REREAD_SEC = 0.1
 _TAG_REREAD_POLL_SEC = 0.002
 _PF_KTHREAD = 0x00200000
@@ -209,8 +208,7 @@ def job_processes(pid: Optional[int], scope: Optional[str] = None, tag: Optional
     }
     if tag:
         members |= _tagged((p for p in procs if p not in exclude and p not in members), tag)
-    # Descendants of any member: a child that left the group or session but whose parent
-    # chain is still intact.
+    # Descendants of any member: a child that left the group or session but whose parent chain is still intact.
     children: dict[int, list[int]] = {}
     for p, info in procs.items():
         children.setdefault(info.ppid, []).append(p)
@@ -299,11 +297,10 @@ async def reap_job_survivors(
 ) -> list[Survivor]:
     """End every process the job left behind: SIGTERM, ``term_grace_sec``, SIGKILL.
 
-    Returns the processes still alive ``kill_wait_sec`` after the SIGKILL (empty in the
-    normal case, where the job left nothing behind and this costs one /proc scan). One that
-    may still hold the device then gets until ``release_wait_sec`` after the SIGKILL to drop
-    out of the holder scan before it is returned (spec 01 I67). Each process found is logged
-    through ``log``. Never raises."""
+    Returns the processes still alive ``kill_wait_sec`` after the SIGKILL (empty in the normal case, where the job left
+    nothing behind and this costs one /proc scan). One that may still hold the device then gets until
+    ``release_wait_sec`` after the SIGKILL to drop out of the holder scan before it is returned (spec 01 I67). Each
+    process found is logged through ``log``. Never raises."""
     try:
         found = await asyncio.to_thread(job_processes, pid, scope, tag)
         if not found:
@@ -439,11 +436,10 @@ def find_reaped_leftovers(
 ) -> list[ReapedLeftover]:
     """The device holders that belong to a job no longer running.
 
-    A holder belongs to a job when it sits in that job's ttdev-job-<id>.scope cgroup (privsep; a
-    process cannot leave it, and it outlives a broker restart), or when it is a survivor the sweep
-    named for that job (``survivors``: pid -> (job id, starttime); the same starttime, so a reused
-    pid is not mistaken for it). A job in ``live_job_ids`` (running, being torn down, re-adopted)
-    owns the device by right and is never a leftover."""
+    A holder belongs to a job when it sits in that job's ttdev-job-<id>.scope cgroup (privsep; a process cannot leave
+    it, and it outlives a broker restart), or when it is a survivor the sweep named for that job (``survivors``: pid ->
+    (job id, starttime); the same starttime, so a reused pid is not mistaken for it). A job in ``live_job_ids``
+    (running, being torn down, re-adopted) owns the device by right and is never a leftover."""
     live = set(live_job_ids)
     known = survivors or {}
     found = []
@@ -503,11 +499,10 @@ def _bounded_read(pid: int, name: str, timeout: float) -> Optional[str]:
 
 
 def device_refs(pid: int, bdfs: Iterable[str], *, maps_timeout: float = STUCK_MAPS_READ_SEC) -> Optional[list[str]]:
-    """What of the device ``pid`` still references (spec 04 I77): open fds on a /dev/tenstorrent node
-    and mappings of a device node or of one of ``bdfs``' PCI BARs (``.../<bdf>/resource<n>``),
-    deleted ones included. [] when both fds and maps were read and name nothing; None when the fds
-    name nothing and the maps could not be read or did not answer in time (a BAR mapping behind it
-    cannot be ruled out: the caller fails closed)."""
+    """What of the device ``pid`` still references (spec 04 I77): open fds on a /dev/tenstorrent node and mappings of a
+    device node or of one of ``bdfs``' PCI BARs (``.../<bdf>/resource<n>``), deleted ones included. [] when both fds and
+    maps were read and name nothing; None when the fds name nothing and the maps could not be read or did not answer in
+    time (a BAR mapping behind it cannot be ruled out: the caller fails closed)."""
     bars = [f"/{b}/resource" for b in bdfs if b]
     node = device_holders.DEVICE_DIR + "/"
     refs: list[str] = []

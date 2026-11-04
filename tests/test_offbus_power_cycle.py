@@ -10,7 +10,6 @@ may run a real power-cycle command (conftest makes the real one a tripwire)."""
 
 import json
 import os
-import socket
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -20,14 +19,12 @@ import pytest
 from tests.conftest import patch_recovery
 from tests.test_device_safety import _arm_offbus_stuck_hold
 from tests.test_ladder_v2 import _ev
-from tt_device_mcp import alert
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
-from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy, pcie_guard
 from tt_device_mcp.health.recovery import offbus_power_cycle as opc
 
-GATE_WHY = "3 chip(s) off the bus and TT_DEVICE_MCP_HOST_RESET_GATE=hold"
+GATE_WHY = "3 chip(s) off the bus and 1 boot(s) under the host-hang latch"
 OFF_BUS, EXPECTED = 3, 32
 # Taken at import, before conftest swaps in its tripwire; only ever called on stand-in scripts.
 _REAL_FIRE = opc.fire_command
@@ -35,21 +32,11 @@ _REAL_GATE = pcie_guard.host_reset_gate
 
 
 def _gated(monkeypatch, tmp_path, *, held_sec=600, cmd="/usr/local/sbin/host-power-cycle --now", manual="exit 1"):
-    """An idle off-bus hold the gate refuses to reset, held ``held_sec``, with the power-cycle command
-    set (``cmd=None`` leaves it unset) and a manual-recovery check running ``manual`` (default: a
-    clean "none seen"; ``None`` leaves it unset, and conftest's TTDEV_ROOT has none installed).
-    Returns (hold_since, rec) where rec collects the fake fires (each with the state file as it stood
-    when the command ran), alerts and journal events."""
+    """An idle off-bus hold the gate refuses to reset, held ``held_sec``, with the power-cycle command set (``cmd=None``
+    leaves it unset) and a manual-recovery check running ``manual`` (default: a clean "none seen"; ``None`` leaves it
+    unset, and conftest's TTDEV_ROOT has none installed)."""
     _arm_offbus_stuck_hold(monkeypatch, off_bus=OFF_BUS, isolated=set(), reset_result=False)
-    for name in (
-        "TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC",
-        "TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC",
-        "TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE",
-        "TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_CMD",
-        "TT_DEVICE_MCP_MANUAL_RECOVERY_CMD",
-        "TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", raising=False)
     if cmd is None:
         monkeypatch.delenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", raising=False)
     else:
@@ -65,7 +52,6 @@ def _gated(monkeypatch, tmp_path, *, held_sec=600, cmd="/usr/local/sbin/host-pow
         rec["fires"].append({"argv": argv, "reason": reason, "state": opc.load_state()})
 
     monkeypatch.setattr(opc, "fire_command", fire)
-    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: rec["alerts"].append(event))
     for mod in (opc, galaxy):
         monkeypatch.setattr(mod, "health_event", lambda kind, **f: rec["events"].append((kind, f)))
     return hold_since, rec
@@ -116,8 +102,6 @@ async def test_an_unset_command_pages_once_and_the_hold_stands(monkeypatch, tmp_
     assert await _pass(hold_since) is None
     assert await _pass(hold_since) is None
     assert rec["fires"] == []
-    assert [a["kind"] for a in rec["alerts"]] == ["offbus_gated_hold_page"], "one page per episode"
-    assert "TT_DEVICE_MCP_POWER_CYCLE_CMD is not set" in rec["alerts"][0]["message"]
 
 
 @pytest.mark.asyncio
@@ -142,13 +126,6 @@ async def test_past_the_grace_and_idle_it_fires_once_with_the_attempt_on_disk_fi
     attempts = fired["state"].get("attempts")
     assert attempts and attempts[0]["episode"] == hold_since, "the attempt is on disk before the command runs"
     assert ("offbus_gated_hold", "firing") in [(k, f.get("phase")) for k, f in rec["events"]]
-    # The same episode a pass later, with an attempt spacing set: the attempt counts, so it pages and
-    # holds to a stated deadline (spec 04 I65) instead of firing again.
-    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", "3600")
-    assert await _pass(hold_since) is False
-    assert len(rec["fires"]) == 1
-    assert [a["kind"] for a in rec["alerts"]] == ["offbus_power_cycle_rate_limited"]
-    assert srv.recovery_mechanism.power_cycle_cooldown_state["until"] == attempts[0]["at_epoch"] + 3600
 
 
 @pytest.mark.asyncio
@@ -215,8 +192,6 @@ async def test_a_reset_in_its_own_scope_holds(monkeypatch, tmp_path, clear_job_s
 @pytest.mark.parametrize(
     "setup, why",
     [
-        ("standback_file", "stand-back marker"),
-        ("standback_cmd_yes", "the stand-back check says stand back"),
         ("manual_recovery", "an operator recovery is in progress"),
         ("cmd_error", "could not answer (exit 3)"),
         ("cmd_timeout", "timed out"),
@@ -224,16 +199,9 @@ async def test_a_reset_in_its_own_scope_holds(monkeypatch, tmp_path, clear_job_s
     ],
 )
 async def test_anything_objecting_stands_back(monkeypatch, tmp_path, clear_job_state, setup, why):
-    """A marker, a check saying yes, an operator recovery — and a check that cannot answer — all
-    stand back; only exit 1 clears a check."""
+    """An operator recovery — and a check that cannot answer — stand back; only exit 1 clears the check."""
     hold_since, rec = _gated(monkeypatch, tmp_path)
-    if setup == "standback_file":
-        marker = tmp_path / "hold-off"
-        marker.touch()
-        monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE", f"{tmp_path / 'absent'}:{marker}")
-    elif setup == "standback_cmd_yes":
-        monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_CMD", _script(tmp_path, "sb", "exit 0"))
-    elif setup == "manual_recovery":
+    if setup == "manual_recovery":
         monkeypatch.setenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", _script(tmp_path, "mr", "echo sudo reboot; exit 0"))
     elif setup == "cmd_error":
         monkeypatch.setenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", _script(tmp_path, "mr", "exit 3"))
@@ -241,7 +209,7 @@ async def test_anything_objecting_stands_back(monkeypatch, tmp_path, clear_job_s
         monkeypatch.setenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", _script(tmp_path, "mr", "sleep 30"))
         monkeypatch.setattr(opc, "CHECK_TIMEOUT_DEFAULT_SEC", 0.3)
     elif setup == "cmd_unstartable":
-        monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_CMD", str(tmp_path / "missing"))
+        monkeypatch.setenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", str(tmp_path / "missing"))
     _ladder_ran(hold_since)
     assert await _pass(hold_since) is False
     assert rec["fires"] == [] and opc.load_state() == {}, "standing back never spends the attempt"
@@ -264,56 +232,28 @@ async def test_a_blocked_power_cycle_pages_once_past_its_bound(monkeypatch, tmp_
     elif blocker == "scope":
         monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: "tt-reset@1.scope")
     else:
-        marker = tmp_path / "hold-off"
-        marker.touch()
-        monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE", str(marker))
+        monkeypatch.setenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", _script(tmp_path, "mr", "exit 0"))
     _ladder_ran(hold_since)
     assert await _pass(hold_since) is False
-    assert rec["alerts"] == [], "inside the bound it only holds"
+    blocked = lambda: [f for k, f in rec["events"] if k == "offbus_power_cycle_blocked"]  # noqa: E731
+    assert blocked() == [], "inside the bound it only holds"
     later = (datetime.fromisoformat(hold_since) - timedelta(seconds=20)).isoformat()
     srv.device_hold_episode_since = later
     _ladder_ran(later)
     for _ in range(3):
         assert await _pass(later) is False
-    assert [a["kind"] for a in rec["alerts"]] == ["offbus_power_cycle_blocked"], "one page per episode"
-    page = rec["alerts"][0]
+    (page,) = blocked()
     assert page["severity"] == "high" and page["host_at_risk"] is True and page["held_since"] == later
     assert rec["fires"] == []
-
-
-def test_a_page_the_alert_hook_drops_is_sent_again(monkeypatch):
-    """A page dropped because the hook is busy is retried on the next pass; journaled only once."""
-    sent, events = [], []
-    monkeypatch.setattr(opc, "health_event", lambda kind, **f: events.append(kind))
-    monkeypatch.setattr(alert, "alert_argv", lambda: ["/bin/true"])
-    results = iter([None, object()])
-    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: sent.append(event) or next(results))
-    opc.arm("2026-10-13T19:29:00")
-    for _ in range(3):
-        opc.page_once("offbus_gated_hold_page", lambda m: None, "held")
-    assert len(sent) == 2 and events.count("offbus_gated_hold_page") == 1
-
-
-def test_the_blocked_page_bound_defaults_and_rejects_nonsense(monkeypatch):
-    monkeypatch.delenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC", raising=False)
-    assert opc.blocked_page_sec() == 1800
-    for bad in ("0", "-1", "later"):
-        monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC", bad)
-        assert opc.blocked_page_sec() == 1800
-    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_BLOCKED_PAGE_SEC", "600")
-    assert opc.blocked_page_sec() == 600
 
 
 @pytest.mark.asyncio
 async def test_a_latch_never_blocks_a_rung_after_its_boot_nor_the_power_cycle_on_it(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """The I25 latch is scoped to its boot. After a later boot the real gate allows resets again and
-    the drop goes back to the ladder (no hold, no cycle); on the latched boot the gate refuses every
-    reset, and that refusal is exactly what the bounded power cycle answers."""
+    """The I25 latch is scoped to its boot."""
     hold_since, rec = _gated(monkeypatch, tmp_path)
     monkeypatch.setattr(pcie_guard, "host_reset_gate", _REAL_GATE)
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
     (pcie_guard.health_dir() / pcie_guard.LATCH_FILE).write_text(
         json.dumps({"boot_id": "boot-a", "latched_on_boot": "boot-b"})
     )
@@ -329,9 +269,7 @@ async def test_a_latch_never_blocks_a_rung_after_its_boot_nor_the_power_cycle_on
 @pytest.mark.asyncio
 async def test_checks_that_say_no_let_it_fire(monkeypatch, tmp_path, clear_job_state):
     hold_since, rec = _gated(monkeypatch, tmp_path)
-    monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE", str(tmp_path / "absent"))
     monkeypatch.setenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", _script(tmp_path, "mr", "exit 1"))
-    monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_CMD", _script(tmp_path, "sb", "exit 1"))
     _ladder_ran(hold_since)
     assert await _pass(hold_since) is True
     assert len(rec["fires"]) == 1
@@ -346,8 +284,6 @@ async def test_no_manual_recovery_check_never_fires_and_pages_once(monkeypatch, 
     for _ in range(3):
         assert await _pass(hold_since) is None
     assert rec["fires"] == [] and opc.load_state() == {}
-    assert [a["kind"] for a in rec["alerts"]] == ["offbus_power_cycle_unguarded"]
-    assert rec["alerts"][0]["severity"] == "high" and rec["alerts"][0]["host_at_risk"] is True
     assert "no manual-recovery check" in opc.standback_reason(), "standback_reason fails closed on its own too"
     monkeypatch.setenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", "'unbalanced")
     assert opc.manual_recovery_argv() is None and await _pass(hold_since) is None
@@ -405,8 +341,6 @@ async def test_a_manual_recovery_check_that_cannot_answer_holds_until_the_bound(
     assert rec["fires"] == [] and opc.load_state() == {}
     standing = [f["why"] for k, f in rec["events"] if f.get("phase") == "standing_back"]
     assert standing and all(why in w for w in standing)
-    assert [a["kind"] for a in rec["alerts"]] == ["offbus_power_cycle_blocked"]
-    assert why in rec["alerts"][0]["why"]
 
 
 @pytest.mark.asyncio
@@ -438,44 +372,6 @@ async def test_a_tenant_arriving_during_the_checks_holds(monkeypatch, tmp_path, 
     assert rec["fires"] == [] and opc.load_state() == {}
 
 
-def test_the_pages_name_the_host(monkeypatch):
-    sent = []
-    monkeypatch.setattr(opc, "health_event", lambda kind, **f: None)
-    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: sent.append(event))
-    opc.arm("2026-10-13T19:29:00")
-    opc.page_once("offbus_power_cycle_unguarded", lambda m: None, "held")
-    opc.page_if_blocked("2026-10-13T19:29:00", 10**6, lambda m: None, "a marker")
-    assert [e["host"] for e in sent] == [socket.gethostname()] * 2
-
-
-@pytest.mark.asyncio
-async def test_an_attempt_within_the_interval_pages_instead(monkeypatch, tmp_path, clear_job_state):
-    hold_since, rec = _gated(monkeypatch, tmp_path)
-    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", "21600")
-    last = opc.now_epoch() - 3600
-    opc.save_state({"attempts": [{"at_epoch": last, "episode": "earlier"}], "last_error": "boom"})
-    _ladder_ran(hold_since)
-    assert await _pass(hold_since) is False
-    assert await _pass(hold_since) is False
-    # The spacing is capped at the I65 backoff cap and stated on /health, retried at its end.
-    until = last + recovery_base.POWER_CYCLE_BACKOFF_CAP_SEC
-    assert srv.recovery_mechanism.power_cycle_cooldown_state["until"] == until
-    assert srv.recovery_mechanism.power_cycle_retry[0] == until
-    assert rec["fires"] == []
-    assert [a["kind"] for a in rec["alerts"]] == ["offbus_power_cycle_rate_limited"]
-    assert rec["alerts"][0]["last_error"] == "boom"
-
-
-@pytest.mark.asyncio
-async def test_an_attempt_older_than_the_interval_does_not_limit(monkeypatch, tmp_path, clear_job_state):
-    hold_since, rec = _gated(monkeypatch, tmp_path)
-    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", "600")
-    opc.save_state({"attempts": [{"at_epoch": opc.now_epoch() - 601, "episode": "earlier"}]})
-    _ladder_ran(hold_since)
-    assert await _pass(hold_since) is True
-    assert len(opc.load_state()["attempts"]) == 2
-
-
 @pytest.mark.asyncio
 async def test_the_mechanism_limits_still_apply(monkeypatch, tmp_path, clear_job_state):
     hold_since, rec = _gated(monkeypatch, tmp_path)
@@ -485,8 +381,6 @@ async def test_the_mechanism_limits_still_apply(monkeypatch, tmp_path, clear_job
     _ladder_ran(hold_since)
     assert await _pass(hold_since) is None
     assert rec["fires"] == []
-    assert [a["kind"] for a in rec["alerts"]] == ["offbus_power_cycle_denied"]
-    assert "per-boot cap reached" in rec["alerts"][0]["message"]
 
 
 @pytest.mark.asyncio
@@ -503,7 +397,7 @@ async def test_an_unwritable_attempt_record_never_fires(monkeypatch, tmp_path, c
 
 
 @pytest.mark.asyncio
-async def test_a_failed_fire_keeps_its_error_for_the_next_page(monkeypatch, tmp_path, clear_job_state):
+async def test_a_failed_fire_keeps_its_error_on_disk(monkeypatch, tmp_path, clear_job_state):
     hold_since, rec = _gated(monkeypatch, tmp_path)
 
     def broken(argv, reason, timeout=0):
@@ -514,9 +408,6 @@ async def test_a_failed_fire_keeps_its_error_for_the_next_page(monkeypatch, tmp_
     assert await _pass(hold_since) is True
     state = opc.load_state()
     assert "BMC unreachable" in state["last_error"] and len(state["attempts"]) == 1
-    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", "3600")
-    assert await _pass(hold_since) is False
-    assert "BMC unreachable" in rec["alerts"][0]["last_error"]
 
 
 def test_fire_command_never_runs_the_command_under_a_live_os(tmp_path, monkeypatch):
@@ -537,7 +428,6 @@ def test_fire_command_never_runs_the_command_under_a_live_os(tmp_path, monkeypat
 
 def test_due_for_the_watchdog_once_per_episode(monkeypatch):
     monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", "/bin/true")
-    monkeypatch.delenv("TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC", raising=False)
     since = datetime(2026, 10, 13, 19, 29, 0)
     ep = since.isoformat()
     assert not opc.due_for_watchdog(ep, since + timedelta(seconds=400)), "not armed"
@@ -578,28 +468,16 @@ def test_the_hold_watchdog_forces_one_pass_at_the_grace(monkeypatch, clear_job_s
     assert fired == [True], "one forced pass per episode from the grace"
 
 
-def test_the_knobs_default_and_reject_nonsense(monkeypatch):
-    for name in ("TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC", "TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC"):
-        monkeypatch.delenv(name, raising=False)
-    assert opc.grace_sec() == 300 and opc.min_interval_sec() == 0
-    for bad in ("0", "-5", "soon", ""):
-        monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC", bad)
-        monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", bad)
-        assert opc.grace_sec() == 300 and opc.min_interval_sec() == 0
-    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_GATED_GRACE_SEC", "90")
-    assert opc.grace_sec() == 90
+def test_a_blank_or_unparseable_power_cycle_command_is_none(monkeypatch):
     monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", "")
     assert opc.power_cycle_argv() is None
     monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", "cycle 'unterminated")
     assert opc.power_cycle_argv() is None, "an unparseable command is no command"
 
 
-def test_a_corrupt_state_file_reads_empty_and_a_bad_stamp_counts_as_now(monkeypatch):
+def test_a_corrupt_state_file_reads_empty(monkeypatch):
     (opc.health_dir() / opc.STATE_FILE).write_text("{not json")
     assert opc.load_state() == {}
-    now = 1_000_000.0
-    assert opc.last_attempt_within({"attempts": [{"at_epoch": "?"}]}, now, 600) == now
-    assert opc.last_attempt_within({"attempts": [{"at_epoch": now - 700}]}, now, 600) is None
 
 
 # --- the manual-recovery check template -----------------------------------------------------------
@@ -730,9 +608,8 @@ def test_the_manual_recovery_check_never_globs_an_auth_log_line(tmp_path, monkey
 
 
 def _below_floor_episode(monkeypatch, tmp_path, *, cmd="/usr/local/sbin/host-power-cycle --now"):
-    """The 10-14 replay: chips 0-7 (tray 1) off the bus and isolated, below the 16-chip floor, the gate
-    allowing resets and the bridge rung not bringing them back. There is no tray re-power rung (spec 04
-    I23). Returns (hold_since, rec, counters, state)."""
+    """The 10-14 replay: chips 0-7 (tray 1) off the bus and isolated, below the 16-chip floor, the gate allowing resets
+    and the bridge rung not bringing them back. There is no tray re-power rung (spec 04 I23)."""
     hold_since, rec = _gated(monkeypatch, tmp_path, cmd=cmd)
     counters = _arm_offbus_stuck_hold(
         monkeypatch, off_bus=8, isolated={str(c) for c in range(8)}, sbr_recovers=False, reset_result=False
@@ -776,10 +653,8 @@ def _spy_gated_power_cycle(monkeypatch) -> list:
 async def test_the_idle_escalation_hands_a_whole_tray_drop_to_the_power_cycle(
     monkeypatch, tmp_path, clear_job_state, galaxy_trays
 ):
-    """The 10-14 drop (chips 0-7, all of tray 1, below the floor) on the idle escalation: a whole tray
-    off the bus goes through ``_offbus_gated_power_cycle`` to the power cycle with no grace (I37). No
-    tray is re-powered (I23), so the other trays stay on the bus, and no mesh reset runs. The device
-    stays held: every verify ran the fabric pass and none passed."""
+    """The 10-14 drop (chips 0-7, all of tray 1, below the floor) on the idle escalation: a whole tray off the bus goes
+    through ``_offbus_gated_power_cycle`` to the power cycle with no grace (I37)."""
     hold_since, rec, counters, state = _below_floor_episode(monkeypatch, tmp_path)
     calls = _spy_gated_power_cycle(monkeypatch)
     await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], EXPECTED, lambda m: None, force=True)
@@ -794,8 +669,7 @@ async def test_the_idle_escalation_hands_a_whole_tray_drop_to_the_power_cycle(
 
 
 async def _gate_below_floor(off):
-    """One post-job gate pass at escalate's BELOW_FLOOR with ``off`` off the bus and no bridge window
-    recorded, so the hold is not TRAY_DOWN_NO_WINDOW."""
+    """One post-job gate pass at escalate's BELOW_FLOOR with ``off`` off the bus and no bridge window recorded."""
     beats = {str(i): 100 for i in range(32) if i not in off}
     return await srv.galaxy_recovery.escalate(
         "gate/post-job",
@@ -812,9 +686,8 @@ async def _gate_below_floor(off):
 async def test_the_post_job_gate_hands_a_whole_tray_drop_to_the_power_cycle(
     monkeypatch, tmp_path, clear_job_state, galaxy_trays
 ):
-    """The 10-15 replay through the post-job gate's BELOW_FLOOR branch: all of tray 1 (0-7) and four
-    chips of tray 4 off, below the floor. A whole tray off the bus goes through
-    ``_offbus_gated_power_cycle`` to the power cycle at once (no grace) and the device stays held."""
+    """The 10-15 replay through the post-job gate's BELOW_FLOOR branch: all of tray 1 (0-7) and four chips of tray 4
+    off, below the floor."""
     hold_since, rec, counters, state = _below_floor_episode(monkeypatch, tmp_path)
     calls = _spy_gated_power_cycle(monkeypatch)
     state["off"] = set(range(8)) | {24, 25, 28, 29}
@@ -832,9 +705,8 @@ async def test_the_post_job_gate_hands_a_whole_tray_drop_to_the_power_cycle(
 
 @pytest.mark.asyncio
 async def test_an_idle_whole_tray_drop_is_journaled_as_whole_tray(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
-    """The idle escalation journals a whole tray off the bus as its own class
-    (``galaxy_reset_skipped_whole_tray``, fault class ``whole_tray``). The cycle's own journal line names
-    the class and the hand-off."""
+    """The idle escalation journals a whole tray off the bus as its own class (``galaxy_reset_skipped_whole_tray``,
+    fault class ``whole_tray``). The cycle's own journal line names the class and the hand-off."""
     hold_since, rec, counters, state = _below_floor_episode(monkeypatch, tmp_path)
     await srv.galaxy_recovery._escalate_offbus_stuck_hold(["0", "1"], EXPECTED, lambda m: None, force=True)
     events = dict(rec["events"])
@@ -865,9 +737,7 @@ def _tray_back_before_the_cycle(monkeypatch, state, back):
 async def test_a_whole_tray_that_comes_back_in_part_is_not_cycled_at_grace_0(
     monkeypatch, tmp_path, clear_job_state, galaxy_trays
 ):
-    """Tray 1 (0-7) is wholly off when the gate records it, then chips 0-3 come back before the cycle.
-    The re-read before the cycle sees no whole tray off any more: no grace-0 cycle, the whole-tray clock
-    is cleared (journaled ``whole_tray_back``) and the device stays held for the ladder."""
+    """Tray 1 (0-7) is wholly off when the gate records it, then chips 0-3 come back before the cycle."""
     hold_since, rec, counters, state = _below_floor_episode(monkeypatch, tmp_path)
     state["off"] = set(range(8)) | {24, 25, 28, 29}
     _tray_back_before_the_cycle(monkeypatch, state, range(4))
@@ -902,11 +772,8 @@ def _flapping_tray(monkeypatch, state, chip):
 async def test_a_flapping_whole_tray_still_reaches_the_power_cycle(
     monkeypatch, tmp_path, clear_job_state, galaxy_trays, path
 ):
-    """Chip 0 of tray 1 flickers, so each whole-tray read is followed by a partial
-    re-read before the cycle. The re-check holds the cycle back once per episode; the next pass that
-    sees the whole tray off fires at grace 0. Before, every pass cleared the whole-tray clock and held,
-    so the hold never ended (6 forced passes: 0 cycles). No tray step and no reset runs, and the
-    device stays held."""
+    """Chip 0 of tray 1 flickers, so each whole-tray read is followed by a partial re-read before the cycle. The
+    re-check holds the cycle back once per episode; the next pass that sees the whole tray off fires at grace 0."""
     hold_since, rec, counters, state = _below_floor_episode(monkeypatch, tmp_path)
     state["off"] = set(range(8))
     _flapping_tray(monkeypatch, state, 0)
@@ -991,9 +858,8 @@ async def test_a_re_read_the_tray_map_cannot_place_keeps_the_whole_tray_verdict(
 async def test_a_partial_drop_below_the_floor_holds_with_no_tray_step(
     monkeypatch, tmp_path, clear_job_state, galaxy_trays
 ):
-    """Four chips each of trays 1 and 4 off, no whole tray, below the floor: the gate's BELOW_FLOOR branch
-    re-powers no tray (I23), runs no reset and no power cycle, and holds. Nothing releases the device: the
-    I76 bound runs the full ladder at 10 min, and only a passing full check lifts the hold."""
+    """Four chips each of trays 1 and 4 off, no whole tray, below the floor: the gate's BELOW_FLOOR branch re-powers no
+    tray (I23), runs no reset and no power cycle, and holds."""
     hold_since, rec, counters, state = _below_floor_episode(monkeypatch, tmp_path)
     calls = _spy_gated_power_cycle(monkeypatch)
     state["off"] = {0, 1, 2, 3, 24, 25, 26, 27}

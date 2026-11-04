@@ -163,7 +163,6 @@ async def test_below_the_bound_a_no_reset_hold_keeps_its_fast_path(monkeypatch, 
     )
     await srv._force_escalate_stuck_hold()
     assert escalations == [] and "host_rung" not in events
-    assert [a["cause"] for a in alerts] == ["topology mismatch"]
 
 
 @pytest.mark.asyncio
@@ -298,7 +297,7 @@ async def test_a_failed_check_after_the_bound_ladder_asks_for_the_host_rung_at_o
         monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", "hardware fault: needs an operator")
     ages = []
 
-    async def host_rung(age, log):
+    async def host_rung(age, log, *a, **k):
         events.append("host_rung")
         ages.append(srv._hold_age_now())
 
@@ -402,7 +401,7 @@ async def _bound_check_pending(monkeypatch, why, detail):
 async def test_a_failed_lift_check_after_the_bound_ladder_asks_for_the_host_rung(
     monkeypatch, clear_job_state, verdict, why, detail
 ):
-    """Review #1495 F4: every idle lift path runs _full_check_gate; a check there that ends with no
+    """Every idle lift path runs _full_check_gate; a check there that ends with no
     pass after the bound's ladder hands the hold to the host rung on the next tick (spec 04 I76)."""
     escalations, events = await _bound_check_pending(monkeypatch, why, detail)
     monkeypatch.setattr(srv, "_hugepages_shortfall", lambda: None)
@@ -434,7 +433,7 @@ async def test_a_lift_check_still_waiting_on_hugepages_asks_for_no_host_rung(mon
 async def test_a_failed_foreign_holder_check_after_the_bound_ladder_asks_for_the_host_rung(
     monkeypatch, clear_job_state
 ):
-    """Review #1495 F4, the foreign-holder lift (spec 03 I43): its failed full check counts too."""
+    """The foreign-holder lift (spec 03 I43): its failed full check counts too."""
     _escalations, events = await _bound_check_pending(monkeypatch, "foreign_holder", "foreign holder")
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     monkeypatch.setattr(srv, "_reaped_leftover_reason", lambda scan: "")
@@ -493,13 +492,9 @@ def test_every_hold_kind_reports_one_escalation_deadline(monkeypatch, clear_job_
     seen = []
     patch_health_event(monkeypatch, lambda kind, **k: seen.append((kind, k)))
     monkeypatch.setattr(srv, "_maybe_spawn_forced_escalation", lambda: False)
-    monkeypatch.setattr(srv.alert, "alert_argv", lambda: ["true"])
-    monkeypatch.setattr(srv, "_persist_hold_alert_backoff", lambda *a: None)
-    monkeypatch.setattr(srv, "device_hold_alert_next_bucket", 0)
     srv._check_hold_deadline()
     stuck = [k for kind, k in seen if kind == "hold_stuck_past_deadline"]
     assert stuck and all(k["escalation_deadline"] == want for k in stuck)
-    assert alerts and alerts[0]["escalation_deadline"] == want
     monkeypatch.setattr(srv, "device_hold_episode_since", "")
     assert srv.hold_bound_deadline() is None and srv._hold_bound_health() is None
 
@@ -542,7 +537,6 @@ async def test_replay_a_latched_topology_mismatch_hold_gets_the_ladder_then_the_
     monkeypatch.setattr(srv, "device_hold_episode_since", _since(BOUND + 1))
     monkeypatch.setattr(srv, "device_hold_episode_reason", "post-job: fabric check COULD NOT RUN (77)")
     monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
     _watchdog(monkeypatch)
     assert srv._fabric_77_only_hold(), "the latch made the hold 77-only: on the old code nothing runs"
     checks = []
@@ -555,7 +549,7 @@ async def test_replay_a_latched_topology_mismatch_hold_gets_the_ladder_then_the_
         return False
 
     async def full_check(expected, log, run_fabric=True, **k):
-        assert run_fabric, "the post-reset check includes the fabric (goal 8)"
+        assert run_fabric, "the post-reset check includes the fabric"
         return False, {"fabric": {"ok": False, "detail": MISMATCH}}
 
     monkeypatch.setattr(g, "_reset_and_verify_device", reset_then_full_check)
@@ -608,9 +602,8 @@ def _refusing_scan(outcome: str) -> PreResetScan:
 
 
 def _scan_refuses_the_mesh_reset(rig, monkeypatch, scans):  # noqa: F811
-    """The ladder's mesh reset is the real ``_reset_and_verify_device`` and ``reset_with_quiesce``; only the
-    broker's pre-reset scan answers from ``scans`` (one per call, the last repeats). A reset that ran would
-    land in ``rig['order']`` as ``reset_ran``; each scan the mesh reset reached as ``glx_reset``."""
+    """The ladder's mesh reset is the real ``_reset_and_verify_device`` and ``reset_with_quiesce``; only the broker's
+    pre-reset scan answers from ``scans`` (one per call, the last repeats)."""
     order, g = rig["order"], rig["g"]
     monkeypatch.setattr(g, "_reset_and_verify_device", type(g)._reset_and_verify_device.__get__(g))
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
@@ -657,7 +650,6 @@ def _bound_hold_with_a_failing_full_check(rig, monkeypatch):  # noqa: F811
     monkeypatch.setattr(srv, "device_hold_episode_since", _since(BOUND + 1))
     monkeypatch.setattr(srv, "device_hold_episode_reason", "gate/post-job: eth/fabric fault on a present mesh")
     monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
     _watchdog(monkeypatch)
     checks = []
 
@@ -682,11 +674,9 @@ def _bound_hold_with_a_failing_full_check(rig, monkeypatch):  # noqa: F811
 async def test_a_reset_the_holder_scan_refuses_keeps_the_hold_and_the_bound_cycles(
     rig, monkeypatch, clear_job_state, outcome  # noqa: F811
 ):
-    """Spec 04 I92 with I76: the pre-reset scan refuses the bound ladder's mesh reset (a reader that would
-    not let go, an off-bus chip it could not detach, a reader stuck in the kernel, a zombie whose live
-    threads never settled within its wait). No reset runs and none
-    is counted; the hold stays, the full check with fabric still fails, and the broker's own code asks for
-    the power cycle once. Nothing is released and the fabric stays owed."""
+    """Spec 04 I92 with I76: the pre-reset scan refuses the bound ladder's mesh reset (a reader that would not let go,
+    an off-bus chip it could not detach, a reader stuck in the kernel, a zombie whose live threads never settled within
+    its wait)."""
     order, g = rig["order"], rig["g"]
     checks = _bound_hold_with_a_failing_full_check(rig, monkeypatch)
     scans = _scan_refuses_the_mesh_reset(rig, monkeypatch, [_refusing_scan(outcome)])
@@ -713,15 +703,11 @@ async def test_a_reset_the_holder_scan_refuses_keeps_the_hold_and_the_bound_cycl
 async def test_a_tenant_the_holder_scan_finds_bounds_the_hold_and_the_ladder_runs_when_it_leaves(
     rig, monkeypatch, clear_job_state  # noqa: F811
 ):
-    """Spec 04 I92 with I76: a tenant at the bound keeps every reset off the device, the ladder's own check
-    and the pre-reset scan alike. That hold is bounded only by the tenant: paged once naming it, shown in
-    /health. On the first tick after it leaves the ladder runs; the scan then refuses past a reader that
-    would not let go, the full check with fabric fails and the power cycle is asked for once."""
+    """Spec 04 I92 with I76: a tenant at the bound keeps every reset off the device, the ladder's own check and the
+    pre-reset scan alike. That hold is bounded only by the tenant: paged once naming it, shown in /health."""
     order = rig["order"]
     checks = _bound_hold_with_a_failing_full_check(rig, monkeypatch)
     scans = _scan_refuses_the_mesh_reset(rig, monkeypatch, [_refusing_scan("survivor")])
-    alerts = []
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: alerts.append(event))
     monkeypatch.setattr(srv, "device_hold_tenant_deferred", False)
     tenant = {"on": True}
     monkeypatch.setattr(
@@ -741,8 +727,6 @@ async def test_a_tenant_the_holder_scan_finds_bounds_the_hold_and_the_ladder_run
     await _drain()
 
     kinds = [k for k, _ in rig["events"]]
-    pages = [a for a in alerts if a["kind"] == "hold_bound_tenant_blocked"]
-    assert len(pages) == 1 and "4303" in pages[0]["blocked_by"]
     assert kinds.count("hold_bound_tenant_blocked") == 1
     assert srv._hold_bound_health()["next_step"] == "tenant_blocked"
     assert "reset_ran" not in order and "power_cycle" not in order and "released" not in order
@@ -776,10 +760,8 @@ async def test_a_tenant_the_holder_scan_finds_bounds_the_hold_and_the_ladder_run
 async def test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_check_and_power_cycle(
     rig, monkeypatch, clear_job_state, driver, post_check, tmp_path  # noqa: F811
 ):
-    """``discovered_links_pass``: the moved tray's check after the bound ladder passes on the discovered
-    links again, through the monitor's real fabric verdict. The latch stands through the bound, so that
-    pass is no pass (spec 03 I42): no release (which would fail the next job, latch again and hold
-    another 10 min), and the power cycle follows."""
+    """``discovered_links_pass``: the moved tray's check after the bound ladder passes on the discovered links again,
+    through the monitor's real fabric verdict."""
     order, g = rig["order"], rig["g"]
     mon = srv.health_monitor
     rig["beats"] = {str(i): 100 for i in range(EXPECTED)}
@@ -791,7 +773,6 @@ async def test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_che
     monkeypatch.setattr(mon, "last_fabric_output", MISMATCH)
     monkeypatch.setattr(mon, "last_fabric_ok", None)
     monkeypatch.setattr(mon, "topology_hw_fault", "")
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
     monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
     # The mismatch lift arms the one-job watch; that job dies on the fabric and sets the latch.
     monkeypatch.setattr(mon, "topology_lift_pending", True)
@@ -813,7 +794,7 @@ async def test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_che
         return ok
 
     async def full_check(expected, log, run_fabric=True, **k):
-        assert run_fabric, "the post-reset check includes the fabric (goal 8)"
+        assert run_fabric, "the post-reset check includes the fabric"
         assert mon.topology_hw_fault, "the latch stands through the bound: a mismatch here fails"
         if post_check == "fails":
             return False, {"fabric": {"ok": False, "detail": MISMATCH}}
@@ -838,7 +819,6 @@ async def test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_che
         monkeypatch.setattr(fabric, "_validator_paths", lambda: ("bin", "root", desc))
         monkeypatch.setattr(monitor_mod, "health_dir", lambda: tmp_path)
         monkeypatch.setattr(monitor_mod, "_asic_bus_map", lambda: {"a": 0xC1})
-        monkeypatch.setattr(monitor_mod.alert, "send_alert", lambda ev, log=None: None)
     monkeypatch.setattr(g, "_reset_and_verify_device", reset_then_full_check)
     monkeypatch.setattr(g, "_verify_device", full_check)
     rig_cycle = srv._auto_power_cycle_host
@@ -873,13 +853,8 @@ async def test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_che
 async def test_replay_a_disproven_lift_hold_gets_the_ladder_and_power_cycle_within_the_class_d_budget(
     rig, monkeypatch, clear_job_state  # noqa: F811
 ):
-    """A Galaxy host's post-job hold: a job's fabric failure after a topology lift sets the I42 latch, the
-    hold takes the ladder, and no idle relift reset ran first (the watchdog path). The latch stands, so the
-    bound applies after one sampler tick, not 600 s (where the ladder started 10 min in and the power
-    cycle came ~14-16 min into the hold, past the old latch's 20 min). Walked tick by tick: on the first
-    tick (spec 04 I83) the full ladder runs, the full check after it (fabric included) fails,
-    the broker asks for the power cycle; the 10-min mark adds no second ladder or cycle while it is
-    pending, and the deadline event reads escalated."""
+    """A Galaxy host's post-job hold: a job's fabric failure after a topology lift sets the I42 latch, the hold takes
+    the ladder, and no idle relift reset ran first (the watchdog path)."""
     order, g = rig["order"], rig["g"]
     mon = srv.health_monitor
     rig["beats"] = {str(i): 100 for i in range(EXPECTED)}
@@ -891,7 +866,6 @@ async def test_replay_a_disproven_lift_hold_gets_the_ladder_and_power_cycle_with
     monkeypatch.setattr(mon, "last_fabric_output", MISMATCH)
     monkeypatch.setattr(mon, "last_fabric_ok", None)
     monkeypatch.setattr(mon, "topology_hw_fault", "")
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
     monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
     monkeypatch.setattr(mon, "topology_lift_pending", True)
     why = mon.note_job_after_topology_lift(True, "... could not find any forwarding direction ...")
@@ -912,7 +886,7 @@ async def test_replay_a_disproven_lift_hold_gets_the_ladder_and_power_cycle_with
         return False
 
     async def full_check(expected, log, run_fabric=True, **k):
-        assert run_fabric, "the post-reset check includes the fabric (goal 8)"
+        assert run_fabric, "the post-reset check includes the fabric"
         assert mon.topology_hw_fault, "the latch stands through the bound: a mismatch here fails"
         return False, {"fabric": {"ok": False, "detail": MISMATCH}}
 
@@ -975,14 +949,7 @@ async def test_replay_a_disproven_lift_hold_gets_the_ladder_and_power_cycle_with
 async def test_replay_post_reset_lift_latch_with_gated_queued_job_runs_the_ladder_at_the_bound(
     rig, monkeypatch, clear_job_state  # noqa: F811
 ):
-    """The same latch reached from an off-bus hold, with a tenant job parked at the door behind it.
-
-    An off-bus hold is healed by a mesh reset; the post-reset check passes with a topology mismatch and
-    lifts. The first job fails on the fabric and sets the I42 latch, which opens a new hold episode at
-    that job's end. The next tenant job is dequeued and held at the CLEAN-GATE (it opens no device fd).
-    At the bound the watchdog runs the ladder with the latch standing, so the full check fails on the
-    mismatch and the power cycle is asked for once. The gated job never dispatches, and its own bound
-    refuses it."""
+    """The same latch reached from an off-bus hold, with a tenant job parked at the door behind it."""
     order, g = rig["order"], rig["g"]
     mon = srv.health_monitor
     rig["beats"] = {str(i): 100 for i in range(EXPECTED)}
@@ -996,7 +963,6 @@ async def test_replay_post_reset_lift_latch_with_gated_queued_job_runs_the_ladde
     monkeypatch.setattr(mon, "topology_lift_pending", False)
     monkeypatch.setattr(mon, "_topology_alerted", set())
     monkeypatch.setattr(monitor_mod, "_asic_bus_map", lambda: {})  # no chip-to-bus map off the host
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
     monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
     monkeypatch.setattr(srv, "device_hold_logged", False)
     monkeypatch.setattr(srv, "device_hold_episode_since", "")
@@ -1135,7 +1101,6 @@ def _present_hold_at_the_bound(r, monkeypatch, *, why, detail, age=BOUND + 1):
     monkeypatch.setattr(srv, "device_hold_episode_since", since)
     monkeypatch.setattr(srv, "device_hold_episode_reason", detail)
     monkeypatch.setattr(srv, "_fabric_no_reset_paged_since", None)
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
     monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
     _watchdog(monkeypatch)
     return since
@@ -1145,10 +1110,8 @@ def _present_hold_at_the_bound(r, monkeypatch, *, why, detail, age=BOUND + 1):
 async def test_replay_a_77_held_with_no_host_rung_gets_the_power_cycle_at_the_bound(
     rig, monkeypatch, clear_job_state  # noqa: F811
 ):
-    """galaxy's _hold_77_without_host_rung (spec 04 I29): the episode's reset came back with the fabric
-    unverified (77) and its last-chance sweep, the full check after it, read a 77 again. Below the
-    bound that holds with no host rung; at the bound the watchdog's forced ladder reaches the same exit
-    and the broker's own code asks for the power cycle in that run."""
+    """galaxy's _hold_77_without_host_rung (spec 04 I29): the episode's reset came back with the fabric unverified (77)
+    and its last-chance sweep, the full check after it, read a 77 again."""
     order, g = rig["order"], rig["g"]
     detail = "post-job: fabric check COULD NOT RUN (77)"
     since = _present_hold_at_the_bound(rig, monkeypatch, why=srv.FABRIC_RELIFT_WHY, detail=detail)
@@ -1187,10 +1150,8 @@ def _leftover_scan(monkeypatch, r, *, tenant: bool):
 async def test_a_killed_jobs_leftover_holder_does_not_stop_the_bound(
     rig, monkeypatch, clear_job_state, tenant  # noqa: F811
 ):
-    """A killed job whose process is stuck in the kernel keeps its device fds (spec 01 I16, after the
-    I67 release wait). Every reset is fenced while it holds, and it read as a tenant, so the bound's
-    ladder stood down and re-armed forever. At the bound it is no tenant: the ladder's resets cannot
-    run, so the broker asks for the host rung, which is what clears it. A live tenant still refuses."""
+    """A killed job whose process is stuck in the kernel keeps its device fds (spec 01 I16, after the I67 release
+    wait)."""
     order = rig["order"]
     _present_hold_at_the_bound(rig, monkeypatch, why="job_killed", detail="job 7 killed: device left dirty")
     _leftover_scan(monkeypatch, rig, tenant=tenant)
@@ -1239,9 +1200,8 @@ def _real_host_rung(monkeypatch, cycles, allowed=lambda action: (True, "")):
 
 @pytest.mark.asyncio
 async def test_a_bound_cycle_that_cannot_launch_pages_once_and_is_asked_every_tick(monkeypatch, clear_job_state):
-    """Spec 04 I71/I76: at the bound, a power cycle that does not launch leaves the rung pending, so the
-    watchdog asks again each tick. Two failed launches in one episode give two cycle attempts and one
-    page; the hold stays and nothing releases it."""
+    """Spec 04 I71/I76: at the bound, a power cycle that does not launch leaves the rung pending, so the watchdog asks
+    again each tick."""
     why, detail, output, beats, _ladder = _KINDS["generic"]
     _escalations, alerts, events = _arm_fabric_only_deadline_hold(
         monkeypatch, why=why, detail=detail, fabric_output=output, beats=beats, age_min=BOUND / 60 + 0.05
@@ -1260,7 +1220,6 @@ async def test_a_bound_cycle_that_cannot_launch_pages_once_and_is_asked_every_ti
         assert srv._hold_bound_rung_pending, "a failed launch keeps the rung pending: asked again next tick"
     assert cycles == ["power_cycle", "power_cycle"]
     assert events.count("power_cycle_launch_failed_holding") == 2, "every failure is journaled"
-    assert [a["kind"] for a in alerts] == ["power_cycle_launch_failed_holding"], "one page per episode"
     assert srv._recovery_degraded() and "device_released" not in events, "the hold stays"
 
 
@@ -1408,9 +1367,8 @@ async def test_a_host_rung_denied_with_no_retry_is_asked_again_each_tick_and_jou
 async def test_a_live_tenant_at_the_bound_is_paged_once_and_the_ladder_runs_when_it_leaves(
     monkeypatch, clear_job_state
 ):
-    """Past the bound a live tenant still keeps every reset and the host rung off the device (no reset over
-    a tenant). That hold is the one past the bound with no deadline of its own, so it is not silent: one
-    page per episode naming the blocker, and /health shows it. The first tick after it leaves runs the ladder."""
+    """Past the bound a live tenant still keeps every reset and the host rung off the device (no reset over a
+    tenant)."""
     escalations, alerts, events = _arm_fabric_only_deadline_hold(
         monkeypatch, why="eth_frozen", detail="gate/post-job: eth/fabric fault on a present mesh", age_min=10.1
     )
@@ -1442,8 +1400,6 @@ async def test_a_live_tenant_at_the_bound_is_paged_once_and_the_ladder_runs_when
     await _drain()
     _tick()
     await _drain()
-    pages = [a for a in alerts if a["kind"] == "hold_bound_tenant_blocked"]
-    assert len(pages) == 1 and pages[0]["pid"] == 5151 and "5151" in pages[0]["blocked_by"]
     assert events.count("hold_bound_tenant_blocked") == 1
     health = srv._hold_bound_health()
     assert health["next_step"] == "tenant_blocked" and "5151" in health["blocked_by"]
@@ -1544,9 +1500,7 @@ async def test_a_disproven_lift_runs_the_bound_ladder_after_one_tick_whatever_th
 async def test_a_hold_with_no_disproven_lift_keeps_the_600s_bound_and_its_fast_path(
     monkeypatch, clear_job_state, detail, output, at_start
 ):
-    """Only the I42 latch moves the bound: a plain topology-mismatch or 77 hold keeps the ceiling as its
-    bound. A 77 hold one tick in runs no rung (I30's no-reset fast path is unchanged); an unlatched
-    mismatch is spec 04 I83's fabric link-short class, so its one tick runs the at-start ladder."""
+    """Only the I42 latch moves the bound: a plain topology-mismatch or 77 hold keeps the ceiling as its bound."""
     escalations, _alerts, events = _arm_fabric_only_deadline_hold(
         monkeypatch, why=srv.FABRIC_RELIFT_WHY, detail=detail, fabric_output=output, age_min=0.2
     )
@@ -1566,7 +1520,7 @@ async def test_a_hold_with_no_disproven_lift_keeps_the_600s_bound_and_its_fast_p
 
 @pytest.mark.asyncio
 async def test_the_10_min_mark_reruns_the_full_ladder_after_an_early_disproven_lift_run(monkeypatch, clear_job_state):
-    """Goal 10: the early ladder one tick in does not count as the 10-min one. With no host action
+    """10-min ladder: the early ladder one tick in does not count as the 10-min one. With no host action
     pending, a hold still standing at 600 s gets the full ladder again (not only the host rung)."""
     escalations, _alerts, _events = _arm_disproven_lift_hold(monkeypatch, age_sec=BOUND + 6)
     monkeypatch.setattr(srv, "_hold_bound_episode", srv.device_hold_episode_since)
@@ -1604,10 +1558,7 @@ async def test_the_host_rung_after_an_early_disproven_lift_ladder_runs_no_second
 
 @pytest.mark.parametrize("kill_switch", [False, True])
 def test_health_names_a_disproven_lifts_early_ladder_then_its_host_rung(monkeypatch, clear_job_state, kill_switch):
-    """Spec 04 I75/I76 with 03 I42: /health's next rung reads the run's own bound. A latched hold names
-    the full ladder (at hold start, spec 04 I83), then, after that early ladder, the host rung at the end of its
-    check bound (not the 600 s ceiling window). Spec 04 I83: that ladder is due at hold start; only the
-    kill switch defers it, to the one-tick bound it never governs."""
+    """Spec 04 I75/I76 with 03 I42: /health's next rung reads the run's own bound."""
     if kill_switch:
         monkeypatch.setenv("TT_DEVICE_MCP_FORCE_ESCALATE", "0")
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
@@ -1666,9 +1617,8 @@ _77 = "post-job: fabric check COULD NOT RUN (77)"
 
 
 def _77_climb_owed(rig, monkeypatch, *, age=BOUND + 1, fired=False):  # noqa: F811
-    """A 77-only hold whose one reset came back UNKNOWN and whose last-chance sweep read a 77 again, with
-    no known no-reset cause: only the I79 host rung is left. ``fired``: that climb already asked for the
-    power cycle on this episode. The rig's power cycle records the pending request as the real one does."""
+    """A 77-only hold whose one reset came back UNKNOWN and whose last-chance sweep read a 77 again, with no known
+    no-reset cause: only the I79 host rung is left."""
     g = rig["g"]
     since = _present_hold_at_the_bound(rig, monkeypatch, why=srv.FABRIC_RELIFT_WHY, detail=_77, age=age)
     for name in ("unverified_reset_since", "unverified_sweep_since", "unverified_sweep_77_since"):
@@ -1714,10 +1664,7 @@ def _cooldown_governor(r, monkeypatch, until: float):
 async def test_t1_a_77_climb_that_fired_before_the_bound_is_not_driven_again_at_the_bound(
     rig, monkeypatch, clear_job_state  # noqa: F811
 ):
-    """T1: the I79 climb asked for the power cycle below the bound and the request is pending. The bound's
-    tick runs no reset, no sweep and no second power cycle (it journals the suppression), and the relift's
-    own I79 path (escalate("present")) adds nothing either. Held: only the full check after the boot
-    releases it."""
+    """T1: the I79 climb asked for the power cycle below the bound and the request is pending."""
     order, g = rig["order"], rig["g"]
     _77_climb_owed(rig, monkeypatch, fired=True)
     assert not srv._fabric_77_climb_retry_due(), "the fired climb is spent"
@@ -1739,10 +1686,7 @@ async def test_t1_a_77_climb_that_fired_before_the_bound_is_not_driven_again_at_
 async def test_t2_a_cooldown_denied_77_climb_fires_one_power_cycle_whichever_path_runs_first(
     rig, monkeypatch, clear_job_state, first  # noqa: F811
 ):
-    """T2: at the bound the climb is owed and the I65 cooldown denies the power cycle (the retry is
-    armed). When the cooldown ends, the relift's I79 path and the watchdog's I65 retry both may ask:
-    whichever runs first fires the one power cycle and the other sees the pending request. No reset
-    runs either way."""
+    """T2: at the bound the climb is owed and the I65 cooldown denies the power cycle (the retry is armed)."""
     order, g = rig["order"], rig["g"]
     _77_climb_owed(rig, monkeypatch)
     until = time.time() + 900
@@ -1774,9 +1718,7 @@ async def test_t2_a_cooldown_denied_77_climb_fires_one_power_cycle_whichever_pat
 async def test_t3_a_77_on_the_boot_a_77_power_cycle_brought_up_still_gets_the_next_cycle_at_the_bound(
     rig, monkeypatch, clear_job_state  # noqa: F811
 ):
-    """T3: on the boot an I79 power cycle brought up, the 77 climb is spent and I79 hands the hold to an
-    operator. I76 still asks for the next power cycle at the bound (the governor's I65 doubling cooldown
-    decides when it fires) — the operator hand-off is never a reason to hold past the bound."""
+    """T3: on the boot an I79 power cycle brought up, the 77 climb is spent and I79 hands the hold to an operator."""
     order, g = rig["order"], rig["g"]
     _77_climb_owed(rig, monkeypatch)
     monkeypatch.setattr(
@@ -1799,10 +1741,8 @@ async def test_t3_a_77_on_the_boot_a_77_power_cycle_brought_up_still_gets_the_ne
 async def test_a_77_climb_the_cooldown_denied_below_the_bound_fires_at_the_cooldowns_end(
     rig, monkeypatch, clear_job_state  # noqa: F811
 ):
-    """Gap (a): below the bound a 77-only hold is never forced, so the watchdog's I65 retry skipped it and
-    a climb the cooldown denied waited for the relift's next re-check (up to 120 s more). When only the
-    host rung is left (the reset and the sweep already ran), the retry asks for it at the cooldown's
-    end: one power cycle, no reset. Fails without the fix: nothing fires until the relift re-checks."""
+    """Gap (a): below the bound a 77-only hold is never forced, so the watchdog's I65 retry skipped it and a climb the
+    cooldown denied waited for the relift's next re-check (up to 120 s more)."""
     g = rig["g"]
 
     def acts():
@@ -1849,9 +1789,7 @@ async def test_a_77_hold_whose_reset_has_not_run_is_still_never_forced_below_the
 async def test_the_idle_relift_runs_no_check_while_a_host_power_cycle_is_pending(
     rig, monkeypatch, clear_job_state, pending  # noqa: F811
 ):
-    """Gap (b): a 77-only hold's relift re-runs the fabric traffic pass. While a host power cycle the
-    broker asked for is pending it runs nothing (no traffic over a host going down, no lift just before
-    it cycles); the full check after the boot decides. Past the pending window it runs again."""
+    """Gap (b): a 77-only hold's relift re-runs the fabric traffic pass."""
     _77_climb_owed(rig, monkeypatch, age=240, fired=pending)
     observed = []
 
@@ -1907,10 +1845,7 @@ def _bound_hold_with_a_governed_host_rung(monkeypatch, state, cycles, until):
 async def test_a_bound_ladder_that_latches_the_pci_wedge_is_not_reported_as_skipped(
     monkeypatch, clear_job_state, cooldown
 ):
-    """Spec 04 I76: a bound ladder's rung blocks in the kernel and latches PCI-wedged, which stops the
-    pass. The power-cycle request after it (at once, or as the cooldown's retry, which takes the
-    latched route) says that ladder ran and met the blocked write, never that it was skipped. Report
-    text only: one ladder, then one power cycle, at the same times."""
+    """Spec 04 I76: a bound ladder's rung blocks in the kernel and latches PCI-wedged, which stops the pass."""
     state, cycles, until = {"cooling": cooldown}, [], datetime.now().timestamp() + 900
     escalations, _events = _bound_hold_with_a_governed_host_rung(monkeypatch, state, cycles, until)
 
@@ -1937,10 +1872,7 @@ async def test_a_bound_ladder_that_latches_the_pci_wedge_is_not_reported_as_skip
 
 @pytest.mark.asyncio
 async def test_a_skipped_ladders_reason_survives_the_cooldown_retry(monkeypatch, clear_job_state):
-    """A leftover holder skips the bound's ladder and the boot cooldown denies the host rung. The
-    cooldown's retry run takes the host-rung route, which reads no leftover itself: its request still
-    names the skip, never 'the full ladder did not heal it', since no ladder ran. Once a bound ladder
-    runs, the kept skip is spent."""
+    """A leftover holder skips the bound's ladder and the boot cooldown denies the host rung."""
     state, cycles, until = {"cooling": True}, [], datetime.now().timestamp() + 900
     escalations, _events = _bound_hold_with_a_governed_host_rung(monkeypatch, state, cycles, until)
     leftover = {"why": "job 7 pid 42 still holds the device"}

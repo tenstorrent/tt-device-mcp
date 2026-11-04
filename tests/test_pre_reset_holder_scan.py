@@ -779,10 +779,8 @@ def _hold_clock(monkeypatch, since, cooldown_until=None):
 async def test_a_zombie_cleared_on_the_last_poll_has_its_reset_and_full_check_done_before_the_ladder_mark(
     monkeypatch, fresh_zombies, reset_age
 ):
-    """Spec 04 I76/I92: an automatic reset at hold age ``reset_age`` waits on a zombie that clears only on
-    the wait's last poll. The mesh reset (~60 s on a Galaxy) and the full check with fabric after it (the
-    fabric pass's 180 s bound + 3 s a chip, 32 chips) hold the device lock the 10-min ladder needs: on the
-    simulated clock they still end before hold_bound_deadline, so the ladder is never late."""
+    """Spec 04 I76/I92: an automatic reset at hold age ``reset_age`` waits on a zombie that clears only on the wait's
+    last poll."""
     from datetime import datetime, timedelta
 
     from tt_device_mcp.constants import FABRIC_CHECK_TIMEOUT_SEC
@@ -813,10 +811,9 @@ async def test_a_zombie_cleared_on_the_last_poll_has_its_reset_and_full_check_do
 async def test_a_hold_begun_in_a_power_cycle_cooldown_ends_the_wait_one_reserve_before_the_ladder_mark(
     monkeypatch, clear_job_state
 ):
-    """Spec 04 I76/I92: a hold that began in a boot or post-power-cycle cooldown running past its 10-min
-    mark. hold_bound_deadline is the cooldown's end, but only the power cycle waits for it: the ladder
-    still runs at the mark. So the zombie wait ends one reserve before the mark, not before the
-    cooldown-extended deadline, and the ladder fires at the mark with the cooldown still running."""
+    """Spec 04 I76/I92: a hold that began in a boot or post-power-cycle cooldown running past its 10-min mark.
+    hold_bound_deadline is the cooldown's end, but only the power cycle waits for it: the ladder still runs at the
+    mark."""
     from datetime import datetime, timedelta
 
     from tests.test_device_safety import _arm_fabric_only_deadline_hold
@@ -931,9 +928,8 @@ async def test_each_holder_is_identified_before_it_is_signalled(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_stuck_identity_read_delays_neither_the_scan_nor_its_signals(monkeypatch):
-    """A holder stuck in the kernel can block its /proc read: the scan reads identities off the loop
-    under one fixed bound, records that holder unread and goes on. The verdict, the holders found and
-    the signals are the ones a read that answers at once gives, and the loop keeps running."""
+    """A holder stuck in the kernel can block its /proc read: the scan reads identities off the loop under one fixed
+    bound, records that holder unread and goes on."""
     import threading
 
     from tt_device_mcp import holder_identity as hi

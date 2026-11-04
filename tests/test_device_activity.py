@@ -159,20 +159,6 @@ def test_an_unreadable_holder_record_is_unknown(proc, monkeypatch):
 # --- cadence and lifetime ------------------------------------------------------------------------
 
 
-def test_the_cadence_and_threshold_default_to_one_second(monkeypatch):
-    monkeypatch.delenv("TT_DEVICE_MCP_ACTIVITY_INTERVAL_SEC", raising=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_DEVICE_IDLE_AFTER_SEC", raising=False)
-    assert device_activity.interval_sec() == 1.0
-    assert device_activity.idle_after_sec() == 1.0
-    monkeypatch.setenv("TT_DEVICE_MCP_ACTIVITY_INTERVAL_SEC", "0.25")
-    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_IDLE_AFTER_SEC", "30")
-    assert device_activity.interval_sec() == 0.25
-    assert device_activity.idle_after_sec() == 30.0
-    for bad in ("x", "-1", "0"):
-        monkeypatch.setenv("TT_DEVICE_MCP_ACTIVITY_INTERVAL_SEC", bad)
-        assert device_activity.interval_sec() == 1.0, f"interval {bad!r} must fall back to 1 s"
-
-
 @pytest.mark.asyncio
 async def test_the_sampler_reads_once_per_interval_and_a_failed_read_is_unknown():
     clock = Clock()
@@ -226,7 +212,7 @@ async def test_the_sampler_runs_only_while_the_job_runs(monkeypatch, clear_job_s
 async def test_the_sampler_is_stopped_before_the_post_job_gate(monkeypatch, clear_job_state):
     seen_at_gate = []
 
-    async def _gate(job_log_file, job_failed=False, noop_failure=False, exit1_failure=False):
+    async def _gate(job_log_file, job_failed=False, noop_failure=False):
         seen_at_gate.append(dict(srv._job_activity))
 
     class Quiet(DeviceActivitySampler):
@@ -234,11 +220,19 @@ async def test_the_sampler_is_stopped_before_the_post_job_gate(monkeypatch, clea
             super().__init__(lambda: (False, "quiet"), interval=0.01, idle_after=0.0)
 
     monkeypatch.setattr(device_activity, "DeviceActivitySampler", Quiet)
+    real_job_end = srv._pcie_job_end
+
+    async def _slow_job_end(job_id):
+        # The job is already marked finished here; a slow host can sit this long before the gate.
+        await asyncio.sleep(0.2)
+        await real_job_end(job_id)
+
+    monkeypatch.setattr(srv, "_pcie_job_end", _slow_job_end)
     # _run_one_job quiets the gate with a no-op; watch it instead.
     monkeypatch.setattr(
         test_device_safety, "_quiet_post_job_gate", lambda mp: mp.setattr(srv, "_verify_device_after_job", _gate)
     )
-    await _run_one_job(monkeypatch, "962", privsep=False, scope_active=True)
+    await _run_one_job(monkeypatch, "962", privsep=False, scope_active=True, until=lambda: bool(seen_at_gate))
     assert seen_at_gate, "the post-job gate never ran"
     assert seen_at_gate == [{}], "the sampler was still running on the between-jobs path"
 
@@ -315,9 +309,8 @@ async def test_job_status_tool_shows_idle_while_running_and_the_total_after(monk
 
 @pytest.mark.asyncio
 async def test_job_status_tool_keeps_the_idle_total_for_a_finished_job_only(monkeypatch, clear_job_state):
-    """The end-of-run total is a finished job's field: in the window after _stop_job_activity set it
-    and before the runner marks the job finished, the status shows no total (spec 03 I54). The
-    re-adopted job fields (spec 03 I76) sit beside this pairing, not inside it."""
+    """The end-of-run total is a finished job's field: in the window after _stop_job_activity set it and before the
+    runner marks the job finished, the status shows no total (spec 03 I54)."""
     from tt_device_mcp.socket_transport import current_peer_uid, current_via_mcp
 
     job = _running_idle_job(monkeypatch)

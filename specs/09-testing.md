@@ -295,7 +295,7 @@ Must pass anywhere, per I1–I7. Passing on a device box proves nothing about CI
 device-free before claiming CI is green:
 
 ```bash
-sudo docker run --rm -v /localdev:/localdev -e HOME=/tmp/cihome python:3.10 bash -lc '
+sudo docker run --rm -v "$PWD":"$PWD" -e HOME=/tmp/cihome python:3.10 bash -lc '
   mkdir -p /run/systemd/system          # GitHub runners are VMs and have systemd; containers do not
   cp -r <repo> /tmp/src && cd /tmp/src && rm -rf .venv
   python -m venv /tmp/civenv && /tmp/civenv/bin/pip install -q -e ".[dev]"
@@ -495,7 +495,7 @@ own claims that are pinned:
 | I2 (the poller exception cannot launder another unit) | `tests/test_device_marker.py::test_the_poller_exception_does_not_extend_to_other_units` |
 | I2 (`systemd-run` cannot launder a never-list payload) | `tests/test_device_marker.py::test_systemd_run_is_permitted_under_the_marker_only_for_what_it_wraps` |
 | I7 (the per-test reset clears every job, hold, hold-bound and escalation global) | `tests/test_test_isolation.py::test_the_per_test_reset_clears_every_hold_bound_and_escalation_global` |
-| I7 (the pairs that leaked state pass with the leaking test first: `tests/test_hold_bound.py::test_a_stuck_hold_event_past_the_bound_never_reads_escalated_false` then `::test_a_latched_i42_hold_still_escalates_and_its_latch_is_lifted`; `tests/test_power_cycle_ac_needed.py::test_the_hold_bound_is_the_one_trigger_of_the_class_a_ladder` then `::test_the_full_ladder_runs_at_the_10_min_hold_bound_then_the_cycle`; `tests/test_chip_state.py::test_the_published_state_is_atomic_and_names_every_expected_chip` then `::test_a_re_created_node_is_read_at_once_and_a_valid_read_clears_lost`) | `tests/test_test_isolation.py::test_the_leaking_pairs_pass_with_the_leaking_test_first` |
+| I7 (the pairs that leaked state pass with the leaking test first: `tests/test_hold_bound.py::test_a_stuck_hold_event_past_the_bound_never_reads_escalated_false` then `::test_a_latched_i42_hold_still_escalates_and_its_latch_stands`; `tests/test_power_cycle_ac_needed.py::test_the_hold_bound_is_the_one_trigger_of_the_class_a_ladder` then `::test_the_full_ladder_runs_at_the_10_min_hold_bound_then_the_cycle`; `tests/test_chip_state.py::test_the_published_state_is_atomic_and_names_every_expected_chip` then `::test_a_re_created_node_is_read_at_once_and_a_valid_read_clears_lost`) | `tests/test_test_isolation.py::test_the_leaking_pairs_pass_with_the_leaking_test_first` |
 | I9 (a signal to a process the test did not spawn is refused, delivers nothing, fails the test) | `tests/test_signal_guard.py::test_a_signal_to_a_process_the_test_did_not_spawn_is_refused_and_delivers_nothing` |
 | I9 (an empty environ read mid-exec is read again: the test's own orphan passes, a foreign process stays refused) | `tests/test_signal_guard.py::test_an_own_orphan_whose_environ_reads_empty_mid_exec_can_be_signalled`, `tests/test_signal_guard.py::test_a_foreign_process_whose_environ_reads_empty_is_still_refused` |
 | I9 (the dead-chip holder kill cannot reach a host process) | `tests/test_signal_guard.py::test_the_dead_chip_holder_kill_cannot_reach_a_host_process` |

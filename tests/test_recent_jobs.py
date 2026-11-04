@@ -1028,17 +1028,17 @@ def test_begin_action_row_creates_durable_header_file(monkeypatch, tmp_path, cle
     monkeypatch.setattr(srv, "job_log_dir", tmp_path)
     monkeypatch.setattr(srv, "_action_row", None)
 
-    srv._begin_action_row("smarton", "tt-smi -r 0")
+    srv._begin_action_row("alice", "tt-smi -r 0")
     try:
         row = srv._action_row
         assert row is not None
-        assert row["owner"] == "smarton"
+        assert row["owner"] == "alice"
         assert row["id"].isdigit()
         log_files = list(tmp_path.glob("*.log"))
         assert len(log_files) == 1
         content = log_files[0].read_text()
         assert f"JOB ID:      {row['id']}" in content
-        assert "OWNER:       smarton" in content
+        assert "OWNER:       alice" in content
         assert "COMMAND:     tt-smi -r 0" in content
     finally:
         srv._action_row = None
@@ -1068,7 +1068,7 @@ def test_a_queued_job_that_never_started_is_abandoned_not_interrupted(monkeypatc
     monkeypatch.setattr(srv, "job_log_dir", logs)
     (logs / "2026-09-16_050100_901.log").write_text(
         "=" * 70 + "\n"
-        "JOB ID:      901\nOWNER:       sjett\nCOMMAND:     /home/sjett/job-body.sh\n"
+        "JOB ID:      901\nOWNER:       bob\nCOMMAND:     /home/bob/job-body.sh\n"
         "QUEUED:      2026-09-16T05:01:00.349696\n" + "-" * 70 + "\n"
         "[Waiting to start...]\n\n[HELD] device degraded — held for self-heal, not reset\n"
     )

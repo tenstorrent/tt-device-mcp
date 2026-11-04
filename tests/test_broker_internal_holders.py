@@ -19,9 +19,9 @@ from tt_device_mcp.device_holders import DeviceHolder, HolderScan, discount_brok
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
-    dh._clear_broker_internal()
+    dh._broker_internal.clear()
     yield
-    dh._clear_broker_internal()
+    dh._broker_internal.clear()
 
 
 GONE = 2**22 + 12345  # a pid no /proc entry has

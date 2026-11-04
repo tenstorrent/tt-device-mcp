@@ -9,21 +9,16 @@ The real probe pass runs here (HealthMonitor.update); only its leaf probes are s
 import pytest
 
 from tests.conftest import fsm_dirty, patch_health_event
-from tt_device_mcp import alert
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health.monitor import ETH_COULD_NOT_CHECK, ETH_LINK_DROP_SKIP
 from tt_device_mcp.health.monitors import eth, hostpci
-from tt_device_mcp.health.recovery import base, pcie_guard
+from tt_device_mcp.health.recovery import pcie_guard
 
 CHIPS = 32
 TIMED_OUT = (None, f"{ETH_COULD_NOT_CHECK}: {eth.READ_TIMED_OUT}")
 ADVANCING = (True, "all active-eth cores advancing (1s)")
-OUTAGE_HOLD = {
-    "TT_DEVICE_MCP_AUTO_MESH_RESET": "0",
-    "TT_DEVICE_MCP_AUTO_POWER_CYCLE": "0",
-}
 
 
 class _Logger:
@@ -41,9 +36,7 @@ class _Logger:
 
 @pytest.fixture
 def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
-    """A 32-chip Galaxy, every chip on the bus and ARC healthy, after a clean job exit whose eth read
-    times out. ``fabric`` records how many resets had run when each fabric pass ran; a reset makes the
-    eth read advance and, unless ``reset_heals`` is False, the fabric pass green."""
+    """A 32-chip Galaxy, every chip on the bus and ARC healthy, after a clean job exit whose eth read times out."""
     st = {
         "eth": TIMED_OUT,
         "fabric_bad": False,
@@ -62,9 +55,7 @@ def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
     srv.device_op_lock = None
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_MESH_RESET", "1")  # not the outage hold; OUTAGE_HOLD sets it to 0
     monkeypatch.delenv("TT_DEVICE_MCP_ETH_HEARTBEAT_CMD", raising=False)
-    monkeypatch.setattr(base, "_mesh_hold_paged", {})
     monkeypatch.setattr(srv, "eth_check_armed", True)
     monkeypatch.setattr(srv, "last_fabric_check_monotonic", srv.time.monotonic())
     mon = srv.health_monitor
@@ -118,7 +109,6 @@ def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
     monkeypatch.setattr(g.mechanism, "await_foreign_scope", no_scope)
     monkeypatch.setattr(g.mechanism, "reset_with_quiesce", reset)
     patch_health_event(monkeypatch, lambda name, *a, **k: st["events"].append(name))
-    monkeypatch.setattr(alert, "send_alert", lambda event, log=None: object())
     monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: {})
     captured = []
     monkeypatch.setattr(srv, "capture_incident", lambda kind, **k: captured.append((kind, k.get("evidence"))))
@@ -289,16 +279,6 @@ async def test_a_degraded_pcie_link_holds_and_never_releases(mesh):
     await _gate()
     assert srv.fsm.state is not ServerState.HEALTHY, "a failed host-pci check never releases"
     assert "PCIe link degraded" in mesh["log"].text()
-
-
-@pytest.mark.asyncio
-async def test_an_outage_hold_refuses_the_reset_and_keeps_todays_pass(mesh, monkeypatch):
-    for var, value in OUTAGE_HOLD.items():
-        monkeypatch.setenv(var, value)
-    await _gate()
-    assert mesh["resets"] == [] and "eth_timeout_mesh_reset" not in mesh["events"]
-    assert mesh["fabric"] == [0], "today's fabric pass ran instead"
-    assert srv._dispatch_reset_spent is False
 
 
 @pytest.mark.asyncio

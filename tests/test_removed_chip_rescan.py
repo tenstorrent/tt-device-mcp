@@ -26,10 +26,18 @@ from tt_device_mcp.health.recovery.stages import bridge_reset as bridge
 CHIPS = {"13": ("0000:46:00.0", "0000:40:01.1"), "14": ("0000:47:00.0", "0000:40:01.2")}
 
 
+def _wait_saved(timeout: float = 5.0) -> bool:
+    """Wait up to ``timeout`` for the last records-file write isolate_chip started."""
+    t = pci._save_thread
+    if t is not None:
+        t.join(timeout)
+        return not t.is_alive()
+    return True
+
+
 class FakeBus:
-    """Fake /sys/bus/pci/devices and /sys/class/tenstorrent. ``trace`` records ("sbr", bridge) for
-    each Secondary Bus Reset assert and ("rescan",) for each scoped rescan. A rescan brings back
-    every chip whose bridge was reset since its remove (``come_back`` False: none)."""
+    """Fake /sys/bus/pci/devices and /sys/class/tenstorrent. ``trace`` records ("sbr", bridge) for each Secondary Bus
+    Reset assert and ("rescan",) for each scoped rescan."""
 
     def __init__(self, tmp_path, monkeypatch, come_back=True):
         self.devices = tmp_path / "devices"
@@ -69,7 +77,7 @@ class FakeBus:
     def remove(self, idx):
         """isolate_chip, then what the kernel does on the remove write."""
         assert pci.isolate_chip(idx) is True
-        assert pci.wait_removed_chips_saved()
+        assert _wait_saved()
         bdf, _ = CHIPS[idx]
         (self.devices / bdf).unlink()
         (self.cls / f"tenstorrent!{idx}" / "device").unlink()
@@ -162,9 +170,8 @@ async def test_a_removed_chip_that_does_not_return_is_retried_through_the_same_b
 async def test_a_chip_the_bridge_rung_did_not_bring_back_is_not_promised_a_heal_without_a_power_cycle(
     tmp_path, monkeypatch, rung, chips
 ):
-    """The escalation line names what follows honestly: the galaxy reset re-powers the trays, and a chip
-    still off the bus after it goes to the power cycle. It never says no power cycle is needed, for a
-    lone chip or a partial drop of several, and it names every chip the bridge resets left off."""
+    """The escalation line names what follows honestly: the galaxy reset re-powers the trays, and a chip still off the
+    bus after it goes to the power cycle."""
     bus = FakeBus(tmp_path, monkeypatch, come_back=False)
     for idx in chips:
         bus.remove(idx)
@@ -230,9 +237,7 @@ async def test_no_rescan_when_a_removed_chip_has_no_usable_bridge(tmp_path, monk
 async def test_a_partial_round_resets_only_the_new_chip_and_the_spent_one_does_not_withhold_the_rescan(
     tmp_path, monkeypatch, rung
 ):
-    """Spec 04 I98 with I69: chip 13 had its SBR round this hold and is still off the bus; chip 14 drops
-    later. The round writes no bridge reset to 13, resets 14, and the rescan still runs: 13's bridge
-    was already reset this hold, so it does not count as a removed chip left unreset."""
+    """Spec 04 I98 with I69: chip 13 had its SBR round this hold and is still off the bus; chip 14 drops later."""
     monkeypatch.setattr(galaxy, "health_event", lambda kind, **f: rung.append((kind, f)))
     monkeypatch.setattr(srv, "device_hold_episode_since", "2026-01-01T00:00:00")
     bus = FakeBus(tmp_path, monkeypatch)
@@ -285,19 +290,6 @@ async def test_a_gate_refusal_keeps_the_bare_rescan_for_a_chip_the_broker_did_no
     assert bus.trace == [("rescan",)], "no SBR past the gate, one bare rescan"
     assert not _kinds(rung, "pci_rescan_withheld")
     assert srv.isolated_chips == set()
-
-
-@pytest.mark.asyncio
-async def test_a_removed_chip_reset_owes_the_aiclk_ceiling(tmp_path, monkeypatch, rung):
-    """Spec 03 I35: an SBR clears the firmware clock cap like any reset, including the batched reset
-    of a removed chip that returns on the pass's one rescan."""
-    owed = []
-    monkeypatch.setattr(recovery_pkg.CEILING, "mark_owed", lambda reason: owed.append(reason))
-    bus = FakeBus(tmp_path, monkeypatch)
-    bus.remove("13")
-    assert await _run({"13"}) is True
-    assert bus.trace[:2] == [("sbr", "0000:40:01.1"), ("rescan",)], bus.trace
-    assert owed == ["bridge reset of chip 13"]
 
 
 @pytest.mark.asyncio
@@ -643,9 +635,8 @@ def _drop_again(bus, idx):
 
 
 def test_a_chip_whose_record_was_dropped_gets_its_sbr_through_the_banked_port(tmp_path, monkeypatch, rung):
-    """The mesh reset's driver wait asks for the SBR of a chip that an earlier SBR brought back (so its
-    removal record is gone) and that left the bus again. The banked link names its root port, the port
-    still feeds the chip's now-empty bus, so the reset fires there."""
+    """The mesh reset's driver wait asks for the SBR of a chip that an earlier SBR brought back (so its removal record
+    is gone) and that left the bus again."""
     bus = FakeBus(tmp_path, monkeypatch)
     _bank("0000:46:00.0", "0000:47:00.0")
     _drop_again(bus, "13")
@@ -723,7 +714,7 @@ def test_the_records_file_write_never_holds_up_the_remove(tmp_path, monkeypatch)
     assert pci.isolate_chip("13") is True
     assert time.monotonic() - t0 < 1, "the remove did not wait for the file write"
     assert "13" in pci.REMOVED_CHIPS, "the record is in memory before the remove"
-    assert not pci.wait_removed_chips_saved(0.05), "the write is still waiting"
+    assert not _wait_saved(0.05), "the write is still waiting"
     gate.set()
-    assert pci.wait_removed_chips_saved()
+    assert _wait_saved()
     assert '"13"' in (pci.evidence.health_dir() / pci.REMOVED_CHIPS_FILE).read_text()

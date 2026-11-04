@@ -19,7 +19,7 @@ a window of the settle time in which a poller it started can run beside a reset 
 the flock may not be held across a subprocess such as ``systemctl start``, so it is only tested
 before the start, and the window can be narrowed, not closed. A
 poller that is disabled is left alone: stopping and disabling it is how an operator keeps it off.
-What it cannot fix goes to the broker's opt-in alert hook (``alert.py``), once per episode.
+What it cannot fix it logs as an ``ALERT`` line, once per episode.
 
 Run as root: ``python -m tt_device_mcp.health_probe``. Always exits 0 unless it crashes.
 """
@@ -28,13 +28,11 @@ import errno
 import fcntl
 import json
 import os
-import socket
 import subprocess
 import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from tt_device_mcp import alert
 from tt_device_mcp.constants import DEFAULT_SOCKET
 from tt_device_mcp.device_holders import enumerate_device_holders
 from tt_device_mcp.health.evidence import _default_health_dir
@@ -54,10 +52,8 @@ DEVICE_OP_FLOCK_NAME = "device-op.flock"
 TT_PCI_VENDOR = "0x1e52"
 STATE_FILE = "health_probe_state.json"
 # Read from the running broker's own environment when this unit does not set them, so the probe
-# uses the same hook, chip count and health dir as the broker with no second place to configure.
+# uses the same chip count and health dir as the broker with no second place to configure.
 INHERITED_ENV = (
-    "TT_DEVICE_MCP_ALERT_CMD",
-    "TT_DEVICE_MCP_ALERT_TIMEOUT_SEC",
     "TT_DEVICE_MCP_EXPECTED_CHIPS",
     "TT_DEVICE_MCP_HEALTH_DIR",
     "TT_DEVICE_MCP_POLLER_SERVICES",
@@ -148,7 +144,6 @@ class Probe:
         self.now: Callable[[], float] = time.time
         self.state: dict = {}
 
-    # --- host seams -------------------------------------------------------------------------
     def health(self) -> Optional[dict]:
         # No connect retry: a refused connect means the broker is down, and the probe must
         # see that at once rather than wait out the client's broker-restart retries.
@@ -212,9 +207,8 @@ class Probe:
         return total
 
     def device_op_lock(self) -> Optional[str]:
-        """The broker's in-flight device op from its inhibit file or its flock, or None. A file
-        whose pid is gone was left by a killed broker and is ignored, as the auto-updater ignores
-        it. The flock is only tested, never kept."""
+        """The broker's in-flight device op from its inhibit file or its flock, or None. A file whose pid is gone was
+        left by a killed broker and is ignored, as the auto-updater ignores it. The flock is only tested, never kept."""
         try:
             text = device_op_inhibit().read_text().strip()
         except FileNotFoundError:
@@ -247,7 +241,6 @@ class Probe:
         except OSError:
             return ""
 
-    # --- state ------------------------------------------------------------------------------
     def _load_state(self, health_dir: Path) -> None:
         try:
             self.state = json.loads((health_dir / STATE_FILE).read_text())
@@ -266,8 +259,8 @@ class Probe:
         except OSError as e:
             log(f"could not save {STATE_FILE}: {e}")
 
-    def _alert_once(self, kind: str, msg: str, key: str = "", **fields) -> None:
-        """Log ALERT and run the hook on the first lap of an episode; later laps stay quiet.
+    def _alert_once(self, kind: str, msg: str, key: str = "") -> None:
+        """Log ALERT on the first lap of an episode; later laps stay quiet.
         ``key`` names the episode when one kind has several (one per poller unit)."""
         key = key or kind
         if key in self.state["open"]:
@@ -275,17 +268,10 @@ class Probe:
             return
         self.state["open"].append(key)
         log(f"ALERT {msg}")
-        self._send(kind, msg, **fields)
 
     def _clear(self, key: str) -> None:
         if key in self.state["open"]:
             self.state["open"].remove(key)
-
-    def _send(self, kind: str, msg: str, **fields) -> None:
-        event = {"kind": kind, "host": socket.gethostname(), "detail": msg, **fields}
-        t = alert.send_alert(event)
-        if t is not None:
-            t.join(alert.alert_timeout_sec() + 5)  # a oneshot must not exit under its own hook
 
     def idle_why(self) -> Optional[str]:
         """Why the probe must stand back: the broker's own verdict, then a device op its inhibit
@@ -307,7 +293,6 @@ class Probe:
             log(f"stopped: {why}")
         return why is None
 
-    # --- the lap ----------------------------------------------------------------------------
     def run(self) -> int:
         for k, v in self.broker_env().items():
             os.environ.setdefault(k, v)  # first: the inhibit file's path is the broker's
@@ -368,17 +353,14 @@ class Probe:
             self._alert_once(
                 "health_probe_chips_missing",
                 f"rescan left {now}/{expected} chips: a link is down, needs a reset",
-                present=now,
-                expected=expected,
             )
         return True
 
     def _check_poller(self, unit: str) -> Optional[str]:
-        """Restart a stopped, enabled poller. Its state, 'absent' when it is not installed, or
-        None when the broker stopped being idle. The episode (spec 08 I17) opens when the probe
-        first has to act and closes after POLLER_OK_LAPS active laps in a row; it pages once,
-        when a start leaves the unit down, when it went down again inside the episode, or when
-        it stays 'activating' for POLLER_ACTIVATING_LAPS laps."""
+        """Restart a stopped, enabled poller. Its state, 'absent' when it is not installed, or None when the broker
+        stopped being idle. The episode (spec 08 I17) opens when the probe first has to act and closes after
+        POLLER_OK_LAPS active laps in a row; it pages once, when a start leaves the unit down, when it went down again
+        inside the episode, or when it stays 'activating' for POLLER_ACTIVATING_LAPS laps."""
         key = f"health_probe_telemetry_down:{unit}"
         rec = self.state.setdefault("pollers", {})
         if self.systemctl("show", "-p", "LoadState", "--value", unit) in ("", "not-found"):
@@ -405,8 +387,6 @@ class Probe:
                     "health_probe_telemetry_down",
                     f"{unit} still activating after {st['activating_laps']} laps",
                     key=key,
-                    unit=unit,
-                    state=state,
                 )
             else:
                 log(f"{unit} activating: left to systemd")
@@ -453,9 +433,6 @@ class Probe:
                 "health_probe_telemetry_down",
                 f"{unit} {after} after a restart{again}: it cannot open the chips or keeps exiting",
                 key=key,
-                unit=unit,
-                state=after,
-                restarts=st["restarts"],
             )
             if after == "active":
                 st["ok_laps"] = 1
@@ -482,7 +459,6 @@ class Probe:
         self.state["aer_alert_at"] = self.now()
         msg = f"AER count {total} across the chips (+{total - seen} since the last alert)"
         log(f"ALERT {msg}")
-        self._send("health_probe_aer", msg, aer_total=total, aer_new=total - seen)
         return total
 
 

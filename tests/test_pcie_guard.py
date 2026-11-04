@@ -75,9 +75,7 @@ def sysfs(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "tt_smi", pkg)
     monkeypatch.setitem(sys.modules, "tt_smi.constants", constants)
     monkeypatch.setattr(pcie_guard, "SYS_ROOT", tmp_path)
-    monkeypatch.setattr(pcie_guard, "_FLOOD_UNTIL", 0.0)
-    monkeypatch.setattr(pcie_guard, "_LAST_AER_SAMPLE", None)
-    monkeypatch.setenv("TT_DEVICE_MCP_AER_QUIET_CHECK_SEC", "0.01")
+    monkeypatch.setattr(pcie_guard, "AER_QUIET_CHECK_SEC", 0.01)
     patch_health_event(monkeypatch, lambda *a, **k: None)
     monkeypatch.setattr(pcie_guard, "health_event", lambda *a, **k: None)
     return tmp_path
@@ -142,18 +140,21 @@ def _beat(root, chip, value):
 # ---------------------------------------------------------------- the per-host gate
 
 
-def test_gate_is_off_by_default(sysfs, monkeypatch):
-    monkeypatch.delenv("TT_DEVICE_MCP_HOST_RESET_GATE", raising=False)
+def _latch_now():
+    """An I25 host-hang latch whose boot id cannot be shown stale, so it holds."""
+    (pcie_guard.health_dir() / pcie_guard.LATCH_FILE).write_text('{"boot_id": "boot-a"}')
+
+
+def test_the_gate_allows_a_reset_with_no_latch(sysfs, monkeypatch):
     assert pcie_guard.host_reset_gate(5) == (True, "")
 
 
-def test_hold_refuses_a_reset_over_chips_already_off_the_bus(sysfs, monkeypatch):
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "hold")
+def test_the_latch_refuses_a_reset_over_chips_already_off_the_bus(sysfs, monkeypatch):
+    assert pcie_guard.host_reset_gate(1)[0], "an off-bus chip alone does not hold"
+    _latch_now()
     assert pcie_guard.host_reset_gate(0)[0]
     allowed, why = pcie_guard.host_reset_gate(1)
     assert not allowed and "off the bus" in why
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "guard")
-    assert pcie_guard.host_reset_gate(1)[0], "guard alone does not hold on an off-bus chip"
 
 
 def test_chips_off_bus_counts_missing_functions(sysfs):
@@ -175,15 +176,15 @@ def test_chips_off_bus_counts_an_all_ones_chip_still_in_sysfs(sysfs, monkeypatch
     assert pcie_guard.chips_off_bus(4) == 0, "ticking heartbeats are on the bus"
     _all_ones(sysfs, monkeypatch, 2)
     assert pcie_guard.chips_off_bus(4) == 1
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "hold")
+    _latch_now()
     assert pcie_guard.host_reset_gate(pcie_guard.chips_off_bus(4))[0] is False
 
 
 @pytest.mark.asyncio
 async def test_a_hold_gate_refuses_the_mesh_reset_and_the_sweep_over_an_all_ones_chip(sysfs, monkeypatch):
-    """Spec 04 I24: in hold mode an all-ones chip with its function still listed refuses the mesh reset
-    and the back-to-back sweep alike. No glx_reset argv is ever issued."""
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "hold")
+    """Spec 04 I24: under the I25 latch an all-ones chip with its function still listed refuses the mesh
+    reset and the back-to-back sweep alike. No glx_reset argv is ever issued."""
+    _latch_now()
     _all_ones(sysfs, monkeypatch, 1)
     events, argvs = [], []
     patch_health_event(monkeypatch, lambda name, **k: events.append(name))
@@ -204,31 +205,13 @@ async def test_a_hold_gate_refuses_the_mesh_reset_and_the_sweep_over_an_all_ones
     assert events.count("host_reset_gated") == 2 and "reset_begin" not in events
 
 
-def test_guard_refuses_during_an_aer_flood(sysfs, monkeypatch):
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "guard")
-    counter = sysfs / "sys/bus/pci/devices/0000:40:01.1/aer_rootport_total_err_cor"
-    assert pcie_guard.host_reset_gate(0)[0]
-    counter.write_text("500\n")
-    allowed, why = pcie_guard.host_reset_gate(0)
-    assert not allowed and "flooding" in why
-    assert not pcie_guard.host_reset_gate(0)[0], "the flood window holds after the counters stop moving"
-
-
-def test_first_look_after_a_recent_boot_counts_errors_since_boot(sysfs, monkeypatch):
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "guard")
-    (sysfs / "proc").mkdir()
-    (sysfs / "proc/uptime").write_text("585.0 1000.0\n")
-    (sysfs / "sys/bus/pci/devices/0000:40:01.1/aer_rootport_total_err_cor").write_text("500\n")
-    assert not pcie_guard.host_reset_gate(0)[0]
-
-
 # ---------------------------------------------------------------- wired into the ladder
 
 
 @pytest.mark.asyncio
 async def test_hold_gate_stops_an_automatic_mesh_reset_over_an_off_bus_chip(sysfs, monkeypatch):
-    """The idle relift's glx_reset that dropped a chip must not be re-issued on the next pass."""
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "hold")
+    """Under the latch, the idle relift's glx_reset that dropped a chip is not re-issued on the next pass."""
+    _latch_now()
     os.unlink(sysfs / "sys/bus/pci/devices/0000:41:00.0")
     g = srv.galaxy_recovery
     monkeypatch.setattr(g.mechanism, "await_foreign_scope", lambda log: _false())
@@ -243,7 +226,6 @@ async def test_hold_gate_stops_an_automatic_mesh_reset_over_an_off_bus_chip(sysf
 
 @pytest.mark.asyncio
 async def test_guard_masks_the_root_ports_around_an_automatic_mesh_reset(sysfs, monkeypatch):
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "guard")
     g = srv.galaxy_recovery
     monkeypatch.setattr(g.mechanism, "await_foreign_scope", lambda log: _false())
     monkeypatch.setattr(g.monitor, "expected", lambda n: 4)
@@ -257,6 +239,30 @@ async def test_guard_masks_the_root_ports_around_an_automatic_mesh_reset(sysfs, 
     await g._reset_and_verify_device(["0", "1", "2", "3"], lambda m: None)
     assert masked == [True]
     assert all(_restored(sysfs, p) for p in PORTS)
+
+
+@pytest.mark.asyncio
+async def test_an_aer_flood_never_refuses_the_mesh_reset(sysfs, monkeypatch):
+    """A refused reset holds every rung above it (I22), so an on-bus hold during a flood would reach
+    neither the 10-min ladder nor the power cycle (I76): the reset fires, masked, whatever the counters."""
+    (sysfs / "proc").mkdir()
+    (sysfs / "proc/uptime").write_text("60.0 10.0\n")
+    g = srv.galaxy_recovery
+    monkeypatch.setattr(g.mechanism, "await_foreign_scope", lambda log: _false())
+    monkeypatch.setattr(g.monitor, "expected", lambda n: 4)
+    masked = []
+
+    async def reset(*a, **k):
+        masked.append(all(_masked(sysfs, p) for p in PORTS))
+        return 1, "reset failed"
+
+    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", reset)
+    for total in (5000, 50000):
+        for p in PORTS:
+            (sysfs / f"sys/bus/pci/devices/{p}/aer_rootport_total_err_cor").write_text(f"{total}\n")
+        assert pcie_guard.host_reset_gate(0) == (True, "")
+        await g._reset_and_verify_device(["0", "1", "2", "3"], lambda m: None)
+    assert masked == [True, True]
 
 
 async def _false():
@@ -286,7 +292,6 @@ def test_an_off_bus_reset_writes_an_intent_and_removes_it_when_done(sysfs):
 def test_an_intent_from_a_boot_that_died_latches_hold_until_cleared(sysfs, monkeypatch):
     events = []
     monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
     _boot(sysfs, "boot-a")
     pcie_guard.begin_offbus_reset("mesh reset", 1)  # the host dies before end_offbus_reset
     monkeypatch.setattr(pcie_guard, "_INTENT_OPEN", False)
@@ -295,14 +300,14 @@ def test_an_intent_from_a_boot_that_died_latches_hold_until_cleared(sysfs, monke
     assert latch["boot_id"] == "boot-a" and latch["kind"] == "mesh reset"
     assert events[0][0] == "offbus_reset_hold_latched" and events[0][1]["host_at_risk"] is True
     assert not (pcie_guard.health_dir() / pcie_guard.INTENT_FILE).exists()
-    assert pcie_guard.gate_mode() == pcie_guard.GATE_HOLD, "the latch overrides a configured gate of off"
+    assert pcie_guard.gate_mode() == pcie_guard.GATE_HOLD, "the latch holds"
     allowed, why = pcie_guard.host_reset_gate(1)
     assert not allowed and "--clear-hang-latch" in why
     assert pcie_guard.host_reset_gate(0)[0] is True, "a reset with every chip present still runs"
     assert pcie_guard.check_offbus_reset_latch(lambda m: None) is not None, "the latch survives a restart"
     assert pcie_guard.main(["--clear-hang-latch"]) == 0
     assert pcie_guard.offbus_reset_latched() is None
-    assert pcie_guard.gate_mode() == pcie_guard.GATE_OFF
+    assert pcie_guard.gate_mode() == pcie_guard.GATE_GUARD
 
 
 def test_an_intent_from_this_boot_does_not_latch(sysfs):
@@ -331,12 +336,9 @@ def _watch_dir_fsyncs(monkeypatch) -> list:
 async def test_a_sweep_that_fails_its_verify_leaves_no_intent_for_the_power_cycle(
     sysfs, monkeypatch, tmp_path, clear_job_state
 ):
-    """The last-chance sweep, its failed verify, then the broker's own power cycle: when the cycle's
-    command runs, the intent is gone AND that unlink reached the disk (the directory was fsynced after
-    it). An unlink still in the page cache is undone by the power loss, and the next boot latched the
-    broker's own cycle as a host hang (spec 04 I25)."""
+    """The last-chance sweep, its failed verify, then the broker's own power cycle: when the cycle's command runs, the
+    intent is gone AND that unlink reached the disk (the directory was fsynced after it)."""
     _boot(sysfs, "boot-a")
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
     monkeypatch.setattr(srv, "job_log_dir", tmp_path)
     g = srv.galaxy_recovery
     monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 0)
@@ -411,12 +413,10 @@ def _intent_then_cycle(sysfs, *, row_action, row_boot="boot-a", row_dt=60.0, boo
 
 @pytest.mark.parametrize("action", ["power-cycle", "reboot"])
 def test_an_intent_older_than_the_brokers_own_cycle_does_not_latch(sysfs, monkeypatch, action):
-    """The boot after the broker's own power cycle or reboot: an intent left from before it (an unlink
-    the power loss undid) is not a host hang. No latch, no event, and the mesh reset is not gated, so
-    the off-bus hold's ladder runs at once (spec 04 I25)."""
+    """The boot after the broker's own power cycle or reboot: an intent left from before it (an unlink the power loss
+    undid) is not a host hang."""
     events = []
     monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
     _intent_then_cycle(sysfs, row_action=action)
 
     assert srv.pcie_guard_at_start(lambda m: None) is None
@@ -424,7 +424,7 @@ def test_an_intent_older_than_the_brokers_own_cycle_does_not_latch(sysfs, monkey
     assert ("offbus_reset_intent_closed", True) in [(n, k.get("at_boot")) for n, k in events]
     assert not (pcie_guard.health_dir() / pcie_guard.INTENT_FILE).exists()
     assert pcie_guard.offbus_reset_latched() is None
-    assert pcie_guard.gate_mode() == pcie_guard.GATE_OFF
+    assert pcie_guard.gate_mode() == pcie_guard.GATE_GUARD
     assert pcie_guard.host_reset_gate(8) == (True, ""), "glx_reset over the off-bus chips is not gated"
 
 
@@ -494,7 +494,6 @@ def test_a_latch_holds_only_on_the_boot_it_was_written_in(sysfs, monkeypatch):
     and the broker drops it at start with an event; a latch that names no boot is no exception."""
     events = []
     monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
     _boot(sysfs, "boot-a")
     pcie_guard.begin_offbus_reset("mesh reset", 1)
     monkeypatch.setattr(pcie_guard, "_INTENT_OPEN", False)
@@ -503,7 +502,7 @@ def test_a_latch_holds_only_on_the_boot_it_was_written_in(sysfs, monkeypatch):
     assert pcie_guard.host_reset_gate(1)[0] is False, "held on the boot it was latched on"
     _boot(sysfs, "boot-c")  # e.g. the bounded power cycle (I27) or an operator's
     assert pcie_guard.offbus_reset_latched() is None
-    assert pcie_guard.gate_mode() == pcie_guard.GATE_OFF and pcie_guard.host_reset_gate(1) == (True, "")
+    assert pcie_guard.gate_mode() == pcie_guard.GATE_GUARD and pcie_guard.host_reset_gate(1) == (True, "")
     logs = []
     assert pcie_guard.check_offbus_reset_latch(logs.append) is None
     assert not (pcie_guard.health_dir() / pcie_guard.LATCH_FILE).exists()
@@ -515,12 +514,9 @@ def test_a_latch_holds_only_on_the_boot_it_was_written_in(sysfs, monkeypatch):
     assert pcie_guard.offbus_reset_latched() is not None, "with the boot id unreadable it cannot be shown stale"
 
 
-def _latched_past_the_ceiling_with_a_chip_off(sysfs, monkeypatch, gate: str) -> list:
+def _latched_past_the_ceiling_with_a_chip_off(sysfs, monkeypatch) -> None:
     """Boot-a began an off-bus reset, boot-b latched it, one chip is still off the bus and the latch
-    is older than its ceiling. Returns the pages sent."""
-    pages = []
-    monkeypatch.setattr(pcie_guard.alert, "send_alert", lambda event, log=None: pages.append(event))
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", gate)
+    is older than its ceiling."""
     _boot(sysfs, "boot-a")
     pcie_guard.begin_offbus_reset("mesh reset", 1)
     monkeypatch.setattr(pcie_guard, "_INTENT_OPEN", False)
@@ -529,48 +525,40 @@ def _latched_past_the_ceiling_with_a_chip_off(sysfs, monkeypatch, gate: str) -> 
     _take_off_bus(sysfs, 0)
     now = time.time()
     monkeypatch.setattr(time, "time", lambda: now + pcie_guard.LATCH_MAX_SEC + 1)
-    return pages
 
 
-@pytest.mark.parametrize("gate", ["off", "hold"])
-def test_with_no_power_cycle_a_latch_with_a_chip_off_lifts_at_its_ceiling(sysfs, monkeypatch, gate):
+def test_with_no_power_cycle_a_latch_with_a_chip_off_lifts_at_its_ceiling(sysfs, monkeypatch):
     """With TT_DEVICE_MCP_POWER_CYCLE_CMD unset no I27 cycle would end an off-bus hold, so the latch
-    lifts at its ceiling even with a chip off, pages once, and the gate follows its configured mode."""
-    pages = _latched_past_the_ceiling_with_a_chip_off(sysfs, monkeypatch, gate)
+    lifts at its ceiling even with a chip off, pages once, and the gate goes back to the AER guard."""
+    _latched_past_the_ceiling_with_a_chip_off(sysfs, monkeypatch)
     logs = []
     reason = pcie_guard.expire_offbus_reset_latch(len(CHIPS), True, logs.append)
     assert reason and "TT_DEVICE_MCP_POWER_CYCLE_CMD" in reason and "ceiling" in reason
     assert pcie_guard.offbus_reset_latched() is None
     assert any("lifted" in m for m in logs)
-    assert len(pages) == 1 and pages[0]["kind"] == "offbus_reset_hold_expired_off_bus"
-    assert "boot boot-a" in pages[0]["message"] and "boot boot-b" in pages[0]["message"]
     assert pcie_guard.expire_offbus_reset_latch(len(CHIPS), True, logs.append) is None
-    assert len(pages) == 1, "paged once"
-    if gate == "off":
-        assert pcie_guard.host_reset_gate(1) == (True, "")
-    else:
-        assert pcie_guard.host_reset_gate(1) == (False, "1 chip(s) off the bus and TT_DEVICE_MCP_HOST_RESET_GATE=hold")
+    assert pcie_guard.host_reset_gate(1) == (True, "")
 
 
 def test_with_no_power_cycle_the_gate_itself_lifts_a_latch_past_its_ceiling(sysfs, monkeypatch):
     """No health pass needed: the gate, asked with a chip off, ends the hold at its ceiling."""
-    pages = _latched_past_the_ceiling_with_a_chip_off(sysfs, monkeypatch, "off")
+    _latched_past_the_ceiling_with_a_chip_off(sysfs, monkeypatch)
     assert pcie_guard.host_reset_gate(1) == (True, "")
-    assert pcie_guard.offbus_reset_latched() is None and len(pages) == 1
+    assert pcie_guard.offbus_reset_latched() is None
 
 
 def test_with_a_power_cycle_a_latch_with_a_chip_off_still_holds_past_its_ceiling(sysfs, monkeypatch):
-    pages = _latched_past_the_ceiling_with_a_chip_off(sysfs, monkeypatch, "off")
+    _latched_past_the_ceiling_with_a_chip_off(sysfs, monkeypatch)
     monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", "/usr/local/bin/cycle-host")
     assert pcie_guard.expire_offbus_reset_latch(len(CHIPS), True, lambda m: None) is None
     allowed, why = pcie_guard.host_reset_gate(1)
-    assert not allowed and pcie_guard.offbus_reset_latched() is not None and not pages
+    assert not allowed and pcie_guard.offbus_reset_latched() is not None
     assert "ceiling" not in why, "the power cycle, not the ceiling, ends this hold"
 
 
 def test_the_hold_message_names_both_boots(sysfs, monkeypatch, capsys):
     """The reset ran in boot-a; the hold is on boot-b. Both the gate and the CLI say so."""
-    _latched_past_the_ceiling_with_a_chip_off(sysfs, monkeypatch, "off")
+    _latched_past_the_ceiling_with_a_chip_off(sysfs, monkeypatch)
     monkeypatch.setattr(time, "time", lambda: 0.0)  # inside the ceiling: it holds
     allowed, why = pcie_guard.host_reset_gate(1)
     assert not allowed
@@ -581,7 +569,6 @@ def test_the_hold_message_names_both_boots(sysfs, monkeypatch, capsys):
 def test_a_latch_from_an_ended_boot_never_gates_even_if_the_broker_never_restarted(sysfs, monkeypatch):
     """Field record: the reset sweep ran on boot A, the hold latched on boot B, the host is now on
     boot C and the broker has not dropped the file. Its boot has ended, so no rung is gated by it."""
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
     rec = {"kind": "reset sweep", "off_bus": 8, "boot_id": "boot-a", "at_epoch": time.time() - 90000}
     rec.update(latched_on_boot="boot-b", latched_at_epoch=time.time() - 89500)
     pcie_guard.health_dir().mkdir(parents=True, exist_ok=True)
@@ -589,22 +576,12 @@ def test_a_latch_from_an_ended_boot_never_gates_even_if_the_broker_never_restart
     _boot(sysfs, "boot-c")
     _take_off_bus(sysfs, 0)
     assert pcie_guard.offbus_reset_latched() is None
-    assert pcie_guard.gate_mode() == pcie_guard.GATE_OFF and pcie_guard.host_reset_gate(1) == (True, "")
-
-
-def test_the_latch_can_be_switched_off(sysfs, monkeypatch):
-    _boot(sysfs, "boot-a")
-    pcie_guard.begin_offbus_reset("tray re-power", 1)
-    _boot(sysfs, "boot-b")
-    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_HANG_LATCH", "0")
-    assert pcie_guard.check_offbus_reset_latch(lambda m: None) is None
-    assert pcie_guard.offbus_reset_latched() is None
+    assert pcie_guard.gate_mode() == pcie_guard.GATE_GUARD and pcie_guard.host_reset_gate(1) == (True, "")
 
 
 def _latched(monkeypatch, root, events) -> dict:
     """A host-hang hold latched on boot-b: an off-bus reset on boot-a never finished."""
     monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
     _boot(root, "boot-a")
     pcie_guard.begin_offbus_reset("mesh reset", 1)
     monkeypatch.setattr(pcie_guard, "_INTENT_OPEN", False)
@@ -634,7 +611,7 @@ def test_the_latch_lifts_once_every_chip_is_back_and_host_pci_is_ok(sysfs, monke
     assert reason and "host-pci is OK" in reason
     assert pcie_guard.offbus_reset_latched() is None
     assert not (pcie_guard.health_dir() / pcie_guard.LATCH_FILE).exists()
-    assert pcie_guard.gate_mode() == pcie_guard.GATE_OFF
+    assert pcie_guard.gate_mode() == pcie_guard.GATE_GUARD
     assert events[-1][0] == "offbus_reset_hold_expired" and events[-1][1]["reason"] == reason
     assert any("lifted" in m for m in logs)
     assert pcie_guard.expire_offbus_reset_latch(n, True, logs.append) is None, "nothing left to lift"
@@ -672,7 +649,7 @@ def test_the_latch_lifts_at_its_ceiling_with_every_chip_on_the_bus(sysfs, monkey
     assert pcie_guard.host_reset_gate(1)[0] is False, "a gate asked with a chip off never lifts it"
     assert pcie_guard.offbus_reset_latched() is not None
     assert pcie_guard.host_reset_gate(0) == (True, "")
-    assert pcie_guard.offbus_reset_latched() is None and pcie_guard.gate_mode() == pcie_guard.GATE_OFF
+    assert pcie_guard.offbus_reset_latched() is None and pcie_guard.gate_mode() == pcie_guard.GATE_GUARD
     assert "ceiling" in events[-1][1]["reason"]
     # A latch that names no time ages from its file; a ceiling set lower is honoured.
     _latched(monkeypatch, sysfs, events)
@@ -680,14 +657,8 @@ def test_the_latch_lifts_at_its_ceiling_with_every_chip_on_the_bus(sysfs, monkey
     path.write_text('{"latched_on_boot": "boot-b"}')
     old = time.time() - 120
     os.utime(path, (old, old))
-    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_HANG_LATCH_MAX_SEC", "60")
+    monkeypatch.setattr(pcie_guard, "LATCH_MAX_SEC", 60)
     assert "ceiling" in pcie_guard.expire_offbus_reset_latch(len(CHIPS), False, lambda m: None)
-
-
-@pytest.mark.parametrize("raw", ["", "0", "-5", "nan", "inf", "six hours"])
-def test_the_latch_ceiling_defaults_and_rejects_nonsense(monkeypatch, raw):
-    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_HANG_LATCH_MAX_SEC", raw)
-    assert pcie_guard.latch_max_sec() == pcie_guard.LATCH_MAX_SEC == 21600
 
 
 def test_a_latch_that_cannot_be_removed_keeps_holding(sysfs, monkeypatch):
@@ -726,15 +697,10 @@ async def test_the_between_jobs_check_lifts_the_latch_once_the_mesh_is_back(sysf
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("latched", [False, True])
-async def test_the_per_chip_bridge_reset_obeys_the_hold_gate_and_the_latch(sysfs, monkeypatch, latched):
+async def test_the_per_chip_bridge_reset_obeys_the_latch(sysfs, monkeypatch):
     from tt_device_mcp.health import recovery as recovery_pkg
 
-    if latched:
-        monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "off")
-        (pcie_guard.health_dir() / pcie_guard.LATCH_FILE).write_text('{"boot_id": "boot-a"}')
-    else:
-        monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "hold")
+    _latch_now()
     srv.isolated_chips = {"1"}
     srv.device_pci_map = {"1": "0000:41:00.0"}
     monkeypatch.setattr(recovery_pkg, "bridge_reset_enabled", lambda: True)
@@ -768,7 +734,6 @@ def _forget_in_process(monkeypatch):
 def test_guard_masks_an_off_bus_chips_port_around_a_mesh_reset(sysfs, monkeypatch):
     pcie_guard.tt_endpoints()
     _take_off_bus(sysfs, 1)
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "guard")
     mask = pcie_guard.mask_for_mesh_reset(lambda m: None)
     assert "0000:40:01.1" in mask.ports and _masked(sysfs, "0000:40:01.1")
     mask.restore(quiet_sec=0)
@@ -817,46 +782,8 @@ def test_a_latch_that_cannot_be_removed_is_reported_not_called_absent(sysfs, mon
 
 
 @pytest.mark.asyncio
-async def test_after_a_kept_masked_port_the_stuck_hold_mesh_reset_does_not_fire(sysfs, monkeypatch):
-    monkeypatch.delenv("TT_DEVICE_MCP_HOST_RESET_GATE", raising=False)
-    pcie_guard._note_flood()
-    g = srv.galaxy_recovery
-    monkeypatch.setattr(g.mechanism, "await_foreign_scope", lambda log: _false())
-    monkeypatch.setattr(g.monitor, "expected", lambda n: 4)
-
-    async def no_reset(*a, **k):
-        pytest.fail("mesh reset fired inside the flood window")
-
-    monkeypatch.setattr(g.mechanism, "reset_with_quiesce", no_reset)
-    assert await g._reset_and_verify_device(["0", "1", "2", "3"], lambda m: None) is False
-
-
-def test_a_steady_trickle_between_distant_looks_is_not_a_flood(sysfs, monkeypatch):
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "guard")
-    counter = sysfs / "sys/bus/pci/devices/0000:40:01.1/aer_rootport_total_err_cor"
-    clock = [10_000.0]
-    monkeypatch.setattr(pcie_guard.time, "monotonic", lambda: clock[0])
-    assert pcie_guard.host_reset_gate(0)[0]
-    clock[0] += 6 * 3600  # six hours later, 300 more correctable errors: under one a minute
-    counter.write_text("300\n")
-    assert pcie_guard.host_reset_gate(0)[0], "a trickle hours apart is not a flood"
-    clock[0] += 10  # 100 more in ten seconds is
-    counter.write_text("400\n")
-    allowed, why = pcie_guard.host_reset_gate(0)
-    assert not allowed and "flooding" in why
-
-
-def test_a_trickle_since_an_old_boot_is_not_a_flood(sysfs, monkeypatch):
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "guard")
-    (sysfs / "proc").mkdir()
-    (sysfs / "proc/uptime").write_text("1500.0 1000.0\n")  # 25 min up, 60 errors since: a trickle
-    (sysfs / "sys/bus/pci/devices/0000:40:01.1/aer_rootport_total_err_cor").write_text("60\n")
-    assert pcie_guard.host_reset_gate(0)[0]
-
-
-@pytest.mark.asyncio
 async def test_a_gated_mesh_reset_records_no_reset_and_arms_no_cooldown(sysfs, monkeypatch):
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "hold")
+    _latch_now()
     os.unlink(sysfs / "sys/bus/pci/devices/0000:41:00.0")
     events = []
     patch_health_event(monkeypatch, lambda name, **k: events.append(name))
@@ -940,7 +867,7 @@ UNREADABLE = [
 @pytest.mark.parametrize("how", UNREADABLE[:-1])
 def test_an_unreadable_sysfs_counts_every_chip_off_so_a_hold_gate_holds(sysfs, monkeypatch, how):
     _break_sysfs(sysfs, monkeypatch, how)
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "hold")
+    _latch_now()
     off_bus = pcie_guard.chips_off_bus(len(CHIPS))
     if how == "devices dir missing":
         assert off_bus == 0, "no PCI sysfs at all: nothing to count, the AER evidence decides"
@@ -1049,7 +976,6 @@ def test_an_unreadable_sysfs_under_guard_logs_a_mask_failure(sysfs, monkeypatch)
     and masks the ports an earlier look recorded."""
     pcie_guard.record_topology()
     _break_sysfs(sysfs, monkeypatch, "devices dir unlistable")
-    monkeypatch.setenv("TT_DEVICE_MCP_HOST_RESET_GATE", "guard")
     events, logs = [], []
     monkeypatch.setattr(pcie_guard, "health_event", lambda name, **k: events.append((name, k)))
     mask = pcie_guard.mask_for_mesh_reset(logs.append)

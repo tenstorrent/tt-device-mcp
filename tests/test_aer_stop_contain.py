@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from tests.conftest import fsm_dirty
+from tests.conftest import fsm_dirty, settle_isolations
 from tests.test_aer_check_stop import _sig
 from tests.test_deadchip_detach_before_kill import FABRIC, TENANT, valve  # noqa: F401 - the fixture
 from tests.test_offbus_early_watch import _Clock
@@ -47,7 +47,6 @@ def watch(valve, monkeypatch):  # noqa: F811
     monkeypatch.setattr(srv.sampler, "ring", deque(maxlen=8))
     monkeypatch.setattr(srv.sampler, "loop", None)
     monkeypatch.setattr(srv.sampler, "aer_containment", None)
-    monkeypatch.setattr(srv.CEILING, "proc", None)
     monkeypatch.setattr(FABRIC_DEBT, "owed", "")
     # A host whose lift needs a passing full check with fabric (03 I78).
     monkeypatch.setattr(FABRIC_DEBT, "runs_here", lambda expected: True)
@@ -83,8 +82,18 @@ async def _contain(burst):
     fut = srv.sampler.aer_containment
     assert fut is not None, "the containment was handed to the loop"
     await asyncio.wait_for(asyncio.wrap_future(fut), 10)
-    await asyncio.wait_for(srv.sampler.settle_isolations(), 10)
+    await asyncio.wait_for(settle_isolations(srv.sampler), 10)
     return reason
+
+
+async def _contain_now(chips, why):
+    """The production entry (03 I96): containment on a worker thread, then what it handed the loop."""
+    srv.sampler.loop = asyncio.get_running_loop()
+    row = await asyncio.to_thread(srv.sampler.contain_on_thread, chips, chips, why)
+    fut = srv.sampler.aer_containment
+    if row is not None and fut is not None:
+        await asyncio.wait_for(asyncio.wrap_future(fut), 10)
+    return row
 
 
 def _rows(kind):
@@ -129,10 +138,8 @@ async def test_an_all_ones_burst_chip_is_removed_before_any_reader_is_killed(wat
     ["no sample", "every chip answers", "another chip all-ones", "blackout", "stale sample"],
 )
 def test_with_no_all_ones_burst_chip_the_stop_kills_only_once_the_chips_answer(watch, case):
-    """No contained chip: the I92 stop, SIGSTOP, no remove. The burst chip is still attached, so no
-    SIGKILL until a sample after the stop reads it answering (a killed reader's fd close would reach
-    it). A blackout (every chip all-ones, the class A/C fault) is never contained here: its direct
-    power cycle path stands."""
+    """No contained chip: the I92 stop, SIGSTOP, no remove. The burst chip is still attached, so no SIGKILL until a
+    sample after the stop reads it answering (a killed reader's fd close would reach it)."""
     w, log, _detach_ok, burst = watch
     if case == "every chip answers":
         _sample()
@@ -205,8 +212,8 @@ async def test_a_reset_that_took_the_chips_since_the_stop_refuses_and_keeps_the_
     if step == "reset_in_flight":
         monkeypatch.setattr(srv.recovery_mechanism, "reset_in_flight", True)
     else:
-        monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: "ttdev-reset.scope")
-    await srv.sampler.contain_after_aer_stop(["13"], ["13"], "AER burst on chip(s) 13")
+        monkeypatch.setattr(srv.sampler, "scope_seen", True)
+    await _contain_now(["13"], "AER burst on chip(s) 13")
     assert not [e for e in log if e[0] in ("detach", "kill")], log
     assert _rows("check_aer_contain_refused")[-1]["reason"] == "reset_in_flight"
     assert srv.fsm.state is not ServerState.HEALTHY and srv._hold_lift_unproven()
@@ -218,15 +225,13 @@ async def test_a_contained_chip_is_contained_once(watch):
     _sample("13")
     await _contain(burst)
     n = len(log)
-    await srv.sampler.contain_after_aer_stop(["13"], ["13"], "again")
+    assert await _contain_now(["13"], "again") is None
     assert len(log) == n and len(_rows("chip_contained")) == 1
 
 
 @pytest.mark.asyncio
 async def test_the_contained_hold_runs_the_full_ladder_at_the_bound_then_the_host_rung(watch, monkeypatch):
-    """Goals of spec 04 I76 on this path: the hold the containment opens is a hold like any other.
-    At 10 min the broker's own full ladder runs, and a ladder that does not heal goes on to the
-    host rung; nothing before it lifts the hold."""
+    """Goals of spec 04 I76 on this path: the hold the containment opens is a hold like any other."""
     _w, _log, _detach_ok, burst = watch
     _sample("13")
     await _contain(burst)
@@ -237,13 +242,12 @@ async def test_the_contained_hold_runs_the_full_ladder_at_the_bound_then_the_hos
         escalations.append(kind)
         return OUTCOME_TERMINAL
 
-    async def host_rung(age, log):
+    async def host_rung(age, log, *a, **k):
         events.append("host_rung")
 
     monkeypatch.setattr(srv.galaxy_recovery, "escalate", ladder)
     monkeypatch.setattr(srv, "_hold_bound_host_rung", host_rung)
     monkeypatch.setattr(srv.fsm, "on_outcome", lambda outcome: None)
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: None)
     monkeypatch.setattr(srv, "_forced_escalation_task", None)
     # The host as the containment left it: chip 13 removed from the bus, chip 14 present and beating.
     monkeypatch.setattr(srv, "_present_chip_indices", lambda: ["14"])
@@ -259,8 +263,7 @@ async def test_the_contained_hold_runs_the_full_ladder_at_the_bound_then_the_hos
 
 @pytest.mark.asyncio
 async def test_the_contained_hold_fails_the_full_check_gate_into_the_bounded_recovery(watch):
-    """A pass from before the fault no longer vouches (03 I82, I78): the hold needs a new full
-    check with fabric."""
+    """A pass from before the fault no longer vouches (03 I82, I78): the hold needs a new full check with fabric."""
     _w, _log, _detach_ok, burst = watch
     FABRIC_DEBT.note_fabric(True)
     fsm_dirty(srv, "startup: the mesh is unverified after a broker start", why="job_killed")
@@ -273,11 +276,9 @@ async def test_the_contained_hold_fails_the_full_check_gate_into_the_bounded_rec
 @pytest.mark.asyncio
 @pytest.mark.parametrize("first", ["containment", "sampler"])
 async def test_overlapping_valve_runs_kill_nobody_before_every_all_ones_chip_is_removed(watch, monkeypatch, first):
-    """The containment of chip 13 and the sampler's own valve run for chip 14 overlap on one loop,
-    either one first, each remove held until the test lets it end: the first one's until the second
-    run's remove is queued, the second one's until the first run has decided. No run clears or replaces the other's all-ones
-    chips: while either chip is attached nobody is killed and no poller stops; once both are removed
-    the valve kills as usual, and the hold stays."""
+    """The containment of chip 13 and the sampler's own valve run for chip 14 overlap on one loop, either one first,
+    each remove held until the test lets it end: the first one's until the second run's remove is queued, the second
+    one's until the first run has decided."""
     import threading
 
     _w, log, _detach_ok, _burst = watch
@@ -302,7 +303,7 @@ async def test_overlapping_valve_runs_kill_nobody_before_every_all_ones_chip_is_
     ones13 = live(ALL_ONES) if first == "containment" else live(1)
 
     def contain():
-        return asyncio.ensure_future(srv.sampler.contain_after_aer_stop(["13"], ["13"], "AER burst on chip(s) 13"))
+        return asyncio.ensure_future(_contain_now(["13"], "AER burst on chip(s) 13"))
 
     def sample():
         return asyncio.ensure_future(
@@ -326,7 +327,7 @@ async def test_overlapping_valve_runs_kill_nobody_before_every_all_ones_chip_is_
         gate.set()
         gate2.set()
     await asyncio.wait_for(asyncio.gather(*runs), 15)
-    await asyncio.wait_for(srv.sampler.settle_isolations(), 15)
+    await asyncio.wait_for(settle_isolations(srv.sampler), 15)
     last = max(log.index(("detached", "13")), log.index(("detached", "14")))
     early = [e for e in log[:last] if e[0] in ("kill", "pollers")]
     assert not early, f"a kill or poller stop came while an all-ones chip was attached: {log}"
@@ -397,6 +398,8 @@ def test_a_journal_stalled_in_fsync_bounds_the_wait_and_delays_neither_signal(wa
         release.wait(30)
 
     monkeypatch.setattr(evidence, "_append_durable", fsync_stall)
+    # The valve fixture writes detached records at once; this test needs the real writer thread.
+    monkeypatch.setattr(srv, "health_event_detached", evidence.health_event_detached)
     monkeypatch.setattr(srv, "logger", None)
     try:
         t = threading.Thread(target=burst, daemon=True)

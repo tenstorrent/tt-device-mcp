@@ -79,10 +79,9 @@ def _tray_of(bus: int, groups: Optional[dict]) -> Optional[int]:
 
 
 def snapshot(suspect=()) -> dict:
-    """``{chip id: record}`` for every Tenstorrent function the kernel lists now. A chip off the bus
-    has no node and is absent (the delta names it ``gone``). ``suspect`` are chip ids whose last
-    sampler read was all-ones: their own link is not read, as for a lost chip. Never raises: {} when
-    sysfs cannot be read."""
+    """``{chip id: record}`` for every Tenstorrent function the kernel lists now. A chip off the bus has no node and is
+    absent (the delta names it ``gone``). ``suspect`` are chip ids whose last sampler read was all-ones: their own link
+    is not read, as for a lost chip. Never raises: {} when sysfs cannot be read."""
     try:
         eps = pcie_guard.tt_endpoints()
     except Exception:  # noqa: BLE001 - telemetry never fails the caller
@@ -158,10 +157,9 @@ def _link_key(link: Optional[dict]) -> Optional[tuple]:
 
 
 def delta(before: dict, after: dict) -> list:
-    """The chips with something to report between two snapshots, sorted by chip id: a non-zero AER
-    delta at the endpoint or the root port, a link that changed at either end (only where both
-    snapshots read it), or a chip that left or joined the bus. Each entry names the chip, its BDF,
-    root port and tray."""
+    """The chips with something to report between two snapshots, sorted by chip id: a non-zero AER delta at the endpoint
+    or the root port, a link that changed at either end (only where both snapshots read it), or a chip that left or
+    joined the bus. Each entry names the chip, its BDF, root port and tray."""
     rows = []
     ids = set(before) | set(after)
 

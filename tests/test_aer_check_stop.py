@@ -61,7 +61,6 @@ def rig(monkeypatch):
     monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", _Reader(FABRIC))
     monkeypatch.setattr(srv.health_monitor, "snapshot_proc", None, raising=False)
     monkeypatch.setattr(srv, "eth_selftest_proc", None, raising=False)
-    monkeypatch.setattr(srv.CEILING, "proc", None)
     monkeypatch.setattr(FABRIC_DEBT, "owed", "")
     log = []
     monkeypatch.setattr(
@@ -125,7 +124,7 @@ def test_a_burst_stops_every_reader_before_any_write_and_owes_a_full_pass(rig, m
     [("startup: the mesh is unverified after a broker start", "job_killed"), ("job 041 ended failed", "job_killed")],
 )
 def test_the_stop_keeps_the_hold_and_the_earlier_pass_no_longer_vouches(rig, monkeypatch, detail, why):
-    """Startup and post-job checks alike: the stop only ends the run; the hold stays (goal 11)."""
+    """Startup and post-job checks alike: the stop only ends the run; the hold stays."""
     w, clock, _log, feed = rig
     monkeypatch.setattr(FABRIC_DEBT, "runs_here", lambda expected: True)
     FABRIC_DEBT.note_fabric(True)  # a pass from before the fault
@@ -293,10 +292,9 @@ def test_a_slow_rise_another_path_or_one_below_the_count_never_stops(rig):
 
 
 def test_an_idle_watch_reads_only_kernel_memory_and_signals_nobody(rig, monkeypatch):
-    """Always on (03 I96): with no check reader running the watch still reads I79's counters and the
-    node list every tick, but nothing that reaches a chip: no config-space read unless
-    WATCH_CONFIG_CONFIRM, no DLLLA read unless WATCH_DLLLA. A burst with every chip answering stops
-    nobody (no broker reader runs, and a tenant is never touched for it)."""
+    """Always on (03 I96): with no check reader running the watch still reads I79's counters and the node list every
+    tick, but nothing that reaches a chip: no config-space read unless WATCH_CONFIG_CONFIRM, no DLLLA read unless
+    WATCH_DLLLA."""
     w, clock, log, feed = rig
     monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", None)
     config = []
@@ -332,7 +330,6 @@ def test_a_journal_stalled_in_fsync_delays_neither_signal(monkeypatch):
     monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", _Reader(FABRIC))
     monkeypatch.setattr(srv.health_monitor, "snapshot_proc", None, raising=False)
     monkeypatch.setattr(srv, "eth_selftest_proc", None, raising=False)
-    monkeypatch.setattr(srv.CEILING, "proc", None)
     monkeypatch.setattr(srv, "logger", None)
     monkeypatch.setattr(FABRIC_DEBT, "owed", "")
     monkeypatch.setattr(srv.sampler, "ring", deque(maxlen=8))

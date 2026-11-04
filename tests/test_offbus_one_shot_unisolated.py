@@ -86,9 +86,8 @@ def _assert_one_shot_ran(count, calls, released):
 
 @pytest.mark.asyncio
 async def test_an_enumerated_dead_arc_chip_arms_the_one_shot_on_its_short_clock(mesh, monkeypatch, verdict):
-    """Chip 8 enumerates with a dead ARC and is not isolated: the gate counts it off the bus, holds below
-    the floor, and the next sampler tick runs the one-shot. Its reset frees the device only through the
-    full post-reset check, fabric included."""
+    """Chip 8 enumerates with a dead ARC and is not isolated: the gate counts it off the bus, holds below the floor, and
+    the next sampler tick runs the one-shot."""
     evidence, released = verdict
     _, bridges, count = _below_floor_hold(monkeypatch, mesh, {"now": IDLE})
     monkeypatch.setattr(srv, "_offbus_hold_chips", set(), raising=False)
@@ -109,9 +108,8 @@ async def test_an_enumerated_dead_arc_chip_arms_the_one_shot_on_its_short_clock(
 async def test_a_hold_carried_across_a_restart_arms_the_one_shot_for_its_dead_arc_chip(
     mesh, monkeypatch, tmp_path, verdict
 ):
-    """The broker restarts mid-hold: the new process has no isolated chip and no record of the old one's,
-    and its startup gate finds chip 8 enumerated with a dead ARC. The carried hold keeps its clock and the
-    next sampler tick runs the one-shot, not the 10-min bound. Released only through the full check."""
+    """The broker restarts mid-hold: the new process has no isolated chip and no record of the old one's, and its
+    startup gate finds chip 8 enumerated with a dead ARC."""
     evidence, released = verdict
     _, bridges, count = _below_floor_hold(monkeypatch, mesh, {"now": IDLE})
     monkeypatch.setattr(health, "HEALTH_DIR", tmp_path)

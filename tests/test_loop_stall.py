@@ -71,8 +71,7 @@ async def _ticks_while(coro, every: float = 0.05):
 
 @pytest.mark.asyncio
 async def test_health_answers_within_a_second_while_the_chip_read_hangs(status_rig):
-    """The loop stays free: /health answers from the last read, with its age, while a fresh read
-    hangs in its thread."""
+    """The loop stays free: /health answers from the last read, with its age, while a fresh read hangs in its thread."""
     first = await srv._status_view(srv._health_payload)
     assert "chip_read_stale_sec" not in first
     assert first["off_bus"] == 0
@@ -222,8 +221,7 @@ async def test_a_timed_out_read_never_lifts_a_hold(
 async def test_a_readable_device_still_lifts_through_the_offloop_read(
     status_rig, monkeypatch, broker_root, enum_arc, events  # noqa: F811
 ):
-    """The same lift with the chips answering: the off-loop read changes where it runs, not what
-    it decides."""
+    """The same lift with the chips answering: the off-loop read changes where it runs, not what it decides."""
     _fabric_only_hold(monkeypatch)
     job = _finished(_job("602", f"{broker_root}/fabric-check.sh", peer_uid=0))
     assert await srv._settle_verification_job(job)

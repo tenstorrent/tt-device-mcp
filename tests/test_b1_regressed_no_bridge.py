@@ -73,7 +73,6 @@ def _episode(monkeypatch, *, held_sec=96, check_passes=False):
     monkeypatch.setattr(srv.galaxy_recovery, "_tray_map_now", lambda: None)
     monkeypatch.setattr(srv.galaxy_recovery, "_chip_buses_now", lambda: {})
     monkeypatch.setattr(galaxy_mod, "_settle_before_host_rung_sec", lambda: 0)
-    monkeypatch.setattr(galaxy_mod, "refuse_mesh_reset", lambda *a, **k: False)
     monkeypatch.setattr(pcie_guard, "chips_off_bus", lambda expected: 1)
     monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off_bus: (True, ""))
     monkeypatch.setattr(pcie_guard, "mask_for_mesh_reset", lambda log: None)
@@ -94,9 +93,8 @@ def _kinds(events):
 async def test_no_bridge_regressed_hold_power_cycles_on_the_first_pass_after_the_kept_rungs(
     monkeypatch, clear_job_state
 ):
-    """Spec 04 I79/I31/I22: no deferral to the ladder end. The kept rungs run once each (the SBR, found
-    inapplicable; the sweep's one mesh reset; the full check with fabric), then the power cycle, on the
-    pass at 96 s. Fails before I79: host_rung_deferred_until_ladder_end, no sweep, no cycle."""
+    """Spec 04 I79/I31/I22: no deferral to the ladder end. The kept rungs run once each (the SBR, found inapplicable;
+    the sweep's one mesh reset; the full check with fabric), then the power cycle, on the pass at 96 s."""
     counters, events, order = _episode(monkeypatch)
     assert await _forced_pass() is True
     kinds = _kinds(events)
@@ -128,9 +126,8 @@ async def test_no_bridge_regressed_hold_released_only_by_a_passing_full_check(mo
 async def test_no_bridge_regressed_hold_with_the_cycle_held_off_is_asked_again_at_the_ten_minute_mark(
     monkeypatch, clear_job_state
 ):
-    """A power cycle held off on the 96 s pass (a cooldown, the rate limit) returns before the sweep and
-    keeps the hold, with no release. The forced pass at the 10-min mark runs the kept rungs and asks for
-    the cycle (spec 04 I76/I79)."""
+    """A power cycle held off on the 96 s pass (a cooldown, the rate limit) returns before the sweep and keeps the hold,
+    with no release. The forced pass at the 10-min mark runs the kept rungs and asks for the cycle (spec 04 I76/I79)."""
     counters, events, order = _episode(monkeypatch)
     allowed = {"ok": False}
     monkeypatch.setattr(

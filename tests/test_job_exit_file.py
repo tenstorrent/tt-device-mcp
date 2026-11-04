@@ -100,9 +100,7 @@ def test_a_file_the_job_could_not_write_is_not_left_behind(monkeypatch, tmp_path
 
 
 def test_a_co_tenant_cannot_win_the_path_while_the_fresh_file_is_made(monkeypatch, tmp_path, caplog):
-    """Review #1864 F1: in the sticky shared dir another user may create ``<id>.exit`` at any moment.
-    Removing the old file and then creating the new one leaves a window where theirs wins and the
-    job starts on a file it cannot write; the fresh file must replace the path in one step."""
+    """In the sticky shared dir another user may create ``<id>.exit`` at any moment."""
     monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
     path = tmp_path / "046.exit"
     path.write_text("0")  # the co-tenant's planted clean exit
@@ -322,7 +320,7 @@ def test_an_exit_file_that_is_not_one_plain_file_reads_as_unknown(monkeypatch, t
 
 
 def test_an_exit_file_another_user_owns_reads_as_unknown(monkeypatch, tmp_path):
-    """A file owned by neither the broker nor the job's submitter is a co-tenant's (review #1864 F1)."""
+    """A file owned by neither the broker nor the job's submitter is a co-tenant's."""
     monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
     (tmp_path / "078.exit").write_text("0")
     mine = os.geteuid()

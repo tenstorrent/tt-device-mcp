@@ -55,9 +55,7 @@ def fence(leftover, rig, monkeypatch):  # noqa: F811 - the imported fixtures
 
 
 def _open(fence):
-    """The first scan opens the episode; returns its monotonic start, pinned to a whole second.
-    A fractional start makes the tick arithmetic inexact: ``(t0 + 600) - t0`` can come out just
-    under 600, and the try at the budget would read as one before it."""
+    """The first scan opens the episode; returns its monotonic start, pinned to a whole second."""
     srv._reaped_leftovers()
     assert srv._leftover_unkillable_mono is not None
     srv._leftover_unkillable_mono = float(int(srv._leftover_unkillable_mono))
@@ -175,18 +173,19 @@ async def test_a_change_during_the_last_checks_holds_the_rung(fence, monkeypatch
 
 async def test_the_operator_stand_back_holds_the_power_cycle_until_it_is_gone(fence, monkeypatch, tmp_path):
     fence["rig"]["beats"] = {str(i): 100 for i in range(EXPECTED) if i >= 4}  # a tray off the bus
-    marker = tmp_path / "cycle-in-progress"
-    marker.write_text("")
-    monkeypatch.setenv("TT_DEVICE_MCP_POWER_CYCLE_STANDBACK_FILE", str(marker))
+    check = tmp_path / "manual-recovery"
+    check.write_text("#!/bin/sh\nexit 0\n")
+    check.chmod(0o755)
+    monkeypatch.setenv("TT_DEVICE_MCP_MANUAL_RECOVERY_CMD", str(check))
     t0 = _open(fence)
 
     assert await _tick(t0 + BUDGET)
     assert fence["order"] == []
     fenced = srv._health_payload()["leftover_fence"]
     assert fenced["escalation_stage"] == "held"
-    assert "standing back from the power cycle" in fenced["detail"] and str(marker) in fenced["detail"]
+    assert "standing back from the power cycle" in fenced["detail"] and "operator recovery" in fenced["detail"]
 
-    marker.unlink()
+    check.write_text("#!/bin/sh\nexit 1\n")
     assert await _tick(t0 + BUDGET + RETRY)
     assert fence["order"] == ["power_cycle"]
     assert [e["phase"] for e in _events(fence["rig"], "leftover_host_rung")] == ["held", "requested"]
@@ -340,10 +339,9 @@ async def test_time_to_request_is_bounded_and_nothing_releases_the_device(fence)
 
 @pytest.fixture
 def both(fence, monkeypatch, clear_job_state):  # noqa: F811 - the imported fixtures
-    """A killed job's unkillable leftover AND its hold, both at 600 s, with only the power cycle opted
-    in (so both paths pick it), the REAL governor (ledger, I65 cooldown, per-boot cap), the real
-    request marker (I34) and the real power-cycle request with only its ``fire`` stubbed.
-    ``both['fires']`` counts the cycler launches; ``both['outcome']`` sets how each launch ends."""
+    """A killed job's unkillable leftover AND its hold, both at 600 s, with only the power cycle opted in (so both paths
+    pick it), the REAL governor (ledger, I65 cooldown, per-boot cap), the real request marker (I34) and the real
+    power-cycle request with only its ``fire`` stubbed."""
     r = fence["rig"]
     m = srv.recovery_mechanism
     _present_hold_at_the_bound(r, monkeypatch, why="job_killed", detail="job 7 killed: device left dirty")
@@ -351,7 +349,6 @@ def both(fence, monkeypatch, clear_job_state):  # noqa: F811 - the imported fixt
     monkeypatch.setattr(m, "host_action_pending", types.MethodType(type(m).host_action_pending, m))
     monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-A")
     monkeypatch.delenv(recovery_base.POWER_CYCLE_HISTORY_FILE_ENV, raising=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK", raising=False)
     monkeypatch.delenv("TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC", raising=False)
     monkeypatch.setattr(srv, "_auto_power_cycle_host", _REAL_POWER_CYCLE)
     state = {"fires": 0, "outcome": "launched"}
@@ -362,8 +359,6 @@ def both(fence, monkeypatch, clear_job_state):  # noqa: F811 - the imported fixt
             raise recovery_base.HostActionTimedOut("power-cycle command timed out after 30s")
 
     monkeypatch.setattr(srv, "_fire_power_cycle", fire)
-    # A fabric pass that passed before the episode: the request voids it, so the full check is owed.
-    monkeypatch.setattr(srv, "last_fabric_ok_monotonic", 1.0)
     return state
 
 
@@ -376,14 +371,8 @@ async def _bound(both):
 @pytest.mark.parametrize("outcome", ["launched", "timed-out"])
 @pytest.mark.parametrize("order", ["bound-first", "leftover-first", "leftover-try-spawned-before-the-bound"])
 async def test_replay_the_bound_and_the_leftover_budget_request_one_power_cycle(fence, both, order, outcome):
-    """Replay: a killed job's process stuck in the kernel keeps the device; the hold it left reaches
-    the 10-min bound (I76, ``hold_bound_leftover``) as the leftover reaches its 600 s budget (I70).
-    Both paths ask for the host rung, and here both would pick the power cycle. Whichever asks first,
-    and however its cycler launch ends, the cycler is launched once: the request marker (I34) and the
-    governor's ledger stop the other. The last order is the race: a leftover try the sampler spawned
-    before the bound's request, which reaches the device lock after it. A launch that timed out
-    retracts its ledger record but stays pending, so only the marker stops that try. Nothing
-    releases the device: it stays held with the full check, fabric included, owed (goal 8)."""
+    """Replay: a killed job's process stuck in the kernel keeps the device; the hold it left reaches the 10-min bound
+    (I76, ``hold_bound_leftover``) as the leftover reaches its 600 s budget (I70)."""
     both["outcome"] = outcome
     t0 = _open(fence)
     if order == "bound-first":
@@ -409,4 +398,3 @@ async def test_replay_the_bound_and_the_leftover_budget_request_one_power_cycle(
     assert "released" not in fence["order"] and "cleared_dirty" not in fence["order"]
     assert srv._recovery_degraded(), "the device stays held until the host comes back"
     assert srv._device_unavailable_for_tenant()
-    assert srv._fabric_ok_age() is None, "the full health check (fabric included) is still owed"

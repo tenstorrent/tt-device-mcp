@@ -260,10 +260,7 @@ async def test_a_preflight_that_errors_or_hangs_lets_the_job_through(monkeypatch
 
 @pytest.mark.asyncio
 async def test_a_cancel_that_lands_as_the_preflight_ends_is_not_dropped(monkeypatch, tmp_path):
-    """The preflight runs at the start of every job, on the runner task. On Python 3.10 a plain
-    asyncio.wait_for returns the result when the cancel lands in the same loop step as the work
-    finishing, so the runner ran the job, went back to its queue and never ended (spec 01, broker
-    shutdown). Land the cancel at every loop step while the call is still pending: it always wins."""
+    """The preflight runs at the start of every job, on the runner task."""
     job = srv.Job(id="984", owner="t", workspace=str(tmp_path), command="true", queued_at="t")
 
     def finished_at_once(func, *args):

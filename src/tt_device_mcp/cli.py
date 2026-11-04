@@ -755,9 +755,8 @@ def overview_lines(running, queued, rjobs, color: bool = False) -> list:
                 except Exception:
                     pass
             lines.append(f"  {jid:<10}  {_pad(icon + _ICON_GAP + owner, max_w + 3)}  {runtime:<8} {cmd}")
-            # The job holds the device but has done no device work for over the threshold
-            # (spec 03 I54). Only IDLE gets a line: active is the normal case, and unknown is
-            # never shown as idle.
+            # The job holds the device but has done no device work for over the threshold (spec 03 I54). Only IDLE gets
+            # a line: active is the normal case, and unknown is never shown as idle.
             if job.get("activity") == "idle":
                 lines.append(_style(f"  {'':<10}  {job.get('activity_label') or 'DEVICE IDLE'}", "idle", color))
     else:
@@ -1395,8 +1394,7 @@ def _udev_reload() -> bool:
 
 
 def _configured_device_group() -> bool:
-    """True if the broker unit or one of its drop-ins already sets
-    ``TT_DEVICE_MCP_DEVICE_GROUP`` to the lock group."""
+    """True if the broker unit or one of its drop-ins already sets ``TT_DEVICE_MCP_DEVICE_GROUP`` to the lock group."""
     want = f"TT_DEVICE_MCP_DEVICE_GROUP={_LOCK_GROUP}"
     paths = [Path(_BROKER_UNIT), *sorted(Path(_BROKER_UNIT + ".d").glob("*.conf"))]
     for path in paths:
@@ -1439,11 +1437,10 @@ def _broker_runs_with_device_group() -> bool:
 
 
 def _set_service_device_group(enable: bool) -> bool:
-    """Add/remove ``Environment=TT_DEVICE_MCP_DEVICE_GROUP=ttdev`` in the broker unit
-    so privsep jobs run with gid=ttdev (DAC access to the locked node); daemon-reload.
-    Removing also drops ``TT_DEVICE_MCP_DEVICE_LOCK``, the opt-in's flip switch.
-    Returns True only if it changed the unit. Enabling is a no-op when the unit or a
-    drop-in already sets the group."""
+    """Add/remove ``Environment=TT_DEVICE_MCP_DEVICE_GROUP=ttdev`` in the broker unit so privsep jobs run with gid=ttdev
+    (DAC access to the locked node); daemon-reload. Removing also drops ``TT_DEVICE_MCP_DEVICE_LOCK``, the opt-in's flip
+    switch. Returns True only if it changed the unit. Enabling is a no-op when the unit or a drop-in already sets the
+    group."""
     text = Path(_BROKER_UNIT).read_text()
     has = "TT_DEVICE_MCP_DEVICE_GROUP" in text
     line = f"Environment=TT_DEVICE_MCP_DEVICE_GROUP={_LOCK_GROUP}\n"

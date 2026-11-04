@@ -309,9 +309,8 @@ async def test_job_start_end_and_the_check_each_write_one_event_into_the_gate_re
 async def test_the_runner_snapshots_before_and_after_the_job_command_and_the_check_reads_them(
     mesh, bus, monkeypatch, tmp_path  # noqa: F811
 ):
-    """Driven through the real job runner: the job-start snapshot is taken before the job's command
-    runs and the job-end one after it, before the post-job check, which writes all three deltas with
-    the job's id. The job's command itself raises chip 1's correctable count from 5 to 9."""
+    """Driven through the real job runner: the job-start snapshot is taken before the job's command runs and the job-end
+    one after it, before the post-job check, which writes all three deltas with the job's id."""
     events = _capture(monkeypatch, mesh)
     mesh["eth"] = ADVANCING
     ws = _quiet_runner(monkeypatch, tmp_path)

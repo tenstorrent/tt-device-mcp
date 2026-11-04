@@ -19,16 +19,11 @@ both files) — every name either of them needs from here is either:
 
 from __future__ import annotations
 
-# chip_state: the per-chip lost/recovering gate in front of every poller read of a chip (spec 03 I66).
-# hold_report: the /health hold report (spec 03 I72, spec 04 I75): its pure helpers, plus the read-only probes
-# server.py feeds them (board-type normalising, off-bus chip ids, PCI bus numbers, the UBB tray
-# tables and the whole-tray classifier the power-cycle rung itself uses), so the report names a
-# hold the way the ladder does.
+# chip_state: the per-chip lost/recovering gate in front of every poller read of a chip (spec 03 I66). hold_report: the
+# /health hold report (spec 03 I72, spec 04 I75): its pure helpers, plus the read-only probes server.py feeds them
+# (board-type normalising, off-bus chip ids, PCI bus numbers, the UBB tray tables and the whole-tray classifier the
+# power-cycle rung itself uses), so the report names a hold the way the ladder does.
 from tt_device_mcp.health import chip_state, hold_report
-
-# The operator's AICLK ceiling state: server.py re-applies it at broker start and at the job door,
-# marks it owed when a job ends, and must be able to kill its helper on the dead-chip path.
-from tt_device_mcp.health.aiclk_ceiling import CEILING
 
 # The shared health vocabulary: HealthMonitor.status() returns a HealthState, and server.py both
 # builds one of its own (_healthy_reading()) and compares a probe's Verdict directly.
@@ -108,13 +103,12 @@ from tt_device_mcp.health.monitors.pci import (
     sysfs_chip_ids,
 )
 
-# The post-reset fabric debt (spec 04 I32): every reset path and broker start marks it owed, and
-# server.py's release funnel and the gate read it to hold fabric-unverified until a pass settles it.
-# The one in-flight PCI sysfs writer and its PCI-wedged latch (spec 04 I76): server.py wires the latch
-# to the hold and the power-cycle request, and clears it only on a verified lift; telemetry.py's
-# dead-chip valve skips chips while it is set and removes chips only through it.
+# The post-reset fabric debt (spec 04 I32): every reset path and broker start marks it owed, and server.py's release
+# funnel and the gate read it to hold fabric-unverified until a pass settles it. The one in-flight PCI sysfs writer and
+# its PCI-wedged latch (spec 04 I76): server.py wires the latch to the hold and the power-cycle request, and clears it
+# only on a verified lift; telemetry.py's dead-chip valve skips chips while it is set and removes chips only through it.
 from tt_device_mcp.health.pci_writer import PCI_WRITER, PciWedged
-from tt_device_mcp.health.post_reset import FABRIC_DEBT
+from tt_device_mcp.health.post_reset import FABRIC_DEBT, POST_RESET_SETTLE_SEC, boot_monotonic
 from tt_device_mcp.health.recovery import (
     BELOW_FLOOR,
     BLOCKED,
@@ -141,9 +135,6 @@ from tt_device_mcp.health.recovery.base import (
     RESET_SCOPE_PREFIX,
     RecoveryMechanism,
     host_action_pending_sec,
-    mesh_hold_repage_sec,
-    mesh_reset_hold_reason,
-    refuse_mesh_reset,
 )
 
 # The Galaxy escalation ladder's own thresholds and vocabulary. The gate takes its escalation
@@ -187,7 +178,6 @@ from tt_device_mcp.health.recovery.stages.power_cycle import (
     note_power_cycle_trigger,
     set_pending_marker_context,
 )
-from tt_device_mcp.health.recovery.stages.power_cycle import run_pre_power_cycle_hook as _run_pre_power_cycle_hook
 from tt_device_mcp.health.shutdown import note_broker_stopping
 
 __all__ = [
@@ -205,8 +195,6 @@ __all__ = [
     "UBB_CHIP_COUNT",
     "_power_cycle_direct_class",
     "_ubb_bus_id_tables",
-    # AICLK ceiling state (start, door, job end, dead-chip kill)
-    "CEILING",
     # construction pieces ServerFsm.boot assembles into the process singletons
     "HealthMonitor",
     "FABRIC_KILLED_BY_ISOLATION",  # spec 03 I82: the gate holds a pass the isolation killed dirty
@@ -279,12 +267,8 @@ __all__ = [
     # the reset's own systemd scope prefix: the in-flight reader cut never kills it (spec 03 I83)
     "RESET_SCOPE_PREFIX",
     "_declared_reset_mode",
-    # how often a standing hardware-fault hold is paged again (spec 03 I42)
-    "mesh_hold_repage_sec",
     # how long a requested host reboot/power cycle keeps the forced ladder from resetting
     "host_action_pending_sec",
-    "mesh_reset_hold_reason",
-    "refuse_mesh_reset",
     # the escalation decision the gate acts on: the evidence it hands next_stage, and every
     # decision value that comes back which is not itself a stage name
     "Evidence",
@@ -308,7 +292,6 @@ __all__ = [
     "bridge_reset_unavailable_reason",
     "gone_chip_bridge_reset_enabled",
     "_fire_power_cycle",
-    "_run_pre_power_cycle_hook",
     # what asked for a power cycle and the pending-cycle marker (spec 04 I88)
     "_offbus_fault_class",
     "_whole_trays_off",
@@ -321,4 +304,7 @@ __all__ = [
     "offbus_power_cycle",
     # the post-reset fabric debt (spec 04 I32): no reset releases until a fabric pass settles it
     "FABRIC_DEBT",
+    # and the settle a multi-tray mesh gets after a reset before that pass runs
+    "POST_RESET_SETTLE_SEC",
+    "boot_monotonic",
 ]

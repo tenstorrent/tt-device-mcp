@@ -56,13 +56,8 @@ def register_deadline_feed(name: str, feed: DeadlineFeed) -> None:
     _deadline_feeds[name] = feed
 
 
-def unregister_deadline_feed(name: str) -> None:
-    _deadline_feeds.pop(name, None)
-
-
 def fed_by_name(started: float, now: float, cooldown_until: Optional[float]) -> dict:
-    """Every registered feed's candidate by feed name; a feed that raises reports nothing (read-only
-    path)."""
+    """Every registered feed's candidate by feed name; a feed that raises reports nothing (read-only path)."""
     out = {}
     for name, feed in list(_deadline_feeds.items()):
         try:
@@ -74,11 +69,6 @@ def fed_by_name(started: float, now: float, cooldown_until: Optional[float]) -> 
     return out
 
 
-def fed_candidates(started: float, now: float, cooldown_until: Optional[float]) -> list:
-    """Every registered feed's candidate."""
-    return list(fed_by_name(started, now, cooldown_until).values())
-
-
 def hold_bound_candidate(
     started: float,
     now: float,
@@ -86,10 +76,9 @@ def hold_bound_candidate(
     bound_sec: int = HOLD_BOUND_SEC,
     host_rung: Optional[str] = "power cycle",
 ) -> RungCandidate:
-    """The full-ladder mark: hold start + ``bound_sec``, then ``host_rung`` (None: none is opted in)
-    if the full check after it fails. The ladder runs at the mark even inside the boot/post-cycle
-    cooldown; only the host rung waits for the cooldown's end, the one wait allowed past the mark,
-    so the rung names that end."""
+    """The full-ladder mark: hold start + ``bound_sec``, then ``host_rung`` (None: none is opted in) if the full check
+    after it fails. The ladder runs at the mark even inside the boot/post-cycle cooldown; only the host rung waits for
+    the cooldown's end, the one wait allowed past the mark, so the rung names that end."""
     at = started + bound_sec
     rung = f"full ladder, then {host_rung}" if host_rung else "full ladder"
     if host_rung and cooldown_until is not None and now < cooldown_until and at < cooldown_until:
@@ -167,11 +156,10 @@ def trays_present(
     read_at: str,
     chips_per_tray: int,
 ) -> list:
-    """Per UBB bus group (spec 04 I16: a chip's tray is its PCI bus masked to ``0xF0``, never its
-    index): the chip indices on the bus there and those with a live ARC heartbeat, all from one read
-    at ``read_at``. ``present_buses`` is ``{chip index: PCI bus}``; ``tray_groups`` is
-    ``{bus group: tray number or None}``. A chip on a bus outside the known groups is listed under
-    its own group with ``tray`` None, never dropped."""
+    """Per UBB bus group (spec 04 I16: a chip's tray is its PCI bus masked to ``0xF0``, never its index): the chip
+    indices on the bus there and those with a live ARC heartbeat, all from one read at ``read_at``. ``present_buses`` is
+    ``{chip index: PCI bus}``; ``tray_groups`` is ``{bus group: tray number or None}``. A chip on a bus outside the
+    known groups is listed under its own group with ``tray`` None, never dropped."""
     rows: dict = {g: [] for g in tray_groups}
     for idx, bus in present_buses.items():
         if isinstance(bus, int):

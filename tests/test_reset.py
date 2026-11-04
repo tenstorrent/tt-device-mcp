@@ -188,9 +188,8 @@ def _client(monkeypatch, dev_dir, holders=None):
 
 @pytest.mark.parametrize("keepalive", [True, False])
 def test_a_silent_reset_stream_sends_keepalives_when_asked(monkeypatch, tmp_path, keepalive):
-    """The CLI reads the stream with a per-read socket timeout. A reset that prints nothing
-    for longer than that must still put bytes on the wire, or the CLI calls a live reset dead.
-    Older CLIs print every line, so only a client that asks gets the sentinel."""
+    """The CLI reads the stream with a per-read socket timeout. A reset that prints nothing for longer than that must
+    still put bytes on the wire, or the CLI calls a live reset dead."""
     (tmp_path / "0").write_text("")
     monkeypatch.setattr(srv, "RESET_STREAM_KEEPALIVE_SEC", 0.02)
 
@@ -221,11 +220,7 @@ def test_a_silent_reset_stream_sends_keepalives_when_asked(monkeypatch, tmp_path
 
 @pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
 def test_a_client_that_leaves_a_silent_reset_does_not_stop_it(monkeypatch, tmp_path, spec_version):
-    """The CLI can go away (Ctrl-C, a dropped socket) while the keepalive wrapper waits on
-    a reset step. The reset must still run to the end, the step must be closed, not left
-    pending, and cleanup must not race it ("already running") or drop it ("destroyed").
-    Starlette has two disconnect paths: under ASGI 2.3 (uvicorn) a cancel scope cancels the
-    stream; under 2.4 the send fails and the wrapper is left for the loop to finalize."""
+    """The CLI can go away (Ctrl-C, a dropped socket) while the keepalive wrapper waits on a reset step."""
     (tmp_path / "0").write_text("")
     monkeypatch.setattr(srv, "RESET_STREAM_KEEPALIVE_SEC", 0.02)
     monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
@@ -493,12 +488,12 @@ def test_a_reset_row_is_owned_by_the_caller_not_by_what_they_posted(monkeypatch,
     monkeypatch.setattr(srv.subprocess, "run", _fake_tt_smi(0))
     _intercept_scoped_subprocess(monkeypatch, rc=0)
 
-    d = _client(monkeypatch, tmp_path).post("/api/tt_device_reset", json={"force": False, "owner": "smarton"}).json()
+    d = _client(monkeypatch, tmp_path).post("/api/tt_device_reset", json={"force": False, "owner": "alice"}).json()
     assert d["status"] == "reset_complete"
 
     rows = [r for r in srv._recent_jobs(20) if r["command"].startswith("tt-smi -r")]
     assert len(rows) == 1
-    assert rows[0]["owner"] != "smarton", "a posted owner must not name the reset's owner"
+    assert rows[0]["owner"] != "alice", "a posted owner must not name the reset's owner"
     # TestClient carries no SO_PEERCRED, so there is no identity to derive and the row says so
     # rather than believing the body.
     assert rows[0]["owner"] == "unknown"
@@ -736,9 +731,8 @@ class _Calls(list):
 
 
 def _verify_seam(monkeypatch, fabric_ok):
-    """Fake the probe pass: heartbeat + snapshot pass, the fabric (when asked for) returns
-    ``fabric_ok``. Records the ``run_fabric`` each pass asked for, and on ``.expected`` the chip
-    count it verified against."""
+    """Fake the probe pass: heartbeat + snapshot pass, the fabric (when asked for) returns ``fabric_ok``. Records the
+    ``run_fabric`` each pass asked for, and on ``.expected`` the chip count it verified against."""
     calls = _Calls()
 
     async def verify(expected, log, *, run_fabric=True, phase="verify_device"):
@@ -791,95 +785,6 @@ def test_an_operator_reset_whose_fabric_fails_is_not_released(monkeypatch, tmp_p
         f"got why={srv.fsm.record.why!r}: a failed operator-reset verify must say so, not pass as a "
         "read-only probe's finding"
     )
-
-
-def test_the_reset_tools_documented_duration_matches_its_timeouts(monkeypatch):
-    """The tool's docstring states the worst case an operator reset on a mesh can take. Recompute it
-    from the timeouts the code actually uses, so a changed timeout cannot leave the doc stale."""
-    import inspect
-    import math
-    import re
-
-    from tt_device_mcp import constants, pre_reset_scan, telemetry
-    from tt_device_mcp.health import aiclk_ceiling
-    from tt_device_mcp.health import monitor as monitor_mod
-    from tt_device_mcp.health.monitors import eth, heartbeat
-    from tt_device_mcp.health.recovery import ipmi_guard
-
-    def default(fn, name):
-        return inspect.signature(fn).parameters[name].default
-
-    def literal(fn, pattern):
-        return float(re.search(pattern, inspect.getsource(fn)).group(1))
-
-    # Stop, then restart, each poller service; each systemctl call is bounded on its own.
-    # The shipped default services, not the live list a test environment may override.
-    services = srv.DEFAULT_POLLER_SERVICES
-    n_services = len([x for x in services.split(",") if x.strip()])
-    pollers = 2 * n_services * literal(srv._set_device_pollers, r"timeout=(\d+)")
-    rescan = literal(recovery_base.RecoveryMechanism.reset_with_quiesce, r"asyncio\.sleep\((\d+)\)")
-    kill = constants.GRACEFUL_KILL_GRACE_SEC + constants.SIGTERM_GRACE_SEC
-    candidates = re.search(r"for c in \((.*?)\n\s*\)\n", inspect.getsource(eth._python_candidates), re.S).group(1)
-    n_candidates = len([line for line in candidates.splitlines() if line.strip()])
-    eth_setup = n_candidates * default(eth.resolve_python, "import_timeout_sec")
-    finished_pass = (
-        heartbeat.HEARTBEAT_SETTLE_SEC
-        + default(monitor_mod.HealthMonitor.verify_device_health, "timeout_sec")
-        + eth_setup
-        + default(monitor_mod.HealthMonitor.verify_eth_heartbeat, "timeout_sec")
-        + constants.FABRIC_CHECK_TIMEOUT_SEC
-    )
-    # A re-check follows only a 77, a pass that finished; only the last pass can hit a timeout and
-    # pay the kill sequence.
-    last_pass = finished_pass + kill
-    # The shipped defaults, read from the source: conftest zeroes the live retry sleep.
-    src = inspect.getsource(recovery_pkg)
-    retries = int(re.search(r'"TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES", "(\d+)"', src).group(1))
-    sleep = float(re.search(r'"TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC", "([\d.]+)"', src).group(1))
-    # The other bounded steps reset_with_quiesce runs under the same lock: the BMC check a mesh reset
-    # starts with; the pre-reset holder clear (in-flight detach, one rescan settle, the wait for a
-    # zombie's release, SIGTERM grace, then the wait after SIGKILL); the post-reset cut of a chip that failed (detach, one stop per
-    # poller service, the reader kill); and the clock-cap re-apply (a run plus its settle retries).
-    bmc = ipmi_guard.BMC_PREFLIGHT_TIMEOUT_SEC
-    clear = pre_reset_scan.clear_device_readers
-    holder_clear = (
-        default(clear, "detach_timeout_sec")
-        + default(clear, "rescan_settle_sec")
-        + default(clear, "zombie_wait_sec")
-        + default(clear, "grace_sec")
-        + default(clear, "release_sec")
-    )
-    cut = telemetry.INFLIGHT_DETACH_TIMEOUT_SEC + pollers / 2 + telemetry.INFLIGHT_KILL_TIMEOUT_SEC
-    aiclk = aiclk_ceiling.DEFAULT_TIMEOUT_SEC + max(
-        aiclk_ceiling.DEFAULT_TIMEOUT_SEC, aiclk_ceiling.DEFAULT_SETTLE_SEC + aiclk_ceiling.SETTLE_RETRY_MARGIN_SEC
-    )
-    worst = (
-        bmc
-        + holder_clear
-        + pollers
-        + constants.DEVICE_RESET_TIMEOUT_SEC
-        + cut
-        + rescan
-        + aiclk
-        + retries * (finished_pass + sleep)
-        + last_pass
-    )
-
-    tools = asyncio.run(srv.create_mcp_server().list_tools())
-    doc = " ".join(next(t.description for t in tools if t.name == "tt_device_reset").split())
-    assert f"about {round(worst / 60)} minutes" in doc, (worst, doc)
-    assert f"BMC check {bmc}s" in doc
-    assert f"pre-reset holder clear up to {math.ceil(holder_clear)}s" in doc
-    assert f"poller stop and restart up to {pollers:.0f}s" in doc
-    assert f"post-reset reader cut up to {math.ceil(cut)}s" in doc
-    assert f"clock-cap re-apply up to {math.ceil(aiclk)}s" in doc
-    assert f"service in TT_DEVICE_MCP_POLLER_SERVICES adds up to {3 * pollers / (2 * n_services):.0f}s" in doc
-    assert f"reset {constants.DEVICE_RESET_TIMEOUT_SEC}s" in doc
-    assert f"PCI rescan {rescan:.0f}s" in doc
-    assert f"first verify pass of up to {math.ceil(finished_pass)}s" in doc
-    assert f"the {sleep:.0f}s wait" in doc
-    assert f"last verify pass of up to {math.ceil(last_pass)}s" in doc
-    assert f"the {kill}s kill" in doc
 
 
 def test_an_operator_reset_whose_fabric_cannot_verify_holds_fabric_unverified(monkeypatch, tmp_path):
@@ -1015,9 +920,8 @@ def test_a_failed_operator_reset_arms_the_cooldown_and_the_two_strikes(
 def test_a_failed_operator_mesh_reset_spends_the_episodes_mesh_reset(
     monkeypatch, tmp_path, route, rc, fabric_ok, spent
 ):
-    """A failed operator -glx_reset is marked as the broker marks its own failed mesh reset, so an
-    all-off mesh after it is class C and no path fires a second mesh reset in the episode (spec 04
-    I37, I87). A persistent 77, a verified reset or one that never finished marks nothing."""
+    """A failed operator -glx_reset is marked as the broker marks its own failed mesh reset, so an all-off mesh after it
+    is class C and no path fires a second mesh reset in the episode (spec 04 I37, I87)."""
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
     _mesh_with_fabric_check(monkeypatch, tmp_path)
     monkeypatch.setattr(srv.fabric, "validator_missing", lambda: None)
@@ -1835,9 +1739,8 @@ def test_forced_reset_stops_a_readopted_job_seen_only_by_the_recheck(monkeypatch
 
 
 def _readopted_job_killed_by_its_owner(monkeypatch, tmp_path, events, *, job_id="905-1"):
-    """A re-adopted job its owner killed: KILLED at once, its scope still unwinding (up to
-    GRACEFUL_KILL_GRACE_SEC) with its `readopted_scopes` entry kept until the monitor drops it.
-    A forced reset's wait for that scope records ("wait", interrupt) and ends it 0.3 s later."""
+    """A re-adopted job its owner killed: KILLED at once, its scope still unwinding (up to GRACEFUL_KILL_GRACE_SEC) with
+    its `readopted_scopes` entry kept until the monitor drops it."""
     job = _readopted_job(monkeypatch, job_id=job_id)
     monkeypatch.setattr(srv, "READOPTED_FINALIZE_WAIT_SEC", 5)
     monkeypatch.setattr(srv, "_scope_active", lambda scope: True)
@@ -1934,8 +1837,7 @@ def test_forced_reset_waits_for_a_killed_readopted_job_seen_only_by_the_recheck(
     assert any(s.startswith("waiting for re-adopted job 906-1 (killed)") for s in d["steps"])
 
 
-# A fabric pass that found fewer links than the cabling expects: a failed check, not a pass on the
-# links it could see.
+# A fabric pass that found fewer links than the cabling expects: a failed check, not a pass on the links it could see.
 _FEWER_LINKS = (
     False,
     {
@@ -1973,10 +1875,8 @@ async def _assert_held_until_a_full_fabric_pass(monkeypatch, tmp_path):
 def test_a_forced_reset_that_kills_a_readopted_job_and_ends_early_keeps_the_hold(
     monkeypatch, tmp_path, clear_job_state, path
 ):
-    """After the reset claims a re-adopted job it can end without a reset or a verify: another
-    reset in flight, no chips, a failed reset, or (in every case here) the wait for the job's
-    record expired and the reset went on. The job's end then owes no kill reset, so nothing on
-    these paths may lift the startup hold: only the gate's full check with fabric does."""
+    """After the reset claims a re-adopted job it can end without a reset or a verify: another reset in flight, no
+    chips, a failed reset, or (in every case here) the wait for the job's record expired and the reset went on."""
     monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
     monkeypatch.setattr(srv, "reset_killed_job_ids", set())
     fsm_dirty(srv, "startup: not verified yet", why="startup_unverified", dirty=False)
@@ -2025,9 +1925,8 @@ def test_a_forced_reset_that_kills_a_readopted_job_and_ends_early_keeps_the_hold
 async def test_a_readopted_job_killed_by_a_forced_reset_does_not_flag_the_device(
     monkeypatch, tmp_path, clear_job_state, held
 ):
-    """The monitor finalizes the job once its scope ends. KILLED is a wedge-risk end, but this kill
-    was the reset's own: flagging the device for it would make the reset its own justification.
-    It owes no kill reset either, so a hold already standing still needs the full check to lift."""
+    """The monitor finalizes the job once its scope ends. KILLED is a wedge-risk end, but this kill was the reset's own:
+    flagging the device for it would make the reset its own justification."""
     monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
     monkeypatch.setattr(srv, "_scope_active", lambda scope: False)
     monkeypatch.setattr(srv, "device_fault_reported", "")
@@ -2092,9 +1991,7 @@ async def test_a_readopted_job_recovery_killed_ends_killed_with_its_cause(monkey
 
 
 def test_killing_a_readopted_job_holds_the_device_until_its_scope_ends(monkeypatch, tmp_path):
-    """A kill marks the job KILLED at once, but its scope gets up to GRACEFUL_KILL_GRACE_SEC to exit.
-    Its `readopted_scopes` entry is what keeps the runner from dispatching and a reset from running
-    over it meanwhile, so the kill must leave it for the monitor to drop when the scope ends (#7)."""
+    """A kill marks the job KILLED at once, but its scope gets up to GRACEFUL_KILL_GRACE_SEC to exit."""
     job = _readopted_job(monkeypatch)
     during_stop = []
 

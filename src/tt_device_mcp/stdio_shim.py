@@ -114,14 +114,12 @@ _RECONNECT_BACKOFF = 1.0  # seconds; ~12s covers a service restart window
 
 
 async def _call_upstream(url: str, client_factory, op, resend_safe: bool = True):
-    """Run ``op(session)`` against a fresh upstream session, retrying transient
-    connection failures (broker mid-restart / socket briefly absent).
+    """Run ``op(session)`` against a fresh upstream session, retrying transient connection failures (broker mid-restart
+    / socket briefly absent).
 
-    Unless ``resend_safe``, a request is retried only while it provably never reached a
-    tool: the connect and initialize phase, a refused connect, a session the broker does
-    not know. Past that the broker may already be running it (a job submit, a reset), so
-    a stream cut is reported to the caller, never re-sent.
-    """
+    Unless ``resend_safe``, a request is retried only while it provably never reached a tool: the connect and initialize
+    phase, a refused connect, a session the broker does not know. Past that the broker may already be running it (a job
+    submit, a reset), so a stream cut is reported to the caller, never re-sent."""
     last_exc = None
     for attempt in range(_RECONNECT_TRIES):
         sent = False

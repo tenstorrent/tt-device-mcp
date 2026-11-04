@@ -54,7 +54,6 @@ class PciSysfsWriter:
         self._deadline = 0.0
         self._context = ""
         self.latched_at: Optional[float] = None  # epoch
-        self.latched_mono: Optional[float] = None
         self.reason = ""
         # Set by the broker at boot: holds the device and asks for the power cycle. Called once per latch.
         self.on_latch: Optional[Callable[[str], None]] = None
@@ -69,12 +68,11 @@ class PciSysfsWriter:
         return self._context if t is not None and not t.done() else ""
 
     def _latch(self, reason: str, loop: Optional[asyncio.AbstractEventLoop] = None, **fields: Any) -> None:
-        """Set the latch and tell the broker once. With ``loop`` (a write from another thread), the
-        notice runs on that loop when it is running, since the broker's hold is the loop's state; with
-        no running loop it runs here."""
+        """Set the latch and tell the broker once. With ``loop`` (a write from another thread), the notice runs on that
+        loop when it is running, since the broker's hold is the loop's state; with no running loop it runs here."""
         if self.latched:
             return
-        self.latched_at, self.latched_mono, self.reason = time.time(), time.monotonic(), reason
+        self.latched_at, self.reason = time.time(), reason
         health_event("pci_wedged", reason=reason, host_at_risk=True, **fields)
         if loop is not None and loop.is_running() and not loop.is_closed():
             try:
@@ -115,7 +113,7 @@ class PciSysfsWriter:
         if self.pending():
             return False
         health_event("pci_wedged_cleared", why=why, reason=self.reason, latched_at=self.latched_at)
-        self.latched_at = self.latched_mono = None
+        self.latched_at = None
         self.reason = ""
         return True
 

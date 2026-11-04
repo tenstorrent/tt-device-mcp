@@ -18,11 +18,9 @@ from types import SimpleNamespace
 import pytest
 
 from tests.test_device_safety import _ledger_dir
-from tests.test_ladder_v2 import _wire_failed_tray_down_sweep
-from tests.test_offbus_power_cycle import _gated, _ladder_ran, _pass
+from tests.test_ladder_v2 import _wire_failed_climb
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.recovery import base as recovery_base
-from tt_device_mcp.health.recovery import offbus_power_cycle as opc
 
 DAY = 1_760_486_400.0  # a fixed midnight; only differences matter
 
@@ -47,7 +45,6 @@ def g8(monkeypatch, tmp_path):
     clock = {"now": G8_CYCLE_ASKED}
     monkeypatch.setattr(srv, "_current_boot_id", lambda: boot["id"])
     monkeypatch.setattr(recovery_base, "POWER_CYCLE_MIN_INTERVAL_SEC", 1800)
-    monkeypatch.setattr(srv.recovery_mechanism, "_power_cycle_backstop_paged", 0.0)
     monkeypatch.setattr(recovery_base, "time", SimpleNamespace(time=lambda: clock["now"], monotonic=_time.monotonic))
     (d / recovery_base.AUTO_RECOVERY_LEDGER).write_text(
         json.dumps({"action": "power-cycle", "boot_id": "boot-1", "at_epoch": G7_CYCLE}) + "\n"
@@ -109,10 +106,9 @@ def test_g8_the_loop_bound_stands_for_an_unverified_cycle(g8):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("verified", [True, False], ids=["verified", "unverified"])
 async def test_g8_the_ladder_takes_the_power_cycle_instead_of_holding_for_the_interval(g8, monkeypatch, verified):
-    """(c) End to end on the climb after a failed reset (the governor real, the clock fake): the new
-    episode after a verified cycle fires the power cycle now. In the incident the denial left
-    the hold to repeat the mesh reset and the sweep for the rest of the interval."""
-    _events, cycles = _wire_failed_tray_down_sweep(monkeypatch, lambda: {})
+    """(c) End to end on the climb after a failed reset (the governor real, the clock fake): the new episode after a
+    verified cycle fires the power cycle now."""
+    _events, cycles = _wire_failed_climb(monkeypatch, lambda: {})
     g = srv.galaxy_recovery
     monkeypatch.delattr(g.mechanism, "auto_recovery_allowed")  # the real governor reads the ledger
     if verified:
@@ -120,52 +116,3 @@ async def test_g8_the_ladder_takes_the_power_cycle_instead_of_holding_for_the_in
     offbus = {str(i) for i in range(32)}
     await g._climb_or_hand_off(32, len(offbus), "2026-10-14T18:04:51", lambda m: None)
     assert cycles["n"] == (1 if verified else 0)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "case, fires",
-    [("verified", True), ("unverified", False), ("legacy row without boot id", False), ("same boot", False)],
-)
-async def test_g8_the_off_bus_hold_interval_skips_a_cycle_a_later_boot_verified(
-    monkeypatch, tmp_path, clear_job_state, case, fires
-):
-    """(a) on the bounded off-bus hold (I27), with an attempt spacing set: it counted every attempt. An attempt a
-    later boot verified healthy no longer holds the next episode's cycle; any attempt it cannot prove
-    healed (no stamp, no boot id, or a stamp from its own boot) still gates and pages."""
-    hold_since, rec = _gated(monkeypatch, tmp_path)
-    monkeypatch.setenv("TT_DEVICE_MCP_OFFBUS_POWER_CYCLE_MIN_INTERVAL_SEC", "3600")
-    _ledger_dir(monkeypatch, tmp_path)
-    monkeypatch.setattr(opc, "health_dir", lambda: tmp_path)
-    monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-2")
-    now = opc.now_epoch()
-    cycled = now - 1290
-    attempt = {"at_epoch": cycled, "episode": "earlier", "reason": "G7", "boot_id": "boot-1"}
-    if case == "legacy row without boot id":
-        del attempt["boot_id"]
-    opc.save_state({"attempts": [attempt]})
-    (tmp_path / recovery_base.AUTO_RECOVERY_LEDGER).write_text(
-        json.dumps({"action": "power-cycle", "boot_id": "boot-1", "at_epoch": cycled - 3600}) + "\n"
-    )
-    if case != "unverified":
-        stamp_boot = "boot-1" if case == "same boot" else "boot-2"
-        (tmp_path / recovery_base.AUTO_RECOVERY_VERIFIED).write_text(
-            json.dumps({"boot_id": stamp_boot, "at_epoch": cycled + 340})
-        )
-    _ladder_ran(hold_since)
-    out = await _pass(hold_since)
-    if fires:
-        assert out is True and len(rec["fires"]) == 1
-        assert rec["fires"][0]["state"]["attempts"][0]["boot_id"] == "boot-2", "the new attempt names its boot"
-    else:
-        assert out is False and rec["fires"] == [], "held to a stated deadline, no fall-through to the ladder"
-        assert [a["kind"] for a in rec["alerts"]] == ["offbus_power_cycle_rate_limited"]
-
-
-def test_last_attempt_within_skips_only_what_healed_says():
-    now = 100_000.0
-    state = {"attempts": [{"at_epoch": now - 60, "boot_id": "a"}, {"at_epoch": now - 120, "boot_id": "b"}]}
-    assert opc.last_attempt_within(state, now, 600) == now - 60
-    assert opc.last_attempt_within(state, now, 600, healed=lambda r: r["boot_id"] == "a") == now - 120
-    assert opc.last_attempt_within(state, now, 600, healed=lambda r: True) is None
-    assert opc.last_attempt_within({"attempts": [{"at_epoch": "?"}]}, now, 600, healed=lambda r: True) == now

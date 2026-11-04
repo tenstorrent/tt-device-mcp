@@ -6,8 +6,7 @@
 Traffic that passes on the discovered links does not make a lost link healthy: a job that routes
 over the whole mesh (e.g. "Could not find any forwarding direction from src (M0, D0) to dst
 (M0, D28)") fails on it. So the check FAILS by port name, the hold keeps the reset ladder, the
-eth link mark is never lowered to the links that are left, and only an explicit accept list turns a
-known-dead port into a lift. No device is opened: the validator, the chip snapshot, the reset and
+eth link mark is never lowered to the links that are left. No device is opened: the validator, the chip snapshot, the reset and
 the alert hook are stand-ins."""
 
 import json
@@ -25,8 +24,6 @@ from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import monitor as monitor_mod
 from tt_device_mcp.health.monitor import HealthMonitor
 from tt_device_mcp.health.monitors import fabric
-
-ACCEPT = "TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS"
 
 
 def _baseline(tmp_path) -> dict:
@@ -74,18 +71,6 @@ def test_more_missing_than_extra_is_links_missing_and_a_moved_tray_is_not():
     assert fabric.links_missing(moved) == ""
 
 
-def test_only_an_explicit_accept_list_naming_every_missing_port_lifts(monkeypatch):
-    two = fabric.topology_marker("d", 2, 0, ([_LOST_PORT, "tray 1 QSFP_DD 1"], []))
-    monkeypatch.delenv(ACCEPT, raising=False)
-    assert fabric.accepted_missing_ports() == frozenset(), "the default accepts nothing"
-    monkeypatch.setenv(ACCEPT, f" {_LOST_PORT} ")
-    accepted = fabric.accepted_missing_ports()
-    assert fabric.links_missing(fabric.topology_marker("d", 1, 0, ([_LOST_PORT], [])), accepted) == ""
-    assert fabric.links_missing(two, accepted), "a port not on the list still fails"
-    # A count with no names (nothing to match) is never accepted.
-    assert fabric.links_missing(fabric.topology_marker("d", 1, 0), accepted)
-
-
 # --- the monitor ----------------------------------------------------------------------------------
 
 
@@ -96,7 +81,6 @@ async def test_a_lost_link_whose_rerun_passes_fails_the_check_and_names_the_port
     monkeypatch,
 ):
     m, state = topo
-    monkeypatch.delenv(ACCEPT, raising=False)
     state["first"] = _LOST
     m.eth_link_drop(256)
     ok, detail = await m._verify_fabric_health_body(60)
@@ -121,7 +105,6 @@ async def test_a_lost_link_whose_rerun_passes_fails_the_check_and_names_the_port
 @pytest.mark.asyncio
 async def test_an_override_wrapper_that_exits_0_on_a_lost_link_still_fails(topo, monkeypatch):  # noqa: F811
     m, _ = topo
-    monkeypatch.delenv(ACCEPT, raising=False)
 
     async def check(argv, env, **kw):
         return 0, f"{_LOST}TOPOLOGY MISMATCH vs d: 1 missing, 0 extra port connections\nall links ok\n"
@@ -135,18 +118,17 @@ async def test_an_override_wrapper_that_exits_0_on_a_lost_link_still_fails(topo,
 @pytest.mark.asyncio
 async def test_a_moved_tray_still_lifts_and_never_lowers_the_mark(topo, tmp_path, monkeypatch):  # noqa: F811
     m, state = topo
-    monkeypatch.delenv(ACCEPT, raising=False)
     m.eth_link_drop(256)
     ok, _ = await m._verify_fabric_health_body(60)
     assert ok is True and m.topology_lift_pending is True
     assert m.fabric_topology["verdict"] == "lift"
     assert m.fabric_topology["extra_ports"] == ["tray 3 port ?", "tray 4 port ?"]
-    assert "252 of 256" in m.eth_link_drop(252), "a lift without the accept list keeps the mark"
+    assert "252 of 256" in m.eth_link_drop(252), "a moved-tray lift keeps the mark"
     assert _baseline(tmp_path)["links"] == 256
 
 
 def test_a_mark_lowered_before_this_fix_is_restored(topo, tmp_path):  # noqa: F811
-    """A baseline an earlier lift wrote at 252 (no accept flag) reads 252 as a drop again."""
+    """A baseline an earlier lift wrote at 252 reads 252 as a drop again."""
     m, _ = topo
     (tmp_path / HealthMonitor.ETH_LINK_BASELINE_FILE).write_text(
         json.dumps({"links": 252, "high_water": 256, "asic_bus": {"a": 0xC1}})
@@ -179,59 +161,16 @@ def test_a_links_missing_hold_is_not_a_no_reset_topology_hold(monkeypatch):
     assert srv._fabric_no_reset_hold() == "", "the measured fault keeps the reset ladder (04 I30)"
 
 
-@pytest.mark.asyncio
-async def test_a_lift_the_accept_list_excused_names_the_accepted_ports(topo, monkeypatch):  # noqa: F811
-    """Review #1495 F5: a lost link the operator's accept list excuses lifts, and the event, /health and
-    the broker log name the port the list excused; a moved tray excuses nothing."""
-    m, state = topo
-    lines = []
-
-    class _Log:
-        def warning(self, msg):
-            lines.append(msg)
-
-        info = error = warning
-
-    monkeypatch.setattr(m, "_logger", lambda: _Log())
-    monkeypatch.setenv(ACCEPT, f"{_LOST_PORT}, tray 9 port 9")
-    state["first"] = _LOST
-    m.eth_link_drop(256)
-    ok, _ = await m._verify_fabric_health_body(60)
-    assert ok is True and m.fabric_topology["verdict"] == "lift"
-    assert m.fabric_topology["accepted_ports"] == [_LOST_PORT], "only the missing port, not the whole list"
-    assert dict(state["events"])["fabric_topology_mismatch"]["accepted_ports"] == [_LOST_PORT]
-    assert any("TOPOLOGY MISMATCH" in ln and f"ACCEPT_MISSING_PORTS: {_LOST_PORT}" in ln for ln in lines)
-    monkeypatch.setattr(srv.health_monitor, "fabric_topology", m.fabric_topology)
-    assert srv._health_payload()["fabric_topology"]["accepted_ports"] == [_LOST_PORT]
-
-
-@pytest.mark.asyncio
-async def test_a_moved_tray_lift_excuses_no_port(topo, monkeypatch):  # noqa: F811
-    m, state = topo
-    monkeypatch.setenv(ACCEPT, _LOST_PORT)
-    ok, _ = await m._verify_fabric_health_body(60)
-    assert ok is True and m.fabric_topology["accepted_ports"] == []
-    assert dict(state["events"])["fabric_topology_mismatch"]["accepted_ports"] == []
-
-
 def test_health_names_the_ports(monkeypatch):
     topology = {"verdict": "failed", "missing_ports": [_LOST_PORT], "extra_ports": [], "marker": "m"}
     monkeypatch.setattr(srv.health_monitor, "fabric_topology", topology)
     assert srv._health_payload()["fabric_topology"]["missing_ports"] == [_LOST_PORT]
 
 
-def test_health_shows_the_accepted_ports(monkeypatch):
-    monkeypatch.delenv(ACCEPT, raising=False)
-    assert srv._health_payload()["fabric_accepted_missing_ports"] == [], "nothing is accepted by default"
-    monkeypatch.setenv(ACCEPT, f"{_LOST_PORT}, b")
-    assert srv._health_payload()["fabric_accepted_missing_ports"] == sorted([_LOST_PORT, "b"])
-
-
 @pytest.fixture
 def lost_mesh(monkeypatch, mesh):  # noqa: F811
-    """The mesh fixture failing on a lost link instead of a dispatch failure. Read-only (no fabric
-    pass) the mesh reads healthy, as a lost link does: every chip present, ARC ticking, the eth read
-    unable to tell. The fabric pass, as in the fixture, fails until a reset heals it."""
+    """The mesh fixture failing on a lost link instead of a dispatch failure. Read-only (no fabric pass) the mesh reads
+    healthy, as a lost link does: every chip present, ARC ticking, the eth read unable to tell."""
     monkeypatch.setattr(dfr, "FABRIC_OUT", LOST_OUT)
     monkeypatch.setattr(dfr, "DISPATCH_LINE", LOST_DETAIL)
     monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
@@ -345,9 +284,7 @@ def _monitor_fabric(monkeypatch, tmp_path, st):
     monkeypatch.setattr(monitor_mod, "health_dir", lambda: hdir)
     monkeypatch.setattr(monitor_mod, "_asic_bus_map", lambda: {"a": 0xC1})
     monkeypatch.setattr(monitor_mod, "health_event", lambda ev, **f: st.setdefault("events", []).append(ev))
-    monkeypatch.setattr(monitor_mod.alert, "send_alert", lambda ev, log=None: object())
     (hdir / monitor_mod.ASIC_BUS_FILE).write_text('{"a": 1}')
-    monkeypatch.delenv(ACCEPT, raising=False)
 
     async def verify(expected, log, run_fabric=True, **kw):
         st.setdefault("verifies", []).append(run_fabric)
@@ -385,10 +322,9 @@ def latched_mesh(monkeypatch, tmp_path, mesh):  # noqa: F811
 
 @pytest.mark.asyncio
 async def test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs(monkeypatch, latched_mesh):
-    """I42: the idle relift resets the latched hold with no grace; the post-reset check runs the
-    descriptor, the latched mismatch FAILS it (never withheld, never a lift), the last-chance sweep
-    runs and the hold climbs to the host rung at once (spec 04 I79): bounded, never an open-ended
-    hold. A later forced window asks for no second host rung and still releases nothing."""
+    """I42: the idle relift resets the latched hold with no grace; the post-reset check runs the descriptor, the latched
+    mismatch FAILS it (never withheld, never a lift), the last-chance sweep runs and the hold climbs to the host rung at
+    once (spec 04 I79): bounded, never an open-ended hold."""
     from tt_device_mcp.health.recovery import galaxy
 
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
@@ -428,11 +364,8 @@ async def test_a_latched_hold_resets_and_a_post_reset_mismatch_fails_and_climbs(
 async def test_a_latched_hold_no_relift_reset_takes_the_ladder_at_the_ceiling(
     monkeypatch, tmp_path, mesh, dirty  # noqa: F811
 ):
-    """I42 with the 10-min bound: a real lift leaves the validator's mismatch line in the last fabric
-    output, and its first job latches the fault. When no idle relift reset has run first (the device
-    dirty, a tenant, a host action pending), the watchdog's forced window still runs the present-mesh
-    reset, never a no-reset hold; its full post-reset check fails, and the same window climbs to the
-    host rung. Never released without a passing full check."""
+    """I42 with the 10-min bound: a real lift leaves the validator's mismatch line in the last fabric output, and its
+    first job latches the fault."""
     from tt_device_mcp.health.recovery import galaxy
 
     m = _monitor_fabric(monkeypatch, tmp_path, mesh)
@@ -467,11 +400,9 @@ async def test_a_latched_hold_no_relift_reset_takes_the_ladder_at_the_ceiling(
 async def test_replay_a_held_77_whose_bound_ladder_leaves_a_port_missing_power_cycles_once(
     monkeypatch, tmp_path, mesh, latched  # noqa: F811
 ):
-    """Replay of a held rc 77 (spec 04 I76 with spec 03 I71): the hold reaches the 10-min bound, the
-    bound's ladder runs glx_reset and it exits 0, but the full check after it still finds one
-    descriptor port missing while the traffic-only rerun passes. That check FAILS: the device is
-    never released and the broker asks for exactly one power cycle; a later watchdog tick asks for
-    no second one while the first is pending."""
+    """Replay of a held rc 77 (spec 04 I76 with spec 03 I71): the hold reaches the 10-min bound, the bound's ladder runs
+    glx_reset and it exits 0, but the full check after it still finds one descriptor port missing while the traffic-only
+    rerun passes."""
     from tt_device_mcp.health.recovery import galaxy
 
     m = _monitor_fabric(monkeypatch, tmp_path, mesh)
@@ -548,11 +479,8 @@ async def _idle_tick():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("heals", [True, False], ids=["reset-heals", "ports-stay-missing"])
 async def test_a_dirty_latched_hold_with_an_empty_queue_takes_the_idle_gate_at_once(monkeypatch, latched_mesh, heals):
-    """03 I42 with I68 (class D time to recover): a dirty mark on the latched hold (the failed job's own)
-    keeps its why, so the read-only relift bails on it and, with nothing queued, it waited for the
-    600 s bound. Now the first idle tick runs the present-mesh rung: the reset with no grace, then
-    the full check with the descriptor. Only its pass releases (and ends the latch); a
-    failed check never releases and the ladder climbs to the host rung at once."""
+    """03 I42 with I68 (class D time to recover): a dirty mark on the latched hold (the failed job's own) keeps its why,
+    so the read-only relift bails on it and, with nothing queued, it waited for the 600 s bound."""
     _idle_queue(monkeypatch)
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     cycles = []
@@ -599,10 +527,8 @@ async def test_a_dirty_latched_hold_with_an_empty_queue_takes_the_idle_gate_at_o
 @pytest.mark.asyncio
 @pytest.mark.parametrize("heals", [True, False], ids=["reset-heals", "ports-stay-missing"])
 async def test_a_paced_present_rung_does_not_spend_the_dirty_latched_idle_gate(monkeypatch, latched_mesh, heals):
-    """03 I68 class D, paced: a mesh reset started 60 s ago, so the present-mesh rung waits out its
-    grace (WAITING, no reset). That tick must not spend the episode's one gate, or the hold waits for
-    the 600 s bound. The first tick after the pacing runs exactly one reset and the full check with
-    the descriptor; only its pass releases, and a failure takes exactly one power cycle."""
+    """03 I68 class D, paced: a mesh reset started 60 s ago, so the present-mesh rung waits out its grace (WAITING, no
+    reset). That tick must not spend the episode's one gate, or the hold waits for the 600 s bound."""
     from tt_device_mcp.health.recovery import galaxy
 
     _idle_queue(monkeypatch)
@@ -718,12 +644,8 @@ def _relift_unpaced(monkeypatch):
 
 @pytest.fixture(params=["missing ports", "latched"])
 def link_short_hold(request, monkeypatch, mesh):  # noqa: F811
-    """A fabric link-short hold (spec 04 I83), every chip on the bus and no reset run yet: the post-job
-    gate's measured missing-port FAIL, or the I42 latch. The watchdog starts its episode. Its at-start
-    ladder runs the glx_reset, the full check after it still counts short and the ladder's host rung is
-    deferred by the boot / post-power-cycle cooldown (WAITING: the hold stands); the bound's host rung
-    after it is deferred too (its retry armed, no host action pending), which leaves the idle relift
-    free to run."""
+    """A fabric link-short hold (spec 04 I83), every chip on the bus and no reset run yet: the post-job gate's measured
+    missing-port FAIL, or the I42 latch. The watchdog starts its episode."""
     from tests.test_hold_bound import _watchdog
     from tt_device_mcp.health.recovery import OUTCOME_WAITING
 
@@ -740,7 +662,7 @@ def link_short_hold(request, monkeypatch, mesh):  # noqa: F811
         mesh["events"].append("at_start_ladder")
         return OUTCOME_WAITING
 
-    async def host_rung(age, log):
+    async def host_rung(age, log, *a, **k):
         mesh["events"].append("host_rung")
         srv._hold_bound_rung_pending, srv._hold_bound_cycle_age = False, age  # the cooldown retry is armed
 

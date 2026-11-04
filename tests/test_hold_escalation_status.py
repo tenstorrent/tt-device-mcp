@@ -239,9 +239,8 @@ def test_not_held_reports_no_escalation(monkeypatch, clear_job_state):
 
 @pytest.mark.asyncio
 async def test_a_forced_pass_updates_the_stage_and_keeps_the_hold(monkeypatch, clear_job_state, tmp_path):
-    """The forced escalation writes each rung and its end into the stage /health shows. A ladder whose
-    reset did not recover releases nothing: the device stays held until the full check, fabric
-    included, passes."""
+    """The forced escalation writes each rung and its end into the stage /health shows. A ladder whose reset did not
+    recover releases nothing: the device stays held until the full check, fabric included, passes."""
     monkeypatch.setattr(srv, "job_log_dir", tmp_path / "jobs")
     _isolate_hold(monkeypatch)
     _arm_offbus_stuck_hold(monkeypatch, off_bus=0, isolated=set(), reset_result=False, sbr_verify_healthy=False)

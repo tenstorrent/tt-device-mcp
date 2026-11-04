@@ -44,8 +44,6 @@ FRESH = {
     "device_held_since": "",
     "device_hold_escalated_monotonic": 0.0,
     "device_hold_deadline_bucket": 0,
-    "device_hold_alert_next_bucket": 0,
-    "device_hold_alert_gap": 0,
     "device_hold_escalate_bucket": 0,
     "device_hold_offbus_escalated": False,
     "device_hold_offbus_tenant_wait": False,
@@ -123,9 +121,8 @@ class _HostHoldsTheRealDevice:
 
 
 def test_a_real_device_holder_on_the_host_is_not_a_holder_in_a_test(monkeypatch):
-    """Spec 09 I1 (holder scan): a real job holding the host's own /dev/tenstorrent does not read as
-    a tenant in an unmarked test. Unsealed, it kept a runner test's job waiting on the holder and
-    blocked a hold-bound test's host rung, only while the host ran device work."""
+    """Spec 09 I1 (holder scan): a real job holding the host's own /dev/tenstorrent does not read as a tenant in an
+    unmarked test."""
     monkeypatch.setattr(dh, "os", _HostHoldsTheRealDevice())
     monkeypatch.setattr(dh, "_iter_pids", lambda: [os.getpid()])
     monkeypatch.setattr(srv, "_present_chip_indices", lambda: ["0"])

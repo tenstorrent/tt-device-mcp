@@ -449,9 +449,8 @@ _UNIT_WITH_GROUP = _UNIT_NO_GROUP.replace("PRIVSEP=1\n", "PRIVSEP=1\nEnvironment
 
 
 def _stub_lock_restart_env(monkeypatch, cli, tmp_path, unit_text, main_pid="4242", live_env=None):
-    """Like _stub_lock_env (deny probe refused), but keeps the real unit/env logic:
-    the unit lives in tmp_path, `systemctl show` reports ``main_pid`` and the broker's
-    /proc environ holds ``live_env``. Returns (issued argv lists, unit path)."""
+    """Like _stub_lock_env (deny probe refused), but keeps the real unit/env logic: the unit lives in tmp_path,
+    `systemctl show` reports ``main_pid`` and the broker's /proc environ holds ``live_env``."""
     from types import SimpleNamespace
 
     real_set = cli._set_service_device_group
@@ -482,9 +481,8 @@ def _restarted(issued):
 
 
 def test_cmd_lock_skips_restart_when_already_locked(monkeypatch, tmp_path, capsys):
-    """A repeat `lock` on a locked box (unit already sets the group, live broker env has
-    it) must not restart the broker: a restart reruns the startup fabric pass on a
-    healthy device. It still verifies the lock and returns 0."""
+    """A repeat `lock` on a locked box (unit already sets the group, live broker env has it) must not restart the
+    broker: a restart reruns the startup fabric pass on a healthy device. It still verifies the lock and returns 0."""
     sys.path.insert(0, SRC_PATH)
     from tt_device_mcp import cli
 
@@ -524,8 +522,7 @@ def test_cmd_lock_skips_restart_when_a_drop_in_sets_the_group(monkeypatch, tmp_p
 
 
 def test_cmd_lock_skips_restart_when_broker_is_stopped_and_unit_is_set(monkeypatch, tmp_path, capsys):
-    """A stopped broker (MainPID 0) picks the env up when it starts; `lock` must not
-    start it as a side effect."""
+    """A stopped broker (MainPID 0) picks the env up when it starts; `lock` must not start it as a side effect."""
     sys.path.insert(0, SRC_PATH)
     from tt_device_mcp import cli
 
@@ -537,8 +534,7 @@ def test_cmd_lock_skips_restart_when_broker_is_stopped_and_unit_is_set(monkeypat
 
 
 def test_cmd_lock_restarts_when_it_adds_the_group(monkeypatch, tmp_path, capsys):
-    """A real change (unit had no group) still edits the unit, daemon-reloads and
-    restarts the broker, as before."""
+    """A real change (unit had no group) still edits the unit, daemon-reloads and restarts the broker, as before."""
     sys.path.insert(0, SRC_PATH)
     from tt_device_mcp import cli
 

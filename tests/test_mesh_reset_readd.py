@@ -86,11 +86,6 @@ def _mechanism(monkeypatch, isolated: set, sysfs: FakeSysfs, events: list, *, ev
         local_reset_dir=(lambda: tmp) if tmp is not None else None,
         isolated_chips=lambda: isolated,
     )
-
-    async def no_ceiling(_log):
-        return None
-
-    mechanism._reapply_aiclk_ceiling = no_ceiling
     return mechanism
 
 
@@ -203,9 +198,8 @@ async def test_a_cancelled_reset_stops_the_repeats(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_no_rescan_while_the_settle_counts(monkeypatch):
-    """The settle's first count ('seconds: 0', printed as the re-power returns) and its running
-    counts start nothing; only its last count does. A rescan before the settle ends can enumerate a
-    chip whose firmware has not come up, which the kernel driver then never re-initialises."""
+    """The settle's first count ('seconds: 0', printed as the re-power returns) and its running counts start nothing;
+    only its last count does."""
     isolated, sysfs, events, seen = {"6"}, FakeSysfs(), [], {}
     mechanism = _mechanism(monkeypatch, isolated, sysfs, events)
     counts = [SETTLE_START] + [f"\r\033[93mWaiting for 30 seconds: {i}\033[0m" for i in range(1, 31)] + ["\n"]
@@ -272,10 +266,8 @@ GAVE_UP = "Didn't find all 32 chips in /dev/tenstorrent after 100 seconds, givin
 def _arm_sbr(
     monkeypatch, sysfs: FakeSysfs, *, heals: bool, started=None, hold_sec: float = 0.0, bdfs: dict | None = None
 ) -> list:
-    """Give the process the SBR capability. Each SBR is recorded as (chip, rescans so far), and the
-    startup address it was handed in ``bdfs``; ``heals``: the next rescan brings the chip back.
-    ``started`` (a threading.Event) is set as the write begins, which then takes ``hold_sec``. The
-    fabric and AICLK debts it notes are recorded, not kept."""
+    """Give the process the SBR capability. Each SBR is recorded as (chip, rescans so far), and the startup address it
+    was handed in ``bdfs``; ``heals``: the next rescan brings the chip back."""
     sbrs: list = []
 
     def reset_removed_chip(idx, bdf=None):
@@ -292,16 +284,14 @@ def _arm_sbr(
     monkeypatch.setattr(bridge_reset, "bridge_reset_enabled", lambda: True)
     monkeypatch.setattr(bridge_reset, "reset_removed_chip", reset_removed_chip)
     monkeypatch.setattr(recovery_base.FABRIC_DEBT, "note_reset", lambda why: None)
-    monkeypatch.setattr(recovery_base.CEILING, "mark_owed", lambda why: None)
     return sbrs
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("heals", [True, False], ids=["sbr-heals", "chip-stays-out"])
 async def test_an_sbr_follows_the_rescans_that_left_a_chip_out_in_the_driver_wait(monkeypatch, heals):
-    """Four rescans in tt-smi's driver wait leave chip 6 out: one SBR through its recorded bridge, then
-    the rescans go on (they add it back, I69). A chip the SBR brought back is in by the next rescan and
-    the reset succeeds; one it did not keeps the rescans to their tries and the reset fails as before."""
+    """Four rescans in tt-smi's driver wait leave chip 6 out: one SBR through its recorded bridge, then the rescans go
+    on (they add it back, I69)."""
     isolated, sysfs, events, seen = {"6"}, FakeSysfs(back_after=10_000), [], {}
     mechanism = _mechanism(monkeypatch, isolated, sysfs, events)
     sbrs = _arm_sbr(monkeypatch, sysfs, heals=heals)
@@ -322,9 +312,8 @@ async def test_an_sbr_follows_the_rescans_that_left_a_chip_out_in_the_driver_wai
 @pytest.mark.asyncio
 @pytest.mark.parametrize("pci_map", ["mapped", "unmapped", "no_map", "map_raises"])
 async def test_the_driver_wait_sbr_hands_each_chip_its_startup_address(monkeypatch, pci_map):
-    """Spec 04 I101: the SBR gets the chip's address from the startup map, so a chip with no removal
-    record can still reach its bridge through the banked baseline. No map, no entry, or a map that
-    raises: the SBR is still tried, with no address, as before."""
+    """Spec 04 I101: the SBR gets the chip's address from the startup map, so a chip with no removal record can still
+    reach its bridge through the banked baseline."""
     isolated, sysfs, events, seen, bdfs = {"24"}, FakeSysfs(back_after=10_000), [], {}, {}
     mechanism = _mechanism(monkeypatch, isolated, sysfs, events)
     sbrs = _arm_sbr(monkeypatch, sysfs, heals=True, bdfs=bdfs)
@@ -460,9 +449,8 @@ def test_the_tray_repower_is_read_from_tt_smi_output():
 
 @pytest.mark.asyncio
 async def test_a_driver_wait_give_up_after_the_tray_repower_says_the_repower_ran(monkeypatch):
-    """The partial-drop case seen on a Galaxy: the re-power ran, the isolated chip never came back in
-    tt-smi's driver wait. The line says the re-power ran, so a reader does not take the failed reset for
-    one that never reset anything; the ladder treats it as the failed reset it is."""
+    """The partial-drop case seen on a Galaxy: the re-power ran, the isolated chip never came back in tt-smi's driver
+    wait."""
     sysfs, events, logs = FakeSysfs(), [], []
     mechanism = _mechanism(monkeypatch, set(), sysfs, events)
 
@@ -527,9 +515,8 @@ async def test_a_two_chip_partial_drop_that_stays_out_through_the_repower_is_a_f
 async def test_a_mesh_reset_that_exited_before_the_tray_repower_is_logged_as_not_run(
     monkeypatch, out, why, ipmi_failed
 ):
-    """tt-smi exits non-zero before it re-powers the trays, or its IPMI call to re-power them failed in
-    both modes: nothing was reset. The line says the reset did not run and why (never "no POST_RESET
-    failure"), journaled reset_did_not_run; it is no driver-wait give-up."""
+    """tt-smi exits non-zero before it re-powers the trays, or its IPMI call to re-power them failed in both modes:
+    nothing was reset."""
     sysfs, events, logs = FakeSysfs(), [], []
     mechanism = _mechanism(monkeypatch, set(), sysfs, events)
 

@@ -13,6 +13,7 @@ asks for the power cycle. Link-short holds, chips off the bus and BMC guard find
 The end-to-end tests drive the real gate: the gate opens the hold, then resets; one fake clock moves
 monotonic time and the wall clock (the hold's age) together as the resets, checks and the wait run."""
 
+import asyncio
 import inspect
 import time
 from datetime import datetime, timedelta
@@ -116,9 +117,7 @@ def test_no_env_or_config_knob_changes_the_gap():
 async def test_a_failed_first_reset_spaces_the_sweeps_mesh_reset_then_asks_for_the_power_cycle(
     mesh, clock, monkeypatch  # noqa: F811
 ):
-    """The gate opens the hold; its mesh reset (120 s) and full check (60 s) fail. The climb's sweep
-    waits until 200 s after the first reset ended, runs the second mesh reset well before the bound,
-    its full check fails, and the power cycle is asked. Two mesh resets, never a third."""
+    """The gate opens the hold; its mesh reset (120 s) and full check (60 s) fail."""
     mesh["reset_heals"] = False
     srv.recovery_mechanism.last_reset_failed = True  # a prior cycle failed: the gate climbs this pass
     fired = _arm_power_cycle(monkeypatch)
@@ -180,9 +179,8 @@ async def test_a_first_reset_ending_late_waits_only_to_the_bound(mesh, clock, mo
 async def test_the_sweep_waits_only_on_a_present_mesh_after_this_episodes_reset(
     mesh, clock, monkeypatch, why  # noqa: F811
 ):
-    """A link-short hold (I79/I83: the power cycle at once), a chip off the bus, a BMC guard finding
-    (I91), a first reset from another episode or a spent sweep: no wait, the sweep runs (or skips) at
-    once, as before."""
+    """A link-short hold (I79/I83: the power cycle at once), a chip off the bus, a BMC guard finding (I91), a first
+    reset from another episode or a spent sweep: no wait, the sweep runs (or skips) at once, as before."""
     mesh["reset_heals"] = False
     await _gate()  # the first reset fails; no prior failure, so the gate holds without climbing
     assert len(clock["runs"]) == 1 and srv.fsm.state is ServerState.RECOVERING
@@ -234,6 +232,63 @@ async def test_the_bound_runs_the_ladder_and_asks_for_the_power_cycle_at_600s(
     assert "hold_deadline_forced_escalation" in mesh["events"], "the bound's ladder runs at 600 s"
     assert clock["waits"] == [], "the bound never waits for the gap"
     assert mesh["events"].count("last_chance_reset_sweep") == 1
-    assert len(mesh["resets"]) == resets + 1, "the bound's sweep's mesh reset"
+    # I89: the bound runs the full ladder, its spent mesh-reset rung included, then the sweep's own.
+    assert len(mesh["resets"]) == resets + 2, "the bound's ladder rung and its sweep each run a mesh reset"
     assert [f[0] for f in fired] == ["power-cycle"], "the full check still fails: the power cycle is asked"
     assert srv.fsm.state is not ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_the_bounds_rerun_of_a_spent_reset_on_a_present_mesh_is_cut_at_its_deadline(
+    mesh, clock, monkeypatch  # noqa: F811
+):
+    """Spec 04 I89/I100: at the 10-min bound a present mesh whose mesh reset already failed reruns it as the I100
+    repeat. A full check after it that never ends is cut at the rerun's deadline and counts as failed: the sweep and
+    the power cycle follow within the stated bound, and nothing lifts the hold."""
+    mesh["reset_heals"] = False
+    await _gate()
+    resets = len(mesh["resets"])
+    assert resets == 1
+    clock["off"] += BOUND - _hold_age() + 1
+    fired = _arm_power_cycle(monkeypatch)
+    for n in ("MESH_RESET_BEFORE_HOST_RUNG_SEC", "MESH_RESET_BEFORE_HOST_RUNG_GAVE_UP_SEC"):
+        monkeypatch.setattr(galaxy, n, 0.5)
+    monkeypatch.setattr(galaxy, "MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC", 1)
+    monkeypatch.setattr(galaxy, "MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC", 0.2)
+    monkeypatch.setattr(galaxy, "MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC", 0.2)
+    g = srv.galaxy_recovery
+    orig = g._verify_device
+    hung = asyncio.Event()
+
+    async def verify(expected, log, *a, **k):
+        if len(mesh["resets"]) > resets:
+            await hung.wait()  # never set: every full check after the bound's rerun hangs
+        return await orig(expected, log, *a, **k)
+
+    monkeypatch.setattr(g, "_verify_device", verify)
+    lifts = []
+    monkeypatch.setattr(srv, "_clear_device_dirty", lambda **kw: lifts.append(kw.get("why")))
+    for name, value in (
+        ("device_hold_deadline_bucket", 0),
+        ("device_hold_escalate_bucket", 0),
+        ("device_hold_offbus_escalated", False),
+        ("_forced_escalation_task", None),
+    ):
+        monkeypatch.setattr(srv, name, value)
+    mesh["events"].clear()
+    srv._check_hold_deadline()
+    assert srv._forced_escalation_task is not None
+    task = srv._forced_escalation_task
+    for _ in range(300):  # 30 s real: the fake clock jumps on each reset, so no loop-time timeout
+        if task.done():
+            break
+        await asyncio.to_thread(time.sleep, 0.1)
+    if not task.done():
+        task.cancel()
+        pytest.fail("the bound's ladder still runs after 30 s: the hung check was not cut at its deadline")
+    await task
+    assert "bound_reruns_spent_rung" in mesh["events"]
+    assert "whole_mesh_reset_before_host_rung_unverified" in mesh["events"], "the hung check is cut at its deadline"
+    assert [f[0] for f in fired] == ["power-cycle"], "the cut check counts as failed: the power cycle is asked"
+    assert fired[0][1] <= 33 * 60, f"within the stated bound: {fired[0][1]:.0f}s"
+    assert lifts == [] and srv.fsm.state is not ServerState.HEALTHY, "a cut check lifts nothing"

@@ -52,11 +52,9 @@ def _arm_all_off_with_two_cycles(monkeypatch, tmp_path):
     monkeypatch.setattr(srv, "_current_boot_id", lambda: boot["id"])
     monkeypatch.setattr(srv, "_boot_btime_id", lambda: str(int(now - 1800)))
     monkeypatch.setattr(srv, "write_action_log", lambda *a, **k: None)
-    monkeypatch.setattr(srv, "_run_pre_power_cycle_hook", lambda log, reason: {"ran": False})
     cycles = []
     monkeypatch.setattr(srv, "_fire_power_cycle", lambda: cycles.append(time.time()))
     alerts = []
-    monkeypatch.setattr(recovery_base.alert, "send_alert", lambda event, *a, **k: alerts.append(event) or True)
     events = []
     patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))
     return cycles, alerts, events, boot
@@ -69,9 +67,8 @@ def _ledger_cycles(tmp_path):
 
 @pytest.mark.asyncio
 async def test_one_gate_pass_on_all_off_counts_its_cycle_once(monkeypatch, tmp_path, clear_job_state):
-    """Two cycles already in the window: the pass requests exactly one cycle (the third), journals no
-    backstop denial, pages nobody and arms no retry. Before the fix the host-rung step counted the
-    cycle just requested as the third, denied, paged and armed the retry."""
+    """Two cycles already in the window: the pass requests exactly one cycle (the third), journals no backstop denial,
+    pages nobody and arms no retry."""
     cycles, alerts, events, _ = _arm_all_off_with_two_cycles(monkeypatch, tmp_path)
     rm = srv.recovery_mechanism
 
@@ -121,5 +118,4 @@ async def test_the_backstop_still_denies_a_real_fourth_cycle(monkeypatch, tmp_pa
     assert len(cycles) == 1, "the backstop refuses a fourth cycle in the window"
     assert len(_ledger_cycles(tmp_path)) == 3
     assert "power_cycle_backstop" in events and "auto_recovery_denied" in events, events
-    assert [a for a in alerts if a.get("kind") == "power_cycle_backstop"], "the backstop pages"
     assert rm.power_cycle_retry is not None, "asked again when the oldest cycle leaves the window"

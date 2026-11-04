@@ -44,9 +44,7 @@ async def test_timeout_cancels_the_inner_work_and_raises_timeout():
 
 @pytest.mark.asyncio
 async def test_a_timed_out_gather_raises_timeout_not_cancel():
-    """A cancelled gather ends with CancelledError as its exception rather than in the cancelled
-    state. The job runner waits on a gather of its stream readers, and a cancel there reads as a
-    broker shutdown: the job is left running and the runner exits."""
+    """A cancelled gather ends with CancelledError as its exception rather than in the cancelled state."""
     a = asyncio.ensure_future(asyncio.sleep(10))
     b = asyncio.ensure_future(asyncio.sleep(10))
     with pytest.raises(asyncio.TimeoutError):
@@ -69,10 +67,7 @@ async def test_result_and_exception_pass_through():
 
 
 def test_the_broker_tasks_that_shutdown_cancels_use_aio_wait_for():
-    """The job runner and the startup tasks must end on the shutdown cancel. Every plain
-    asyncio.wait_for in server.py is one more place a cancel can be dropped (the output-dir
-    preflight was one: the runner then ran the job and waited on its queue forever), so only the
-    request handlers and the route-side wait below may keep it."""
+    """The job runner and the startup tasks must end on the shutdown cancel."""
     import ast
     from pathlib import Path
 

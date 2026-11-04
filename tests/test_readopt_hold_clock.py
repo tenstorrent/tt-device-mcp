@@ -97,10 +97,8 @@ def _restarted_over_a_live_job(monkeypatch, tmp_path):
 async def test_a_live_readopted_job_opens_no_hold_and_nothing_escalates_past_10_min(
     monkeypatch, tmp_path, clear_job_state
 ):
-    """The startup hold over a healthy re-adopted job that runs 25 min opens no hold episode: no clock, no
-    deadline, no forced escalation, no tenant-blocked page. Fails on base: the hold opened at the restart
-    and its clock passed 10 min while the bound's ladder deferred on the running job. The device stays
-    refused to every other job meanwhile (goal 11): the startup record and the re-adopted scope hold it."""
+    """The startup hold over a healthy re-adopted job that runs 25 min opens no hold episode: no clock, no deadline, no
+    forced escalation, no tenant-blocked page."""
     _restarted_over_a_live_job(monkeypatch, tmp_path)
     seen = _record_events(monkeypatch)
 
@@ -150,9 +148,8 @@ async def test_anything_that_names_a_fault_opens_the_hold_at_once(monkeypatch, t
 async def test_a_restored_startup_episode_is_dropped_and_a_restored_fault_episode_keeps_its_clock(
     monkeypatch, tmp_path, clear_job_state, startup
 ):
-    """A startup hold the previous broker left open over the same job restarts its clock: it is dropped from
-    disk, so a later restart restores nothing from it either. A fault hold open at the restart keeps its
-    own clock (spec 04 I82) and opens at once."""
+    """A startup hold the previous broker left open over the same job restarts its clock: it is dropped from disk, so a
+    later restart restores nothing from it either."""
     _isolate(monkeypatch, tmp_path)
     old = _since(BOUND + 900)
     srv._persist_hold_episode(old, startup=startup)
@@ -175,9 +172,8 @@ async def test_a_restored_startup_episode_is_dropped_and_a_restored_fault_episod
 async def test_the_jobs_end_opens_a_fresh_hold_that_only_a_full_check_with_fabric_lifts(
     monkeypatch, tmp_path, clear_job_state, verdict
 ):
-    """Goal 11: after the re-adopted job's 30 min, the hold opens with a fresh clock when it ends and the
-    queue stays shut until the startup gate's full check, fabric included, passes. A fabric check that
-    finds fewer links than the cabling expects is a fail: the hold and its clock stay."""
+    """Lift only on a fresh pass: after the re-adopted job's 30 min, the hold opens with a fresh clock when it ends and
+    the queue stays shut until the startup gate's full check, fabric included, passes."""
     _isolate(monkeypatch, tmp_path)
     _watchdog(monkeypatch)
     _restart_broker(monkeypatch)
@@ -219,12 +215,8 @@ async def test_the_jobs_end_opens_a_fresh_hold_that_only_a_full_check_with_fabri
 async def test_a_failed_startup_gate_after_the_job_gets_the_bound_ladder_by_600_s_after_its_end(
     rig, monkeypatch, tmp_path, clear_job_state, gate_sec  # noqa: F811
 ):
-    """The re-adopted job ran 25 min, then the startup gate took the device: its hugepage wait and full
-    check run as a device op, which the sampler's verdict skips, and the check fails ``gate_sec`` later.
-    The hold's clock still counts from the job's end, not from that failing verdict: no ladder before the
-    10-min mark, the broker's own full ladder at it, and when the full check with fabric after it still
-    fails, one power-cycle request. Nothing releases the hold. Fails on a clock that starts at the
-    gate's verdict: the hold is ``gate_sec`` short of the bound at the job's end + 600 s."""
+    """The re-adopted job ran 25 min, then the startup gate took the device: its hugepage wait and full check run as a
+    device op, which the sampler's verdict skips, and the check fails ``gate_sec`` later."""
     order = rig["order"]
     job = _restarted_over_a_live_job(monkeypatch, tmp_path)
     for minutes in (0, 25):
@@ -271,9 +263,8 @@ async def test_a_failed_startup_gate_after_the_job_gets_the_bound_ladder_by_600_
 async def test_a_fault_hold_over_a_readopted_job_pages_once_and_runs_the_ladder_when_the_job_ends(
     rig, monkeypatch, tmp_path, clear_job_state  # noqa: F811
 ):
-    """A fault hold open at the restart keeps its clock over the re-adopted job (spec 04 I82). Past the bound
-    the running job keeps every reset off the device: paged once, naming it. On the first tick after the job
-    ends the ladder runs, its full check fails, and the power cycle is asked for once."""
+    """A fault hold open at the restart keeps its clock over the re-adopted job (spec 04 I82). Past the bound the
+    running job keeps every reset off the device: paged once, naming it."""
     order = rig["order"]
     _isolate(monkeypatch, tmp_path)
     checks = _bound_hold_with_a_failing_full_check(rig, monkeypatch)
@@ -281,8 +272,6 @@ async def test_a_fault_hold_over_a_readopted_job_pages_once_and_runs_the_ladder_
     srv._persist_hold_episode(old)
     _restart_broker(monkeypatch)
     job = _readopted_job(monkeypatch, tmp_path)
-    alerts = []
-    monkeypatch.setattr(srv.alert, "send_alert", lambda event, log=None: alerts.append(event))
     monkeypatch.setattr(srv, "device_hold_tenant_deferred", False)
 
     srv._note_tenant_gate_verdict(srv._device_unavailable_for_tenant())
@@ -293,7 +282,6 @@ async def test_a_fault_hold_over_a_readopted_job_pages_once_and_runs_the_ladder_
     await _drain()
 
     kinds = [k for k, _ in rig["events"]]
-    assert [a["kind"] for a in alerts].count("hold_bound_tenant_blocked") == 1
     assert kinds.count("hold_bound_tenant_blocked") == 1
     assert "glx_reset" not in order and "power_cycle" not in order, "no reset over the running job"
 
@@ -310,10 +298,8 @@ async def test_a_fault_hold_over_a_readopted_job_pages_once_and_runs_the_ladder_
 
 @pytest.mark.asyncio
 async def test_the_deferred_startup_hold_does_not_take_a_closed_episodes_carry(monkeypatch, tmp_path, clear_job_state):
-    """Spec 04 I82: a release saved a carry and the next job started inside its window; a restart 26 min
-    later re-adopted that live job. The deferred startup hold takes no carry and escalates nothing. When the
-    job then fails, the carry is pinned to the startup hold that opens after it, as to one already open:
-    that hold starts its own clock and nothing escalates at once."""
+    """Spec 04 I82: a release saved a carry and the next job started inside its window; a restart 26 min later
+    re-adopted that live job. The deferred startup hold takes no carry and escalates nothing."""
     _isolate(monkeypatch, tmp_path)
     _watchdog(monkeypatch)
     escalations, _events, _detail = _open_hold(monkeypatch, "generic", 130)

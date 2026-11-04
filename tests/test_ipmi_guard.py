@@ -115,7 +115,7 @@ def test_the_mounted_copy_refuses_as_ipmitool(tmp_path):
 
 
 def test_nothing_switches_the_guard_off():
-    """No environment variable, flag or config is read (user msgs on broker overrides): the module
+    """No environment variable, flag or config is read (no broker overrides): the module
     never touches os.environ except for PATH, which only widens what it guards."""
     src = (ROOT / "src/tt_device_mcp/health/recovery/ipmi_guard.py").read_text()
     tree = ast.parse(src)
@@ -400,7 +400,6 @@ def ladder(monkeypatch, tmp_path, clear_job_state):
     m = g.mechanism
     monkeypatch.setattr(m, "scope_active", lambda: None)
     monkeypatch.setattr(m, "bmc_guard_state", None)
-    monkeypatch.setattr(m, "_bmc_guard_paged", False)
     monkeypatch.setattr(m, "last_reset_failed", False)
 
     async def no_pollers(on, log):
@@ -410,7 +409,6 @@ def ladder(monkeypatch, tmp_path, clear_job_state):
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
     monkeypatch.setattr(srv, "_clear_device_reported_fault", lambda why: None)
     pages = []
-    monkeypatch.setattr(recovery_base.alert, "send_alert", lambda event: pages.append(event) or 0)
     launches = []
     fsm_dirty(srv, "gate/post-job: reset", why="job_killed")
     return {"g": g, "m": m, "events": events, "pages": pages, "launches": launches}
@@ -463,7 +461,6 @@ async def test_the_fallback_never_reads_as_a_passing_reset_and_pages_once(ladder
         assert rc == 1, "tt-smi's exit 0 after the fallback is not a recovered mesh"
     attempted = [f for k, f in rig["events"] if k == "bmc_legacy_reset_attempted"]
     assert len(attempted) == 2 and all(f["host_at_risk"] for f in attempted)
-    assert len(rig["pages"]) == 1, "paged once per episode"
     assert srv._health_payload()["mesh_reset_bmc_guard"]["kind"] == kind
 
 
@@ -483,7 +480,7 @@ async def test_a_guard_that_cannot_arm_is_a_reset_that_did_not_fire(ladder, monk
 @pytest.mark.asyncio
 @pytest.mark.parametrize("evidence, released", [(F77, False), (FOK, True)], ids=["fabric-77", "fabric-ok"])
 async def test_a_guarded_reset_still_owes_the_full_check_before_release(ladder, monkeypatch, evidence, released):
-    """Goals 8/11: a clean guarded mesh reset releases only once the full check, fabric included,
+    """Full check before any release: a clean guarded mesh reset releases only once the full check, fabric included,
     has passed after it; the guard state clears on that clean reset."""
     rig = ladder
     rig["m"].bmc_guard_state = {"kind": "preflight_refused", "reason": "x", "at": "t"}
@@ -559,9 +556,8 @@ async def test_a_plain_tt_smi_override_runs_unguarded(ladder, monkeypatch):
 async def test_an_unclassifiable_override_is_refused_and_the_ladder_climbs_with_the_hold_kept(
     ladder, monkeypatch, override
 ):
-    """Fail closed: an override the guard cannot classify never runs. The rung did not fire (rc None,
-    no cooldown), the ladder climbs, and the hold lifts only after a full check (fabric included)
-    passes after a reset that did run."""
+    """Fail closed: an override the guard cannot classify never runs. The rung did not fire (rc None, no cooldown), the
+    ladder climbs, and the hold lifts only after a full check (fabric included) passes after a reset that did run."""
     rig = ladder
     _launch(monkeypatch, rig, 0, "ok")
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_ARGS", override)

@@ -37,9 +37,8 @@ _LOGGED = (
     " --- /opt/x/libtt_metal.so(+0x1234)\n"
 )
 _NO_ERROR_LINE = "banner\nsomething odd\nlast words\n"
-# metal's TT_FATAL: the what() header names only the source line and the failed condition; the
-# message itself comes two lines down, under "info:" (as run_cluster_validation printed it when a
-# route was missing on a galaxy).
+# metal's TT_FATAL: the what() header names only the source line and the failed condition; the message itself comes two
+# lines down, under "info:" (as run_cluster_validation printed it when a route was missing on a galaxy).
 _TT_FATAL = (
     "2026-10-14 08:55:40.1 | info     | Device | Opening 32 chips\n"
     "terminate called after throwing an instance of 'std::runtime_error'\n"
@@ -183,8 +182,12 @@ def test_wrapper_last_run_log_keeps_both_ends_past_its_cap(tmp_path):
     assert len(log) < 6000
 
 
-@pytest.mark.parametrize("raw", ["4M", "0", "-1", "12", "1e6", "99999999999999999999"])
-@pytest.mark.parametrize("rc", [0, 134])
+# The cap is checked before the validator runs, the same way whatever its rc: every raw value at
+# one rc, and one at the other.
+@pytest.mark.parametrize(
+    ("raw", "rc"),
+    [(raw, 134) for raw in ["4M", "0", "-1", "12", "1e6", "99999999999999999999"]] + [("4M", 0)],
+)
 def test_a_malformed_last_run_cap_falls_back_to_the_default(tmp_path, raw, rc):
     """A cap that is not a byte count must not turn the run into a fault (rc 1 reads as a measured
     fabric fail): the wrapper says so and keeps its verdict, with the default cap."""

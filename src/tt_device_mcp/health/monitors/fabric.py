@@ -172,26 +172,16 @@ def names_links_missing(text: str) -> bool:
     return LINKS_MISSING in (text or "")
 
 
-def accepted_missing_ports() -> frozenset[str]:
-    """Port connections an operator accepts as known dead (``TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS``,
-    comma-separated names exactly as the marker prints them). Empty by default: nothing is accepted."""
-    raw = os.environ.get("TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS", "")
-    return frozenset(" ".join(n.split()) for n in raw.split(",") if n.strip())
-
-
-def links_missing(marker: str, accepted: frozenset[str] = frozenset()) -> str:
+def links_missing(marker: str) -> str:
     """The FAILED detail for a topology marker whose descriptor ports are missing, else "".
 
     A moved tray renames its links (as many extra as missing, I42) and stays a lift. More missing
-    than extra means links are gone. Only an explicit accept list naming every missing port (all
-    names known, none cut off) turns that back into a lift (I71)."""
+    than extra means links are gone (I71)."""
     m = _MARKER_COUNTS.search(marker or "")
     if not m or int(m.group(1)) <= int(m.group(2)):
         return ""
     missing, extra = int(m.group(1)), int(m.group(2))
     names = marker_ports(marker)[0]
-    if accepted and len(names) == missing and set(names) <= accepted:
-        return ""
     named = f": {_names(names)}" if names else " (names not listed by the check)"
     return (
         f"{LINKS_MISSING}: {missing} port connection(s) of the cabling descriptor missing, {extra} extra, "
@@ -268,12 +258,11 @@ def job_fabric_error(log_tail: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
-# The lines naming why the validator never reached a verdict, most specific first, for a SKIPPED
-# detail that says more than a bare exit code. Order matters: an uncaught exception prints
-# "terminate called after throwing an instance of '<type>'" on the line ABOVE "  what():  <cause>",
-# so a first-match-in-line-order search kept the exception type and dropped the cause (a missing
-# 1G hugepage pool read as a bare UmdException). A logged error/TT_THROW line is next: some aborts
-# print their cause only there.
+# The lines naming why the validator never reached a verdict, most specific first, for a SKIPPED detail that says more
+# than a bare exit code. Order matters: an uncaught exception prints "terminate called after throwing an instance of
+# '<type>'" on the line ABOVE "  what():  <cause>", so a first-match-in-line-order search kept the exception type and
+# dropped the cause (a missing 1G hugepage pool read as a bare UmdException). A logged error/TT_THROW line is next: some
+# aborts print their cause only there.
 _REASON_PATTERNS = (
     # The wrapper's own final verdict on a mesh whose links passed and whose dispatch did not
     # (spec 03 I55): it names the failure the exit code is about, ahead of any validator line above.
@@ -368,10 +357,9 @@ def _validator_paths() -> tuple[str, str, str]:
 def validator_missing() -> Optional[str]:
     """What of the pinned validator is not on disk yet, or ``None`` once all of it is.
 
-    The same three things the wrapper script exits 77 on: the binary, its runtime root and, when one
-    is configured, the cabling descriptor. ``install-fabric-validator.sh`` publishes them together by
-    flipping the ``current`` link, which on a fresh boot can land minutes after the broker's startup
-    pass ran. Stat calls only, so a caller may poll it."""
+    The same three things the wrapper script exits 77 on: the binary, its runtime root and, when one is configured, the
+    cabling descriptor. ``install-fabric-validator.sh`` publishes them together by flipping the ``current`` link, which
+    on a fresh boot can land minutes after the broker's startup pass ran. Stat calls only, so a caller may poll it."""
     binpath, runtime_root, desc = _validator_paths()
     if not os.access(binpath, os.X_OK):
         return f"pinned validator not installed yet ('{binpath}')"
@@ -389,10 +377,9 @@ _SHIPPED_WRAPPER = "tt-device-fabric-check.sh"
 
 
 def validator_not_built() -> Optional[str]:
-    """``validator_missing()`` when the fabric check runs the pinned validator, else ``None`` (spec 03
-    I81). That is with no ``TT_DEVICE_MCP_FABRIC_CHECK_CMD``, or one naming the shipped wrapper. An
-    operator's own command needs none of these paths, so their absence says nothing about it. Stat
-    calls only."""
+    """``validator_missing()`` when the fabric check runs the pinned validator, else ``None`` (spec 03 I81). That is
+    with no ``TT_DEVICE_MCP_FABRIC_CHECK_CMD``, or one naming the shipped wrapper. An operator's own command needs none
+    of these paths, so their absence says nothing about it. Stat calls only."""
     override = os.environ.get("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "").strip()
     if override and _SHIPPED_WRAPPER not in override:
         return None
@@ -400,25 +387,20 @@ def validator_not_built() -> Optional[str]:
 
 
 def build_command(descriptor: bool = True) -> Optional[tuple[list[str], dict[str, str]]]:
-    """The argv + env to run the fabric check with, or ``None`` when nothing is
-    configured/available to run at all.
+    """The argv + env to run the fabric check with, or ``None`` when nothing is configured/available to run at all.
 
-    ``TT_DEVICE_MCP_FABRIC_CHECK_CMD`` set names an operator's own wrapper, run through
-    ``/bin/bash -c`` exactly as before — unchanged semantics for anyone pointed at
-    ``deploy/tt-device-fabric-check.sh`` or an equivalent.
+    ``TT_DEVICE_MCP_FABRIC_CHECK_CMD`` set names an operator's own wrapper, run through ``/bin/bash -c`` exactly as
+    before — unchanged semantics for anyone pointed at ``deploy/tt-device-fabric-check.sh`` or an equivalent.
 
     Unset, this resolves the pinned validator under ``TTDEV_VALIDATOR_ROOT`` (default
     ``/opt/tt-device-broker/validator``) the same way that script did: the binary at
-    ``current/build/tools/scaleout/run_cluster_validation``, run directly against the checkout
-    it was built from (``TT_METAL_RUNTIME_ROOT``/``TT_METAL_HOME``) with its own dedicated
-    firmware/kernel cache, and an OPTIONAL cabling descriptor — optional because defaulting it
-    to any one topology makes the check work on only that topology, where every host gets a
-    traffic-only check without it. A binary that has not been published yet is exactly as
-    unavailable as no override at all, so both collapse to the same ``None``.
+    ``current/build/tools/scaleout/run_cluster_validation``, run directly against the checkout it was built from
+    (``TT_METAL_RUNTIME_ROOT``/``TT_METAL_HOME``) with its own dedicated firmware/kernel cache, and an OPTIONAL cabling
+    descriptor — optional because defaulting it to any one topology makes the check work on only that topology, where
+    every host gets a traffic-only check without it. A binary that has not been published yet is exactly as unavailable
+    as no override at all, so both collapse to the same ``None``.
 
-    ``descriptor=False`` drops the cabling descriptor: the traffic-only rerun after a topology
-    mismatch.
-    """
+    ``descriptor=False`` drops the cabling descriptor: the traffic-only rerun after a topology mismatch."""
     override = os.environ.get("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "").strip()
     if override:
         return ["/bin/bash", "-c", override], {**os.environ, "PYTHONUNBUFFERED": "1"}

@@ -23,7 +23,7 @@ import time
 from datetime import datetime
 from typing import Callable, Optional
 
-from tt_device_mcp import aio, alert, metrics
+from tt_device_mcp import aio, metrics
 from tt_device_mcp.constants import (
     ETH_POST_JOB_TIMEOUT_SEC,
     ETH_REAP_SEC,
@@ -33,17 +33,15 @@ from tt_device_mcp.constants import (
 )
 from tt_device_mcp.device_holders import note_broker_internal
 from tt_device_mcp.health import chip_state
-from tt_device_mcp.health.aiclk_ceiling import CEILING
 from tt_device_mcp.health.core import HealthState, Observation, Verdict
 from tt_device_mcp.health.evidence import capture_incident, health_dir, health_event
 from tt_device_mcp.health.monitors import eth, fabric, hostpci, pci
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.shutdown import CheckInterruptedByShutdown, interrupted_by_shutdown
 
-# How much of a fabric run's output the action-log row keeps for a run that got no healthy verdict:
-# all of it, since the validator's first error line (the cause) sits near the head and a wrapper's
-# verdict at the tail. Only past this ceiling, so a chatty validator cannot fill the disk, is the
-# middle cut, keeping both ends.
+# How much of a fabric run's output the action-log row keeps for a run that got no healthy verdict: all of it, since the
+# validator's first error line (the cause) sits near the head and a wrapper's verdict at the tail. Only past this
+# ceiling, so a chatty validator cannot fill the disk, is the middle cut, keeping both ends.
 ACTION_LOG_OUTPUT_CHARS = 256 * 1024
 
 
@@ -58,9 +56,8 @@ def _action_log_output(text: str) -> str:
 # the validator's abort and the wrapper's verdict sit. The action-log row rotates with the jobs list;
 # the bundle rotates with the incidents (MAX_INCIDENTS), so the cause outlives the row.
 FABRIC_SKIP_OUTPUT_TAIL_BYTES = 64 * 1024
-# A no-verdict run with the same reason as the last one bundled this recently reuses that bundle:
-# the idle relift reruns a 77-only hold, and a bundle per rerun would rotate the bundles that explain
-# a reboot out of the bounded set.
+# A no-verdict run with the same reason as the last one bundled this recently reuses that bundle: the idle relift reruns
+# a 77-only hold, and a bundle per rerun would rotate the bundles that explain a reboot out of the bounded set.
 FABRIC_SKIP_INCIDENT_REUSE_SEC = 3600.0
 
 
@@ -109,9 +106,8 @@ def _load_asic_bus_map() -> dict[str, int]:
         return {}
 
 
-# A topology mismatch remembered per chip-to-bus map: while the map is unchanged, the descriptor
-# run that would only throw the same mismatch again (~19 s) is skipped and the gate goes straight
-# to the traffic-only rerun. Spec 03 I45.
+# A topology mismatch remembered per chip-to-bus map: while the map is unchanged, the descriptor run that would only
+# throw the same mismatch again (~19 s) is skipped and the gate goes straight to the traffic-only rerun. Spec 03 I45.
 TOPOLOGY_CACHE_FILE = "fabric_topology_mismatch.json"
 
 
@@ -224,11 +220,10 @@ def moved_trays(before: dict[str, int], now: dict[str, int]) -> list[str]:
 def _override_reason(text: str) -> str:
     """The reason an operator's fabric wrapper gives for its exit code, as one line.
 
-    The validator's first error line wins (see :func:`fabric.first_reason`: what() before the
-    'terminate called' banner above it): the wrapper prints its verdict AFTER the validator's own
-    output, and a multi-line verdict put the cause on a line above the last, so the last line alone
-    said "no link was tested" and dropped why. With no such line, the last line is the wrapper's
-    own verdict."""
+    The validator's first error line wins (see :func:`fabric.first_reason`: what() before the 'terminate called' banner
+    above it): the wrapper prints its verdict AFTER the validator's own output, and a multi-line verdict put the cause
+    on a line above the last, so the last line alone said "no link was tested" and dropped why. With no such line, the
+    last line is the wrapper's own verdict."""
     reason = fabric.first_reason(text)
     if reason:
         return reason
@@ -236,12 +231,8 @@ def _override_reason(text: str) -> str:
     return lines[-1].strip() if lines else "(no output)"
 
 
-def _env_int(name: str, default: int, floor: int) -> int:
-    raw = os.environ.get(name, "").strip()
-    try:
-        return max(floor, int(raw)) if raw else default
-    except ValueError:
-        return default
+FABRIC_ROUTE_FAULT_JOBS = 2
+FABRIC_KNOWN_FAULT_HOLD_SEC = 21600
 
 
 def _group_alive(pgid: int) -> bool:
@@ -372,8 +363,7 @@ class HealthMonitor:
         self.topology_hw_fault: str = ""
         self._topology_alerted: set[str] = set()
         # The last pass's port connections against the cabling descriptor, by name, for /health
-        # (spec 03 I71): ``{"verdict": "failed"|"lift", "missing_ports", "extra_ports", "accepted_ports",
-        # "marker"}``, ``accepted_ports`` naming the missing ports the accept list excused on a lift;
+        # (spec 03 I71): ``{"verdict": "failed"|"lift", "missing_ports", "extra_ports", "marker"}``;
         # empty after a clean pass on the full topology.
         self.fabric_topology: dict = {}
         # Whether the last fabric pass that ran reached no verdict (a 77). A job that then dies on the
@@ -424,46 +414,40 @@ class HealthMonitor:
         """Run one probe pass — heartbeat+pci always, then eth, then the fabric traffic pass
         when ``run_fabric``/``force_fabric`` — and store it as the new ``readings`` blackboard.
 
-        ``run_eth`` asks for the passive eth read WITHOUT the traffic pass: the clean post-job gate
-        on a host whose eth rung is armed (spec 03 I30). The read is bounded to
-        ``ETH_POST_JOB_TIMEOUT_SEC`` there. A frozen verdict stops the pass as usual; a read that
-        reached no verdict (its own timeout, a crash, a could-not-check) runs the fabric traffic
-        pass in this same pass, because on an armed host that read has answered before and a
-        read that now cannot is the stuck-read shape a fabric failure follows. Pass it only when
-        the rung is armed: a disarmed reader always skips, so ``run_eth`` there would buy the
-        traffic pass on every call. A ``run_eth`` read skipped for a link-count drop (``eth_link_drop``)
-        runs that traffic pass only when ``fabric_stale`` (no pass fresher than the caller's
-        interval): the drop persists until an operator re-baselines, so running the pass on it
-        would charge every clean job ~45-100s. Otherwise the skip is recorded and the pass ends.
+        ``run_eth`` asks for the passive eth read WITHOUT the traffic pass: the clean post-job gate on a host whose eth
+        rung is armed (spec 03 I30). The read is bounded to ``ETH_POST_JOB_TIMEOUT_SEC`` there. A frozen verdict stops
+        the pass as usual; a read that reached no verdict (its own timeout, a crash, a could-not-check) runs the fabric
+        traffic pass in this same pass, because on an armed host that read has answered before and a read that now
+        cannot is the stuck-read shape a fabric failure follows. Pass it only when the rung is armed: a disarmed reader
+        always skips, so ``run_eth`` there would buy the traffic pass on every call. A ``run_eth`` read skipped for a
+        link-count drop (``eth_link_drop``) runs that traffic pass only when ``fabric_stale`` (no pass fresher than the
+        caller's interval): the drop persists until an operator re-baselines, so running the pass on it would charge
+        every clean job ~45-100s. Otherwise the skip is recorded and the pass ends.
 
-        ``eth_timeout_reset`` says the post-job gate can still grant this hold episode's one
-        present-mesh reset (spec 03 I61). A ``run_eth`` read that then TIMED OUT with no verdict, on
-        a pass whose host-pci read is OK and whose snapshot found every chip with a healthy ARC,
-        skips the fabric pass: the gate resets next, and the full check after the reset runs the
-        pass. Any guard that fails keeps the pass.
+        ``eth_timeout_reset`` says the post-job gate can still grant this hold episode's one present-mesh reset (spec 03
+        I61). A ``run_eth`` read that then TIMED OUT with no verdict, on a pass whose host-pci read is OK and whose
+        snapshot found every chip with a healthy ARC, skips the fabric pass: the gate resets next, and the full check
+        after the reset runs the pass. Any guard that fails keeps the pass.
 
-        Mirrors ``Recovery._verify_device``'s gentlest-first short-circuiting (a frozen heartbeat
-        or a failed snapshot skips every heavier, more perturbing check below it — the traffic
-        pass is only safe to run once nothing is known to be frozen), but records every probe
-        that DID run as an :class:`Observation` instead of collapsing straight to a bool. Each
-        probe's existing ``(Optional[bool], detail)`` tri-state maps onto an Observation the same
-        way: True -> HEALTHY, False -> UNHEALTHY, None -> SKIPPED.
+        Mirrors ``Recovery._verify_device``'s gentlest-first short-circuiting (a frozen heartbeat or a failed snapshot
+        skips every heavier, more perturbing check below it — the traffic pass is only safe to run once nothing is known
+        to be frozen), but records every probe that DID run as an :class:`Observation` instead of collapsing straight to
+        a bool. Each probe's existing ``(Optional[bool], detail)`` tri-state maps onto an Observation the same way: True
+        -> HEALTHY, False -> UNHEALTHY, None -> SKIPPED.
 
-        ``indices``/``expected`` let a caller that already read the mesh this pass (the gate reads
-        both before it ever reaches a probe) hand them in instead of this method re-reading
-        ``present_chip_indices()`` and re-deriving ``expected()`` itself — the latter WRITES the
-        chip-baseline high-water mark, so a second, independent read/ratchet mid-pass can disagree
-        with the caller's own. Omit both only where no such read exists yet (e.g. a bare test).
+        ``indices``/``expected`` let a caller that already read the mesh this pass (the gate reads both before it ever
+        reaches a probe) hand them in instead of this method re-reading ``present_chip_indices()`` and re-deriving
+        ``expected()`` itself — the latter WRITES the chip-baseline high-water mark, so a second, independent
+        read/ratchet mid-pass can disagree with the caller's own. Omit both only where no such read exists yet (e.g. a
+        bare test).
 
-        ``log``, when given, gets the same per-probe line ``Recovery._verify_device`` used to
-        write to the job log, and each probe's own ``set_device_op_detail`` string — both are what
-        ``Recovery._verify_device`` now delegates here for (see below); dropping them here would
-        silently blank the job log and the queue's "what's it doing" detail for every caller.
+        ``log``, when given, gets the same per-probe line ``Recovery._verify_device`` used to write to the job log, and
+        each probe's own ``set_device_op_detail`` string — both are what ``Recovery._verify_device`` now delegates here
+        for (see below); dropping them here would silently blank the job log and the queue's "what's it doing" detail
+        for every caller.
 
-        A probe the host shutdown or the broker's own stop killed raises
-        ``CheckInterruptedByShutdown`` out of here, logged once: no readings are stored, and the
-        caller unwinds as from a cancellation, counting nothing (I63).
-        """
+        A probe the host shutdown or the broker's own stop killed raises ``CheckInterruptedByShutdown`` out of here,
+        logged once: no readings are stored, and the caller unwinds as from a cancellation, counting nothing (I63)."""
         try:
             return await self._update(
                 phase,
@@ -564,17 +548,6 @@ class HealthMonitor:
         if log:
             log(f"snapshot: {'OK' if ok else 'UNHEALTHY'} — {detail}")
         _record("pci", ok, detail)
-        # The operator's AICLK ceiling, re-proven (and re-applied where a chip lost it) on every
-        # pass once the snapshot showed the chips present — a reset, power cycle, boot or job exit
-        # may have cleared it — and before the eth read and the traffic pass, so no load the broker
-        # drives runs above it. ~2 ms per chip. Off (no step, no observation) when unconfigured.
-        if ok and CEILING.armed():
-            self._deps.set_device_op_detail("health check: AICLK ceiling")
-            cok, cdetail, cevidence = await CEILING.apply(phase, log=log, terminate=self._terminate_process_group)
-            if cok is not None:
-                _record("aiclk_ceiling", cok, cdetail, cevidence)
-            if cok is False:
-                return _store()
         fabric_asked = run_fabric or force_fabric
         if ok and (fabric_asked or run_eth):
             # A full pass re-arms a rung a failed self-test left off before it reads (spec 03 I28). A
@@ -685,15 +658,13 @@ class HealthMonitor:
     def eth_link_drop(self, measured: int) -> str:
         """Judge the built-in eth probe's measured link count against this host's high-water mark.
 
-        The probe reads only links that are up, so a link that went down is simply one core fewer
-        and every remaining core still reads advancing. The count is the only place that loss
-        shows. Returns "" when ``measured`` is at least the mark (and ratchets the mark up), else
-        the reason the read cannot vouch for the fabric. Like the chip baseline, the mark only
-        rises: links go down from a wedge, not from the design. An operator re-baselines a host
-        whose links really changed by deleting the file. An unreadable file fails closed for this
-        read and is rewritten with the current count, so a file lost that way loses its mark.
-        Writes go through a temp file and ``os.replace``, so a crash mid-write cannot tear it.
-        """
+        The probe reads only links that are up, so a link that went down is simply one core fewer and every remaining
+        core still reads advancing. The count is the only place that loss shows. Returns "" when ``measured`` is at
+        least the mark (and ratchets the mark up), else the reason the read cannot vouch for the fabric. Like the chip
+        baseline, the mark only rises: links go down from a wedge, not from the design. An operator re-baselines a host
+        whose links really changed by deleting the file. An unreadable file fails closed for this read and is rewritten
+        with the current count, so a file lost that way loses its mark. Writes go through a temp file and
+        ``os.replace``, so a crash mid-write cannot tear it."""
         self._eth_drop_measured = True
         path = health_dir() / self.ETH_LINK_BASELINE_FILE
         try:
@@ -709,24 +680,22 @@ class HealthMonitor:
             # A topology-mismatch lift re-baselined this host (I45): the mark belongs to the
             # chip-to-bus map it was taken on, and the pre-lift mark is kept as ``high_water``.
             high, keyed, pending = topo
-            accepted = bool(data.get("accepted"))
             if keyed != _asic_bus_map():
                 # Trays moved again since: the re-baseline no longer describes this mesh.
                 data, baseline = {"links": high}, high
                 _write_json(self.ETH_LINK_BASELINE_FILE, data)
-            elif pending and (accepted or measured >= high):
+            elif pending and measured >= high:
                 # The first read after the lift sets the mark at the links it discovered.
                 _write_json(
                     self.ETH_LINK_BASELINE_FILE,
-                    {"links": measured, "high_water": max(high, measured), "asic_bus": keyed, "accepted": accepted},
+                    {"links": measured, "high_water": max(high, measured), "asic_bus": keyed},
                 )
                 health_event("eth_link_rebaselined", links=measured, high_water=high)
                 self.last_eth_link_drop = ""
                 return ""
-            elif baseline < high and not accepted:
-                # Never down to a degraded count (I71): only a lift over ports the operator accepted
-                # as dead lowers the mark, so a lost link stays a drop for every later read. A mark a
-                # broker before I71 lowered reads at the high-water mark again.
+            elif baseline < high:
+                # Never down to a degraded count (I71): a lost link stays a drop for every later read.
+                # A mark an earlier broker lowered reads at the high-water mark again.
                 data, baseline = {**data, "links": high}, high
                 _write_json(self.ETH_LINK_BASELINE_FILE, data)
             elif measured != baseline:
@@ -761,10 +730,9 @@ class HealthMonitor:
             return None
         return high, keyed, bool(data.get("rebaseline"))
 
-    def _arm_eth_rebaseline(self, accepted: bool = False) -> None:
+    def _arm_eth_rebaseline(self) -> None:
         """A topology-mismatch lift: key the link mark to this chip-to-bus map and let the next read
-        set it at the links the traffic-only pass found, never below the high-water mark unless
-        ``accepted`` (a lift over ports the operator accepted as dead, I71). A map already
+        set it at the links the traffic-only pass found, never below the high-water mark (I71). A map already
         re-baselined the same way keeps its mark, so a link lost since then still reads as a drop."""
         now = _asic_bus_map()
         if not now:
@@ -775,12 +743,12 @@ class HealthMonitor:
             links = int(data.get("links", 0))
         except (OSError, ValueError, TypeError, AttributeError):
             data, topo, links = {}, None, 0
-        if topo is not None and topo[1] == now and bool(data.get("accepted")) == accepted:
+        if topo is not None and topo[1] == now:
             return
         high = max(links, topo[0] if topo else 0)
         _write_json(
             self.ETH_LINK_BASELINE_FILE,
-            {"links": high, "high_water": high, "asic_bus": now, "rebaseline": True, "accepted": accepted},
+            {"links": high, "high_water": high, "asic_bus": now, "rebaseline": True},
         )
 
     def _restore_eth_high_water(self) -> None:
@@ -879,19 +847,16 @@ class HealthMonitor:
     def _bank_chip_buses(self, bus_ids: list, expected_count: int) -> None:
         """Keep every chip index's PCI address, read from sysfs, as of the latest trusted full read.
 
-        The index is the kernel's (/dev, sysfs, heartbeat), so the tray of an off-bus chip comes from
-        its own address, not from where tt-smi happened to list it (spec 04 I16). Trusted and full
-        means the same "complete or not at all" rule as ``_bus_ids``, read in the same pass, and the
-        two agreeing on the set of buses: a disagreement means the bus moved under one of the reads,
-        so both are journaled and the next full pass tries again.
+        The index is the kernel's (/dev, sysfs, heartbeat), so the tray of an off-bus chip comes from its own address,
+        not from where tt-smi happened to list it (spec 04 I16). Trusted and full means the same "complete or not at
+        all" rule as ``_bus_ids``, read in the same pass, and the two agreeing on the set of buses: a disagreement means
+        the bus moved under one of the reads, so both are journaled and the next full pass tries again.
 
-        Unlike ``_bus_ids`` the map is not first-read-stands. tt-kmd can give a chip another index
-        after a drop, a rescan or a tray reset (it falls back to a free index when the chip's own is
-        still taken), and a map naming the old index re-powers the wrong tray. So a trusted full read
-        that differs re-banks it here, in the gate's pass before any rung reads it, and journals the
-        old and the new map. A short or disagreeing read never touches a banked map: a chip off the
-        bus has no node, so that read cannot place it.
-        """
+        Unlike ``_bus_ids`` the map is not first-read-stands. tt-kmd can give a chip another index after a drop, a
+        rescan or a tray reset (it falls back to a free index when the chip's own is still taken), and a map naming the
+        old index re-powers the wrong tray. So a trusted full read that differs re-banks it here, in the gate's pass
+        before any rung reads it, and journals the old and the new map. A short or disagreeing read never touches a
+        banked map: a chip off the bus has no node, so that read cannot place it."""
         if expected_count <= 0 or len(bus_ids) < expected_count or not all(bus_ids):
             return
         chips = pci.chip_pci_bdfs()
@@ -994,10 +959,9 @@ class HealthMonitor:
         FABRIC_DEBT.note_fabric_killed(f"tt-smi snapshot killed ({self._snapshot_killed})", journal)
 
     def _run_snapshot(self, argv: list[str], timeout_sec: float) -> subprocess.CompletedProcess:
-        """``subprocess.run`` for the snapshot, but in its own session and tracked on
-        ``snapshot_proc`` while it runs, so the dead-chip valve can SIGSTOP its group before a PCI
-        remove and SIGKILL it after (spec 03 I86). Raises TimeoutExpired as run does, after killing
-        the group."""
+        """``subprocess.run`` for the snapshot, but in its own session and tracked on ``snapshot_proc`` while it runs,
+        so the dead-chip valve can SIGSTOP its group before a PCI remove and SIGKILL it after (spec 03 I86). Raises
+        TimeoutExpired as run does, after killing the group."""
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         # Its own session takes it out of the broker's process group: register it, or a holder scan
         # reads the broker's own snapshot as a tenant (spec 04 I59).
@@ -1159,21 +1123,16 @@ class HealthMonitor:
         return outcome if outcome and at >= since else ""
 
     def fabric_verdict(self) -> dict:
-        """The last fabric verdict, for the detail of every hold-lift and release event (spec 03 I78):
-        ``result`` (pass/fail/skipped/none), ``missing_vs_cabling``/``extra_vs_cabling`` (port connections
-        the links found lack, or add, against the cabling descriptor: 0/0 on a clean pass means every
-        cabled link was found), ``links_short`` (True when more are missing than extra and the operator's
-        accept list does not name every missing port, which FAILS the check, I71), ``excused_ports``
-        (only when that list turned a shortfall into a pass: the ports it excused) and ``age_s``. Only
-        the shortfall is logged: the validator prints no link totals. ``result`` "none" once a reset
-        voided it or before any check ran."""
+        """The last fabric verdict, for the detail of every hold-lift and release event (spec 03 I78): ``result``
+        (pass/fail/skipped/none), ``missing_vs_cabling``/``extra_vs_cabling`` (port connections the links found lack, or
+        add, against the cabling descriptor: 0/0 on a clean pass means every cabled link was found), ``links_short``
+        (True when more are missing than extra, which FAILS the check, I71) and ``age_s``. Only the shortfall is logged:
+        the validator prints no link totals. ``result`` "none" once a reset voided it or before any check ran."""
         v = dict(self._fabric_verdict)
         if not v or self.last_fabric_ok is None and v["result"] != "skipped":
             return {"result": "none"}
         marker = v.pop("_marker", "")
-        v["links_short"] = bool(fabric.links_missing(marker, fabric.accepted_missing_ports()))
-        if v["missing_vs_cabling"] > v["extra_vs_cabling"] and not v["links_short"]:
-            v["excused_ports"] = sorted(fabric.marker_ports(marker)[0])
+        v["links_short"] = bool(fabric.links_missing(marker))
         v["age_s"] = round(time.monotonic() - v.pop("_at"), 1)
         return v
 
@@ -1185,15 +1144,13 @@ class HealthMonitor:
         FABRIC_DEBT.note_fabric_killed(f"fabric check killed ({self._fabric_killed})", journal)
 
     async def stop_check_readers(self, reason: str, grace_sec: float) -> list:
-        """Spec 04 I97: end the full check's own readers at its deadline. SIGTERM the process group of
-        the fabric pass, the tt-smi snapshot and the AICLK ceiling, SIGKILL any group still alive
-        ``grace_sec`` later, and mark each killed check no verdict (never a pass). Returns the pids
-        signalled. Never raises."""
+        """Spec 04 I97: end the full check's own readers at its deadline. SIGTERM the process group of the fabric pass
+        and the tt-smi snapshot, SIGKILL any group still alive ``grace_sec`` later, and mark each killed check no
+        verdict (never a pass). Returns the pids signalled. Never raises."""
         stopped = []
         for proc, note in (
             (self.fabric_check_proc, self.note_fabric_check_killed),
             (self.snapshot_proc, self.note_snapshot_killed),
-            (CEILING.proc, None),
         ):
             if proc is None or getattr(proc, "returncode", None) is not None:
                 continue
@@ -1307,7 +1264,7 @@ class HealthMonitor:
         # again and a reset that brought the link back reads clean.
         marker = fabric.find_topology_marker(text) if ok is True else None
         marker = fabric.with_ports(marker, text) if marker else None
-        lost = fabric.links_missing(marker, fabric.accepted_missing_ports()) if marker else ""
+        lost = fabric.links_missing(marker) if marker else ""
         if marker and not lost and self.topology_hw_fault:
             # The lift's first job already failed on these links (I42): a mismatch now FAILS, so the
             # ladder (a reset, then a power cycle) runs instead of a second lift.
@@ -1376,7 +1333,6 @@ class HealthMonitor:
                 "verdict": "failed",
                 "missing_ports": missing,
                 "extra_ports": extra,
-                "accepted_ports": [],
                 "marker": marker,
             }
             health_event("fabric_links_missing", detail=lost[:400], missing_ports=missing, extra_ports=extra)
@@ -1478,8 +1434,7 @@ class HealthMonitor:
         return rc, combined, ok, reason
 
     def _note_fabric_ok(self) -> None:
-        """What every healthy fabric verdict settles: the post-reset debt (04 I32) and a known fabric
-        fault (I46)."""
+        """What every healthy fabric verdict settles: the post-reset debt (04 I32) and a known fabric fault (I46)."""
         self.last_fabric_ok = True
         FABRIC_DEBT.note_fabric(True)  # the one verdict that settles a post-reset debt (04 I32)
         if self.fabric_known_fault:
@@ -1487,12 +1442,11 @@ class HealthMonitor:
         self.fabric_known_fault, self._fabric_route_fault_streak = "", 0
 
     def adopt_fabric_pass(self, output: str) -> str:
-        """Fold in a healthy fabric pass on the full topology, as a clean pass of the monitor's own
-        does, also one run outside the monitor (an operator verification job, spec 01 I21). A pass
-        whose output carries a topology marker ran on the discovered links only: it is adopted for
-        nothing and its marker returned, so the caller leaves the lift to the monitor's own pass
-        (I45). Nor is a pass the eth read's link count says missed a link (``links_unseen_by_traffic``):
-        its reason is returned. Returns "" once adopted."""
+        """Fold in a healthy fabric pass on the full topology, as a clean pass of the monitor's own does, also one run
+        outside the monitor (an operator verification job, spec 01 I21). A pass whose output carries a topology marker
+        ran on the discovered links only: it is adopted for nothing and its marker returned, so the caller leaves the
+        lift to the monitor's own pass (I45). Nor is a pass the eth read's link count says missed a link
+        (``links_unseen_by_traffic``): its reason is returned. Returns "" once adopted."""
         marker = fabric.find_topology_marker(output)
         if marker:
             return marker
@@ -1536,14 +1490,10 @@ class HealthMonitor:
         next job (the lift is bounded by that one job, see note_job_after_topology_lift)."""
         moved = moved_trays(_load_asic_bus_map(), _asic_bus_map())
         missing, extra = fabric.marker_ports(marker)
-        # A lift that would have FAILED without the accept list: the ports it excused, by name (I71).
-        excused = bool(fabric.links_missing(marker))
-        accepted = sorted(set(missing) & fabric.accepted_missing_ports()) if excused else []
         self.fabric_topology = {
             "verdict": "lift",
             "missing_ports": missing,
             "extra_ports": extra,
-            "accepted_ports": accepted,
             "marker": marker,
         }
         health_event(
@@ -1552,34 +1502,22 @@ class HealthMonitor:
             moved_trays=moved,
             missing_ports=missing,
             extra_ports=extra,
-            accepted_ports=accepted,
         )
         self.topology_lift_pending = True
-        # Only a lift over ports the operator accepted as dead may lower the link mark (I71).
-        self._arm_eth_rebaseline(accepted=excused)
+        self._arm_eth_rebaseline()
         log = self._logger()
         if log:
-            log.warning(
-                f"FABRIC TOPOLOGY MISMATCH: {marker}"
-                + (f"; moved: {', '.join(moved)}" if moved else "")
-                + (f"; excused by TT_DEVICE_MCP_FABRIC_ACCEPT_MISSING_PORTS: {', '.join(accepted)}" if accepted else "")
-            )
+            log.warning(f"FABRIC TOPOLOGY MISMATCH: {marker}" + (f"; moved: {', '.join(moved)}" if moved else ""))
         key = marker + "|" + ",".join(moved)
         if key not in self._topology_alerted:
             self._topology_alerted.add(key)
-            alert.send_alert(
-                {"kind": "fabric_topology_mismatch", "detail": marker, "moved_trays": moved},
-                log,
-            )
 
     def note_job_after_topology_lift(self, failed: bool, log_tail: Optional[str]) -> Optional[str]:
-        """Called once per finished job. Only the first job after a topology-mismatch lift
-        counts: if it failed on the fabric, the skipped links are a fault. The fabric reads
-        measured-bad and the cached mismatch goes, so the next pass runs the descriptor again, and
-        while this latch stands a mismatch FAILS the check instead of lifting (I42). The hold this
-        makes takes the ladder like any measured fabric fault: a reset, then a power cycle. The
-        operator is paged by the ladder's own end, never by this latch. Returns the hold reason,
-        or None."""
+        """Called once per finished job. Only the first job after a topology-mismatch lift counts: if it failed on the
+        fabric, the skipped links are a fault. The fabric reads measured-bad and the cached mismatch goes, so the next
+        pass runs the descriptor again, and while this latch stands a mismatch FAILS the check instead of lifting (I42).
+        The hold this makes takes the ladder like any measured fabric fault: a reset, then a power cycle. The operator
+        is paged by the ladder's own end, never by this latch. Returns the hold reason, or None."""
         if not self.topology_lift_pending:
             return None
         self.topology_lift_pending = False
@@ -1611,19 +1549,17 @@ class HealthMonitor:
         self.topology_hw_fault = ""
 
     def note_job_fabric_route_fault(self, failed: bool, log_tail: Optional[str]) -> Optional[str]:
-        """Called once per finished job (spec 03 I46). A job that dies on the fabric's routing right
-        after a fabric pass that could not run (a 77) ran on a mesh no pass cleared. After
-        ``TT_DEVICE_MCP_FABRIC_ROUTE_FAULT_JOBS`` (default 2) such jobs in a row, resetting is shown
-        futile (each reset ends in another 77 and the next job dies the same way), so this declares a
-        known fabric fault: journal it, page once, and return the hold reason. Any other job
-        outcome, or a fabric pass that measured, breaks the streak. Returns the reason, or None."""
+        """Called once per finished job (spec 03 I46). A job that dies on the fabric's routing right after a fabric pass
+        that could not run (a 77) ran on a mesh no pass cleared. After ``FABRIC_ROUTE_FAULT_JOBS`` (2) such jobs in a
+        row, resetting is shown futile (each reset ends in another 77 and the next job dies the same way), so this
+        declares a known fabric fault: journal it, page once, and return the hold reason. Any other job outcome, or a
+        fabric pass that measured, breaks the streak. Returns the reason, or None."""
         sig = fabric.job_fabric_error(log_tail or "") if failed else None
         if not sig or not self.last_fabric_skipped:
             self._fabric_route_fault_streak = 0
             return None
         self._fabric_route_fault_streak += 1
-        limit = _env_int("TT_DEVICE_MCP_FABRIC_ROUTE_FAULT_JOBS", 2, 1)
-        if self._fabric_route_fault_streak < limit:
+        if self._fabric_route_fault_streak < FABRIC_ROUTE_FAULT_JOBS:
             return None
         self.fabric_known_fault = (
             f"known fabric fault: {self._fabric_route_fault_streak} jobs in a row failed on the fabric ({sig}) "
@@ -1634,7 +1570,6 @@ class HealthMonitor:
         log = self._logger()
         if log:
             log.error(f"FABRIC {self.fabric_known_fault}")
-        alert.send_alert({"kind": "fabric_known_fault", "detail": self.fabric_known_fault}, log)
         return self.fabric_known_fault
 
     def _declare_cable_fault(self, detail: str) -> None:
@@ -1651,19 +1586,15 @@ class HealthMonitor:
             log.error(f"FABRIC HARDWARE FAULT: {detail}")
         if detail not in self._cable_fault_alerted:
             self._cable_fault_alerted.add(detail)
-            alert.send_alert({"kind": "fabric_known_fault", "cause": "missing_cable", "detail": detail}, log)
 
     def known_fabric_fault(self) -> str:
-        """The open known fabric fault, or "". Bounded: past ``TT_DEVICE_MCP_FABRIC_KNOWN_FAULT_HOLD_SEC``
-        (default 21600 s) it expires and the usual 77 path (03 I40) gets one more try; the streak is
+        """The open known fabric fault, or "". Bounded: past ``FABRIC_KNOWN_FAULT_HOLD_SEC``
+        (21600 s) it expires and the usual 77 path (03 I40) gets one more try; the streak is
         left one short, so the next job that dies the same way declares it again at once."""
-        if self.fabric_known_fault and (
-            time.monotonic() - self._fabric_known_fault_at
-            >= _env_int("TT_DEVICE_MCP_FABRIC_KNOWN_FAULT_HOLD_SEC", 21600, 60)
-        ):
+        if self.fabric_known_fault and (time.monotonic() - self._fabric_known_fault_at >= FABRIC_KNOWN_FAULT_HOLD_SEC):
             health_event("fabric_known_fault_expired", detail=self.fabric_known_fault)
             self.fabric_known_fault = ""
-            self._fabric_route_fault_streak = _env_int("TT_DEVICE_MCP_FABRIC_ROUTE_FAULT_JOBS", 2, 1) - 1
+            self._fabric_route_fault_streak = FABRIC_ROUTE_FAULT_JOBS - 1
         return self.fabric_known_fault
 
     async def verify_eth_heartbeat(self, timeout_sec: float = 60.0) -> tuple[Optional[bool], str]:

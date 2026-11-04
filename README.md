@@ -184,23 +184,10 @@ cycle). An out-of-band tool can append them to `power_cycle_history.jsonl` in th
 `TT_DEVICE_MCP_POWER_CYCLE_HISTORY_FILE` names another file. A missing file or a malformed line is
 ignored.
 
-If other workloads share the host, an automatic power cycle cuts them too. Set
-`TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK` to a command that drains them; the broker
-runs it just before it power-cycles the host and waits for it to exit, up to
-`TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK_TIMEOUT_SEC` (default 300 s). The command is
-split like shell words and run without a shell; the reason for the cycle is in
-`TT_DEVICE_MCP_POWER_CYCLE_REASON`. Its exit code and output go to the log. The
-cycle goes ahead whatever the hook does, so a failing or hung hook never blocks
-recovery. The full reset ladder still runs first. The cycle itself comes after a
-clean OS shutdown, with the same reason in `TT_DEVICE_MCP_POWER_CYCLE_REASON`;
-if that cannot start, nothing fires and the device stays held (spec 04 I88). For example, in a systemd
-drop-in for the broker:
-
-```
-[Service]
-Environment="TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK=/usr/local/bin/drain-jobs --reason power-cycle"
-Environment=TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK_TIMEOUT_SEC=300
-```
+If other workloads share the host, an automatic power cycle cuts them too. The
+full reset ladder runs first. The cycle itself comes after a clean OS shutdown,
+with the reason in `TT_DEVICE_MCP_POWER_CYCLE_REASON`; if that cannot start,
+nothing fires and the device stays held (spec 04 I88).
 
 ## Reading chip state from other tools
 
@@ -250,8 +237,7 @@ replaced atomically), so other users of the box can save their work:
   `unknown`. `chips` lists the chips off the bus; `bdf` is empty when the PCI
   address is not known.
 - `earliest_cycle_at` is the time of the write: the cycle can follow at once.
-- The file is a warning only. The broker never waits on it. To drain work
-  before a cycle, use `TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK` (above).
+- The file is a warning only. The broker never waits on it.
 
 When the cycle starts, the broker logs why in one line, for example:
 

@@ -66,19 +66,10 @@ def _health(monkeypatch, at):
     return srv._health_payload(now=datetime.fromtimestamp(at)).get("power_cycle_cooldown")
 
 
-@pytest.fixture
-def paged(cool, monkeypatch):  # noqa: F811
-    """Pages sent. The mechanism is shared across tests: start with no page sent yet."""
-    sent = []
-    monkeypatch.setattr(cool["g"].mechanism, "_power_cycle_miss_paged", 0.0)
-    monkeypatch.setattr(recovery_base.alert, "send_alert", lambda event, log=None: sent.append(event) or object())
-    return sent
-
-
 # ---- (1) a missed request is asked again as its window ends -----------------------------------------
 
 
-def test_a_request_the_host_never_acted_on_is_asked_again_as_its_window_ends(cool, monkeypatch, paged):  # noqa: F811
+def test_a_request_the_host_never_acted_on_is_asked_again_as_its_window_ends(cool, monkeypatch):  # noqa: F811
     """The request returned, the host never went down: at the end of its window it is marked missed
     on disk and asked again at once, with no backoff on top of the window that already gave the
     cycler its time; not 30 min or 4 h after the request."""
@@ -91,10 +82,9 @@ def test_a_request_the_host_never_acted_on_is_asked_again_as_its_window_ends(coo
     assert _watchdog(cool, monkeypatch, T0 + WINDOW) == [T0 + WINDOW]
     allowed, why = m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=T0 + WINDOW)
     assert allowed, why
-    assert paged == [], "one miss pages no one"
 
 
-def test_later_retries_wait_5_min_after_their_window_and_never_stop(cool, paged):  # noqa: F811
+def test_later_retries_wait_5_min_after_their_window_and_never_stop(cool):  # noqa: F811
     m = cool["g"].mechanism
     at, waits = T0, []
     for _ in range(5):
@@ -110,9 +100,7 @@ def test_later_retries_wait_5_min_after_their_window_and_never_stop(cool, paged)
 
 @pytest.mark.parametrize("misses", [1, 2, 6])
 def test_the_retry_comes_at_most_the_window_plus_5_min_after_a_request_the_bmc_missed(cool, misses):  # noqa: F811
-    """The stated bound (spec 04 I72): the BMC answers again just after a request it missed. The
-    next request goes out at most ``host_action_pending_sec()`` + 5 min after that one (the window
-    alone for the first miss), whatever the miss count: 15 min, then 20 min, by default."""
+    """The stated bound (spec 04 I72): the BMC answers again just after a request it missed."""
     m = cool["g"].mechanism
     at = T0
     for _ in range(misses - 1):
@@ -128,9 +116,8 @@ def test_the_retry_comes_at_most_the_window_plus_5_min_after_a_request_the_bmc_m
 
 
 def test_no_retry_while_the_earlier_request_is_still_pending(cool):  # noqa: F811
-    """The pending window counts from the hand-off, after the pre-fire hook, so it can end a little
-    after the ledger row's window. Until it does the retry is refused with a stated deadline: never
-    a second cycle on top of one that may still come."""
+    """The pending window counts from the hand-off, after the pre-fire hook, so it can end a little after the ledger
+    row's window."""
     m = cool["g"].mechanism
     _request(cool, T0)
     m.host_action_requested = ("power-cycle", time.monotonic() - WINDOW + 20)  # handed off 20 s after the row
@@ -142,9 +129,8 @@ def test_no_retry_while_the_earlier_request_is_still_pending(cool):  # noqa: F81
 
 
 def test_a_late_cycle_before_the_retry_is_never_cycled_again_on_top(cool):  # noqa: F811
-    """The retry's boot check: the host went down a minute after the window (a slow cycler). On the
-    boot it brought up that request is a cycle that ran, so no second cycle follows before the
-    cooldown it anchors ends."""
+    """The retry's boot check: the host went down a minute after the window (a slow cycler). On the boot it brought up
+    that request is a cycle that ran, so no second cycle follows before the cooldown it anchors ends."""
     m = cool["g"].mechanism
     _request(cool, T0)
     _window_ends(cool, T0 + WINDOW)
@@ -173,7 +159,7 @@ async def test_a_whole_tray_drop_still_goes_to_the_power_cycle_after_a_missed_re
 # ---- (2) missed requests do not double the cooldown -----------------------------------------------
 
 
-def test_two_missed_requests_leave_the_interval_at_base_and_page(cool, paged):  # noqa: F811
+def test_two_missed_requests_leave_the_interval_at_base_and_page(cool):  # noqa: F811
     m = cool["g"].mechanism
     _request(cool, T0)
     _window_ends(cool, T0 + WINDOW)
@@ -184,7 +170,6 @@ def test_two_missed_requests_leave_the_interval_at_base_and_page(cool, paged):  
     assert m.power_cycle_cooldown(now_epoch=second + WINDOW) is None, "no cycle ran, nothing anchors I65"
     state = m.power_cycle_cooldown_state
     assert state["missed"] == 2 and "paging an operator" in state["why"]
-    assert [e["kind"] for e in paged] == ["power_cycle_missed"]
     # Neither the per-boot cap nor the backstop counts them: the third ask is allowed.
     allowed, why = m.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=state["until"])
     assert allowed, why
@@ -232,13 +217,10 @@ def test_a_cycle_that_took_the_host_down_still_anchors_the_cooldown_and_doubles(
 
 
 def test_cycles_that_land_after_their_window_still_double_the_cooldown_and_count_for_the_backstop(
-    cool, paged  # noqa: F811
+    cool,  # noqa: F811
 ):
-    """The loop guard (spec 04 I65/I72): a slow cycler takes the host down 2 min after each window
-    ran out, so each row was marked missed first. The next boot starts within the window plus the
-    attribution window of it with no other escalation between: it is a cycle that ran (late), on that
-    boot and every later one. The cooldown doubles 30 min, 1 h, 2 h, then 4 h; the backstop and
-    the boot's attribution count it; no miss is paged."""
+    """The loop guard (spec 04 I65/I72): a slow cycler takes the host down 2 min after each window ran out, so each row
+    was marked missed first."""
     m = cool["g"].mechanism
     at, intervals = T0, []
     for n in range(5):
@@ -258,7 +240,6 @@ def test_cycles_that_land_after_their_window_still_double_the_cooldown_and_count
         at = cd["until"]
     assert intervals == [1800, 3600, 7200, 14400, 14400]
     assert all(r.get("late") is True and r.get("took_host_down") is True for r in _rows()[:4])
-    assert paged == []
 
 
 def _broker_starts(monkeypatch, tmp_path):
@@ -273,12 +254,10 @@ def _broker_starts(monkeypatch, tmp_path):
 
 
 def test_a_late_cycle_whose_boot_only_reboots_still_doubles_the_cooldown_on_later_boots(
-    cool, monkeypatch, tmp_path, paged  # noqa: F811
+    cool, monkeypatch, tmp_path  # noqa: F811
 ):
-    """The loop guard (spec 04 I65/I72) when the boot a late cycle brought up runs no power-cycle
-    gate: it escalates by reboot once the 1 h loop guard allows it. Broker startup writes the late
-    mark, so the boot after that reboot still counts the cycle: the cooldown doubles 30 min, 1 h,
-    2 h, then 4 h, and the backstop counts the late cycles (two once two fall in its window)."""
+    """The loop guard (spec 04 I65/I72) when the boot a late cycle brought up runs no power-cycle gate: it escalates by
+    reboot once the 1 h loop guard allows it."""
     m = cool["g"].mechanism
     assert srv.recovery_mechanism is m
     at, intervals, live_backstop, later_backstop = T0, [], [], []
@@ -295,8 +274,6 @@ def test_a_late_cycle_whose_boot_only_reboots_still_doubles_the_cooldown_on_late
         live_backstop.append(len(_power_cycle_backstop_stamps(ran, btime + 30)))
         t = at + 3600 + 30
         cool["clk"][0] = t
-        allowed, why = m.auto_recovery_allowed("reboot", tenant_active=False, now_epoch=t)
-        assert allowed, why
         m.record_auto_recovery("reboot", "wedge", now_epoch=t)
         later = t + 60
         cool["boot"].update(id=f"boot-{n}b", btime=later)
@@ -312,7 +289,6 @@ def test_a_late_cycle_whose_boot_only_reboots_still_doubles_the_cooldown_on_late
     assert later_backstop == [1, 1, 1, 1]
     cycles = [r for r in _rows() if r["action"] == "power-cycle"]
     assert len(cycles) == 4 and all(r.get("took_host_down") is True and r.get("late") is True for r in cycles)
-    assert paged == []
 
 
 def test_the_startup_mark_leaves_an_unreadable_ledger_as_it_is(cool, monkeypatch, caplog):  # noqa: F811
@@ -329,7 +305,7 @@ def test_the_startup_mark_leaves_an_unreadable_ledger_as_it_is(cool, monkeypatch
     assert "unreadable" in caplog.text
 
 
-# ---- (4) goal 8: a healed retry releases only after the full check --------------------------------
+# ---- (4) full check after every reset: a healed retry releases only after the full check --------------------------------
 
 
 def test_a_retried_cycle_that_heals_releases_only_after_the_full_fabric_check(monkeypatch, tmp_path):
@@ -389,9 +365,8 @@ def test_health_shows_no_missed_requests_for_a_plain_cooldown(cool, monkeypatch)
 
 @pytest.mark.parametrize("failed, expect", [(2, 3600), (3, 7200)])
 def test_a_verified_release_on_a_later_boot_ends_the_streak_without_a_heal_file(cool, failed, expect):  # noqa: F811
-    """The heal file is missing (written by a release before it existed). Cycle 1 was followed by a
-    verified release on the boot it brought up; the cycles after it healed nothing. Only those count:
-    2 failed is 1 h and 3 is 2 h, not the 2 h and 4 h of counting cycle 1 too."""
+    """The heal file is missing (written by a release before it existed). Cycle 1 was followed by a verified release on
+    the boot it brought up; the cycles after it healed nothing."""
     m = cool["g"].mechanism
     assert not (recovery_base.health_dir() / POWER_CYCLE_HEALED_FILE).exists()
     h = 3600

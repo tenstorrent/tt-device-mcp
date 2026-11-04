@@ -5,7 +5,6 @@
 
 import http.client
 import json
-import os
 import socket
 import sys
 import time
@@ -15,31 +14,19 @@ from tt_device_mcp.constants import resolve_socket
 # A broker restart (e.g. an autoupdate) leaves its socket gone for ~2 s. Retry only the
 # connect step, and only on a refused connect or a missing socket file: in both cases
 # nothing was sent, so a retried submit can never create a duplicate job.
-CONNECT_RETRIES_ENV = "TT_DEVICE_MCP_CONNECT_RETRIES"
-CONNECT_DELAY_ENV = "TT_DEVICE_MCP_CONNECT_DELAY_SEC"
 DEFAULT_CONNECT_RETRIES = 5
 DEFAULT_CONNECT_DELAY_SEC = 1.0
 
 
-def _env_num(name: str, default, cast):
-    try:
-        val = cast(os.environ.get(name, default))
-    except ValueError:
-        return default
-    return val if val >= 0 else default
-
-
 def retry_unreachable(attempt, *, sleep=None, retries=None):
-    """Call ``attempt()`` (a connect step); on ConnectionRefusedError or FileNotFoundError
-    only, wait and retry up to TT_DEVICE_MCP_CONNECT_RETRIES times (default 5 x 1 s,
-    TT_DEVICE_MCP_CONNECT_DELAY_SEC). Prints one line to stderr on the first wait. After
-    the last retry the original exception is raised. Other errors propagate at once.
-    ``retries`` overrides the env/default count; 0 means one attempt, no wait (probes
-    that must report a dead broker at once)."""
+    """Call ``attempt()`` (a connect step); on ConnectionRefusedError or FileNotFoundError only, wait and retry up to
+    DEFAULT_CONNECT_RETRIES times (5 x 1 s). Prints one line to stderr on the first wait. After the last retry the
+    original exception is raised. Other errors propagate at once. ``retries`` overrides the count; 0 means one attempt,
+    no wait (probes that must report a dead broker at once)."""
     sleep = sleep or time.sleep
     if retries is None:
-        retries = _env_num(CONNECT_RETRIES_ENV, DEFAULT_CONNECT_RETRIES, int)
-    delay = _env_num(CONNECT_DELAY_ENV, DEFAULT_CONNECT_DELAY_SEC, float)
+        retries = DEFAULT_CONNECT_RETRIES
+    delay = DEFAULT_CONNECT_DELAY_SEC
     for n in range(retries + 1):
         try:
             return attempt()

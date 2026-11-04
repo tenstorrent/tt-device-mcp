@@ -23,18 +23,14 @@ from pathlib import Path
 
 import pytest
 
+from tests.deploy_helpers import _clock
+
 # Fork-heavy deploy-script laps: one xdist worker runs them all (conftest: --dist loadgroup).
 pytestmark = pytest.mark.xdist_group("forks")
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "deploy" / "tt-device-autoupdate.sh"
 _OLD = "1" * 40
 _NEW = "2" * 40
-
-
-def _clock(text):
-    """The script's clock seam (au_now, au_time) as it defines them: the lap reads the real clock."""
-    i = text.index("au_now() {")
-    return text[i : text.index("\n", text.index("au_time() {", i)) + 1]
 
 
 def _health(held=False, state="healthy", age=None):
@@ -45,8 +41,7 @@ def _health(held=False, state="healthy", age=None):
 
 
 def _top():
-    """From the decision log through the recovery gate: everything an update lap decides before
-    it touches dispatch."""
+    """From the decision log through the recovery gate: everything an update lap decides before it touches dispatch."""
     text = _SCRIPT.read_text()
     top = text[text.index("# Decision log (spec 08 I22)") : text.index("# Dispatch hold (spec 08 I18")]
     assert top.count("INHIBIT=/run/tt-device-broker/device-op.lock\n") == 1
@@ -59,8 +54,7 @@ def _tail():
 
 
 def _run(tmp_path, body, *, health=(), env=None, pending=None, curl_fails=False, stand_ins=""):
-    """Run `body` under the stand-ins. `health` is the /health answers in call order (the last one
-    repeats)."""
+    """Run `body` under the stand-ins. `health` is the /health answers in call order (the last one repeats)."""
     root = tmp_path / "root"
     root.mkdir(exist_ok=True)
     logs = tmp_path / "logs"
@@ -84,10 +78,12 @@ echo {_OLD} > "$STATE"
 HOLD={tmp_path}/dispatch-hold
 {_clock(_SCRIPT.read_text())}curl() {{
     {"return 22" if curl_fails else ""}
-    n=$(cat {calls}); n=$((n+1)); echo "$n" > {calls}
-    total=$(wc -l < {answers})
-    [ "$n" -le "$total" ] || n=$total
-    sed -n "${{n}}p" {answers}
+    local n a  # builtins only: a cat, wc and sed per call were three forks
+    read -r n < {calls}; n=$((n+1)); echo "$n" > {calls}
+    mapfile -t a < {answers}
+    [ "$n" -le "${{#a[@]}}" ] || n=${{#a[@]}}
+    [ "$n" -ge 1 ] || return 1
+    printf '%s\n' "${{a[n-1]}}"
 }}
 logger() {{ echo "logger $*" >> {trace}; }}
 sleep() {{ echo "sleep $*" >> {trace}; }}
@@ -152,8 +148,7 @@ def test_a_broker_that_does_not_answer_is_not_deferred_for(tmp_path):
 
 
 def test_a_hold_older_than_the_bound_lets_the_update_apply(tmp_path):
-    # Every fault class's budget is under the bound: a hold past it is over budget, and the update
-    # may be its fix.
+    # Every fault class's budget is under the bound: a hold past it is over budget, and the update may be its fix.
     done, _, _ = _gate(tmp_path, health=[_health(held=True, state="recovering", age=1200)])
     assert "GATE PASSED" in done.stdout, done.stderr
     assert "past the deferral bound" in done.stderr
@@ -185,8 +180,16 @@ def test_the_bound_is_capped_at_30_minutes_and_0_turns_it_off(tmp_path):
     assert "GATE PASSED" in done.stdout, done.stderr
 
 
-def test_the_default_bound_is_20_minutes():
-    assert 'RECOVERY_DEFER="${TTDEV_RECOVERY_DEFER_SEC:-1200}"' in _SCRIPT.read_text()
+@pytest.mark.parametrize(
+    "line",
+    [
+        'RECOVERY_DEFER="${TTDEV_RECOVERY_DEFER_SEC:-1200}"',
+        'AU_LOG="${TTDEV_LOG_DIR:-/var/log/tt-device-broker}/autoupdate.log"',
+    ],
+    ids=["default-bound-20-min", "log-in-broker-log-dir"],
+)
+def test_the_script_defaults(line):
+    assert line in _SCRIPT.read_text()
 
 
 def test_the_device_op_bar_still_comes_first_and_is_logged(tmp_path):
@@ -233,9 +236,8 @@ _RESET_SCOPE = """systemctl() {
 
 
 def test_a_running_reset_scope_always_defers_even_past_the_bound(tmp_path):
-    """A reset step is bounded, so it is waited out with no bound of the updater's own: a restart
-    mid-reset kills the running tt-smi. Holds well past the bound, or no /health at all, change
-    nothing."""
+    """A reset step is bounded, so it is waited out with no bound of the updater's own: a restart mid-reset kills the
+    running tt-smi. Holds well past the bound, or no /health at all, change nothing."""
     stand_ins = _RESET_SCOPE.replace("TRACE", str(tmp_path / "trace"))
     for name, kw in (
         ("held_past_bound", {"health": [_health(held=True, state="recovering", age=99999)]}),
@@ -265,7 +267,6 @@ def test_a_running_job_on_a_healthy_broker_is_left_to_the_idle_rule(tmp_path):
     assert not (tmp_path / "root" / "recovery.defer").exists()
     text = _SCRIPT.read_text()
     assert text.index("if recovery_gate; then") < text.index("# Idle gate (spec 08 I24)") < text.index("count_busy\nif")
-    assert "TTDEV_MAX_DEFER_SEC" not in text
 
 
 def test_the_deferral_touches_no_recovery_switch():
@@ -296,9 +297,8 @@ def _pre_install():
 
 
 def _apply(tmp_path, **kw):
-    """The top gate (healthy at first), the drain and the check before the install, and the
-    restart tail, with the install in between elided. /health is asked once at the top, once
-    before the install and once before the restart."""
+    """The top gate (healthy at first), the drain and the check before the install, and the restart tail, with the
+    install in between elided. /health is asked once at the top, once before the install and once before the restart."""
     body = _top() + _waits() + _pre_install() + 'trap au_exit EXIT\necho "INSTALLED"\n' + _tail()
     return _run(tmp_path, body, **kw)
 
@@ -361,7 +361,10 @@ def test_no_recovery_deferral_comes_after_the_install_starts():
 def test_a_device_op_at_restart_time_is_waited_out(tmp_path):
     # The op ends after three 5 s polls.
     trace = tmp_path / "trace"
-    stand_in = f'op_in_flight() {{ [ "$(cat {trace} 2>/dev/null | grep -c "^sleep")" -lt 3 ]; }}'
+    stand_in = (
+        f"op_in_flight() {{ local c=0 l; if [ -f {trace} ]; then while IFS= read -r l; do "
+        f'[[ $l == sleep* ]] && c=$((c + 1)); done < {trace}; fi; [ "$c" -lt 3 ]; }}'
+    )
     done, trace, log = _apply(tmp_path, health=[_health()], stand_ins=stand_in)
     assert done.returncode == 0, done.stderr
     steps = [t for t in trace if not t.startswith("logger ")]
@@ -422,7 +425,3 @@ def test_the_log_is_kept_to_about_a_mebibyte(tmp_path):
     done, _, log = _gate(tmp_path, health=[_health(held=True, age=60)])
     assert len(log) == 1 and "decision=deferred" in log[0]
     assert (logs / "autoupdate.log.1").stat().st_size == 1048576
-
-
-def test_the_log_lives_in_the_broker_log_dir():
-    assert 'AU_LOG="${TTDEV_LOG_DIR:-/var/log/tt-device-broker}/autoupdate.log"' in _SCRIPT.read_text()

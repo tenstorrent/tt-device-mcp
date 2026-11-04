@@ -28,9 +28,8 @@ verdict = prg.verdict
 
 
 def _bridge_rung(monkeypatch, idx, beats, attr=True):
-    """The real bridge rung for isolated chip ``idx``: its stubbed bridge reset re-creates the chip's
-    sysfs node; the node's ``tt_heartbeat`` reads ``beats`` one value per poll (None: ENODATA, the
-    ARC is not up). ``attr=False``: a KMD with no ``tt_heartbeat`` attr. Returns the events the rung logs."""
+    """The real bridge rung for isolated chip ``idx``: its stubbed bridge reset re-creates the chip's sysfs node; the
+    node's ``tt_heartbeat`` reads ``beats`` one value per poll (None: ENODATA, the ARC is not up)."""
     srv.isolated_chips = {idx}
     srv.device_pci_map = {idx: "0000:46:00.0"}
     monkeypatch.setattr(recovery_pkg, "arc_live_chips", heartbeat.arc_live_chips)
@@ -120,10 +119,8 @@ async def test_a_pci_wedged_pass_reads_no_heartbeat(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_an_arc_dead_reenumeration_reaches_the_one_shot_on_its_short_clock(mesh, monkeypatch, verdict):
-    """Replay: one chip drops, the gate's bridge rung re-creates its node with the ARC dead, the hold
-    opens below the reset floor. The chip stays isolated, so the off-bus one-shot fires within one
-    sampler tick (before, it waited out the 10-min window), and its reset lifts the hold only through
-    the full post-reset check, fabric included."""
+    """Replay: one chip drops, the gate's bridge rung re-creates its node with the ARC dead, the hold opens below the
+    reset floor."""
     evidence, released = verdict
     tick, bridges, count = _below_floor_hold(monkeypatch, mesh, {"now": IDLE})
     _bridge_rung(monkeypatch, "8", [None])

@@ -99,8 +99,7 @@ async def test_a_hung_selftest_outside_a_fault_episode_only_leaves_the_rung_off(
 
 @pytest.mark.asyncio
 async def test_a_full_pass_rearms_the_rung_before_it_reads(monkeypatch, unarmed):
-    """Fails on base: the rung stayed off, the pass's eth read skipped, and the mesh was released on
-    the traffic pass alone. Unpaced: the last attempt was a moment ago."""
+    """Unpaced: the last attempt was a moment ago."""
     fsm_dirty(srv, "gate/post-job: fabric unhealthy", why="job_killed")
     _clean_reader(monkeypatch)
     fabric_calls = _stub_mesh(monkeypatch)
@@ -262,7 +261,7 @@ async def test_a_retry_outside_an_episode_is_paced_to_the_rearm_interval(monkeyp
 
 @pytest.mark.asyncio
 async def test_a_retry_inside_a_fault_episode_is_never_paced(monkeypatch, unarmed):
-    """Goal 8: a reset's post-check re-arms at once, however recent the last attempt."""
+    """Full check after every reset: a reset's post-check re-arms at once, however recent the last attempt."""
     fsm_dirty(srv, "gate/post-job: fabric unhealthy", why="job_killed")
     attempts = []
 

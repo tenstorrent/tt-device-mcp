@@ -137,9 +137,8 @@ def test_a_new_link_mark_is_journaled(monkeypatch, tmp_path):
 
 @pytest.fixture
 def nodesc_mesh(monkeypatch, tmp_path, mesh):  # noqa: F811
-    """The dispatch-failure mesh fixture on a descriptor-less host whose reset leaves a link down
-    (``reset_heals`` False) or brings it back. The recovery verify runs the monitor's own eth read
-    and fabric pass; read-only, the mesh reads healthy, as a lost link does."""
+    """The dispatch-failure mesh fixture on a descriptor-less host whose reset leaves a link down (``reset_heals``
+    False) or brings it back."""
     m = _wire(monkeypatch, tmp_path, mesh)
     monkeypatch.setattr(srv, "last_relift_monotonic", 0.0)
     mesh["fabric"] = []
@@ -192,9 +191,8 @@ async def test_a_post_reset_check_that_finds_every_link_releases(nodesc_mesh):
 
 @pytest.mark.asyncio
 async def test_the_held_drop_runs_the_ladder_at_the_10_min_mark_then_the_host_rung(monkeypatch, nodesc_mesh):
-    """At the 10-min hold ceiling the watchdog runs the present-mesh reset; its full post-reset check
-    still fails on the count, and the same window requests the power cycle, the only host rung. Never
-    a release without a passing full check."""
+    """At the 10-min hold ceiling the watchdog runs the present-mesh reset; its full post-reset check still fails on the
+    count, and the same window requests the power cycle, the only host rung."""
     from tt_device_mcp.health.recovery import galaxy
 
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
@@ -275,10 +273,8 @@ async def test_a_clean_exit_full_count_releases_without_a_pass(monkeypatch, tmp_
 async def test_the_clean_post_job_gate_holds_a_descriptorless_drop_inside_the_fabric_interval(
     monkeypatch, tmp_path, bad
 ):
-    """Through the broker's gate: a clean exit, a fabric pass fresher than the interval, the real eth
-    read one link short. The gate fails the check and runs no traffic pass: the ladder takes it (its
-    reset here does not heal, so the device stays withheld from the next tenant). A full count
-    releases with no reset."""
+    """Through the broker's gate: a clean exit, a fabric pass fresher than the interval, the real eth read one link
+    short."""
     from tests.conftest import patch_recovery
     from tests.test_device_safety import _clean_post_job_gate
 

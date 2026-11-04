@@ -5,7 +5,7 @@
 
 Four or more chips off ONE physical tray at the first sighting of an episode is a tray that lost
 power. Before the ladder's first rung it gets one PCI rescan and a read-only capture of the
-BMC/CPLD/PCIe state; then the full reset ladder runs exactly as before, and the power cycle fires
+BMC/PCIe state; then the full reset ladder runs exactly as before, and the power cycle fires
 only from the ladder's own host rung, when every reset failed. Anything else keeps the ladder
 with no prelude.
 """
@@ -61,7 +61,7 @@ def bh_map():
     ],
 )
 def test_a_tray_with_four_or_more_chips_off_is_a_tray_down_onset(bh_map, spec, fast):
-    onset = galaxy.tray_down_onset(_off(bh_map, spec), BH_CHIP_BUSES, "tt-galaxy-bh")
+    onset = galaxy._tray_down_counts(_off(bh_map, spec), galaxy._tray_map(BH_CHIP_BUSES, "tt-galaxy-bh"))
     assert (onset is not None) is fast
     if fast:
         assert onset == dict(sorted(spec.items()))
@@ -69,11 +69,13 @@ def test_a_tray_with_four_or_more_chips_off_is_a_tray_down_onset(bh_map, spec, f
 
 def test_no_map_or_an_unplaced_chip_never_classifies_as_tray_down(bh_map):
     off = _off(bh_map, {3: 8})
-    assert galaxy.tray_down_onset(off, {}, "tt-galaxy-bh") is None
-    assert galaxy.tray_down_onset(off, BH_CHIP_BUSES, "tt-galaxy-wh-unknown") is None
+    assert galaxy._tray_down_counts(off, galaxy._tray_map({}, "tt-galaxy-bh")) is None
+    assert galaxy._tray_down_counts(off, galaxy._tray_map(BH_CHIP_BUSES, "tt-galaxy-wh-unknown")) is None
     partial = {c: a for c, a in BH_CHIP_BUSES.items() if c != min(off)}
-    assert galaxy.tray_down_onset(off, partial, "tt-galaxy-bh") is None, "a chip the map cannot place declines"
-    assert galaxy.tray_down_onset(set(), BH_CHIP_BUSES, "tt-galaxy-bh") is None
+    assert (
+        galaxy._tray_down_counts(off, galaxy._tray_map(partial, "tt-galaxy-bh")) is None
+    ), "a chip the map cannot place declines"
+    assert galaxy._tray_down_counts(set(), galaxy._tray_map(BH_CHIP_BUSES, "tt-galaxy-bh")) is None
 
 
 def _replay_rows():
@@ -87,9 +89,7 @@ def _replay_rows():
 
 
 def test_replay_the_prelude_runs_only_on_onsets_that_never_recovered_without_a_power_cycle(bh_map):
-    """Every recorded onset, anonymised to its per-tray counts and outcome. The prelude changes no
-    ladder decision anyway; on top of that, no episode that came back without a power cycle
-    (NO-BOOT) is even classified as tray-down, so none of them gets the extra rescan or capture."""
+    """Every recorded onset, anonymised to its per-tray counts and outcome."""
     tray_down = partial = no_boot = 0
     for per_tray, outcome in _replay_rows():
         if per_tray.startswith("count="):
@@ -97,7 +97,7 @@ def test_replay_the_prelude_runs_only_on_onsets_that_never_recovered_without_a_p
         else:
             spec = {int(t[1:]): int(n) for t, n in (p.split(":") for p in per_tray.split(","))}
             off = _off(bh_map, spec)
-        onset = galaxy.tray_down_onset(off, BH_CHIP_BUSES, "tt-galaxy-bh")
+        onset = galaxy._tray_down_counts(off, galaxy._tray_map(BH_CHIP_BUSES, "tt-galaxy-bh"))
         if outcome == "NO-BOOT":
             no_boot += 1
             assert onset is None, f"a recoverable onset ({per_tray}) gets no prelude"
@@ -114,9 +114,8 @@ def test_replay_the_prelude_runs_only_on_onsets_that_never_recovered_without_a_p
 
 @pytest.fixture
 def rig(monkeypatch, galaxy_trays):
-    """srv.galaxy_recovery with the rescan, the capture, every ladder primitive and the power cycle
-    recorded in ``rig['order']``, and the bus read from ``rig['beats']``. The ladder's dispatch
-    (_fire_gate_rung) is the real one."""
+    """srv.galaxy_recovery with the rescan, the capture, every ladder primitive and the power cycle recorded in
+    ``rig['order']``, and the bus read from ``rig['beats']``."""
     g = srv.galaxy_recovery
     state = {
         "beats": {},
@@ -138,7 +137,6 @@ def rig(monkeypatch, galaxy_trays):
     monkeypatch.setattr(g.mechanism, "auto_recovery_allowed", lambda action, tenant_active=False, **k: state["allowed"])
     monkeypatch.setattr(g.mechanism, "_journal_auto_recovery_denied", lambda *a, **k: None)
     monkeypatch.setattr(galaxy, "TRAY_DOWN_RESCAN_SETTLE_SEC", 0)
-    monkeypatch.delenv("TT_DEVICE_MCP_TRAY_DOWN_CAPTURE", raising=False)
 
     def rescan():
         order.append("rescan")
@@ -149,7 +147,7 @@ def rig(monkeypatch, galaxy_trays):
 
     def capture(onset, expected):
         order.append("capture")
-        return {"cpld": "read"}
+        return {"reads": 4}
 
     monkeypatch.setattr(g, "_tray_down_capture", capture)
 
@@ -247,9 +245,8 @@ async def test_the_last_chance_sweep_still_gates_the_power_cycle_of_a_tray_down(
     ],
 )
 async def test_the_prelude_changes_no_ladder_input(rig, monkeypatch, stage, rung):
-    """The ladder sees the caller's own stage, indices, evidence and beats, with or without the
-    prelude: the same call with TT_DEVICE_MCP_TRAY_DOWN_CAPTURE=0 (1.0.0's path) records the same
-    arguments and the same rungs."""
+    """The ladder sees the caller's own stage, indices, evidence and beats, with or without the prelude: the same call
+    with no onset latched (1.0.0's path) records the same arguments and the same rungs."""
     g = rig["g"]
     seen = []
     real = galaxy.GalaxyRecovery._fire_gate_rung
@@ -266,7 +263,11 @@ async def test_the_prelude_changes_no_ladder_input(rig, monkeypatch, stage, rung
     assert rig["order"][:2] == ["rescan", "capture"]
     g.tray_down_episode_end()
     rig["order"].clear()
-    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_DOWN_CAPTURE", "0")
+
+    async def no_onset(*a, **k):
+        return None
+
+    monkeypatch.setattr(g, "_tray_down_latch", no_onset)
     await g.escalate("gate/post-job", ["24"], 32, lambda m: None, stage=stage, ev=None, beats=dict(beats))
     assert rig["order"] == with_prelude and rung in with_prelude
     assert seen[0] == seen[1]
@@ -341,9 +342,8 @@ async def test_a_rescan_recovery_releases_only_on_a_passing_fabric_pass(rig, mon
 
 @pytest.mark.asyncio
 async def test_a_rescan_recovery_keeps_the_runtime_fault_and_un_isolates_the_chips(rig, monkeypatch):
-    """As for the bridge rung: a rescan re-inits no eth core and the verify cannot see a stuck one,
-    so a runtime-reported fault stays set for the next gate's galaxy reset. The chips that came back
-    leave isolated_chips, so that gate fires no bridge reset on them."""
+    """As for the bridge rung: a rescan re-inits no eth core and the verify cannot see a stuck one, so a
+    runtime-reported fault stays set for the next gate's galaxy reset."""
     off = _off(rig["map"], {1: 8})
     rig["beats"] = _beats_without(off)
     rig["after_rescan"] = _beats_without(set())
@@ -481,9 +481,7 @@ async def test_a_restarted_broker_latches_a_tray_still_missing_afresh(rig):
 
 @pytest.mark.asyncio
 async def test_the_gate_runs_the_prelude_then_its_ladder_end_to_end(rig, monkeypatch, tmp_path, clear_job_state):
-    """End to end through server.device_health_gate: tray 3 off the bus after a job, no tenant. The
-    hook in escalate() latches TRAY_DOWN, rescans and captures before the gate's first rung, and the
-    gate's ladder then runs its rung; no power cycle on a first pass."""
+    """End to end through server.device_health_gate: tray 3 off the bus after a job, no tenant."""
     for i in range(24):
         (tmp_path / str(i)).write_text("")
     monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
@@ -520,15 +518,6 @@ async def test_the_gate_runs_the_prelude_then_its_ladder_end_to_end(rig, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_capture_off_runs_the_ladder_alone(rig, monkeypatch):
-    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_DOWN_CAPTURE", "0")
-    g = rig["g"]
-    rig["beats"] = _beats_without(_off(rig["map"], {3: 6}))
-    await _run_ladder(g, [])
-    assert rig["order"] == ["glx_reset", "last_chance", "power_cycle"] and g._td is None
-
-
-@pytest.mark.asyncio
 async def test_the_whole_bus_off_keeps_its_own_route(rig):
     g = rig["g"]
     rig["beats"] = {}
@@ -544,7 +533,7 @@ async def test_the_whole_bus_off_keeps_its_own_route(rig):
     [
         ["ipmitool", "raw", "0x30", "0x8b", "0x01"],  # the tray re-power: a write
         ["ipmitool", "raw", "0x06", "0x52", "0x03", "0x42", "0x00", "0x0C", "0x0D"],  # index write
-        ["ipmitool", "raw", "0x06", "0x52", "0x03", "0x42", "0x01", "0x0A", "0x00"],
+        ["ipmitool", "raw", "0x06", "0x52", "0x03", "0x42", "0x01", "0x0A"],  # a register read
         ["ipmitool", "chassis", "power", "cycle"],
         ["ipmitool", "sel", "clear"],
         ["ipmitool", "sdr", "elist", "full"],
@@ -557,33 +546,12 @@ def test_the_allow_list_refuses_anything_but_the_read_shapes(argv):
     assert not bmc_capture.argv_allowed(argv)
 
 
-def test_cpld_reads_come_only_from_config_and_cover_every_configured_tray(monkeypatch):
-    for k in ("BUSES", "ADDR", "REGS"):
-        monkeypatch.delenv(f"TT_DEVICE_MCP_TRAY_CPLD_{k}", raising=False)
-    for k in ("BUS", "ADDR", "REGS"):
-        monkeypatch.delenv(f"TT_DEVICE_MCP_PDB_CPLD_{k}", raising=False)
-    argvs, cpld = bmc_capture.capture_argvs(["0000:c1:00.0"], 1000.0)
-    assert cpld == {"tray": False, "pdb": False} and not any(a[:2] == ["ipmitool", "raw"] for a in argvs)
+def test_the_capture_reads_the_bmc_without_any_config():
+    argvs = bmc_capture.capture_argvs(["0000:c1:00.0"], 1000.0)
+    assert not any(a[:2] == ["ipmitool", "raw"] for a in argvs)
     for fixed in (["ipmitool", "sel", "elist", "last", "40"], ["ipmitool", "sdr", "elist"], ["ipmitool", "mc", "info"]):
         assert fixed in argvs, "the SEL, sensors and BMC state are read without any config"
-    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_CPLD_BUSES", "3:0x07,1:0x05")
-    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_CPLD_ADDR", "0x42")
-    monkeypatch.setenv("TT_DEVICE_MCP_TRAY_CPLD_REGS", "0x0A,0x0B")
-    monkeypatch.setenv("TT_DEVICE_MCP_PDB_CPLD_BUS", "0x02")
-    monkeypatch.setenv("TT_DEVICE_MCP_PDB_CPLD_ADDR", "0x44")
-    monkeypatch.setenv("TT_DEVICE_MCP_PDB_CPLD_REGS", "0x10")
-    argvs, cpld = bmc_capture.capture_argvs(["0000:c1:00.0"], 1000.0)
-    raw = [a for a in argvs if a[:2] == ["ipmitool", "raw"]]
-    assert cpld == {"tray": True, "pdb": True} and raw == [
-        ["ipmitool", "raw", "0x06", "0x52", "0x05", "0x42", "0x01", "0x0A"],
-        ["ipmitool", "raw", "0x06", "0x52", "0x05", "0x42", "0x01", "0x0B"],
-        ["ipmitool", "raw", "0x06", "0x52", "0x07", "0x42", "0x01", "0x0A"],
-        ["ipmitool", "raw", "0x06", "0x52", "0x07", "0x42", "0x01", "0x0B"],
-        ["ipmitool", "raw", "0x06", "0x52", "0x02", "0x44", "0x01", "0x10"],
-    ], "every configured tray (the healthy ones are the baseline) and the PDB, as single-byte reads"
     assert all(bmc_capture.argv_allowed(a) for a in argvs)
-    monkeypatch.setenv("TT_DEVICE_MCP_PDB_CPLD_REGS", "0x10,nope")
-    assert bmc_capture.capture_argvs([], 1000.0)[1]["pdb"] is False, "a malformed PDB config reads nothing"
 
 
 def test_bmc_reads_get_the_long_timeout_inside_the_deadline():
@@ -646,9 +614,7 @@ def test_the_capture_meets_its_deadline_survives_a_missing_tool_and_fsyncs_the_b
 
 
 def _sysfs_tree(tmp_path):
-    """A /sys/bus/pci/devices look-alike: links into a device tree where each chip sits under its
-    own bridge. Chip 01 is still enumerated; chip 02 has left the bus (its bridge stays, pointing
-    at the empty bus 2); bus 03 has no bridge at all."""
+    """A /sys/bus/pci/devices look-alike: links into a device tree where each chip sits under its own bridge."""
     tree = tmp_path / "tree" / "pci0000:00"
     devices = tmp_path / "devices"
     devices.mkdir()
@@ -662,16 +628,15 @@ def _sysfs_tree(tmp_path):
 
 
 def test_lspci_targets_the_bridge_above_each_off_chip(tmp_path, monkeypatch):
-    """The bridge keeps the link status when the endpoint drops: it is found by the sysfs parent
-    while the endpoint is listed, and by its secondary bus once it is gone. The endpoint is added
-    only while present; an address with no bridge or a malformed one adds nothing."""
+    """The bridge keeps the link status when the endpoint drops: it is found by the sysfs parent while the endpoint is
+    listed, and by its secondary bus once it is gone."""
     monkeypatch.setattr(pci, "PCI_DEVICES_DIR", _sysfs_tree(tmp_path))
     assert bmc_capture.upstream_bridge("0000:01:00.0") == "0000:00:01.1"
     assert bmc_capture.upstream_bridge("0000:02:00.0") == "0000:00:01.2", "found with the endpoint gone"
     assert bmc_capture.upstream_bridge("0000:03:00.0") is None
     targets = bmc_capture.lspci_targets(["0000:01:00.0", "0000:02:00.0", "0000:03:00.0", "x; reboot", "0000:01:00.0"])
     assert targets == ["0000:00:01.1", "0000:01:00.0", "0000:00:01.2"]
-    argvs, _ = bmc_capture.capture_argvs(targets, 1000.0)
+    argvs = bmc_capture.capture_argvs(targets, 1000.0)
     assert [a[2] for a in argvs if a[0] == "lspci"] == targets
 
 
@@ -693,9 +658,8 @@ def test_the_capture_reads_the_bridge_of_every_off_chip(galaxy_trays, monkeypatc
 @pytest.mark.asyncio
 @pytest.mark.parametrize("removed", [True, False])
 async def test_the_prelude_rescan_never_re_enumerates_a_removed_un_reset_chip(rig, removed):
-    """Spec 04 I69: the prelude resets nothing, so with a chip the broker removed (still hung) its rescan
-    is withheld and journaled, and the ladder follows at once with no added wait. With no removal
-    record the rescan runs as before."""
+    """Spec 04 I69: the prelude resets nothing, so with a chip the broker removed (still hung) its rescan is withheld
+    and journaled, and the ladder follows at once with no added wait."""
     off = _off(rig["map"], {3: 5})
     rig["beats"] = _beats_without(off)
     if removed:

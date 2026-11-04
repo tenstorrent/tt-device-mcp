@@ -9,9 +9,7 @@ import json
 import logging
 import os
 import re
-import shlex
 import shutil
-import signal
 import subprocess
 import tempfile
 import time
@@ -20,16 +18,6 @@ from typing import Callable, Optional
 from tt_device_mcp.health.evidence import health_dir, health_event
 
 _logger = logging.getLogger("tt-device-mcp")
-
-# Spec 04 I26. The pre-power-cycle hook gets this long by default to drain whatever else on the host
-# would be cut by the cycle; past it the hook's process group is killed and the cycle goes ahead.
-PRE_POWER_CYCLE_HOOK_TIMEOUT_DEFAULT_SEC = 300.0
-# Ceiling on a configured timeout: the hook delays recovery of a box that is already down, so a
-# typo (3000000) must never read as "wait forever".
-PRE_POWER_CYCLE_HOOK_TIMEOUT_MAX_SEC = 3600.0
-# Only the tail of the hook's output reaches the log line; the rest stays in the temp file.
-HOOK_OUTPUT_TAIL_BYTES = 2048
-
 
 DEFAULT_POWER_CYCLE_ARGV = ("ipmitool", "chassis", "power", "cycle")
 # The auto rung's ipmitool answers in seconds; the configured command (I27) brings its own timeout.
@@ -68,15 +56,14 @@ FALLBACK_UNIT_PREFIX = "tt-device-mcp-power-cycle-fallback"
 # hook finds it by the pid it writes and stops it before firing the cycle itself.
 FALLBACK_ARGV0 = "@" + FALLBACK_UNIT_PREFIX
 FALLBACK_FIRE_ARGV0 = "@tt-device-mcp-power-cycle-fire"
-# Spec 04 I99. Past the bound the fallback cycles a shutdown that hangs, so the bound must cover a
-# slow shutdown that still ends with the filesystems read-only: a clean reboot of a Galaxy host
-# reached systemd-shutdown in 86 s (measured), and one unit that hangs (an unmount, a service stop)
-# adds up to systemd's own timeout for it before systemd gives up on it and goes on (a mount unit
-# timed out at 90 s and the power went off 116 s after the request, 4 s inside a fixed 120 s bound).
-# So the bound is the clean shutdown, plus the host's longer default unit timeout (start covers
-# mount units, stop covers services), plus a margin: 210 s with systemd's 90 s defaults. Read from
-# the host at each request; a value it cannot read counts as systemd's default. Never off, never
-# past MAX, so the cycle stays bounded.
+# Spec 04 I99. Past the bound the fallback cycles a shutdown that hangs, so the bound must cover a slow shutdown that
+# still ends with the filesystems read-only: a clean reboot of a Galaxy host reached systemd-shutdown in 86 s
+# (measured), and one unit that hangs (an unmount, a service stop) adds up to systemd's own timeout for it before
+# systemd gives up on it and goes on (a mount unit timed out at 90 s and the power went off 116 s after the request, 4 s
+# inside a fixed 120 s bound). So the bound is the clean shutdown, plus the host's longer default unit timeout (start
+# covers mount units, stop covers services), plus a margin: 210 s with systemd's 90 s defaults. Read from the host at
+# each request; a value it cannot read counts as systemd's default. Never off, never past MAX, so the cycle stays
+# bounded.
 SHUTDOWN_CLEAN_SEC = 90
 SHUTDOWN_MARGIN_SEC = 30
 SYSTEMD_DEFAULT_UNIT_TIMEOUT_SEC = 90
@@ -86,10 +73,9 @@ STEP_TIMEOUT_SEC = 30
 # The read-only BMC check before anything is written: a BMC that does not answer it cannot cycle, so
 # the host would only reboot warm (F2 of the I88 review).
 PREFLIGHT_TIMEOUT_SEC = 10
-# systemd-shutdown kills a hook still running after 90 s and reboots warm. The hook's worst case —
-# the RAID wait and the IPMI driver load side by side, the SEL record, every try at its cap, the
-# pauses between them and the wait for power to drop after a try that worked — stays inside it
-# (hook_worst_case_sec).
+# systemd-shutdown kills a hook still running after 90 s and reboots warm. The hook's worst case — the RAID wait and the
+# IPMI driver load side by side, the SEL record, every try at its cap, the pauses between them and the wait for power to
+# drop after a try that worked — stays inside it (hook_worst_case_sec).
 SYSTEMD_SHUTDOWN_HOOK_TIMEOUT_SEC = 90
 HOOK_MDADM_WAIT_SEC = 10
 HOOK_IPMI_PREPARE_SEC = 10
@@ -99,11 +85,10 @@ HOOK_RETRY_PAUSE_SEC = 2
 HOOK_POWER_DROP_WAIT_SEC = 25
 HOOK_TRY_TIMEOUT_MIN_SEC = 5
 HOOK_TRY_TIMEOUT_MAX_SEC = 15
-# Runs in the fallback unit under bash, as FALLBACK_ARGV0: record its pid for the hook, wait out the
-# bound inside bash (a sleep child would die in the killall and fire the cycle early), flush what it
-# can without blocking on it, have the installed hook load the IPMI drivers again if a service stopped
-# them (a hung shutdown may hang past that stop), then cycle under the command's timeout. Args: pid
-# file, bound, timeout, argv.
+# Runs in the fallback unit under bash, as FALLBACK_ARGV0: record its pid for the hook, wait out the bound inside bash
+# (a sleep child would die in the killall and fire the cycle early), flush what it can without blocking on it, have the
+# installed hook load the IPMI drivers again if a service stopped them (a hung shutdown may hang past that stop), then
+# cycle under the command's timeout. Args: pid file, bound, timeout, argv.
 FALLBACK_SH = (
     'printf "%s\\n" "$$" >"$1" 2>/dev/null; b=$2; t=$3; shift 3\n'
     'read -rt "$b" <> <(:)\n'
@@ -201,11 +186,10 @@ def host_unit_timeout_sec() -> float:
 
 
 def shutdown_bound_sec(unit_timeout: Optional[float] = None) -> int:
-    """How long the clean shutdown gets before the fallback cycles the host anyway (spec 04 I99):
-    SHUTDOWN_CLEAN_SEC + the host's unit timeout (:func:`host_unit_timeout_sec` unless given) +
-    SHUTDOWN_MARGIN_SEC. ``TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC`` may only raise it; a lower or
-    malformed value is ignored. Always within SHUTDOWN_BOUND_MAX_SEC (``inf`` reads as that cap), so
-    no host and no setting turns the bound off."""
+    """How long the clean shutdown gets before the fallback cycles the host anyway (spec 04 I99): SHUTDOWN_CLEAN_SEC +
+    the host's unit timeout (:func:`host_unit_timeout_sec` unless given) + SHUTDOWN_MARGIN_SEC.
+    ``TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC`` may only raise it; a lower or malformed value is ignored. Always
+    within SHUTDOWN_BOUND_MAX_SEC (``inf`` reads as that cap), so no host and no setting turns the bound off."""
     if unit_timeout is None:
         unit_timeout = host_unit_timeout_sec()
     if not unit_timeout >= 0:  # NaN
@@ -248,10 +232,11 @@ def _one_line(reason: str) -> str:
 
 
 # Spec 04 I88. What asked for the cycle, journaled just before the fallback unit starts: the broker's
-# escalation notes it (note_power_cycle_trigger) and fire_os_first takes it once. A note older than any
-# pre-cycle hook could take is from an escalation that never fired and is not used.
+# escalation notes it (note_power_cycle_trigger) and fire_os_first takes it once. A note older than
+# this is from an escalation that never fired and is not used.
 _trigger: dict = {}
-TRIGGER_MAX_AGE_SEC = PRE_POWER_CYCLE_HOOK_TIMEOUT_MAX_SEC + 600.0
+# Kept at its old value (an hour plus 10 min) so a note's lifetime does not change.
+TRIGGER_MAX_AGE_SEC = 4200.0
 
 
 def note_power_cycle_trigger(reason: str, fault_class: str = "", chips: Optional[dict] = None, hold: str = "") -> None:
@@ -447,9 +432,8 @@ def fallback_argv(
 
 
 def bmc_query_argv(argv: list, query: list) -> Optional[list]:
-    """A read-only BMC query on the same BMC and credentials as the cycle command, or None when there
-    is none to derive: ``ipmitool [options] chassis power cycle`` becomes ``ipmitool [options]
-    <query>``. Any other command is opaque."""
+    """A read-only BMC query on the same BMC and credentials as the cycle command, or None when there is none to derive:
+    ``ipmitool [options] chassis power cycle`` becomes ``ipmitool [options] <query>``. Any other command is opaque."""
     argv = [str(a) for a in argv]
     if len(argv) >= 4 and os.path.basename(argv[0]) == "ipmitool" and argv[-3:] == ["chassis", "power", "cycle"]:
         return [*argv[:-3], *query]
@@ -505,11 +489,10 @@ def restart_cause_is_mapped(cause: str) -> bool:
 
 
 def read_restart_cause(argv: list) -> Optional[str]:
-    """The BMC's last system restart cause, lower case, for the BMC the cycle command ``argv`` drives:
-    the raw Get System Restart Cause (``ipmitool [options] raw 0x00 0x07``, read-only, bounded by
-    PREFLIGHT_TIMEOUT_SEC) named from :data:`RESTART_CAUSES`, or ``unmapped code 0x..`` for a
-    reserved code. None when there is no query to derive, the BMC does not answer, does not support
-    it (some answer "Unspecified error") or the answer does not parse."""
+    """The BMC's last system restart cause, lower case, for the BMC the cycle command ``argv`` drives: the raw Get
+    System Restart Cause (``ipmitool [options] raw 0x00 0x07``, read-only, bounded by PREFLIGHT_TIMEOUT_SEC) named from
+    :data:`RESTART_CAUSES`, or ``unmapped code 0x..`` for a reserved code. None when there is no query to derive, the
+    BMC does not answer, does not support it (some answer "Unspecified error") or the answer does not parse."""
     return read_restart_cause_why(argv)[0]
 
 
@@ -565,11 +548,10 @@ def _sel_naive_epoch(text: str) -> Optional[float]:
 
 
 def read_sel_power_off(argv: list, since: float, until: float) -> Optional[float]:
-    """The host-clock epoch of the last Power Unit "Power off/down" or "Power cycle" record (asserted)
-    the BMC that the cycle command ``argv`` drives logged within ``[since, until]`` (host epochs, with
-    :data:`SEL_WINDOW_SLACK_SEC`), or None. Read-only and bounded: ``sel time get`` gives the BMC
-    clock's offset to the host's (zone and skew), then ``sel list last N``. None when there is no
-    query to derive, the BMC does not answer or no such record is in the window."""
+    """The host-clock epoch of the last Power Unit "Power off/down" or "Power cycle" record (asserted) the BMC that the
+    cycle command ``argv`` drives logged within ``[since, until]`` (host epochs, with :data:`SEL_WINDOW_SLACK_SEC`), or
+    None. Read-only and bounded: ``sel time get`` gives the BMC clock's offset to the host's (zone and skew), then ``sel
+    list last N``. None when there is no query to derive, the BMC does not answer or no such record is in the window."""
     clock = bmc_query_argv(argv, ["sel", "time", "get"])
     tail = bmc_query_argv(argv, ["sel", "list", "last", str(SEL_TAIL_RECORDS)])
     if clock is None or tail is None:
@@ -719,16 +701,15 @@ def _stop_fallback(unit: str) -> bool:
 
 
 def fire_os_first(argv: list, reason: str, timeout: float = DEFAULT_POWER_CYCLE_TIMEOUT_SEC) -> str:
-    """Power-cycle the host with its OS brought down cleanly first (spec 04 I88). Never cuts power
-    under a running OS from here.
+    """Power-cycle the host with its OS brought down cleanly first (spec 04 I88). Never cuts power under a running OS
+    from here.
 
-    Checks the BMC read-only (:func:`preflight_argv`), writes the request, starts the fallback unit
-    (fires ``argv`` once :func:`shutdown_bound_sec` passes), then ``systemctl reboot``; the shutdown
-    hook fires ``argv`` once the filesystems are read-only. Returns "os_first" once the reboot is
-    queued. When any step cannot start it undoes what it started and raises PowerCycleNotLaunched:
-    nothing fired, the caller holds and pages. The one exception: a fallback unit that outlives a
-    failed reboot may still fire at its bound, so that returns "fallback_pending" and the action
-    stays pending."""
+    Checks the BMC read-only (:func:`preflight_argv`), writes the request, starts the fallback unit (fires ``argv`` once
+    :func:`shutdown_bound_sec` passes), then ``systemctl reboot``; the shutdown hook fires ``argv`` once the filesystems
+    are read-only. Returns "os_first" once the reboot is queued. When any step cannot start it undoes what it started
+    and raises PowerCycleNotLaunched: nothing fired, the caller holds and pages. The one exception: a fallback unit that
+    outlives a failed reboot may still fire at its bound, so that returns "fallback_pending" and the action stays
+    pending."""
     argv = [str(a) for a in argv]
     why = os_first_unavailable()
     if not why and (not argv or any("\n" in a for a in argv)):
@@ -803,86 +784,3 @@ def fire_os_first(argv: list, reason: str, timeout: float = DEFAULT_POWER_CYCLE_
     health_event("power_cycle_os_first", phase="not_launched", reason=reason, why=why[-300:])
     _logger.error("POWER CYCLE NOT LAUNCHED: %s; nothing fired, the device stays held", why)
     raise PowerCycleNotLaunched(why)
-
-
-def pre_power_cycle_hook_timeout_sec() -> float:
-    """The hook's timeout. A non-positive or malformed value reads as the default; a huge one is
-    capped, so no setting makes the hook block recovery for good."""
-    raw = os.environ.get("TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK_TIMEOUT_SEC", "").strip()
-    try:
-        v = float(raw)
-    except ValueError:
-        return PRE_POWER_CYCLE_HOOK_TIMEOUT_DEFAULT_SEC
-    if not 0 < v < float("inf"):
-        return PRE_POWER_CYCLE_HOOK_TIMEOUT_DEFAULT_SEC
-    return min(v, PRE_POWER_CYCLE_HOOK_TIMEOUT_MAX_SEC)
-
-
-def run_pre_power_cycle_hook(log: Callable[[str], None], reason: str) -> dict:
-    """Run ``TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK`` (spec 04 I26) and wait for it, bounded.
-
-    The command is split like shell words and run without a shell, in its own session, with the
-    cycle's reason in ``TT_DEVICE_MCP_POWER_CYCLE_REASON``. Its output goes to a temp file, not a
-    pipe, so a background child it leaves holding stdout cannot stretch the wait past its own exit.
-    On timeout its whole process group is killed. Every outcome — unset, unparseable, not
-    startable, non-zero, timed out — is logged and returned, and the caller fires the cycle anyway:
-    the hook is a courtesy to co-tenants, never a gate on recovery. Never raises.
-
-    Returns {"ran": bool, "rc": int|None, "timed_out": bool, "seconds": float, "detail": str}."""
-    out = {"ran": False, "rc": None, "timed_out": False, "seconds": 0.0, "detail": ""}
-    raw = os.environ.get("TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK", "").strip()
-    if not raw:
-        return out
-    try:
-        argv = shlex.split(raw)
-    except ValueError as e:
-        out["detail"] = f"does not parse ({e})"
-        log(f"PRE-POWER-CYCLE HOOK skipped: TT_DEVICE_MCP_PRE_POWER_CYCLE_HOOK {out['detail']}")
-        return out
-    if not argv:
-        return out
-    timeout = pre_power_cycle_hook_timeout_sec()
-    env = {**os.environ, "TT_DEVICE_MCP_POWER_CYCLE_REASON": reason}
-    log(f"PRE-POWER-CYCLE HOOK: running {argv[0]!r} (up to {timeout:g}s) before the power cycle")
-    t0 = time.monotonic()
-    try:
-        with tempfile.TemporaryFile() as buf:
-            try:
-                proc = subprocess.Popen(
-                    argv,
-                    stdin=subprocess.DEVNULL,
-                    stdout=buf,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                    env=env,
-                )
-            except OSError as e:
-                out["detail"] = f"could not start: {e}"
-                log(f"PRE-POWER-CYCLE HOOK {argv[0]!r} {out['detail']}; power-cycling anyway")
-                return out
-            out["ran"] = True
-            try:
-                out["rc"] = proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                out["timed_out"] = True
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-                try:
-                    proc.wait(timeout=5)  # reap it, so it never lingers as a zombie
-                except subprocess.TimeoutExpired:
-                    pass
-            out["seconds"] = round(time.monotonic() - t0, 1)
-            buf.seek(max(0, buf.seek(0, os.SEEK_END) - HOOK_OUTPUT_TAIL_BYTES))
-            out["detail"] = buf.read().decode("utf-8", "replace").strip()
-    except Exception as e:  # noqa: BLE001 - a broken hook must never stop the cycle
-        out["detail"] = f"failed: {e!r}"
-        log(f"PRE-POWER-CYCLE HOOK {argv[0]!r} {out['detail']}; power-cycling anyway")
-        return out
-    tail = f": {out['detail'][-500:]}" if out["detail"] else ""
-    if out["timed_out"]:
-        log(f"PRE-POWER-CYCLE HOOK {argv[0]!r} killed after {timeout:g}s; power-cycling anyway{tail}")
-    else:
-        log(f"PRE-POWER-CYCLE HOOK {argv[0]!r} exited {out['rc']} after {out['seconds']:g}s{tail}")
-    return out

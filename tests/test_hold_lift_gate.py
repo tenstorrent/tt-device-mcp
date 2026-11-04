@@ -82,7 +82,7 @@ async def test_a_healthy_mesh_pays_no_fabric_pass_pre_job(held):
 
 @pytest.mark.asyncio
 async def test_the_pre_job_full_check_waits_for_hugepages(held, monkeypatch):
-    """Goal 8: no full check before the 1G pool exists (it could only 77). The hold stays; the 10-min
+    """Full check after every reset: no full check before the 1G pool exists (it could only 77). The hold stays; the 10-min
     bound's own check waits the same way and is bounded by its window (spec 04 I76)."""
     monkeypatch.setattr(srv, "_hugepages_shortfall", lambda: (0, 32))
     await srv._device_health_gate(None, phase="pre-job", run_fabric=False)

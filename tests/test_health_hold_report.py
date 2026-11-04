@@ -62,7 +62,6 @@ def held(monkeypatch, galaxy_trays):
     monkeypatch.setattr(m, "host_action_requested", None)
     monkeypatch.setattr(opc, "_pending", {})
     monkeypatch.delenv("TT_DEVICE_MCP_POWER_CYCLE_CMD", raising=False)
-    monkeypatch.delenv("TT_DEVICE_MCP_OFFBUS_HOLD_HANDOFF_SEC", raising=False)
     monkeypatch.delenv("TT_DEVICE_MCP_STUCK_HOLD_SEC", raising=False)
     monkeypatch.delenv("TT_DEVICE_MCP_OFFBUS_HOLD_SEC", raising=False)
     monkeypatch.delenv("TT_DEVICE_MCP_FORCE_ESCALATE", raising=False)
@@ -329,12 +328,6 @@ def _gated(monkeypatch, **pending) -> None:
     "pending, cmd, at, source",
     [
         ({"gated": True}, True, START + 300, "gated off-bus grace"),
-        (
-            {"handoff": {"deadline": START + 1200, "why": "w", "latched": "", "operator_seen": "none"}},
-            False,
-            START + 1200,
-            "gated off-bus operator hand-off bound",
-        ),
     ],
 )
 def test_the_off_bus_forced_pass_bounds_are_named_when_they_fire(held, monkeypatch, pending, cmd, at, source):
@@ -546,13 +539,12 @@ def test_cooldown_candidate_and_next_rung():
     assert hr.next_rung([None, a, b]) is b and hr.next_rung([]) is None
 
 
-# ---- rungs rollout-3 added beside the watchdog chain (spec 04 I73, I70) ---------------------------
+# ---- rungs added beside the watchdog chain (spec 04 I73, I70) ---------------------------
 
 
 def test_a_class_a_hold_in_the_cooldown_has_no_second_10_min_trigger(held, monkeypatch):
-    """Spec 04 I73/I76: a whole tray whose cycle the cooldown refuses gets its full ladder only in the
-    10-min hold bound's run. No separate class-A start exists: with the first ceiling window spent, the
-    report names the next window, and no class-A kind fires 10 min after the last cycle or boot."""
+    """Spec 04 I73/I76: a whole tray whose cycle the cooldown refuses gets its full ladder only in the 10-min hold
+    bound's run."""
     held["off"] = set(TRAY_CHIPS[0x40])
     monkeypatch.setattr(held["m"], "whole_tray_off", list(TRAY_CHIPS[0x40]))
     monkeypatch.setattr(held["m"], "_class_a_ladder_anchor", None)
@@ -592,9 +584,8 @@ _ROUTE_RUNG = {srv.ROUTE_LADDER: "forced ladder", srv.ROUTE_HOST_RUNG: "power cy
 
 
 def _acts_at(t: float, monkeypatch, read_at: float):
-    """What the watchdog really does at epoch ``t``: the first kind its tick spawns, routed by the
-    forced run's own routing (the monotonic clock moved on by ``t - read_at``). None when no spawn
-    acts: nothing fires, or the run returns on a pending post-ladder check or a startup stand-down."""
+    """What the watchdog really does at epoch ``t``: the first kind its tick spawns, routed by the forced run's own
+    routing (the monotonic clock moved on by ``t - read_at``)."""
     kinds = _fires(t, monkeypatch)
     if not kinds:
         return None
@@ -632,10 +623,7 @@ def _bound_ladder_ran(monkeypatch, lad: float, recovered: bool) -> None:
     [(True, 1300, "hold bound host rung"), (False, 1200, "hold bound host rung at hold ceiling window 2")],
 )
 def test_the_report_names_the_rung_the_forced_run_routes_to(held, monkeypatch, recovered, at, source):
-    """A bound ladder ran at 1000 s. Window 2 (1200 s) is then no ladder: while its post-ladder check
-    is pending the run returns, so the host rung follows at the check's end (1300 s); when that ladder
-    did not bring the mesh back, window 2 itself goes to the host rung. The report answers what the
-    watchdog's own routing does, at the same time."""
+    """A bound ladder ran at 1000 s."""
     held["off"] = {3, 4, 5, 6}
     monkeypatch.setattr(srv, "device_hold_escalate_bucket", 1)
     _bound_ladder_ran(monkeypatch, 1000.0, recovered)
@@ -660,9 +648,8 @@ def test_a_class_a_hold_inside_the_check_window_reports_the_host_rung(held, monk
 
 
 def test_a_startup_verify_stand_down_is_reported_with_its_bounded_end(held, monkeypatch):
-    """Spec 03 I75: a ceiling window due while the startup gate still owns the hold stands down; the
-    report names the gate first and the window's ladder at the stand-down's bounded end, when the
-    watchdog's run stops standing down."""
+    """Spec 03 I75: a ceiling window due while the startup gate still owns the hold stands down; the report names the
+    gate first and the window's ladder at the stand-down's bounded end, when the watchdog's run stops standing down."""
     held["state"] = ServerState.RECOVERING
     srv.fsm.on_fault("startup_unverified", detail="broker start", dirty=False)
     monkeypatch.setattr(srv, "jobs", {})
@@ -872,9 +859,8 @@ def test_the_power_cycle_gates_read_marks_nothing(held, monkeypatch):
 
 
 def test_a_fenced_chip_link_is_never_read_and_none_while_the_dead_chip_watch_is_armed(held, monkeypatch):
-    """Spec 03 I99: a link read is a config-space read, which stalls the loop on a dying chip. A fenced
-    or lost chip is not present and its link is never read; while the dead-chip watch is armed the
-    report reads no link at all."""
+    """Spec 03 I99: a link read is a config-space read, which stalls the loop on a dying chip. A fenced or lost chip is
+    not present and its link is never read; while the dead-chip watch is armed the report reads no link at all."""
     reads = []
     monkeypatch.setattr(srv, "link_down", lambda bdf: reads.append(GALAXY_BUS_IDS.index(bdf)) or False)
     monkeypatch.setattr(srv.chip_state, "read_blocked", lambda i: str(i) == "27")
