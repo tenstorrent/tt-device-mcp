@@ -95,9 +95,10 @@ def test_an_unreadable_uptime_reads_as_unknown(monkeypatch, tmp_path):
 # ---- the gate ----
 
 
-def _gate(monkeypatch, tmp_path, *, chips=32, mode="galaxy", fabric=(True, "links healthy")):
+def _gate(monkeypatch, tmp_path, *, chips=32, mode="galaxy", fabric=(True, "links healthy"), slice_sec=None):
     """A clean post-job gate (every probe stubbed) on a ``chips``-chip host; records each settle wait and what held
-    while it ran."""
+    while it ran. The settle sleeps in one slice unless ``slice_sec`` is given."""
+    monkeypatch.setattr(srv, "POST_RESET_SETTLE_SLICE_SEC", slice_sec or 10 * POST_RESET_SETTLE_SEC)
     monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "true")
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", mode)
     calls = _clean_post_job_gate(
@@ -215,3 +216,72 @@ async def test_the_bound_and_the_hold_clock_are_untouched_while_settling(monkeyp
     assert calls["waits"][0]["bound"] == srv._hold_bound_sec() == 600
     assert srv.device_hold_episode_since == since, "the wait counts in the hold's own clock"
     assert srv.fsm.state is not ServerState.HEALTHY
+
+
+# ---- a chip off the bus never waits for the settle (04 I37 and the off-bus paths keep their time) ----
+
+
+def _observed(monkeypatch, calls):
+    """Record, in ``calls["order"]``, each settle slice and each observe, and every post_reset_settle* event."""
+    calls["order"], calls["events"] = [], []
+    real_observe, real_event = srv.fsm.observe, srv.health_event
+
+    async def observe(*a, **k):
+        calls["order"].append("observe")
+        return await real_observe(*a, **k)
+
+    def event(name, **k):
+        if name.startswith("post_reset_settle"):
+            calls["events"].append((name, k))
+        return real_event(name, **k)
+
+    monkeypatch.setattr(srv.fsm, "observe", observe)
+    monkeypatch.setattr(srv, "health_event", event)
+
+
+@pytest.mark.asyncio
+async def test_a_tray_off_the_bus_skips_the_settle_and_observe_runs_at_once(monkeypatch, tmp_path):
+    calls = _gate(monkeypatch, tmp_path, slice_sec=5.0)
+    _observed(monkeypatch, calls)
+    for i in range(24, 32):  # one tray did not come back from the reset
+        (tmp_path / str(i)).unlink()
+    FABRIC_DEBT.note_reset("tt-smi -glx_reset", at=srv.time.monotonic() - 5)
+    assert srv._post_reset_settle_left(32, srv.galaxy_recovery) > 0, "a young debt would otherwise wait"
+    await srv._device_health_gate(None, phase="post-job", run_fabric=True)
+    assert calls["waits"] == [] and calls["order"][:1] == ["observe"]
+    assert calls["events"] == [("post_reset_settle", calls["events"][0][1])]
+    assert calls["events"][0][1]["wait_sec"] == 0.0 and calls["events"][0][1]["off_bus"] == 8
+    assert not FABRIC_DEBT.settle_served, "a skipped settle is not one served"
+
+
+@pytest.mark.asyncio
+async def test_a_chip_leaving_mid_settle_ends_the_wait(monkeypatch, tmp_path):
+    calls = _gate(monkeypatch, tmp_path, slice_sec=5.0)
+    _observed(monkeypatch, calls)
+    gate_sleep = srv.asyncio.sleep
+
+    async def sleep(sec, *a, **k):
+        if sec >= 1:
+            calls["order"].append("slice")
+            if len(calls["waits"]) == 1:  # chip 7 drops during the second slice
+                (tmp_path / "7").unlink()
+        return await gate_sleep(sec, *a, **k)
+
+    monkeypatch.setattr(srv.asyncio, "sleep", sleep)
+    FABRIC_DEBT.note_reset("tenant job j5", at=srv.time.monotonic() - 1)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=True)
+    assert [w["sec"] for w in calls["waits"]] == [5.0, 5.0], "the settle ends after the slice the chip left in"
+    assert calls["order"][:3] == ["slice", "slice", "observe"]
+    assert [e[0] for e in calls["events"]] == ["post_reset_settle", "post_reset_settle_ended"]
+    assert calls["events"][1][1]["off_bus"] == 1 and calls["events"][1][1]["waited_sec"] == 10.0
+
+
+@pytest.mark.asyncio
+async def test_the_sliced_settle_still_waits_the_whole_remainder(monkeypatch, tmp_path):
+    calls = _gate(monkeypatch, tmp_path, slice_sec=5.0)
+    FABRIC_DEBT.note_reset("tenant job j6", at=srv.time.monotonic() - 2)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=True)
+    total = sum(w["sec"] for w in calls["waits"])
+    assert POST_RESET_SETTLE_SEC - 4 <= total <= POST_RESET_SETTLE_SEC - 1
+    assert all(w["sec"] <= 5.0 and w["fabric_ran"] == 0 for w in calls["waits"])
+    assert calls["fabric"] == 1 and srv.fsm.state is ServerState.HEALTHY

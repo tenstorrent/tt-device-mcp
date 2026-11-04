@@ -3945,22 +3945,52 @@ def _post_reset_settle_left(expected: int, recovery) -> float:
     return left
 
 
+# Spec 04 I32: the settle sleeps in slices this long, so a chip that leaves the bus during it ends it within one slice.
+POST_RESET_SETTLE_SLICE_SEC = 5.0
+
+
+def _settle_chips_off_bus(expected: int) -> int:
+    """How many of the ``expected`` chips are off the bus now (spec 04 I32): any skips or ends the settle."""
+    return max(0, expected - len(_present_chip_indices()))
+
+
 async def _post_reset_settle(expected: int, recovery, log) -> float:
     """Spec 04 I32: a multi-tray mesh settles after a reset before the full check its debt owes. The device stays held
     throughout (the gate holds the device lock, and the open debt refuses any release); the check after it is
-    unchanged. Each reset is waited for once. Returns the seconds waited."""
+    unchanged. Each reset is waited for once. A chip off the bus skips the settle, or ends it as soon as one leaves, so
+    observe routes the drop at once (the whole-tray power cycle, 04 I37, and the off-bus paths keep their time).
+    Returns the seconds waited."""
     left = _post_reset_settle_left(expected, recovery)
     if left <= 0.0:
         return 0.0
-    FABRIC_DEBT.note_settle_served()
     age = time.monotonic() - FABRIC_DEBT.reset_monotonic
+    gone = _settle_chips_off_bus(expected)
+    if gone:
+        log(
+            f"post-reset settle: skipped, {gone} of {expected} chip(s) off the bus "
+            f"({FABRIC_DEBT.owed} was {age:.0f}s ago)"
+        )
+        health_event(
+            "post_reset_settle", reset=FABRIC_DEBT.owed, wait_sec=0.0, reset_age_sec=round(age, 1), off_bus=gone
+        )
+        return 0.0
+    FABRIC_DEBT.note_settle_served()
     log(
         f"post-reset settle: waiting {left:.0f}s before the full check ({FABRIC_DEBT.owed} was {age:.0f}s ago; "
         f"a multi-tray mesh settles {POST_RESET_SETTLE_SEC:.0f}s after a reset)"
     )
     health_event("post_reset_settle", reset=FABRIC_DEBT.owed, wait_sec=round(left, 1), reset_age_sec=round(age, 1))
-    await asyncio.sleep(left)
-    return left
+    waited = 0.0
+    while waited < left:
+        step = min(POST_RESET_SETTLE_SLICE_SEC, left - waited)
+        await asyncio.sleep(step)
+        waited += step
+        gone = _settle_chips_off_bus(expected) if waited < left else 0
+        if gone:
+            log(f"post-reset settle: ended after {waited:.0f}s, {gone} of {expected} chip(s) left the bus")
+            health_event("post_reset_settle_ended", reset=FABRIC_DEBT.owed, waited_sec=round(waited, 1), off_bus=gone)
+            break
+    return waited
 
 
 # Spec 04 I32: the post-job gate's one heartbeat read waits at most this long for sysfs.
