@@ -68,6 +68,9 @@ def valve(monkeypatch):
     monkeypatch.setattr(srv.health_monitor, "snapshot_proc", None, raising=False)
     monkeypatch.setattr(srv, "eth_selftest_proc", None, raising=False)
     monkeypatch.setattr(srv, "current_process", None)
+    # The sampler's pre-remove records go through the detached writer (03 I99); write them at once so the
+    # journal reads below see them.
+    monkeypatch.setattr(srv, "health_event_detached", srv.health_event)
     log = []
     detach_ok = {}
     monkeypatch.setattr(srv, "isolate_chip", lambda idx: log.append(("detach", idx)) or detach_ok.get(idx, True))
