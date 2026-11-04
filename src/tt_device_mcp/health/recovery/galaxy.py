@@ -2666,7 +2666,9 @@ class GalaxyRecovery(Recovery):
         # 10-min bound, and the power cycle request stays bounded.
         # ``at_bound``: the sweep the 10-min bound runs before its power cycle (a cooldown-end retry included). Its mesh
         # reset and full check run under that deadline too, whatever the off-bus set: a present mesh, or a set that
-        # changed since the failed reset, never gets a check bounded only by its probes' timeouts (I65).
+        # changed since the failed reset, never gets a check bounded only by its probes' timeouts (I65). The sweep the
+        # bound's own ladder climbs to at the 10-min mark is that sweep too.
+        at_bound = at_bound or (self._bound and sweep_phase is not None and sweep_phase[1])
         bounded = (repeat_failed or at_bound) and self._repeat_runs_under_deadline(expected)
         trays = _affected_trays(offbus_chips, expected, tray_map) or []
         placement = _offbus_placement(offbus_chips, self._chip_buses_now(), tray_map)
@@ -3108,6 +3110,14 @@ class GalaxyRecovery(Recovery):
             # The deadline watchdog's window: a mesh reset already failed on this same off-bus set this
             # boot. A forced window takes the next stronger rung, never the same reset (spec 04 I36, I58).
             await self._climb_past_failed_rung(expected, ids_before, hold_since, log)
+            return True
+        if spent and self._bound and self._repeat_runs_under_deadline(expected):
+            if await self._bound_rerun_spent_mesh_reset(expected, ids_before, hold_since, log):
+                return True
+            self.mechanism.spent_climb_since = hold_since or None
+            await self._climb_or_hand_off(
+                expected, off_bus_before, hold_since, log, present_reset_failed=off_bus_before == 0
+            )
             return True
         recovered = await self._reset_and_verify_device(indices, log)
         await self._note_mesh_reset_failed(recovered, hold_since, ids_before, expected)
@@ -3628,6 +3638,10 @@ class GalaxyRecovery(Recovery):
             beats_before = await asyncio.to_thread(self.deps.read_heartbeats)
             off_bus_before = offbus_count(beats_before, expected)
         ids_before = await self._offbus_ids_now(expected)
+        if self._bound and (spent or failed_unchanged) and self._repeat_runs_under_deadline(expected):
+            if not await self._bound_rerun_spent_mesh_reset(expected, ids_before, hold_since, log):
+                await self._climb_or_hand_off(expected, off_bus_before, hold_since, log)
+            return True
         recovered = await self._reset_and_verify_device(indices, log)
         await self._note_mesh_reset_failed(recovered, hold_since, ids_before, expected)
         if recovered is None:
@@ -3871,6 +3885,21 @@ class GalaxyRecovery(Recovery):
         health_event(
             "whole_mesh_reset_before_host_rung_unverified", phase=phase, reason="deadline", stopped_pids=stopped
         )
+
+    async def _bound_rerun_spent_mesh_reset(
+        self, expected: int, ids_before: Optional[set], hold_since: str, log
+    ) -> bool:
+        """Spec 04 I89, I100: the 10-min bound's rerun of this hold's spent mesh reset, with its settle and its full
+        check with fabric, runs as the I100 repeat, under the I97 deadline or one from its own start (at most 315 s,
+        570 s after a give-up), whatever the off-bus set. A check still running at that deadline is cut and failed. True
+        when the hold is handled (the check passed); False sends the caller on to the bound's sweep and power cycle. A
+        rerun that did not run (refused, a reset cycling in its scope, a tenant) goes on the same way: the sweep checks
+        for a tenant itself."""
+        rerun = await self._whole_mesh_reset_before_host_rung(expected, log, "idle-escalation", None, repeat=True)
+        if rerun:
+            return True
+        await self._note_mesh_reset_failed(False, hold_since, ids_before, expected)
+        return False
 
     async def _note_mesh_reset_failed(
         self, recovered: Optional[bool], hold_since: str, ids_before: Optional[set], expected: int

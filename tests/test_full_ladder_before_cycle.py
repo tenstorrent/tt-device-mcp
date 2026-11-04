@@ -168,3 +168,43 @@ async def test_a_sweep_check_cut_at_its_deadline_at_the_cooldown_end_still_power
     cut = [e for e in events if e == "whole_mesh_reset_before_host_rung_unverified"]
     assert cut, "the cut check is journaled"
     assert counters["dirty_cleared"] == 0, "a cut check lifts nothing"
+
+
+@pytest.mark.asyncio
+async def test_the_bounds_rerun_of_a_spent_reset_with_a_chip_still_off_is_cut_at_its_deadline(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 04 I89/I100: at the 10-min bound a hold whose chip is still off after the kept rescan/SBR reruns its spent
+    mesh reset as the I100 repeat. A full check after it that never ends is cut at the rerun's deadline and counts as
+    failed: the sweep and the power cycle follow within the stated bound, and nothing lifts the hold."""
+    order, events, counters, clock, state = _cooldown_deferred(monkeypatch, tmp_path)
+    state["cooling"] = False
+    monkeypatch.setattr(galaxy, "MESH_RESET_BEFORE_HOST_RUNG_SEC", 0.5)
+    monkeypatch.setattr(galaxy, "MESH_RESET_BEFORE_HOST_RUNG_GAVE_UP_SEC", 0.5)
+    monkeypatch.setattr(galaxy, "MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC", 1)
+    monkeypatch.setattr(galaxy, "MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC", 0.2)
+    monkeypatch.setattr(galaxy, "MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC", 0.2)
+    hung = asyncio.Event()
+
+    async def verify(expected, log, run_fabric=True, **k):
+        order.append("full check" if run_fabric else "check without fabric")
+        await hung.wait()  # never set: a check that does not end
+
+    async def plain_mesh_reset(indices, log):
+        # The plain reset and its check, with no deadline: the bound's rerun must not take this path.
+        order.append("mesh reset")
+        srv.recovery_mechanism.last_reset_rc = 1
+        return await verify(32, log)
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    patch_recovery(monkeypatch, "_reset_and_verify_device", plain_mesh_reset)
+    clock.shift = galaxy._stuck_hold_ceiling_sec() - _age()
+    started = datetime.now()
+    await asyncio.wait_for(_bound_ladder(), 30)
+    took = (datetime.now() - started).total_seconds()
+    assert "bound_reruns_spent_rung" in events
+    assert order[:3] == ["rescan", "mesh reset", "full check"], "the kept rungs, then the spent mesh reset again"
+    assert order[-1] == "power cycle" and order.count("power cycle") == 1, "the cut check counts as failed"
+    assert took < 15, f"bounded by the deadline, not by the check: {took:.1f}s"
+    assert "whole_mesh_reset_before_host_rung_unverified" in events, "the hung check is cut at its deadline"
+    assert counters["dirty_cleared"] == 0 and counters["fault_cleared"] == 0, "a cut check lifts nothing"

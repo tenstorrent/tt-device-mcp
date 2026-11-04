@@ -1329,9 +1329,12 @@ async def test_a_refused_lift_after_the_mesh_reset_before_the_host_rung_still_po
         # Spec 04 I89: the 10-min bound runs the full ladder, its spent mesh reset included; I97's runs no second time.
         assert order.count("mesh reset") == 3, "the bound reran the spent mesh reset once"
         assert "bound_reruns_spent_rung" in [n for n, _ in events]
+        # Spec 04 I100: the bound's rerun and its sweep's mesh reset run as the repeat, under its deadline.
+        at_bound = [k for k in _i97(events) if k["fired"] and k["hold_age_sec"] >= ceiling]
+        assert at_bound and all(k["repeat"] is True for k in at_bound)
     else:
         assert order.count("mesh reset") <= 2, "no third mesh reset in the hold"
-    assert len(_i97(events)) == 1 or _i97(events)[-1]["fired"] is False, "the I97 reset runs once per hold"
+        assert len(_i97(events)) == 1 or _i97(events)[-1]["fired"] is False, "the I97 reset runs once per hold"
     assert order[-1] == "power cycle" and order.count("power cycle") == 1
     # I97's deadline (from hold start) is unchanged: its reset does not run again. At the bound the cycle follows the
     # bound's own ladder, a few seconds of fake reset here (I76: 600 s + ladder time).
