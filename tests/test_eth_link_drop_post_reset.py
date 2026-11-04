@@ -45,6 +45,8 @@ def replay(monkeypatch, tmp_path, mesh):  # noqa: F811
     monkeypatch.setattr(monitor_mod, "_asic_bus_map", lambda: {"a": 0xC1})
     monkeypatch.setattr(monitor_mod, "health_event", lambda ev, **f: mesh["mon_events"].append((ev, f)))
     monkeypatch.setattr(srv, "last_relift_monotonic", srv.last_relift_monotonic)
+    # The replayed resets take no time, so their settle is skipped here; spec 04 I32's settle has its own tests.
+    monkeypatch.setattr(srv, "POST_RESET_SETTLE_SEC", 0.0)
     for attr, value in (
         ("verify_eth_heartbeat", HealthMonitor.verify_eth_heartbeat.__get__(mon)),
         ("verify_fabric_health", HealthMonitor.verify_fabric_health.__get__(mon)),
