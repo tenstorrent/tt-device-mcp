@@ -867,7 +867,8 @@ each rung fires only when the gentler one failed or cannot apply.
 - **I87 — One mesh reset per hold episode; the last-chance sweep at most once per phase.** Once a
   mesh reset (`tt-smi -glx_reset`) has run in a hold episode and left the mesh unhealthy, no path
   runs another standalone mesh reset in that episode, whatever the off-bus set did after it (shrank,
-  changed or stayed): not the between-jobs gate, the idle relift, the stuck-hold escalation, the
+  changed or stayed), except the I76 10-min bound's own ladder, which runs every rung again, this
+  reset included (I89, `bound_reruns_spent_rung`): not the between-jobs gate, the idle relift, the stuck-hold escalation, the
   hold-deadline watchdog's forced windows, the I65 cooldown retry or a startup check. Each such skip
   journals `reset_rung_skipped_spent` and the episode climbs: the last-chance sweep (I22), then the
   power cycle (I71). The sweep (SBR, then the mesh reset, then one full check, fabric included) runs
@@ -880,7 +881,8 @@ each rung fires only when the gentler one failed or cannot apply.
   I11 ARC-not-ready retry inside the same reset call and I97's one reset of the whole mesh before the
   power cycle, once an SBR has every chip back on the bus. A power cycle the governor denies, the I65
   cooldown holds or that is not opted in buys no second reset: the hold waits for the cycle (asked
-  again at its deadline), or goes to an operator (I33) when there is none. No flag, env var, config
+  again at its deadline, where the last-chance sweep runs first when it has not run in full in this
+  phase, I65), or goes to an operator (I33) when there is none. No flag, env var, config
   key or CLI option brings a repeat back. A new episode (after a verified release or a
   power cycle) gets its own one reset. Releases nothing: only a full health check, fabric included,
   that has just passed lifts the hold (I32). Time to recover: a fabric, dispatch or hold-deadline
@@ -888,8 +890,9 @@ each rung fires only when the gentler one failed or cannot apply.
   mesh resets (one replayed Galaxy episode: 1186 s before, 586 s now); a
   present-mesh wedge the reset does not heal: the sweep, then the cycle, then the full check; a
   whole-tray drop: unchanged here (I37, straight to the cycle at the cooldown's end). Most mesh
-  resets one episode can run: the first reset, then the sweep's at most once per phase (one below the
-  10-min bound, one more as the bound's ladder when the cycle is held off past it), plus the I11
+  resets one episode can run: the first reset, the bound's ladder's one rerun of it (I89), then the
+  sweep's at most once per phase (one below the 10-min bound, one more at or after the bound, at the
+  I65 cooldown's end when the cycle is held off past it), plus the I11
   ARC-not-ready retry inside a reset call and I97's one reset of the whole mesh before the cycle. A spent mesh reset also lets the power cycle fire before
   the 10-min ceiling: the stuck-hold escalation journals `host_rung_not_deferred` (reason
   `mesh_reset_spent`), runs the sweep once if this phase has not, then cycles, instead of waiting
@@ -986,7 +989,20 @@ each rung fires only when the gentler one failed or cannot apply.
   `escalation_stage` `power-cycle`, `next_deadline`, the anchor, its cause and the interval. No other
   rung runs in its place: classes A and C stay on the I37 path. At the deadline the hold-deadline
   watchdog asks once (a forced escalation in the same hold episode), and the cycle fires then if the
-  fault persists, behind I37's stand-back, tenant and scope guards. Every governor denial names its
+  fault persists, behind I37's stand-back, tenant and scope guards. When the denied cycle was the I76
+  bound's, the cooldown's end first runs the last-chance sweep (I100: the mesh reset with its re-init,
+  then the full check with fabric), a repeated mesh reset under the I97 deadline from the hold's start
+  or, when that is too close, the I100 deadline from the repeat's own start, whatever the off-bus set:
+  a present mesh (a fabric or check failure, a dispatch failure, a hold-deadline expiry, ARC not ready
+  with every chip on the bus) or an off-bus set that changed during the cooldown runs under it too, its
+  SBR (when chips are isolated) first and no check before the mesh reset. A pass lifts the hold and
+  cycles nothing; a failed check, or one cut at its deadline, keeps the hold and requests the cycle at
+  once; a sweep that could not run (a tenant, a reset cycling in its scope) keeps the cycle pending to
+  the next tick (I22). No sweep runs there when the sweep already ran in full in this hold phase (I87),
+  or when a 77 climb's own sweep read a 77 right before the denied cycle (I79). This adds at most the
+  readers' stop and the SBR (about 30 s) plus the I100 bound (315 s, 570 s after a give-up) between the
+  cooldown's end and the cycle request, for every class that reaches it. How the
+  I97 deadline is computed and enforced does not change. Every governor denial names its
   end: the per-boot cap counts only records within the interval and never a missed request (I72),
   which is asked again as its window ends (later misses 5 min after) rather than never. There an unreadable
   stamp counts as the boot's start (a fixed end, not now), a stamp later than now does not count for
@@ -1332,7 +1348,11 @@ each rung fires only when the gentler one failed or cannot apply.
   fabric; that disproven lift's bound is one sampler tick, not 600 s, and the kill switch does not
   stop it; the forced-run routing and the I75 next rung key on that same bound, so the host rung
   its early ladder owes runs no second ladder first and `/health` names the ladder one tick in, then
-  that host rung) or a known fabric fault (spec 03 I46). This holds whichever trigger starts the forced run
+  that host rung) or a known fabric fault (spec 03 I46). The ladder runs every rung, one this hold
+  already spent included (I89: the rescan, SBR and mesh reset again), then the full check with fabric,
+  and only a failed check requests the power cycle; a power cycle the I65 cooldown denies there gets
+  the last-chance sweep first at the cooldown's end (I65). The I97 deadline, taken from the hold's
+  start, is computed and enforced as before. This holds whichever trigger starts the forced run
   past the bound: the watchdog's ceiling window or a held job's tenant-hold bound; neither returns
   at the 77-only early exit any more. The exits that end a hold with no rung below the bound, and
   that the bound overrides: the watchdog's 77-only early return; the I30 no-reset hold
@@ -1951,9 +1971,13 @@ each rung fires only when the gentler one failed or cannot apply.
   gone is re-detected at the next run. Chips the stuck-hold ladder's own bridge rung already reset in
   the same run are not SBR'd a second time. If they bring every chip
   back, the full check with fabric runs at once and a pass lifts the hold with no mesh reset.
-  Otherwise the ladder goes on: its one mesh reset and the full check with fabric when this hold has
-  not run one yet; else the I87 climb (the sweep once per phase, or the power cycle at once when the
-  reset failed on the same chips, I22). When that climb skips the sweep because its mesh reset
+  Otherwise the ladder goes on: the mesh reset and the full check with fabric, even when this hold's
+  one mesh reset already ran and failed, on these chips or others (`bound_reruns_spent_rung`): the
+  bound runs the full ladder, spent rungs included, and is the one exception to I87's one reset per
+  episode. A chip this hold already SBR'd gets its SBR again at the bound. Class A and C still go
+  straight to the power cycle (I37). Below the bound a spent reset takes the I87 climb instead (the
+  sweep once per phase, or the power cycle at once when the reset failed on the same chips, I22).
+  When that climb skips the sweep because its mesh reset
   already failed on the same chips, the sweep's SBR still runs if the drop is below the galaxy floor,
   is not class A or C (I37) and this hold has not SBR'd those chips (an isolated or removed chip, a node-present chip whose link reads down or whose heartbeat reads
   all-ones, or a gone chip with the opt-in), with the rescan and the full check with fabric after it; only a pass lifts, else the power
@@ -1966,12 +1990,12 @@ each rung fires only when the gentler one failed or cannot apply.
   host rung, whether the sweep ran, was skipped or was spent, any such chip this hold has not SBR'd (one
   the dead-chip valve isolated during the sweep's settle, say) gets the rescan, its remove and the SBR,
   then the full check with fabric (`host_rung_sbr_owed`); only a pass lifts, else the power cycle. One
-  SBR per chip per hold episode. A drop at or above the floor, all
+  SBR per chip per hold episode, apart from the bound's ladder and the last-chance sweep. A drop at or above the floor, all
   chips off included, owes no SBR: it stops no reader, removes no chip and goes straight to the power
   cycle, never nibbled at with per-chip bridge resets. A pass lifts the hold; a failure requests the power cycle (I76), or pages and
   holds when none is opted in (I31). An enumerated chip is still not SBR'd at the bound; the mesh
   reset covers it. An earlier forced run is not the bound's ladder: the rescan and SBR run again at
-  the bound; a spent mesh reset is not repeated (I87). Below the bound a forced run keeps its own path:
+  the bound, and so does a spent mesh reset (the bound's exception to I87). Below the bound a forced run keeps its own path:
   the mesh reset, with no rescan or SBR (the gate ran those at once). It keeps I58 (a mesh reset that
   failed on the same chips is not repeated and the host rung fires at once); otherwise its host rung
   waits for the ceiling (I38) or the bound. A power-cycle cooldown at the bound still
@@ -2561,19 +2585,26 @@ each rung fires only when the gentler one failed or cannot apply.
   - **B1/B2 partial drop** (the climb's sweep below the bound): the sweep's start plus about 3.5 min
     plus 315 s; with the climb at 5-6 min (after a mesh reset that gave up) that is about 14-15 min,
     and at most about 19 min for a sweep that starts just before the bound.
-  - **Hold-deadline expiry at the 10-min bound** (I76): 600 s, the bound's kept rungs and their full
-    check (about 3.5 min), then the sweep as above: about 22 min at most.
-  - **With the I102 late-chip step** (only when the sweep's mesh reset is not a repeat, so it runs on
-    the plain sweep path, gave up at its driver wait after the tray re-power, and every chip is back
+  - **Hold-deadline expiry at the 10-min bound** (I76), and a B1/B2 partial drop that reaches the bound
+    without its sweep having run: 600 s; the bound's kept rungs (rescan and SBR, about 20 s); the mesh
+    reset this hold already spent, run again (`bound_reruns_spent_rung`, about 263 s, or a give-up), with
+    its settle and its full check with fabric, all under the rerun's I97/I100 deadline (at most 315 s
+    from its start, 570 s after a give-up); then the sweep's own steps (up to about 3.5 min) and its
+    mesh reset and full check under the same bound. Both resets in budget: about 24.5 min; both give
+    up: at most about 33 min.
+  - **Cooldown end** (I65, the bound's cycle denied by the boot or post-cycle cooldown): the cooldown's
+    end plus about 30 s (readers stopped, SBR) plus at most the I100 bound (315 s, 570 s after a
+    give-up), whatever the class and the off-bus set.
+  - **With the I102 late-chip step** (only when the sweep's mesh reset is not a repeat and the sweep is
+    not the bound's, so it runs on the plain sweep path, gave up at its driver wait after the tray re-power, and every chip is back
     after the rescan): the sweep's mesh reset (about 263 s), then the step (at most about 458 s: its 380 s
     wait plus the second reset's post-reset tail of up to about 78 s; about 275 s plus that tail when
     the second reset gives up too, about 45 s plus it when it ends in budget), the settle (60 s) and the
     full check (allowance 180 s; 119.5 s slowest measured). B1/B2: the climb at 5-6 min, about 3.5 min
     to the mesh reset, then those: success (the check passes and lifts) at about 16 min with a second
     reset in budget, failure (the check fails and the power cycle is requested) at about 21 min with a
-    second give-up, at most about 25.5 min. Hold-deadline expiry: the 600 s bound and its kept rungs
-    (about 3.5 min) in front of the same sweep: success at about 21 min, failure at about 26 min, at
-    most about 30.5 min. Without the step the same hold power-cycles about 1 min after its mesh reset;
+    second give-up, at most about 25.5 min. At the 10-min bound the sweep's mesh reset runs on the
+    I100 path, where I106 covers a give-up: the hold-deadline expiry figures above hold. Without the step the same hold power-cycles about 1 min after its mesh reset;
     the step costs the power cycle up to about 458 s more and saves it whenever the check passes. Both
     classes then exceed their 15 min budget on a failure, a cost accepted for the power cycles the
     step saves.
@@ -3334,6 +3365,7 @@ sees a silent fabric pass.
 | I37/I65 the gate counts a class A/C direct cycle once: one pass with two cycles already in the backstop window requests one cycle, journals no backstop denial, pages nobody and arms no retry; a pass while it is pending asks nothing; a real fourth cycle in the window is still denied, paged and retried | `tests/test_power_cycle_backstop_once.py::test_one_gate_pass_on_all_off_counts_its_cycle_once`, `::test_a_second_pass_while_the_cycle_is_pending_asks_nothing`, `::test_the_backstop_still_denies_a_real_fourth_cycle` |
 | I78 the driver-wait rescan repeats until every isolated chip is back and then stops; it gives up after its tries, journaled; it ends with the reset and never delays its cleanup; a cancelled reset stops it; no rescan while the settle counts; on both backends (line reader and file reader) the rescan runs after the settle and inside the driver wait | `tests/test_mesh_reset_readd.py::test_the_rescan_repeats_until_the_chip_is_back_and_then_stops`, `::test_the_repeat_gives_up_after_its_tries`, `::test_the_repeat_ends_with_the_reset_and_never_delays_its_cleanup`, `::test_a_cancelled_reset_stops_the_repeats`, `::test_no_rescan_while_the_settle_counts`, `::test_both_backends_rescan_only_once_the_settle_is_over` |
 | I76 every hold kind (77-only, topology mismatch, known fabric fault, latched, generic) runs the full ladder at the 10-min bound, then the host rung; below the bound a no-reset hold keeps its fast path; a latched I42 hold escalates with its latch standing | `tests/test_hold_bound.py::test_every_hold_kind_runs_the_ladder_at_the_bound_then_the_host_rung`, `::test_below_the_bound_a_no_reset_hold_keeps_its_fast_path`, `::test_a_latched_i42_hold_still_escalates_and_its_latch_stands`, `::test_replay_a_latched_topology_mismatch_hold_gets_the_ladder_then_the_power_cycle` |
+| I89/I76/I87: the 10-min bound runs the full ladder, the mesh reset this hold already spent included, and a cooldown-denied cycle gets the last-chance sweep (the mesh reset, then the full check with fabric) at the cooldown's end; a pass lifts with no cycle, a failure or a check cut at the I97/I100 deadline cycles, a present mesh (no chip off the bus) included (I65); the I97 deadline is unchanged | `tests/test_full_ladder_before_cycle.py::test_a_cooldown_deferred_cycle_gets_the_full_ladder_at_600s_and_the_sweep_at_the_cooldown_end`, `::test_a_sweep_that_passes_at_the_cooldown_end_lifts_the_hold_and_cycles_nothing`, `::test_a_sweep_check_cut_at_its_deadline_at_the_cooldown_end_still_power_cycles`, `::test_a_present_mesh_sweep_check_cut_at_its_deadline_at_the_cooldown_end_still_power_cycles`, `tests/test_below_floor_offbus_ladder.py::test_a_cooldown_denial_at_the_bound_still_runs_the_ladder_and_arms_the_retry` |
 | I76 the I29 77 hold with no host rung (reset and sweep already ran this episode) gets the power cycle at the bound in the same run; a killed job's leftover holder (01 I16) does not stand the bound down: no reset runs over it and the host rung is asked for, which a live tenant still refuses | `tests/test_hold_bound.py::test_replay_a_77_held_with_no_host_rung_gets_the_power_cycle_at_the_bound`, `::test_a_killed_jobs_leftover_holder_does_not_stop_the_bound` |
 | I76 a holder the spec 03 I84 valve refused to kill (a running broker job or a tenant fd) does not stand the bound down: the ladder is skipped and the host rung asked for, nobody is killed; a process the valve did not refuse, or a recycled pid, still blocks | `tests/test_deadchip_refused_bound.py::test_a_refused_holder_gets_the_power_cycle_at_the_bound`, `::test_a_tenant_the_valve_never_refused_still_blocks_the_bound` |
 | I76 a cooldown denial of the host rung arms the retry, which fires at the cooldown's end | `tests/test_hold_bound.py::test_a_cooldown_denial_arms_the_retry_and_the_host_rung_fires_at_its_end` |

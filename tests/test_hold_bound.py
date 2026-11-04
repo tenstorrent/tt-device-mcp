@@ -297,7 +297,7 @@ async def test_a_failed_check_after_the_bound_ladder_asks_for_the_host_rung_at_o
         monkeypatch.setattr(srv.health_monitor, "topology_hw_fault", "hardware fault: needs an operator")
     ages = []
 
-    async def host_rung(age, log):
+    async def host_rung(age, log, *a, **k):
         events.append("host_rung")
         ages.append(srv._hold_age_now())
 

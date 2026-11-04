@@ -163,7 +163,7 @@ async def test_a_failed_check_after_that_reset_keeps_the_hold_and_the_bound_stil
         ladders.append(kind)
         return OUTCOME_TERMINAL
 
-    async def host_rung(age, log):
+    async def host_rung(age, log, *a, **k):
         events.append("host_rung")
 
     monkeypatch.setattr(srv.galaxy_recovery, "escalate", failed_ladder)

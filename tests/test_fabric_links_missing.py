@@ -662,7 +662,7 @@ def link_short_hold(request, monkeypatch, mesh):  # noqa: F811
         mesh["events"].append("at_start_ladder")
         return OUTCOME_WAITING
 
-    async def host_rung(age, log):
+    async def host_rung(age, log, *a, **k):
         mesh["events"].append("host_rung")
         srv._hold_bound_rung_pending, srv._hold_bound_cycle_age = False, age  # the cooldown retry is armed
 

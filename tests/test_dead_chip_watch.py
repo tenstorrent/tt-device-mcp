@@ -218,7 +218,7 @@ async def test_a_remove_that_times_out_latches_pci_wedged_and_asks_for_the_power
     monkeypatch.setattr(srv.recovery_mechanism, "power_cycle_retry", None)
     rungs = []
 
-    async def host_rung(age, log_):
+    async def host_rung(age, log_, *a, **k):
         rungs.append(age)
 
     monkeypatch.setattr(srv, "_hold_bound_host_rung", host_rung)
