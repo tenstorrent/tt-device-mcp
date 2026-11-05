@@ -651,6 +651,9 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     # Spec 04 I109: the suite runs the root BMC path (plain ipmitool, the unshare guard) whatever uid
     # runs pytest; the non-root sudo path is covered by its own tests.
     monkeypatch.setattr(ipmi_guard, "is_root", lambda: True)
+    # A boot re-latches the privilege probes; the sudoers listing (`sudo -n -l ipmitool`) never
+    # reaches the host from the suite. test_privileges drives the real probe against a stub.
+    monkeypatch.setattr(privileges, "_ipmi_sudo_allowed", lambda: False)
     monkeypatch.setattr(heartbeat, "_heartbeat_supported", None)
     # raising=False so a base tree without the re-arm latch (a fails-on-base stash) still sets up.
     monkeypatch.setattr(heartbeat, "_heartbeat_absent_journaled", False, raising=False)

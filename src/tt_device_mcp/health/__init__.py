@@ -157,6 +157,7 @@ from tt_device_mcp.health.recovery.galaxy import (
     _ubb_bus_id_tables,
     _whole_trays_off,
 )
+from tt_device_mcp.health.recovery.ipmi_guard import SUDO_RULE as IPMI_SUDO_RULE
 from tt_device_mcp.health.recovery.pcie_guard import pcie_guard_at_start
 from tt_device_mcp.health.recovery.per_target import PerTargetRecovery
 from tt_device_mcp.health.recovery.stages.bridge_reset import (
@@ -243,6 +244,7 @@ __all__ = [
     "read_heartbeats",
     "hugepages_counts",
     "hugepages_shortfall",
+    "IPMI_SUDO_RULE",
     "version_floor_warnings",
     "SAMPLE_INTERVAL_SEC",
     "SAMPLE_RING_SIZE",

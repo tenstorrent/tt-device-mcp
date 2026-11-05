@@ -228,7 +228,9 @@ from tt_device_mcp.health import (
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
 )
-from tt_device_mcp.health.recovery import ipmi_guard
+from tt_device_mcp.health import (
+    IPMI_SUDO_RULE as health_ipmi_sudo_rule,
+)
 from tt_device_mcp.holder_identity import describe_identity, read_holder_identities
 from tt_device_mcp.job_log_store import exit_signal, find_job_log, prune_job_logs, read_log_tail
 from tt_device_mcp.job_preflight import preflight_output_dirs
@@ -4465,7 +4467,7 @@ def _no_bmc_reason() -> str:
     if not privileges.is_root():
         return (
             "no openable /dev/ipmi* and `sudo -n ipmitool` is not allowed — a non-root server needs the "
-            f"sudoers rule `{ipmi_guard.SUDO_RULE}` (ipmitool only)"
+            f"sudoers rule `{health_ipmi_sudo_rule}` (ipmitool only)"
         )
     return "no openable /dev/ipmi* — this host or container exposes no local BMC interface"
 

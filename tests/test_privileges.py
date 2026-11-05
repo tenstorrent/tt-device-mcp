@@ -15,6 +15,9 @@ import pytest
 
 from tt_device_mcp import privileges
 
+# conftest stubs the sudoers probe for the suite; these tests drive the real one.
+_REAL_SUDO_PROBE = privileges._ipmi_sudo_allowed
+
 
 @pytest.fixture(autouse=True)
 def unprivileged(monkeypatch):
@@ -27,6 +30,7 @@ def unprivileged(monkeypatch):
     monkeypatch.setattr(privileges.shutil, "which", lambda _name: None)
     monkeypatch.setattr(privileges, "SYSTEMD_DIR", "/nonexistent")
     monkeypatch.setattr(privileges, "IPMI_DEVICE_NODES", ())
+    monkeypatch.setattr(privileges, "_ipmi_sudo_allowed", _REAL_SUDO_PROBE)
 
 
 def test_root_is_euid_zero_not_the_login_user(monkeypatch):
