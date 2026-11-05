@@ -153,7 +153,7 @@ def test_a_non_root_server_with_the_sudo_rule_reaches_the_bmc(monkeypatch):
     """Spec 04 I109: the rule is read with `sudo -n -l`, never by running ipmitool or prompting."""
     calls = _sudo(monkeypatch, 0)
     assert privileges.can_ipmi() is True
-    (argv, kw), = calls[-1:]
+    ((argv, kw),) = calls[-1:]
     assert argv == ["sudo", "-n", "-l", "ipmitool"] and kw["stdin"] is privileges.subprocess.DEVNULL
     assert kw["timeout"] <= privileges.SUDO_LIST_TIMEOUT_SEC
 

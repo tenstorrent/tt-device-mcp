@@ -223,13 +223,13 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     version_floor_warnings,
 )
 from tt_device_mcp.health import (
+    IPMI_SUDO_RULE as health_ipmi_sudo_rule,
+)
+from tt_device_mcp.health import (
     hugepages_counts as health_hugepages_counts,
 )
 from tt_device_mcp.health import (
     hugepages_shortfall as health_hugepages_shortfall,
-)
-from tt_device_mcp.health import (
-    IPMI_SUDO_RULE as health_ipmi_sudo_rule,
 )
 from tt_device_mcp.holder_identity import describe_identity, read_holder_identities
 from tt_device_mcp.job_log_store import exit_signal, find_job_log, prune_job_logs, read_log_tail

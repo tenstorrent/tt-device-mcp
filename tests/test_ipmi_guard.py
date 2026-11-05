@@ -672,7 +672,7 @@ def test_the_user_wrapper_puts_the_guard_first_on_path_as_sudo(non_root, monkeyp
 
     monkeypatch.setattr(ipmi_guard.os, "execvpe", execvpe)
     assert ipmi_guard.main(["--wrap-user", "--", "tt-smi", "-glx_reset"]) == 127
-    (path, argv, env), = execs
+    ((path, argv, env),) = execs
     assert argv == ["tt-smi", "-glx_reset"] and env["PATH"].split(os.pathsep)[0] == str(tmp_path)
     shim = tmp_path / "sudo"
     assert ipmi_guard.GUARD_TAG in shim.read_text() and shim.stat().st_mode & 0o777 == 0o700
