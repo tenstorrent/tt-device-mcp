@@ -3046,7 +3046,9 @@ async def test_pollers_quiesce_logs_once_and_flags_nothing_when_no_poller_unit_i
         assert await srv._set_device_pollers(False, lines.append) == []
 
     assert health.read_health_events(kinds={"pollers_none_active"}) == []
-    assert lines == ["no configured device poller unit is installed on this host: tt-telemetry.service, tt-metrics-exporter.service"]
+    assert lines == [
+        "no configured device poller unit is installed on this host: tt-telemetry.service, tt-metrics-exporter.service"
+    ]
 
 
 @pytest.mark.asyncio
