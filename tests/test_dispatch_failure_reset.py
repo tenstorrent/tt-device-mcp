@@ -243,3 +243,21 @@ async def test_a_clean_exit_dispatch_failure_whose_reset_fails_stays_held(mesh):
     assert mesh["verifies"][-1] is True, "the post-reset check ran the fabric pass"
     assert srv.fsm.state is ServerState.RECOVERING, "a failed post-reset check never releases"
     assert srv._device_unavailable_for_tenant()
+
+
+@pytest.mark.asyncio
+async def test_a_startup_dispatch_failure_resets_at_once_with_no_relift_wait(monkeypatch, mesh):
+    """The startup gate's dispatch probe crashed (the wrapper's exit 1, not a 77): the gate itself fires
+    the one present-mesh reset and the full check, and never parks the mesh as fabric-unverified for an
+    idle relift to find later."""
+    fsm_dirty(srv, "startup_unverified", why="startup_unverified", dirty=False)
+    monkeypatch.setattr(srv, "_startup_fabric_owed_since", None)
+    monkeypatch.setattr(srv, "_hugepages_shortfall", lambda: None)
+    held = []
+    monkeypatch.setattr(srv, "_hold_device_fabric_unverified", lambda *a, **k: held.append(a))
+    await srv._device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
+    assert held == [], "a dispatch failure is never a fabric-unverified hold"
+    assert mesh["resets"] == [["tt-smi", "-glx_reset"]], "one present-mesh reset, from the startup gate itself"
+    assert "dispatch_failure_mesh_reset" in mesh["events"]
+    assert mesh["verifies"][-1] is True, "the post-reset check runs the fabric pass (dispatch included)"
+    assert srv.fsm.state is ServerState.HEALTHY, "a passing full check releases the device"

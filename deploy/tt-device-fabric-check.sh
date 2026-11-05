@@ -308,12 +308,21 @@ TT_METAL_OPERATION_TIMEOUT_SECONDS="${TTDEV_DISPATCH_OP_TIMEOUT:-25}" \
     timeout --signal=KILL "$DTMO" "$DBIN" >"$DOUT" 2>&1
 drc=$?
 
-case "$drc" in
+# Killed at the cap AFTER it crashed (metal threw, or the process aborted) is a measured failure: the
+# crash is the verdict, the hang was only its teardown. Measured: a probe that printed its abort and
+# was then killed at the cap read as a 77, and the hold waited minutes for a reset it was owed.
+dcase="$drc"
+if [ "$drc" -eq 137 ] && grep -qE 'TT_THROW|TT_FATAL|terminate called|what\(\):|\*\*\* End of error message \*\*\*|Aborted' "$DOUT"; then
+    log "dispatch probe crashed, then hung until its ${DTMO}s cap killed it"
+    dcase=crashed
+fi
+
+case "$dcase" in
     0)   log "dispatch OK: every chip ran a program"; topo_ok; exit 0 ;;
-    # Killed at the cap. We did NOT measure a wedge — we failed to measure at all, and this is the
-    # exact verdict that reset this host in a loop when the probe itself was the slow thing. A real
-    # dispatch hang comes back through the operation timeout as a non-zero exit above, so nothing
-    # is lost by refusing to guess here.
+    # Killed at the cap with no crash in its output. We did NOT measure a wedge — we failed to
+    # measure at all, and this is the exact verdict that reset this host in a loop when the probe
+    # itself was the slow thing. A real dispatch hang comes back through the operation timeout as a
+    # non-zero exit above, so nothing is lost by refusing to guess here.
     137) save_to_last "$DOUT"
          log "dispatch probe last output: $(grep -vE '^\s*$' "$DOUT" | sed -n '$p' | cut -c1-160)"
          cannot_check "dispatch probe hit its ${DTMO}s cap without a verdict (typical is 14s)" ;;

@@ -844,6 +844,11 @@ cooldown (spec 04 I65) holds longer.
   check keeps it held and goes on up the bounded ladder (the host rungs when opted in, the idle
   relift and the hold deadline); a second dispatch failure in the same episode takes the
   self-heal hold and that ladder, never a second gate reset.
+  A dispatch probe killed at its cap after its output shows a crash (`TT_THROW`, `TT_FATAL`,
+  `terminate called`, `what():`, `*** End of error message ***`, `Aborted`) is such a dispatch
+  failure (wrapper exit 1), not a 77: the crash is the verdict and the hang only its teardown, so the
+  startup gate and the idle relift (I56) take this reset at once. A cap kill with no crash in its
+  output stays the 77 of spec 04 I84.
   The fabric verdict names the dispatch failure: `first_reason()` reads the wrapper's dispatch line
   first and, past a `TOPOLOGY MISMATCH` marker, never the descriptor run's downgraded
   `Connection mismatch detected`; a hold naming a dispatch failure is never a topology-mismatch
@@ -2571,6 +2576,7 @@ refuses.
 | I55 (a green-fabric dispatch failure on a present mesh: one glx_reset, then the full check; release only on a pass) | `tests/test_dispatch_failure_reset.py::test_dispatch_failure_on_a_present_mesh_resets_once_then_runs_the_full_check`, `tests/test_dispatch_failure_reset.py::test_a_second_dispatch_failure_in_the_episode_holds_instead_of_resetting_again` |
 | I55 (a failed post-reset check stays held and climbs the bounded ladder) | `tests/test_dispatch_failure_reset.py::test_a_failed_post_reset_check_stays_held_and_climbs` |
 | I55 (the verdict names the dispatch failure, never the downgraded mismatch) | `tests/test_dispatch_failure_reset.py::test_first_reason_names_the_dispatch_failure_over_a_downgraded_mismatch`, `tests/test_dispatch_failure_reset.py::test_a_dispatch_failure_hold_is_not_a_topology_mismatch` |
+| I55 (a dispatch probe that crashed and was then killed at its cap is a dispatch failure, exit 1; a plain cap kill stays 77; the startup gate resets at once) | `tests/test_dispatch_probe_reason.py::test_a_crash_killed_at_the_cap_is_a_dispatch_failure`, `tests/test_dispatch_probe_reason.py::test_a_plain_cap_kill_with_no_crash_stays_cannot_check`, `tests/test_dispatch_probe_reason.py::test_dispatch_verdict_keeps_the_what_text`, `tests/test_dispatch_failure_reset.py::test_a_startup_dispatch_failure_resets_at_once_with_no_relift_wait` |
 | I55 (floor message honest, the whole-tray power cycle promised only while armed) | `tests/test_dispatch_failure_reset.py::test_floor_message_promises_escalation_only_when_armed` |
 | I56 (a measured fabric failure on a present mesh resets on the first relift; frozen read or no measured failure keeps the grace) | `tests/test_device_safety.py::test_idle_relift_resets_a_measured_fabric_failure_without_the_grace`, `tests/test_device_safety.py::test_idle_relift_keeps_the_grace_without_a_measured_fabric_failure`, `tests/test_post_reset_gate.py::test_the_measured_fabric_failure_reset_on_the_first_relift` (the real reset path: the verify after it runs the fabric pass, release only on a healthy verdict, 04 I32/I32a) |
 | I62 | `tests/test_startup_fabric_hugepages.py::test_a_validator_crash_77_escalates_on_the_first_relift`, `tests/test_startup_fabric_hugepages.py::test_a_tick_before_the_grace_does_not_push_the_reset_past_it`, `tests/test_startup_fabric_hugepages.py::test_a_not_due_tick_past_the_grace_keeps_the_interval`, `tests/test_startup_fabric_hugepages.py::test_the_crash_reset_runs_the_full_check_and_releases_only_on_a_pass`, `tests/test_startup_fabric_hugepages.py::test_the_crash_reset_keeps_the_hold_on_a_pass_with_links_missing`, `tests/test_startup_fabric_hugepages.py::test_a_validator_crash_77_gets_no_second_reset_after_an_unverified_one`, `tests/test_startup_fabric_hugepages.py::test_a_validator_crash_77_keeps_its_no_reset_exclusions`, `tests/test_startup_fabric_hugepages.py::test_the_replayed_crash_hold_with_links_down_escalates_present` |
