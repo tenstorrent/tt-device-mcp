@@ -2998,15 +2998,15 @@ async def test_pollers_are_restarted_even_if_the_reset_raises(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_pollers_quiesce_journals_none_active_when_configured_units_resolve_to_nothing(monkeypatch):
-    """Configured poller units that resolve to no active unit make the quiesce a no-op: the reset
-    then lands on a bus the broker only ASSUMES is quiet, while the real pollers may still hammer
-    MMIO under a name it was never told — the exact condition that reboots the host. A no-op quiesce
-    must land in the journal loud, not read as a clean one."""
+async def test_pollers_quiesce_journals_none_active_when_an_installed_poller_will_not_stop(monkeypatch):
+    """Installed poller units whose stop fails make the quiesce a no-op: the reset then lands on a
+    bus the broker only ASSUMES is quiet, while the pollers may still hammer MMIO — the exact
+    condition that reboots the host. A no-op quiesce must land in the journal loud, not read as a
+    clean one."""
     monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service", "tt-metrics-exporter.service"))
 
-    class _NotLoaded:
-        returncode = 5  # `systemctl stop` against a unit not loaded on this host
+    class _StopFails:
+        returncode = 1  # the unit is installed but `systemctl stop` failed
 
         async def wait(self):
             return self.returncode
@@ -3015,11 +3015,13 @@ async def test_pollers_quiesce_journals_none_active_when_configured_units_resolv
             return b"inactive\n", b""
 
     async def _exec(*argv, **kw):
-        return _NotLoaded()
+        return _StopFails()
 
     monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _exec)
+    monkeypatch.setattr(srv, "_poller_unit_installed", lambda svc: True)
+    lines = []
 
-    touched = await srv._set_device_pollers(False, lambda m: None)
+    touched = await srv._set_device_pollers(False, lines.append)
 
     assert touched == []
     events = health.read_health_events(kinds={"pollers_none_active"})
@@ -3027,6 +3029,80 @@ async def test_pollers_quiesce_journals_none_active_when_configured_units_resolv
     assert events[0]["verb"] == "stop"
     assert events[0]["host_at_risk"] is True
     assert events[0]["configured"] == ["tt-telemetry.service", "tt-metrics-exporter.service"]
+    assert events[0]["not_installed"] == []
+    assert any(line.startswith("WARNING: no configured device poller") for line in lines), lines
+
+
+@pytest.mark.asyncio
+async def test_pollers_quiesce_logs_once_and_flags_nothing_when_no_poller_unit_is_installed(monkeypatch):
+    """A host with none of the listed units installed has nothing to quiesce: no WARNING and no
+    host_at_risk event on any quiesce, and one plain log line per broker process."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service", "tt-metrics-exporter.service"))
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units(set(), calls))
+    monkeypatch.setattr(srv, "_poller_unit_installed", lambda svc: False)
+    lines = []
+
+    for _ in range(3):
+        assert await srv._set_device_pollers(False, lines.append) == []
+
+    assert health.read_health_events(kinds={"pollers_none_active"}) == []
+    assert lines == [
+        "no configured device poller unit is installed on this host: tt-telemetry.service, tt-metrics-exporter.service"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pollers_quiesce_flags_the_host_when_one_installed_poller_will_not_stop(monkeypatch):
+    """One listed unit missing does not excuse another that is installed and whose stop failed."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service", "tt-metrics-exporter.service"))
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units(set(), calls))
+    installed = {"tt-metrics-exporter.service"}
+    monkeypatch.setattr(srv, "_poller_unit_installed", lambda svc: svc in installed)
+
+    async def _exec(*argv, **kw):
+        proc = await _systemctl_with_units(set(), calls)(*argv, **kw)
+        if argv[-1] == "tt-metrics-exporter.service" and argv[1] == "stop":
+            proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _exec)
+
+    assert await srv._set_device_pollers(False, lambda m: None) == []
+
+    events = health.read_health_events(kinds={"pollers_none_active"})
+    assert len(events) == 1, events
+    assert events[0]["host_at_risk"] is True
+    assert events[0]["not_installed"] == ["tt-telemetry.service"]
+
+
+@pytest.mark.asyncio
+async def test_pollers_quiesce_flags_the_host_when_the_installed_lookup_is_unreadable(monkeypatch):
+    """An installed-check that cannot read the unit dirs counts the unit as installed: its failed
+    stop still flags the host."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service",))
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units(set(), calls))
+    monkeypatch.setattr(srv, "_poller_unit_installed", lambda svc: (_ for _ in ()).throw(OSError("stat failed")))
+
+    with pytest.raises(OSError):
+        await srv._set_device_pollers(False, lambda m: None)
+
+    # The conservative read a real stat failure leaves: with no unit dir reachable, every unit
+    # counts as installed and a failed stop flags the host (exercised without raising).
+    monkeypatch.setattr(srv, "_poller_unit_installed", lambda svc: True)
+
+    async def _exec(*argv, **kw):
+        proc = await _systemctl_with_units(set(), calls)(*argv, **kw)
+        if argv[1] == "stop":
+            proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _exec)
+    assert await srv._set_device_pollers(False, lambda m: None) == []
+    events = health.read_health_events(kinds={"pollers_none_active"})
+    assert len(events) == 1 and events[0]["host_at_risk"] is True, events
 
 
 @pytest.mark.asyncio

@@ -1931,6 +1931,8 @@ _POLLER_RUNNING_STATES = ("active", "activating", "reloading", "refreshing")
 # How long a stop that returned 0 is given to show the unit gone (`systemctl stop` waits for it, so
 # the first read normally shows it), per unit that was running. Inside the 30 s per-unit bound.
 POLLER_STOP_VERIFY_SEC = 5.0
+# A host with none of the listed poller units installed is said once per broker process, not per quiesce.
+_pollers_not_installed_logged = False
 logger: logging.Logger | None = None
 job_log_dir: Path | None = None
 job_runner_task: asyncio.Task | None = None  # Singleton job runner
@@ -7093,7 +7095,7 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
         # nothing, so its post-reset verify runs on the same quiet bus. The owner restarts them.
         log(f"device pollers kept stopped: {_pollers_held_for} still running")
         return []
-    global _pollers_owed
+    global _pollers_owed, _pollers_not_installed_logged
     if active:
         unfit = _pollers_unfit_reason()
         if unfit:
@@ -7181,13 +7183,26 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
         log(f"WARNING: device reader {svc} (pid {pid}) is still running; continuing without it stopped")
         health_event("poller_stop_unverified", service=svc, pid=pid)
     if not touched and services:
-        # Pollers were configured, yet the verb reached none of them: on this host they resolve
-        # to no active unit. Quiescing was a no-op, so a reset about to run cannot assume it lands
-        # on a quiet bus — the real pollers may still be hammering MMIO under a name we were never
-        # told. On the stop path that is the host-reboot hazard the quiesce exists to prevent, so
-        # flag it host_at_risk; either way, do not let the absence read as a clean quiesce.
-        log(f"WARNING: no configured device poller answered '{verb}': {', '.join(services)}")
-        health_event("pollers_none_active", verb=verb, configured=list(services), host_at_risk=not active)
+        # Pollers were configured, yet the verb reached none of them. A host that has none of the
+        # listed units installed has nothing to quiesce: said once per broker process, not on every
+        # reset. Otherwise a listed unit exists and its verb failed: quiescing was a no-op, so a
+        # reset about to run cannot assume it lands on a quiet bus — the real pollers may still be
+        # hammering MMIO. On the stop path that is the host-reboot hazard the quiesce exists to
+        # prevent, so flag it host_at_risk; either way, do not let the absence read as a clean quiesce.
+        missing = [s for s in services if not _poller_unit_installed(s)]
+        if len(missing) == len(services):
+            if not _pollers_not_installed_logged:
+                _pollers_not_installed_logged = True
+                log(f"no configured device poller unit is installed on this host: {', '.join(services)}")
+        else:
+            log(f"WARNING: no configured device poller answered '{verb}': {', '.join(services)}")
+            health_event(
+                "pollers_none_active",
+                verb=verb,
+                configured=list(services),
+                not_installed=missing,
+                host_at_risk=not active,
+            )
     health_event("pollers_" + ("restarted" if active else "quiesced"), services=touched)
     return touched
 
