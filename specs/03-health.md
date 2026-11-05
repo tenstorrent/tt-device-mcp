@@ -1937,6 +1937,31 @@ cooldown (spec 04 I65) holds longer.
   the periodic stats write runs on a worker thread from a snapshot taken on the loop. Nothing here
   lifts a hold or releases the device: the hold lifts only on a just-passed full check with fabric
   (I78), and the bounded recovery (spec 04) is unchanged.
+- **I100 — A non-root server's fabric check writes only under its own state dir, and a host-side
+  file error is no verdict.** A root server runs the pinned validator from its own tree, with argv
+  and env unchanged. A server that is not root (`os.geteuid() != 0`; a per-user server) cannot
+  write that root-owned tree, and metal writes under its runtime root as it runs (`generated/`:
+  watcher kernel names, inspector, fabric exports). So its runtime root is a scratch tree,
+  `fabric-check/root` under the server's own state dir: a symlink to each top-level entry of the
+  pinned tree except `generated`, which is a real directory of its own, re-synced on every build of
+  the command. `TT_METAL_RUNTIME_ROOT`, `TT_METAL_HOME` and `TT_METAL_LOGS_PATH` name it, and the
+  kernel cache (`fabric-check/cache`, unless `TTDEV_FABRIC_CACHE` names one) and the output dir
+  live there too. Kernels, firmware and toolchain still come from the pinned tree, and nothing is
+  written there. If the scratch, cache or output dir cannot be made writable, the command is still
+  built but marked, and the check refuses to start the validator ("check cannot run (not
+  writable)"): the gate journals `fabric_check_unavailable` (`not_runnable`) and the result is a
+  skip, never a pass, so a hold stays and only a later full check that passes lifts it (I78). A
+  validator abort whose first error line (`first_reason`) is a host-side file error (permission
+  denied, read-only file system, operation not permitted, failed to create, open or write a file or
+  directory) is classed as check unavailable on this host (`healthy=None`, its cause in the
+  detail), never a device fault; a timeout, measured bad links, a wedged eth init, the validator's
+  own watchdog or links still missing after retrains are matched first and still fail. The check
+  child runs with `RLIMIT_CORE=0`, so a crashing validator ends at once rather than run into the
+  check's timeout while it writes a core, which would read as a wedge. An operator's own
+  `TT_DEVICE_MCP_FABRIC_CHECK_CMD` is untouched. Spec 04 I76 is unchanged: a hold this check
+  cannot clear still gets the full ladder at the 10-min mark, then the host rung. Time to recover:
+  no class gets a new wait; a validator crash on the fabric check now ends in seconds, not at the
+  check's timeout.
 
 ## Interfaces
 
@@ -2661,6 +2686,7 @@ refuses.
 | I97 | `tests/test_own_read_fence.py::test_a_snapshot_mid_chip_stops_at_its_next_read_and_the_remove_is_in_budget`, `tests/test_own_read_fence.py::test_without_the_fence_the_same_snapshot_holds_the_remove_past_its_budget`, `tests/test_own_read_fence.py::test_a_fence_set_mid_snapshot_stops_the_next_attribute_read`, `tests/test_own_read_fence.py::test_a_fence_ends_with_the_broker_s_own_reset_step`, `tests/test_own_read_fence.py::test_a_failed_fence_never_stops_the_containment`, `tests/test_own_read_fence.py::test_the_pre_reset_scan_never_detaches_a_chip_fenced_on_one_sample`, `tests/test_own_read_fence.py::test_the_pre_reset_scan_still_detaches_a_fenced_chip_a_real_read_finds_dead` |
 | I98 | `tests/test_trace_off_critical_path.py::test_a_stalled_trace_fsync_does_not_delay_the_fast_watch`, `tests/test_trace_off_critical_path.py::test_a_stalled_trace_fsync_does_not_delay_the_hung_chip_poller_stop`, `tests/test_trace_off_critical_path.py::test_first_evidence_is_the_earliest_all_ones_read_not_the_check_time`, `tests/test_trace_off_critical_path.py::test_the_sampler_loop_stamps_all_ones_evidence_at_the_read`, `tests/test_trace_off_critical_path.py::test_a_full_trace_backlog_drops_the_row_and_never_blocks` |
 | I99 | `tests/test_containment_off_loop.py::test_a_remove_still_running_at_the_hard_bound_latches_pci_wedged`, `tests/test_containment_off_loop.py::test_slow_journal_state_and_log_writes_never_delay_the_stop_or_the_remove`, `tests/test_containment_off_loop.py::test_the_periodic_stats_write_runs_off_the_event_loop`, `tests/test_containment_off_loop.py::test_the_stats_write_keeps_its_file_and_current_link`, `tests/test_health_hold_report.py::test_a_fenced_chip_link_is_never_read_and_none_while_the_dead_chip_watch_is_armed`, `tests/test_removed_chip_rescan.py::test_the_records_file_write_never_holds_up_the_remove`, `tests/test_dead_chip_watch.py::test_a_remove_that_times_out_latches_pci_wedged_and_asks_for_the_power_cycle` |
+| I100 | `tests/test_fabric_nonroot_scratch.py::test_nonroot_writes_only_under_its_own_state_dir`, `tests/test_fabric_nonroot_scratch.py::test_nonroot_unwritable_state_fails_closed_without_starting`, `tests/test_fabric_nonroot_scratch.py::test_root_path_unchanged`, `tests/test_fabric_nonroot_scratch.py::test_host_side_throw_is_unavailable_not_a_device_fault`, `tests/test_fabric_nonroot_scratch.py::test_host_side_words_never_mask_a_device_fault`, `tests/test_fabric_nonroot_scratch.py::test_check_child_gets_no_core_dump` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
