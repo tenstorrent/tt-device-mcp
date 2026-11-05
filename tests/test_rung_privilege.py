@@ -238,3 +238,33 @@ def test_the_force_escalate_kill_switch_warns_that_the_hold_bound_ignores_it(mon
     assert any(
         "RUNG OFF forced-escalation" in m and "I76" in m and "ignore" in m for lvl, m in said if lvl == "warning"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_non_root_server_with_the_sudo_rule_has_no_host_rung(monkeypatch, said):
+    """Spec 04 I109/I14: the `sudo -n ipmitool` rule reaches the BMC for the mesh reset, but the OS-first
+    power cycle needs root. The rung reads OFF with that cause, and the 10-min bound pages
+    hold_bound_no_host_rung instead of choosing a cycle that always fails to launch."""
+    monkeypatch.delenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", raising=False)
+    _latch(monkeypatch, systemd=True, ipmitool=True, ipmi_sudo=True)
+    assert srv._auto_power_cycle_enabled() is False
+
+    srv.log_rung_inventory()
+    warnings = [m for lvl, m in said if lvl == "warning"]
+    assert any("RUNG OFF auto-power-cycle" in m and "not root" in m and "mesh reset only" in m for m in warnings)
+    assert any("auto-power-cycle=OFF" in m for lvl, m in said if lvl == "info")
+
+    events, cycles, logged = [], [], []
+    monkeypatch.setattr(srv, "health_event", lambda kind, **kw: events.append(kind))
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)
+
+    async def power_cycle(log, reason):
+        cycles.append(reason)
+        return True
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+    monkeypatch.setattr(srv, "device_hold_episode_since", 1000.0)
+    monkeypatch.setattr(srv, "_hold_bound_unarmed_paged", None)
+    await srv._hold_bound_host_rung(601, logged.append)
+    assert events == ["hold_bound_no_host_rung"] and cycles == []
+    assert any("power-cycle rung is OFF" in m and "not root" in m for m in logged)

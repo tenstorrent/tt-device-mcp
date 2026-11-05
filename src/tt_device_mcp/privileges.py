@@ -122,14 +122,22 @@ def can_setpci() -> bool:
 
 
 def can_ipmi() -> bool:
-    """Whether the BMC rungs can reach the BMC: ipmitool plus an openable local IPMI node, or, for a
-    non-root process, a sudoers rule that lets it run `sudo -n ipmitool` (spec 04 I109).
+    """Whether the BMC rungs can reach the BMC: ipmitool plus an openable local IPMI node.
 
-    A host with the binary and no way to the node cannot cold-cycle at all, and I14 requires a rung
-    that cannot fire to read OFF rather than be chosen and then raise.
+    A host with the binary and no node cannot cold-cycle at all, and I14 requires a rung that
+    cannot fire to read OFF rather than be chosen and then raise. The `sudo -n ipmitool` rule
+    (``ipmi_sudo``, spec 04 I109) serves the mesh reset only and is not counted here.
     """
     state = _state()
-    return state["ipmitool"] and (state["ipmi_node"] or state.get("ipmi_sudo", False))
+    return state["ipmitool"] and state["ipmi_node"]
+
+
+def can_power_cycle() -> bool:
+    """Whether the host rung (the OS-first BMC power cycle) can fire: root plus :func:`can_ipmi`.
+
+    The cycle writes the root-owned request file under /run and starts a system unit, so a non-root
+    server cannot fire it whatever the sudoers rule allows (spec 04 I14, I109)."""
+    return is_root() and can_ipmi()
 
 
 def snapshot() -> dict:

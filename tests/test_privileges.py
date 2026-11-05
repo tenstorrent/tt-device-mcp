@@ -149,10 +149,12 @@ def _sudo(monkeypatch, rc):
     return calls
 
 
-def test_a_non_root_server_with_the_sudo_rule_reaches_the_bmc(monkeypatch):
-    """Spec 04 I109: the rule is read with `sudo -n -l`, never by running ipmitool or prompting."""
+def test_a_non_root_server_with_the_sudo_rule_keeps_the_host_rung_off(monkeypatch):
+    """Spec 04 I109/I14: the rule is read with `sudo -n -l`, never by running ipmitool or prompting. It
+    serves the mesh reset only: the OS-first power cycle needs root, so the host rung stays OFF."""
     calls = _sudo(monkeypatch, 0)
-    assert privileges.can_ipmi() is True
+    assert privileges.snapshot()["ipmi_sudo"] is True
+    assert privileges.can_ipmi() is False and privileges.can_power_cycle() is False
     ((argv, kw),) = calls[-1:]
     assert argv == ["sudo", "-n", "-l", "ipmitool"] and kw["stdin"] is privileges.subprocess.DEVNULL
     assert kw["timeout"] <= privileges.SUDO_LIST_TIMEOUT_SEC
@@ -167,3 +169,14 @@ def test_root_is_never_asked_for_sudo(monkeypatch):
     calls = _sudo(monkeypatch, 0)
     monkeypatch.setattr(privileges.os, "geteuid", lambda: 0)
     assert privileges.snapshot()["ipmi_sudo"] is False and calls == []
+
+
+def test_a_non_root_server_that_opens_the_node_still_has_no_host_rung(monkeypatch, tmp_path):
+    """Spec 04 I14: the OS-first cycle needs root whatever reaches the BMC; root with the node has it."""
+    node = tmp_path / "ipmi0"
+    node.write_text("")
+    monkeypatch.setattr(privileges, "IPMI_DEVICE_NODES", (str(node),))
+    monkeypatch.setattr(privileges.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert privileges.can_ipmi() is True and privileges.can_power_cycle() is False
+    monkeypatch.setattr(privileges.os, "geteuid", lambda: 0)
+    assert privileges.can_power_cycle() is True

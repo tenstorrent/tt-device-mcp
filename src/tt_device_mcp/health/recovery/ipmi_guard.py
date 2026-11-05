@@ -71,6 +71,8 @@ _SUDO_REFUSED = (
 )
 # The prefix of the non-root wrapper's private PATH dir that holds the `sudo` copy.
 USER_SHIM_PREFIX = "tt-device-mcp-ipmi-shim-"
+# A guard copy older than this belongs to a mesh reset that has ended (the longest one runs minutes).
+USER_SHIM_STALE_SEC = 3600
 # BMC v0.05.22 is the first that accepts op_mode 0x3.
 MIN_BMC_FIRMWARE = (0, 5)
 MIN_BMC_AUX_PATCH = 0x16  # 22: the lower of the byte's decimal (0x16) and BCD (0x22) readings
@@ -411,14 +413,40 @@ def _real_tool(name: str) -> Optional[str]:
     return None
 
 
+def _prune_stale_shims(tmp_root: str, now: float) -> None:
+    """Remove this user's guard copies left by earlier mesh resets: the wrapper execs into the reset and
+    never comes back to remove its own. Only directories this euid owns with the shim prefix, and only
+    once older than :data:`USER_SHIM_STALE_SEC`, so a reset still running keeps its copy."""
+    import shutil
+
+    try:
+        names = os.listdir(tmp_root)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(USER_SHIM_PREFIX):
+            continue
+        path = os.path.join(tmp_root, name)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if not os.path.isdir(path) or os.path.islink(path) or st.st_uid != os.geteuid():
+            continue
+        if now - st.st_mtime >= USER_SHIM_STALE_SEC:
+            shutil.rmtree(path, ignore_errors=True)
+
+
 def _wrap_user_main(argv: list[str]) -> int:
     """Spec 04 I109: the non-root mesh reset. tt-smi sends its tray reset as ``sudo ipmitool raw ...``; a
     copy of this file named ``sudo``, first on PATH, refuses it or runs ``sudo -n ipmitool``."""
     import tempfile
+    import time
 
     if not argv:
         sys.stderr.write(f"{NOT_ARMED_MARKER}: no command given\n")
         return 1
+    _prune_stale_shims(tempfile.gettempdir(), time.time())
     try:
         shim_dir = tempfile.mkdtemp(prefix=USER_SHIM_PREFIX)
         shim = os.path.join(shim_dir, "sudo")

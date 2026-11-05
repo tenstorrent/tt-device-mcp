@@ -732,3 +732,38 @@ async def test_a_non_root_server_without_the_sudo_rule_keeps_the_hold_and_climbs
     assert srv.fsm.state is not srv.ServerState.HEALTHY, "the hold stays"
     refused = [f for k, f in rig["events"] if k == "mesh_reset_bmc_preflight_refused"]
     assert refused and ipmi_guard.SUDO_RULE in refused[0]["reason"]
+
+
+def test_the_user_wrapper_removes_its_stale_guard_copies(non_root, monkeypatch, tmp_path):
+    """The wrapper execs into the reset and never removes its own copy: each run prunes this user's
+    copies older than USER_SHIM_STALE_SEC, and leaves a fresh one (a reset still running) and others'."""
+    now = 10_000_000.0
+    old = tmp_path / f"{ipmi_guard.USER_SHIM_PREFIX}old"
+    fresh = tmp_path / f"{ipmi_guard.USER_SHIM_PREFIX}fresh"
+    other = tmp_path / "unrelated"
+    for d in (old, fresh, other):
+        d.mkdir()
+        (d / "sudo").write_text("x")
+    os.utime(old, (now - ipmi_guard.USER_SHIM_STALE_SEC - 1,) * 2)
+    os.utime(fresh, (now - 60,) * 2)
+    os.utime(other, (now - 10 * ipmi_guard.USER_SHIM_STALE_SEC,) * 2)
+    link = tmp_path / f"{ipmi_guard.USER_SHIM_PREFIX}link"
+    link.symlink_to(other)
+
+    ipmi_guard._prune_stale_shims(str(tmp_path), now)
+    assert not old.exists() and fresh.exists() and other.exists() and (other / "sudo").exists()
+
+    monkeypatch.setattr(ipmi_guard.os, "geteuid", lambda: os.getuid() + 1)
+    os.utime(fresh, (now - ipmi_guard.USER_SHIM_STALE_SEC - 1,) * 2)
+    ipmi_guard._prune_stale_shims(str(tmp_path), now)
+    assert fresh.exists(), "another user's copy is never removed"
+
+
+def test_the_user_wrapper_prunes_before_each_new_copy(non_root, monkeypatch, tmp_path):
+    pruned = []
+    monkeypatch.setattr(ipmi_guard, "_prune_stale_shims", lambda root, now: pruned.append(root))
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda prefix: str(tmp_path))
+    monkeypatch.setattr(ipmi_guard.os, "execvpe", lambda *a: (_ for _ in ()).throw(OSError("stub")))
+    assert ipmi_guard.main(["--wrap-user", "--", "tt-smi", "-glx_reset"]) == 127
+    assert pruned == [str(tmp_path)]

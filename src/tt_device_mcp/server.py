@@ -4460,14 +4460,16 @@ def _opted_out(var: str) -> str:
 
 
 def _no_bmc_reason() -> str:
-    """Which half of the BMC capability is missing. The two have different fixes: one is a package,
-    the other is a host or container that exposes no local IPMI interface at all."""
+    """Which part of the host rung's capability is missing. Each has its own fix: a package, a root
+    server (spec 04 I109: the sudo rule does not stand in for it), or a host or container that exposes
+    a local IPMI interface at all."""
     if not privileges.snapshot()["ipmitool"]:
         return "ipmitool is not on PATH"
     if not privileges.is_root():
         return (
-            "no openable /dev/ipmi* and `sudo -n ipmitool` is not allowed — a non-root server needs the "
-            f"sudoers rule `{health_ipmi_sudo_rule}` (ipmitool only)"
+            "the server is not root — the OS-first power cycle writes its request file under /run and "
+            "starts a system unit, which need root; the sudoers rule "
+            f"`{health_ipmi_sudo_rule}` serves the mesh reset only and does not enable it"
         )
     return "no openable /dev/ipmi* — this host or container exposes no local BMC interface"
 
@@ -7047,7 +7049,7 @@ def _auto_power_cycle_enabled() -> bool:
     to the already-loud BLOCKED path: the cascade emits its power-cycle-required event and holds."""
     if os.environ.get("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1").strip() == "0":
         return False
-    return privileges.can_ipmi()
+    return privileges.can_power_cycle()
 
 
 def _host_rung_opted_in() -> bool:
@@ -9933,7 +9935,8 @@ async def _hold_bound_host_rung(age: float, log, skipped: str = "") -> None:
                 "held_age_sec": int(age),
             }
             health_event(event["kind"], **{k: v for k, v in event.items() if k != "kind"})
-        log("10-min hold bound: the ladder did not heal the hold and the operator opted out of the power cycle")
+        off = _opted_out("TT_DEVICE_MCP_AUTO_POWER_CYCLE") or _no_bmc_reason()
+        log(f"10-min hold bound: the ladder did not heal the hold and the power-cycle rung is OFF ({off})")
         return
     blocker = await asyncio.to_thread(_bound_tenant_blocker, True)
     if blocker is not None:
@@ -18346,7 +18349,7 @@ def _preflight_required_capabilities(socket_path: Optional[str]) -> tuple[list[s
     # at all — no queue, no gating, every tenant back on bare metal — which is a worse outage
     # than a ladder that stops one rung short. The rung reads as OFF everywhere else (see
     # _auto_power_cycle_enabled), so the shortfall is stated, not assumed.
-    if os.environ.get("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1").strip() != "0" and not privileges.can_ipmi():
+    if os.environ.get("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1").strip() != "0" and not privileges.can_power_cycle():
         warns.append(
             f"TT_DEVICE_MCP_AUTO_POWER_CYCLE is armed but {_no_bmc_reason()} — the "
             "BMC power-cycle rung is OFF. The ladder has no host rung; a chip "
