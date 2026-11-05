@@ -648,6 +648,9 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
             ["ipmitool", "mc", "info"], 0, "Firmware Revision : 0.05\nAux Firmware Rev Info : 0x23 0x00 0x00 0x00\n", ""
         ),
     )
+    # Spec 04 I109: the suite runs the root BMC path (plain ipmitool, the unshare guard) whatever uid
+    # runs pytest; the non-root sudo path is covered by its own tests.
+    monkeypatch.setattr(ipmi_guard, "is_root", lambda: True)
     monkeypatch.setattr(heartbeat, "_heartbeat_supported", None)
     # raising=False so a base tree without the re-arm latch (a fails-on-base stash) still sets up.
     monkeypatch.setattr(heartbeat, "_heartbeat_absent_journaled", False, raising=False)

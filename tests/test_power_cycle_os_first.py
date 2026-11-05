@@ -634,6 +634,31 @@ def test_a_bmc_that_fails_the_preflight_never_reboots(os_first, rc):
     assert _steps(os_first) == ["preflight"]
 
 
+def _non_root(monkeypatch):
+    from tt_device_mcp.health.recovery import ipmi_guard
+
+    monkeypatch.setattr(ipmi_guard, "is_root", lambda: False)
+    monkeypatch.setattr(ipmi_guard, "ipmi_node_openable", lambda: False)
+    return ipmi_guard
+
+
+def test_a_non_root_server_checks_the_bmc_through_sudo_n_and_fires_plain_ipmitool(os_first, monkeypatch):
+    """Spec 04 I109: the read-only pre-flight goes through `sudo -n`; the cycle argv the root shutdown
+    hook and fallback unit fire stays plain ipmitool."""
+    _non_root(monkeypatch)
+    pc.fire_os_first(CYCLE, REASON)
+    assert os_first["calls"][0][1] == ["sudo", "-n", "/usr/bin/ipmitool", "mc", "info"]
+    assert os_first["req"].read_text().splitlines()[3:] == CYCLE_ABS
+
+
+def test_a_non_root_server_without_the_sudo_rule_names_it_and_never_reboots(os_first, monkeypatch):
+    ipmi_guard = _non_root(monkeypatch)
+    os_first["rc"]["preflight"] = 1
+    os_first["out"]["preflight"] = "sudo: a password is required"
+    assert ipmi_guard.SUDO_RULE in _not_launched(os_first)
+    assert _steps(os_first) == ["preflight"]
+
+
 def test_the_preflight_keeps_the_configured_commands_bmc_options(os_first):
     _real_fire_command(["ipmitool", "-I", "lanplus", "-H", "bmc", "chassis", "power", "cycle"], REASON)
     assert os_first["calls"][0][1] == ["/usr/bin/ipmitool", "-I", "lanplus", "-H", "bmc", "mc", "info"]

@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from tt_device_mcp.health.monitors import pci
+from tt_device_mcp.health.recovery import ipmi_guard
 
 CAPTURE_DEADLINE_SEC = 10.0
 # A BMC answers IPMI slowly while a tray is browning out; each read gets most of the deadline,
@@ -115,7 +116,7 @@ def capture_argvs(pci_targets: list, onset_epoch: float) -> list:
 def _run_one(argv: list, run: Callable) -> str:
     timeout = {"journalctl": JOURNAL_TIMEOUT_SEC, "ipmitool": BMC_CALL_TIMEOUT_SEC}.get(argv[0], CALL_TIMEOUT_SEC)
     try:
-        p = run(argv, capture_output=True, text=True, timeout=timeout)
+        p = run(ipmi_guard.bmc_argv(argv), capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
         return f"exit {p.returncode}\n{p.stdout or ''}{p.stderr or ''}"
     except FileNotFoundError:
         return "not installed"

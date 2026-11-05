@@ -16,6 +16,7 @@ import time
 from typing import Callable, Optional
 
 from tt_device_mcp.health.evidence import health_dir, health_event
+from tt_device_mcp.health.recovery import ipmi_guard
 
 _logger = logging.getLogger("tt-device-mcp")
 
@@ -510,7 +511,7 @@ def read_restart_cause_why(argv: list) -> tuple:
     exe = _resolve_command(probe[0])
     if exe is None:
         return None, f"{probe[0]} not found"
-    rc, out = _run_step([exe, *probe[1:]], PREFLIGHT_TIMEOUT_SEC)
+    rc, out = _run_step(ipmi_guard.bmc_argv([exe, *probe[1:]]), PREFLIGHT_TIMEOUT_SEC)
     last = next((ln.strip() for ln in reversed((out or "").splitlines()) if ln.strip()), "")
     if rc is None:
         return None, f"the BMC query did not finish in {PREFLIGHT_TIMEOUT_SEC}s: {last}"[:_CAUSE_WHY_MAX]
@@ -559,7 +560,7 @@ def read_sel_power_off(argv: list, since: float, until: float) -> Optional[float
     exe = _resolve_command(clock[0])
     if exe is None:
         return None
-    rc, out = _run_query([exe, *clock[1:]], SEL_TIMEOUT_SEC)
+    rc, out = _run_query(ipmi_guard.bmc_argv([exe, *clock[1:]]), SEL_TIMEOUT_SEC)
     host_now = time.time()
     bmc_now = None
     for ln in reversed((out or "").splitlines()) if rc == 0 else ():
@@ -569,7 +570,7 @@ def read_sel_power_off(argv: list, since: float, until: float) -> Optional[float
     if bmc_now is None:
         return None
     offset = host_now - bmc_now
-    rc, out = _run_query([exe, *tail[1:]], SEL_TIMEOUT_SEC)
+    rc, out = _run_query(ipmi_guard.bmc_argv([exe, *tail[1:]]), SEL_TIMEOUT_SEC)
     if rc != 0:
         return None
     found = None
@@ -724,9 +725,13 @@ def fire_os_first(argv: list, reason: str, timeout: float = DEFAULT_POWER_CYCLE_
     if not why:
         probe = preflight_argv(argv)
         if probe is not None:
-            rc, out = _run_step(probe, PREFLIGHT_TIMEOUT_SEC)
+            # Spec 04 I109: a non-root server's BMC calls go through `sudo -n`. The cycle argv itself does not:
+            # the shutdown hook and the fallback unit fire it as root.
+            rc, out = _run_step(ipmi_guard.bmc_argv(probe), PREFLIGHT_TIMEOUT_SEC)
             if rc != 0:
-                why = f"BMC did not answer the read-only pre-flight {' '.join(probe[-2:])} (rc {rc}): {out}"
+                why = ipmi_guard.sudo_refused(out) or (
+                    f"BMC did not answer the read-only pre-flight {' '.join(probe[-2:])} (rc {rc}): {out}"
+                )
     unit_timeout: Optional[float] = None
     bound: Optional[int] = None
     if not why:

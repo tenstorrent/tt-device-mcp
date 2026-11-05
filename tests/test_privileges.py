@@ -87,7 +87,7 @@ def test_an_unopenable_ipmi_node_is_not_a_reachable_bmc(monkeypatch, tmp_path):
 
 
 def test_the_snapshot_names_every_probe_for_the_boot_line(monkeypatch, tmp_path):
-    """The boot line has to state all four, because a rung reported OFF is only readable if the
+    """The boot line has to state every probe, because a rung reported OFF is only readable if the
     privilege it lacked is named alongside it."""
     monkeypatch.setattr(privileges.os, "geteuid", lambda: 0)
     monkeypatch.setattr(privileges, "SYSTEMD_DIR", str(tmp_path))
@@ -101,6 +101,7 @@ def test_the_snapshot_names_every_probe_for_the_boot_line(monkeypatch, tmp_path)
         "setpci_bin": False,
         "ipmitool": False,
         "ipmi_node": False,
+        "ipmi_sudo": False,
     }
 
 
@@ -127,3 +128,38 @@ def test_the_latch_holds_the_host_it_measured(monkeypatch, tmp_path):
 
     monkeypatch.setattr(privileges, "_LATCHED", None)
     assert privileges.has_systemd() is False, "unlatched, the probes measure live again"
+
+
+def _sudo(monkeypatch, rc):
+    """A non-root host with ipmitool and sudo; `sudo -n -l ipmitool` answers rc."""
+    calls = []
+
+    def run(argv, **kw):
+        calls.append((argv, kw))
+        return privileges.subprocess.CompletedProcess(argv, rc, "", "")
+
+    monkeypatch.setattr(
+        privileges.shutil, "which", lambda name: f"/usr/bin/{name}" if name in ("ipmitool", "sudo") else None
+    )
+    monkeypatch.setattr(privileges.subprocess, "run", run)
+    return calls
+
+
+def test_a_non_root_server_with_the_sudo_rule_reaches_the_bmc(monkeypatch):
+    """Spec 04 I109: the rule is read with `sudo -n -l`, never by running ipmitool or prompting."""
+    calls = _sudo(monkeypatch, 0)
+    assert privileges.can_ipmi() is True
+    (argv, kw), = calls[-1:]
+    assert argv == ["sudo", "-n", "-l", "ipmitool"] and kw["stdin"] is privileges.subprocess.DEVNULL
+    assert kw["timeout"] <= privileges.SUDO_LIST_TIMEOUT_SEC
+
+
+def test_a_non_root_server_without_the_sudo_rule_cannot_reach_the_bmc(monkeypatch):
+    _sudo(monkeypatch, 1)
+    assert privileges.can_ipmi() is False
+
+
+def test_root_is_never_asked_for_sudo(monkeypatch):
+    calls = _sudo(monkeypatch, 0)
+    monkeypatch.setattr(privileges.os, "geteuid", lambda: 0)
+    assert privileges.snapshot()["ipmi_sudo"] is False and calls == []

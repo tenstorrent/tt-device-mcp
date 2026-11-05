@@ -19,7 +19,7 @@ and never dispatch onto a mesh the broker cannot prove fit.
 
 Two deployment shapes serve opposite hosts (spec 08): the **system broker** (root, systemd,
 multi-tenant arbiter, health-gated, recovery-armed) on shared machines, and the **per-user
-daemon** (no sudo, health-gated, ladder capped to what it can execute) on a single-user box or
+daemon** (no sudo beyond an optional `ipmitool` rule, spec 04 I109; health-gated, ladder capped to what it can execute) on a single-user box or
 in a container —
 one card, one arbiter, never two.
 

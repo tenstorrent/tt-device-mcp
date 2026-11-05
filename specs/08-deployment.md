@@ -614,6 +614,13 @@ print (never write) the PATH line (I12); `daemon start` fail-closed (I10); remov
 tt-device-mcp cron entry; wire Claude if the `claude` CLI is present. No
 self-update, no lock — the operator owns the box.
 
+**Per-user BMC access (spec 04 I109).** The per-user daemon is not root, so on a host whose
+`/dev/ipmi0` is root-only it reaches the BMC (mesh reset preflight and tray reset, power-cycle
+pre-flight) only through `sudo -n ipmitool`. The one sudoers rule it needs, added by the box's
+admin, is `<user> ALL=(root) NOPASSWD: /usr/bin/ipmitool` (ipmitool only; nothing else is run
+through sudo). Without it the boot line reads `ipmi_sudo=False`, the BMC rungs are off, and a mesh
+reset is refused with a reason that names the rule; the hold stays and the ladder climbs.
+
 **Validator build/pin flow (`install-fabric-validator.sh`).** flock-serialized (concurrent
 tt-metal builds corrupt a tree; the timer refires long before a build ends). If all three pinned
 binaries exist in a slot for the SHA (I27): flip `current` to it if it is not already live, prune the

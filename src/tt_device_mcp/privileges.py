@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 from typing import Optional
 
 # What sd_booted(3) reads. Not `systemctl` on PATH: a restricted-PATH host still runs systemd, and
@@ -40,7 +41,11 @@ _PROBES = {
     "setpci_bin": lambda: shutil.which("setpci") is not None,
     "ipmitool": lambda: shutil.which("ipmitool") is not None,
     "ipmi_node": lambda: _ipmi_node_openable(),
+    "ipmi_sudo": lambda: _ipmi_sudo_allowed(),
 }
+
+# `sudo -n -l ipmitool` lists the rule without running ipmitool or prompting; a few seconds at most.
+SUDO_LIST_TIMEOUT_SEC = 5
 
 # The measurement, taken once by latch() at boot. None until then, and the probes measure live in
 # the meantime so a caller that never booted a broker still gets a truthful answer.
@@ -55,6 +60,28 @@ def _ipmi_node_openable() -> bool:
     """
     kwargs = {"effective_ids": True} if os.access in os.supports_effective_ids else {}
     return any(os.access(node, os.R_OK | os.W_OK, **kwargs) for node in IPMI_DEVICE_NODES)
+
+
+def _ipmi_sudo_allowed() -> bool:
+    """Spec 04 I109: whether a non-root process that cannot open the IPMI node may run `sudo -n ipmitool`.
+
+    Reads the sudoers rule (`sudo -n -l ipmitool`), never runs ipmitool and never prompts. Root, or a
+    process that opens the node itself, does not need it and is not asked."""
+    if os.geteuid() == 0 or _ipmi_node_openable():
+        return False
+    if shutil.which("sudo") is None or shutil.which("ipmitool") is None:
+        return False
+    try:
+        res = subprocess.run(
+            ["sudo", "-n", "-l", "ipmitool"],
+            capture_output=True,
+            text=True,
+            timeout=SUDO_LIST_TIMEOUT_SEC,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return res.returncode == 0
 
 
 def _measure() -> dict:
@@ -95,13 +122,14 @@ def can_setpci() -> bool:
 
 
 def can_ipmi() -> bool:
-    """Whether the BMC rungs can reach the BMC: ipmitool plus an openable local IPMI node.
+    """Whether the BMC rungs can reach the BMC: ipmitool plus an openable local IPMI node, or, for a
+    non-root process, a sudoers rule that lets it run `sudo -n ipmitool` (spec 04 I109).
 
-    A host with the binary and no node cannot cold-cycle at all, and I14 requires a rung that
-    cannot fire to read OFF rather than be chosen and then raise.
+    A host with the binary and no way to the node cannot cold-cycle at all, and I14 requires a rung
+    that cannot fire to read OFF rather than be chosen and then raise.
     """
     state = _state()
-    return state["ipmitool"] and state["ipmi_node"]
+    return state["ipmitool"] and (state["ipmi_node"] or state.get("ipmi_sudo", False))
 
 
 def snapshot() -> dict:

@@ -16,7 +16,11 @@ Stdlib only, because this one file plays three roles:
   :func:`guarded_argv`, :func:`bmc_preflight`, :func:`scan_reset_output`;
 - ``python -I ipmi_guard.py --wrap -- <argv>``, inside ``unshare --mount``: mount a copy of this file
   over every ipmitool sudo can resolve, check the mounts, exec ``<argv>``;
-- that copy, run as ``ipmitool``: refuse, or exec the real binary.
+- that copy, run as ``ipmitool``: refuse, or exec the real binary;
+- ``python -I ipmi_guard.py --wrap-user -- <argv>`` for a non-root server, which cannot make a mount
+  namespace: put a copy named ``sudo`` first on PATH (tt-smi sends its tray reset as
+  ``sudo ipmitool raw ...``), exec ``<argv>``; that copy refuses, or runs the real
+  ``sudo -n ipmitool`` (spec 04 I109).
 
 Nothing turns the guard off: no environment variable, flag or config is read.
 """
@@ -53,6 +57,20 @@ SECURE_PATH_DIRS = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin"
 MOUNT_TIMEOUT_SEC = 10
 # The read-only `mc info` before a mesh reset; also the most it adds to one (spec 04 I91 TTR).
 BMC_PREFLIGHT_TIMEOUT_SEC = 10
+# Spec 04 I109: the local IPMI nodes ipmitool's default (open) interface uses. A non-root process
+# that can open none of them reaches the BMC with `sudo -n ipmitool`, never a prompt or password.
+IPMI_DEVICE_NODES = ("/dev/ipmi0", "/dev/ipmi/0", "/dev/ipmidev/0")
+SUDO_RULE = "<user> ALL=(root) NOPASSWD: /usr/bin/ipmitool"
+# What sudo -n prints when it will not run the command without a password or a rule.
+_SUDO_REFUSED = (
+    "a password is required",
+    "a terminal is required",
+    "is not allowed to execute",
+    "is not in the sudoers file",
+    "may not run sudo",
+)
+# The prefix of the non-root wrapper's private PATH dir that holds the `sudo` copy.
+USER_SHIM_PREFIX = "tt-device-mcp-ipmi-shim-"
 # BMC v0.05.22 is the first that accepts op_mode 0x3.
 MIN_BMC_FIRMWARE = (0, 5)
 MIN_BMC_AUX_PATCH = 0x16  # 22: the lower of the byte's decimal (0x16) and BCD (0x22) readings
@@ -142,8 +160,60 @@ def override_unclassified(argv: list[str]) -> str:
     )
 
 
+def is_root() -> bool:
+    return os.geteuid() == 0
+
+
+def ipmi_node_openable() -> bool:
+    """Whether this process may open a local IPMI node (as its effective uid, as ipmitool does)."""
+    kwargs = {"effective_ids": True} if os.access in os.supports_effective_ids else {}
+    return any(os.access(node, os.R_OK | os.W_OK, **kwargs) for node in IPMI_DEVICE_NODES)
+
+
+def needs_sudo() -> bool:
+    """Spec 04 I109: whether a local ipmitool call from this process must go through ``sudo -n``.
+    Root, or a user who can open the IPMI node, calls ipmitool directly."""
+    return not is_root() and not ipmi_node_openable()
+
+
+def _local_interface(args: list[str]) -> bool:
+    """Whether ``ipmitool <args>`` uses the local (open) interface, the one that needs the node."""
+    args = [str(a) for a in args]
+    for i, a in enumerate(args):
+        if a == "-I" and i + 1 < len(args):
+            return args[i + 1] == "open"
+        if a.startswith("-I") and len(a) > 2:
+            return a[2:] == "open"
+    return True
+
+
+def bmc_argv(argv: list[str]) -> list[str]:
+    """Spec 04 I109: ``argv`` as this process must run it to reach the BMC. A local ``ipmitool`` call from
+    a non-root process that cannot open the IPMI node becomes ``sudo -n ipmitool ...`` (never a prompt);
+    anything else (root, an openable node, a LAN interface, another command) runs as is."""
+    argv = [str(a) for a in argv]
+    if argv and os.path.basename(argv[0]) == "ipmitool" and _local_interface(argv[1:]) and needs_sudo():
+        return ["sudo", "-n", *argv]
+    return argv
+
+
+def sudo_refused(text: str) -> str:
+    """'' unless ``text`` is sudo refusing to run ipmitool without a password or a rule; then the plain
+    reason, naming the one sudoers rule a non-root server needs (spec 04 I109)."""
+    low = (text or "").lower()
+    if "sudo" not in low or not any(m in low for m in _SUDO_REFUSED):
+        return ""
+    return (
+        "`sudo -n ipmitool` was refused: this non-root server reaches the BMC only through sudo, and "
+        f"needs the sudoers rule `{SUDO_RULE}` (ipmitool only)"
+    )
+
+
 def guarded_argv(argv: list[str]) -> list[str]:
-    """``argv`` run inside a private mount namespace where every ipmitool is the guard."""
+    """``argv`` run inside a private mount namespace where every ipmitool is the guard. A non-root
+    process cannot make one; its wrapper puts the guard first on PATH as ``sudo`` instead (I109)."""
+    if not is_root():
+        return [sys.executable, "-I", os.path.abspath(__file__), "--wrap-user", "--", *argv]
     return [
         "unshare",
         "--mount",
@@ -184,7 +254,9 @@ def bmc_step_ok(text: str) -> bool:
 
 
 def _run_mc_info(timeout: float) -> subprocess.CompletedProcess:
-    return subprocess.run(["ipmitool", "mc", "info"], capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(
+        bmc_argv(["ipmitool", "mc", "info"]), capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL
+    )
 
 
 def bmc_preflight(run: Optional[Callable[[float], subprocess.CompletedProcess]] = None) -> str:
@@ -200,6 +272,8 @@ def bmc_preflight(run: Optional[Callable[[float], subprocess.CompletedProcess]] 
     except OSError as exc:
         return f"`ipmitool mc info` could not run: {exc}"
     out = f"{res.stdout or ''}{res.stderr or ''}"
+    if res.returncode != 0 and sudo_refused(out):
+        return sudo_refused(out)
     if res.returncode != 0:
         tail = " ".join(out.split())[-200:]
         return f"the BMC did not answer `ipmitool mc info` (exit {res.returncode}: {tail or 'no output'})"
@@ -328,6 +402,77 @@ def _wrap_main(argv: list[str]) -> int:
     return 127  # not reached
 
 
+def _real_tool(name: str) -> Optional[str]:
+    """``name`` on sudo's secure path only: the wrapper's own PATH dir holds the guard copy."""
+    for d in SECURE_PATH_DIRS:
+        p = os.path.join(d, name)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def _wrap_user_main(argv: list[str]) -> int:
+    """Spec 04 I109: the non-root mesh reset. tt-smi sends its tray reset as ``sudo ipmitool raw ...``; a
+    copy of this file named ``sudo``, first on PATH, refuses it or runs ``sudo -n ipmitool``."""
+    import tempfile
+
+    if not argv:
+        sys.stderr.write(f"{NOT_ARMED_MARKER}: no command given\n")
+        return 1
+    try:
+        shim_dir = tempfile.mkdtemp(prefix=USER_SHIM_PREFIX)
+        shim = os.path.join(shim_dir, "sudo")
+        with open(shim, "w", encoding="utf-8") as f:
+            f.write(guard_source())
+        os.chmod(shim, 0o700)
+        with open(shim, encoding="utf-8") as f:
+            if GUARD_TAG not in f.read(4096):
+                raise OSError(f"{shim} is not the guard after writing it")
+    except OSError as exc:
+        sys.stderr.write(f"{NOT_ARMED_MARKER}: {exc}; mesh reset NOT run\n")
+        sys.stderr.flush()
+        return 1
+    env = dict(os.environ, PATH=os.pathsep.join([shim_dir, os.environ.get("PATH", "")]))
+    try:
+        os.execvpe(argv[0], argv, env)
+    except OSError as exc:
+        sys.stderr.write(f"tt-device-mcp ipmi guard: cannot exec {argv[0]}: {exc}\n")
+        return 127
+    return 127  # not reached
+
+
+def _sudo_shim_main(args: list[str]) -> int:
+    """The non-root guard, run as ``sudo``: only ``sudo [-n] ipmitool <args>`` passes, after :func:`refusal`;
+    it runs the real ipmitool directly when the node opens, else through the real ``sudo -n``."""
+    rest = args[1:] if args[:1] == ["-n"] else args
+    if not rest or os.path.basename(rest[0]) != "ipmitool":
+        sys.stderr.write(f"{REFUSED_MARKER}: only `sudo ipmitool` passes the guard. Command: sudo {' '.join(args)}\n")
+        sys.stderr.flush()
+        return GUARD_REFUSED_RC
+    why = refusal(rest[1:])
+    if why:
+        sys.stderr.write(f"{REFUSED_MARKER}: {why}. Command: ipmitool {' '.join(rest[1:])}\n")
+        sys.stderr.flush()
+        return GUARD_REFUSED_RC
+    ipmitool = _real_tool("ipmitool")
+    if ipmitool is None:
+        sys.stderr.write("tt-device-mcp ipmi guard: ipmitool is not installed\n")
+        return 127
+    argv = [ipmitool, *rest[1:]]
+    if needs_sudo():
+        sudo = _real_tool("sudo")
+        if sudo is None:
+            sys.stderr.write("tt-device-mcp ipmi guard: sudo is not installed\n")
+            return 127
+        argv = [sudo, "-n", *argv]
+    try:
+        os.execv(argv[0], argv)
+    except OSError as exc:
+        sys.stderr.write(f"tt-device-mcp ipmi guard: cannot exec {argv[0]}: {exc}\n")
+        return 127
+    return 127  # not reached
+
+
 def _guard_main(args: list[str]) -> int:
     why = refusal(args)
     if why:
@@ -344,11 +489,18 @@ def _guard_main(args: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
+    if os.path.basename(sys.argv[0]) == "sudo":
+        return _sudo_shim_main(argv)
     if argv[:1] == ["--wrap"]:
         rest = argv[1:]
         if rest[:1] == ["--"]:
             rest = rest[1:]
         return _wrap_main(rest)
+    if argv[:1] == ["--wrap-user"]:
+        rest = argv[1:]
+        if rest[:1] == ["--"]:
+            rest = rest[1:]
+        return _wrap_user_main(rest)
     return _guard_main(argv)
 
 

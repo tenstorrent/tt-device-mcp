@@ -10,9 +10,11 @@ these tests assert on argv, the guard's verdicts and the ladder's state.
 """
 
 import ast
+import os
 import pathlib
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
@@ -116,7 +118,8 @@ def test_the_mounted_copy_refuses_as_ipmitool(tmp_path):
 
 def test_nothing_switches_the_guard_off():
     """No environment variable, flag or config is read (no broker overrides): the module
-    never touches os.environ except for PATH, which only widens what it guards."""
+    never touches os.environ except for PATH, which only widens what it guards (and, for the
+    non-root wrapper, puts the guard first on the reset's PATH)."""
     src = (ROOT / "src/tt_device_mcp/health/recovery/ipmi_guard.py").read_text()
     tree = ast.parse(src)
     reads = [
@@ -124,14 +127,8 @@ def test_nothing_switches_the_guard_off():
         for n in ast.walk(tree)
         if isinstance(n, ast.Attribute) and n.attr in ("environ", "getenv") and isinstance(n.value, ast.Name)
     ]
-    assert len(reads) == 1 and '"PATH"' in ast.get_source_segment(src, _parent_call(tree, reads[0]))
-
-
-def _parent_call(tree, node):
-    for n in ast.walk(tree):
-        if isinstance(n, ast.Call) and any(c is node for c in ast.walk(n.func)):
-            return n
-    raise AssertionError("no call")
+    lines = src.splitlines()
+    assert reads and all("PATH" in lines[n.lineno - 1] for n in reads)
 
 
 # --- arming ------------------------------------------------------------------------------------------
@@ -590,3 +587,148 @@ async def test_an_unclassifiable_override_is_refused_and_the_ladder_climbs_with_
     assert out is True
     srv._clear_device_dirty(verified=True, why="gate/post-job: verified healthy")
     _assert_settled(True)
+
+
+# Spec 04 I109: a non-root server reaches the BMC through `sudo -n ipmitool`, never a prompt.
+
+SUDO_NO_RULE = "sudo: a password is required\n"
+
+
+@pytest.fixture
+def non_root(monkeypatch):
+    """A non-root server on a host whose /dev/ipmi0 is root-only."""
+    monkeypatch.setattr(ipmi_guard, "is_root", lambda: False)
+    monkeypatch.setattr(ipmi_guard, "ipmi_node_openable", lambda: False)
+
+
+def test_root_calls_ipmitool_directly():
+    assert ipmi_guard.needs_sudo() is False
+    assert ipmi_guard.bmc_argv(["ipmitool", "mc", "info"]) == ["ipmitool", "mc", "info"]
+    assert ipmi_guard.guarded_argv(["tt-smi", "-glx_reset"])[:2] == ["unshare", "--mount"]
+
+
+def test_a_non_root_server_that_opens_the_node_calls_ipmitool_directly(monkeypatch):
+    monkeypatch.setattr(ipmi_guard, "is_root", lambda: False)
+    monkeypatch.setattr(ipmi_guard, "ipmi_node_openable", lambda: True)
+    assert ipmi_guard.bmc_argv(["ipmitool", "mc", "info"]) == ["ipmitool", "mc", "info"]
+
+
+@pytest.mark.parametrize(
+    "argv, wrapped",
+    [
+        (["ipmitool", "mc", "info"], True),
+        (["/usr/bin/ipmitool", "chassis", "status"], True),
+        (["ipmitool", "-I", "open", "sel", "list"], True),
+        (["ipmitool", "-I", "lanplus", "-H", "bmc", "mc", "info"], False),
+        (["ipmitool", "-Ilanplus", "mc", "info"], False),
+        (["lspci", "-vv"], False),
+    ],
+)
+def test_a_non_root_local_bmc_call_goes_through_sudo_n(non_root, argv, wrapped):
+    out = ipmi_guard.bmc_argv(argv)
+    assert out == (["sudo", "-n", *argv] if wrapped else argv)
+
+
+def test_the_non_root_preflight_runs_sudo_n_ipmitool_without_a_terminal(non_root, monkeypatch):
+    seen = {}
+
+    def run(argv, **kw):
+        seen.update(argv=argv, **kw)
+        return subprocess.CompletedProcess(argv, 0, MC_INFO.format(rev="0.05", aux="0x23"), "")
+
+    monkeypatch.setattr(ipmi_guard, "_run_mc_info", _REAL_RUN_MC_INFO)
+    monkeypatch.setattr(ipmi_guard.subprocess, "run", run)
+    assert ipmi_guard.bmc_preflight() == ""
+    assert seen["argv"] == ["sudo", "-n", "ipmitool", "mc", "info"]
+    assert seen["stdin"] is subprocess.DEVNULL, "sudo -n never waits on a password"
+
+
+@pytest.mark.parametrize(
+    "text", [SUDO_NO_RULE, "Sorry, user u is not allowed to execute '/usr/bin/ipmitool mc info' as root on h.\n(sudo)"]
+)
+def test_a_refused_sudo_names_the_one_rule_it_needs(non_root, text):
+    why = ipmi_guard.bmc_preflight(lambda timeout: subprocess.CompletedProcess([], 1, "", text))
+    assert ipmi_guard.SUDO_RULE in why and "ipmitool only" in why
+    assert ipmi_guard.SUDO_RULE.endswith("NOPASSWD: /usr/bin/ipmitool")
+
+
+def test_a_bmc_error_is_not_read_as_a_sudo_refusal():
+    assert ipmi_guard.sudo_refused("Could not open device at /dev/ipmi0: No such file") == ""
+
+
+def test_the_non_root_mesh_reset_runs_under_the_sudo_shim(non_root):
+    argv = ipmi_guard.guarded_argv(["tt-smi", "-glx_reset"])
+    assert argv[0] == sys.executable and argv[3:] == ["--wrap-user", "--", "tt-smi", "-glx_reset"]
+    assert "unshare" not in argv
+
+
+def test_the_user_wrapper_puts_the_guard_first_on_path_as_sudo(non_root, monkeypatch, tmp_path):
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda prefix: str(tmp_path))
+    execs = []
+
+    def execvpe(path, argv, env):
+        execs.append((path, argv, env))
+        raise OSError("stub")
+
+    monkeypatch.setattr(ipmi_guard.os, "execvpe", execvpe)
+    assert ipmi_guard.main(["--wrap-user", "--", "tt-smi", "-glx_reset"]) == 127
+    (path, argv, env), = execs
+    assert argv == ["tt-smi", "-glx_reset"] and env["PATH"].split(os.pathsep)[0] == str(tmp_path)
+    shim = tmp_path / "sudo"
+    assert ipmi_guard.GUARD_TAG in shim.read_text() and shim.stat().st_mode & 0o777 == 0o700
+
+
+def _as_sudo(monkeypatch):
+    monkeypatch.setattr(ipmi_guard.sys, "argv", ["/tmp/x/sudo"])
+    monkeypatch.setattr(ipmi_guard, "_real_tool", lambda name: f"/usr/bin/{name}")
+    execs = []
+
+    def execv(path, argv):
+        execs.append(argv)
+        raise OSError("stub")
+
+    monkeypatch.setattr(ipmi_guard.os, "execv", execv)
+    return execs
+
+
+def test_the_sudo_shim_refuses_the_legacy_retimer_reset(non_root, monkeypatch, capsys):
+    execs = _as_sudo(monkeypatch)
+    assert ipmi_guard.main(["ipmitool", *_raw("0xf", "0xff", "0x0", "0xf")]) == ipmi_guard.GUARD_REFUSED_RC
+    assert not execs and ipmi_guard.REFUSED_MARKER in capsys.readouterr().err
+
+
+def test_the_sudo_shim_refuses_anything_but_ipmitool(non_root, monkeypatch):
+    execs = _as_sudo(monkeypatch)
+    assert ipmi_guard.main(["rm", "-rf", "/"]) == ipmi_guard.GUARD_REFUSED_RC
+    assert ipmi_guard.main(["-n", "sh"]) == ipmi_guard.GUARD_REFUSED_RC
+    assert not execs
+
+
+def test_the_sudo_shim_sends_the_tray_reset_through_sudo_n(non_root, monkeypatch):
+    execs = _as_sudo(monkeypatch)
+    ipmi_guard.main(["ipmitool", *_raw("0xf", "0xff", "0x3", "0xf")])
+    assert execs == [["/usr/bin/sudo", "-n", "/usr/bin/ipmitool", *_raw("0xf", "0xff", "0x3", "0xf")]]
+
+
+def test_the_sudo_shim_runs_ipmitool_directly_when_the_node_opens(monkeypatch):
+    monkeypatch.setattr(ipmi_guard, "is_root", lambda: False)
+    monkeypatch.setattr(ipmi_guard, "ipmi_node_openable", lambda: True)
+    execs = _as_sudo(monkeypatch)
+    ipmi_guard.main(["-n", "ipmitool", *_raw("0xf", "0xff", "0x3", "0xf")])
+    assert execs == [["/usr/bin/ipmitool", *_raw("0xf", "0xff", "0x3", "0xf")]]
+
+
+@pytest.mark.asyncio
+async def test_a_non_root_server_without_the_sudo_rule_keeps_the_hold_and_climbs(ladder, non_root, monkeypatch):
+    rig = ladder
+    _launch(monkeypatch, rig, 0, "ok")
+    no_rule = subprocess.CompletedProcess([], 1, "", SUDO_NO_RULE)
+    monkeypatch.setattr(ipmi_guard, "_run_mc_info", lambda timeout: no_rule)
+    verifies = []
+    _verify_returning(monkeypatch, FOK, verifies)
+    out = await rig["g"]._reset_and_verify_device([str(i) for i in range(32)], lambda m: None)
+    assert out is False, "the ladder climbs to its next rung"
+    assert rig["launches"] == [], "no mesh reset ran"
+    assert srv.fsm.state is not srv.ServerState.HEALTHY, "the hold stays"
+    refused = [f for k, f in rig["events"] if k == "mesh_reset_bmc_preflight_refused"]
+    assert refused and ipmi_guard.SUDO_RULE in refused[0]["reason"]
