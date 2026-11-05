@@ -1870,6 +1870,8 @@ _pollers_to_restore: Optional[set[str]] = None
 # `systemctl is-active` states of a unit that is running or on its way up: a crash-looping poller
 # reads "activating" between restarts, and it was running all the same.
 _POLLER_RUNNING_STATES = ("active", "activating", "reloading", "refreshing")
+# A host with none of the listed poller units installed is said once per broker process, not per quiesce.
+_pollers_not_installed_logged = False
 logger: logging.Logger | None = None
 job_log_dir: Path | None = None
 job_runner_task: asyncio.Task | None = None  # Singleton job runner
@@ -6813,6 +6815,24 @@ def _note_poller_to_restore(svc: str, owed: bool) -> None:
         pass  # never let bookkeeping break a reset; the record in memory still holds
 
 
+async def _poller_unit_load_state(svc: str) -> str:
+    """systemd's LoadState for ``svc`` ("not-found" when the host has no such unit); "" when unread."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "systemctl",
+            "show",
+            "--property=LoadState",
+            "--value",
+            svc,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await aio.wait_for(proc.communicate(), timeout=10)
+    except (asyncio.TimeoutError, OSError, ValueError):
+        return ""  # unread: treated as installed, so a failed stop still flags the host at risk
+    return out.decode(errors="replace").strip()
+
+
 async def _set_device_pollers(active: bool, log) -> list[str]:
     """Stop (or restart) the daemons that continuously poll every chip.
 
@@ -6831,7 +6851,7 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
         # nothing, so its post-reset verify runs on the same quiet bus. The owner restarts them.
         log(f"device pollers kept stopped: {_pollers_held_for} still running")
         return []
-    global _pollers_owed
+    global _pollers_owed, _pollers_not_installed_logged
     if active:
         unfit = _pollers_unfit_reason()
         if unfit:
@@ -6898,13 +6918,27 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
         if left:
             log(f"left device pollers stopped (not running before the stop): {', '.join(left)}")
     if not touched and services:
-        # Pollers were configured, yet the verb reached none of them: on this host they resolve
-        # to no active unit. Quiescing was a no-op, so a reset about to run cannot assume it lands
-        # on a quiet bus — the real pollers may still be hammering MMIO under a name we were never
-        # told. On the stop path that is the host-reboot hazard the quiesce exists to prevent, so
-        # flag it host_at_risk; either way, do not let the absence read as a clean quiesce.
-        log(f"WARNING: no configured device poller answered '{verb}': {', '.join(services)}")
-        health_event("pollers_none_active", verb=verb, configured=list(services), host_at_risk=not active)
+        # Pollers were configured, yet the verb reached none of them. A host that has none of the
+        # listed units installed (systemd LoadState not-found) has nothing to quiesce: said once per
+        # broker process, not on every reset. Otherwise a listed unit exists and its verb failed:
+        # quiescing was a no-op, so a reset about to run cannot assume it lands on a quiet bus — the
+        # real pollers may still be hammering MMIO. On the stop path that is the host-reboot hazard
+        # the quiesce exists to prevent, so flag it host_at_risk; either way, do not let the
+        # absence read as a clean quiesce.
+        missing = [s for s in services if await _poller_unit_load_state(s) == "not-found"]
+        if len(missing) == len(services):
+            if not _pollers_not_installed_logged:
+                _pollers_not_installed_logged = True
+                log(f"no configured device poller unit is installed on this host: {', '.join(services)}")
+        else:
+            log(f"WARNING: no configured device poller answered '{verb}': {', '.join(services)}")
+            health_event(
+                "pollers_none_active",
+                verb=verb,
+                configured=list(services),
+                not_installed=missing,
+                host_at_risk=not active,
+            )
     health_event("pollers_" + ("restarted" if active else "quiesced"), services=touched)
     return touched
 

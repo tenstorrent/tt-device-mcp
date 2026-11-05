@@ -2997,28 +2997,31 @@ async def test_pollers_are_restarted_even_if_the_reset_raises(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_pollers_quiesce_journals_none_active_when_configured_units_resolve_to_nothing(monkeypatch):
-    """Configured poller units that resolve to no active unit make the quiesce a no-op: the reset
-    then lands on a bus the broker only ASSUMES is quiet, while the real pollers may still hammer
-    MMIO under a name it was never told — the exact condition that reboots the host. A no-op quiesce
-    must land in the journal loud, not read as a clean one."""
+async def test_pollers_quiesce_journals_none_active_when_an_installed_poller_will_not_stop(monkeypatch):
+    """Installed poller units whose stop fails make the quiesce a no-op: the reset then lands on a
+    bus the broker only ASSUMES is quiet, while the pollers may still hammer MMIO — the exact
+    condition that reboots the host. A no-op quiesce must land in the journal loud, not read as a
+    clean one."""
     monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service", "tt-metrics-exporter.service"))
 
-    class _NotLoaded:
-        returncode = 5  # `systemctl stop` against a unit not loaded on this host
+    class _StopFails:
+        returncode = 1  # the unit exists (LoadState loaded) but `systemctl stop` failed
 
         async def wait(self):
             return self.returncode
 
         async def communicate(self):
-            return b"inactive\n", b""
+            return (b"loaded\n" if self.verb == "show" else b"inactive\n"), b""
 
     async def _exec(*argv, **kw):
-        return _NotLoaded()
+        proc = _StopFails()
+        proc.verb = argv[1]
+        return proc
 
     monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _exec)
+    lines = []
 
-    touched = await srv._set_device_pollers(False, lambda m: None)
+    touched = await srv._set_device_pollers(False, lines.append)
 
     assert touched == []
     events = health.read_health_events(kinds={"pollers_none_active"})
@@ -3026,6 +3029,70 @@ async def test_pollers_quiesce_journals_none_active_when_configured_units_resolv
     assert events[0]["verb"] == "stop"
     assert events[0]["host_at_risk"] is True
     assert events[0]["configured"] == ["tt-telemetry.service", "tt-metrics-exporter.service"]
+    assert events[0]["not_installed"] == []
+    assert any(line.startswith("WARNING: no configured device poller") for line in lines), lines
+
+
+@pytest.mark.asyncio
+async def test_pollers_quiesce_logs_once_and_flags_nothing_when_no_poller_unit_is_installed(monkeypatch):
+    """A host with none of the listed units installed (LoadState not-found) has nothing to quiesce:
+    no WARNING and no host_at_risk event on any quiesce, and one plain log line per broker process."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service", "tt-metrics-exporter.service"))
+    calls = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units(set(), calls))
+    lines = []
+
+    for _ in range(3):
+        assert await srv._set_device_pollers(False, lines.append) == []
+
+    assert health.read_health_events(kinds={"pollers_none_active"}) == []
+    assert lines == ["no configured device poller unit is installed on this host: tt-telemetry.service, tt-metrics-exporter.service"]
+
+
+@pytest.mark.asyncio
+async def test_pollers_quiesce_flags_the_host_when_one_installed_poller_will_not_stop(monkeypatch):
+    """One listed unit missing does not excuse another that is installed and whose stop failed."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service", "tt-metrics-exporter.service"))
+    calls = []
+    systemctl = _systemctl_with_units(set(), calls)
+
+    async def _exec(*argv, **kw):
+        proc = await systemctl(*argv, **kw)
+        if argv[-1] == "tt-metrics-exporter.service":
+            if argv[1] == "show":
+                proc._out = b"loaded\n"
+            elif argv[1] == "stop":
+                proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _exec)
+
+    assert await srv._set_device_pollers(False, lambda m: None) == []
+
+    events = health.read_health_events(kinds={"pollers_none_active"})
+    assert len(events) == 1, events
+    assert events[0]["host_at_risk"] is True
+    assert events[0]["not_installed"] == ["tt-telemetry.service"]
+
+
+@pytest.mark.asyncio
+async def test_pollers_quiesce_flags_the_host_when_the_load_state_is_unreadable(monkeypatch):
+    """A LoadState read that fails counts the unit as installed: a failed stop still flags the host."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service",))
+    calls = []
+    systemctl = _systemctl_with_units(set(), calls)
+
+    async def _exec(*argv, **kw):
+        if argv[1] == "show":
+            raise OSError("systemctl unavailable")
+        return await systemctl(*argv, **kw)
+
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _exec)
+
+    assert await srv._set_device_pollers(False, lambda m: None) == []
+
+    events = health.read_health_events(kinds={"pollers_none_active"})
+    assert len(events) == 1 and events[0]["host_at_risk"] is True, events
 
 
 @pytest.mark.asyncio
@@ -3072,7 +3139,8 @@ def test_the_specs_name_the_default_pollers():
 
 def _systemctl_with_units(installed, calls, stopped=()):
     """A `systemctl` stand-in: 0 for a unit the host has, 5 (not loaded) for one it lacks. `is-active`
-    reads "active" for an installed unit unless it is in ``stopped``; a stop or start updates that."""
+    reads "active" for an installed unit unless it is in ``stopped``; a stop or start updates that. `show`
+    reads LoadState: "loaded", or "not-found" for a unit the host lacks."""
     stopped = set(stopped)
 
     class _Proc:
@@ -3092,6 +3160,8 @@ def _systemctl_with_units(installed, calls, stopped=()):
         if verb == "is-active":
             up = unit in installed and unit not in stopped
             return _Proc(0 if up else 3, b"active\n" if up else b"inactive\n")
+        if verb == "show":  # show --property=LoadState --value <unit>
+            return _Proc(0, b"loaded\n" if unit in installed else b"not-found\n")
         if unit in installed:
             (stopped.add if verb == "stop" else stopped.discard)(unit)
         return _Proc(0 if unit in installed else 5)

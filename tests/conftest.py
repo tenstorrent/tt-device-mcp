@@ -679,6 +679,7 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     # A poller restart one test deferred must not fire on the next test's close to HEALTHY.
     monkeypatch.setattr(srv, "_pollers_owed", None)
     monkeypatch.setattr(srv, "_pollers_owed_loop", None)
+    monkeypatch.setattr(srv, "_pollers_not_installed_logged", False)
 
     # No board types seen yet: the conservative default, and the machine type reads as unknown.
     # Nothing here can shell out — the cache is only ever filled by a health snapshot — so the
