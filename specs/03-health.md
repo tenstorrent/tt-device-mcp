@@ -1946,7 +1946,7 @@ cooldown (spec 04 I65) holds longer.
   pinned tree except `generated`, which is a real directory of its own, re-synced on every build of
   the command. `TT_METAL_RUNTIME_ROOT`, `TT_METAL_HOME` and `TT_METAL_LOGS_PATH` name it, and the
   kernel cache (`fabric-check/cache`, unless `TTDEV_FABRIC_CACHE` names one) and the output dir
-  live there too. Kernels, firmware and toolchain still come from the pinned tree, and nothing is
+  (`<cache>/cluster_validation_logs`, unless `TTDEV_FABRIC_OUTPUT` names one) live there too. Kernels, firmware and toolchain still come from the pinned tree, and nothing is
   written there. If the scratch, cache or output dir cannot be made writable, the command is still
   built but marked, and the check refuses to start the validator ("check cannot run (not
   writable)"): the gate journals `fabric_check_unavailable` (`not_runnable`) and the result is a
@@ -1955,10 +1955,12 @@ cooldown (spec 04 I65) holds longer.
   denied, read-only file system, operation not permitted, failed to create, open or write a file or
   directory) is classed as check unavailable on this host (`healthy=None`, its cause in the
   detail), never a device fault; a timeout, measured bad links, a wedged eth init, the validator's
-  own watchdog or links still missing after retrains are matched first and still fail. The check
+  own watchdog, a topology mismatch (a skip) or links still missing after retrains are matched
+  first and keep their own verdict. The check
   child runs with `RLIMIT_CORE=0`, so a crashing validator ends at once rather than run into the
   check's timeout while it writes a core, which would read as a wedge. An operator's own
-  `TT_DEVICE_MCP_FABRIC_CHECK_CMD` is untouched. Spec 04 I76 is unchanged: a hold this check
+  `TT_DEVICE_MCP_FABRIC_CHECK_CMD` keeps its argv, env and exit-code verdict (no scratch root, no
+  `classify()`); only the core limit applies to it too. Spec 04 I76 is unchanged: a hold this check
   cannot clear still gets the full ladder at the 10-min mark, then the host rung. Time to recover:
   no class gets a new wait; a validator crash on the fabric check now ends in seconds, not at the
   check's timeout.
