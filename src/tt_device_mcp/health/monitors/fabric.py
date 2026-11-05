@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import os
 import re
+import resource
 from pathlib import Path
 from typing import Optional
 
+from tt_device_mcp.constants import user_state_dir
 from tt_device_mcp.health.monitors.subproc import Terminate, Track, run_probe
 
 # The validator's own throw when generate_link_metrics finds a bad link under --hard-fail. This
@@ -282,6 +284,15 @@ _ASSERT_HEADER = re.compile(r"TT_(?:FATAL|THROW) @ ")
 _ASSERT_INFO = re.compile(r"[^\n]*\n[ \t]*info:[ \t]*\n[ \t]*(\S[^\n]*)")
 
 
+# A validator that died on the host's own filesystem (it could not create or open a file) measured
+# nothing on the device: its abort says the check cannot run here, never that the fabric is bad.
+_HOST_SIDE_ERROR = re.compile(
+    r"Permission denied|Read-only file system|Operation not permitted"
+    r"|[Ff]ailed to (?:create|open|write)\b[^\n]*\b(?:file|directory|dir)\b"
+)
+HOST_SIDE_UNAVAILABLE = "fabric check unavailable on this host (a host-side file error, not a device fault)"
+
+
 def first_reason(output: str) -> Optional[str]:
     """The validator's first error line, by :data:`_REASON_PATTERNS` priority, or ``None``.
     A TT_FATAL/TT_THROW header line gets its "info:" message appended.
@@ -338,6 +349,8 @@ def classify(rc: Optional[int], output: str) -> tuple[Optional[bool], str]:
     if _LINKS_MISSING_AFTER_RETRAIN.search(output):
         return False, "links the cabling descriptor expects are still missing after the validator's retrains"
     reason = first_reason(output)
+    if reason and _HOST_SIDE_ERROR.search(reason):
+        return None, f"{HOST_SIDE_UNAVAILABLE} (rc={rc}): {reason}"
     detail = f"validator did not complete a measurement (rc={rc})"
     if reason:
         detail += f": {reason}"
@@ -386,6 +399,50 @@ def validator_not_built() -> Optional[str]:
     return validator_missing()
 
 
+# Set in a built command's env when a non-root server has no writable scratch for the validator:
+# check() then refuses to start it rather than run it into a file it cannot create.
+NOT_WRITABLE_ENV = "TTDEV_FABRIC_NOT_WRITABLE"
+NOT_WRITABLE = "check cannot run (not writable)"
+
+
+def _scratch_runtime_root(scratch: Path, source: str) -> str:
+    """A writable stand-in for the validator's runtime root, for a server that is not root.
+
+    The pinned validator tree is root-owned, and metal writes under its runtime root and logs dir as
+    it runs (``generated/watcher`` kernel names, ``generated/inspector``, ``generated/fabric``
+    exports): as another user the Watcher aborts on the first of them. ``scratch/root`` links every
+    top-level entry of ``source`` except ``generated``, which is a real directory of its own, so the
+    kernels, firmware and toolchain still come from the pinned tree and nothing is written there.
+    Re-synced on every call, so a ``current`` flip that adds or drops an entry is followed.
+    Raises ``OSError`` when the scratch cannot be made or written."""
+    root = scratch / "root"
+    (root / "generated").mkdir(parents=True, exist_ok=True)
+    want = {name for name in os.listdir(source) if name != "generated"}
+    for name in want:
+        link, target = root / name, os.path.join(source, name)
+        if link.is_symlink() and os.readlink(link) == target:
+            continue
+        if link.is_symlink():
+            link.unlink()
+        os.symlink(target, link)
+    for name in os.listdir(root):
+        if name not in want and name != "generated" and (root / name).is_symlink():
+            (root / name).unlink()
+    if not os.access(root / "generated", os.W_OK | os.X_OK):
+        raise PermissionError(f"'{root / 'generated'}' is not writable")
+    return str(root)
+
+
+def _is_root() -> bool:
+    return os.geteuid() == 0
+
+
+def _no_core_dump() -> None:
+    """Child-side, before exec: a crashing validator must not sit for minutes writing a core (and
+    run the check into its timeout, which reads as a device fault)."""
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+
 def build_command(descriptor: bool = True) -> Optional[tuple[list[str], dict[str, str]]]:
     """The argv + env to run the fabric check with, or ``None`` when nothing is configured/available to run at all.
 
@@ -400,7 +457,12 @@ def build_command(descriptor: bool = True) -> Optional[tuple[list[str], dict[str
     every host gets a traffic-only check without it. A binary that has not been published yet is exactly as unavailable
     as no override at all, so both collapse to the same ``None``.
 
-    ``descriptor=False`` drops the cabling descriptor: the traffic-only rerun after a topology mismatch."""
+    ``descriptor=False`` drops the cabling descriptor: the traffic-only rerun after a topology mismatch.
+
+    Run by a non-root server, the cache, output and runtime root move to ``fabric-check/`` under its own
+    state dir (``_scratch_runtime_root``), with ``TT_METAL_LOGS_PATH`` there too. If that cannot be made
+    writable the command is still returned, marked ``NOT_WRITABLE_ENV``: the check is configured but
+    cannot run, which ``check()`` reports without starting the validator (a skip, never a pass)."""
     override = os.environ.get("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "").strip()
     if override:
         return ["/bin/bash", "-c", override], {**os.environ, "PYTHONUNBUFFERED": "1"}
@@ -410,9 +472,11 @@ def build_command(descriptor: bool = True) -> Optional[tuple[list[str], dict[str
     binpath, runtime_root, desc = _validator_paths()
     desc_argv = ["--cabling-descriptor-path", desc] if desc and descriptor else []
 
+    scratch = None if _is_root() else user_state_dir() / "fabric-check"
     # Dedicated so the (root-run) check never depends on $HOME and never pollutes a
     # user's own firmware/kernel cache.
-    cache = os.environ.get("TTDEV_FABRIC_CACHE", "").strip() or "/var/cache/tt-device-broker/fabric-tt-metal-cache"
+    default_cache = str(scratch / "cache") if scratch else "/var/cache/tt-device-broker/fabric-tt-metal-cache"
+    cache = os.environ.get("TTDEV_FABRIC_CACHE", "").strip() or default_cache
     try:
         Path(cache).mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -432,6 +496,16 @@ def build_command(descriptor: bool = True) -> Optional[tuple[list[str], dict[str
         "TT_METAL_RUNTIME_ROOT": runtime_root,
         "TT_METAL_HOME": runtime_root,
     }
+    if scratch is not None:
+        try:
+            root = _scratch_runtime_root(scratch, runtime_root)
+            for d in (cache, out):
+                if not os.access(d, os.W_OK | os.X_OK):
+                    raise PermissionError(f"'{d}' is not writable")
+        except OSError as e:
+            env[NOT_WRITABLE_ENV] = f"{NOT_WRITABLE}: {e}"
+        else:
+            env.update(TT_METAL_RUNTIME_ROOT=root, TT_METAL_HOME=root, TT_METAL_LOGS_PATH=root)
     return argv, env
 
 
@@ -462,7 +536,17 @@ async def check(
     ``env`` would silently relocate an override's cwd too, since ``env`` for that path is just
     ``os.environ`` and the broker's own process may already have that variable set.
     """
+    if env.get(NOT_WRITABLE_ENV):
+        raise PermissionError(env[NOT_WRITABLE_ENV])
     rc, raw = await run_probe(
-        argv, timeout_sec=timeout_sec, track=track, stream=True, env=env, cwd=cwd, terminate=terminate, name="fabric"
+        argv,
+        timeout_sec=timeout_sec,
+        track=track,
+        stream=True,
+        env=env,
+        cwd=cwd,
+        terminate=terminate,
+        name="fabric",
+        preexec_fn=_no_core_dump,
     )
     return rc, raw.decode("utf-8", "replace").strip()

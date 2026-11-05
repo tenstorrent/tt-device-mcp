@@ -32,7 +32,7 @@ from tt_device_mcp.health import evidence as health
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.core import HealthState
 from tt_device_mcp.health.monitor import HealthMonitor
-from tt_device_mcp.health.monitors import eth, heartbeat, pci
+from tt_device_mcp.health.monitors import eth, fabric, heartbeat, pci
 from tt_device_mcp.health.recovery import RecoveryDeps, offbus_power_cycle, pcie_guard
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy as recovery_galaxy
@@ -445,6 +445,8 @@ def _seal_real_hardware(monkeypatch, tmp_dirs):
     # setenv from another test, a host-level env file) — clear all three, and the override
     # command itself, so every test starts from the same "nothing configured or installed" floor.
     monkeypatch.setenv("TTDEV_VALIDATOR_ROOT", str(tmp_dirs.mktemp("no-fabric-validator")))
+    # The suite models the root broker whatever uid runs it; the non-root scratch paths have their own tests.
+    monkeypatch.setattr(fabric, "_is_root", lambda: True)
     monkeypatch.delenv("TTDEV_FABRIC_BIN", raising=False)
     monkeypatch.delenv("TTDEV_FABRIC_RUNTIME_ROOT", raising=False)
     monkeypatch.delenv("TTDEV_FABRIC_DESCRIPTOR", raising=False)

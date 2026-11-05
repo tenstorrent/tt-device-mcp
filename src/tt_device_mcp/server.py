@@ -4456,6 +4456,18 @@ def _opted_out(var: str) -> str:
     return f"{var}=0" if os.environ.get(var, "1").strip() == "0" else ""
 
 
+# A server that cannot fire the host rung though nobody opted out of it (spec 04 I76): its hold bound has
+# no step after the ladder, and it says so at startup, in /health and at the bound, never silently.
+RECOVERY_UNAVAILABLE = "recovery unavailable: no reset/power-cycle rights"
+
+
+def _recovery_unavailable() -> str:
+    """``RECOVERY_UNAVAILABLE`` and its cause, or "" when the power-cycle rung can fire or the operator opted out."""
+    if _opted_out("TT_DEVICE_MCP_AUTO_POWER_CYCLE") or _auto_power_cycle_enabled():
+        return ""
+    return f"{RECOVERY_UNAVAILABLE} ({_no_bmc_reason()})"
+
+
 def _no_bmc_reason() -> str:
     """Which half of the BMC capability is missing. The two have different fixes: one is a package,
     the other is a host or container that exposes no local IPMI interface at all."""
@@ -4506,6 +4518,9 @@ def log_rung_inventory() -> None:
         "ipmitool={ipmitool} ipmi_node={ipmi_node}".format(**priv)
     )
     logger.info("RUNG INVENTORY: " + ", ".join(f"{name}={'on' if on else 'OFF'}" for name, on, _ in rungs))
+    unavailable = _recovery_unavailable()
+    if unavailable:
+        logger.warning(f"BOOT {unavailable}: a hold past its 10-min bound gets the ladder and no power cycle")
     for name, on, why in rungs:
         # eth states its own reason in the self-test — but that only runs on the privsep path, so
         # elsewhere the inventory is the only place its OFF is ever explained.
@@ -9194,6 +9209,8 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
     # Spec 04 I91: why the last mesh reset did not run or did not count (BMC preflight refused, guard
     # not armed, tt-smi's op_mode 0x0 fallback refused or sent); null after a clean mesh reset.
     payload["mesh_reset_bmc_guard"] = getattr(recovery_mechanism, "bmc_guard_state", None)
+    # Spec 04 I76: this server cannot power-cycle (no rights, not an opt-out); null where it can.
+    payload["recovery_unavailable"] = _recovery_unavailable() or None
     # Spec 03 I71: the descriptor's port connections the last fabric pass found missing or extra, by
     # name; null after a clean pass on the full topology.
     payload["fabric_topology"] = (getattr(health_monitor, "fabric_topology", None) or None) if health_monitor else None
@@ -9916,6 +9933,7 @@ async def _hold_bound_host_rung(age: float, log, skipped: str = "") -> None:
     action = "power-cycle"
     if not _auto_power_cycle_enabled():
         _hold_bound_rung_pending, _hold_bound_cycle_age = False, age
+        why = _recovery_unavailable() or "the operator opted out of the power cycle"
         if _hold_bound_unarmed_paged != device_hold_episode_since:
             _hold_bound_unarmed_paged = device_hold_episode_since
             event = {
@@ -9923,9 +9941,10 @@ async def _hold_bound_host_rung(age: float, log, skipped: str = "") -> None:
                 "host": socket.gethostname(),
                 "held_since": device_hold_episode_since,
                 "held_age_sec": int(age),
+                "why": why,
             }
             health_event(event["kind"], **{k: v for k, v in event.items() if k != "kind"})
-        log("10-min hold bound: the ladder did not heal the hold and the operator opted out of the power cycle")
+        log(f"10-min hold bound: the ladder did not heal the hold and {why}")
         return
     blocker = await asyncio.to_thread(_bound_tenant_blocker, True)
     if blocker is not None:
@@ -10136,6 +10155,9 @@ def _hold_bound_health(now: Optional[datetime] = None) -> Optional[dict]:
         out["blocked_by"] = _describe_bound_blocker(_hold_bound_tenant_blocker)
     if cooling:
         out["cooldown_until"] = datetime.fromtimestamp(cd["until"]).isoformat(timespec="seconds")
+    unavailable = _recovery_unavailable()
+    if unavailable:
+        out["recovery_unavailable"] = unavailable  # the host rung next_step names cannot fire here
     return out
 
 
