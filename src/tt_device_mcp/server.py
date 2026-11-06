@@ -1136,6 +1136,16 @@ device_hold_escalate_bucket: int = 0
 # One early forced escalation per off-bus episode, tracked apart from the ceiling windows so it adds
 # an attempt rather than consuming one (see _offbus_hold_ceiling_sec).
 device_hold_offbus_escalated: bool = False
+# Spec 04 I110: the chips every off-bus one-shot of this episode was spawned for, and how many times a set lost after
+# the one-shot re-armed it. Both re-arm (empty, 0) with the episode.
+device_hold_offbus_shot_chips: set = set()
+device_hold_offbus_rearms: int = 0
+# At most this many re-arms per hold: each is one more forced run of the off-bus ladder, so a mesh that keeps shedding
+# chip sets gets its cheap rung for each of a few drops and the 10-min bound's full ladder for the rest.
+OFFBUS_ONE_SHOT_REARM_MAX = 3
+# No re-arm this close to the 10-min bound: a forced run still in flight at the bound would delay the bound's ladder
+# (and eat into its full check's deadline). Room for a bridge reset, a mesh reset and their full checks.
+OFFBUS_ONE_SHOT_REARM_MARGIN_SEC = 180
 # Whether the early one-shot (see _offbus_one_shot_sec) found a live tenant: the hold then keeps the
 # tenant's _offbus_hold_ceiling_sec wait for its one-shot. Re-arms (False) with the episode.
 device_hold_offbus_tenant_wait: bool = False
@@ -2800,6 +2810,7 @@ def _reset_for_testing():
     global device_op_stage_started_at, device_held_since, device_hold_escalated_monotonic, tenant_job_degraded_since
     global device_hold_deadline_bucket
     global device_hold_escalate_bucket, device_hold_offbus_escalated, device_hold_offbus_tenant_wait
+    global device_hold_offbus_rearms
     global device_hold_offbus_idle_early, device_hold_offbus_prior_bucket, device_hold_tenant_deferred
     global device_hold_job_bound_escalated, device_hold_escalation_trigger, device_hold_escalation_kind
     global _forced_escalation_task, _host_action_suppressed_logged, exec_scope_seq
@@ -2847,6 +2858,8 @@ def _reset_for_testing():
     device_hold_offbus_idle_early = False
     device_hold_offbus_prior_bucket = None
     _offbus_hold_chips.clear()
+    device_hold_offbus_shot_chips.clear()
+    device_hold_offbus_rearms = 0
     device_hold_tenant_deferred = False
     device_hold_job_bound_escalated = False
     device_hold_escalation_trigger = ""
@@ -8941,12 +8954,13 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
         at_start = hold_report.RungCandidate(now_epoch, "forced ladder", "fabric link-short at-start ladder")
         if add(candidates, at_start, "fabric_link_short"):
             return done(candidates)  # due: the watchdog's chain stops at it
-    if _offbus_one_shot_chips() and not device_hold_offbus_escalated:
-        one_shot = started + _offbus_one_shot_sec()
+    rearm = bool(_offbus_one_shot_new_chips(age))
+    if _offbus_one_shot_chips() and (not device_hold_offbus_escalated or rearm):
+        one_shot = now_epoch if rearm else started + _offbus_one_shot_sec()
         acts = add(
             candidates, hold_report.RungCandidate(one_shot, "forced ladder", "off-bus one-shot"), "offbus_one_shot"
         )
-        if acts and age >= _offbus_one_shot_sec():
+        if acts and (rearm or age >= _offbus_one_shot_sec()):
             return done(candidates)  # due: the watchdog's chain stops at it
     if _disproven_lift_bound_due(max(age, bound_sec)):
         # Spec 03 I42: the bound's early ladder, owed from one sampler tick in until a bound ladder ran.
@@ -9291,7 +9305,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     onto one degraded device writes a single ``device_held`` event, not one per job."""
     global device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global device_hold_deadline_bucket, device_hold_escalate_bucket
-    global device_hold_offbus_escalated
+    global device_hold_offbus_escalated, device_hold_offbus_rearms
     global device_hold_tenant_deferred, device_hold_offbus_prior_bucket, device_hold_offbus_tenant_wait
     global device_hold_escalated_monotonic, _hold_row, _hold_episode_restorable
     global device_hold_job_bound_escalated, _dispatch_reset_spent, _carried_hold, device_held_since
@@ -9440,6 +9454,8 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         device_hold_offbus_prior_bucket = None
         device_hold_offbus_tenant_wait = False
         _offbus_hold_chips.clear()
+        device_hold_offbus_shot_chips.clear()
+        device_hold_offbus_rearms = 0
         device_hold_tenant_deferred = False
         # ...and its held-job bound's attempt.
         device_hold_job_bound_escalated = False
@@ -10426,6 +10442,30 @@ def _offbus_one_shot_chips() -> set:
     return isolated_chips | _offbus_hold_chips
 
 
+def _offbus_one_shot_new_chips(age: float) -> list:
+    """Spec 04 I110: the chips that re-arm a spent off-bus one-shot, sorted; empty when it is not spent or may not re-arm.
+    They are the chips arming it now that no one-shot of this episode was spawned for, while re-arms are left and the
+    hold is at least OFFBUS_ONE_SHOT_REARM_MARGIN_SEC short of the 10-min bound, whose ladder takes the rest."""
+    if not device_hold_offbus_escalated or device_hold_offbus_rearms >= OFFBUS_ONE_SHOT_REARM_MAX:
+        return []
+    if not device_hold_offbus_shot_chips:  # spent with no record of its chips: nothing to tell a new set by
+        return []
+    if age >= _hold_bound_sec() - OFFBUS_ONE_SHOT_REARM_MARGIN_SEC:
+        return []
+    new = {str(c) for c in _offbus_one_shot_chips()} - device_hold_offbus_shot_chips
+    return sorted(new, key=lambda c: (len(c), c))
+
+
+def _offbus_one_shot_due(age: float) -> bool:
+    """Whether the watchdog spawns the off-bus one-shot now: armed and past its clock, or spent and re-armed by
+    chips lost since (spec 04 I110)."""
+    if not _offbus_one_shot_chips():
+        return False
+    if not device_hold_offbus_escalated:
+        return age >= _offbus_one_shot_sec()
+    return bool(_offbus_one_shot_new_chips(age))
+
+
 def _offbus_one_shot_sec() -> float:
     """Seconds an off-bus hold waits before its one-shot forced escalation. On a tenant-free box, one sampler interval:
     the first sampler tick at or past it is the second since the hold opened, so two samples have seen the chip still
@@ -10496,6 +10536,7 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     global device_hold_deadline_bucket, device_hold_escalate_bucket, device_hold_offbus_escalated
     global device_hold_risky_escalated, device_hold_escalation_trigger, device_hold_escalation_kind
     global device_hold_offbus_prior_bucket, device_hold_offbus_idle_early, _pci_wedged_asked
+    global device_hold_offbus_rearms
     if not device_hold_episode_since:
         return
     if _hold_episode_tenant and not _hold_is_tenant_held():
@@ -10581,11 +10622,29 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         _maybe_spawn_forced_escalation()
     elif only_77:
         pass
-    elif _offbus_one_shot_chips() and not device_hold_offbus_escalated and age >= _offbus_one_shot_sec():
+    elif _offbus_one_shot_due(age):
+        # Spec 04 I110: spent, the one-shot re-arms for chips lost since it ran (a mesh that sheds chip sets one
+        # after another), up to OFFBUS_ONE_SHOT_REARM_MAX times and never close to the bound.
+        new = _offbus_one_shot_new_chips(age) if device_hold_offbus_escalated else []
         device_hold_escalation_kind = "offbus_one_shot"
-        device_hold_escalation_trigger = f"the {int(_offbus_one_shot_sec())}s off-bus one-shot"
+        device_hold_escalation_trigger = (
+            f"the off-bus one-shot re-armed for chip(s) {new} lost after it ran"
+            if new
+            else f"the {int(_offbus_one_shot_sec())}s off-bus one-shot"
+        )
         device_hold_offbus_idle_early = not device_hold_offbus_tenant_wait and age < _offbus_hold_ceiling_sec()
         if _maybe_spawn_forced_escalation():
+            if new:
+                device_hold_offbus_rearms += 1
+                health_event(
+                    "offbus_one_shot_rearmed",
+                    chips=new,
+                    rearm=device_hold_offbus_rearms,
+                    rearm_max=OFFBUS_ONE_SHOT_REARM_MAX,
+                    held_age_sec=int(age),
+                    held_since=device_hold_episode_since,
+                )
+            device_hold_offbus_shot_chips.update(str(c) for c in _offbus_one_shot_chips())
             device_hold_offbus_escalated = True
             # A one-shot that waited out a tenant past the ceiling is that window's run as well: one
             # forced climb, not two back to back. Remember what it claimed over, to give back with it.
