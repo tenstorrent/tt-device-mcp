@@ -23,6 +23,13 @@ Only a run that completed and actually measured >=1 up-link core returns 3; ever
 attach failure, no measurable core, a read that raised, an operator env typo, OOM — is caught and
 returned as 77, and the wrapper folds a residual crash (exit 1) or a timeout SIGKILL to 77 too.
 FROZEN is therefore only ever a deliberate, evidenced verdict.
+
+Every run that got past the attach also prints one count line ahead of the verdict line:
+    eth-links: measured=<n> down=<n> unreadable=<n>
+``measured`` is the number of up-link cores whose heartbeat was read. The broker keeps a high-water
+mark of it, so a link that went down since the last read shows up as a drop in the count instead of
+as one core fewer silently skipped. ``down`` counts cores whose link is not up and ``unreadable``
+counts cores whose read raised or came back off-bus. The line changes no exit code.
 """
 
 import os
@@ -121,6 +128,8 @@ def main() -> int:
         return EXIT_CANNOT_CHECK
 
     measured = 0
+    down = 0
+    unreadable = 0
     frozen: list[str] = []
     for device in devices:
         if device.is_blackhole():
@@ -133,17 +142,21 @@ def main() -> int:
         for loc in device.active_eth_block_locations:
             try:
                 if not core_is_measurable(loc, regs, context):
+                    down += 1
                     continue
                 verdict = heartbeat_verdict(loc, regs.heartbeat, context, window, poll)
             except Exception as e:  # one unreadable core must not abort the sweep or fake a verdict
                 print(f"eth-heartbeat-probe: dev {device.id} {loc}: read error, skipping: {e}")
+                unreadable += 1
                 continue
             if verdict == "offbus":
+                unreadable += 1
                 continue
             measured += 1
             if verdict == "frozen":
                 frozen.append(f"dev{device.id}:{loc}")
 
+    print(f"eth-links: measured={measured} down={down} unreadable={unreadable}")
     if measured == 0:
         print("eth-heartbeat-probe: no active-eth core with its link up was measurable")
         return EXIT_CANNOT_CHECK

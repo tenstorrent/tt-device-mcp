@@ -9,6 +9,11 @@ import pytest
 
 import tt_device_mcp.device_holders as dh
 
+# Stubbed scans use small made-up pids. The reclaim's self-exclusion reads the real process group of each pid, so in a
+# pid namespace (a sandboxed run) a made-up pid can be a real process in this test's own group and be dropped as "self".
+# Calls that do not test the self-exclusion get an identity no stubbed pid can match.
+_NOT_SELF = {"getpid": lambda: -1, "getpgid": lambda pid: pid}
+
 
 class TestEnumerateDeviceHolders:
     def test_detects_self_holding_a_device_node(self, tmp_path, monkeypatch):
@@ -75,6 +80,7 @@ class TestEnumerateDeviceHolders:
         result = dh.enumerate_device_holders()
         assert result.complete is False
         assert result.holders == []
+        assert result.gaps == ["1 processes' fd tables unreadable"], "an incomplete scan must say what it missed"
 
     def test_vanished_process_is_skipped(self, monkeypatch):
         """A process that exits mid-scan (FileNotFoundError) is ignored, scan stays complete."""
@@ -103,6 +109,7 @@ def test_reclaim_signals_only_tenant_holders():
     )
     signals = []
     res = reclaim_foreign_holders(
+        **_NOT_SELF,
         grace_sec=0,
         kill=lambda pid, sig: signals.append((pid, sig)),
         sleep=lambda _: None,
@@ -125,6 +132,7 @@ def test_reclaim_escalates_term_to_kill():
     signals = []
     scans = [stubborn, stubborn, HolderScan(holders=[], complete=True)]
     res = reclaim_foreign_holders(
+        **_NOT_SELF,
         grace_sec=0,
         kill=lambda pid, sig: signals.append((pid, sig)),
         sleep=lambda _: None,
@@ -143,6 +151,7 @@ def test_reclaim_reports_a_survivor_rather_than_claiming_success():
 
     stuck = HolderScan(holders=[DeviceHolder(pid=4242, uid=1001)], complete=True)
     res = reclaim_foreign_holders(
+        **_NOT_SELF,
         grace_sec=0,
         kill=lambda pid, sig: None,
         sleep=lambda _: None,
@@ -170,6 +179,7 @@ def test_reclaim_tolerates_a_process_that_already_exited():
         raise ProcessLookupError(pid)
 
     res = reclaim_foreign_holders(
+        **_NOT_SELF,
         grace_sec=0,
         kill=gone,
         sleep=lambda _: None,
@@ -198,6 +208,7 @@ def test_reclaim_does_not_report_a_permission_denied_pid_as_signalled():
         raise PermissionError(pid)
 
     res = reclaim_foreign_holders(
+        **_NOT_SELF,
         grace_sec=0,
         kill=denied,
         sleep=lambda _: None,
@@ -213,7 +224,11 @@ def test_reclaim_carries_the_rescan_completeness():
     from tt_device_mcp.device_holders import HolderScan, reclaim_foreign_holders
 
     res = reclaim_foreign_holders(
-        grace_sec=0, kill=lambda p, s: None, sleep=lambda _: None, rescan=lambda: HolderScan(holders=[], complete=False)
+        **_NOT_SELF,
+        grace_sec=0,
+        kill=lambda p, s: None,
+        sleep=lambda _: None,
+        rescan=lambda: HolderScan(holders=[], complete=False),
     )
     assert res.scan_complete is False, "reclaim reported a blind re-scan as complete"
 
@@ -239,6 +254,7 @@ def test_reclaim_never_retargets_onto_a_new_holder_that_appears_after_it_began()
     ]
     signals = []
     res = reclaim_foreign_holders(
+        **_NOT_SELF,
         grace_sec=0,
         kill=lambda pid, sig: signals.append((pid, sig)),
         sleep=lambda _: None,
@@ -305,6 +321,7 @@ def test_reclaim_reports_a_pid_that_died_to_an_earlier_round_as_signalled():
         HolderScan(holders=[newcomer], complete=True),  # final rescan
     ]
     res = reclaim_foreign_holders(
+        **_NOT_SELF,
         grace_sec=0,
         kill=lambda pid, sig: None,
         sleep=lambda _: None,
@@ -349,6 +366,7 @@ def test_reclaim_never_escalates_onto_a_pid_reused_by_an_unrelated_process():
 
     signals = []
     res = reclaim_foreign_holders(
+        **_NOT_SELF,
         grace_sec=1,  # truthy, so `sleep` (and thus the reuse) actually happens between rounds
         kill=lambda pid, sig: signals.append((pid, sig)),
         sleep=fake_sleep,
@@ -371,6 +389,7 @@ def test_reclaim_never_signals_a_target_whose_starttime_was_unreadable_at_select
     scan = HolderScan(holders=[unreadable], complete=True)
     signals = []
     res = reclaim_foreign_holders(
+        **_NOT_SELF,
         grace_sec=0,
         kill=lambda pid, sig: signals.append((pid, sig)),
         sleep=lambda _: None,
@@ -402,6 +421,7 @@ def test_reclaim_revalidates_identity_immediately_before_the_first_signal_too():
 
     signals = []
     reclaim_foreign_holders(
+        **_NOT_SELF,
         grace_sec=0,
         kill=lambda pid, sig: signals.append((pid, sig)),
         sleep=lambda _: None,
@@ -421,7 +441,7 @@ def test_reclaim_with_nothing_to_reclaim_does_not_rescan_again():
     scans = [HolderScan(holders=[], complete=False), HolderScan(holders=[], complete=True)]
 
     res = reclaim_foreign_holders(
-        grace_sec=0, kill=lambda p, s: None, sleep=lambda _: None, rescan=lambda: scans.pop(0)
+        **_NOT_SELF, grace_sec=0, kill=lambda p, s: None, sleep=lambda _: None, rescan=lambda: scans.pop(0)
     )
     assert res.scan_complete is False, "reclaim used a second rescan instead of the first scan's own completeness"
 
@@ -516,6 +536,7 @@ class TestDriverHolderRecord:
 
         assert scan.holders == []
         assert scan.complete is False, "an unattributable holder read as an empty, complete scan"
+        assert scan.gaps == [f"pid {absent} named by the driver has no /proc entry here"]
         assert dh.evaluate_reset_gate(os.getuid(), scan).allowed is False
 
     def test_a_pid_that_holds_no_device_here_is_not_attributed(self, tmp_path, monkeypatch):
@@ -535,6 +556,11 @@ class TestDriverHolderRecord:
 
         assert scan.holders == [], "a pid holding no device node was attributed as a holder"
         assert scan.complete is False
+        # The same shape as a probe killed on its timeout and not yet reaped (fd table gone, the
+        # driver's release still running): the gap names the pid, its comm and its run state.
+        comm, state = dh.holder_comm(os.getpid()), dh.holder_state(os.getpid())
+        assert comm != "?" and state != "?"
+        assert scan.gaps == [f"pid {os.getpid()} ({comm}, state {state}) named by the driver holds no device fd here"]
 
     def test_an_unreadable_device_file_marks_the_scan_incomplete(self, tmp_path, monkeypatch):
         """Readable devices still answer, but the driver knows of holders we could not enumerate."""
@@ -549,6 +575,7 @@ class TestDriverHolderRecord:
 
         assert scan.source == "driver"
         assert scan.complete is False
+        assert scan.gaps == ["a per-device driver pids file was unreadable"]
 
     def test_an_absent_driver_dir_falls_back_to_the_walk(self, tmp_path, monkeypatch):
         """A host whose tt-kmd predates this interface must not read as 'no holders'."""
@@ -595,3 +622,16 @@ class TestDriverHolderRecord:
 
         assert scan.source == "proc"
         assert any(h.pid == os.getpid() for h in scan.holders)
+
+
+def test_read_proc_ppid_reads_this_process_parent():
+    """The real /proc parse (no device involved): our own ppid, and None for a pid that is gone."""
+    assert dh._read_proc_ppid(os.getpid()) == os.getppid()
+    assert dh._read_proc_ppid(2**22 + 1) is None  # above pid_max
+
+
+def test_holder_comm_and_state_read_unknown_for_a_gone_pid():
+    """A log line about a holder never raises over a pid that has already exited."""
+    gone = 2**22 - 1
+    assert dh.holder_comm(gone) == "?"
+    assert dh.holder_state(gone) == "?"

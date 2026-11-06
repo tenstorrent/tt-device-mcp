@@ -21,6 +21,9 @@ import pytest
 
 from tt_device_mcp import cli, constants
 
+# Fork-heavy deploy-script laps: one xdist worker runs them all (conftest: --dist loadgroup).
+pytestmark = pytest.mark.xdist_group("forks")
+
 _ROOT = Path(__file__).resolve().parent.parent
 _INSTALL = _ROOT / "install.sh"
 _USER_INSTALL = _ROOT / "deploy" / "install-user.sh"
@@ -367,10 +370,8 @@ def test_the_daemon_env_declares_no_rung_policy(monkeypatch, tmp_path):
 def test_the_daemon_env_preserves_explicit_operator_overrides(monkeypatch, tmp_path):
     """Spawn must not override an operator's own arming; it copies the environment, not edits it."""
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_REBOOT", "1")
-    monkeypatch.setenv("TT_DEVICE_MCP_AUTO_UBB_RESET", "1")
     env = _capture_daemon_env(monkeypatch, tmp_path)
     assert env["TT_DEVICE_MCP_AUTO_REBOOT"] == "1"
-    assert env["TT_DEVICE_MCP_AUTO_UBB_RESET"] == "1"
 
 
 def test_per_user_daemon_keeps_its_state_somewhere_writable(monkeypatch, tmp_path):

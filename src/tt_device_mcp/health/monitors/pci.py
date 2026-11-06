@@ -11,12 +11,15 @@ holds the value, so a probe here is a file read and nothing reaches the chip.
 
 from __future__ import annotations
 
+import json
 import os
+import re
+import threading
 import time
 from pathlib import Path
 from typing import Optional
 
-from tt_device_mcp.health import evidence
+from tt_device_mcp.health import chip_state, evidence
 
 SYSFS_CLASS_DIR = Path(os.environ.get("TT_DEVICE_MCP_SYSFS_DIR", "/sys/class/tenstorrent"))
 
@@ -71,8 +74,14 @@ def _sum_aer(path: Path) -> Optional[int]:
     return total
 
 
+def _read_attr(path: Path) -> str:
+    """One sysfs attribute read. For a chip's telemetry and link config this is a PCIe read of the chip."""
+    return path.read_text()
+
+
 def chip_snapshot() -> dict:
-    """Everything the host knows about the chips without touching them.
+    """Everything the host knows about the chips. The telemetry attributes and link config are PCIe reads of each chip,
+    so a chip confirmed lost is listed without them (spec 03 I66).
 
     This is the record that makes a post-mortem possible. When a chip wedges, the
     question is always "what was it doing beforehand" — was it hot, was it throttling,
@@ -95,9 +104,16 @@ def chip_snapshot() -> dict:
         if not idx.isdigit():
             continue
         rec: dict = {}
+        # A chip confirmed lost or fenced is not read (spec 03 I66/I97): its attributes and its link config are PCIe
+        # reads that would stall on it and hold up its PCI remove. The fence is checked before EACH read, so a
+        # containment that starts mid-chip stops the next one. The AER counters below are kernel memory and stay.
+        lost = chip_state.read_blocked(idx)
         for attr in _CHIP_ATTRS:
+            if lost or chip_state.read_blocked(idx):
+                lost = True
+                break
             try:
-                val = (ent / attr).read_text().strip()
+                val = _read_attr(ent / attr).strip()
             except OSError:
                 continue
             rec[attr] = int(val) if val.isdigit() else val
@@ -110,8 +126,11 @@ def chip_snapshot() -> dict:
                 ("max_link_width", "link_width_max"),
                 ("current_link_speed", "link_speed"),
             ):
+                if lost or chip_state.read_blocked(idx):
+                    lost = True
+                    break
                 try:
-                    rec[key] = (pci / f).read_text().strip()
+                    rec[key] = _read_attr(pci / f).strip()
                 except OSError:
                     pass
             for f, key in (
@@ -124,6 +143,8 @@ def chip_snapshot() -> dict:
                     rec[key] = _sum_aer(p)
         except OSError:
             pass
+        if lost:
+            rec["lost"] = True
         chips[idx] = rec
     return chips
 
@@ -183,12 +204,14 @@ SAMPLE_RING_SIZE = int(os.environ.get("TT_DEVICE_MCP_SAMPLE_RING", "120"))
 
 
 def chip_sample() -> dict:
-    """One compact sample of every chip's volatile state. Zero device touches.
+    """One compact sample of every chip's volatile state.
 
-    Compact on purpose: this runs every few seconds for the life of a job, so it carries
-    the moving values only, as a flat list per chip — [heartbeat, aiclk, arcclk,
-    therm_trips, aer_correctable, aer_fatal].
-    """
+    Compact on purpose: this runs every few seconds for the life of a job, so it carries the moving values only, as a
+    flat list per chip — [heartbeat, aiclk, arcclk, therm_trips, aer_correctable, aer_fatal].
+
+    The four telemetry values are PCIe reads of the chip. A chip confirmed lost reads as [ALL_ONES, None, None, None,
+    ...] without touching it; when its re-read is due (:func:`chip_state.may_read`) only its heartbeat is read, once
+    (spec 03 I66)."""
     out: dict = {}
     try:
         entries = sorted(SYSFS_CLASS_DIR.iterdir())
@@ -199,12 +222,30 @@ def chip_sample() -> dict:
         if not idx.isdigit():
             continue
         row = []
-        for attr in _VOLATILE:
+        lost = chip_state.is_lost(idx)
+        # A fenced chip (read all-ones, not yet confirmed) is read like a lost one, under the probe
+        # rules: the sampler's next read is the confirm read, heartbeat only (spec 03 I97).
+        fenced = not lost and chip_state.is_fenced(idx)
+        attrs = _VOLATILE
+        if (lost or fenced) and not chip_state.may_read(idx, ent, probe=fenced):
+            attrs = ()
+            row = [chip_state.ALL_ONES, None, None, None]
+        elif (lost and chip_state.is_lost(idx)) or (fenced and chip_state.is_fenced(idx)):
+            attrs = _VOLATILE[:1]
+        for n, attr in enumerate(attrs):
+            # Fenced mid-row by a containment: stop reading the chip.
+            if attrs is _VOLATILE and chip_state.read_blocked(idx):
+                row.extend([chip_state.ALL_ONES] if n == 0 else [])
+                row.extend([None] * (len(_VOLATILE) - len(row)))
+                break
             try:
-                v = (ent / attr).read_text().strip()
+                v = _read_attr(ent / attr).strip()
                 row.append(int(v) if v.isdigit() else v)
             except OSError:
                 row.append(None)
+        if attrs == _VOLATILE[:1]:
+            chip_state.observe(idx, row[0])
+            row.extend([None, None, None])
         try:
             pci = (ent / "device").resolve()
             row.append(_sum_aer(pci / "aer_dev_correctable"))
@@ -217,6 +258,107 @@ def chip_sample() -> dict:
 
 SAMPLE_FIELDS = list(_VOLATILE) + ["aer_correctable", "aer_fatal"]
 
+_BDF = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$")
+
+
+def _uncorrectable_aer(dev: Path) -> Optional[int]:
+    """Uncorrectable (non-fatal + fatal) AER errors the kernel has counted on one PCI function: its own
+    ``aer_dev_nonfatal``/``aer_dev_fatal`` and, on a root port, the ``aer_rootport_total_err_*`` messages it received
+    from below, plus the one correctable row that is not link noise (``NonFatalErr`` in ``aer_dev_correctable``: an
+    Advisory Non-Fatal error, i.e. an uncorrectable error the device downgraded, such as a completion timeout or an
+    unsupported request). None when no counter could be read. The other correctable rows (RxErr, BadTLP, Timeout, ...)
+    are left out on purpose: they are routine on a healthy link and would arm the watch all day. A chip that stops
+    answering with its reads in flight shows first as an Advisory Non-Fatal storm on the port above it, often reported
+    firmware-first, so this row is the earliest kernel signal of it."""
+    total, seen = 0, False
+    try:
+        for line in (dev / "aer_dev_correctable").read_text().splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "NonFatalErr" and parts[1].isdigit():
+                total, seen = total + int(parts[1]), True
+    except OSError:
+        pass
+    for name in ("aer_dev_nonfatal", "aer_dev_fatal"):
+        p = dev / name
+        if p.exists():
+            v = _sum_aer(p)
+            if v is not None:
+                total, seen = total + v, True
+    for name in ("aer_rootport_total_err_nonfatal", "aer_rootport_total_err_fatal"):
+        try:
+            total += int((dev / name).read_text().strip())
+            seen = True
+        except (OSError, ValueError):
+            continue
+    return total if seen else None
+
+
+def link_signals() -> dict:
+    """The kernel's own record of PCIe trouble on every chip's path, for the sampler's early off-bus watch (spec 03
+    I79): ``{"chips": [index, ...], "aer": {bdf: uncorrectable total}}``.
+
+    ``chips`` is the KMD node list; ``aer`` covers each chip's endpoint and every port above it up to the root port,
+    keyed by PCI address, so a link drop the port above a chip counted shows even when the chip's own counters did not
+    move (a vanished node is its own signal). ``paths`` maps each chip index to the addresses on its own path, endpoint
+    first, so a rise can be pinned to the chips below the port that counted it. Every value here is a counter the kernel
+    keeps in memory: no read reaches a chip, a switch or a config space, which is what makes it safe to take every
+    second while a chip may be dying (an access at a dead endpoint is what stalls a CPU core). The link-state attributes
+    (``current_link_speed``/``width``) are config reads and stay out."""
+    chips: list = []
+    aer: dict = {}
+    paths: dict = {}
+    try:
+        entries = sorted(SYSFS_CLASS_DIR.iterdir())
+    except OSError:
+        return {"chips": chips, "aer": aer, "paths": paths}
+    for ent in entries:
+        idx = ent.name.rsplit("!", 1)[-1]
+        if not idx.isdigit():
+            continue
+        chips.append(idx)
+        try:
+            dev = (ent / "device").resolve()
+        except OSError:
+            continue
+        path = paths.setdefault(idx, [])
+        while _BDF.match(dev.name):
+            path.append(dev.name)
+            if dev.name not in aer:
+                aer[dev.name] = _uncorrectable_aer(dev)
+            dev = dev.parent
+    return {"chips": chips, "aer": aer, "paths": paths}
+
+
+def config_vendor_id(bdf: str) -> Optional[int]:
+    """The vendor ID in ``bdf``'s config space, one 2-byte config read (spec 03 I96), or None when unreadable. 0xFFFF is
+    the all-ones a function off the bus answers. Unlike :func:`link_signals` this read reaches the device, so only the
+    dead-chip watch takes it, once per trigger, and only behind its own constant."""
+    try:
+        with open(f"/sys/bus/pci/devices/{bdf}/config", "rb", buffering=0) as f:
+            raw = f.read(2)
+    except OSError:
+        return None
+    return int.from_bytes(raw, "little") if len(raw) == 2 else None
+
+
+def link_active(bdf: str) -> Optional[bool]:
+    """Data Link Layer Link Active (PCIe Link Status bit 13) of the port ``bdf``, or None when it cannot be read (spec
+    03 I96). Meant for a chip's root port, never the chip: config reads of the port's own capability list."""
+    try:
+        with open(f"/sys/bus/pci/devices/{bdf}/config", "rb", buffering=0) as f:
+            cfg = f.read(256)
+    except OSError:
+        return None
+    if len(cfg) < 64 or not cfg[0x06] & 0x10:  # no capability list
+        return None
+    pos, seen = cfg[0x34] & 0xFC, set()
+    while pos and pos + 0x14 <= len(cfg) and pos not in seen:
+        seen.add(pos)
+        if cfg[pos] == 0x10:  # PCI Express capability
+            return bool(int.from_bytes(cfg[pos + 0x12 : pos + 0x14], "little") & 0x2000)
+        pos = cfg[pos + 1] & 0xFC
+    return None
+
 
 def chip_pci_bdf(idx: str) -> Optional[str]:
     """The PCI address behind a chip index, e.g. '0000:46:00.0'."""
@@ -224,6 +366,194 @@ def chip_pci_bdf(idx: str) -> Optional[str]:
         return (SYSFS_CLASS_DIR / f"tenstorrent!{idx}" / "device").resolve().name
     except OSError:
         return None
+
+
+def sysfs_chip_ids() -> list[str]:
+    """Every chip index the KMD exposes a class node for, sorted, from the directory listing alone.
+
+    No attribute is read, so a chip whose heartbeat (or any other attribute) cannot be read is
+    still listed: this is enumeration, not liveness. Use it wherever "which chips does the kernel
+    have" is the question, e.g. the startup chip-index-to-PCI-address map the bridge rung needs."""
+    try:
+        entries = list(SYSFS_CLASS_DIR.iterdir())
+    except OSError:
+        return []
+    ids = (ent.name.rsplit("!", 1)[-1] for ent in entries)
+    return sorted((i for i in ids if i.isdigit()), key=int)
+
+
+def chip_pci_bdfs() -> dict:
+    """Every chip index the KMD currently exposes, mapped to its PCI address: ``{0: '0000:01:00.0', ...}``. A chip whose
+    address cannot be read is left out.
+
+    The kernel's chip index is the one /dev, sysfs and the heartbeat read use, and it need not follow PCI order — so
+    this, not a list position in a tt-smi snapshot, is what ties a chip index to its bus."""
+    out: dict = {}
+    try:
+        entries = sorted(SYSFS_CLASS_DIR.iterdir())
+    except OSError:
+        return out
+    for ent in entries:
+        idx = ent.name.rsplit("!", 1)[-1]
+        if not idx.isdigit():
+            continue
+        bdf = chip_pci_bdf(idx)
+        if bdf and pci_bus_number(bdf) is not None:
+            out[int(idx)] = bdf
+    return out
+
+
+def pci_bus_number(address) -> Optional[int]:
+    """The bus number of a PCI address ('0000:81:00.0' -> 0x81), or None when unreadable."""
+    try:
+        return int(str(address).split(":")[1], 16)
+    except (IndexError, ValueError):
+        return None
+
+
+# Chips this broker cut out of the kernel itself (isolate_chip), chip index -> {"bdf", "bridge"}.
+# Once the endpoint's node is removed its parent link is gone with it, so the bridge a reset must
+# go through is recorded HERE, before the remove. A chip in this map is hung AND un-enumerated by
+# us: re-enumerating it without a reset first lets the driver probe a hung chip (spec 04 I69).
+# Kept on disk too (REMOVED_CHIPS_FILE), so a broker restart does not forget a chip it removed.
+REMOVED_CHIPS: dict = {}
+# The rung, the sampler and the gate read and write the records from worker threads.
+_REMOVED_LOCK = threading.RLock()
+# One write of the records file at a time (its temp name is shared).
+_SAVE_LOCK = threading.Lock()
+REMOVED_CHIPS_FILE = "removed_chips.json"
+# Spec 04 I98: how many times each chip was seen back on the bus (forget_removed_chip), so the hold's
+# SBR record can tell a chip that came back and dropped again from one that never returned.
+_BACK_SEQ: dict = {}
+BOOT_ID_FILE = Path("/proc/sys/kernel/random/boot_id")
+
+_BDF_RE = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]")
+
+
+def parent_bridge(bdf: Optional[str]) -> Optional[str]:
+    """The BDF of the bridge directly above an enumerated endpoint, or None."""
+    if not bdf:
+        return None
+    try:
+        bridge = (PCI_DEVICES_DIR / bdf).resolve().parent.name
+    except OSError:
+        return None
+    return bridge if _BDF_RE.fullmatch(bridge) else None
+
+
+def _boot_id() -> str:
+    try:
+        return BOOT_ID_FILE.read_text().strip()
+    except OSError:
+        return ""
+
+
+def _save_removed_chips(health_dir: Optional[Path] = None) -> None:
+    """Write the records with this boot's id, atomically. State that cannot be written must not
+    break recovery: the in-memory records still guard this process. One write at a time, each of the
+    records as they are when it runs, so the last write always holds the latest state."""
+    try:
+        with _SAVE_LOCK:
+            with _REMOVED_LOCK:
+                chips = dict(REMOVED_CHIPS)
+            body = json.dumps({"boot_id": _boot_id(), "chips": chips})
+            p = (health_dir or evidence.health_dir()) / REMOVED_CHIPS_FILE
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_name(p.name + ".tmp")
+            tmp.write_text(body)
+            os.replace(tmp, p)
+    except Exception:  # noqa: BLE001 - persistence is best effort; recovery must go on
+        pass
+
+
+def load_removed_chips() -> list:
+    """Reload the records a previous broker process of THIS boot left, at broker start (spec 04 I69). A record from
+    another boot is dropped: the boot reset every endpoint, so the chip is no longer un-reset, and its bus numbers may
+    have moved. Records of chips back on the bus are dropped too. Returns the chip ids still recorded; the caller
+    isolates them, so the bridge rung resets each through its recorded bridge before anything re-enumerates it. The file
+    is rewritten only when a record was dropped."""
+    try:
+        data = json.loads((evidence.health_dir() / REMOVED_CHIPS_FILE).read_text())
+    except (OSError, ValueError):
+        data = None
+    chips = data.get("chips") if isinstance(data, dict) else None
+    if isinstance(chips, dict) and chips:
+        if data.get("boot_id") and data.get("boot_id") == _boot_id():
+            with _REMOVED_LOCK:
+                for idx, rec in chips.items():
+                    if str(idx).isdigit() and isinstance(rec, dict):
+                        REMOVED_CHIPS.setdefault(str(idx), {"bdf": rec.get("bdf"), "bridge": rec.get("bridge")})
+                loaded = sorted(REMOVED_CHIPS, key=int)
+            evidence.health_event("removed_chip_records_loaded", chips=loaded)
+        else:
+            _save_removed_chips()
+            evidence.health_event("removed_chip_records_cleared", chips=sorted(chips), reason="new_boot")
+    forget_returned_removed_chips("broker start")
+    return removed_chip_ids()
+
+
+def _back_on_bus(idx: str, rec: dict) -> bool:
+    """Whether anything is enumerated again at the removed chip's recorded address. Keyed on the
+    address, not on ``tenstorrent!<idx>``: the driver may hand that index to another chip."""
+    bdf = rec.get("bdf") if isinstance(rec, dict) else None
+    try:
+        if bdf:
+            return (PCI_DEVICES_DIR / bdf).exists()
+        return (SYSFS_CLASS_DIR / f"tenstorrent!{idx}").exists()
+    except OSError:
+        return False
+
+
+def forget_returned_removed_chips(context: str) -> list:
+    """Drop every record whose chip is enumerated again, whatever brought it back (a bridge reset, a
+    mesh reset, an external tray re-power, a power cycle, an outside rescan): a record only describes a chip
+    that is still off the bus. Left standing, it would withhold every later rescan and aim a bridge
+    reset at a bus that now holds live silicon. Never releases anything (spec 04 I69)."""
+    with _REMOVED_LOCK:
+        back = [i for i, rec in sorted(REMOVED_CHIPS.items(), key=lambda kv: int(kv[0])) if _back_on_bus(i, rec)]
+        for i in back:
+            REMOVED_CHIPS.pop(i, None)
+            # Seen back on the bus, as in forget_removed_chip: out of the hold's SBR record (spec 04 I98).
+            _BACK_SEQ[i] = _BACK_SEQ.get(i, 0) + 1
+    if back:
+        _save_removed_chips()
+        evidence.health_event("removed_chip_records_cleared", chips=back, reason="back_on_bus", context=context)
+    return back
+
+
+def removed_chip(idx) -> Optional[dict]:
+    """The record isolate_chip left for a chip it removed, or None when the broker did not remove it
+    or the chip is back on the bus."""
+    with _REMOVED_LOCK:
+        rec = REMOVED_CHIPS.get(str(idx))
+    if rec is not None and _back_on_bus(str(idx), rec):
+        forget_returned_removed_chips("record read")
+        return None
+    return rec
+
+
+def removed_chip_ids() -> list:
+    """Every chip that still has a removal record and is still off the bus, sorted by index."""
+    forget_returned_removed_chips("record read")
+    with _REMOVED_LOCK:
+        return sorted(REMOVED_CHIPS, key=int)
+
+
+def forget_removed_chip(idx) -> None:
+    with _REMOVED_LOCK:
+        gone = REMOVED_CHIPS.pop(str(idx), None)
+        _BACK_SEQ[str(idx)] = _BACK_SEQ.get(str(idx), 0) + 1
+    if gone is not None:
+        _save_removed_chips()
+
+
+def chip_back_seq(idx) -> int:
+    """How many times chip ``idx`` was seen back on the bus in this process (spec 04 I98)."""
+    with _REMOVED_LOCK:
+        return _BACK_SEQ.get(str(idx), 0)
+
+
+_save_thread: Optional[threading.Thread] = None
 
 
 def isolate_chip(idx: str) -> bool:
@@ -246,10 +576,24 @@ def isolate_chip(idx: str) -> bool:
         # A silent False here reads as "isolated" to the caller; journal it as the hazard.
         evidence.health_event("chip_isolation_failed", chip=idx, reason="no_pci_bdf", host_at_risk=True)
         return False
+    # Record the bridge BEFORE the remove: afterwards the node and its parent link are gone.
+    rec = {"bdf": bdf, "bridge": parent_bridge(bdf)}
+    with _REMOVED_LOCK:
+        REMOVED_CHIPS[str(idx)] = rec
+    # The file write runs beside the remove, never ahead of it (spec 03 I99): on a host whose I/O
+    # stalls, a write before the remove would hold the remove up while the dead chip stays mapped.
+    try:
+        where: Optional[Path] = evidence.health_dir()
+    except Exception:  # noqa: BLE001 - the save finds out on its own; the remove goes on
+        where = None
+    global _save_thread
+    _save_thread = threading.Thread(target=_save_removed_chips, args=(where,), name="removed-chips-save", daemon=True)
+    _save_thread.start()
     try:
         (PCI_DEVICES_DIR / bdf / "remove").write_text("1")
         return True
     except OSError as e:
+        forget_removed_chip(idx)
         evidence.health_event(
             "chip_isolation_failed", chip=idx, bdf=bdf, reason="remove_write_failed", error=str(e), host_at_risk=True
         )
