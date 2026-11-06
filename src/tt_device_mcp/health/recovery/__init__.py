@@ -433,6 +433,8 @@ class Recovery(ABC):
         # The chips the last _recover_isolated_chips call reached with a bridge write, whatever came of
         # it (spec 04 I98): the hold's SBR record keys on this, not on the reasons above.
         self.last_bridge_reset_fired: set = set()
+        # Spec 04 I110: a monotonic time after which no bridge reset call starts (None: no cutoff).
+        self.bridge_reset_cutoff: Optional[float] = None
 
     @abstractmethod
     def next_stage(self, ev: Evidence) -> str:
@@ -679,6 +681,12 @@ class Recovery(ABC):
                     if all((pci.SYSFS_CLASS_DIR / f"tenstorrent!{i}").exists() for i in removed):
                         break
         for idx in targets:
+            if self.bridge_reset_cutoff is not None and time.monotonic() >= self.bridge_reset_cutoff and not wedged:
+                # Spec 04 I110: a re-armed one-shot's pass ends before the 10-min bound; the bound's ladder takes the rest.
+                withheld.append(idx)
+                self.last_bridge_reset_reasons[idx] = {"reason": "past_cutoff"}
+                metrics.stage_fired("bridge_reset", "blocked")
+                continue
             if wedged and idx not in lost:
                 withheld.append(idx)
                 self.last_bridge_reset_reasons[idx] = {"reason": "pci_wedged"}
@@ -731,6 +739,10 @@ class Recovery(ABC):
             # A removed chip already spent one try on the reset above.
             tries = BRIDGE_RESET_MAX_TRIES - 1 if idx in reset_this_pass else BRIDGE_RESET_MAX_TRIES
             for attempt in range(tries):
+                if attempt and self.bridge_reset_cutoff is not None and time.monotonic() >= self.bridge_reset_cutoff:
+                    lost.append(idx)  # spec 04 I110: no retry past the cutoff
+                    metrics.stage_fired("bridge_reset", "failed")
+                    break
                 if idx in reset_this_pass and attempt == 0:
                     await asyncio.sleep(BRIDGE_RESET_SETTLE_SEC)
                 FABRIC_DEBT.note_reset(f"bridge reset of chip {idx}")

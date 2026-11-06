@@ -22,7 +22,12 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from tt_device_mcp import metrics, pre_reset_scan
-from tt_device_mcp.constants import PRE_RESET_ZOMBIE_WAIT_SEC
+from tt_device_mcp.constants import (
+    FABRIC_CHECK_TIMEOUT_SEC,
+    GRACEFUL_KILL_GRACE_SEC,
+    PRE_RESET_ZOMBIE_WAIT_SEC,
+    SIGTERM_GRACE_SEC,
+)
 from tt_device_mcp.device_holders import discount_broker_internal, holder_comm, is_tenant, username_for_uid
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
@@ -45,6 +50,7 @@ from tt_device_mcp.health.pci_writer import PCI_WRITER, PciWedged
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (
     BELOW_FLOOR,
+    BRIDGE_RESET_SETTLE_SEC,
     BLOCKED,
     DEFER,
     HOLD_FABRIC_UNVERIFIED,
@@ -63,6 +69,7 @@ from tt_device_mcp.health.recovery import (
     offbus_power_cycle,
     pcie_guard,
     present_reinit,
+    bridge_reset_call_timeout,
 )
 from tt_device_mcp.health.recovery.base import (
     CYCLE_LAUNCH_REPAGE_SEC,
@@ -779,6 +786,15 @@ def _placement_text(placement: list) -> str:
 TRAY_DOWN_MIN_CHIPS = 4
 TRAY_DOWN_RESCAN_SETTLE_SEC = 3
 
+# Spec 04 I110: a re-armed off-bus one-shot runs only the per-chip rungs and ends by the 10-min bound. No bridge reset
+# call starts later than one call's bound and its settle before the bound; its full check with fabric starts only with
+# the fabric pass's timeout and the probe kill sequence (SIGINT, then SIGTERM) left before the bound.
+def offbus_rearm_bridge_call_sec() -> float:
+    return bridge_reset_call_timeout() + BRIDGE_RESET_SETTLE_SEC
+
+
+OFFBUS_REARM_VERIFY_SEC = FABRIC_CHECK_TIMEOUT_SEC + GRACEFUL_KILL_GRACE_SEC + SIGTERM_GRACE_SEC
+
 # Spec 04 I97: the budget for one Galaxy mesh reset of a whole mesh (about 35 s seen) and the settle
 # after it. Every chip is already on the bus and tt-smi re-inits the boards itself, so the settle is
 # short. The reset's worst case is a tt-smi that gives up at its 100 s driver wait (about 263 s seen).
@@ -959,6 +975,7 @@ class GalaxyRecovery(Recovery):
     # on it. The caller reads its predicate once before the device-op lock, and the re-adopted job can
     # end in any read after that, so the last read is the one right before a rung acts.
     _stand_down: Optional[Callable[[], bool]] = None
+    _rearm_deadline: Optional[float] = None
     startup_verify_deferred: bool = False
     # Spec 04 I71: the (episode, monotonic time) of the last page for a power cycle that did not launch.
     # One page per hold episode, then at most one every CYCLE_LAUNCH_REPAGE_SEC while it keeps failing.
@@ -1115,6 +1132,7 @@ class GalaxyRecovery(Recovery):
         measured_fault: bool = False,
         stand_down: Optional[Callable[[], bool]] = None,
         bound: bool = False,
+        rearm_deadline: Optional[float] = None,
     ) -> str:
         """Run the next justified rung of this ladder and report the outcome, replacing the
         direct ``_escalate_stuck_hold``/``_escalate_offbus_stuck_hold`` calls the idle relift and
@@ -1164,9 +1182,14 @@ class GalaxyRecovery(Recovery):
         kept ladder even when an earlier forced run already failed its mesh reset on the same chips. A whole tray whose
         power cycle the cooldown refuses gets its full ladder only in this run, once per cycle or boot (I73). In that
         run a holder outside every broker job or exec scope never defers a rung: its pre-reset scan clears it like a
-        reader (spec 04 I103)."""
+        reader (spec 04 I103).
+
+        ``rearm_deadline`` (spec 04 I110, a monotonic time: the 10-min bound) marks a re-armed off-bus one-shot: it runs
+        the per-chip rungs only, never the mesh reset or a climb, and ends by the deadline."""
         self._stand_down = stand_down
         self._bound = bound
+        self._rearm_deadline = rearm_deadline
+        self.bridge_reset_cutoff = None if rearm_deadline is None else rearm_deadline - offbus_rearm_bridge_call_sec()
         self.startup_verify_deferred = False
         try:
             with pre_reset_scan.foreign_holders_yield(bound):
@@ -1176,6 +1199,8 @@ class GalaxyRecovery(Recovery):
         finally:
             self._stand_down = None
             self._bound = False
+            self._rearm_deadline = None
+            self.bridge_reset_cutoff = None
 
     async def _escalate_phase(
         self,
@@ -3419,7 +3444,8 @@ class GalaxyRecovery(Recovery):
         # fit (the release transition clears the episode clock and this latch together).
         self.deps.set_device_hold_episode_escalated(True)
         offbus_power_cycle.note_ladder_ran(hold_since)
-        if off_bus > 0 and self.mechanism.reset_regressed_in(hold_since):
+        per_chip = self._rearm_deadline is not None
+        if off_bus > 0 and not per_chip and self.mechanism.reset_regressed_in(hold_since):
             # This episode's galaxy reset already made the drop WORSE. Re-running the ladder would fire that same mesh
             # reset again (one Galaxy host went 4 -> 31 -> 32 off-bus across three, one per forced window). Go straight
             # to the host climb: it routes the drop to the cold rung, whose last-chance sweep still runs the full reset
@@ -3443,7 +3469,7 @@ class GalaxyRecovery(Recovery):
                 f"{off_bus}/{expected} off-bus and this hold's mesh reset already failed — the 10-min bound runs the full ladder again"
             )
             health_event("bound_reruns_spent_rung", rung="mesh_reset", held_since=hold_since, off_bus=off_bus)
-        elif spent or failed_unchanged:
+        elif (spent or failed_unchanged) and not per_chip:
             # This episode already ran the ladder to its mesh reset and that reset failed on exactly the chips off the
             # bus now. Re-running it repeats a known failure (one Galaxy host fired six identical 263 s resets in one
             # hold, one per window): take the next stronger rung, whose last-chance sweep still runs every reset once
@@ -3521,6 +3547,10 @@ class GalaxyRecovery(Recovery):
                 isolated_chips.discard(c)
             if unqueued:
                 health_event("gone_chip_bridge_reset_unqueued", chips=unqueued, reason="sbr_not_fired")
+        if sbr_healed and per_chip and time.monotonic() + OFFBUS_REARM_VERIFY_SEC > self._rearm_deadline:
+            log("re-armed off-bus one-shot: chips back, but no full check fits before the 10-min bound — the hold stands")
+            health_event("offbus_rearm_check_left_to_bound", held_since=hold_since)
+            return True
         if sbr_healed:
             healthy, evidence = await self._verify_device(expected, log, run_fabric=True)
             FABRIC_DEBT.note_evidence(evidence)
@@ -3530,6 +3560,11 @@ class GalaxyRecovery(Recovery):
                     verified=True, why="idle off-bus escalation: bridge reset recovered the mesh"
                 )
                 return True
+        if per_chip:
+            # Spec 04 I110: a re-armed one-shot never runs the mesh reset; the 10-min bound's full ladder does.
+            log("re-armed off-bus one-shot: no mesh reset here — the hold stands for the 10-min bound's full ladder")
+            health_event("offbus_rearm_mesh_reset_left_to_bound", held_since=hold_since, off_bus=off_bus)
+            return bool(sbr_tried)
         # Below the galaxy-reset floor, hold rather than fire the mesh-wide reset — the same suppression
         # the gate applies (galaxy_reset_suppressed_below_mass_threshold). A galaxy reset is the measured
         # all-chip drop: run against a single/few-chip off-bus wedge it inverts the mesh (the drop goes

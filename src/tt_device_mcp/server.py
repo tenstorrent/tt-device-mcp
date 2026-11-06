@@ -1144,8 +1144,13 @@ device_hold_offbus_rearms: int = 0
 # chip sets gets its cheap rung for each of a few drops and the 10-min bound's full ladder for the rest.
 OFFBUS_ONE_SHOT_REARM_MAX = 3
 # No re-arm this close to the 10-min bound: a forced run still in flight at the bound would delay the bound's ladder
-# (and eat into its full check's deadline). Room for a bridge reset, a mesh reset and their full checks.
-OFFBUS_ONE_SHOT_REARM_MARGIN_SEC = 180
+# (and eat into its full check's deadline). A re-armed run is per-chip only and stops starting bridge calls one call
+# before the bound, so the margin is room for one bridge call before that cutoff and the one in flight at it.
+from tt_device_mcp.health.recovery.galaxy import offbus_rearm_bridge_call_sec  # noqa: E402
+
+OFFBUS_ONE_SHOT_REARM_MARGIN_SEC = 2 * offbus_rearm_bridge_call_sec()
+# Whether the forced run being spawned is a re-armed one-shot (spec 04 I110): it then runs the per-chip rungs only.
+_offbus_rearm_run: bool = False
 # Whether the early one-shot (see _offbus_one_shot_sec) found a live tenant: the hold then keeps the
 # tenant's _offbus_hold_ceiling_sec wait for its one-shot. Re-arms (False) with the episode.
 device_hold_offbus_tenant_wait: bool = False
@@ -9658,6 +9663,11 @@ async def _force_escalate_stuck_hold() -> None:
             log,
             stand_down=lambda: _forced_run_route(kind, held_age).action == ROUTE_STAND_DOWN,
             bound=bound,
+            rearm_deadline=(
+                time.monotonic() + _hold_bound_sec() - held_age
+                if kind == "offbus_one_shot" and _offbus_rearm_run and not bound
+                else None
+            ),
         )
         if outcome == OUTCOME_WAITING and galaxy_recovery.startup_verify_deferred:
             _defer_to_startup_verify(kind, log, journaled=True)  # spec 03 I75: the job ended inside the ladder
@@ -10626,6 +10636,8 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         # Spec 04 I110: spent, the one-shot re-arms for chips lost since it ran (a mesh that sheds chip sets one
         # after another), up to OFFBUS_ONE_SHOT_REARM_MAX times and never close to the bound.
         new = _offbus_one_shot_new_chips(age) if device_hold_offbus_escalated else []
+        global _offbus_rearm_run
+        _offbus_rearm_run = bool(new)
         device_hold_escalation_kind = "offbus_one_shot"
         device_hold_escalation_trigger = (
             f"the off-bus one-shot re-armed for chip(s) {new} lost after it ran"
