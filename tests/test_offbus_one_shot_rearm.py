@@ -6,6 +6,7 @@ the cheap rung in seconds instead of waiting for the 10-min bound. At most OFFBU
 per hold, none inside OFFBUS_ONE_SHOT_REARM_MARGIN_SEC of the bound; a set already shot does not fire again.
 The bound's full ladder, its power-cycle request and the fabric-gated release are unchanged."""
 
+import asyncio
 import time
 from datetime import datetime, timedelta
 
@@ -17,9 +18,11 @@ from tests.test_bridge_reset_arc_dead import _bridge_rung
 from tests.test_device_safety import _arm_offbus_stuck_hold
 from tests.test_offbus_one_shot_idle import IDLE, _below_floor_hold
 from tests.test_post_reset_gate import _assert_settled, _verify_returning
+from tests.test_removed_chip_rescan import FakeBus, _kinds, rung  # noqa: F401 (rung: a fixture)
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health import recovery as recovery_pkg
+from tt_device_mcp.health.monitors import pci
 from tt_device_mcp.health.recovery import galaxy
 
 mesh = prg.mesh  # the post-reset gate's fixtures, shared
@@ -208,11 +211,22 @@ async def test_rearm_inside_margin_runs_no_mesh_reset(mesh, monkeypatch):
     assert counters["dirty_cleared"] == 0
 
 
-def test_rearm_margin_from_bridge_call_bound():
-    """The margin is two bridge calls with their settle, from named constants."""
-    call = recovery_pkg.bridge_reset_call_timeout() + recovery_pkg.BRIDGE_RESET_SETTLE_SEC
-    assert galaxy.offbus_rearm_bridge_call_sec() == call
-    assert srv.OFFBUS_ONE_SHOT_REARM_MARGIN_SEC == 2 * call
+def test_rearm_margin_from_deadline_terms():
+    """The margin is D's terms from named constants: the cut's grace and reap, one bridge call with the rung's tail,
+    and the minimum check. D is the 10-min mark less the cut's grace and reap, as the I97 deadline is."""
+    cut = galaxy.MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC + galaxy.MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC
+    tail = recovery_pkg.bridge_reset_tail_sec()
+    assert tail == (
+        recovery_pkg.SBR_RETRAIN_SETTLE_SEC
+        + recovery_pkg._base.PCI_SYSFS_WRITE_TIMEOUT_SEC
+        + recovery_pkg.BRIDGE_RESET_BATCH_POLLS * recovery_pkg.BRIDGE_RESET_BATCH_POLL_SEC
+        + recovery_pkg.BRIDGE_RESET_ARC_WAIT_SEC
+        + recovery_pkg.BARE_RESCAN_SETTLE_SEC
+    )
+    assert galaxy.OFFBUS_REARM_MIN_CHECK_SEC == galaxy.MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC
+    call = recovery_pkg.bridge_reset_call_timeout()
+    assert srv.OFFBUS_ONE_SHOT_REARM_MARGIN_SEC == cut + call + tail + galaxy.OFFBUS_REARM_MIN_CHECK_SEC
+    assert galaxy.offbus_rearm_deadline(1000.0) == 1000.0 - cut
 
 
 @pytest.mark.asyncio
@@ -262,14 +276,263 @@ async def test_rearm_check_that_does_not_fit_keeps_the_hold(mesh, monkeypatch):
 
     patch_recovery(monkeypatch, "_recover_isolated_chips", recover)
     patch_recovery(monkeypatch, "_verify_device", verify)
-    monkeypatch.setattr(galaxy, "OFFBUS_REARM_VERIFY_SEC", srv._hold_bound_sec())
+    monkeypatch.setattr(galaxy, "OFFBUS_REARM_MIN_CHECK_SEC", srv._hold_bound_sec())
     srv.isolated_chips.add("20")
     await tick(172)
     assert _rearmed(mesh) == [["20"]] and counters["sbr"] == 2
     assert verifies == [], "a full check ran that could not end before the bound"
     assert [k for k, _ in mesh if k == "offbus_rearm_check_left_to_bound"]
     assert counters["dirty_cleared"] == 0 and srv.fsm.state is not ServerState.HEALTHY, "released unchecked"
-    monkeypatch.setattr(galaxy, "OFFBUS_REARM_VERIFY_SEC", 0)
+    monkeypatch.setattr(galaxy, "OFFBUS_REARM_MIN_CHECK_SEC", 0)
     srv.isolated_chips.add("21")
     await tick(232)
     assert verifies == [True], "a check that fits did not run with its fabric pass"
+
+
+@pytest.fixture
+def bridge_events(rung):  # noqa: F811 (the imported fixture)
+    """The I69 tests' bridge rung (root+setpci, the host reset gate open, no real waits); its health events."""
+    return rung
+
+
+class _Clock:
+    """A monotonic clock a test can freeze and move (``t`` None: real time). Patched in as a module's ``time``, it
+    leaves every other time attribute, and asyncio's own clock, real."""
+
+    def __init__(self):
+        self.t = None
+
+    def monotonic(self):
+        return time.monotonic() if self.t is None else self.t
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+CUT_SEC = galaxy.MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC + galaxy.MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC
+CALL_AND_TAIL_SEC = recovery_pkg.bridge_reset_call_timeout() + recovery_pkg.bridge_reset_tail_sec()
+
+
+def _rearm_at(monkeypatch, left_at_d):
+    """Freeze galaxy's clock as each re-armed run starts and give it a deadline D ``left_at_d`` (a callable of the
+    server's own time left to the 10-min mark) from then. Returns (clock, runs)."""
+    clock = _Clock()
+    monkeypatch.setattr(galaxy, "time", clock)
+    runs = []
+    real = srv.galaxy_recovery.escalate
+
+    async def escalate(*a, rearm_deadline=None, **kw):
+        if rearm_deadline is not None:
+            left = rearm_deadline - time.monotonic()
+            clock.t = time.monotonic()
+            rearm_deadline = clock.t + CUT_SEC + left_at_d(left - CUT_SEC)
+            runs.append(rearm_deadline)
+        try:
+            return await real(*a, rearm_deadline=rearm_deadline, **kw)
+        finally:
+            clock.t = None
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
+    return clock, runs
+
+
+@pytest.mark.asyncio
+async def test_rearm_check_cut_at_deadline(mesh, monkeypatch):
+    """A re-armed check still running at D is cut there by the I97 cut: its readers are stopped, its result (even a
+    pass) is never read, nothing releases, the cut is journaled, and the bound's ladder runs at the 10-min mark."""
+    counters, tick = _stuck(monkeypatch, mesh)
+    await tick(srv.SAMPLE_INTERVAL_SEC)
+    resets = counters["resets"]
+    clock, runs = _rearm_at(monkeypatch, lambda left: 0.0)  # D is the check's start: it runs out at once
+    monkeypatch.setattr(galaxy, "OFFBUS_REARM_MIN_CHECK_SEC", 0)
+    stuck_recover, stuck_verify = srv.galaxy_recovery._recover_isolated_chips, srv.galaxy_recovery._verify_device
+    killed = asyncio.Event()
+    stopped = []
+
+    async def stop_readers(reason, grace):
+        stopped.append(grace)
+        killed.set()
+        return [4242] if grace else []
+
+    async def recover(log):
+        counters["sbr"] += 1
+        return True
+
+    async def hung_check(expected, log, run_fabric=True, **_):
+        await killed.wait()  # runs until its readers are killed, then would report a pass
+        return True, {"snapshot": {"ok": True}, "fabric": {"ok": True}}
+
+    monkeypatch.setattr(srv.galaxy_recovery.monitor, "stop_check_readers", stop_readers)
+    patch_recovery(monkeypatch, "_recover_isolated_chips", recover)
+    patch_recovery(monkeypatch, "_verify_device", hung_check)
+    srv.isolated_chips.add("20")
+    await tick(172)
+    assert _rearmed(mesh) == [["20"]] and len(runs) == 1
+    assert stopped and stopped[0] == galaxy.MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC, "the check's readers ran on"
+    cut = [f for k, f in mesh if k == "offbus_rearm_check_cut"]
+    assert cut and cut[0]["reason"] == "deadline" and cut[0]["stopped_pids"] == [4242], "the cut was not journaled"
+    assert counters["dirty_cleared"] == 0 and srv.fsm.state is not ServerState.HEALTHY, "a cut check released"
+    assert counters["resets"] == resets and counters["power_cycles"] == 0, "the re-armed run climbed"
+    patch_recovery(monkeypatch, "_recover_isolated_chips", stuck_recover)
+    patch_recovery(monkeypatch, "_verify_device", stuck_verify)
+    await tick(srv._stuck_hold_ceiling_sec() + 1)
+    assert counters["resets"] > resets, "the bound did not run the mesh reset"
+    assert counters["power_cycles"] == 1, "the bound did not request the power cycle"
+    assert counters["dirty_cleared"] == 0
+
+
+@pytest.mark.asyncio
+async def test_rearm_ladder_on_time(mesh, monkeypatch):
+    """The latest re-arm the margin lets fire: one bridge call and the rung's whole tail take their full bounds, and
+    its check still starts with the minimum check time left before D, which is the bridge cutoff too. D leaves the
+    cut its grace and reap before the 10-min mark, so the bound's ladder runs there on time."""
+    counters, tick = _stuck(monkeypatch, mesh)
+    await tick(srv.SAMPLE_INTERVAL_SEC)
+    resets = counters["resets"]
+    clock, runs = _rearm_at(monkeypatch, lambda left: left)  # the server's own deadline, on the frozen clock
+    stuck_recover, stuck_verify = srv.galaxy_recovery._recover_isolated_chips, srv.galaxy_recovery._verify_device
+    gr = srv.galaxy_recovery
+    seen = []
+
+    async def recover(log):
+        counters["sbr"] += 1
+        clock.t += CALL_AND_TAIL_SEC  # a call and the whole tail at their bounds
+        return True
+
+    async def verify(expected, log, run_fabric=True, **kw):
+        seen.append({"left": gr._rearm_deadline - clock.t, "D": gr._rearm_deadline, "cutoff": gr.bridge_reset_cutoff})
+        return await stuck_verify(expected, log, run_fabric=run_fabric, **kw)
+
+    patch_recovery(monkeypatch, "_recover_isolated_chips", recover)
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    srv.isolated_chips.add("20")
+    await tick(srv._hold_bound_sec() - srv.OFFBUS_ONE_SHOT_REARM_MARGIN_SEC - 1)
+    assert _rearmed(mesh) == [["20"]] and len(seen) == 1, "the latest re-arm's check did not start"
+    assert seen[0]["D"] == seen[0]["cutoff"] == runs[0] - CUT_SEC, "the cutoff and the check work to different ends"
+    assert galaxy.OFFBUS_REARM_MIN_CHECK_SEC <= seen[0]["left"] <= galaxy.OFFBUS_REARM_MIN_CHECK_SEC + 1.5
+    assert counters["dirty_cleared"] == 0 and counters["resets"] == resets
+    patch_recovery(monkeypatch, "_recover_isolated_chips", stuck_recover)
+    patch_recovery(monkeypatch, "_verify_device", stuck_verify)
+    await tick(srv._stuck_hold_ceiling_sec() + 1)
+    assert counters["resets"] > resets and counters["power_cycles"] == 1, "the bound's ladder did not run"
+
+
+@pytest.mark.asyncio
+async def test_rearm_start_gate(mesh, monkeypatch):
+    """No re-armed check starts with less than OFFBUS_REARM_MIN_CHECK_SEC left before D; one with exactly that starts,
+    with its fabric pass."""
+    counters, tick = _stuck(monkeypatch, mesh)
+    await tick(srv.SAMPLE_INTERVAL_SEC)
+    left_at_d = [galaxy.OFFBUS_REARM_MIN_CHECK_SEC - 1]
+    _rearm_at(monkeypatch, lambda left: left_at_d[0])
+    verifies = []
+
+    async def recover(log):
+        counters["sbr"] += 1
+        return True
+
+    async def verify(expected, log, run_fabric=True, **_):
+        verifies.append(run_fabric)
+        return False, UNPROVEN
+
+    patch_recovery(monkeypatch, "_recover_isolated_chips", recover)
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    srv.isolated_chips.add("20")
+    await tick(172)
+    assert verifies == [], "a check started below the minimum check time"
+    gate = [f for k, f in mesh if k == "offbus_rearm_check_left_to_bound"]
+    assert gate and gate[0]["left_s"] == galaxy.OFFBUS_REARM_MIN_CHECK_SEC - 1
+    left_at_d[0] = galaxy.OFFBUS_REARM_MIN_CHECK_SEC
+    srv.isolated_chips.add("21")
+    await tick(232)
+    assert verifies == [True], "a check with the minimum time left did not start with its fabric pass"
+    assert counters["dirty_cleared"] == 0
+
+
+@pytest.mark.asyncio
+async def test_removed_chip_past_cutoff(tmp_path, monkeypatch, bridge_events):
+    """A removed chip whose bridge call and the rung's tail no longer fit before the cutoff gets no bridge call; it
+    stays un-reset, so the rescan is withheld (I69) and it stays off the bus, isolated, not recorded spent."""
+    bus = FakeBus(tmp_path, monkeypatch)
+    bus.remove("13")
+    clock = _Clock()
+    clock.t = 1000.0
+    monkeypatch.setattr(recovery_pkg, "time", clock)
+    gr = srv.galaxy_recovery
+    monkeypatch.setattr(gr, "bridge_reset_cutoff", clock.t + CALL_AND_TAIL_SEC - 1)
+    srv.isolated_chips = {"13"}
+    assert await gr._recover_isolated_chips(lambda m: None) is False
+    assert bus.trace == [], "a bridge call or a rescan ran past the cutoff"
+    assert gr.last_bridge_reset_reasons["13"] == {"reason": "past_cutoff"}
+    assert "13" not in gr.last_bridge_reset_fired, "a chip never reset was recorded as reached"
+    assert srv.isolated_chips == {"13"} and pci.removed_chip("13") is not None
+    assert [f["reason"] for f in _kinds(bridge_events, "pci_rescan_withheld")] == ["removed_chip_not_reset"]
+
+
+@pytest.mark.asyncio
+async def test_no_tail_past_bound_removed_batch(tmp_path, monkeypatch, bridge_events):
+    """A removed chip's bridge call that ends at the cutoff: its batch rescan, re-enumeration poll, retry and the
+    bare rescan all start no later, and no wait runs past the cutoff."""
+    bus = FakeBus(tmp_path, monkeypatch)
+    bus.remove("13")
+    clock = _Clock()
+    clock.t = 1000.0
+    monkeypatch.setattr(recovery_pkg, "time", clock)
+    gr = srv.galaxy_recovery
+    monkeypatch.setattr(gr, "bridge_reset_cutoff", clock.t + CALL_AND_TAIL_SEC)
+    real_reset = recovery_pkg.reset_removed_chip
+
+    def reset_to_cutoff(idx):
+        fired = real_reset(idx)
+        clock.t = gr.bridge_reset_cutoff
+        return fired
+
+    monkeypatch.setattr(recovery_pkg, "reset_removed_chip", reset_to_cutoff)
+    late = []
+    fast_sleep = asyncio.sleep
+
+    async def sleep(delay, *a, **k):
+        if delay and clock.t >= gr.bridge_reset_cutoff:
+            late.append(delay)
+        await fast_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    srv.isolated_chips = {"13"}
+    assert await gr._recover_isolated_chips(lambda m: None) is False
+    assert bus.trace == [("sbr", "0000:40:01.1")], "a rescan or a retry ran past the cutoff"
+    assert late == [], "a wait ran past the cutoff"
+    assert gr.last_bridge_reset_reasons["13"] == {"reason": "past_cutoff"} and srv.isolated_chips == {"13"}
+
+
+@pytest.mark.asyncio
+async def test_no_tail_past_bound_arc_wait(monkeypatch):
+    """A bridge call that brings its chip back and ends at the cutoff: the I94 ARC wait and the bare rescan do not
+    run, and the chip counts as not recovered: it stays isolated for the bound's ladder."""
+    _bridge_rung(monkeypatch, "13", [None])
+    clock = _Clock()
+    clock.t = 1000.0
+    monkeypatch.setattr(recovery_pkg, "time", clock)
+    gr = srv.galaxy_recovery
+    monkeypatch.setattr(gr, "bridge_reset_cutoff", clock.t + CALL_AND_TAIL_SEC)
+    inner = recovery_pkg.reset_chip_via_bridge
+
+    def reset_to_cutoff(i, bdf):
+        back = inner(i, bdf)
+        clock.t = gr.bridge_reset_cutoff
+        return back
+
+    rescans, arc = [], []
+
+    async def rescan(*a, **k):
+        rescans.append(a[0])
+
+    async def arc_wait(chips, log):
+        arc.append(chips)
+        return []
+
+    monkeypatch.setattr(recovery_pkg, "reset_chip_via_bridge", reset_to_cutoff)
+    monkeypatch.setattr(recovery_pkg, "pci_rescan", rescan)
+    monkeypatch.setattr(gr, "_arc_dead_after_bridge_reset", lambda chips, log: arc_wait(chips, log))
+    assert await gr._recover_isolated_chips(lambda m: None) is False
+    assert arc == [[]] and rescans == [], "the ARC wait or a rescan ran past the cutoff"
+    assert gr.last_bridge_reset_reasons["13"] == {"reason": "past_cutoff"} and srv.isolated_chips == {"13"}

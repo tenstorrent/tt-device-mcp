@@ -22,12 +22,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from tt_device_mcp import metrics, pre_reset_scan
-from tt_device_mcp.constants import (
-    FABRIC_CHECK_TIMEOUT_SEC,
-    GRACEFUL_KILL_GRACE_SEC,
-    PRE_RESET_ZOMBIE_WAIT_SEC,
-    SIGTERM_GRACE_SEC,
-)
+from tt_device_mcp.constants import PRE_RESET_ZOMBIE_WAIT_SEC
 from tt_device_mcp.device_holders import discount_broker_internal, holder_comm, is_tenant, username_for_uid
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
@@ -51,7 +46,6 @@ from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (
     BELOW_FLOOR,
     BLOCKED,
-    BRIDGE_RESET_SETTLE_SEC,
     DEFER,
     HOLD_FABRIC_UNVERIFIED,
     OUTCOME_RECOVERED,
@@ -65,6 +59,7 @@ from tt_device_mcp.health.recovery import (
     Evidence,
     Recovery,
     bridge_reset_call_timeout,
+    bridge_reset_tail_sec,
     ipmi_guard,
     mesh_repeat,
     offbus_power_cycle,
@@ -787,15 +782,6 @@ TRAY_DOWN_MIN_CHIPS = 4
 TRAY_DOWN_RESCAN_SETTLE_SEC = 3
 
 
-# Spec 04 I110: a re-armed off-bus one-shot runs only the per-chip rungs and ends by the 10-min bound. No bridge reset
-# call starts later than one call's bound and its settle before the bound; its full check with fabric starts only with
-# the fabric pass's timeout and the probe kill sequence (SIGINT, then SIGTERM) left before the bound.
-def offbus_rearm_bridge_call_sec() -> float:
-    return bridge_reset_call_timeout() + BRIDGE_RESET_SETTLE_SEC
-
-
-OFFBUS_REARM_VERIFY_SEC = FABRIC_CHECK_TIMEOUT_SEC + GRACEFUL_KILL_GRACE_SEC + SIGTERM_GRACE_SEC
-
 # Spec 04 I97: the budget for one Galaxy mesh reset of a whole mesh (about 35 s seen) and the settle
 # after it. Every chip is already on the bus and tt-smi re-inits the boards itself, so the settle is
 # short. The reset's worst case is a tt-smi that gives up at its 100 s driver wait (about 263 s seen).
@@ -809,6 +795,32 @@ MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC = 180
 # At the deadline the check's readers get SIGTERM, SIGKILL this much later, then the reap.
 MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC = 10
 MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC = 5
+
+
+# Spec 04 I110: a re-armed off-bus one-shot runs only the per-chip rungs, all to one deadline D: the 10-min bound less
+# the I97 cut's grace and reap, as the I97 deadline is. No bridge call or tail step starts unless it fits before D, and
+# its full check with fabric runs under D and is cut there (the I97 cut). D, not a sum of timeouts, ends the run.
+def offbus_rearm_deadline(bound_at: float) -> float:
+    return bound_at - MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC - MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC
+
+
+# The least time left before D for which the re-armed check starts at all: the I97 check time (the slowest 32-chip
+# full check plus a margin). A start gate only: D cuts a check that runs longer.
+OFFBUS_REARM_MIN_CHECK_SEC = MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC
+
+
+def offbus_rearm_margin_sec() -> float:
+    """Spec 04 I110: the least hold time left before the 10-min bound for which a re-arm fires: D's cut grace and
+    reap, one bridge call and the rung's tail, and the minimum check."""
+    return (
+        MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC
+        + MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC
+        + bridge_reset_call_timeout()
+        + bridge_reset_tail_sec()
+        + OFFBUS_REARM_MIN_CHECK_SEC
+    )
+
+
 # Spec 04 I102: the one rescan for chips a mesh reset's re-power brought back after tt-smi's driver wait
 # gave up. It is one write through the PCI writer, so its bound is the writer's (30 s; well under a
 # second on a Galaxy). No settle follows it: a chip that is not back by then costs no wait.
@@ -1186,11 +1198,12 @@ class GalaxyRecovery(Recovery):
         reader (spec 04 I103).
 
         ``rearm_deadline`` (spec 04 I110, a monotonic time: the 10-min bound) marks a re-armed off-bus one-shot: it runs
-        the per-chip rungs only, never the mesh reset or a climb, and ends by the deadline."""
+        the per-chip rungs only, never the mesh reset or a climb, all to one deadline D (offbus_rearm_deadline): the
+        bridge rung's cutoff and the end of its full check."""
         self._stand_down = stand_down
         self._bound = bound
-        self._rearm_deadline = rearm_deadline
-        self.bridge_reset_cutoff = None if rearm_deadline is None else rearm_deadline - offbus_rearm_bridge_call_sec()
+        self._rearm_deadline = None if rearm_deadline is None else offbus_rearm_deadline(rearm_deadline)
+        self.bridge_reset_cutoff = self._rearm_deadline
         self.startup_verify_deferred = False
         try:
             with pre_reset_scan.foreign_holders_yield(bound):
@@ -3548,13 +3561,38 @@ class GalaxyRecovery(Recovery):
                 isolated_chips.discard(c)
             if unqueued:
                 health_event("gone_chip_bridge_reset_unqueued", chips=unqueued, reason="sbr_not_fired")
-        if sbr_healed and per_chip and time.monotonic() + OFFBUS_REARM_VERIFY_SEC > self._rearm_deadline:
-            log(
-                "re-armed off-bus one-shot: chips back, but no full check fits before the 10-min bound — the hold stands"
-            )
-            health_event("offbus_rearm_check_left_to_bound", held_since=hold_since)
-            return True
-        if sbr_healed:
+        if sbr_healed and per_chip:
+            # Spec 04 I110: the check runs under D and is cut there; it starts only with the minimum check time left.
+            left = self._rearm_deadline - time.monotonic()
+            if left < OFFBUS_REARM_MIN_CHECK_SEC:
+                log(
+                    "re-armed off-bus one-shot: chips back, but no full check fits before the 10-min bound — "
+                    "the hold stands"
+                )
+                health_event("offbus_rearm_check_left_to_bound", held_since=hold_since, left_s=round(left, 1))
+                return True
+            check = asyncio.ensure_future(self._verify_device(expected, log, run_fabric=True))
+            await asyncio.wait({check}, timeout=left)
+            if not check.done():
+                await self._cut_check_at_deadline(
+                    check,
+                    left,
+                    log,
+                    "offbus-rearm",
+                    reason="the re-armed off-bus one-shot's full check ran to its deadline before the 10-min bound",
+                    event="offbus_rearm_check_cut",
+                    then="the 10-min bound's full ladder goes on",
+                )
+                return True
+            healthy, evidence = check.result()
+            FABRIC_DEBT.note_evidence(evidence)
+            if healthy:
+                self.deps.clear_device_reported_fault("idle off-bus escalation: bridge reset recovered the mesh")
+                self.deps.clear_device_dirty(
+                    verified=True, why="idle off-bus escalation: bridge reset recovered the mesh"
+                )
+                return True
+        elif sbr_healed:
             healthy, evidence = await self._verify_device(expected, log, run_fabric=True)
             FABRIC_DEBT.note_evidence(evidence)
             if healthy:
@@ -3902,11 +3940,21 @@ class GalaxyRecovery(Recovery):
         health_event("gate", phase=phase, healthy=True, recovered_via="whole-mesh reset", evidence=evidence)
         return True
 
-    async def _cut_check_at_deadline(self, check: asyncio.Future, deadline: float, log, phase: str) -> None:
-        """Spec 04 I97: the full check after the mesh reset is still running at the deadline. It counts
+    async def _cut_check_at_deadline(
+        self,
+        check: asyncio.Future,
+        deadline: float,
+        log,
+        phase: str,
+        *,
+        reason: Optional[str] = None,
+        event: str = "whole_mesh_reset_before_host_rung_unverified",
+        then: str = "the power cycle goes on",
+    ) -> None:
+        """Spec 04 I97 (and I110's re-armed check): the full check is still running at the deadline. It counts
         as failed and the hold stays: its readers get SIGTERM, SIGKILL after the grace, the check task is
         reaped (cancelled if it still has not ended) and its result is never read."""
-        reason = f"the full check after the mesh reset ran to the {deadline:.0f}s hold deadline"
+        reason = reason or f"the full check after the mesh reset ran to the {deadline:.0f}s hold deadline"
         stopped = await self.monitor.stop_check_readers(reason, MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC)
         loop = asyncio.get_running_loop()
         end = loop.time() + MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC
@@ -3919,10 +3967,8 @@ class GalaxyRecovery(Recovery):
         if check.done() and not check.cancelled():
             check.exception()  # read, so a late error is not logged as never retrieved
         pcie_guard.end_offbus_reset()
-        log(f"{reason} — failed, the hold stays and the power cycle goes on")
-        health_event(
-            "whole_mesh_reset_before_host_rung_unverified", phase=phase, reason="deadline", stopped_pids=stopped
-        )
+        log(f"{reason} — failed, the hold stays and {then}")
+        health_event(event, phase=phase, reason="deadline", stopped_pids=stopped)
 
     async def _bound_rerun_spent_mesh_reset(
         self, expected: int, ids_before: Optional[set], hold_since: str, log

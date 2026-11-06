@@ -108,6 +108,25 @@ NO_WINDOW_REMOVED_REASON = "removed_not_reenumerated"
 BRIDGE_RESET_ARC_POLLS = 10
 BRIDGE_RESET_ARC_POLL_SEC = 0.5
 BRIDGE_RESET_ARC_WAIT_SEC = BRIDGE_RESET_ARC_POLLS * BRIDGE_RESET_ARC_POLL_SEC
+# The removed-chip batch's re-enumeration poll after its one rescan, and the bare rescan's settle.
+BRIDGE_RESET_BATCH_POLLS = 20
+BRIDGE_RESET_BATCH_POLL_SEC = 0.5
+BARE_RESCAN_SETTLE_SEC = 3
+
+
+def bridge_reset_tail_sec() -> float:
+    """Spec 04 I110: the bridge rung's steps after its last bridge call: the batch's link-retrain
+    settle, its rescan (up to PCI_SYSFS_WRITE_TIMEOUT_SEC), its re-enumeration poll, the I94 ARC wait
+    and the bare rescan's settle. A call starts under a cutoff only if it and this tail fit."""
+    return (
+        SBR_RETRAIN_SETTLE_SEC
+        + _base.PCI_SYSFS_WRITE_TIMEOUT_SEC
+        + BRIDGE_RESET_BATCH_POLLS * BRIDGE_RESET_BATCH_POLL_SEC
+        + BRIDGE_RESET_ARC_WAIT_SEC
+        + BARE_RESCAN_SETTLE_SEC
+    )
+
+
 # A KMD without the heartbeat attr cannot answer the I94 check: it is skipped there, said once.
 _arc_check_skip_logged = False
 
@@ -433,8 +452,17 @@ class Recovery(ABC):
         # The chips the last _recover_isolated_chips call reached with a bridge write, whatever came of
         # it (spec 04 I98): the hold's SBR record keys on this, not on the reasons above.
         self.last_bridge_reset_fired: set = set()
-        # Spec 04 I110: a monotonic time after which no bridge reset call starts (None: no cutoff).
+        # Spec 04 I110: the re-armed off-bus one-shot's deadline D (monotonic; None: no cutoff). No
+        # bridge call and no tail step starts unless it fits before it.
         self.bridge_reset_cutoff: Optional[float] = None
+
+    def _before_cutoff(self, sec: float) -> bool:
+        """Spec 04 I110: a step that takes up to `sec` ends before the cutoff (always, with none)."""
+        return self.bridge_reset_cutoff is None or time.monotonic() + sec <= self.bridge_reset_cutoff
+
+    def _bridge_call_fits(self, settle: float = 0.0) -> bool:
+        """Spec 04 I110: a bridge call, the settle before it and the rung's tail all fit."""
+        return self._before_cutoff(settle + bridge_reset_call_timeout() + bridge_reset_tail_sec())
 
     @abstractmethod
     def next_stage(self, ev: Evidence) -> str:
@@ -639,6 +667,12 @@ class Recovery(ABC):
         if sbr and not gated and removed:
             for idx in removed:
                 for attempt in range(BRIDGE_RESET_MAX_TRIES):
+                    if not self._bridge_call_fits(BRIDGE_RESET_SETTLE_SEC if attempt else 0.0):
+                        # Spec 04 I110: no call past the cutoff; the chip stays un-reset, so no rescan.
+                        self.last_bridge_reset_reasons[idx] = {"reason": "past_cutoff"}
+                        break
+                    if attempt:
+                        await asyncio.sleep(BRIDGE_RESET_SETTLE_SEC)
                     FABRIC_DEBT.note_reset(f"bridge reset of chip {idx}")
                     try:
                         fired = await PCI_WRITER.write(
@@ -660,14 +694,15 @@ class Recovery(ABC):
                         # Same no-window signal as reset_chip_via_bridge's no_bridge (see below).
                         self.last_bridge_reset_reasons[idx] = {"reason": "no_bridge"}
                         break
-                    if attempt + 1 < BRIDGE_RESET_MAX_TRIES:
-                        await asyncio.sleep(BRIDGE_RESET_SETTLE_SEC)
                 if idx not in reset_this_pass:
                     unreset.append(idx)
                 if wedged:
                     unreset.extend(i for i in removed if i not in reset_this_pass and i not in unreset)
                     break
-            if not unreset:
+            if not unreset and not self._before_cutoff(SBR_RETRAIN_SETTLE_SEC + _base.PCI_SYSFS_WRITE_TIMEOUT_SEC):
+                # Spec 04 I110: the reset chips stay off the bus and isolated; the bound's ladder takes them.
+                log(f"chip(s) {removed} reset, but their batch rescan would run past the cutoff — skipped")
+            elif not unreset:
                 log(f"chip(s) {removed} reset through their recorded bridges — rescanning once")
                 # One link-retrain settle for the batch, after the last SBR release, as
                 # reset_chip_via_bridge waits before its own rescan.
@@ -676,17 +711,13 @@ class Recovery(ABC):
                     await pci_rescan("bridge reset batch rescan", _sysfs_rescan)
                 except (OSError, asyncio.TimeoutError) as e:
                     log(f"PCI rescan after the bridge reset could not run ({e})")
-                for _ in range(20):
-                    await asyncio.sleep(0.5)
+                for _ in range(BRIDGE_RESET_BATCH_POLLS):
+                    if not self._before_cutoff(BRIDGE_RESET_BATCH_POLL_SEC):
+                        break
+                    await asyncio.sleep(BRIDGE_RESET_BATCH_POLL_SEC)
                     if all((pci.SYSFS_CLASS_DIR / f"tenstorrent!{i}").exists() for i in removed):
                         break
         for idx in targets:
-            if self.bridge_reset_cutoff is not None and time.monotonic() >= self.bridge_reset_cutoff and not wedged:
-                # Spec 04 I110: a re-armed one-shot's pass ends before the 10-min bound; the bound's ladder takes the rest.
-                withheld.append(idx)
-                self.last_bridge_reset_reasons[idx] = {"reason": "past_cutoff"}
-                metrics.stage_fired("bridge_reset", "blocked")
-                continue
             if wedged and idx not in lost:
                 withheld.append(idx)
                 self.last_bridge_reset_reasons[idx] = {"reason": "pci_wedged"}
@@ -739,12 +770,16 @@ class Recovery(ABC):
             # A removed chip already spent one try on the reset above.
             tries = BRIDGE_RESET_MAX_TRIES - 1 if idx in reset_this_pass else BRIDGE_RESET_MAX_TRIES
             for attempt in range(tries):
-                if attempt and self.bridge_reset_cutoff is not None and time.monotonic() >= self.bridge_reset_cutoff:
-                    lost.append(idx)  # spec 04 I110: no retry past the cutoff
-                    metrics.stage_fired("bridge_reset", "failed")
+                settle = BRIDGE_RESET_SETTLE_SEC if attempt or idx in reset_this_pass else 0.0
+                if not self._bridge_call_fits(settle):
+                    # Spec 04 I110: a re-armed one-shot's pass ends by its deadline D; the bound's ladder
+                    # takes the rest. Not a no-window fact: the chip is not recorded spent.
+                    withheld.append(idx)
+                    self.last_bridge_reset_reasons[idx] = {"reason": "past_cutoff"}
+                    metrics.stage_fired("bridge_reset", "blocked")
                     break
-                if idx in reset_this_pass and attempt == 0:
-                    await asyncio.sleep(BRIDGE_RESET_SETTLE_SEC)
+                if settle:
+                    await asyncio.sleep(settle)
                 FABRIC_DEBT.note_reset(f"bridge reset of chip {idx}")
                 try:
                     # The one in-flight PCI write (spec 04 I76): its rescan waits on the kernel's PCI
@@ -786,8 +821,6 @@ class Recovery(ABC):
                     self.last_bridge_reset_reasons[idx] = {"reason": "no_bridge"}
                     metrics.stage_fired("bridge_reset", "not_applicable")
                     break
-                if attempt + 1 < tries:
-                    await asyncio.sleep(BRIDGE_RESET_SETTLE_SEC)
             else:
                 lost.append(idx)
                 if idx in reset_this_pass:
@@ -799,6 +832,13 @@ class Recovery(ABC):
         # Spec 04 I94: back on the bus is not recovered. A chip re-enumerated with its ARC dead stays
         # isolated and still dead, so the rung fails and the off-bus one-shot escalates past it. A
         # PCI-wedged pass already failed and requested the power cycle: it reads nothing more.
+        if recovered and not wedged and not self._before_cutoff(BRIDGE_RESET_ARC_WAIT_SEC):
+            # Spec 04 I110: an unproven ARC is not recovered; the chips stay isolated for the bound's ladder.
+            log(f"chip(s) {recovered} back on the bus, but their ARC wait would run past the cutoff — not recovered")
+            for idx in recovered:
+                self.last_bridge_reset_reasons[idx] = {"reason": "past_cutoff"}
+            withheld.extend(recovered)
+            recovered = []
         arc_dead = [] if wedged else await self._arc_dead_after_bridge_reset(recovered, log)
         recovered = [i for i in recovered if i not in arc_dead]
         lost.extend(arc_dead)
@@ -840,7 +880,13 @@ class Recovery(ABC):
                 f"PCI rescan withheld ({withhold}) for chip(s) {still_dead}: re-enumerating a hung chip "
                 f"that was not reset can take the host down; they stay isolated, escalating to a heavier rung"
             )
-        if still_dead and not withhold and set(still_dead) - set(arc_dead):
+        if (
+            still_dead
+            and not withhold
+            and not self._before_cutoff(_base.PCI_SYSFS_WRITE_TIMEOUT_SEC + BARE_RESCAN_SETTLE_SEC)
+        ):
+            log(f"bare PCI rescan of chip(s) {still_dead} would run past the cutoff — skipped (spec 04 I110)")
+        elif still_dead and not withhold and set(still_dead) - set(arc_dead):
             # Cheapest rung there is, and the one that was missing: a bare PCI rescan. A chip with no
             # parent bridge is not necessarily a departed ASIC — measured twice on this host, the
             # endpoint was still in lspci AND still bound to the driver, and only its /dev node was
@@ -850,7 +896,7 @@ class Recovery(ABC):
             # downtime; both times it restored 8/8. Try it before anything that costs a tenant.
             try:
                 await pci_rescan("bare rescan of dead chips", _sysfs_rescan)
-                await asyncio.sleep(3)
+                await asyncio.sleep(BARE_RESCAN_SETTLE_SEC)
             except (OSError, asyncio.TimeoutError) as e:
                 log(f"PCI rescan could not run ({e}); falling through to the heavier rungs")
             else:

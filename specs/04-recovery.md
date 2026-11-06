@@ -2899,23 +2899,53 @@ each rung fires only when the gentler one failed or cannot apply.
 
   A re-armed one-shot runs the per-chip rungs only (the bridge reset of each off-bus chip and its
   full check): never the mesh reset, the regressed-reset or spent-reset climb, or a host rung. Those
-  belong to the bound's full ladder, which still runs them all. The forced run gets the bound as a
-  deadline (`rearm_deadline`, the monotonic time of the 10-min mark), and ends by it:
-  - no bridge reset call or retry starts at or after `Recovery.bridge_reset_cutoff`, the deadline
-    less `offbus_rearm_bridge_call_sec()` (one call's bound, `bridge_reset_call_timeout()`, plus
-    `BRIDGE_RESET_SETTLE_SEC`); a withheld chip records the reason `past_cutoff` and stays isolated;
-  - its full check with fabric starts only if `OFFBUS_REARM_VERIFY_SEC`
-    (`FABRIC_CHECK_TIMEOUT_SEC` + `GRACEFUL_KILL_GRACE_SEC` + `SIGTERM_GRACE_SEC`: the fabric pass and
-    its probe kill sequence) fits before the deadline. Otherwise no check runs, the hold stands
-    (journaled `offbus_rearm_check_left_to_bound`) and the bound's ladder takes it;
-  - a run whose chips stay off journals `offbus_rearm_mesh_reset_left_to_bound` and keeps the hold.
+  belong to the bound's full ladder, which still runs them all. The forced run gets the 10-min mark
+  (`rearm_deadline`, a monotonic time) and works the whole run to one deadline D before it:
+  `offbus_rearm_deadline()`, the mark less the I97 cut's grace and reap
+  (`MESH_RESET_BEFORE_HOST_RUNG_TERM_GRACE_SEC` + `MESH_RESET_BEFORE_HOST_RUNG_REAP_SEC`), as the I97
+  deadline is. D is also `Recovery.bridge_reset_cutoff`. The rule: no step starts unless its own
+  bound fits before D, and the check, whose length is not bounded, is cut at D. No sum of timeouts
+  bounds the run.
+  - A bridge call starts, in the removed-chip batch (I69) and in the per-chip loop, first try or
+    retry, only if now plus the settle before it, `bridge_reset_call_timeout()` and
+    `bridge_reset_tail_sec()` fits before D. The tail is the batch's link-retrain settle
+    (`SBR_RETRAIN_SETTLE_SEC`), its rescan (up to `PCI_SYSFS_WRITE_TIMEOUT_SEC`), its re-enumeration
+    poll (`BRIDGE_RESET_BATCH_POLLS` x `BRIDGE_RESET_BATCH_POLL_SEC`), the I94 ARC wait
+    (`BRIDGE_RESET_ARC_WAIT_SEC`) and the bare rescan's settle (`BARE_RESCAN_SETTLE_SEC`). A chip
+    whose call does not fit records the reason `past_cutoff` and stays isolated; it is not recorded
+    as spent (I98), so the bound's ladder still resets it. A removed chip left un-reset this way
+    still withholds the rescan (I69).
+  - Each tail step is gated on its own bound too: the batch settle and rescan, each poll, the ARC
+    wait and the bare rescan with its settle start only if they end before D. A skipped ARC wait
+    leaves the chips it would have proven not recovered (`past_cutoff`, still isolated).
+  - The full check with fabric starts only with `OFFBUS_REARM_MIN_CHECK_SEC` left before D (the I97
+    check time, `MESH_RESET_BEFORE_HOST_RUNG_CHECK_SEC`: the slowest 32-chip full check plus a
+    margin). It is a start gate, not a bound. Below it no check runs, the hold stands (journaled
+    `offbus_rearm_check_left_to_bound` with the time left) and the bound's ladder takes it. A check
+    that starts runs under `asyncio.wait` to D. One still running there is cut by the I97 cut
+    (`_cut_check_at_deadline`): its readers get SIGTERM, SIGKILL after the grace, the task is reaped
+    and its result never read. A cut check counts as failed: the hold stays, nothing releases, and
+    the cut is journaled `offbus_rearm_check_cut` (with the stopped pids).
+  - A run whose chips stay off journals `offbus_rearm_mesh_reset_left_to_bound` and keeps the hold.
 
-  No re-arm at or after `OFFBUS_ONE_SHOT_REARM_MARGIN_SEC` before the bound: twice
-  `offbus_rearm_bridge_call_sec()`, room for one bridge call before the cutoff and the one in flight
-  at it, so a re-armed run does not delay the bound's ladder or eat into the I97 check deadline. The
-  first one-shot of a hold is not a re-arm and keeps its full rung set (bridge reset, then the
-  below-floor mesh reset, I108). The record and the
-  count re-arm with the episode and on release. The hold report names the re-armed one-shot as the
+  D uses the cut's grace and reap, not the probes' own kill sequence (`GRACEFUL_KILL_GRACE_SEC` then
+  `SIGTERM_GRACE_SEC`): the cut signals the check's reader process groups itself and does not wait
+  on that sequence.
+
+  No re-arm at or after `OFFBUS_ONE_SHOT_REARM_MARGIN_SEC` before the bound: `offbus_rearm_margin_sec()`,
+  D's terms summed (the cut's grace and reap, one bridge call, the tail and the minimum check). A
+  re-arm at the margin can run one call and the whole tail at their bounds and still start its
+  check. The margin only decides whether a re-arm fires; it bounds nothing, since D does.
+
+  Known limits, accepted: a late re-arm (a drop near the margin, a slow call or a long tail) may be
+  skipped past the cutoff or cut at D, and its chips wait for the bound's ladder. The steps before
+  the first gate are not gated: the gone-chip confirm settle (`GONE_CHIP_CONFIRM_SETTLE_SEC`) and the
+  sysfs and heartbeat reads that pick the targets. Sysfs reads have no timeout of their own. As in
+  I97, the cut's reader release can wait on a reader the kernel stopped under AER. A bridge call that
+  overruns its bound latches PCI-wedged (I76) and ends the pass.
+
+  The first one-shot of a hold is not a re-arm and keeps its full rung set (bridge reset, then the
+  below-floor mesh reset, I108). The record and the count re-arm with the episode and on release. The hold report names the re-armed one-shot as the
   next rung, due now.
 
   Unchanged: the first one-shot's clock and its give-backs (I23); a forced run already in flight or a
@@ -3637,8 +3667,14 @@ sees a silent fabric pass.
 | I110 a set already shot does not fire again before the bound | `tests/test_offbus_one_shot_rearm.py::test_offbus_rearm_same_set_no_repeat` |
 | I110 no re-arm inside the margin before the bound; the bound's full ladder and power-cycle request are unchanged and a failed run releases nothing | `tests/test_offbus_one_shot_rearm.py::test_bound_ladder_unchanged` |
 | I110 a re-armed run frees the device only through a full check whose fabric pass just passed | `tests/test_offbus_one_shot_rearm.py::test_release_needs_fabric_pass` |
-| I110 a re-armed run with a failing bridge rung runs no mesh reset or host rung, is bounded by the 10-min mark, and the bound's ladder still runs the mesh reset and requests the power cycle | `tests/test_offbus_one_shot_rearm.py::test_rearm_inside_margin_runs_no_mesh_reset` |
-| I110 the re-arm margin is twice `offbus_rearm_bridge_call_sec()` | `tests/test_offbus_one_shot_rearm.py::test_rearm_margin_from_bridge_call_bound` |
-| I110 no bridge reset call or retry starts past `bridge_reset_cutoff` | `tests/test_offbus_one_shot_rearm.py::test_bridge_cutoff_withholds_calls` |
-| I110 a full check that does not fit before the bound does not run and the hold stands | `tests/test_offbus_one_shot_rearm.py::test_rearm_check_that_does_not_fit_keeps_the_hold` |
+| I110 a re-armed run with a failing bridge rung runs no mesh reset or host rung, is given the 10-min mark, and the bound's ladder still runs the mesh reset and requests the power cycle | `tests/test_offbus_one_shot_rearm.py::test_rearm_inside_margin_runs_no_mesh_reset` |
+| I110 D is the 10-min mark less the cut's grace and reap; the margin is D's terms (cut, one call, tail, minimum check) | `tests/test_offbus_one_shot_rearm.py::test_rearm_margin_from_deadline_terms` |
+| I110 no bridge reset call or retry starts unless it and the tail fit before the cutoff | `tests/test_offbus_one_shot_rearm.py::test_bridge_cutoff_withholds_calls` |
+| I110 a removed chip past the cutoff gets no bridge call and no rescan, stays isolated and is not recorded spent | `tests/test_offbus_one_shot_rearm.py::test_removed_chip_past_cutoff` |
+| I110 a removed chip's call that ends at the cutoff runs no batch rescan, poll, retry, bare rescan or wait past it | `tests/test_offbus_one_shot_rearm.py::test_no_tail_past_bound_removed_batch` |
+| I110 a call that ends at the cutoff runs no ARC wait or rescan; its chip stays isolated | `tests/test_offbus_one_shot_rearm.py::test_no_tail_past_bound_arc_wait` |
+| I110 no check starts below `OFFBUS_REARM_MIN_CHECK_SEC`; one with exactly that starts with its fabric pass | `tests/test_offbus_one_shot_rearm.py::test_rearm_start_gate` |
+| I110 a re-armed check still running at D is cut: readers stopped, result unread, journaled, the hold stands and the bound's ladder runs at the 10-min mark | `tests/test_offbus_one_shot_rearm.py::test_rearm_check_cut_at_deadline` |
+| I110 the latest re-arm, with a call and the tail at their bounds, still starts its check with the minimum left; the cutoff and the check share D | `tests/test_offbus_one_shot_rearm.py::test_rearm_ladder_on_time` |
+| I110 a full check below the minimum check time does not run and the hold stands | `tests/test_offbus_one_shot_rearm.py::test_rearm_check_that_does_not_fit_keeps_the_hold` |
 | I102 with I103: the late-chip second mesh reset runs in the pre-cycle sweep, so its pre-reset scan clears a holder outside every broker scope and runs (at the 10-min bound, on the I97 path, and in the sweep outside the bound); its wait still ends at the step's start plus `LATE_CHIP_STEP_SEC`; a failed full check keeps the hold and the cycle journals the holder; a holder in a broker job's scope or the running job's own process still refuses it, nothing lifts and the hold goes on to the cycle | `tests/test_late_chips_after_driver_wait.py::test_the_late_chip_second_reset_clears_a_foreign_holder_and_keeps_its_bound`, `::test_a_job_holder_still_refuses_the_late_chip_second_reset_and_the_hold_goes_on_to_the_cycle` |

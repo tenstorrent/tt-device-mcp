@@ -156,7 +156,7 @@ from tt_device_mcp.health.recovery.galaxy import (
     _stuck_hold_ceiling_sec,
     _ubb_bus_id_tables,
     _whole_trays_off,
-    offbus_rearm_bridge_call_sec,
+    offbus_rearm_margin_sec,
 )
 from tt_device_mcp.health.recovery.pcie_guard import pcie_guard_at_start
 from tt_device_mcp.health.recovery.per_target import PerTargetRecovery
@@ -182,8 +182,8 @@ from tt_device_mcp.health.recovery.stages.power_cycle import (
 from tt_device_mcp.health.shutdown import note_broker_stopping
 
 __all__ = [
-    # the re-armed off-bus one-shot's bridge-call bound (spec 04 I110)
-    "offbus_rearm_bridge_call_sec",
+    # the re-armed off-bus one-shot's margin before the 10-min bound (spec 04 I110)
+    "offbus_rearm_margin_sec",
     # the one in-flight PCI sysfs writer and its PCI-wedged latch (spec 04 I76)
     "PCI_WRITER",
     "PciWedged",

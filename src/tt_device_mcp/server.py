@@ -1143,12 +1143,12 @@ device_hold_offbus_rearms: int = 0
 # At most this many re-arms per hold: each is one more forced run of the off-bus ladder, so a mesh that keeps shedding
 # chip sets gets its cheap rung for each of a few drops and the 10-min bound's full ladder for the rest.
 OFFBUS_ONE_SHOT_REARM_MAX = 3
-# No re-arm this close to the 10-min bound: a forced run still in flight at the bound would delay the bound's ladder
-# (and eat into its full check's deadline). A re-armed run is per-chip only and stops starting bridge calls one call
-# before the bound, so the margin is room for one bridge call before that cutoff and the one in flight at it.
-from tt_device_mcp.health import offbus_rearm_bridge_call_sec  # noqa: E402
+# No re-arm this close to the 10-min bound: a re-armed run is per-chip only and works to one deadline D before the
+# bound (spec 04 I110), so the margin is D's cut grace and reap, one bridge call with the rung's tail, and the minimum
+# full check. A later re-arm would only be skipped or cut at D.
+from tt_device_mcp.health import offbus_rearm_margin_sec  # noqa: E402
 
-OFFBUS_ONE_SHOT_REARM_MARGIN_SEC = 2 * offbus_rearm_bridge_call_sec()
+OFFBUS_ONE_SHOT_REARM_MARGIN_SEC = offbus_rearm_margin_sec()
 # Whether the forced run being spawned is a re-armed one-shot (spec 04 I110): it then runs the per-chip rungs only.
 _offbus_rearm_run: bool = False
 # Whether the early one-shot (see _offbus_one_shot_sec) found a live tenant: the hold then keeps the
@@ -9664,7 +9664,7 @@ async def _force_escalate_stuck_hold() -> None:
             stand_down=lambda: _forced_run_route(kind, held_age).action == ROUTE_STAND_DOWN,
             bound=bound,
             rearm_deadline=(
-                time.monotonic() + _hold_bound_sec() - held_age
+                time.monotonic() + _hold_bound_sec() - _hold_age_now()
                 if kind == "offbus_one_shot" and _offbus_rearm_run and not bound
                 else None
             ),
