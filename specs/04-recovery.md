@@ -2888,17 +2888,33 @@ each rung fires only when the gentler one failed or cannot apply.
   never near the 10-min bound.** Seen on a Galaxy hold: the one-shot ran for the first set of chips off
   the bus and failed, then three more sets dropped, about 1.5 min apart, 3 to 6 min into the hold. The
   one-shot was spent, so each new set waited for the I76 10-min bound although its cheap rung (bridge
-  reset, then the below-floor mesh reset, I108) heals such a drop in seconds. Now the hold keeps the
+  reset of each chip) heals such a drop in seconds. Now the hold keeps the
   chips every one-shot of the episode was spawned for (`device_hold_offbus_shot_chips`). A spent
   one-shot re-arms when chips arm it now (isolated, or held below the reset floor) that none of them
   covered: the next watchdog tick spawns the same forced run (`offbus-forced`), journals
   `offbus_one_shot_rearmed` (the new chips, the re-arm count and its cap) and adds the chips it faced
   to the record. A set already shot never fires again, so a chip that stays off waits for the bound.
-  At most `OFFBUS_ONE_SHOT_REARM_MAX` (3) re-arms per hold: each is one more forced run of the same
-  ladder, a mesh that keeps shedding sets past that is not healed by the cheap rung, and the bound's
-  full ladder takes the rest. No re-arm at or after `OFFBUS_ONE_SHOT_REARM_MARGIN_SEC` (180 s) before
-  the bound: a forced run still in flight at the bound would delay its ladder and eat into the I97
-  check deadline; 180 s holds a bridge reset, a mesh reset and their full checks. The record and the
+  At most `OFFBUS_ONE_SHOT_REARM_MAX` (3) re-arms per hold: a mesh that keeps shedding sets past that
+  is not healed by the cheap rung, and the bound's full ladder takes the rest.
+
+  A re-armed one-shot runs the per-chip rungs only (the bridge reset of each off-bus chip and its
+  full check): never the mesh reset, the regressed-reset or spent-reset climb, or a host rung. Those
+  belong to the bound's full ladder, which still runs them all. The forced run gets the bound as a
+  deadline (`rearm_deadline`, the monotonic time of the 10-min mark), and ends by it:
+  - no bridge reset call or retry starts at or after `Recovery.bridge_reset_cutoff`, the deadline
+    less `offbus_rearm_bridge_call_sec()` (one call's bound, `bridge_reset_call_timeout()`, plus
+    `BRIDGE_RESET_SETTLE_SEC`); a withheld chip records the reason `past_cutoff` and stays isolated;
+  - its full check with fabric starts only if `OFFBUS_REARM_VERIFY_SEC`
+    (`FABRIC_CHECK_TIMEOUT_SEC` + `GRACEFUL_KILL_GRACE_SEC` + `SIGTERM_GRACE_SEC`: the fabric pass and
+    its probe kill sequence) fits before the deadline. Otherwise no check runs, the hold stands
+    (journaled `offbus_rearm_check_left_to_bound`) and the bound's ladder takes it;
+  - a run whose chips stay off journals `offbus_rearm_mesh_reset_left_to_bound` and keeps the hold.
+
+  No re-arm at or after `OFFBUS_ONE_SHOT_REARM_MARGIN_SEC` before the bound: twice
+  `offbus_rearm_bridge_call_sec()`, room for one bridge call before the cutoff and the one in flight
+  at it, so a re-armed run does not delay the bound's ladder or eat into the I97 check deadline. The
+  first one-shot of a hold is not a re-arm and keeps its full rung set (bridge reset, then the
+  below-floor mesh reset, I108). The record and the
   count re-arm with the episode and on release. The hold report names the re-armed one-shot as the
   next rung, due now.
 
@@ -3621,4 +3637,8 @@ sees a silent fabric pass.
 | I110 a set already shot does not fire again before the bound | `tests/test_offbus_one_shot_rearm.py::test_offbus_rearm_same_set_no_repeat` |
 | I110 no re-arm inside the margin before the bound; the bound's full ladder and power-cycle request are unchanged and a failed run releases nothing | `tests/test_offbus_one_shot_rearm.py::test_bound_ladder_unchanged` |
 | I110 a re-armed run frees the device only through a full check whose fabric pass just passed | `tests/test_offbus_one_shot_rearm.py::test_release_needs_fabric_pass` |
+| I110 a re-armed run with a failing bridge rung runs no mesh reset or host rung, is bounded by the 10-min mark, and the bound's ladder still runs the mesh reset and requests the power cycle | `tests/test_offbus_one_shot_rearm.py::test_rearm_inside_margin_runs_no_mesh_reset` |
+| I110 the re-arm margin is twice `offbus_rearm_bridge_call_sec()` | `tests/test_offbus_one_shot_rearm.py::test_rearm_margin_from_bridge_call_bound` |
+| I110 no bridge reset call or retry starts past `bridge_reset_cutoff` | `tests/test_offbus_one_shot_rearm.py::test_bridge_cutoff_withholds_calls` |
+| I110 a full check that does not fit before the bound does not run and the hold stands | `tests/test_offbus_one_shot_rearm.py::test_rearm_check_that_does_not_fit_keeps_the_hold` |
 | I102 with I103: the late-chip second mesh reset runs in the pre-cycle sweep, so its pre-reset scan clears a holder outside every broker scope and runs (at the 10-min bound, on the I97 path, and in the sweep outside the bound); its wait still ends at the step's start plus `LATE_CHIP_STEP_SEC`; a failed full check keeps the hold and the cycle journals the holder; a holder in a broker job's scope or the running job's own process still refuses it, nothing lifts and the hold goes on to the cycle | `tests/test_late_chips_after_driver_wait.py::test_the_late_chip_second_reset_clears_a_foreign_holder_and_keeps_its_bound`, `::test_a_job_holder_still_refuses_the_late_chip_second_reset_and_the_hold_goes_on_to_the_cycle` |

@@ -50,8 +50,8 @@ from tt_device_mcp.health.pci_writer import PCI_WRITER, PciWedged
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (
     BELOW_FLOOR,
-    BRIDGE_RESET_SETTLE_SEC,
     BLOCKED,
+    BRIDGE_RESET_SETTLE_SEC,
     DEFER,
     HOLD_FABRIC_UNVERIFIED,
     OUTCOME_RECOVERED,
@@ -64,12 +64,12 @@ from tt_device_mcp.health.recovery import (
     WAIT,
     Evidence,
     Recovery,
+    bridge_reset_call_timeout,
     ipmi_guard,
     mesh_repeat,
     offbus_power_cycle,
     pcie_guard,
     present_reinit,
-    bridge_reset_call_timeout,
 )
 from tt_device_mcp.health.recovery.base import (
     CYCLE_LAUNCH_REPAGE_SEC,
@@ -785,6 +785,7 @@ def _placement_text(placement: list) -> str:
 # the ladder; the ladder itself, and the power cycle only when the ladder fails, are unchanged.
 TRAY_DOWN_MIN_CHIPS = 4
 TRAY_DOWN_RESCAN_SETTLE_SEC = 3
+
 
 # Spec 04 I110: a re-armed off-bus one-shot runs only the per-chip rungs and ends by the 10-min bound. No bridge reset
 # call starts later than one call's bound and its settle before the bound; its full check with fabric starts only with
@@ -3548,7 +3549,9 @@ class GalaxyRecovery(Recovery):
             if unqueued:
                 health_event("gone_chip_bridge_reset_unqueued", chips=unqueued, reason="sbr_not_fired")
         if sbr_healed and per_chip and time.monotonic() + OFFBUS_REARM_VERIFY_SEC > self._rearm_deadline:
-            log("re-armed off-bus one-shot: chips back, but no full check fits before the 10-min bound — the hold stands")
+            log(
+                "re-armed off-bus one-shot: chips back, but no full check fits before the 10-min bound — the hold stands"
+            )
             health_event("offbus_rearm_check_left_to_bound", held_since=hold_since)
             return True
         if sbr_healed:

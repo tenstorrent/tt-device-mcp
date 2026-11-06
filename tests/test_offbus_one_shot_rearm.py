@@ -12,12 +12,15 @@ from datetime import datetime, timedelta
 import pytest
 
 from tests import test_post_reset_gate as prg
-from tests.conftest import fsm_dirty, patch_health_event
+from tests.conftest import fsm_dirty, patch_health_event, patch_recovery
+from tests.test_bridge_reset_arc_dead import _bridge_rung
 from tests.test_device_safety import _arm_offbus_stuck_hold
 from tests.test_offbus_one_shot_idle import IDLE, _below_floor_hold
 from tests.test_post_reset_gate import _assert_settled, _verify_returning
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
+from tt_device_mcp.health import recovery as recovery_pkg
+from tt_device_mcp.health.recovery import galaxy
 
 mesh = prg.mesh  # the post-reset gate's fixtures, shared
 verdict = prg.verdict
@@ -82,12 +85,15 @@ async def test_offbus_rearm_same_set_no_repeat(mesh, monkeypatch):
     assert _rearmed(mesh) == [] and srv.device_hold_offbus_rearms == 0
 
 
-@pytest.mark.asyncio
-async def test_bound_ladder_unchanged(mesh, monkeypatch):
-    """A re-armed one-shot that fails keeps the hold; a set lost inside the margin before the bound gets no
-    one-shot; the 10-min bound still runs the full ladder and requests the power cycle; nothing releases."""
+def _stuck(monkeypatch, mesh, sbr_recovers=False, sbr_verify_healthy=False):
+    """Chip 8 off the bus and isolated, every rung mocked to fail unless told otherwise, the power cycle armed.
+    Returns (counters, tick)."""
     counters = _arm_offbus_stuck_hold(
-        monkeypatch, isolated={"8"}, sbr_recovers=False, sbr_verify_healthy=False, reset_result=False
+        monkeypatch,
+        isolated={"8"},
+        sbr_recovers=sbr_recovers,
+        sbr_verify_healthy=sbr_verify_healthy,
+        reset_result=False,
     )
     patch_health_event(monkeypatch, lambda kind, **f: mesh.append((kind, f)))
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC", "0.5")  # floor = 16
@@ -116,6 +122,14 @@ async def test_bound_ladder_unchanged(mesh, monkeypatch):
             await srv._forced_escalation_task
             srv._forced_escalation_task = None
 
+    return counters, tick
+
+
+@pytest.mark.asyncio
+async def test_bound_ladder_unchanged(mesh, monkeypatch):
+    """A re-armed one-shot that fails keeps the hold; a set lost inside the margin before the bound gets no
+    one-shot; the 10-min bound still runs the full ladder and requests the power cycle; nothing releases."""
+    counters, tick = _stuck(monkeypatch, mesh)
     await tick(srv.SAMPLE_INTERVAL_SEC)
     assert counters["sbr"] == 1, "the one-shot did not run the bridge rung"
     srv.isolated_chips.add("20")
@@ -152,3 +166,110 @@ async def test_release_needs_fabric_pass(mesh, monkeypatch, verdict):
     else:
         assert srv.fsm.state is not ServerState.HEALTHY, "released over an unproven fabric"
         assert count("post_reset_release_refused") >= 1
+
+
+def _record_escalate(monkeypatch):
+    """Record each forced run's rearm_deadline and the bridge cutoff it sets, around the real escalate."""
+    runs = []
+    real = srv.galaxy_recovery.escalate
+
+    async def escalate(*a, rearm_deadline=None, **kw):
+        runs.append({"deadline": rearm_deadline, "now": time.monotonic()})
+        return await real(*a, rearm_deadline=rearm_deadline, **kw)
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
+    return runs
+
+
+@pytest.mark.asyncio
+async def test_rearm_inside_margin_runs_no_mesh_reset(mesh, monkeypatch):
+    """A set lost just before the margin with a failing bridge rung: its re-armed one-shot runs the bridge rung
+    only, never the mesh reset or a host rung, is bounded by the 10-min mark, and the bound's ladder still runs
+    the mesh reset and requests the power cycle."""
+    counters, tick = _stuck(monkeypatch, mesh)
+    runs = _record_escalate(monkeypatch)
+    await tick(srv.SAMPLE_INTERVAL_SEC)
+    assert counters["sbr"] == 1 and runs[0]["deadline"] is None, "the first one-shot is not a re-arm"
+    resets = counters["resets"]
+    late = int(srv._hold_bound_sec() - srv.OFFBUS_ONE_SHOT_REARM_MARGIN_SEC) - 5
+    srv.isolated_chips.add("20")
+    await tick(late)
+    assert _rearmed(mesh) == [["20"]] and counters["sbr"] == 2
+    left = runs[-1]["deadline"] - runs[-1]["now"]
+    assert abs(left - (srv._hold_bound_sec() - late)) < 2, "the re-armed run is not bounded by the 10-min mark"
+    assert counters["resets"] == resets, "the re-armed one-shot ran the mesh reset"
+    assert counters["power_cycles"] == 0 and counters["reboots"] == 0, "the re-armed one-shot climbed"
+    assert [k for k, _ in mesh if k == "offbus_rearm_mesh_reset_left_to_bound"]
+    assert srv.galaxy_recovery.bridge_reset_cutoff is None, "the cutoff outlived the run"
+    await tick(srv._stuck_hold_ceiling_sec() + 1)
+    assert runs[-1]["deadline"] is None, "the bound's ladder ran as a re-arm"
+    assert counters["resets"] > resets, "the bound did not run the mesh reset"
+    assert counters["power_cycles"] == 1, "the bound did not request the power cycle"
+    assert counters["dirty_cleared"] == 0
+
+
+def test_rearm_margin_from_bridge_call_bound():
+    """The margin is two bridge calls with their settle, from named constants."""
+    call = recovery_pkg.bridge_reset_call_timeout() + recovery_pkg.BRIDGE_RESET_SETTLE_SEC
+    assert galaxy.offbus_rearm_bridge_call_sec() == call
+    assert srv.OFFBUS_ONE_SHOT_REARM_MARGIN_SEC == 2 * call
+
+
+@pytest.mark.asyncio
+async def test_bridge_cutoff_withholds_calls(monkeypatch):
+    """Past the cutoff no bridge reset call starts; a cutoff passed during a call stops its retries."""
+    calls = []
+    _bridge_rung(monkeypatch, "13", ["12345"])
+
+    def bridge_reset(i, bdf):
+        calls.append(i)
+        return False
+
+    monkeypatch.setattr(recovery_pkg, "reset_chip_via_bridge", bridge_reset)
+    gr = srv.galaxy_recovery
+    monkeypatch.setattr(gr, "bridge_reset_cutoff", time.monotonic() - 1)
+    assert await gr._recover_isolated_chips(lambda m: None) is False
+    assert calls == [] and gr.last_bridge_reset_reasons["13"] == {"reason": "past_cutoff"}
+    assert srv.isolated_chips == {"13"}
+
+    def bridge_reset_then_cutoff(i, bdf):
+        calls.append(i)
+        gr.bridge_reset_cutoff = time.monotonic() - 1
+        return False
+
+    monkeypatch.setattr(gr, "bridge_reset_cutoff", time.monotonic() + 600)
+    monkeypatch.setattr(recovery_pkg, "reset_chip_via_bridge", bridge_reset_then_cutoff)
+    assert await gr._recover_isolated_chips(lambda m: None) is False
+    assert calls == ["13"], "a retry started past the cutoff"
+    assert srv.isolated_chips == {"13"}
+
+
+@pytest.mark.asyncio
+async def test_rearm_check_that_does_not_fit_keeps_the_hold(mesh, monkeypatch):
+    """The re-armed bridge rung brings the chips back, but its full check with fabric would not end before the
+    bound: no check runs, nothing releases, and the bound's ladder takes the hold."""
+    counters, tick = _stuck(monkeypatch, mesh)
+    await tick(srv.SAMPLE_INTERVAL_SEC)
+    verifies = []
+
+    async def recover(log):
+        counters["sbr"] += 1
+        return True
+
+    async def verify(expected, log, run_fabric=True, **_):
+        verifies.append(run_fabric)
+        return True, {"snapshot": {"ok": True}}
+
+    patch_recovery(monkeypatch, "_recover_isolated_chips", recover)
+    patch_recovery(monkeypatch, "_verify_device", verify)
+    monkeypatch.setattr(galaxy, "OFFBUS_REARM_VERIFY_SEC", srv._hold_bound_sec())
+    srv.isolated_chips.add("20")
+    await tick(172)
+    assert _rearmed(mesh) == [["20"]] and counters["sbr"] == 2
+    assert verifies == [], "a full check ran that could not end before the bound"
+    assert [k for k, _ in mesh if k == "offbus_rearm_check_left_to_bound"]
+    assert counters["dirty_cleared"] == 0 and srv.fsm.state is not ServerState.HEALTHY, "released unchecked"
+    monkeypatch.setattr(galaxy, "OFFBUS_REARM_VERIFY_SEC", 0)
+    srv.isolated_chips.add("21")
+    await tick(232)
+    assert verifies == [True], "a check that fits did not run with its fabric pass"
