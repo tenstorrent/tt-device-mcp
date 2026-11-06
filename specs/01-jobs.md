@@ -261,11 +261,20 @@ the queue and a running job outlive the broker process.
   broker first sees that pid's hold, never earlier (the file's epoch is only its last refresh).
   The updater rewrites the hold on every poll; the same pid stays the same waiter and keeps its
   arrival, while a later lap's hold (another pid) is a new waiter and starts a fresh minute. A dead
-  or overdue hold is no waiter. The hold waiter is never dispatched, never a job, and never counted
+  or overdue hold is no waiter. A device hold whose I76 bound (spec 04) is blocked by a running
+  broker job (`_hold_bound_tenant_blocker` `job_running`, for the episode still open) is contention
+  too: a held device refuses tenants, so no job can queue behind the one running and a job past x
+  would otherwise hold the bound off with no end (a re-adopted job over a startup hold, spec 03
+  I75). It counts as one more waiter (`_hold_bound_waiter`, id `hold-bound:<episode start>`),
+  arriving when the broker first sees the blocked bound; a later episode is a new waiter and starts
+  a fresh minute, and a bound blocked by a tenant outside every broker job is no waiter (preempting
+  the job would not free the device). Like the hold waiter it is never dispatched, never a job,
+  never counted in `queued`, and never makes a silent job reapable before x; `preempt_cause` reads
+  `hold_bound` when it is the only waiter. The hold waiter is never dispatched, never a job, and never counted
   in `/health` `queued` or queue status; it does not make a silent job reapable before x (I10:
   only a queued job does). Everything else is as for a queued waiter: the minute, the label, the
   kill and what follows it. `/health` and job status name the cause while the label reads
-  `PREEMPTING` (`preempt_cause`: `update` when the hold is the only waiter, else `queued`), and
+  `PREEMPTING` (`preempt_cause`: `update` when the update hold, alone or with the hold-bound waiter, is the only waiter, `hold_bound` when that waiter is, else `queued`), and
   `/health` gives the seconds left before the running job's x (`preempt_limit_left_sec`, 0 past
   it), which the updater bounds its drain by (spec 08 I20: the time left plus 100 s, then the
   post-job gate the preemption leads to, at most `GATE_CAP`; a limit too far off is not held
