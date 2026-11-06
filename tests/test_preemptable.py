@@ -2247,3 +2247,108 @@ def test_health_shows_the_seconds_left_before_a_preemptable_jobs_limit(clear_job
     assert 118 <= srv._health_payload()["preempt_limit_left_sec"] <= 120
     job.preempt_limit_monotonic = time.monotonic() - 5
     assert srv._health_payload()["preempt_limit_left_sec"] == 0
+
+
+# A hold whose 10-min bound a running broker job blocks is contention too (spec 01 I20, spec 04 I76): a held device
+# refuses tenants, so nothing can queue behind a preemptable job past its limit. Without this waiter a re-adopted
+# preemptable job past its limit ran on unbounded over a startup_unverified hold and the bound's ladder never ran.
+
+
+@pytest.fixture
+def bound_blocked(monkeypatch):
+    """An open hold episode whose bound a running job blocks, as _hold_bound_tenant_blocked leaves it."""
+    since = srv.datetime.now().isoformat()
+    monkeypatch.setattr(srv, "device_hold_episode_since", since)
+    monkeypatch.setattr(srv, "_hold_bound_episode", since)
+    monkeypatch.setattr(srv, "_hold_bound_tenant_blocker", {"blocker": "job_running", "job_id": "990"})
+    monkeypatch.setattr(srv, "_hold_bound_waiter_seen", None)
+    monkeypatch.setattr(srv, "_dispatch_hold_waiter_seen", None)
+    return since
+
+
+def test_a_job_blocked_hold_bound_past_the_limit_starts_the_minute(clear_job_state, bound_blocked):
+    job = _pjob()
+    job.status = srv.JobStatus.RUNNING
+    now = time.monotonic()
+    assert srv._preempt_kill_at(job, now + 10, now) is None, "the bound preempted a job before its limit"
+    assert srv._preempt_kill_at(job, now - 100, now) == now + srv.PREEMPT_GRACE_SEC
+    assert srv.preempt_label(job).startswith("PREEMPTING ")
+    assert srv.preempt_cause(job) == "hold_bound"
+    # Never a queued job: no silent job becomes reapable before its limit, and /health 'queued' counts nothing.
+    assert srv._first_waiter_arrival(update=False) is None
+
+
+@pytest.mark.parametrize("case", ["tenant", "no_blocker", "no_hold", "stale_episode"])
+def test_no_job_blocked_hold_bound_is_no_contention(clear_job_state, bound_blocked, monkeypatch, case):
+    if case == "tenant":  # a holder outside a broker job: preempting the job would not free the device
+        monkeypatch.setattr(srv, "_hold_bound_tenant_blocker", {"blocker": "tenant"})
+    elif case == "no_blocker":
+        monkeypatch.setattr(srv, "_hold_bound_tenant_blocker", None)
+    elif case == "no_hold":
+        monkeypatch.setattr(srv, "device_hold_episode_since", "")
+    else:  # the blocker belongs to an episode that already ended
+        monkeypatch.setattr(srv, "device_hold_episode_since", srv.datetime.now().isoformat() + "x")
+    job = _pjob()
+    job.status = srv.JobStatus.RUNNING
+    now = time.monotonic()
+    assert srv._preempt_kill_at(job, now - 100, now) is None
+    assert srv._waiter_arrivals(now) == {}
+
+
+def test_a_new_hold_episode_starts_a_fresh_minute(clear_job_state, bound_blocked, monkeypatch):
+    job = _pjob()
+    job.status = srv.JobStatus.RUNNING
+    now = time.monotonic()
+    first = srv._preempt_kill_at(job, now - 100, now)
+    assert srv._preempt_kill_at(job, now - 100, now + 5) == first, "the same episode's waiter moved"
+    later = srv.datetime.now().isoformat() + "1"
+    monkeypatch.setattr(srv, "device_hold_episode_since", later)
+    monkeypatch.setattr(srv, "_hold_bound_episode", later)
+    assert srv._preempt_kill_at(job, now - 100, now + 6) == now + 6 + srv.PREEMPT_GRACE_SEC
+
+
+def test_an_update_beside_the_hold_bound_is_named_update(clear_job_state, bound_blocked):
+    job = _pjob()
+    job.status = srv.JobStatus.RUNNING
+    _update_hold(age_sec=0)
+    now = time.monotonic()
+    srv._preempt_kill_at(job, now - 100, now)
+    assert srv.preempt_cause(job) == "update"
+    _waiting_job("989")
+    srv._preempt_kill_at(job, now - 100, time.monotonic())
+    assert srv.preempt_cause(job) == "queued"
+
+
+def test_the_bound_blocker_names_the_preemption(clear_job_state, bound_blocked):
+    _readopted("990", served_sec=2400, timeout_sec=300)
+    desc = srv._describe_bound_blocker(srv._hold_bound_tenant_blocker)
+    assert "preemptable" in desc and "ladder runs" in desc, desc
+
+
+@pytest.mark.asyncio
+async def test_a_readopted_preemptable_job_past_its_limit_is_killed_a_minute_after_the_hold_bound_blocks(
+    monkeypatch, tmp_path, clear_job_state, bound_blocked
+):
+    """The startup_unverified case: a broker restart re-adopted a preemptable job, it ran past its limit, the hold
+    opened and its 10-min bound was blocked by the job. Nothing else waits. The job gets its full minute, then is
+    killed, so the bound's ladder (and the power cycle if the full check still fails) can run."""
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
+    monkeypatch.setattr(srv, "PREEMPT_GRACE_SEC", 1)
+    _recording_dirty(monkeypatch)
+    active = {"v": True}
+    stopped = []
+    monkeypatch.setattr(srv, "_scope_active", lambda scope: active["v"])
+
+    async def fake_kill(job_id, pid):
+        stopped.append((job_id, time.monotonic()))
+        active["v"] = False
+
+    monkeypatch.setattr(srv, "_preempt_kill", fake_kill)
+    _readopted("990", served_sec=2400, timeout_sec=1500)
+
+    t0 = time.monotonic()
+    await asyncio.wait_for(srv._monitor_readopted_scope("990", "ttdev-job-990.scope"), timeout=5)
+    assert [j for j, _ in stopped] == ["990"], "the job blocking the hold bound ran on unbounded"
+    assert stopped[0][1] - t0 >= 1 - 0.05, "killed before its full minute"
+    assert srv.jobs["990"].status is srv.JobStatus.PREEMPTED

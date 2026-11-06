@@ -1413,7 +1413,13 @@ each rung fires only when the gentler one failed or cannot apply.
   at the bound the broker journals and pages `hold_bound_tenant_blocked` once per episode, naming the
   blocker (pid, user, command), `/health` shows `next_step` `tenant_blocked` with `blocked_by`, and
   on the first sampler tick after the tenant leaves the ladder runs, then the host rung if the full
-  check fails. With the power cycle
+  check fails. A running broker job blocks the bound the same way, but only up to its own limit: a
+  preemptable job past its limit meets the blocked bound as a waiter (spec 01 I20, `hold_bound`), so
+  it gets its minute, is killed, and the ladder runs on the next tick; a non-preemptable job times
+  out at its limit. Before, a preemptable job re-adopted over a startup hold (spec 03 I75) ran on past
+  its limit with no waiter (the held device refuses tenants) and the hold had no bound. Time to
+  recover, class startup hold behind a re-adopted preemptable job: its limit plus `PREEMPT_GRACE_SEC`,
+  then the ladder and, if the full check still fails, the power cycle. With the power cycle
   opted out (`TT_DEVICE_MCP_AUTO_POWER_CYCLE=0`) the hold pages
   `hold_bound_no_host_rung` once per episode. The operator kill switch
   `TT_DEVICE_MCP_FORCE_ESCALATE=0` turns off only the forced runs below the bound; the bound's ladder

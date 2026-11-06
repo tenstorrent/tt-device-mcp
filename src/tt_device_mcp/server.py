@@ -9205,7 +9205,7 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         if j.status == JobStatus.RUNNING and j.preemptable:
             payload["preempt"] = preempt_label(j)
             payload["preempt_job_id"] = j.id
-            # Spec 01 I20: why it is being preempted ('queued' or 'update'); absent with no contention.
+            # Spec 01 I20: why it is being preempted ('queued', 'update' or 'hold_bound'); absent with no contention.
             cause = preempt_cause(j)
             if cause:
                 payload["preempt_cause"] = cause
@@ -10097,6 +10097,10 @@ def _describe_bound_blocker(blocker: dict) -> str:
         return "a tenant holds the device"
     if blocker.get("job_id"):
         desc += f" (re-adopted job {blocker['job_id']}, past its stated end {blocker.get('service_end')})"
+    if blocker.get("blocker") == "job_running" and any(
+        j.status == JobStatus.RUNNING and j.preemptable for j in jobs.values()
+    ):
+        desc += f"; preemptable: stopped {PREEMPT_GRACE_SEC}s after its limit, then the ladder runs (spec 01 I20)"
     return desc
 
 
@@ -10734,18 +10738,45 @@ def _dispatch_hold_waiter(now: float) -> Optional[tuple]:
     return _dispatch_hold_waiter_seen
 
 
+HOLD_BOUND_WAITER_PREFIX = "hold-bound:"
+_hold_bound_waiter_seen: Optional[tuple] = None
+
+
+def _hold_bound_waiter(now: float) -> Optional[tuple]:
+    """The open hold's 10-min bound as (waiter id, arrival on time.monotonic()) while a running broker job is all that
+    keeps its ladder off the device (spec 04 I76, spec 01 I20), else None. A held device refuses tenants, so no job can
+    queue behind a preemptable job past its limit: without this waiter it ran on unbounded and the bound waited for it
+    with no end. It arrives when the broker first sees the bound blocked, per hold episode. Never raises."""
+    global _hold_bound_waiter_seen
+    blocker = _hold_bound_tenant_blocker
+    since = device_hold_episode_since
+    if (
+        not since
+        or _hold_bound_episode != since
+        or not isinstance(blocker, dict)
+        or blocker.get("blocker") != "job_running"
+    ):
+        _hold_bound_waiter_seen = None
+        return None
+    waiter = f"{HOLD_BOUND_WAITER_PREFIX}{since}"
+    if _hold_bound_waiter_seen is None or _hold_bound_waiter_seen[0] != waiter:
+        _hold_bound_waiter_seen = (waiter, now)
+    return _hold_bound_waiter_seen
+
+
 def _waiter_arrivals(now: Optional[float] = None, *, update: bool = True) -> dict:
     """Every job now waiting for the device, by id, with when (time.monotonic) it was queued.
     The monotonic clock keeps a wall-clock step or DST change from moving the kill. A job queued
     before a broker restart has only its queued_at, read against the wall clock once and kept as
     its queued_monotonic; one that does not parse counts as arriving at that read. With `update`,
-    a pending update (the auto-updater's live dispatch hold) is one more waiter (spec 01 I20)."""
+    a pending update (the auto-updater's live dispatch hold) is one more waiter (spec 01 I20), and so
+    is a hold whose 10-min bound a running job blocks (_hold_bound_waiter)."""
     now = time.monotonic() if now is None else now
     arrivals = {}
     if update:
-        held = _dispatch_hold_waiter(now)
-        if held is not None:
-            arrivals[held[0]] = min(now, held[1])
+        for held in (_dispatch_hold_waiter(now), _hold_bound_waiter(now)):
+            if held is not None:
+                arrivals[held[0]] = min(now, held[1])
     for j in jobs.values():
         if j.status != JobStatus.QUEUED:
             continue
@@ -10828,11 +10859,14 @@ def preempt_label(job: "Job") -> Optional[str]:
 
 def preempt_cause(job: "Job") -> Optional[str]:
     """Why a running preemptable job is under contention: 'queued' while a job waits for the
-    device, 'update' while only a pending broker update does (spec 01 I20); None otherwise."""
+    device, 'update' while only a pending broker update does (beside the hold bound or not), 'hold_bound' while only
+    the open hold's 10-min bound does (spec 01 I20); None otherwise."""
     label = preempt_label(job)
     if not label or not label.startswith("PREEMPTING") or not job.contention_waiters:
         return None
-    if all(w.startswith(DISPATCH_HOLD_WAITER_PREFIX) for w in job.contention_waiters):
+    if all(w.startswith(HOLD_BOUND_WAITER_PREFIX) for w in job.contention_waiters):
+        return "hold_bound"
+    if all(w.startswith((DISPATCH_HOLD_WAITER_PREFIX, HOLD_BOUND_WAITER_PREFIX)) for w in job.contention_waiters):
         return "update"
     return "queued"
 
@@ -14269,6 +14303,11 @@ export {JOB_TAG_ENV}={job_tag}
                                 note(
                                     f"PREEMPTING: a broker update is waiting past the limit; end within {left}s "
                                     "or be killed"
+                                )
+                            elif preempt_cause(job) == "hold_bound":
+                                note(
+                                    f"PREEMPTING: the device hold's 10-min recovery bound is waiting past the limit; "
+                                    f"end within {left}s or be killed"
                                 )
                             else:
                                 note(f"PREEMPTING: a job is waiting past the limit; end within {left}s or be killed")
