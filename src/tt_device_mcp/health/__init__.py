@@ -148,6 +148,7 @@ from tt_device_mcp.health.recovery.galaxy import (
     _eth_freeze_holds,
     _galaxy_reset_min_dead_chips,
     _is_galaxy,
+    offbus_rearm_bridge_call_sec,
     _offbus_fault_class,
     _offbus_hold_ceiling_sec,
     _power_cycle_direct_class,
@@ -181,6 +182,8 @@ from tt_device_mcp.health.recovery.stages.power_cycle import (
 from tt_device_mcp.health.shutdown import note_broker_stopping
 
 __all__ = [
+    # the re-armed off-bus one-shot's bridge-call bound (spec 04 I110)
+    "offbus_rearm_bridge_call_sec",
     # the one in-flight PCI sysfs writer and its PCI-wedged latch (spec 04 I76)
     "PCI_WRITER",
     "PciWedged",

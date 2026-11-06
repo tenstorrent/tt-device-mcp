@@ -1146,7 +1146,7 @@ OFFBUS_ONE_SHOT_REARM_MAX = 3
 # No re-arm this close to the 10-min bound: a forced run still in flight at the bound would delay the bound's ladder
 # (and eat into its full check's deadline). A re-armed run is per-chip only and stops starting bridge calls one call
 # before the bound, so the margin is room for one bridge call before that cutoff and the one in flight at it.
-from tt_device_mcp.health.recovery.galaxy import offbus_rearm_bridge_call_sec  # noqa: E402
+from tt_device_mcp.health import offbus_rearm_bridge_call_sec  # noqa: E402
 
 OFFBUS_ONE_SHOT_REARM_MARGIN_SEC = 2 * offbus_rearm_bridge_call_sec()
 # Whether the forced run being spawned is a re-armed one-shot (spec 04 I110): it then runs the per-chip rungs only.
