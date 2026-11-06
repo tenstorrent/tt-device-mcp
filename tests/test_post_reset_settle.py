@@ -154,7 +154,7 @@ async def test_no_wait(monkeypatch, tmp_path, case, chips, mode, age):
         FABRIC_DEBT.note_reset("tt-smi -glx_reset", at=srv.time.monotonic() - age)
     await srv._device_health_gate(None, phase="post-job", run_fabric=True)
     assert calls["waits"] == []
-    assert calls["fabric"] == (0 if age is None else 1), "between jobs with no reset adds nothing (goal 5)"
+    assert calls["fabric"] == (0 if age is None else 1), "between jobs with no reset adds nothing"
 
 
 @pytest.mark.asyncio
@@ -186,7 +186,7 @@ async def test_a_ladder_reset_inside_the_gate_adds_no_second_wait(monkeypatch, t
     assert len(calls["waits"]) == 1
 
 
-# ---- goal 10: the settle never delays the 10-min bound ----
+# ---- the settle never delays the 10-min hold bound ----
 
 
 def _open_hold(monkeypatch, age):
