@@ -148,7 +148,6 @@ from tt_device_mcp.health.recovery.galaxy import (
     _eth_freeze_holds,
     _galaxy_reset_min_dead_chips,
     _is_galaxy,
-    offbus_rearm_bridge_call_sec,
     _offbus_fault_class,
     _offbus_hold_ceiling_sec,
     _power_cycle_direct_class,
@@ -157,6 +156,7 @@ from tt_device_mcp.health.recovery.galaxy import (
     _stuck_hold_ceiling_sec,
     _ubb_bus_id_tables,
     _whole_trays_off,
+    offbus_rearm_bridge_call_sec,
 )
 from tt_device_mcp.health.recovery.pcie_guard import pcie_guard_at_start
 from tt_device_mcp.health.recovery.per_target import PerTargetRecovery
