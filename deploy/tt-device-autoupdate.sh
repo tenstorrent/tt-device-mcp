@@ -24,6 +24,12 @@
 # So root fetches the public repo itself, into a root-owned clone: code that is about to be
 # installed as root has no business sitting anywhere else on the way in.
 #
+# The one other source is also fixed in code: a bare repository at "$ROOT/mirror.git", used
+# instead of the public repo when root alone can have filled it (it and $ROOT are real
+# directories owned by root, writable by no group or other user, and the mirror is bare). An
+# operator who fills it does so as root, e.g. `git push --receive-pack='sudo -n git receive-pack'`
+# over ssh; root reads it as a local file, so no credential lands on the box either way.
+#
 # Idle-gated: an update never interrupts an in-flight device op, and never restarts the broker
 # under a running job. From its busy check through the restart the updater holds dispatch (spec 08
 # I18): the broker starts no queued job while the hold names a live pid, so a job queued behind one
@@ -62,33 +68,6 @@ ETH_EXALENS_VERSION="0.3.20"
 exec 9>"$ROOT/.autoupdate.lock"
 flock -n 9 || { echo "autoupdate: another run holds the lock; skipping" >&2; exit 0; }
 
-# Fetch as root, straight from the public repo. Every failure below is a no-op lap that says
-# why: a host that cannot reach the network, or a branch nobody has pushed, is a thing to
-# report and retry next minute, not a reason to install anything.
-#
-# Credentials are refused explicitly, not merely unavailable. The source is public, so a fetch
-# that wants a username is a fetch aimed somewhere it should not be — a URL that has changed
-# under us, or a host carrying a credential helper someone configured for other work. Under
-# systemd there is no terminal for git to prompt on, so it would fail anyway, but only by
-# accident of having no tty; these two say so on purpose, and keep a stored credential from
-# quietly making the fetch succeed.
-clone="$CLONE"; remote_sha=""; src_desc="$REPO ($BR)"
-if [ ! -d "$CLONE/.git" ]; then
-    # A leftover that is not a repository (an interrupted first clone) would fail every lap
-    # forever, because git will not clone into a non-empty directory.
-    rm -rf "$CLONE" 2>/dev/null || true
-    # umask in the subshell so the tree is 0700 from creation, never briefly world-readable.
-    ( umask 077 && GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true git clone -q -b "$BR" "$REPO" "$CLONE" ) \
-        || { echo "autoupdate: cannot clone $REPO ($BR)" >&2; rm -rf "$CLONE" 2>/dev/null; exit 0; }
-fi
-GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true git -C "$CLONE" fetch -q origin "$BR" \
-    || { echo "autoupdate: cannot reach $REPO" >&2; exit 0; }
-# --verify -q, because a bare `rev-parse <missing ref>` echoes its own argument to stdout
-# and exits non-zero, which a plain non-empty test would take for a sha.
-remote_sha="$(git -C "$CLONE" rev-parse --verify -q "refs/remotes/origin/$BR" || true)"
-[ -n "$remote_sha" ] \
-    || { echo "autoupdate: $REPO has no branch $BR" >&2; exit 0; }
-
 # The clock: whole seconds since the epoch, into the variable named $1, by the shell itself (a
 # drain reads it on every 5 s poll). Every time a lap decides on comes from here, so it is the one
 # seam a test replaces; defined after the config is sourced, so nothing on a box can.
@@ -100,18 +79,9 @@ au_now() { printf -v "$1" '%(%s)T' -1; }
 au_cap() { local _au_o _au_rc=0; _au_o="$("${@:2}")" || _au_rc=$?; printf -v "$1" '%s' "$_au_o"; return "$_au_rc"; }
 # Epoch seconds $2 as local time, the way the decision log writes it, into the variable named $1.
 au_time() { printf -v "$1" '%(%Y-%m-%dT%H:%M:%S%z)T' "$2"; }
-
-# Read as $(cat) would, without a process: the whole file, less its trailing newlines.
-installed_sha=""; { IFS= read -r -d '' installed_sha < "$STATE"; } 2>/dev/null
-while [ "${installed_sha%$'\n'}" != "$installed_sha" ]; do installed_sha="${installed_sha%$'\n'}"; done
-# Already current. A coalescing record (I21, below) belongs to an unapplied sha: with none left, it goes.
-# Tested first: the rm is the only process an idle lap would start.
-if [ "$installed_sha" = "$remote_sha" ]; then
-    if [ -e "$ROOT/pending-head" ] || [ -L "$ROOT/pending-head" ]; then rm -f "$ROOT/pending-head" 2>/dev/null; fi
-    exit 0
-fi
-
-echo "autoupdate: $BR ${installed_sha:0:9} -> ${remote_sha:0:9} via $src_desc" >&2
+# The uid that must own the local mirror and $ROOT, into the variable named $1: root's. The seam a
+# test replaces with its own uid, so the mirror checks run unprivileged.
+au_root_uid() { printf -v "$1" '%s' 0; }
 
 # Decision log (spec 08 I22). Every lap that has an update to make records what it decided
 # (deferred, applied, failed), when, and from which sha to which, in the broker's log dir and
@@ -135,6 +105,102 @@ au_log() {  # <decision> <reason>
         echo "$line" >> "$AU_LOG"
     } 2>/dev/null || true
 }
+
+# The source this lap (I16): the local mirror when root alone can have filled it, else the public repo.
+# Nothing falls back from one to the other within a lap: a mirror that cannot be read is reported like
+# an unreachable repo, so a box never quietly fetches from a source other than the one it named.
+MIRROR="$ROOT/mirror.git"
+# Whether "$MIRROR" is one root alone can have filled: it and $ROOT real directories, not links, owned
+# by root, writable by no group or other user, and the mirror a bare repository. A box with no mirror
+# pays one test and no process.
+mirror_ok() {
+    local d out uid mode root_uid
+    [ -d "$MIRROR" ] || return 1
+    au_root_uid root_uid
+    for d in "$ROOT" "$MIRROR"; do
+        [ -d "$d" ] && [ ! -L "$d" ] || return 1
+    done
+    au_cap out stat -c '%u %a' -- "$ROOT" "$MIRROR" 2>/dev/null || return 1
+    [ "${out//[!$'\n']/}" = $'\n' ] || return 1
+    while read -r uid mode; do
+        [ "$uid" = "$root_uid" ] && [[ $mode =~ ^[0-7]+$ ]] && (( (8#$mode & 8#022) == 0 )) || return 1
+    done <<< "$out"
+    au_cap out env GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true git -C "$MIRROR" rev-parse --is-bare-repository 2>/dev/null \
+        && [ "$out" = true ]
+}
+src="$REPO"
+if mirror_ok; then src="file://$MIRROR"; fi
+src_desc="$src ($BR)"
+
+# A source that fails stays failing for minutes or days, and a lap runs every minute: each no-op lap
+# below says why on the first lap of an outage only. The marker holds when it began and what failed;
+# a different failure is a new line, and the first good fetch says how long it lasted.
+DOWN="$ROOT/.source-unreachable"
+src_down() {  # <what>: print it, unless this outage already did
+    local t was="" since=""
+    { read -r since was < "$DOWN"; } 2>/dev/null || true
+    [ "$was" = "$1" ] && return 0
+    au_now t
+    echo "${since:-$t} $1" > "$DOWN" 2>/dev/null || true
+    echo "autoupdate: $1" >&2
+}
+
+# Fetch as root, from that source. Every failure below is a no-op lap that says why: a host that cannot
+# reach the network, or a branch nobody has pushed, is a thing to report and retry next minute, not a
+# reason to install anything.
+#
+# Credentials are refused explicitly, not merely unavailable. Neither source needs one, so a fetch
+# that wants a username is a fetch aimed somewhere it should not be — a URL that has changed
+# under us, or a host carrying a credential helper someone configured for other work. Under
+# systemd there is no terminal for git to prompt on, so it would fail anyway, but only by
+# accident of having no tty; these two say so on purpose, and keep a stored credential from
+# quietly making the fetch succeed.
+clone="$CLONE"; remote_sha=""
+if [ ! -d "$CLONE/.git" ]; then
+    # A leftover that is not a repository (an interrupted first clone) would fail every lap
+    # forever, because git will not clone into a non-empty directory.
+    rm -rf "$CLONE" 2>/dev/null || true
+    # umask in the subshell so the tree is 0700 from creation, never briefly world-readable.
+    ( umask 077 && GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true git clone -q -b "$BR" "$src" "$CLONE" ) \
+        || { src_down "cannot clone $src ($BR)"; rm -rf "$CLONE" 2>/dev/null; exit 0; }
+else
+    # The clone follows the source: origin is pointed at this lap's choice before the fetch, both ways.
+    origin=""
+    au_cap origin env GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true git -C "$CLONE" config --get remote.origin.url 2>/dev/null
+    if [ "$origin" != "$src" ]; then
+        GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true git -C "$CLONE" remote set-url origin "$src" \
+            || { src_down "cannot point the clone at $src"; exit 0; }
+        echo "autoupdate: source ${origin:-none} -> $src" >&2
+        # Not a decision about this lap's update: a failed apply later in the lap still logs its own.
+        au_log source "origin ${origin:-none} -> $src"; au_logged=0
+    fi
+fi
+GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true git -C "$CLONE" fetch -q origin "$BR" \
+    || { src_down "cannot reach $src"; exit 0; }
+# --verify -q, because a bare `rev-parse <missing ref>` echoes its own argument to stdout
+# and exits non-zero, which a plain non-empty test would take for a sha.
+remote_sha="$(git -C "$CLONE" rev-parse --verify -q "refs/remotes/origin/$BR" || true)"
+[ -n "$remote_sha" ] \
+    || { src_down "$src has no branch $BR"; exit 0; }
+if [ -e "$DOWN" ]; then
+    since=""; { read -r since was < "$DOWN"; } 2>/dev/null || true
+    au_now now
+    case "$since" in ''|*[!0-9]*) since=$now ;; esac
+    echo "autoupdate: $src reachable again after $(( now - since ))s" >&2
+    rm -f "$DOWN" 2>/dev/null || true
+fi
+
+# Read as $(cat) would, without a process: the whole file, less its trailing newlines.
+installed_sha=""; { IFS= read -r -d '' installed_sha < "$STATE"; } 2>/dev/null
+while [ "${installed_sha%$'\n'}" != "$installed_sha" ]; do installed_sha="${installed_sha%$'\n'}"; done
+# Already current. A coalescing record (I21, below) belongs to an unapplied sha: with none left, it goes.
+# Tested first: the rm is the only process an idle lap would start.
+if [ "$installed_sha" = "$remote_sha" ]; then
+    if [ -e "$ROOT/pending-head" ] || [ -L "$ROOT/pending-head" ]; then rm -f "$ROOT/pending-head" 2>/dev/null; fi
+    exit 0
+fi
+
+echo "autoupdate: $BR ${installed_sha:0:9} -> ${remote_sha:0:9} via $src_desc" >&2
 
 # Apply rate limit (spec 08 I21), ON by default (1800 s). Every apply but a docs/tests/CI-only one
 # (I29, below) restarts the broker, and every start runs the full startup check, fabric traffic

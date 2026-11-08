@@ -94,6 +94,33 @@ has waited 3600 s, whichever comes first. A burst of pushes thus costs about one
 one startup fabric check) per hour, not one per push; a lone push waits 10 min. A broken broker gets
 a new sha at once. Spec 08 I21.
 
+## Autoupdate source: local mirror
+
+The updater fetches the public repository, or a local bare mirror at `$TTDEV_ROOT/mirror.git`
+(`/opt/tt-device-broker/mirror.git` by default) when one is present that root alone can have
+filled: it and `$TTDEV_ROOT` are real directories owned by root, writable by no group or other
+user, and it is a bare repository. Anything else is ignored and the public repository is used.
+Each lap points the clone's `origin` at the source it chose and logs a switch in `autoupdate.log`.
+Spec 08 I16.
+
+To use one, create it as root and fill it from a machine that can read the repository:
+
+```bash
+sudo git init --bare /opt/tt-device-broker/mirror.git
+# from the machine that can read the repository, after each fetch:
+git push --mirror --receive-pack='sudo -n git receive-pack' <host>:/opt/tt-device-broker/mirror.git
+```
+
+`--receive-pack` runs as root on the box, so every object and ref stays root-owned. No credential,
+key or helper lands on the box: root reads the mirror as a local file. An updater older than this
+source choice fetches its clone's `origin` as is; on such a host, point it once with
+`sudo git -C /opt/tt-device-broker/src remote set-url origin file:///opt/tt-device-broker/mirror.git`.
+Remove the mirror to go back to the public repository; the next lap repoints `origin`.
+
+A source that keeps failing is named once, on the first failing lap (the marker
+`$TTDEV_ROOT/.source-unreachable` records when it began), and once more when a fetch works again.
+A failing lap changes nothing: no dispatch hold, no restart.
+
 ## Slurm
 
 `deploy/install-tt-device-broker.sh` stages both hooks into `/opt/tt-device-broker/slurm/`;

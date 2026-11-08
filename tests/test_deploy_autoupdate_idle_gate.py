@@ -111,7 +111,7 @@ def _gate(
     # The stand-ins read their files with the read builtin, never $(cat ...): a lap polls every 5 s
     # for up to the job cap, and each fork on a poll is hundreds per test.
     prelude = f"""set -u
-ROOT={root}; remote_sha=abc123; INHIBIT={tmp_path / "device-op.lock"}; STATE={root / "installed.sha"}
+ROOT={root}; BR=main; remote_sha=abc123; INHIBIT={tmp_path / "device-op.lock"}; STATE={root / "installed.sha"}
 {_clock(text)}on_restart() {{ :; }}
 seen() {{ local h; if [ -e "$HOLD" ]; then read -r h < "$HOLD"; echo "$1 held $h" >> {trace}; else echo "$1 free" >> {trace}; fi; }}
 sleep() {{ seen "sleep $*"; }}
@@ -729,8 +729,8 @@ def _apply_event(tmp_path, health_dir, idle="true", drained_s=0, restart_rc=0):
     script = (
         f"set -u\ninstalled_sha=old111; remote_sha=new222; src_desc=test; idle={idle}; drained_s={drained_s}\n"
         f"LAST_APPLY_NRESTARTS={tmp_path}/last-apply.nrestarts\n"
-        f"RECOVERY_PENDING={tmp_path}/recovery.defer\nau_log() {{ :; }}\n"
-        f"systemctl() {{ return {restart_rc}; }}\n" + _clock(text) + block
+        f"RECOVERY_PENDING={tmp_path}/recovery.defer\n"
+        f"systemctl() {{ return {restart_rc}; }}\n" + _clock(text) + "au_log() { :; }\n" + block
     )
     env = {"PATH": "/usr/bin:/bin", "TT_DEVICE_MCP_HEALTH_DIR": str(health_dir)}
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=30)
