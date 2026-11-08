@@ -74,6 +74,15 @@ POST_STEP_AER_QUIET_SEC = 5.0
 # the links).
 AER_STOP_COUNT = 4
 AER_STOP_WINDOW_SEC = 2.0
+# Spec 03 I92, 04 I112: while the broker's own check runs, one uncorrectable record on a chip's root port is a trigger.
+# A chip was seen to read all-ones 2.6 s after its root port logged a single uncorrectable record, with no burst on any
+# function, and the check went on reading it for 7 s; the port above the chip is the first to count a link that fails.
+# Only the root port, only during the broker's own check: an endpoint's isolated record stays under AER_STOP_COUNT.
+AER_CHECK_ROOT_STOP_COUNT = 1
+# Spec 03 I95, 04 I112: how long the containment waits for the trigger-and-stop record's fsync before the PCI remove.
+# The record is what shows the trigger if the remove takes the host down; a storm has stalled an fsync for tens of
+# seconds, so the wait is short and comes out of WATCH_HARD_BOUND_SEC, and a record not on disk by then is still queued.
+PRE_REMOVE_RECORD_WAIT_SEC = 1.0
 # The watch polls every LINK_WATCH_SEC plus the poll's own time, so the read two polls back is just
 # over AER_STOP_WINDOW_SEC old. Half a poll of slack keeps it as the baseline; the read three polls
 # back (at least 3 s old) is always out, so a rise spread over three polls never stops a check.
@@ -1052,10 +1061,11 @@ class TelemetrySampler:
         return chip_state.chip_nodes(ids)
 
     @classmethod
-    def _fence(cls, ids, reason: str) -> None:
-        """Spec 03 I97: fence ``ids``; a failure to fence never stops the containment or the sample."""
+    def _fence(cls, ids, reason: str, *, unread: bool = False) -> None:
+        """Spec 03 I97: fence ``ids``; a failure to fence never stops the containment or the sample.
+        ``unread``: fenced on a suspicion, not an all-ones read (:func:`chip_state.fence`)."""
         try:
-            chip_state.fence(ids, reason, cls._nodes(ids))
+            chip_state.fence(ids, reason, cls._nodes(ids), unread=unread)
         except Exception:  # noqa: BLE001
             pass
 
@@ -1180,12 +1190,12 @@ class TelemetrySampler:
             fut.set_exception(e)
         self.aer_containment = fut
 
-    def _journal_now(self, kind: str, **fields) -> bool:
+    def _journal_now(self, kind: str, wait: Optional[float] = None, **fields) -> bool:
         """Queue one record for the journal's writer and wait, bounded, for its fsync (I95)."""
         try:
             flush = getattr(self._deps, "health_event_flushed", None)
             if flush is not None:
-                return bool(flush(kind, AER_STOP_JOURNAL_WAIT_SEC, **fields))
+                return bool(flush(kind, AER_STOP_JOURNAL_WAIT_SEC if wait is None else wait, **fields))
             self._deps.health_event(kind, **fields)
             return True
         except Exception:  # noqa: BLE001 - the journal must not stop the containment
@@ -1257,6 +1267,19 @@ class TelemetrySampler:
             for i in fresh:
                 if not pci.get(i) and getattr(deps, "chip_pci_bdf", None) is not None:
                     pci[i] = deps.chip_pci_bdf(i)
+
+            # 1b. The trigger and the stop on disk before the remove (04 I112): a remove that takes the host down
+            # still leaves them. Bounded by PRE_REMOVE_RECORD_WAIT_SEC, inside the hard bound; past it the record stays
+            # queued and the remove goes ahead.
+            self._journal_now(
+                "chip_contain_trigger",
+                wait=PRE_REMOVE_RECORD_WAIT_SEC,
+                chips=fresh,
+                trigger=reason,
+                readers_stopped=readers,
+                users_stopped=users,
+                trigger_to_sigstop_s=round(t_stop - t0, 3),
+            )
 
             # 2. Remove: the one PCI writer, all chips inside one bound, WATCH_HARD_BOUND_SEC from the
             # trigger (I99; WATCH_REMOVE_BUDGET_SEC from now when a host stall started us past it).
@@ -1759,18 +1782,21 @@ class CheckAerWatch:
             return True
         return self._step_seen_at is not None and now - self._step_seen_at <= POST_STEP_AER_QUIET_SEC
 
-    def burst(self, sig: dict, now: float) -> Optional[str]:
-        """Fold one link_signals read in: the burst on a chip's path it completes, as a reason, or None."""
+    def burst(self, sig: dict, now: float, checking: bool = False) -> Optional[str]:
+        """Fold one link_signals read in: the burst on a chip's path it completes, as a reason, or None. While the
+        broker's own check runs (``checking``), AER_CHECK_ROOT_STOP_COUNT on a chip's root port is enough."""
         aer = sig.get("aer") or {}
         while self._reads and now - self._reads[0][0] > AER_STOP_WINDOW_SEC + AER_STOP_WINDOW_SLACK_SEC:
             self._reads.popleft()
         paths = sig.get("paths") or {}
+        roots = {path[-1] for path in paths.values() if path and len(path) > 1} if checking else set()
         hits = {}
         first = now
         for bdf in sorted({b for path in paths.values() for b in (path or ())}):
             v = aer.get(bdf)
             base = next((r[bdf] for _, r in self._reads if r.get(bdf) is not None), None)
-            if v is not None and base is not None and v - base >= AER_STOP_COUNT:
+            need = AER_CHECK_ROOT_STOP_COUNT if bdf in roots else AER_STOP_COUNT
+            if v is not None and base is not None and v - base >= need:
                 hits[bdf] = v - base
                 # The first read in the window that counted the rise: the burst's first evidence.
                 rose = next((t for t, r in self._reads if (r.get(bdf) or base) > base), now)
@@ -1782,6 +1808,8 @@ class CheckAerWatch:
         self.last_chips = chips
         chip_state.note_evidence(chips, "aer_burst", time.time() - (now - first))
         rose = ", ".join(f"{b} +{n}" for b, n in hits.items())
+        if not any(n >= AER_STOP_COUNT for n in hits.values()):
+            return f"AER rise on the root port of chip(s) {', '.join(chips)} ({rose}) during the broker's check"
         return f"AER burst on chip(s) {', '.join(chips)} ({rose} in {AER_STOP_WINDOW_SEC:g}s)"
 
     def _vanished(self, nodes: set) -> list:
@@ -1846,7 +1874,10 @@ class CheckAerWatch:
                 done = self._resolve_pending(nodes, read_at, now)
                 if done is not None:
                     return done
-        reason = self.burst(sig, now)
+        readers_fn = getattr(self._deps, "broker_check_readers", None)
+        stop = getattr(self._deps, "stop_check_readers_on_aer", None)
+        checking = bool(readers_fn is not None and stop is not None and readers_fn())
+        reason = self.burst(sig, now, checking=checking)
         # A vanished chip's path is read from before it went (its sysfs link is gone with it).
         pci = {c: (self._paths.get(c) or [None])[0] for c in vanished}
         self._paths.update(sig.get("paths") or {})
@@ -1856,9 +1887,6 @@ class CheckAerWatch:
         chips = list(self.last_chips) if reason else []
         offbus, all_ones = self._sampler.aer_stop_offbus(chips)
         dead = set(offbus) | set(vanished) | set(self._confirmed([c for c in chips if c not in offbus]))
-        readers_fn = getattr(self._deps, "broker_check_readers", None)
-        stop = getattr(self._deps, "stop_check_readers_on_aer", None)
-        checking = bool(readers_fn is not None and stop is not None and readers_fn())
         blackout = bool(dead) and dead >= known
         if dead and not blackout:
             # Contained here, on this thread (I96): stop, remove, kill, hold, record.
@@ -1886,6 +1914,10 @@ class CheckAerWatch:
             # stopped until a later poll shows the chips detached, proven off the bus (contained) or answering again.
             attached = self._attached(chips, nodes)
             stopped = stop(reason, kill=not offbus and not attached)
+            if attached:
+                # Fenced after the stop (04 I112): the sampler's own reads stay off the chips under the port that
+                # counted until a probe read answers, the chip is contained or a reset step ends (I97).
+                self._sampler._fence(attached, f"AER on their path during the broker's check ({reason})", unread=True)
             if attached and not offbus:
                 self.pending_stop = {
                     "chips": attached,

@@ -270,6 +270,7 @@ def _systemctl(monkeypatch):
     """The real poller quiesce over a fake ``systemctl`` on a running poller: every stop and start
     lands in the returned list, and no reset scope is cycling unless a test says so."""
     calls = []
+    state = {"active": True}  # a stop takes the unit down, as a real one does
 
     class _Proc:
         returncode = 0
@@ -278,12 +279,14 @@ def _systemctl(monkeypatch):
             return 0
 
         async def communicate(self):
-            return b"active\n", b""
+            return (b"active\n" if state["active"] else b"inactive\n"), b""
 
     async def fake_exec(program, *args, **kwargs):
         assert program == "systemctl", f"unexpected spawn {program} {args}"
-        if args[0] != "is-active":  # the running-state probe before a stop
+        if args[0] != "is-active":  # the running-state probe before a stop, and the stop's verify
             calls.append(args[0])
+        if args[0] in ("stop", "start"):
+            state["active"] = args[0] == "start"
         return _Proc()
 
     monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service",))

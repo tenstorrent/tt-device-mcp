@@ -262,7 +262,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_POST_RESET_FABRIC_RETRIES` | 1 | Fabric re-check retries after a reset | 04 |
 | `TT_DEVICE_MCP_POST_RESET_FABRIC_SLEEP_SEC` | 60 | Sleep between post-reset fabric retries | 04 |
 | `TT_DEVICE_MCP_BOOT_ATTRIBUTION_WINDOW_SEC` | 900 | Window to attribute a boot to our own power cycle | 04 |
-| `TT_DEVICE_MCP_POLLER_SERVICES` | `tt-telemetry.service,tt-metrics-exporter.service` | Pollers quiesced around a reset; a unit the host lacks is skipped. The idle-time probe re-arms the same list, with the same default | 04, 08 |
+| `TT_DEVICE_MCP_POLLER_SERVICES` | `tt-telemetry.service,tt-metrics-exporter.service,prometheus-node-exporter.service` | Pollers quiesced around a reset, a fabric check and a power-cycle request (04 I12, I112); a unit the host lacks is skipped. The idle-time probe re-arms the same list, with the same default | 04, 08 |
 | `TT_DEVICE_MCP_PRE_STEP_DEADLINE_SEC` | `120` | Wall-clock cap on the reply to an external read-only health pass, **and** the base the CLI derives its pre-step client timeout from (+60 s margin) | 03/07 |
 | `TT_DEVICE_MCP_POST_STEP_DEADLINE_SEC` | `600` | Wall-clock cap on the reply to the whole post-step route — the straggler reclaim and the recovering health pass together, not the pass alone — **and** the base the CLI derives its post-step client timeout from (+60 s margin) | 03/07 |
 

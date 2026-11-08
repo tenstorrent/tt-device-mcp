@@ -2971,6 +2971,15 @@ class RecoveryMechanism:
             return False
         # From here the host is going down: no device reset may start under it.
         self.host_action_requested = (action, time.monotonic())
+        # The cycle takes every chip off the bus under whatever still polls it: stop the host's device readers first
+        # (verified, bounded; one that will not stop is named and the cycle still goes). Restarted only if the cycle
+        # certainly did not launch; otherwise owed to the next close to HEALTHY.
+        quiesced: list = []
+        if action == "power-cycle":
+            try:
+                quiesced = await self._set_device_pollers(False, log) or []
+            except Exception as exc:  # noqa: BLE001 - best-effort: never holds the cycle
+                log(f"{label.upper()}: could not stop the device pollers ({exc!r}); going ahead")
         # Our own cycle is not a host hang: the next boot must not latch an off-bus intent (I25).
         from tt_device_mcp.health.recovery import pcie_guard  # the package imports this module
 
@@ -3009,7 +3018,15 @@ class RecoveryMechanism:
 
             if isinstance(exc, PowerCycleNotLaunched):
                 self._page_power_cycle_not_launched(label, reason, exc.why)
+            if timed_out:
+                if quiesced:
+                    self.owe_pollers(f"{action} request timed out")
+            else:
+                # Nothing touched the chips: the same fitness rule as after a completed reset step.
+                await self.restore_pollers(quiesced, log, ok=True, after=f"{action} that did not launch")
             return timed_out
+        if quiesced:
+            self.owe_pollers(f"{action} requested")
         # The pending window counts from the hand-off, not from before a slow pre-fire hook.
         self.host_action_requested = (action, time.monotonic())
         metrics.stage_fired(stage, "ok")

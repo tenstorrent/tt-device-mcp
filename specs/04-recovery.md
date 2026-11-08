@@ -225,7 +225,8 @@ each rung fires only when the gentler one failed or cannot apply.
   endpoint is the MMIO stall that reboots the host, and the sampler would isolate mid-reset
   all-ones chips as dead), and restores them only when no reset scope is still cycling. A PCI
   rescan runs before restore so isolated endpoints re-enumerate. The poller list defaults to
-  `tt-telemetry` and `tt-metrics-exporter` on every host. It names no clock-cap keeper, which every
+  `tt-telemetry`, `tt-metrics-exporter` and `prometheus-node-exporter` (whose hwmon collector reads
+  every chip's telemetry through the driver on each scrape) on every host. It names no clock-cap keeper, which every
   reset would otherwise stop and restart on every host. A host that runs another unit that reads or
   writes the chips adds it with `TT_DEVICE_MCP_POLLER_SERVICES`. A listed unit the host does not
   have is skipped and never fails or blocks the recovery. The restore starts only the pollers the
@@ -2893,6 +2894,66 @@ each rung fires only when the gentler one failed or cannot apply.
   70 s) on a drop that follows a failed reset in the same hold, in exchange for the full ladder
   before the power cycle.
 
+- **I112 — Fabric checks, bridge resets and power-cycle requests run with device readers stopped and
+  verified.** Seen on a Galaxy: a chip dropped off the bus during the post-job fabric check, and the
+  host died of a machine check seconds later, with the host's chip readers still polling. Only the
+  tt-smi resets (I12) and the startup check stopped them; and on a host that has none of the
+  listed units the stop was a no-op logged as a warning, while the one unit there that did read the
+  chips (a node exporter's hwmon collector) was not listed. Now:
+  - Every fabric check (`verify_fabric_health`: the post-job, gate, post-reset and startup checks)
+    runs inside the poller quiesce (`deps.quiesce_readers`), restored on every exit: pass, fail,
+    timeout, raise or cancel. Its stop runs before the check's own timeout starts. A check nested in
+    the startup block reuses that block's stop.
+  - The bridge (SBR) reset, which the last-chance sweep also runs, stops them when it has a chip to
+    reset, and restores them through `restore_pollers` (a step that did not complete leaves them owed
+    to the next close to HEALTHY, as I12 says).
+  - A power-cycle request stops them after its ledger write, before the cycle fires. A request that
+    certainly did not launch restores them under the same fitness rule; one that launched or timed out
+    leaves them owed.
+  - The operator reset, ladder rungs, glx_reset and every other tt-smi reset keep I12's quiesce.
+  - A stop is verified: for each unit found running whose stop returned 0, `systemctl is-active` is
+    read until the unit is no longer running, for at most `POLLER_STOP_VERIFY_SEC` (5 s) per unit.
+    A unit still running, or whose stop failed or timed out, is logged as a warning with its name and
+    main pid and journaled `poller_stop_unverified`; the check or reset runs anyway (never a hold).
+    No process is killed. A listed unit with no unit file (nor mask, nor template for an instance) in the system
+    manager's unit search path (`SYSTEMD_UNIT_DIRS`, systemd.unit(5)) is not installed: it is skipped
+    by a stat, without a `systemctl` process, on every check and reset (a unit this step recorded as
+    stopped is still restored). A host with none of those folders counts every unit as installed. A
+    state read past its bound is killed, never left running. Worst-case added wait before the step: with the three default units, each
+    stop is bounded at 30 s (state probe and stop together) plus its 5 s verify, so about 105 s, and
+    the restore after it at most 30 s per unit. Before a power-cycle request that is about 105 s on
+    top of the reset ladder (the restore never runs before a cycle that launched); in practice a
+    unit stops in under a second.
+  - During the broker's own check, one uncorrectable AER record on a chip's root port is a trigger
+    (`AER_CHECK_ROOT_STOP_COUNT`, spec 03 I92), without waiting for a burst or an all-ones read: the
+    same incident's root port logged a single uncorrectable record 2.6 s before its chip read
+    all-ones, and the check went on for 7 s. On the poll that reads the rise (every `LINK_WATCH_SEC`,
+    1 s) the watch SIGSTOPs the check readers, then fences the chips under that port (03 I97), so
+    the sampler reads none of them until a probe read answers, they are contained or a reset step
+    ends. Endpoint and switch counters keep the burst count; with no broker check running nothing is
+    stopped. This fence is a suspicion, not an all-ones read: until a real read of the chip returns
+    all-ones, a read the sampler skips reports it unread (None, `chip_state.placeholder`), never
+    all-ones, so no off-bus test (I94's `aer_stop_offbus`, the dead-chip strikes, the pending stop's
+    answering test) acts on a value nobody read, and a chip that answers is never PCI-removed for it.
+  - A containment writes `chip_contain_trigger` (the trigger, the chips, the readers and users
+    stopped) after its SIGSTOP and before the PCI remove, waiting for its fsync at most
+    `PRE_REMOVE_RECORD_WAIT_SEC` (1 s, inside I99's hard bound); past that the record stays queued
+    and the remove goes ahead.
+  - A chip whose config vendor ID reads all-ones (`pci.chips_off_bus`: one 2-byte config read per
+    chip, never an MMIO read) is off the bus: the fabric check does not run (it fails, so the hold
+    stays and recovery takes it, and no reader is stopped for it) and no poller starts
+    (`_pollers_unfit_reason`).
+
+  Not stopped: the broker's own telemetry sampler, which is the dead-chip tripwire (I94) and already
+  skips chip reads while a reset owns the chips (I66); the kernel driver's own firmware-log poller,
+  set by a module parameter that changes only on a module reload; and a BMC's own board-side SMBUS
+  polling, for which no documented control is used.
+
+  Unchanged: only a full health check with fabric over every cabled link that has just passed lifts
+  a hold (I32); the 10-min ladder and its power cycle (I76) keep their timing. Cost: on a host with no
+  listed unit running, a few `systemctl` calls (milliseconds) per check or reset; with one running,
+  its stop and start, bounded at 30 s each per unit as in I12, plus at most 5 s of verify per unit.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -3597,6 +3658,8 @@ sees a silent fabric pass.
 | I107 the I94 check's verdict reaches the per-hold record; the record is keyed by the hold and the lift clears it | `tests/test_arc_dead_skips_early_mesh_reset.py::test_the_arc_check_records_the_dead_chips_and_a_lift_clears_the_record` |
 | I107 a power cycle denied (I65 cooldown, backstop, unreadable ledger), at the check or at the climb, keeps the early mesh reset; only its passing full check with fabric lifts | `tests/test_arc_dead_skips_early_mesh_reset.py::test_a_denied_power_cycle_keeps_the_early_mesh_reset`, `tests/test_arc_dead_skips_early_mesh_reset.py::test_a_denied_power_cycle_lifts_only_on_the_mesh_resets_passing_full_check`, `tests/test_arc_dead_skips_early_mesh_reset.py::test_a_denial_at_the_climb_itself_still_runs_the_early_mesh_reset` |
 | I107 no power cycle armed: the early mesh reset runs before any operator hand-off | `tests/test_arc_dead_skips_early_mesh_reset.py::test_no_power_cycle_armed_runs_the_early_mesh_reset_before_any_hand_off` |
+| I112 fabric checks, bridge resets, power-cycle requests and tt-smi resets stop the device readers, verify the stop (bounded) and restore them on pass, fail, timeout, raise and cancel; an unstoppable reader is warned by name and pid and never blocks the step; a reader with no unit file in the search path costs no process, and a fabric check on a host with none installed starts none | `tests/test_reader_quiesce.py` |
+| I112 one root-port AER record during the broker's check SIGSTOPs the check readers and fences the chips under that port within a poll; none with no check running; an endpoint record below the burst count stops nothing; a chip so fenced is never contained on a skipped read (unread, not all-ones) until a real read returns all-ones; the trigger record is on disk before the remove; a chip whose config vendor ID reads all-ones is never under the fabric check or a starting poller | `tests/test_aer_root_contain.py`, `tests/test_aer_check_stop.py` |
 | I108 a mesh reset that ran before a chip dropped does not spend the off-bus ladder's mesh reset: mesh reset, sweep, power cycle, in order, across a broker restart too | `tests/test_no_repeat_failed_rung.py::test_a_reset_that_ran_before_the_drop_does_not_spend_the_offbus_mesh_reset` |
 | I108 a mesh reset that faced the dropped chip (off before it, or found off by its own check) still spends it; a regressed reset and one with no sets on record stay spent | `tests/test_no_repeat_failed_rung.py::test_a_reset_that_faced_the_dropped_chip_still_spends_the_offbus_mesh_reset`, `::test_mesh_reset_spent_counts_only_chips_the_reset_faced`, `::test_a_reset_with_no_record_of_its_sets_stays_spent` |
 | I102 with I103: the late-chip second mesh reset runs in the pre-cycle sweep, so its pre-reset scan clears a holder outside every broker scope and runs (at the 10-min bound, on the I97 path, and in the sweep outside the bound); its wait still ends at the step's start plus `LATE_CHIP_STEP_SEC`; a failed full check keeps the hold and the cycle journals the holder; a holder in a broker job's scope or the running job's own process still refuses it, nothing lifts and the hold goes on to the cycle | `tests/test_late_chips_after_driver_wait.py::test_the_late_chip_second_reset_clears_a_foreign_holder_and_keeps_its_bound`, `::test_a_job_holder_still_refuses_the_late_chip_second_reset_and_the_hold_goes_on_to_the_cycle` |

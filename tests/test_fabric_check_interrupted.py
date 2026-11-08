@@ -24,6 +24,7 @@ def _events(kind):
 
 def _monitor(monkeypatch, body):
     m = mon.HealthMonitor.__new__(mon.HealthMonitor)
+    m._deps = None  # no reader quiesce wired: only the check's own in-flight journal is under test
     monkeypatch.setattr(m, "_fabric_check_cmd", lambda: "fabric-check.sh", raising=False)
     monkeypatch.setattr(m, "_verify_fabric_health_body", body, raising=False)
     return m

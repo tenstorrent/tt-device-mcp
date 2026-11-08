@@ -23,7 +23,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from tt_device_mcp import constants, metrics
 from tt_device_mcp.device_holders import HolderScan, is_tenant
@@ -409,6 +409,10 @@ class RecoveryDeps:
     # spec 03 I28). Returns a FROZEN detail when the self-test hung during an open fault episode,
     # else "". None (the conftest deps fixture) skips the retry.
     eth_rearm: Optional[Callable[[], Awaitable[str]]] = None
+    # Async context manager factory (what, log): holds the host's device readers stopped (verified,
+    # bounded) for the block and restores them on every exit (server._pollers_quiesced_for). The
+    # fabric check runs inside it. None (the conftest deps fixture) runs the check without it.
+    quiesce_readers: Optional[Callable[[str, Callable[[str], None]], Any]] = None
 
 
 class Recovery(ABC):
@@ -525,6 +529,33 @@ class Recovery(ABC):
         return state.healthy, state.as_evidence()
 
     async def _recover_isolated_chips(self, log, exclude=frozenset(), not_reset=frozenset()) -> bool:
+        """The bridge reset (:meth:`_recover_isolated_chips_body`) with the host's device readers stopped.
+
+        Like a tt-smi reset (``reset_with_quiesce``), a bridge write takes a chip off the bus and the
+        rescan re-enumerates it: a telemetry reader polling it meanwhile is MMIO at a dead endpoint.
+        The readers are stopped (verified, bounded) only when there is a chip to reset, and restored
+        after a step that completed; a failed, timed-out or cancelled step leaves them owed to the
+        next close to HEALTHY (``restore_pollers``). Best-effort: a reader that will not stop is
+        named in the log and never blocks the rung."""
+        mech = self.mechanism
+        if not self.deps.isolated_chips() and not pci.removed_chip_ids():
+            return await self._recover_isolated_chips_body(log, exclude, not_reset)
+        quiesced: list = []
+        try:
+            quiesced = await mech._set_device_pollers(False, log)
+        except Exception as e:  # noqa: BLE001 - best-effort: never blocks the rung
+            log(f"could not stop the device pollers before a bridge reset: {e!r}")
+        ok = False
+        try:
+            ok = await self._recover_isolated_chips_body(log, exclude, not_reset)
+            return ok
+        finally:
+            try:
+                await mech.restore_pollers(quiesced or [], log, ok=bool(ok), after="bridge reset")
+            except Exception as e:  # noqa: BLE001 - best-effort: never masks the rung's own outcome
+                log(f"could not restore the device pollers after a bridge reset: {e!r}")
+
+    async def _recover_isolated_chips_body(self, log, exclude=frozenset(), not_reset=frozenset()) -> bool:
         """Bring back chips that were cut out of the kernel after leaving the PCIe bus.
 
         Reset through the parent bridge, not the chip: a dead endpoint cannot be reset through
