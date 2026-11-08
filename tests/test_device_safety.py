@@ -6187,6 +6187,14 @@ class _BrokerFault:
         raise RuntimeError("broker fault while reading job output")
 
 
+async def _wait_until(cond, timeout_sec=60.0):
+    """Poll ``cond`` against a wall-clock deadline, not a count of sleeps: a loaded host stretches each step of a job
+    run, and the asserts after the wait still say what went wrong if it never held."""
+    deadline = time.monotonic() + timeout_sec
+    while not cond() and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+
+
 @pytest.mark.asyncio
 async def test_a_broker_error_mid_job_walks_the_kill_ladder(monkeypatch, clear_job_state, tmp_path):
     """01 I5. An error in the broker, not the job, still ends a job that may hold the device: it gets SIGINT first, the
@@ -6199,7 +6207,7 @@ async def test_a_broker_error_mid_job_walks_the_kill_ladder(monkeypatch, clear_j
 
     async def _ladder(job_id, pid, grace_sec=srv.GRACEFUL_KILL_GRACE_SEC):
         calls.append(job_id)
-        await srv._terminate_process_group(pid, grace_sec=2)  # no scope off privsep
+        await srv._terminate_process_group(pid, grace_sec=30)  # no scope off privsep
 
     monkeypatch.setattr(srv, "_terminate_job", _ladder)
     mark = tmp_path / "sigint"
@@ -6207,7 +6215,8 @@ async def test_a_broker_error_mid_job_walks_the_kill_ladder(monkeypatch, clear_j
         id="903",
         owner="tenant",
         workspace="/tmp",
-        command=f"trap 'touch {mark}; exit 7' INT; echo hi; sleep 30 & wait",
+        # The trap also ends the background sleep (an async child ignores SIGINT), so the group is gone on SIGINT.
+        command=f"trap 'touch {mark}; kill $! 2>/dev/null || true; exit 7' INT; echo hi; sleep 30 & wait",
         queued_at="t",
     )
     srv.jobs["903"] = job
@@ -6215,10 +6224,7 @@ async def test_a_broker_error_mid_job_walks_the_kill_ladder(monkeypatch, clear_j
 
     runner = asyncio.create_task(srv.job_runner())
     try:
-        for _ in range(200):
-            if job.finished_at is not None:
-                break
-            await asyncio.sleep(0.05)
+        await _wait_until(lambda: job.finished_at is not None)
         assert job.status is srv.JobStatus.FAILED
         assert calls == ["903"], "the exception path skipped the SIGINT -> SIGTERM -> SIGKILL ladder"
         assert mark.exists(), "the job never saw SIGINT, so it had no chance to close the device"
@@ -6823,10 +6829,7 @@ async def test_a_job_that_reports_an_unrecoverable_device_is_reaped_while_still_
 
     runner = asyncio.create_task(srv.job_runner())
     try:
-        for _ in range(300):
-            if job.finished_at is not None:
-                break
-            await asyncio.sleep(0.05)
+        await _wait_until(lambda: job.finished_at is not None)
         assert job.status is srv.JobStatus.HUNG, (
             f"a job that declared its device unrecoverable ended as {job.status.value}; "
             "it holds the device for its whole unwind"
@@ -6847,7 +6850,7 @@ async def test_the_doomed_grace_lets_the_backtrace_land(monkeypatch, clear_job_s
     _quiet_post_job_gate(monkeypatch)
     _no_workspace_activation(monkeypatch)
     monkeypatch.setattr(srv, "HUNG_SILENCE_SEC", 3600)
-    monkeypatch.setattr(srv, "DOOMED_GRACE_SEC", 2)
+    monkeypatch.setattr(srv, "DOOMED_GRACE_SEC", 5)  # wide: a loaded host may print the 0.3 s line late
     monkeypatch.setattr(srv, "HUNG_POLL_SEC", 0.05)
 
     job = srv.Job(
@@ -6857,7 +6860,7 @@ async def test_the_doomed_grace_lets_the_backtrace_land(monkeypatch, clear_job_s
         command=(
             "echo 'Timeout detected (metal_context.cpp:778)'; "
             "sleep 0.3; echo 'waiting for physical cores to finish: 14-3, 14-2'; "
-            "sleep 60"
+            "sleep 120"
         ),
         queued_at="t",
     )
@@ -6866,10 +6869,7 @@ async def test_the_doomed_grace_lets_the_backtrace_land(monkeypatch, clear_job_s
 
     runner = asyncio.create_task(srv.job_runner())
     try:
-        for _ in range(400):
-            if job.finished_at is not None:
-                break
-            await asyncio.sleep(0.05)
+        await _wait_until(lambda: job.finished_at is not None)
         assert job.status is srv.JobStatus.HUNG
         assert "14-3" in (job.output or "") + (job.error or ""), "reaped before the cores it wedged on were printed"
     finally:
@@ -8650,7 +8650,7 @@ async def test_misconfigured_probe_timeout_cannot_swallow_the_inner_skip(tmp_pat
     py_dir = vroot / "current" / "python_env" / "bin"
     py_dir.mkdir(parents=True)
     py = py_dir / "python"
-    py.write_text('#!/usr/bin/env bash\nif [ "$1" = "-c" ]; then exit 0; fi\nsleep 5\n')
+    py.write_text('#!/usr/bin/env bash\nif [ "$1" = "-c" ]; then exit 0; fi\nsleep 60\n')
     py.chmod(0o755)
     monkeypatch.setenv("TTDEV_VALIDATOR_ROOT", str(vroot))
     install_root = tmp_path / "install-root"
@@ -8660,7 +8660,9 @@ async def test_misconfigured_probe_timeout_cannot_swallow_the_inner_skip(tmp_pat
     monkeypatch.setenv("TTDEV_ETH_CHECK_ALLOW_KNOWN_BROKEN", "1")
     monkeypatch.setenv("TTDEV_ETH_CHECK_TIMEOUT", "999")  # misconfigured: far above timeout_sec
 
-    ok, detail = await srv.health_monitor.verify_eth_heartbeat(timeout_sec=0.5)
+    # The cap leaves 10% of timeout_sec between the inner and the outer bound for the kill and reap: 0.5 s left
+    # 50 ms, which a loaded host overran. 5 s leaves 0.5 s.
+    ok, detail = await srv.health_monitor.verify_eth_heartbeat(timeout_sec=5)
     assert ok is None, f"the misconfigured inner timeout let the outer hang branch fire instead: {detail}"
 
 
@@ -15273,10 +15275,11 @@ async def test_a_runner_error_still_forces_the_post_job_fabric_pass(monkeypatch,
         monkeypatch.setattr(srv, "DOOMED_PATTERNS", _BrokerFault())
 
         async def _ladder(job_id, pid, grace_sec=srv.GRACEFUL_KILL_GRACE_SEC):
-            await srv._terminate_process_group(pid, grace_sec=2)  # no scope off privsep
+            await srv._terminate_process_group(pid, grace_sec=30)  # no scope off privsep
 
         monkeypatch.setattr(srv, "_terminate_job", _ladder)
-        command = "trap 'exit 7' INT; echo hi; sleep 30 & wait"
+        # The trap also ends the background sleep (an async child ignores SIGINT), so the group is gone on SIGINT.
+        command = "trap 'kill $! 2>/dev/null || true; exit 7' INT; echo hi; sleep 30 & wait"
     gates = []
 
     async def _gate(job_log_file, job_failed=False, noop_failure=False):
@@ -15290,7 +15293,7 @@ async def test_a_runner_error_still_forces_the_post_job_fabric_pass(monkeypatch,
 
     runner = asyncio.create_task(srv.job_runner())
     try:
-        await _wait_for(lambda: len(gates) == 1)
+        await _wait_until(lambda: len(gates) == 1)
         assert job.status is srv.JobStatus.FAILED and "EXCEPTION" in (job.error or "")
         if where == "after-spawn":
             assert job.exit_code == 7, "precondition: the job exited on its own code inside the bound"

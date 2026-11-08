@@ -28,6 +28,7 @@ import tt_device_mcp.server as srv
 from tt_device_mcp import pre_reset_scan, privileges
 from tt_device_mcp.fsm import ServerFsm
 from tt_device_mcp.health import bmc_capture, post_reset
+from tt_device_mcp.health import shutdown as health_shutdown
 from tt_device_mcp.health import evidence as health
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.core import HealthState
@@ -57,6 +58,14 @@ def old_host_boot(monkeypatch):
     """Pin this host's boot time to a day ago around every test: the power-cycle cooldown counts from the host's boot
     (spec 04 I65), and a suite run soon after the runner's own reboot must not see every power cycle in cooldown."""
     monkeypatch.setattr(srv, "_boot_btime_id", lambda: str(int(time.time()) - 86400))
+
+
+@pytest.fixture(autouse=True)
+def host_not_shutting_down(monkeypatch):
+    """A probe that exits by SIGTERM/SIGKILL asks systemd whether the host is going down (spec 03 I63). Tests never ask
+    the host's systemd: its answer depends on the runner (a boot still settling, a guard that refuses the call). A test
+    of that read stubs ``_systemctl`` itself."""
+    monkeypatch.setattr(health_shutdown, "_systemctl", lambda *args: "")
 
 
 @pytest.fixture(autouse=True)
