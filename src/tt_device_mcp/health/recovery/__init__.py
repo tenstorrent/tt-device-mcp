@@ -314,6 +314,8 @@ class RecoveryDeps:
     capture_incident: Optional[Callable[..., object]] = None
     isolate_chip: Optional[Callable[[str], bool]] = None
     chip_pci_bdf: Optional[Callable[[str], Optional[str]]] = None
+    # Spec 04 I76: whether a remove that returned past its bound finished (the chip's KMD and PCI nodes are gone).
+    chip_removed: Optional[Callable[[str, Optional[str]], bool]] = None
     health_event: Optional[Callable[..., None]] = None
     kill_device_holders: Optional[Callable[[str], Awaitable[list]]] = None
     # Spec 03 I86: SIGSTOP the broker's own device readers (fabric check, snapshot, eth self-test) before the

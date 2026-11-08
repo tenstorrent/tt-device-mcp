@@ -261,7 +261,21 @@ SAMPLE_FIELDS = list(_VOLATILE) + ["aer_correctable", "aer_fatal"]
 _BDF = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$")
 
 
+# The AER classes the early off-bus watch counts (spec 03 I79), as its reason names them.
+AER_KIND_LABELS = {
+    "advisory_nonfatal": "correctable Advisory Non-Fatal",
+    "nonfatal": "uncorrectable non-fatal",
+    "fatal": "uncorrectable fatal",
+}
+
+
 def _uncorrectable_aer(dev: Path) -> Optional[int]:
+    """The total of :func:`_aer_kinds`, or None when no counter could be read."""
+    kinds = _aer_kinds(dev)
+    return None if kinds is None else sum(kinds.values())
+
+
+def _aer_kinds(dev: Path) -> Optional[dict]:
     """Uncorrectable (non-fatal + fatal) AER errors the kernel has counted on one PCI function: its own
     ``aer_dev_nonfatal``/``aer_dev_fatal`` and, on a root port, the ``aer_rootport_total_err_*`` messages it received
     from below, plus the one correctable row that is not link noise (``NonFatalErr`` in ``aer_dev_correctable``: an
@@ -269,33 +283,38 @@ def _uncorrectable_aer(dev: Path) -> Optional[int]:
     unsupported request). None when no counter could be read. The other correctable rows (RxErr, BadTLP, Timeout, ...)
     are left out on purpose: they are routine on a healthy link and would arm the watch all day. A chip that stops
     answering with its reads in flight shows first as an Advisory Non-Fatal storm on the port above it, often reported
-    firmware-first, so this row is the earliest kernel signal of it."""
-    total, seen = 0, False
+    firmware-first, so this row is the earliest kernel signal of it.
+
+    Counted per class, ``{"advisory_nonfatal": n, "nonfatal": n, "fatal": n}`` (the keys of AER_KIND_LABELS), so a
+    reason names the class that rose: an Advisory Non-Fatal record is a correctable one, not an uncorrectable one."""
+    kinds = dict.fromkeys(AER_KIND_LABELS, 0)
+    seen = False
     try:
         for line in (dev / "aer_dev_correctable").read_text().splitlines():
             parts = line.split()
             if len(parts) == 2 and parts[0] == "NonFatalErr" and parts[1].isdigit():
-                total, seen = total + int(parts[1]), True
+                kinds["advisory_nonfatal"] += int(parts[1])
+                seen = True
     except OSError:
         pass
-    for name in ("aer_dev_nonfatal", "aer_dev_fatal"):
-        p = dev / name
+    for kind in ("nonfatal", "fatal"):
+        p = dev / f"aer_dev_{kind}"
         if p.exists():
             v = _sum_aer(p)
             if v is not None:
-                total, seen = total + v, True
-    for name in ("aer_rootport_total_err_nonfatal", "aer_rootport_total_err_fatal"):
+                kinds[kind] += v
+                seen = True
         try:
-            total += int((dev / name).read_text().strip())
+            kinds[kind] += int((dev / f"aer_rootport_total_err_{kind}").read_text().strip())
             seen = True
         except (OSError, ValueError):
             continue
-    return total if seen else None
+    return kinds if seen else None
 
 
 def link_signals() -> dict:
     """The kernel's own record of PCIe trouble on every chip's path, for the sampler's early off-bus watch (spec 03
-    I79): ``{"chips": [index, ...], "aer": {bdf: uncorrectable total}}``.
+    I79): ``{"chips": [index, ...], "aer": {bdf: total}, "aer_kind": {bdf: {class: count}}, "paths": {...}}``.
 
     ``chips`` is the KMD node list; ``aer`` covers each chip's endpoint and every port above it up to the root port,
     keyed by PCI address, so a link drop the port above a chip counted shows even when the chip's own counters did not
@@ -306,11 +325,12 @@ def link_signals() -> dict:
     (``current_link_speed``/``width``) are config reads and stay out."""
     chips: list = []
     aer: dict = {}
+    kind: dict = {}
     paths: dict = {}
     try:
         entries = sorted(SYSFS_CLASS_DIR.iterdir())
     except OSError:
-        return {"chips": chips, "aer": aer, "paths": paths}
+        return {"chips": chips, "aer": aer, "aer_kind": kind, "paths": paths}
     for ent in entries:
         idx = ent.name.rsplit("!", 1)[-1]
         if not idx.isdigit():
@@ -324,9 +344,12 @@ def link_signals() -> dict:
         while _BDF.match(dev.name):
             path.append(dev.name)
             if dev.name not in aer:
-                aer[dev.name] = _uncorrectable_aer(dev)
+                kinds = _aer_kinds(dev)
+                aer[dev.name] = None if kinds is None else sum(kinds.values())
+                if kinds is not None:
+                    kind[dev.name] = kinds
             dev = dev.parent
-    return {"chips": chips, "aer": aer, "paths": paths}
+    return {"chips": chips, "aer": aer, "aer_kind": kind, "paths": paths}
 
 
 def config_vendor_id(bdf: str) -> Optional[int]:
@@ -597,6 +620,18 @@ def isolate_chip(idx: str) -> bool:
         evidence.health_event(
             "chip_isolation_failed", chip=idx, bdf=bdf, reason="remove_write_failed", error=str(e), host_at_risk=True
         )
+        return False
+
+
+def chip_removed(idx: str, bdf: Optional[str]) -> bool:
+    """Whether a remove of chip ``idx`` (PCI address ``bdf``) finished: its KMD class node and its PCI endpoint node are
+    both gone (spec 04 I76, a remove that returned past its bound). Fail-safe toward "not removed": an unknown address
+    or a read error proves nothing."""
+    if not bdf:
+        return False
+    try:
+        return not (SYSFS_CLASS_DIR / f"tenstorrent!{idx}").exists() and not (PCI_DEVICES_DIR / bdf).exists()
+    except OSError:
         return False
 
 

@@ -37,12 +37,14 @@ def _contained():
 @pytest.mark.parametrize("late", [False, True], ids=["inside the bound", "started past the bound"])
 def test_a_remove_still_running_at_the_hard_bound_latches_pci_wedged(watch, monkeypatch, late):  # noqa: F811
     """The bound counts from the trigger, not from the stop: a remove blocked in the kernel latches PCI-wedged when it
-    passes. A host stall that started the remove past the bound still gives it the remove budget."""
+    and the late-completion grace after it pass (spec 04 I76). A host stall that started the remove past the bound
+    still gives it the remove budget."""
     _w, log, _detach_ok, _burst = watch
     stuck = threading.Event()
     monkeypatch.setattr(srv, "isolate_chip", lambda idx: log.append(("detach", idx)) or stuck.wait(30))
     monkeypatch.setattr(telemetry, "WATCH_HARD_BOUND_SEC", 1.0)
     monkeypatch.setattr(telemetry, "WATCH_REMOVE_BUDGET_SEC", 0.3)
+    monkeypatch.setattr(telemetry, "REMOVE_LATE_GRACE_SEC", 0.3)
     _sample("13")
     trigger = time.monotonic() - (5.0 if late else 0.4)
     try:
@@ -53,9 +55,9 @@ def test_a_remove_still_running_at_the_hard_bound_latches_pci_wedged(watch, monk
     assert srv.PCI_WRITER.latched, "a remove past the bound latches PCI-wedged"
     assert ("detach", "13") in log, f"the remove was tried: {log}"
     if late:
-        assert 5.25 <= took < 6.5, f"a late start still gets the remove budget: {took:.2f}s"
+        assert 5.55 <= took < 6.8, f"a late start still gets the remove budget and the grace: {took:.2f}s"
     else:
-        assert 0.95 <= took < 2.0, f"latched at the bound from the trigger: {took:.2f}s"
+        assert 1.25 <= took < 2.3, f"latched at the bound from the trigger plus the grace: {took:.2f}s"
     assert row["stuck"] == ["13"] and row["removed"] is False and row["pci_wedged"] is True, row
     assert row == _contained() or _contained()["stuck"] == ["13"]
     assert not [e for e in log if e[0] == "kill"], f"no kill while the chip may be attached: {log}"

@@ -10,7 +10,11 @@ good, and no thread can be cancelled there. So every such write in the broker go
 - one write in flight per broker, so a write blocked in the kernel leaks at most one worker thread
   of the default executor per host;
 - a write that does not return within its timeout latches PCI-wedged and raises :class:`PciWedged`;
-  its thread may stay blocked until the host is power-cycled (an accepted gap);
+  its thread may stay blocked until the host is power-cycled (an accepted gap). A write given a
+  ``settle`` check (a chip's remove) first gets ``grace`` more seconds: a remove can run past its bound
+  (the kernel tears down the device it removes) and still finish. One that returns inside the grace
+  and whose ``settle`` check passes (the chip's nodes are gone) is a late completion
+  (``pci_write_late``), not a wedge; only a writer still blocked at the grace's end latches;
 - while that thread is alive, or while the latch is set, a new write is refused at once and starts
   no thread (a refusal also latches);
 - the latch tells the broker (``on_latch``), which holds the device and requests the power cycle at
@@ -32,12 +36,15 @@ import asyncio
 import concurrent.futures
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from tt_device_mcp.health.evidence import health_event
 
 # Default bound on one rescan or remove; a bridge reset passes its own (it runs setpci and a rescan).
 PCI_SYSFS_WRITE_TIMEOUT_SEC = 30
+# A late write's settle check is polled this often until its grace ends.
+SETTLE_POLL_SEC = 0.25
 
 
 class PciWedged(asyncio.TimeoutError):
@@ -117,15 +124,45 @@ class PciSysfsWriter:
         self.reason = ""
         return True
 
+    def _slow(self, context: str, timeout: float, grace: float, tids: list) -> None:
+        """Journal a write past its bound that now gets its grace, with the writer's kernel stack when readable."""
+        stack = ""
+        if tids:
+            try:
+                stack = Path(f"/proc/self/task/{tids[0]}/stack").read_text()[:2000]
+            except OSError:
+                pass
+        # A concurrent writer waits for this one through the grace instead of refusing it as a wedge.
+        self._deadline = time.monotonic() + grace
+        health_event("pci_write_slow", context=context, timeout_s=timeout, grace_s=grace, stack=stack)
+
+    def _late(self, context: str, timeout: float, started: float, settled: bool) -> bool:
+        """After a write returned inside its grace: journal the late completion and return True when its ``settle``
+        check passed; else False (the caller latches)."""
+        took = round(time.monotonic() - started, 1)
+        if settled:
+            health_event("pci_write_late", context=context, timeout_s=timeout, took_s=took, completed_at=time.time())
+        return settled
+
     def reset_for_tests(self) -> None:
         on_latch = self.on_latch
         self.__init__()
         self.on_latch = on_latch
 
-    async def write(self, context: str, fn: Callable[..., Any], *args: Any, timeout: Optional[float] = None) -> Any:
+    async def write(
+        self,
+        context: str,
+        fn: Callable[..., Any],
+        *args: Any,
+        timeout: Optional[float] = None,
+        settle: Optional[Callable[[], bool]] = None,
+        grace: float = 0.0,
+    ) -> Any:
         """Run ``fn(*args)`` as the one PCI sysfs write in flight, at most ``timeout`` seconds
         (PCI_SYSFS_WRITE_TIMEOUT_SEC by default). Returns its result or raises its exception; raises
-        PciWedged on a timeout or a refusal."""
+        PciWedged on a timeout or a refusal. With ``settle`` and ``grace``, a write past its bound is waited for
+        ``grace`` more seconds: one that returns in it is returned (a truthy result only once ``settle()`` passes
+        within the grace), one still blocked at its end latches."""
         if timeout is None:
             timeout = PCI_SYSFS_WRITE_TIMEOUT_SEC
         # Wait out a write still inside its own bound (a concurrent caller, or one whose awaiting task
@@ -155,16 +192,42 @@ class PciSysfsWriter:
                 raise self._refuse(context)
             # One worker thread of the default executor; the one-in-flight rule caps what a blocked
             # write can leak there at one thread per host.
-            task = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+            tids: list = []
+
+            def _run() -> Any:
+                tids.append(threading.get_native_id())
+                return fn(*args)
+
+            task = asyncio.ensure_future(asyncio.to_thread(_run))
             self._task, self._context = task, context
-            self._deadline = time.monotonic() + timeout
+            started = time.monotonic()
+            self._deadline = started + timeout
         try:
             return await asyncio.wait_for(asyncio.shield(task), timeout)
         except asyncio.TimeoutError:
             if task.done() and not task.cancelled() and isinstance(task.exception(), asyncio.TimeoutError):
                 raise  # the write itself raised a timeout; it returned, so nothing is blocked
-            self._latch(f"{context}: no answer in {timeout:.0f} s", context=context, timeout_s=timeout)
-            raise PciWedged(f"{context}: no answer in {timeout:.0f} s (its thread may stay blocked)") from None
+        bound = timeout
+        if settle is not None and grace > 0:
+            bound += grace
+            self._slow(context, timeout, grace, tids)
+            await asyncio.wait({task}, timeout=grace)
+            if task.done() and not task.cancelled():
+                if task.exception() is not None:
+                    raise task.exception()  # it returned with its own failure: nothing is blocked
+                result = task.result()
+                if not result:
+                    return result  # a failed write, as inside the bound
+                end = started + timeout + grace
+                while not settle() and time.monotonic() < end:
+                    await asyncio.sleep(SETTLE_POLL_SEC)
+                if self._late(context, timeout, started, settle()):
+                    return result
+                why = f"{context}: returned after {timeout:.0f} s but its device is still listed"
+                self._latch(why, context=context, timeout_s=bound)
+                raise PciWedged(why)
+        self._latch(f"{context}: no answer in {bound:.0f} s", context=context, timeout_s=bound)
+        raise PciWedged(f"{context}: no answer in {bound:.0f} s (its thread may stay blocked)") from None
 
     def write_sync(
         self,
@@ -173,12 +236,15 @@ class PciSysfsWriter:
         *args: Any,
         timeout: Optional[float] = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
+        settle: Optional[Callable[[], bool]] = None,
+        grace: float = 0.0,
     ) -> Any:
         """:meth:`write` for a thread with no event loop (spec 03 I96, the dead-chip watch). Same
         one-in-flight slot, same latch, same bound: a write still inside its own bound is waited
         for, within ``timeout``; ``fn`` runs on its own daemon thread, so one blocked in the kernel
         leaks that one thread. ``loop``: where the latch notice runs (the broker's loop). Returns
-        ``fn``'s result or raises its exception; raises PciWedged on a timeout or a refusal."""
+        ``fn``'s result or raises its exception; raises PciWedged on a timeout or a refusal. ``settle`` and
+        ``grace``: as in :meth:`write`."""
         if timeout is None:
             timeout = PCI_SYSFS_WRITE_TIMEOUT_SEC
         end = time.monotonic() + timeout
@@ -203,20 +269,41 @@ class PciSysfsWriter:
                 while not task.done() and time.monotonic() < stop:
                     time.sleep(0.05)
 
+        tids: list = []
+
         def _run() -> None:
+            tids.append(threading.get_native_id())
             try:
                 fut.set_result(fn(*args))
             except BaseException as e:  # noqa: BLE001 - handed to the caller
                 fut.set_exception(e)
 
+        started = time.monotonic()
         threading.Thread(target=_run, name=f"pci-write {context}", daemon=True).start()
         try:
             return fut.result(timeout=max(0.0, end - time.monotonic()))
         except concurrent.futures.TimeoutError:
             if fut.done():
                 raise  # the write itself raised a timeout; it returned, so nothing is blocked
-            self._latch(f"{context}: no answer in {timeout:.0f} s", loop, context=context, timeout_s=timeout)
-            raise PciWedged(f"{context}: no answer in {timeout:.0f} s (its thread may stay blocked)") from None
+        bound = timeout
+        if settle is not None and grace > 0:
+            bound += grace
+            self._slow(context, timeout, grace, tids)
+            concurrent.futures.wait([fut], timeout=grace)
+            if fut.done():
+                result = fut.result()  # raises its own failure: it returned, so nothing is blocked
+                if not result:
+                    return result
+                stop = end + grace
+                while not settle() and time.monotonic() < stop:
+                    time.sleep(SETTLE_POLL_SEC)
+                if self._late(context, timeout, started, settle()):
+                    return result
+                why = f"{context}: returned after {timeout:.0f} s but its device is still listed"
+                self._latch(why, loop, context=context, timeout_s=bound)
+                raise PciWedged(why)
+        self._latch(f"{context}: no answer in {bound:.0f} s", loop, context=context, timeout_s=bound)
+        raise PciWedged(f"{context}: no answer in {bound:.0f} s (its thread may stay blocked)") from None
 
 
 PCI_WRITER = PciSysfsWriter()
