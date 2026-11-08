@@ -2389,3 +2389,172 @@ async def test_a_readopted_preemptable_job_past_its_limit_is_killed_a_minute_aft
     assert [j for j, _ in stopped] == ["990"], "the job blocking the hold bound ran on unbounded"
     assert stopped[0][1] - t0 >= 1 - 0.05, "killed before its full minute"
     assert srv.jobs["990"].status is srv.JobStatus.PREEMPTED
+
+
+class _ManualClock:
+    """The broker's monotonic clock, moved only by the test: the grace minute and the kill grace are read at their
+    real lengths (PREEMPT_GRACE_SEC, PREEMPT_KILL_GRACE_SEC) with no real minute spent."""
+
+    def __init__(self):
+        self.now = time.monotonic()
+
+    def monotonic(self):
+        return self.now
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+async def _until(cond, what, limit_sec=10.0):
+    """Yield to the broker's tasks until ``cond()``; fail after ``limit_sec`` of real time."""
+    end = time.monotonic() + limit_sec
+    while not cond():
+        assert time.monotonic() < end, what
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("check_passes", [True, False], ids=["check passes", "check fails"])
+async def test_one_hold_bound_tick_ends_a_readopted_preemptable_job_end_to_end(monkeypatch, tmp_path, check_passes):
+    """Spec 01 I20 with spec 04 I76 and spec 03 I74/I75, end to end, with nothing set by hand between the steps: a broker
+    restart re-adopted a running preemptable job already past its 1500 s limit (counted from its original start) and
+    opened the startup hold. The hold passes its 10-min bound; the bound's tick meets the running job and names it the
+    blocker. That alone is contention: the job gets PREEMPT_GRACE_SEC, then SIGTERM, then SIGKILL at most
+    PREEMPT_KILL_GRACE_SEC later. Its kill owes one reset, which the startup gate pays before its full check, fabric
+    included. A passing check is the only thing that lifts the hold; a failed one leaves it held, and the next tick runs
+    the bound's ladder and then asks for the power cycle."""
+    from tests.test_device_safety import _setup_startup_hold_behind_readopted_job
+
+    _since, job, climbs, _gate_calls, _heals, _release, _tick, events = _setup_startup_hold_behind_readopted_job(
+        monkeypatch, tmp_path
+    )
+    clock = _ManualClock()
+    monkeypatch.setattr(srv, "time", clock)
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
+    bound = srv._hold_bound_sec()
+    monkeypatch.setattr(srv, "device_hold_episode_since", (srv.datetime.now() - srv.timedelta(seconds=bound + 30)).isoformat())
+    monkeypatch.setattr(srv, "_hold_bound_episode", "")
+    monkeypatch.setattr(srv, "_hold_bound_tenant_blocker", None)
+    monkeypatch.setattr(srv, "_hold_bound_waiter_seen", None, raising=False)
+    monkeypatch.setattr(srv, "_dispatch_hold_waiter_seen", None)
+    monkeypatch.setattr(srv, "_kill_reset_owed", "")
+    monkeypatch.setattr(srv.recovery_mechanism, "last_reset_monotonic", 0.0)
+    cycles = []
+    order = []
+
+    async def power_cycle(log, reason):
+        cycles.append(reason)
+        order.append("power cycle")
+        srv.recovery_mechanism.host_action_requested = ("power-cycle", time.monotonic())
+
+    async def sweep(expected, log, kind, **kw):
+        # The bound's full check right before the power cycle (spec 04 I58/I76), after the ladder's climb.
+        assert climbs == ["present-forced"], "the full check before the cycle runs after the ladder"
+        order.append("full check before the cycle")
+        return False
+
+    monkeypatch.setattr(srv.galaxy_recovery, "_settle_and_verify_before_host_rung", sweep)
+
+    monkeypatch.setattr(srv.recovery_mechanism, "host_action_requested", None)
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    monkeypatch.setattr(srv.recovery_mechanism, "auto_recovery_allowed", lambda action, tenant_active: (True, ""))
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", power_cycle)
+
+    # The startup gate: the real task (it waits on the re-adopted scope), down to the gate call. It records the
+    # spec 03 I69 debt the kill left open, which the real gate pays as one reset before its full check (I74).
+
+    async def gate(job_log_file, *, phase, run_fabric, force_fabric=False):
+        debt = srv._kill_reset_debt()
+        if debt:
+            order.append(("owed reset", phase))
+            srv.recovery_mechanism.last_reset_monotonic = srv.time.monotonic()
+        order.append(("full check", phase, run_fabric, force_fabric))
+        assert srv.fsm.state is ServerState.RECOVERING, "the hold lifted before the full check"
+        if check_passes:
+            fsm_healthy(srv)
+
+    monkeypatch.setattr(srv, "_device_health_gate", gate)
+
+    # The re-adopted job: a real process in its own group behind a live scope stand-in. It ignores SIGTERM, so the
+    # kill grace runs out and SIGKILL ends it.
+    job.preemptable = True
+    job.timeout_sec = srv.MAX_TIMEOUT_SEC
+    job.started_at = (srv.datetime.now() - srv.timedelta(seconds=srv.MAX_TIMEOUT_SEC + 120)).isoformat()
+    p, reaper = _spawn_reaped(
+        [sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"]
+    )
+    signals = []
+    sent = _live_scope(monkeypatch, "428", lambda: p.pid)
+    real_run = srv.subprocess.run
+
+    def run(argv, *a, **k):
+        if list(argv[:2]) == ["systemctl", "kill"]:
+            signals.append((argv[2].split("=", 1)[1], clock.now))
+        return real_run(argv, *a, **k)
+
+    monkeypatch.setattr(srv.subprocess, "run", run)
+    assert srv.readopted_scopes == {"428": srv.job_scope_unit("428")}
+    monitor = asyncio.create_task(srv._monitor_readopted_scope("428", srv.job_scope_unit("428")))
+
+    async def tick():
+        srv._check_hold_deadline()
+        if srv._forced_escalation_task is not None:
+            await srv._forced_escalation_task
+
+    try:
+        await asyncio.sleep(0.1)
+        assert job.preempt_limit_monotonic <= clock.now, "the limit is counted from the job's original start"
+        assert signals == [] and job.contention_since_monotonic is None, "nobody waits yet: the job runs on"
+
+        await tick()  # the bound: the ladder meets the running job, which is named the blocker
+        assert climbs == [] and cycles == [], "a rung over the running job"
+        assert srv._hold_bound_tenant_blocker["blocker"] == "job_running"
+        assert ("hold_bound_tenant_blocked", "job_running") in events
+
+        await _until(
+            lambda: job.contention_since_monotonic is not None,
+            "the job blocking the hold bound never saw contention: it would run on unbounded",
+        )
+        arrival = job.contention_since_monotonic
+        assert srv.preempt_cause(job) == "hold_bound"
+        clock.now = arrival + srv.PREEMPT_GRACE_SEC - 0.1
+        await asyncio.sleep(0.1)
+        assert signals == [], "killed before its full minute"
+        clock.now = arrival + srv.PREEMPT_GRACE_SEC
+        await _until(lambda: signals, "no SIGTERM once the minute was spent")
+        assert signals == [("SIGTERM", arrival + srv.PREEMPT_GRACE_SEC)]
+        clock.now += srv.PREEMPT_KILL_GRACE_SEC - 0.1
+        await asyncio.sleep(0.2)
+        assert [s for s, _ in signals] == ["SIGTERM"], "SIGKILL inside the kill grace"
+        clock.now = arrival + srv.PREEMPT_GRACE_SEC + srv.PREEMPT_KILL_GRACE_SEC
+        await asyncio.wait_for(monitor, timeout=10)
+        assert signals[1] == ("SIGKILL", arrival + srv.PREEMPT_GRACE_SEC + srv.PREEMPT_KILL_GRACE_SEC)
+        assert sent == [signal.SIGTERM, signal.SIGKILL]
+        assert job.status is srv.JobStatus.PREEMPTED
+
+        await asyncio.wait_for(srv._startup_verify_task, timeout=10)
+        assert order == [("owed reset", "startup"), ("full check", "startup", True, True)], (
+            "the kill's owed reset, then the one full check, fabric included"
+        )
+        assert climbs == [] and cycles == [], "the startup gate runs before the bound's ladder"
+        if check_passes:
+            assert srv.fsm.state is ServerState.HEALTHY, "the passing full check lifts the hold"
+            await tick()
+            assert climbs == [] and cycles == [], "a hold the full check lifted is never reset"
+            return
+        assert srv.fsm.state is ServerState.RECOVERING, "a failed full check never lifts the hold"
+        await tick()
+        assert climbs == ["present-forced"], "the bound's ladder on the first tick after the failed check"
+        assert order[2:] == ["full check before the cycle", "power cycle"], (
+            "the full check after the ladder still fails: then the power cycle"
+        )
+        assert len(cycles) == 1
+        assert srv.fsm.state is ServerState.RECOVERING
+    finally:
+        if not monitor.done():
+            monitor.cancel()
+        srv.readopted_scopes.clear()
+        srv._startup_verify_task.cancel()
+        if p.poll() is None:
+            _REAL_KILLPG(p.pid, signal.SIGKILL)
+        reaper.join(timeout=5)
