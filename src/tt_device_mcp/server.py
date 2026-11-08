@@ -3436,9 +3436,14 @@ async def _terminate_check_reader(pid: int) -> str:
     why = ""
     if PCI_WRITER.latched:
         why = "PCI-wedged"
-    else:
-        members = [pid, *_pgid_pids(pid)]
-        if any(m in _kill_refused_pids and _read_proc_starttime(m) == _kill_refused_pids[m] for m in members):
+    elif _kill_refused_pids:  # the /proc scan only when the valve refused a kill, off the event loop
+        refused = dict(_kill_refused_pids)
+
+        def _holds_refused() -> bool:
+            members = [pid, *_pgid_pids(pid)]
+            return any(m in refused and _read_proc_starttime(m) == refused[m] for m in members)
+
+        if await asyncio.to_thread(_holds_refused):
             why = "the dead-chip valve refused to kill it"
     if not why:
         return await _terminate_process_group(pid)
