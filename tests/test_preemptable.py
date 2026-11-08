@@ -2493,6 +2493,17 @@ async def test_one_hold_bound_tick_ends_a_readopted_preemptable_job_end_to_end(m
         return real_run(argv, *a, **k)
 
     monkeypatch.setattr(srv.subprocess, "run", run)
+    # The kill grace's deadline is set once SIGTERM's systemctl call returns, on another thread: the clock moves on
+    # only after the kill loop's first liveness probe, which follows it.
+    probes_after_term = []
+    scope_active = srv._scope_active
+
+    def probe(unit):
+        if signals:
+            probes_after_term.append(clock.now)
+        return scope_active(unit)
+
+    monkeypatch.setattr(srv, "_scope_active", probe)
     assert srv.readopted_scopes == {"428": srv.job_scope_unit("428")}
     monitor = asyncio.create_task(srv._monitor_readopted_scope("428", srv.job_scope_unit("428")))
 
@@ -2523,6 +2534,7 @@ async def test_one_hold_bound_tick_ends_a_readopted_preemptable_job_end_to_end(m
         clock.now = arrival + srv.PREEMPT_GRACE_SEC
         await _until(lambda: signals, "no SIGTERM once the minute was spent")
         assert signals == [("SIGTERM", arrival + srv.PREEMPT_GRACE_SEC)]
+        await _until(lambda: probes_after_term, "the kill grace never started after SIGTERM")
         clock.now += srv.PREEMPT_KILL_GRACE_SEC - 0.1
         await asyncio.sleep(0.2)
         assert [s for s, _ in signals] == ["SIGTERM"], "SIGKILL inside the kill grace"
