@@ -524,7 +524,7 @@ flowchart LR
   K --> P
   KD --> P
   DM --> P
-  P["finally: stop privsep scope, killpg leftovers,<br>exit file cleared,<br>footer written; classify device evidence:<br>fault-signature scan / recovery-kill exemption /<br>wedge-risk exit → device marked dirty"] --> PJ["post-job gate:<br>snapshot always,<br>fabric pass on failure"]
+  P["finally: stop privsep scope, killpg leftovers,<br>exit file cleared,<br>footer written; classify device evidence:<br>fault-signature scan / recovery-kill exemption /<br>wedge-risk exit → device marked dirty"] --> PJ["post-job gate:<br>snapshot always,<br>fabric pass on failure,<br>not on a clean software exit (03 I36)"]
   PJ --> D
 ```
 

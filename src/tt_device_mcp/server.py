@@ -7469,7 +7469,8 @@ async def device_health_gate(
         # job left unretrained — and then believe the answer.
         #
         # The traffic pass costs ~45s, so it is gated: a dirty device or a failed job
-        # (force_fabric) always pays; otherwise it runs only when a caller asks
+        # (force_fabric) pays, a clean software exit with no device event excepted (03 I36);
+        # otherwise it runs only when a caller asks
         # (run_fabric) and no recent pass is fresh. The post-job gate does NOT ask on a
         # clean exit — charging every clean job 45s is how a device ends up being checked
         # instead of used. Only startup asks; the stale window bounds any run_fabric caller
@@ -13902,7 +13903,7 @@ async def _job_runner_loop():
 
         cancelled = False  # set if the broker is shutting down (don't kill the job)
         terminal_note = ""  # timeout/exception marker, appended to error at the end
-        runner_error = False  # the broker, not the job, ended it: never a no-op failure (03 I36)
+        runner_error = False  # the broker, not the job, ended it: never a clean software exit (03 I36)
         exit_status = None  # spec 01 I70: the status the exit gave a job recovery then marked KILLED
         privsep_prefix = None  # set below; read by the finally even when setup raised first
         proc = None
@@ -14676,7 +14677,8 @@ export {JOB_TAG_ENV}={job_tag}
                     # Any non-success exit means we do not know what the job did to the
                     # mesh, so the fabric is proved before the next tenant sees it — the
                     # periodic interval does not get a vote on whether a failure is
-                    # investigated. A preemption the kernel saw end cleanly on SIGTERM is a normal
+                    # investigated. One exception: a clean software exit with no device
+                    # event (03 I36). A preemption the kernel saw end cleanly on SIGTERM is a normal
                     # end, not a failure: the fast check, which escalates on its own if it fails.
                     clean_preempt = job.status == JobStatus.PREEMPTED and job.preempt_clean
                     job_failed = (job.status != JobStatus.COMPLETED or job.exit_code != 0) and not clean_preempt
