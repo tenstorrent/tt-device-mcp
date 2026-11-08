@@ -856,6 +856,7 @@ async def test_a_startup_hold_that_deferred_a_carry_lifts_only_on_a_full_check_p
     srv._note_hold_carry_job("start")
     _restart_broker(monkeypatch)
     _ledger_dir(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_HEALTH_CHECK", "1")  # the runner's harness turned the gate off
     short = (False, {"snapshot": {"ok": True}, "fabric": {"ok": False, "detail": f"what(): {MISMATCH}"}})
     fresh = ServerFsm(tmp_path / "fsmdir" / "fsm.json", current_boot_id="boot-a")
     fresh.boot_merge(None)
@@ -919,6 +920,7 @@ async def test_a_startup_hold_whose_real_startup_check_fails_takes_the_carry(mon
     srv._note_hold_carry_job("start")
     _restart_broker(monkeypatch)
     _ledger_dir(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_HEALTH_CHECK", "1")  # the runner's harness turned the gate off
     short = (False, {"snapshot": {"ok": True}, "fabric": {"ok": False, "detail": f"what(): {MISMATCH}"}})
     fresh = ServerFsm(tmp_path / "fsmdir" / "fsm.json", current_boot_id="boot-a")
     fresh.boot_merge(None)
@@ -1096,6 +1098,7 @@ async def test_a_slow_real_startup_gate_after_a_failed_readopted_job_goes_to_the
     )
     _gate_ran_for(srv._HOLD_CARRY_SEC + 10)
     _ledger_dir(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_HEALTH_CHECK", "1")  # the runner's harness turned the gate off
     short = (False, {"snapshot": {"ok": True}, "fabric": {"ok": False, "detail": f"what(): {MISMATCH}"}})
     fresh = ServerFsm(tmp_path / "fsmdir" / "fsm.json", current_boot_id="boot-a")
     fresh.boot_merge(None)
@@ -1203,12 +1206,15 @@ async def test_a_killed_first_job_with_device_evidence_against_it_keeps_the_epis
     old = _verified_carry(monkeypatch, tmp_path)
     if how == "fault in its log":
         job, runner = await _start("494", "echo 'waiting for active ethernet core'; sleep 600")
+        job.log_file = str(tmp_path / "run_494.log")
     else:
         job, runner = await _start("494", "sleep 600")
     try:
         assert await _until(lambda: job.status is srv.JobStatus.RUNNING and job.pid)
-        if how == "fault while it ran":
-            srv._mark_device_dirty("heartbeat stalled on chip 3", why="heartbeat_stalled")
+        if how == "fault in its log":  # the kill lands after the job wrote the fault
+            assert await _until(lambda: srv._scan_output_for_device_fault(srv.Path(job.log_file)))
+        else:
+            srv._mark_device_dirty("heartbeat stalled on chip 3", why="heartbeat")
         mcp = srv.create_mcp_server()
         await mcp.call_tool("tt_device_job_kill", {"params": {"job_id": "494", "owner": job.owner}})
         assert await _until(lambda: _runner_done(job), tries=800)
@@ -1278,17 +1284,26 @@ async def test_a_kill_reset_hold_lifts_only_on_a_full_check_pass_and_starts_the_
     than the cabling expects, and only a full pass, fabric included, releases it. The carry that release saves is the
     kill-reset hold's own episode."""
     from tests.test_boot_fabric_reverify import _FABRIC_OK, _broker
+    from tests.conftest import patch_recovery
     from tests.test_device_safety import _ledger_dir
 
     await _neutral_kill_hold(monkeypatch, tmp_path)
     own = srv.device_hold_episode_since
     _ledger_dir(monkeypatch, tmp_path)
+    monkeypatch.setenv("TT_DEVICE_MCP_HEALTH_CHECK", "1")  # the runner's harness turned the gate off
     short = (False, {"snapshot": {"ok": True}, "fabric": {"ok": False, "detail": f"what(): {MISMATCH}"}})
     for verdict, held in ((short, True), (_FABRIC_OK, False)):
-        _broker(monkeypatch, tmp_path, srv.fsm, verdict)
+        _events, seen = _broker(monkeypatch, tmp_path, srv.fsm, verdict)
+
+        async def reset(indices, log, ok=verdict[0]):  # the reset's own full check gives the same verdict
+            seen["resets"] += 1
+            return ok
+
+        patch_recovery(monkeypatch, "_reset_and_verify_device", reset)
         monkeypatch.setattr(srv, "_post_reset_debt", lambda: "")
         srv.recovery_mechanism.last_reset_monotonic = time.monotonic() + 1.0  # the kill's reset ran
         await srv._device_health_gate(None, phase="post-job", run_fabric=True, force_fabric=True)
+        assert seen["resets"] or seen["fabric"], "the gate ran a check"
         assert srv.device_hold_logged is held, "a short link count is a failure" if held else "a full pass lifts it"
         assert (srv.fsm.state is ServerState.HEALTHY) is not held
     assert srv._load_hold_carry()["since"] == own and not srv._hold_episode_neutral
