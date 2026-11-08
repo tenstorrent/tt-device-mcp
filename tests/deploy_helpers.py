@@ -78,6 +78,7 @@ rm() {
 
 
 def _clock(text):
-    """The script's clock seam (au_now, au_time) as it defines them: the lap reads the real clock."""
+    """The script's seams (au_now, au_cap, au_time, au_root_uid) and its decision log (au_log) as it
+    defines them, ahead of the source: the lap reads the real clock."""
     i = text.index("au_now() {")
-    return text[i : text.index("\n", text.index("au_time() {", i)) + 1]
+    return text[i : text.index("\n}\n", text.index("au_log() {", i)) + 3]

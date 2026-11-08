@@ -43,7 +43,7 @@ def _health(held=False, state="healthy", age=None):
 def _top():
     """From the decision log through the recovery gate: everything an update lap decides before it touches dispatch."""
     text = _SCRIPT.read_text()
-    top = text[text.index("# Decision log (spec 08 I22)") : text.index("# Dispatch hold (spec 08 I18")]
+    top = text[text.index("# Apply rate limit (spec 08 I21)") : text.index("# Dispatch hold (spec 08 I18")]
     assert top.count("INHIBIT=/run/tt-device-broker/device-op.lock\n") == 1
     return top
 

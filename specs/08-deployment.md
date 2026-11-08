@@ -135,6 +135,16 @@ job log, so every "installed" claim below is verified, not assumed.
   resolved and announced**, not `origin/$BRANCH` re-read afterwards: the drain (I20) can wait for
   minutes, and a branch that moved in that window must not be installed unannounced under a sha
   `installed.sha` would then misname.
+  **The one other source is also fixed in code**: a bare repository at `$TTDEV_ROOT/mirror.git`.
+  A lap uses it instead of the public repository only when root alone can have filled it: it
+  and `$TTDEV_ROOT` are real directories (not links), owned by root, writable by no group or
+  other user, and it is bare; otherwise the public literal, unchanged. No fallback within a lap:
+  a mirror that fails is reported like an unreachable repository. Each lap points the clone's
+  `origin` at its choice before the fetch, both ways, and records a switch in the decision log
+  (I22). Root reads the mirror as a local file, so neither source needs a credential. A source
+  that keeps failing is named on the first failing lap of the outage only (the marker
+  `$TTDEV_ROOT/.source-unreachable` holds when it began), and the first good fetch says
+  once how long it lasted.
 
 - **I17 — The idle-time health probe acts only on an idle broker, and pages once per episode.**
   `tt-device-health-probe.timer` (every 2 min) runs `python -m tt_device_mcp.health_probe` as root,
@@ -778,6 +788,8 @@ script exists, the claim stands on the script (listed below).
 | I16 (the source is a literal that expands nothing, assigned once; the config's only operator input is the branch) | `tests/test_deploy_update_source.py::test_the_update_source_is_a_literal_with_no_expansion`, `tests/test_deploy_update_source.py::test_nothing_else_assigns_the_source`, `tests/test_deploy_update_source.py::test_the_only_operator_input_in_the_config_is_the_branch` |
 | I16 (root-owned clone, private from creation) | `tests/test_deploy_update_source.py::test_the_clone_lives_under_the_broker_root_never_in_a_home`, `tests/test_deploy_update_source.py::test_the_clone_is_created_private` |
 | I16 (installs the sha it resolved; unreachable source is a no-op lap that says why; leftover cleared) | `tests/test_deploy_update_source.py::test_the_lap_installs_the_sha_it_resolved`, `tests/test_deploy_update_source.py::test_every_unreachable_source_is_a_no_op_lap_that_says_why`, `tests/test_deploy_update_source.py::test_a_leftover_non_repository_is_cleared_rather_than_retried_forever` |
+| I16 (the local mirror: used only when root-owned, not linked, not group/other writable and bare; origin follows the choice; no fallback within a lap) | `tests/test_deploy_autoupdate_source_mirror.py::test_a_valid_mirror_is_the_source_from_the_first_clone_on`, `tests/test_deploy_autoupdate_source_mirror.py::test_a_mirror_root_alone_cannot_have_filled_is_ignored`, `tests/test_deploy_autoupdate_source_mirror.py::test_the_clone_origin_follows_the_choice_both_ways_and_the_decision_log_says_so`, `tests/test_deploy_autoupdate_source_mirror.py::test_a_mirror_without_the_branch_does_not_fall_back_to_the_public_repo`, `tests/test_deploy_autoupdate_source_mirror.py::test_the_mirror_is_a_fixed_path_under_the_broker_root` |
+| I16 (a failing source is named once per outage, then once when it is back; no hold, no restart) | `tests/test_deploy_autoupdate_source_mirror.py::test_an_unreachable_source_is_logged_once_over_five_laps_then_reachable_again_once`, `tests/test_deploy_autoupdate_source_mirror.py::test_a_missing_branch_is_logged_once_per_outage`, `tests/test_deploy_autoupdate_source_mirror.py::test_a_failed_fetch_takes_no_hold_and_restarts_nothing` |
 | I16 (the branch stays operator input, bash-escaped, round-trips an apostrophe) | `tests/test_deploy_update_source.py::test_the_branch_is_written_bash_escaped`, `tests/test_deploy_update_source.py::test_the_config_round_trips_a_branch_containing_an_apostrophe` |
 | Slurm hooks exist, parse, and propagate the CLI's exit code | `tests/test_slurm_steps.py::test_the_slurm_hooks_exist_and_are_executable`, `tests/test_slurm_steps.py::test_the_slurm_hooks_are_shell_clean`, `tests/test_slurm_steps.py::test_the_hooks_propagate_the_cli_exit_code` |
 | The epilog carries Slurm's job exit code inward | `tests/test_slurm_steps.py::test_the_epilog_passes_slurms_job_exit_code_through` |
