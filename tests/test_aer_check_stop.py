@@ -35,12 +35,21 @@ PATHS = {"13": ["0000:02:00.0", "0000:00:01.1"], "14": ["0000:03:00.0", "0000:00
 FABRIC, SNAPSHOT, ETH = 9101, 9102, 9103
 
 
-def _sig(port1: int, port2: int = 0, stray: int = 0) -> dict:
+# The same counters on switch ports below a root port that counts nothing: the plain burst count applies (a root
+# port's own rise during the broker's check is a trigger at one, spec 04 I112).
+SWITCHED = {c: [*p, "0000:00:00.1"] for c, p in PATHS.items()}
+
+
+def _sig(port1: int, port2: int = 0, stray: int = 0, paths: dict = PATHS) -> dict:
     return {
         "chips": ["13", "14"],
-        "aer": {"0000:00:01.1": port1, "0000:00:01.2": port2, "0000:00:1f.0": stray},
-        "paths": PATHS,
+        "aer": {"0000:00:01.1": port1, "0000:00:01.2": port2, "0000:00:1f.0": stray, "0000:00:00.1": 0},
+        "paths": paths,
     }
+
+
+def _ssig(*a, **kw) -> dict:
+    return _sig(*a, paths=SWITCHED, **kw)
 
 
 class _Reader:
@@ -241,7 +250,7 @@ def test_a_burst_split_over_two_polls_at_the_real_cadence_stops(rig):
     is just over AER_STOP_WINDOW_SEC old: it must still be the baseline."""
     w, clock, log, feed = rig
     step = telemetry.LINK_WATCH_SEC + 0.02
-    feed(_sig(0), _sig(2), _sig(4))
+    feed(_ssig(0), _ssig(2), _ssig(4))
     assert w.poll_once() is None
     clock.t += step
     assert w.poll_once() is None, "+2 alone is below the count"
@@ -253,17 +262,17 @@ def test_a_burst_split_over_two_polls_at_the_real_cadence_stops(rig):
 def test_a_rise_spread_past_the_window_at_the_real_cadence_never_stops(rig):
     w, clock, log, feed = rig
     step = telemetry.LINK_WATCH_SEC + 0.02
-    feed(*(_sig(n) for n in range(8)))
+    feed(*(_ssig(n) for n in range(8)))
     for _ in range(8):
         assert w.poll_once() is None, "+1 a poll is 2 in two polls"
         clock.t += step
     w._reads.clear()
-    feed(_sig(0), _sig(2), _sig(2), _sig(4))
+    feed(_ssig(0), _ssig(2), _ssig(2), _ssig(4))
     for _ in range(4):
         assert w.poll_once() is None, "+2, a still poll, +2: 4 over three polls"
         clock.t += step
     w._reads.clear()
-    feed(_sig(0), _sig(AER_STOP_COUNT))
+    feed(_ssig(0), _ssig(AER_STOP_COUNT))
     assert w.poll_once() is None
     clock.t += 3 * telemetry.LINK_WATCH_SEC
     assert w.poll_once() is None, "a stalled poll: 4 over 3 s"
@@ -274,17 +283,17 @@ def test_a_slow_rise_another_path_or_one_below_the_count_never_stops(rig):
     w, clock, log, feed = rig
     # The calibrated count (telemetry's basis comment): benign ports post at most 2 in 2 s.
     assert (AER_STOP_COUNT, telemetry.AER_STOP_WINDOW_SEC) == (4, 2.0)
-    feed(_sig(0), _sig(3))
+    feed(_ssig(0), _ssig(3))
     assert w.poll_once() is None
     clock.t += 1
     assert w.poll_once() is None, "3 in 2 s is below the count"
     w._reads.clear()
-    feed(_sig(0), _sig(2), _sig(4))
+    feed(_ssig(0), _ssig(2), _ssig(4))
     for _ in range(3):
         assert w.poll_once() is None, "4 spread over more than the window"
         clock.t += 1.5
     w._reads.clear()
-    feed(_sig(0, stray=0), _sig(0, stray=50))
+    feed(_ssig(0, stray=0), _ssig(0, stray=50))
     assert w.poll_once() is None
     clock.t += 1
     assert w.poll_once() is None, "a function on no chip's path"
