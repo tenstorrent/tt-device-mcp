@@ -198,7 +198,10 @@ class PciSysfsWriter:
                 tids.append(threading.get_native_id())
                 return fn(*args)
 
-            task = asyncio.ensure_future(asyncio.to_thread(_run))
+            # Only a write with a grace needs its thread id (the stack read at its bound); others run ``fn`` as is.
+            task = asyncio.ensure_future(
+                asyncio.to_thread(_run) if settle is not None else asyncio.to_thread(fn, *args)
+            )
             self._task, self._context = task, context
             started = time.monotonic()
             self._deadline = started + timeout
