@@ -8,6 +8,7 @@ import errno
 import fnmatch
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -58,6 +59,18 @@ def old_host_boot(monkeypatch):
     """Pin this host's boot time to a day ago around every test: the power-cycle cooldown counts from the host's boot
     (spec 04 I65), and a suite run soon after the runner's own reboot must not see every power cycle in cooldown."""
     monkeypatch.setattr(srv, "_boot_btime_id", lambda: str(int(time.time()) - 86400))
+
+
+@pytest.fixture(autouse=True, scope="session")
+def jobs_can_trap_sigint():
+    """A suite started in the background of a script (a detached or CI run) inherits SIGINT ignored, and every job it
+    spawns inherits that too: a shell cannot trap a signal ignored on entry, so the kill ladder's SIGINT never reaches
+    a test job's trap. Run the tests as the broker runs under systemd, with SIGINT at its default."""
+    prev = signal.getsignal(signal.SIGINT)
+    if prev is signal.SIG_IGN:
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+    yield
+    signal.signal(signal.SIGINT, prev)
 
 
 @pytest.fixture(autouse=True)
