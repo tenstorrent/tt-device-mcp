@@ -31,8 +31,10 @@ SHA="${TTDEV_VALIDATOR_SHA:?pin is missing TTDEV_VALIDATOR_SHA}"
 # They are part of the build's identity: the prefix is keyed on the SHA plus a hash of the patches, so
 # a changed patch builds a new prefix and flips to it exactly like a new pin does.
 PATCHES=()
+# Absolute, because `git -C "$BUILD" apply` resolves a relative name from the checkout.
+PIN_DIR="$(cd -- "$(dirname -- "$PIN")" && pwd)"
 for p in ${TTDEV_VALIDATOR_PATCHES:-}; do
-    p="$(dirname -- "$PIN")/$p"
+    p="$PIN_DIR/$p"
     [ -r "$p" ] || { echo "install-fabric-validator: pinned patch $p missing" >&2; exit 1; }
     PATCHES+=("$p")
 done

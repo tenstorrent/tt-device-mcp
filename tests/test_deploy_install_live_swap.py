@@ -329,13 +329,15 @@ def _live_bins(root: Path, bins=_BINS) -> list[str]:
 
 
 def _run_validator(
-    tmp: Path, sha: str, live: list[str], root: str | None = None, patches: str = "", key: bool = False
+    tmp: Path, sha: str, live: list[str], root: str | None = None, patches: str = "", key: bool = False,
+    relative: bool = False,
 ) -> subprocess.CompletedProcess:
     bindir = tmp / "vstubs" if (tmp / "vstubs").exists() else _validator_bindir(tmp)
     env = _env(tmp, bindir, live)
     env["TTDEV_VALIDATOR_ROOT"] = root or str(tmp / "validator")
-    argv = ["bash", str(_VALIDATOR), str(_pin(tmp, sha, patches)), *(["--key"] if key else [])]
-    return subprocess.run(argv, env=env, capture_output=True, text=True, timeout=60)
+    pin = _pin(tmp, sha, patches)
+    argv = ["bash", str(_VALIDATOR), pin.name if relative else str(pin), *(["--key"] if key else [])]
+    return subprocess.run(argv, env=env, cwd=tmp if relative else None, capture_output=True, text=True, timeout=60)
 
 
 def _built(p: Path) -> bool:
@@ -468,9 +470,10 @@ def _key(sha: str, *texts: str) -> str:
     return f"{sha}-{hashlib.sha256(''.join(texts).encode()).hexdigest()[:12]}"
 
 
-def test_validator_build_applies_the_pins_patches_under_a_patch_keyed_prefix(tmp_path):
+@pytest.mark.parametrize("relative", [False, True], ids=["absolute-pin", "relative-pin"])
+def test_validator_build_applies_the_pins_patches_under_a_patch_keyed_prefix(tmp_path, relative):
     names = f"{_patch(tmp_path, 'one.patch', _ADD_LINE)} {_patch(tmp_path, 'two.patch', _ADD_SECOND)}"
-    res = _run_validator(tmp_path, "aaa", [], patches=names)
+    res = _run_validator(tmp_path, "aaa", [], patches=names, relative=relative)
     assert res.returncode == 0, res.stderr
     root = tmp_path / "validator"
     key = _key("aaa", _ADD_LINE, _ADD_SECOND)
