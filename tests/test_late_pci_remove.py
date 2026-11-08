@@ -110,6 +110,27 @@ async def test_a_write_with_no_settle_check_latches_at_its_bound(slow):
     assert w.latched and "pci_write_slow" not in _kinds(slow)
 
 
+async def test_a_write_with_no_settle_check_hands_its_own_function_to_the_thread(monkeypatch):
+    """A write with no grace runs ``fn`` itself on the worker thread, never a wrapper: callers' fakes tell a rescan
+    from other work by the function they are given."""
+    w = PciSysfsWriter()
+    w.on_latch = None
+    given: list = []
+    real = asyncio.to_thread
+
+    async def to_thread(fn, *a, **k):
+        given.append(fn)
+        return await real(fn, *a, **k)
+
+    monkeypatch.setattr(pci_writer.asyncio, "to_thread", to_thread)
+
+    def rescan():
+        return True
+
+    assert await w.write("rescan", rescan, timeout=5.0) is True
+    assert given == [rescan]
+
+
 def test_the_watch_threads_write_has_the_same_grace(slow):
     w = PciSysfsWriter()
     w.on_latch = None
