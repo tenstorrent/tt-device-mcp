@@ -26,6 +26,7 @@ from tests.conftest import REAL_RUN_SNAPSHOT
 from tests.test_aer_check_stop import _sig
 from tests.test_aer_stop_contain import _held, _rows, _sample, _stop_row, watch  # noqa: F401 - the fixture
 from tests.test_deadchip_detach_before_kill import FABRIC, valve  # noqa: F401 - the fixture
+from tests.test_late_pci_remove import _kinds, _late_remove, slow  # noqa: F401 - the fixture
 from tt_device_mcp import server as srv
 from tt_device_mcp import telemetry
 from tt_device_mcp.health import ALL_ONES, chip_state
@@ -647,10 +648,41 @@ def test_a_pending_stop_holds_its_readers_through_the_remove_and_then_releases_t
     _stopped_only(log)
     assert chip_state.reader_held(FABRIC), "the stopped reader's own timeout must not kill it now"
     left = chip_state._held[FABRIC] - time.monotonic()
-    # Bounded, and past the cap's remove: the watch acts first.
-    assert telemetry.PENDING_STOP_CAP_SEC + telemetry.DETACH_TIMEOUT_SEC < left <= telemetry.READER_HOLD_SEC
+    # Bounded, and past the cap's remove and its late grace: the watch acts first.
+    late = telemetry.DETACH_TIMEOUT_SEC + telemetry.REMOVE_LATE_GRACE_SEC
+    assert telemetry.PENDING_STOP_CAP_SEC + late < left <= telemetry.READER_HOLD_SEC
     assert _cap(w, monkeypatch)
     assert at_remove == [True], "held while the chip was still attached"
+    assert FABRIC not in chip_state._held and ("kill", FABRIC) in log
+    _held()
+
+
+def test_a_held_reader_stays_held_through_a_late_remove_s_grace_and_is_released_when_it_returns(
+    watch, slow, monkeypatch  # noqa: F811
+):
+    """Spec 03 I92 over spec 04 I76: a remove past its bound may still finish in its grace, and the chip stays attached
+    until it does. The stopped reader's hold outlasts the longest such remove, and the late return releases it."""
+    w, log, _detach_ok, burst = watch
+    bound = telemetry.WATCH_HARD_BOUND_SEC
+    longest = telemetry.PENDING_STOP_CAP_SEC + bound + min(telemetry.REMOVE_LATE_GRACE_SEC, 3 * bound)
+    monkeypatch.setattr(telemetry, "WATCH_HARD_BOUND_SEC", 0.05)
+    monkeypatch.setattr(telemetry, "WATCH_REMOVE_BUDGET_SEC", 0.05)
+    late = _late_remove(slow)
+    in_grace = []
+
+    def remove(idx):
+        late()
+        in_grace.append(chip_state.reader_held(FABRIC))
+        return True
+
+    monkeypatch.setattr(srv, "isolate_chip", remove)
+    monkeypatch.setattr(srv, "chip_removed", lambda idx, bdf: True)
+    assert burst()
+    _stopped_only(log)
+    assert chip_state._held[FABRIC] - time.monotonic() > longest, "the hold ends before a late remove can"
+    assert _cap(w, monkeypatch)
+    assert _kinds(slow) == ["pci_write_slow", "pci_write_late"] and not srv.PCI_WRITER.latched
+    assert in_grace == [True], "held while the late remove ran"
     assert FABRIC not in chip_state._held and ("kill", FABRIC) in log
     _held()
 

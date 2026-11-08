@@ -124,9 +124,10 @@ DETACH_TIMEOUT_SEC = 15.0
 # full check with fabric) instead of the power cycle.
 REMOVE_LATE_GRACE_SEC = 45.0
 # Spec 03 I92: how long a reader an AER stop left SIGSTOPped is held from its own timeout's SIGKILL
-# (chip_state.hold_readers): the pending stop's cap, two watch ticks, then the containment's removes.
-# The watch releases it sooner once the stop is settled, and a broker reset step at once.
-READER_HOLD_SEC = PENDING_STOP_CAP_SEC + 2 * LINK_WATCH_SEC + DETACH_TIMEOUT_SEC
+# (chip_state.hold_readers): the pending stop's cap, two watch ticks, then the containment's removes and their late
+# grace (spec 04 I76: the chip stays attached until a late remove returns). The watch releases it sooner once the stop
+# is settled or the remove returned, and a broker reset step at once.
+READER_HOLD_SEC = PENDING_STOP_CAP_SEC + 2 * LINK_WATCH_SEC + DETACH_TIMEOUT_SEC + REMOVE_LATE_GRACE_SEC
 
 
 @dataclass(frozen=True)
