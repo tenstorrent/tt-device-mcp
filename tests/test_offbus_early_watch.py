@@ -106,7 +106,53 @@ def test_link_signals_reads_uncorrectable_aer_up_the_chip_path(tmp_path):
 
 def test_link_signals_with_no_class_dir_reads_as_nothing(monkeypatch, tmp_path):
     monkeypatch.setattr(pci, "SYSFS_CLASS_DIR", tmp_path / "absent")
-    assert pci.link_signals() == {"chips": [], "aer": {}, "paths": {}}
+    assert pci.link_signals() == {"chips": [], "aer": {}, "aer_kind": {}, "paths": {}}
+
+
+def test_link_signals_counts_each_aer_class_apart(tmp_path):
+    """Spec 03 I79: the total keeps the Advisory Non-Fatal row, and the per-class count tells it from the
+    uncorrectable non-fatal and fatal counters."""
+    root = tmp_path / "pci" / "0000:00:01.1"
+    ep = root / "0000:02:00.0"
+    ep.mkdir(parents=True)
+    (ep / "aer_dev_correctable").write_text("RxErr 40\nNonFatalErr 3\nTOTAL_ERR_COR 43\n")
+    (ep / "aer_dev_nonfatal").write_text("CmpltTO 2\nTOTAL_ERR_NONFATAL 2\n")
+    (root / "aer_rootport_total_err_fatal").write_text("1\n")
+    c = pci.SYSFS_CLASS_DIR / "tenstorrent!0"
+    c.mkdir()
+    (c / "device").symlink_to(ep)
+
+    sig = pci.link_signals()
+    assert sig["aer"] == {"0000:02:00.0": 5, "0000:00:01.1": 1}
+    assert sig["aer_kind"]["0000:02:00.0"] == {"advisory_nonfatal": 3, "nonfatal": 2, "fatal": 0}
+    assert sig["aer_kind"]["0000:00:01.1"] == {"advisory_nonfatal": 0, "nonfatal": 0, "fatal": 1}
+
+
+@pytest.mark.parametrize(
+    "kind, label",
+    [
+        ("advisory_nonfatal", "correctable Advisory Non-Fatal AER errors on 0000:00:01.1"),
+        ("nonfatal", "uncorrectable non-fatal AER errors on 0000:00:01.1"),
+        ("fatal", "uncorrectable fatal AER errors on 0000:00:01.1"),
+    ],
+)
+def test_the_aer_reason_names_the_class_that_rose(watch, kind, label):
+    """Spec 03 I79: a correctable (Advisory Non-Fatal) record is never reported as an uncorrectable error."""
+    s, *_ = watch
+    zero = {"advisory_nonfatal": 0, "nonfatal": 0, "fatal": 0}
+    s.link_signal({"chips": ["0"], "aer": {"0000:00:01.1": 0}, "aer_kind": {"0000:00:01.1": dict(zero)}})
+    reason = s.link_signal(
+        {"chips": ["0"], "aer": {"0000:00:01.1": 4}, "aer_kind": {"0000:00:01.1": {**zero, kind: 4}}}
+    )
+    assert reason == label, reason
+    if kind == "advisory_nonfatal":
+        assert "uncorrectable" not in reason
+
+
+def test_an_aer_rise_with_no_class_count_names_no_class(watch):
+    s, *_ = watch
+    s.link_signal({"chips": ["0"], "aer": {"0000:00:01.1": 0}})
+    assert s.link_signal({"chips": ["0"], "aer": {"0000:00:01.1": 2}}) == "AER errors on 0000:00:01.1"
 
 
 def test_link_signal_baselines_then_reports_a_rise_or_a_vanished_node(watch):

@@ -85,12 +85,14 @@ from tt_device_mcp.health.monitors.hostpci import (
 
 # The tt-smi/sysfs telemetry-sampler primitives server.py's own polling loop runs directly.
 from tt_device_mcp.health.monitors.pci import (
+    AER_KIND_LABELS,
     SAMPLE_INTERVAL_SEC,
     SAMPLE_RING_SIZE,
     aer_totals,
     chip_node_present,
     chip_pci_bdf,
     chip_pci_bdfs,
+    chip_removed,
     chip_sample,
     chip_snapshot,
     chip_snapshot_event,
@@ -246,9 +248,11 @@ __all__ = [
     "version_floor_warnings",
     "SAMPLE_INTERVAL_SEC",
     "SAMPLE_RING_SIZE",
+    "AER_KIND_LABELS",
     "aer_totals",
     "chip_node_present",
     "chip_pci_bdf",
+    "chip_removed",
     "sysfs_chip_ids",
     "chip_sample",
     "chip_snapshot",

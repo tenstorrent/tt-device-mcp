@@ -25,15 +25,23 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 from tt_device_mcp import metrics
-from tt_device_mcp.health import ALL_ONES, PCI_WRITER, SAMPLE_INTERVAL_SEC, SAMPLE_RING_SIZE, PciWedged, chip_state
+from tt_device_mcp.health import (
+    AER_KIND_LABELS,
+    ALL_ONES,
+    PCI_WRITER,
+    SAMPLE_INTERVAL_SEC,
+    SAMPLE_RING_SIZE,
+    PciWedged,
+    chip_state,
+)
 
 if TYPE_CHECKING:
     from tt_device_mcp.health import HealthMonitor, RecoveryDeps, RecoveryMechanism
 
 # The early off-bus watch (spec 03 I79). Between samples the loop reads the kernel's own PCIe record (pci.link_signals:
-# AER counters and the KMD node list, kernel memory only) every LINK_WATCH_SEC. A rise in an uncorrectable AER counter
+# AER counters and the KMD node list, kernel memory only) every LINK_WATCH_SEC. A rise in a counted AER counter
 # on a chip's path, or a chip node leaving sysfs, arms a fast cadence: the next sample comes FAST_SAMPLE_SEC after the
-# last one (never sooner, except at once when the edge is an uncorrectable AER rise pinned to a chip's own path, whose
+# last one (never sooner, except at once when the edge is a counted AER rise pinned to a chip's own path, whose
 # all-ones read then proves itself on that sample, I86), and samples stay FAST_SAMPLE_SEC apart for FAST_WINDOW_SEC after the last such signal. One
 # storm (signals less than FAST_WINDOW_SEC apart) keeps the fast cadence at most FAST_MAX_SEC from its first signal;
 # after that the regular cadence runs until the link has been quiet for FAST_WINDOW_SEC. The signal itself decides
@@ -110,10 +118,16 @@ INFLIGHT_KILL_TIMEOUT_SEC = 30.0
 # runs in a worker thread so the sampler never stalls on it, and a remove still running at the bound
 # counts as not detached (no kill, the hold stays). Only that case waits this long.
 DETACH_TIMEOUT_SEC = 15.0
+# Spec 04 I76: a dead chip's remove still running at its bound gets this much more (at most three times its bound)
+# before it latches PCI-wedged. A remove can return late and still have finished: one that returns in the grace with
+# the chip's KMD and PCI nodes gone is removed, and the hold keeps its partial off-bus path (the full ladder, then the
+# full check with fabric) instead of the power cycle.
+REMOVE_LATE_GRACE_SEC = 45.0
 # Spec 03 I92: how long a reader an AER stop left SIGSTOPped is held from its own timeout's SIGKILL
-# (chip_state.hold_readers): the pending stop's cap, two watch ticks, then the containment's removes.
-# The watch releases it sooner once the stop is settled, and a broker reset step at once.
-READER_HOLD_SEC = PENDING_STOP_CAP_SEC + 2 * LINK_WATCH_SEC + DETACH_TIMEOUT_SEC
+# (chip_state.hold_readers): the pending stop's cap, two watch ticks, then the containment's removes and their late
+# grace (spec 04 I76: the chip stays attached until a late remove returns). The watch releases it sooner once the stop
+# is settled or the remove returned, and a broker reset step at once.
+READER_HOLD_SEC = PENDING_STOP_CAP_SEC + 2 * LINK_WATCH_SEC + DETACH_TIMEOUT_SEC + REMOVE_LATE_GRACE_SEC
 
 
 @dataclass(frozen=True)
@@ -224,6 +238,19 @@ def snapshot(fsm, monitor, mechanism, stats, *, queue_depth: int = 0, isolated_c
     snap["queue_depth"] = int(queue_depth)
     snap["isolated_chips"] = int(isolated_chips)
     return BrokerTelemetry(**snap)
+
+
+def _aer_rise_reason(rose: list, before: dict, now: dict) -> str:
+    """The early off-bus watch's reason for AER counters that rose on ``rose`` (spec 03 I79), naming each class that
+    rose: an Advisory Non-Fatal record is correctable, never reported as uncorrectable. Without a per-class count it
+    says only "AER errors"."""
+    by_label: dict = {}
+    for bdf in rose:
+        was, cur = before.get(bdf) or {}, now.get(bdf) or {}
+        kinds = [k for k in AER_KIND_LABELS if k in was and cur.get(k, 0) > was[k]]
+        for label in [AER_KIND_LABELS[k] for k in kinds] or [""]:
+            by_label.setdefault(label, []).append(bdf)
+    return "; ".join(f"{label + ' ' if label else ''}AER errors on {', '.join(b)}" for label, b in by_label.items())
 
 
 def _first_evidence(chips: list, trigger_ts: float, remove_ts: float) -> dict:
@@ -448,8 +475,9 @@ class TelemetrySampler:
 
     def link_signal(self, now: dict) -> Optional[str]:
         """What changed since the last link_signals read, as a reason, or None (I79). An
-        uncorrectable AER counter that rose on a chip's path, or a chip node that left sysfs.
-        The first read is only a baseline; a counter that could not be read compares as nothing."""
+        AER counter that rose on a chip's path, named by the class that rose (Advisory Non-Fatal is
+        correctable), or a chip node that left sysfs. The first read is only a baseline; a counter
+        that could not be read compares as nothing."""
         prev, self._link_prev = self._link_prev, now
         self._aer_rose_chips = []
         if prev is None:
@@ -468,7 +496,7 @@ class TelemetrySampler:
             if v is not None and before.get(bdf) is not None and v > before[bdf]
         )
         if rose:
-            why.append(f"uncorrectable AER errors on {', '.join(rose)}")
+            why.append(_aer_rise_reason(rose, prev.get("aer_kind") or {}, now.get("aer_kind") or {}))
             # The chips below a port that counted (I86): only their own all-ones read is corroborated.
             hit = set(rose)
             self._aer_rose_chips = sorted(
@@ -615,6 +643,8 @@ class TelemetrySampler:
             # Each remove is the one in-flight PCI write (spec 04 I76), all within one budget. The first
             # that times out or is refused (PCI-wedged) ends the cut: nobody is killed.
             deadline = time.monotonic() + INFLIGHT_DETACH_TIMEOUT_SEC
+            bdf = getattr(self._deps, "chip_pci_bdf", None)
+            pci = {i: bdf(i) for i in confirmed} if bdf is not None else {}
             for idx in confirmed:
                 try:
                     ok = await PCI_WRITER.write(
@@ -622,6 +652,8 @@ class TelemetrySampler:
                         self._deps.isolate_chip,
                         idx,
                         timeout=max(0.01, deadline - time.monotonic()),
+                        settle=self._remove_settle(idx, pci.get(idx)),
+                        grace=min(REMOVE_LATE_GRACE_SEC, 3 * INFLIGHT_DETACH_TIMEOUT_SEC),
                     )
                 except PciWedged:
                     blocked = True
@@ -1050,21 +1082,35 @@ class TelemetrySampler:
                 f"{expected - present} chip(s) dropped off the PCIe bus. Holding the device."
             )
 
-    async def _detach_chips(self, chips: list) -> tuple:
+    def _remove_settle(self, idx: str, bdf: Optional[str]):
+        """The proof a late remove of chip ``idx`` finished (spec 04 I76): its KMD node and its PCI node are gone."""
+        gone = getattr(self._deps, "chip_removed", None)
+        return None if gone is None else (lambda: gone(idx, bdf))
+
+    async def _detach_chips(self, chips: list, pci: Optional[dict] = None) -> tuple:
         """PCI-remove each chip, every write the one in-flight PCI write (spec 04 I76) and all of them inside one
-        DETACH_TIMEOUT_SEC budget (spec 03 I84). Returns ``(removed, stuck)``. A remove still running at the bound, or
-        refused behind an earlier blocked write, latches PCI-wedged and is stuck, and no further chip is tried: a hung
-        remove keeps the kernel's remove path busy, so the next write would hang behind it."""
+        DETACH_TIMEOUT_SEC budget (spec 03 I84). Returns ``(removed, stuck)``. A remove still running at the bound gets
+        REMOVE_LATE_GRACE_SEC more, and one that returns in it with the chip's nodes gone is removed. One still running
+        then, or refused behind an earlier blocked write, latches PCI-wedged and is stuck, and no further chip is
+        tried: a hung remove keeps the kernel's remove path busy, so the next write would hang behind it."""
         removed: list = []
         if self._deps.isolate_chip is None:
             return removed, list(chips)
         deadline = time.monotonic() + DETACH_TIMEOUT_SEC
+        grace = min(REMOVE_LATE_GRACE_SEC, 3 * DETACH_TIMEOUT_SEC)
         for idx in chips:
             left = deadline - time.monotonic()
             if left <= 0:
                 break
             try:
-                ok = await PCI_WRITER.write(f"isolate dead chip {idx}", self._deps.isolate_chip, idx, timeout=left)
+                ok = await PCI_WRITER.write(
+                    f"isolate dead chip {idx}",
+                    self._deps.isolate_chip,
+                    idx,
+                    timeout=left,
+                    settle=self._remove_settle(idx, (pci or {}).get(idx)),
+                    grace=grace,
+                )
             except PciWedged:
                 self._deps.health_event(
                     "chip_detach_timeout", chip=idx, timeout_sec=DETACH_TIMEOUT_SEC, host_at_risk=True
@@ -1225,13 +1271,20 @@ class TelemetrySampler:
                 stuck = list(to_remove)
             else:
                 deadline = max(t0 + WATCH_HARD_BOUND_SEC, time.monotonic() + WATCH_REMOVE_BUDGET_SEC)
+                grace = min(REMOVE_LATE_GRACE_SEC, 3 * (deadline - time.monotonic()))
                 for n, idx in enumerate(to_remove):
                     left = deadline - time.monotonic()
                     ok = False
                     if left > 0:
                         try:
                             ok = PCI_WRITER.write_sync(
-                                f"isolate dead chip {idx}", deps.isolate_chip, idx, timeout=left, loop=self.loop
+                                f"isolate dead chip {idx}",
+                                deps.isolate_chip,
+                                idx,
+                                timeout=left,
+                                loop=self.loop,
+                                settle=self._remove_settle(idx, pci.get(idx)),
+                                grace=grace,
                             )
                         except PciWedged:
                             stuck = list(to_remove[n:])
@@ -1454,7 +1507,7 @@ class TelemetrySampler:
         # off-bus chip. A stopped poller closes its fd the same way, so it waits for the detach too.
         self.valve_detaching.update(fresh)
         try:
-            removed, stuck = await self._detach_chips(fresh)
+            removed, stuck = await self._detach_chips(fresh, pci)
         finally:
             self.valve_detaching.difference_update(fresh)
         t_remove = time.monotonic()
