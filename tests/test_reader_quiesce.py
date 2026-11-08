@@ -390,8 +390,8 @@ async def test_an_unstoppable_reader_never_blocks_the_bridge_reset(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["launched", "not launched", "timed out"])
 async def test_a_power_cycle_request_stops_readers_before_it_fires(monkeypatch, tmp_path, case):
-    from tests.test_power_cycle_host_rung import _ledger_dir
     from tests.conftest import patch_health_event
+    from tests.test_power_cycle_host_rung import _ledger_dir
     from tt_device_mcp.health.recovery import base as recovery_base
 
     _ledger_dir(monkeypatch, tmp_path)
@@ -437,8 +437,8 @@ async def test_a_power_cycle_request_stops_readers_before_it_fires(monkeypatch, 
 
 @pytest.mark.asyncio
 async def test_an_unstoppable_reader_never_blocks_the_power_cycle_request(monkeypatch, tmp_path):
-    from tests.test_power_cycle_host_rung import _ledger_dir
     from tests.conftest import patch_health_event
+    from tests.test_power_cycle_host_rung import _ledger_dir
 
     _ledger_dir(monkeypatch, tmp_path)
     monkeypatch.setattr(srv, "_current_boot_id", lambda: "boot-A")
