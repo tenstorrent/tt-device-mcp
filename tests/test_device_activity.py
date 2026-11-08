@@ -212,7 +212,7 @@ async def test_the_sampler_runs_only_while_the_job_runs(monkeypatch, clear_job_s
 async def test_the_sampler_is_stopped_before_the_post_job_gate(monkeypatch, clear_job_state):
     seen_at_gate = []
 
-    async def _gate(job_log_file, job_failed=False, noop_failure=False):
+    async def _gate(job_log_file, job_failed=False, clean_exit_code=None):
         seen_at_gate.append(dict(srv._job_activity))
 
     class Quiet(DeviceActivitySampler):
