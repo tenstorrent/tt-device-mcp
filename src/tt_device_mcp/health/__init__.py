@@ -58,6 +58,12 @@ from tt_device_mcp.health.monitor import (
 # per-chip PCIe AER and link telemetry the job and gate paths in server.py snapshot (spec 03 I91).
 from tt_device_mcp.health.monitors import eth, fabric, pcie_aer
 
+# The post-reset fabric debt (spec 04 I32): every reset path and broker start marks it owed, and server.py's release
+# funnel and the gate read it to hold fabric-unverified until a pass settles it. The one in-flight PCI sysfs writer and
+# its PCI-wedged latch (spec 04 I76): server.py wires the latch to the hold and the power-cycle request, and clears it
+# only on a verified lift; telemetry.py's dead-chip valve skips chips while it is set and removes chips only through it.
+from tt_device_mcp.health.monitors import pci as _pci_monitor
+
 # Heartbeat probe primitives the gate/telemetry sampler in server.py calls directly (off-bus
 # counts, the dead-chip sampler, the startup probe) — not merely bounced into RecoveryDeps.
 from tt_device_mcp.health.monitors.heartbeat import (
@@ -104,12 +110,6 @@ from tt_device_mcp.health.monitors.pci import (
     pci_bus_number,
     sysfs_chip_ids,
 )
-
-# The post-reset fabric debt (spec 04 I32): every reset path and broker start marks it owed, and server.py's release
-# funnel and the gate read it to hold fabric-unverified until a pass settles it. The one in-flight PCI sysfs writer and
-# its PCI-wedged latch (spec 04 I76): server.py wires the latch to the hold and the power-cycle request, and clears it
-# only on a verified lift; telemetry.py's dead-chip valve skips chips while it is set and removes chips only through it.
-from tt_device_mcp.health.monitors import pci as _pci_monitor
 from tt_device_mcp.health.pci_writer import PCI_WRITER, PciWedged
 from tt_device_mcp.health.post_reset import FABRIC_DEBT, POST_RESET_SETTLE_SEC, boot_monotonic
 from tt_device_mcp.health.recovery import (

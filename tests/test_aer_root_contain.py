@@ -29,7 +29,7 @@ def _poll_after_rise(w, clock, feed, sig_after):
     return reason, time.monotonic() - t0
 
 
-def test_one_root_port_record_during_the_check_stops_and_fences_within_a_poll(rig):
+def test_one_root_port_record_during_the_check_stops_and_fences_within_a_poll(rig):  # noqa: F811
     """The incident's shape: one uncorrectable record on the root port, no burst, no all-ones read yet."""
     w, clock, log, feed = rig
     assert telemetry.LINK_WATCH_SEC <= 1.0 and telemetry.AER_CHECK_ROOT_STOP_COUNT == 1
@@ -44,7 +44,7 @@ def test_one_root_port_record_during_the_check_stops_and_fences_within_a_poll(ri
     assert ("event", "check_aer_stop") in log, f"the stop record is written by the poll that stopped (I95): {log}"
 
 
-def test_a_root_port_record_with_no_broker_check_running_stops_and_fences_nothing(rig, monkeypatch):
+def test_a_root_port_record_with_no_broker_check_running_stops_and_fences_nothing(rig, monkeypatch):  # noqa: F811
     w, clock, log, feed = rig
     monkeypatch.setattr(srv.health_monitor, "fabric_check_proc", None)
     reason, _ = _poll_after_rise(w, clock, feed, _sig(1))
@@ -52,7 +52,7 @@ def test_a_root_port_record_with_no_broker_check_running_stops_and_fences_nothin
     assert not chip_state.is_fenced("13")
 
 
-def test_an_endpoint_record_below_the_burst_count_stops_nothing_during_the_check(rig):
+def test_an_endpoint_record_below_the_burst_count_stops_nothing_during_the_check(rig):  # noqa: F811
     w, clock, log, feed = rig
     endpoint = PATHS["13"][0]
     rise = _sig(0)
@@ -67,7 +67,7 @@ def test_an_endpoint_record_below_the_burst_count_stops_nothing_during_the_check
 
 
 @pytest.mark.asyncio
-async def test_the_trigger_and_stop_record_is_on_disk_before_the_remove(watch, monkeypatch):
+async def test_the_trigger_and_stop_record_is_on_disk_before_the_remove(watch, monkeypatch):  # noqa: F811
     _w, log, _detach_ok, burst = watch
     journal = srv.sampler._journal_now
     waits = {}
