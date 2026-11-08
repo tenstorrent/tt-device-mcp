@@ -225,7 +225,8 @@ each rung fires only when the gentler one failed or cannot apply.
   endpoint is the MMIO stall that reboots the host, and the sampler would isolate mid-reset
   all-ones chips as dead), and restores them only when no reset scope is still cycling. A PCI
   rescan runs before restore so isolated endpoints re-enumerate. The poller list defaults to
-  `tt-telemetry` and `tt-metrics-exporter` on every host. It names no clock-cap keeper, which every
+  `tt-telemetry`, `tt-metrics-exporter` and `prometheus-node-exporter` (whose hwmon collector reads
+  every chip's telemetry through the driver on each scrape) on every host. It names no clock-cap keeper, which every
   reset would otherwise stop and restart on every host. A host that runs another unit that reads or
   writes the chips adds it with `TT_DEVICE_MCP_POLLER_SERVICES`. A listed unit the host does not
   have is skipped and never fails or blocks the recovery. The restore starts only the pollers the
@@ -2892,6 +2893,39 @@ each rung fires only when the gentler one failed or cannot apply.
   every cabled link that has just passed does (I32). Cost: one more mesh reset and its check (about
   70 s) on a drop that follows a failed reset in the same hold, in exchange for the full ladder
   before the power cycle.
+
+- **I112 — Fabric checks, bridge resets and power-cycle requests run with device readers stopped and
+  verified.** Seen on a Galaxy: a chip dropped off the bus during the post-job fabric check, and the
+  host died of a machine check seconds later, with the host's chip readers still polling. Only the
+  tt-smi resets (I12) and the startup check stopped them; and on a host that has none of the
+  listed units the stop was a no-op logged as a warning, while the one unit there that did read the
+  chips (a node exporter's hwmon collector) was not listed. Now:
+  - Every fabric check (`verify_fabric_health`: the post-job, gate, post-reset and startup checks)
+    runs inside the poller quiesce (`deps.quiesce_readers`), restored on every exit: pass, fail,
+    timeout, raise or cancel. Its stop runs before the check's own timeout starts. A check nested in
+    the startup block reuses that block's stop.
+  - The bridge (SBR) reset, which the last-chance sweep also runs, stops them when it has a chip to
+    reset, and restores them through `restore_pollers` (a step that did not complete leaves them owed
+    to the next close to HEALTHY, as I12 says).
+  - A power-cycle request stops them after its ledger write, before the cycle fires. A request that
+    certainly did not launch restores them under the same fitness rule; one that launched or timed out
+    leaves them owed.
+  - The operator reset, ladder rungs, glx_reset and every other tt-smi reset keep I12's quiesce.
+  - A stop is verified: for each unit found running whose stop returned 0, `systemctl is-active` is
+    read until the unit is no longer running, for at most `POLLER_STOP_VERIFY_SEC` (5 s) per unit.
+    A unit still running, or whose stop failed or timed out, is logged as a warning with its name and
+    main pid and journaled `poller_stop_unverified`; the check or reset runs anyway (never a hold).
+    No process is killed.
+
+  Not stopped: the broker's own telemetry sampler, which is the dead-chip tripwire (I94) and already
+  skips chip reads while a reset owns the chips (I66); the kernel driver's own firmware-log poller,
+  set by a module parameter that changes only on a module reload; and a BMC's own board-side SMBUS
+  polling, for which no documented control is used.
+
+  Unchanged: only a full health check with fabric over every cabled link that has just passed lifts
+  a hold (I32); the 10-min ladder and its power cycle (I76) keep their timing. Cost: on a host with no
+  listed unit running, a few `systemctl` calls (milliseconds) per check or reset; with one running,
+  its stop and start, bounded at 30 s each per unit as in I12, plus at most 5 s of verify per unit.
 
 ## Interfaces
 
