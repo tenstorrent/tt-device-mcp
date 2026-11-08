@@ -114,9 +114,7 @@ def _recording_quiesce(order: list):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "outcome", ["pass", "fail", "timeout", "skip", "raise", "cancel"]
-)
+@pytest.mark.parametrize("outcome", ["pass", "fail", "timeout", "skip", "raise", "cancel"])
 async def test_the_fabric_check_runs_with_readers_stopped_and_restores_them_on_every_exit(monkeypatch, outcome):
     order: list = []
     monkeypatch.setattr(srv._recovery_deps, "quiesce_readers", _recording_quiesce(order))

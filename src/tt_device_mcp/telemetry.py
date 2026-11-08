@@ -1864,9 +1864,7 @@ class CheckAerWatch:
             if attached:
                 # Fenced after the stop (04 I112): the sampler's own reads stay off the chips under the port that
                 # counted until a probe read answers, the chip is contained or a reset step ends (I97).
-                self._sampler._fence(
-                    attached, f"AER on their path during the broker's check ({reason})", unread=True
-                )
+                self._sampler._fence(attached, f"AER on their path during the broker's check ({reason})", unread=True)
             if attached and not offbus:
                 self.pending_stop = {
                     "chips": attached,
