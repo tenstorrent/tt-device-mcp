@@ -6845,7 +6845,16 @@ def _pollers_unfit_reason() -> Optional[str]:
         debt = _post_reset_debt()
     except Exception:  # noqa: BLE001 - an unreadable debt never keeps the pollers off a HEALTHY device
         debt = ""
-    return f"fabric unverified since {debt}" if debt else None
+    if debt:
+        return f"fabric unverified since {debt}"
+    from tt_device_mcp.health.monitors import pci as _pci
+
+    try:
+        off = _pci.chips_off_bus()
+    except Exception:  # noqa: BLE001 - an unreadable config space never keeps the pollers off
+        off = []
+    # A poller never starts over a chip off the bus (spec 04 I112): config reads only, no MMIO.
+    return f"chip(s) {', '.join(off)} read all-ones vendor ID" if off else None
 
 
 def _pollers_restore_record() -> set[str]:

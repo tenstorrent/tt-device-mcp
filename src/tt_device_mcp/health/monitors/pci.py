@@ -364,6 +364,29 @@ def config_vendor_id(bdf: str) -> Optional[int]:
     return int.from_bytes(raw, "little") if len(raw) == 2 else None
 
 
+def chips_off_bus() -> list:
+    """Chip indices whose config vendor ID reads all-ones (0xFFFF), the answer of a function off the bus (spec 04
+    I112). One 2-byte config read per chip, never an MMIO read: the root port answers it for a dead endpoint, so it is
+    safe where a BAR read would stall a core. Taken once before a fabric check and before the pollers start, so neither
+    touches such a chip. A chip whose address or config cannot be read is not counted here."""
+    dead = []
+    try:
+        entries = sorted(SYSFS_CLASS_DIR.iterdir())
+    except OSError:
+        return dead
+    for ent in entries:
+        idx = ent.name.rsplit("!", 1)[-1]
+        if not idx.isdigit():
+            continue
+        try:
+            bdf = (ent / "device").resolve().name
+        except OSError:
+            continue
+        if _BDF.match(bdf) and config_vendor_id(bdf) == 0xFFFF:
+            dead.append(idx)
+    return sorted(dead, key=int)
+
+
 def link_active(bdf: str) -> Optional[bool]:
     """Data Link Layer Link Active (PCIe Link Status bit 13) of the port ``bdf``, or None when it cannot be read (spec
     03 I96). Meant for a chip's root port, never the chip: config reads of the port's own capability list."""

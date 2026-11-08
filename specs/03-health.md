@@ -1736,7 +1736,9 @@ cooldown (spec 04 I65) holds longer.
   counters, sysfs only) every `LINK_WATCH_SEC` on a dedicated thread, never on the event loop, so
   an event loop stalled on journal I/O cannot delay it. An AER burst, a rise of `AER_STOP_COUNT`
   (4) counted errors on one function of any chip's path within `AER_STOP_WINDOW_SEC` (2 s), stops
-  the readers' process groups within one `LINK_WATCH_SEC`. The window keeps the reads up to
+  the readers' process groups within one `LINK_WATCH_SEC`. On a chip's root port, while a broker
+  check reader runs, a rise of `AER_CHECK_ROOT_STOP_COUNT` (1) is enough, and the chips under that
+  port are fenced (I97) right after the stop (spec 04 I112). The window keeps the reads up to
   `AER_STOP_WINDOW_SLACK_SEC` (half a poll) older than 2 s, because each poll also takes its own
   time: the read two polls back stays the baseline, so 4 split over two polls stops the readers,
   and the read three polls back (3 s or more) never does. The stop itself: SIGSTOP each group, mark each run no
