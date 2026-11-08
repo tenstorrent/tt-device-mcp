@@ -110,8 +110,14 @@ gets through anyway.
   production never runs, and the more dangerous one on real silicon. The exception reads the
   broker's own constant rather than a literal, so it cannot drift wider than the set the broker
   actually manages; notably it excludes `tt-device-broker.service`, which a test stopping would
-  pull the host out from under itself. Read-only queries (scope liveness) pass either way,
-  because gate paths genuinely need them, except on the broker's own job and exec units (I10).
+  pull the host out from under itself. Read-only queries (scope liveness) are not refused,
+  because gate paths genuinely need them. Outside the `device` marker none reaches the host's
+  own `systemctl`: each is answered by I10's stand-in (prints nothing, exits 3, so every unit
+  reads inactive), whatever the unit. A unit test reads no host service state, and on a host
+  whose PATH wraps `systemctl` (a test harness's shim) a suite of such reads becomes a process
+  storm. A test opts in by running its own: a fake `systemctl` written under pytest's basetemp
+  (its `tmp_path`) runs as written, and a test that replaces the runner never reaches the seam.
+  Under the marker a read runs, except on the broker's own job and exec units (I10).
 - **I3** — A test that needs a forbidden command MUST stub the function that composes the
   argv and assert on the argv itself — never on a mocked spawn. The established seams:
   `Recovery.reset_argv` (`health/recovery/__init__.py`), `systemd_run_prefix` (`privsep.py`), and the
@@ -510,6 +516,7 @@ own claims that are pinned:
 | I10 (a live host job scope reads as none through the real queries, sync and asyncio) | `tests/test_host_job_units.py::test_a_live_host_job_scope_reads_as_none_through_the_real_queries`, `::test_a_live_host_job_scope_reads_as_none_through_asyncio`, `::test_a_glob_over_job_scopes_counts_as_naming_them` |
 | I10 (a test's kill never takes the host scope path) | `tests/test_host_job_units.py::test_killing_a_tests_job_never_takes_the_host_scope_path` |
 | I10 (an action on a broker unit is refused, marker or not) | `tests/test_host_job_units.py::test_an_action_on_a_broker_unit_is_refused_marker_or_not` |
+| I2 (outside the marker no test runs the host's `systemctl`, sync or asyncio; a fake under `tmp_path` runs) | `tests/test_host_job_units.py::test_an_unmarked_test_never_runs_the_hosts_systemctl`, `::test_an_unmarked_test_never_runs_the_hosts_systemctl_through_asyncio`, `::test_the_stand_in_answers_for_units_that_are_not_the_brokers` |
 | I8 (an unmarked test keeps its seals) | `tests/test_device_marker.py::test_this_test_is_not_device_marked` |
 | I8 (real silicon: topology, probes, `/proc` identity, reclaim, warm reset) | every test in `tests/test_device_hardware.py` |
 | Spec anchors resolve (a renamed or deleted test cannot leave a table asserting coverage) | `tests/test_spec_anchors.py::test_every_spec_anchor_names_a_test_that_exists`, `tests/test_spec_anchors.py::test_every_anchor_points_at_a_test_file_that_exists` |

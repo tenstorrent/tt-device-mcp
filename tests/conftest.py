@@ -963,9 +963,17 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
         raising=False,
     )
 
-    _install_spawn_tripwire(monkeypatch, allow_device_spawns=device_marked)
+    _install_spawn_tripwire(monkeypatch, allow_device_spawns=device_marked, test_root=isolation_tmp_root.parent)
+    if not device_marked:
+        # Reader quiesce (spec 04 I112) spawns `systemctl` only for a unit the host has installed. Here none is, so a
+        # fabric check or reset starts no process for it; a test opts in by putting its own `systemctl` runner in
+        # place (asyncio.create_subprocess_exec), and every configured unit then counts as installed.
+        guarded = asyncio.create_subprocess_exec
+        monkeypatch.setattr(srv, "_poller_unit_installed", lambda svc: asyncio.create_subprocess_exec is not guarded)
 
 
+# The real installed-unit lookup the fixture above swaps out (spec 04 I112).
+REAL_POLLER_UNIT_INSTALLED = srv._poller_unit_installed
 # The tracked snapshot runner the fixture above swaps out (spec 03 I86).
 REAL_RUN_SNAPSHOT = getattr(HealthMonitor, "_run_snapshot", None)
 
@@ -1067,7 +1075,15 @@ def _spawn_is_forbidden(argv, allow_device_spawns: bool = False) -> "str | None"
     return None
 
 
-def _install_spawn_tripwire(monkeypatch, allow_device_spawns: bool = False):
+def _systemctl_path(argv, env) -> "str | None":
+    """The `systemctl` file this spawn would run (its PATH lookup), or None when it names none or none is found."""
+    for tok in _argv_parts(argv):
+        if os.path.basename(tok) == "systemctl":
+            return tok if os.sep in tok else shutil.which(tok, path=(env or os.environ).get("PATH"))
+    return None
+
+
+def _install_spawn_tripwire(monkeypatch, allow_device_spawns: bool = False, test_root=None):
     """Refuse, loudly, any spawn that would reach real hardware or host services.
 
     The seam is the process-spawn layer rather than each caller, because the callers are spread across the gate, the
@@ -1081,7 +1097,21 @@ def _install_spawn_tripwire(monkeypatch, allow_device_spawns: bool = False):
     not: it runs a stand-in that prints nothing and exits 3 (systemctl's "inactive"), so every caller reads no such unit
     live and never the host broker's. A test that means a live scope stubs the query (`srv._scope_active`,
     `srv.list_active_job_scopes`) or `subprocess.run` itself. asyncio's subprocess transport spawns through Popen, so it
-    is answered the same way."""
+    is answered the same way.
+
+    Outside the device marker every other `systemctl` the host has is answered by that stand-in too: a unit test reads
+    no host service state, and on a host whose PATH wraps `systemctl` (a test harness's shim) a suite of such reads is a
+    process storm. A test opts in by running its own: a fake `systemctl` written under `test_root` (pytest's basetemp,
+    which holds every `tmp_path`) runs as written, and a test that replaces the runner never reaches this layer."""
+    test_root = os.path.realpath(test_root) if test_root is not None else None
+
+    def _stand_in(args, k) -> bool:
+        if _is_broker_unit_query(args):
+            return True
+        path = None if allow_device_spawns else _systemctl_path(args, k.get("env"))
+        if path is None:
+            return False
+        return test_root is None or os.path.commonpath([os.path.realpath(path), test_root]) != test_root
 
     def _refuse(argv, kind):
         reason = _spawn_is_forbidden(argv, allow_device_spawns)
@@ -1096,7 +1126,7 @@ def _install_spawn_tripwire(monkeypatch, allow_device_spawns: bool = False):
 
     def guarded_popen_init(self, args, *a, **k):
         _refuse(args, "subprocess.Popen")
-        if _is_broker_unit_query(args):
+        if _stand_in(args, k):
             k.pop("executable", None)
             a = a[:1] + (None,) + a[2:] if len(a) >= 2 else a
             args = "exit 3" if k.get("shell") else ["/bin/sh", "-c", "exit 3"]
