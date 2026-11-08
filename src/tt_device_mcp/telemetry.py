@@ -1061,10 +1061,11 @@ class TelemetrySampler:
         return chip_state.chip_nodes(ids)
 
     @classmethod
-    def _fence(cls, ids, reason: str) -> None:
-        """Spec 03 I97: fence ``ids``; a failure to fence never stops the containment or the sample."""
+    def _fence(cls, ids, reason: str, *, unread: bool = False) -> None:
+        """Spec 03 I97: fence ``ids``; a failure to fence never stops the containment or the sample.
+        ``unread``: fenced on a suspicion, not an all-ones read (:func:`chip_state.fence`)."""
         try:
-            chip_state.fence(ids, reason, cls._nodes(ids))
+            chip_state.fence(ids, reason, cls._nodes(ids), unread=unread)
         except Exception:  # noqa: BLE001
             pass
 
@@ -1916,7 +1917,9 @@ class CheckAerWatch:
             if attached:
                 # Fenced after the stop (04 I112): the sampler's own reads stay off the chips under the port that
                 # counted until a probe read answers, the chip is contained or a reset step ends (I97).
-                self._sampler._fence(attached, f"AER on their path during the broker's check ({reason})")
+                self._sampler._fence(
+                    attached, f"AER on their path during the broker's check ({reason})", unread=True
+                )
             if attached and not offbus:
                 self.pending_stop = {
                     "chips": attached,

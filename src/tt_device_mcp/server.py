@@ -6974,7 +6974,10 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
             # Running, and its stop failed or is still running (systemd finishes it): the inline
             # restore may be skipped when no stop returned 0, so the next close to HEALTHY starts it.
             _owe_device_pollers(f"{svc} stop did not complete")
-            unstopped[svc] = await _poller_still_running(svc) or "?"
+            # Only a unit still running is named: one that reads inactive by now is stopped, no warning.
+            pid = await _poller_still_running(svc)
+            if pid is not None:
+                unstopped[svc] = pid
     if touched:
         log(f"{'restarted' if active else 'stopped'} device pollers: {', '.join(touched)}")
     if active:
