@@ -4221,6 +4221,8 @@ async def test_a_failed_quick_check_after_a_clean_software_exit_ends_as_a_forced
     assert skipped == forced, f"{failed}: a clean exit with a failed quick check ended {skipped}, a forced pass {forced}"
     if failed == "eth-no-verdict":
         assert skipped[0] == 1, "an eth read with no verdict let the mesh through without the traffic pass"
+    elif failed == "snapshot":
+        assert skipped[1] == 1, "a failed snapshot after a clean exit released the mesh without the reset and its check"
     else:
         assert skipped[2] is not ServerState.HEALTHY, f"{failed}: released a mesh a quick check failed"
 
