@@ -30,7 +30,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from tt_device_mcp.health.monitors.subproc import Terminate, Track, run_probe
+from tt_device_mcp.health.monitors.subproc import Abort, Terminate, Track, run_probe
 
 # The validator's own throw when generate_link_metrics finds a bad link under --hard-fail. This
 # is the ONE place a board reset can act on: every other non-zero exit means the validator never
@@ -443,6 +443,7 @@ async def check(
     track: Track,
     terminate: Terminate,
     cwd: Optional[str] = None,
+    abort: Optional[Abort] = None,
 ) -> tuple[Optional[int], str]:
     """Run an already-built fabric command (see ``build_command()``) and return ``(rc, output)``.
 
@@ -463,6 +464,14 @@ async def check(
     ``os.environ`` and the broker's own process may already have that variable set.
     """
     rc, raw = await run_probe(
-        argv, timeout_sec=timeout_sec, track=track, stream=True, env=env, cwd=cwd, terminate=terminate, name="fabric"
+        argv,
+        timeout_sec=timeout_sec,
+        track=track,
+        stream=True,
+        env=env,
+        cwd=cwd,
+        terminate=terminate,
+        name="fabric",
+        abort=abort,
     )
     return rc, raw.decode("utf-8", "replace").strip()

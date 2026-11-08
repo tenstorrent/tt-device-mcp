@@ -1213,7 +1213,7 @@ _recovery_deps = RecoveryDeps(
     write_action_log=lambda *a, **k: write_action_log(*a, **k),
     device_hold_episode_since=lambda: device_hold_episode_since,
     auto_power_cycle_enabled=lambda: _auto_power_cycle_enabled(),
-    terminate_process_group=lambda pid: _terminate_process_group(pid),
+    terminate_process_group=lambda pid: _terminate_check_reader(pid),
     logger=lambda: logger,
     present_chip_indices=lambda: _present_chip_indices(),
     enumerate_device_holders=lambda: enumerate_device_holders(),
@@ -3425,6 +3425,30 @@ async def _terminate_process_group(pid: int, grace_sec: float = GRACEFUL_KILL_GR
     except (ProcessLookupError, OSError):
         return f"{step} (gone before SIGKILL)"
     return "SIGKILL"
+
+
+async def _terminate_check_reader(pid: int) -> str:
+    """End a broker check's timed-out process group, honouring the dead-chip valve (spec 03 I84, spec 04 I114).
+
+    While the PCI-wedged latch is set, or a live member of the group is a holder the valve refused to kill,
+    the group is stopped (SIGSTOP), never signalled to exit: a stop issues no reads and closes no fd, and the
+    power cycle the hold bound requests ends it. Anything else gets the usual SIGINT/SIGTERM/SIGKILL ladder."""
+    why = ""
+    if PCI_WRITER.latched:
+        why = "PCI-wedged"
+    else:
+        members = [pid, *_pgid_pids(pid)]
+        if any(m in _kill_refused_pids and _read_proc_starttime(m) == _kill_refused_pids[m] for m in members):
+            why = "the dead-chip valve refused to kill it"
+    if not why:
+        return await _terminate_process_group(pid)
+    try:
+        os.killpg(pid, signal.SIGSTOP)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    if logger:
+        logger.warning(f"check process group {pid} left stopped, not killed ({why}); the power cycle ends it")
+    return f"SIGSTOP (kill refused: {why})"
 
 
 def _pgid_pids(pgid: int) -> list[int]:

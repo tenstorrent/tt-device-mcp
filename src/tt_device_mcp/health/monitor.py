@@ -37,6 +37,7 @@ from tt_device_mcp.health import chip_state, pcie_quiet
 from tt_device_mcp.health.core import HealthState, Observation, Verdict
 from tt_device_mcp.health.evidence import capture_incident, health_dir, health_event
 from tt_device_mcp.health.monitors import eth, fabric, hostpci, pci
+from tt_device_mcp.health.pci_writer import PCI_WRITER
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.shutdown import CheckInterruptedByShutdown, interrupted_by_shutdown
 
@@ -1231,6 +1232,17 @@ class HealthMonitor:
 
     async def _verify_fabric_health_body(self, timeout_sec: float) -> tuple[Optional[bool], str]:
         self._fabric_killed = ""
+        # Spec 04 I114: a PCI-wedged latch set while this pass runs ends it at once, no verdict. Only the
+        # power cycle recovers the mesh, and it waits on the device op this check holds. A latch already
+        # set at the start does not: a pass then is what may clear it.
+        latched_at = PCI_WRITER.latched_at
+        wedged = {"why": ""}
+
+        def _abort() -> str:
+            if PCI_WRITER.latched and PCI_WRITER.latched_at != latched_at:
+                wedged["why"] = wedged["why"] or f"PCI-wedged during the check: {PCI_WRITER.reason}"
+            return wedged["why"]
+
         override = self._fabric_check_cmd()
         built = fabric.build_command()
         if built is None:
@@ -1265,12 +1277,18 @@ class HealthMonitor:
             # This chip-to-bus map already mismatched the descriptor: that run would only throw the
             # same mismatch again, so go straight to the traffic-only rerun (I45).
             rc, text, ok, reason = await self._fabric_traffic_only_rerun(
-                desc, "", timeout_sec=timeout_sec, track=_track, cwd=cwd, marker=cached
+                desc, "", timeout_sec=timeout_sec, track=_track, cwd=cwd, marker=cached, abort=_abort
             )
         else:
             try:
                 rc, text = await fabric.check(
-                    argv, env, timeout_sec=timeout_sec, track=_track, terminate=self._terminate_process_group, cwd=cwd
+                    argv,
+                    env,
+                    timeout_sec=timeout_sec,
+                    track=_track,
+                    terminate=self._terminate_process_group,
+                    cwd=cwd,
+                    abort=_abort,
                 )
             except Exception as e:  # noqa: BLE001 - configured but could not spawn; never raise into the gate
                 self._journal_skip_once("fabric_check_unavailable", "not_runnable", detail=str(e)[:400])
@@ -1281,6 +1299,8 @@ class HealthMonitor:
         # the journal carries truncates exactly the part naming them.
         self.last_fabric_output = text
         self.last_fabric_output_at = _t0
+        if wedged["why"]:
+            return self._fabric_wedged_no_verdict(cmd, text, dt, wedged["why"])
         if self._fabric_killed:
             return self._fabric_killed_no_verdict(cmd, rc, text, dt)
         last = text.splitlines()[-1][:200] if text else "(no output)"
@@ -1298,10 +1318,12 @@ class HealthMonitor:
             ok, reason = fabric.classify(rc, text)
             if ok is None and desc and fabric.is_topology_mismatch(text):
                 rc, text, ok, reason = await self._fabric_traffic_only_rerun(
-                    desc, text, timeout_sec=timeout_sec, track=_track, cwd=cwd
+                    desc, text, timeout_sec=timeout_sec, track=_track, cwd=cwd, abort=_abort
                 )
                 self.last_fabric_output = text
                 self.last_fabric_output_at = _t0
+        if wedged["why"]:
+            return self._fabric_wedged_no_verdict(cmd, text, (datetime.now() - _t0).total_seconds(), wedged["why"])
         if self._fabric_killed:
             # Read again after the traffic-only rerun (I45): a kill there is no verdict either (I82),
             # never a link fault or a missing-cable verdict (I47) from whatever the killed run printed.
@@ -1409,6 +1431,22 @@ class HealthMonitor:
             log.warning(f"FABRIC-CHECK {detail}")
         return None, detail
 
+    def _fabric_wedged_no_verdict(self, cmd: str, text: str, dt: float, why: str) -> tuple[None, str]:
+        """A pass a PCI-wedged latch ended (spec 04 I114): no verdict, never a pass or a link fault. Its readers are left
+        SIGSTOPped, never killed: a chip under them may be off the bus and still attached (spec 03 I84), and the power
+        cycle ends them."""
+        self._fabric_killed = ""
+        self._write_action_log("[broker]fabric-check", cmd, dt, "stopped", None, output=_action_log_output(text))
+        self.last_fabric_ok = None
+        self.last_fabric_skipped = False
+        FABRIC_DEBT.note_fabric_killed(f"fabric check stopped ({why})")
+        detail = f"fabric check stopped after {dt:.0f}s: {why}; no verdict, the power cycle is next"
+        health_event("fabric_check_no_verdict", cause="pci_wedged", reason=why[:400])
+        log = self._logger()
+        if log:
+            log.warning(f"FABRIC-CHECK {detail}")
+        return None, detail
+
     async def _keep_skip_output(self, rc: int, text: str, reason: str, cmd: str) -> Optional[str]:
         """Freeze a no-verdict fabric run's exit code and output tail (``FABRIC_SKIP_OUTPUT_TAIL_BYTES``)
         in an incident bundle; return its path, or ``None`` when it could not be written. A run with
@@ -1438,6 +1476,7 @@ class HealthMonitor:
         track,
         cwd: Optional[str],
         marker: Optional[str] = None,
+        abort=None,
     ) -> tuple[Optional[int], str, Optional[bool], str]:
         """The validator stopped on its descriptor comparison: rerun it once without the descriptor
         so traffic still crosses every link it discovered. Same verdict table as the first run; a
@@ -1469,6 +1508,7 @@ class HealthMonitor:
                 track=track,
                 terminate=self._terminate_process_group,
                 cwd=cwd,
+                abort=abort,
             )
         except Exception as e:  # noqa: BLE001 - never raise into the gate
             return None, first, None, no_verdict(f"traffic-only rerun not runnable: {e}")

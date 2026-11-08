@@ -1237,7 +1237,7 @@ def health_deps():
         glx_board_types_provider=lambda: srv.health_monitor._glx_board_types(),
         chip_buses_provider=lambda: srv.health_monitor._chip_buses,
         journal_skip_once=lambda kind, reason, **f: srv.health_monitor._journal_skip_once(kind, reason, **f),
-        terminate_process_group=lambda pid: srv._terminate_process_group(pid),
+        terminate_process_group=lambda pid: srv._terminate_check_reader(pid),
         logger=lambda: srv.logger,
         present_chip_indices=lambda: srv._present_chip_indices(),
         enumerate_device_holders=lambda: srv.enumerate_device_holders(),

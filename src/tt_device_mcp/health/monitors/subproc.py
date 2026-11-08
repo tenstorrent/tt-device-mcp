@@ -25,6 +25,11 @@ from tt_device_mcp.health.shutdown import SIGNAL_RCS, interrupted_by_shutdown
 
 Track = Callable[[Optional["asyncio.subprocess.Process"]], None]
 Terminate = Callable[[int], Awaitable[None]]
+# Returns why the caller stopped waiting on the probe, or "" to keep waiting.
+Abort = Callable[[], str]
+
+# How often the wait reads ``abort``: a flag read, no I/O.
+ABORT_POLL_SEC = 0.5
 
 
 async def _killpg(pid: int) -> None:
@@ -35,6 +40,44 @@ async def _killpg(pid: int) -> None:
         os.killpg(pid, signal.SIGKILL)
     except (ProcessLookupError, OSError):
         pass  # already gone
+
+
+def _stop_group(pid: int) -> None:
+    """SIGSTOP the probe's group: it reads nothing more and closes no fd."""
+    try:
+        os.killpg(pid, signal.SIGSTOP)
+    except (ProcessLookupError, OSError):
+        pass
+
+
+async def _wait_or_abort(aw: Awaitable, abort: Optional[Abort], timeout: Optional[float] = None):
+    """Await ``aw`` (bounded by ``timeout`` when given) until it ends or ``abort`` gives a reason.
+    Returns ``(reason, result)``: ``reason`` "" when ``aw`` ended. Raises what ``aw`` raises."""
+    bounded = aio.wait_for(aw, timeout=timeout) if timeout is not None else aw
+    if abort is None:
+        return "", await bounded
+    main = asyncio.ensure_future(bounded)
+
+    async def _watch() -> str:
+        while True:
+            why = abort()
+            if why:
+                return why
+            await asyncio.sleep(ABORT_POLL_SEC)
+
+    watch = asyncio.ensure_future(_watch())
+    try:
+        await asyncio.wait({main, watch}, return_when=asyncio.FIRST_COMPLETED)
+        if main.done():
+            return "", main.result()
+        main.cancel()
+        await asyncio.gather(main, return_exceptions=True)
+        return watch.result(), None
+    finally:
+        for t in (main, watch):
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(main, watch, return_exceptions=True)
 
 
 async def run_probe(
@@ -48,6 +91,7 @@ async def run_probe(
     terminate: Terminate = _killpg,
     reap_sec: float = 0.0,
     name: str = "",
+    abort: Optional[Abort] = None,
 ) -> tuple[Optional[int], bytes]:
     """Run ``argv`` to completion or to ``timeout_sec``, whichever comes first.
 
@@ -69,7 +113,12 @@ async def run_probe(
 
     A probe that ends by SIGTERM/SIGKILL while the host or the broker is shutting down raises
     ``shutdown.CheckInterruptedByShutdown`` (``name`` labels it, else ``argv[0]``): the shutdown killed it, it measured
-    nothing, and no caller may count it (spec 03 I63)."""
+    nothing, and no caller may count it (spec 03 I63).
+
+    ``abort`` (polled every :data:`ABORT_POLL_SEC`) ends the wait early, also inside the timeout path's wait and
+    ``terminate``: the group is SIGSTOPped, never killed, and ``(None, output)`` returns at once. The caller reads
+    ``abort`` again to tell it from a timeout (spec 04 I114: PCI-wedged, no fd of a reader may close before the power
+    cycle)."""
     proc: Optional[asyncio.subprocess.Process] = None
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -91,12 +140,16 @@ async def run_probe(
                 async for line in proc.stdout:
                     chunks.append(line)
 
-            await aio.wait_for(_drain(), timeout=timeout_sec)
-            await proc.wait()
+            why, _ = await _wait_or_abort(_drain(), abort, timeout_sec)
+            if not why:
+                why, _ = await _wait_or_abort(proc.wait(), abort)
         else:
-            out, _ = await aio.wait_for(proc.communicate(), timeout=timeout_sec)
-            if out:
-                chunks.append(out)
+            why, res = await _wait_or_abort(proc.communicate(), abort, timeout_sec)
+            if res and res[0]:
+                chunks.append(res[0])
+        if why:
+            _stop_group(proc.pid)
+            return None, b"".join(chunks)
         if proc.returncode in SIGNAL_RCS:
             interrupted = await asyncio.to_thread(
                 interrupted_by_shutdown, name or os.path.basename(argv[0]), proc.returncode
@@ -108,11 +161,15 @@ async def run_probe(
         if proc is not None:
             # A reader an AER stop left SIGSTOPped while a chip it may read is attached is not killed
             # on its own timeout until the stop is settled, at most to the hold's bound (spec 03 I92).
-            await chip_state.await_reader_release(proc.pid)
-            try:
-                await terminate(proc.pid)
-            except (ProcessLookupError, OSError):
-                pass
+            why, _ = await _wait_or_abort(chip_state.await_reader_release(proc.pid), abort)
+            if not why:
+                try:
+                    why, _ = await _wait_or_abort(terminate(proc.pid), abort)
+                except (ProcessLookupError, OSError):
+                    pass
+            if why:
+                _stop_group(proc.pid)
+                return None, b"".join(chunks)
             if reap_sec > 0:
                 try:
                     await aio.wait_for(proc.wait(), timeout=reap_sec)
