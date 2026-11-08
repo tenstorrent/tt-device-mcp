@@ -42,7 +42,7 @@ def host_broker(tmp_path, monkeypatch):
 
 
 def test_the_stand_in_answers_for_units_that_are_not_the_brokers(host_broker):
-    """The control: the fake host is reachable, so the reads below are answered by the guard."""
+    """The control: a fake under the test's own tmp_path runs as written (the test opted in by writing it)."""
     run = subprocess.run(["systemctl", "is-active", "tt-device-broker"], capture_output=True, text=True)
     assert run.returncode == 0
     assert host_broker.read_text().strip() == "is-active tt-device-broker"
@@ -94,3 +94,38 @@ def test_a_glob_over_job_scopes_counts_as_naming_them(host_broker):
     run = subprocess.run(["systemctl", "list-units", "--no-legend", "*.scope"], capture_output=True, text=True)
     assert run.stdout == ""
     assert not host_broker.exists()
+
+
+@pytest.fixture
+def host_systemctl(monkeypatch):
+    """A logging `systemctl` first on PATH, outside pytest's basetemp: the host's own, as a harness shim is."""
+    import shutil
+    import tempfile
+
+    d = tempfile.mkdtemp(prefix="host-systemctl-")
+    calls = os.path.join(d, "calls")
+    fake = os.path.join(d, "systemctl")
+    with open(fake, "w") as f:
+        f.write(f'#!/bin/sh\necho "$*" >> "{calls}"\necho active\nexit 0\n')
+    os.chmod(fake, 0o755)
+    monkeypatch.setenv("PATH", f"{d}{os.pathsep}{os.environ.get('PATH', '')}")
+    yield calls
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def test_an_unmarked_test_never_runs_the_hosts_systemctl(host_systemctl):
+    """Any unit, any verb: outside the device marker the host's systemctl is answered by the stand-in (inactive)."""
+    for argv in (["systemctl", "is-active", "tt-telemetry.service"], ["systemctl", "is-system-running"]):
+        run = subprocess.run(argv, capture_output=True, text=True)
+        assert (run.returncode, run.stdout) == (3, "")
+    assert not os.path.exists(host_systemctl)
+
+
+@pytest.mark.asyncio
+async def test_an_unmarked_test_never_runs_the_hosts_systemctl_through_asyncio(host_systemctl):
+    proc = await asyncio.create_subprocess_exec(
+        "systemctl", "show", "-p", "MainPID", "--value", "tt-telemetry.service", stdout=subprocess.PIPE
+    )
+    out, _ = await proc.communicate()
+    assert (proc.returncode, out) == (3, b"")
+    assert not os.path.exists(host_systemctl)

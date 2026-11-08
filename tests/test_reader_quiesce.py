@@ -195,6 +195,131 @@ async def test_an_unstoppable_reader_never_blocks_the_fabric_check(monkeypatch):
     assert ran == [True]
 
 
+# --- only installed readers cost a process --------------------------------------------------------
+
+
+def _counting_exec(spawned: list):
+    async def _exec(*argv, **kw):
+        spawned.append(argv)
+        raise AssertionError(f"spawned {argv}")
+
+    return _exec
+
+
+@pytest.mark.asyncio
+async def test_a_fabric_check_with_no_reader_installed_starts_no_process(monkeypatch, tmp_path):
+    """The host lists none of the readers: the real lookup (a stat) skips each, so the quiesce spawns nothing."""
+    from tests.conftest import REAL_POLLER_UNIT_INSTALLED
+
+    unit_dir = tmp_path / "system"
+    unit_dir.mkdir()
+    (unit_dir / "sshd.service").write_text("")
+    monkeypatch.setattr(srv, "SYSTEMD_UNIT_DIRS", (str(unit_dir), str(tmp_path / "absent")))
+    monkeypatch.setattr(srv, "_poller_unit_installed", REAL_POLLER_UNIT_INSTALLED)
+    monkeypatch.setattr(srv._recovery_deps, "quiesce_readers", lambda what, log: srv._pollers_quiesced_for(what, log))
+    monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: None)
+    spawned: list = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _counting_exec(spawned))
+    ran: list = []
+
+    async def body(timeout_sec):
+        ran.append(True)
+        return True, "ok"
+
+    monkeypatch.setattr(srv.health_monitor, "_verify_fabric_health_body", body)
+    assert (await srv.health_monitor.verify_fabric_health(1))[0] is True
+    assert ran == [True]
+    assert spawned == []
+    # Still flagged: none of the configured readers was there to stop (the bus may not be quiet).
+    assert [e["configured"] for e in health.read_health_events(kinds={"pollers_none_active"})] == [
+        list(srv.DEVICE_POLLER_SERVICES)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_only_the_installed_reader_is_asked_of_systemd(monkeypatch, tmp_path):
+    from tests.conftest import REAL_POLLER_UNIT_INSTALLED
+
+    unit_dir = tmp_path / "lib"
+    unit_dir.mkdir()
+    (unit_dir / EXPORTER).write_text("")
+    monkeypatch.setattr(srv, "SYSTEMD_UNIT_DIRS", (str(tmp_path / "etc"), str(unit_dir)))
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service", EXPORTER))
+    calls: list = []
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _systemctl_with_units({EXPORTER}, calls))
+    monkeypatch.setattr(srv, "_poller_unit_installed", REAL_POLLER_UNIT_INSTALLED)
+
+    assert await srv._set_device_pollers(False, lambda m: None) == [EXPORTER]
+    assert calls == [("is-active", EXPORTER), ("stop", EXPORTER), ("is-active", EXPORTER)]
+    calls.clear()
+    assert await srv._set_device_pollers(True, lambda m: None) == [EXPORTER]
+    assert calls == [("start", EXPORTER)]
+
+
+@pytest.mark.parametrize(
+    "layout, unit, installed",
+    [
+        ({"etc": ["tt-telemetry.service"]}, "tt-telemetry.service", True),
+        ({"lib": ["tt-telemetry.service"]}, "tt-telemetry.service", True),
+        ({"etc": ["other.service"]}, "tt-telemetry.service", False),
+        ({"lib": ["reader@.service"]}, "reader@chip0.service", True),
+        ({}, "tt-telemetry.service", True),  # no unit folder at all: never skipped on a guess
+    ],
+)
+def test_the_installed_lookup_reads_unit_files_only(monkeypatch, tmp_path, layout, unit, installed):
+    from tests.conftest import REAL_POLLER_UNIT_INSTALLED
+
+    dirs = []
+    for name in ("etc", "lib"):
+        d = tmp_path / name
+        dirs.append(str(d))
+        if name in layout:
+            d.mkdir()
+            for f in layout[name]:
+                (d / f).write_text("")
+    monkeypatch.setattr(srv, "SYSTEMD_UNIT_DIRS", tuple(dirs))
+    assert REAL_POLLER_UNIT_INSTALLED(unit) is installed
+
+
+def test_a_masked_reader_counts_as_installed(monkeypatch, tmp_path):
+    """A mask is a symlink to /dev/null: its state is read (inactive), never guessed away."""
+    from tests.conftest import REAL_POLLER_UNIT_INSTALLED
+
+    (tmp_path / "tt-telemetry.service").symlink_to("/dev/null")
+    monkeypatch.setattr(srv, "SYSTEMD_UNIT_DIRS", (str(tmp_path),))
+    assert REAL_POLLER_UNIT_INSTALLED("tt-telemetry.service") is True
+
+
+def test_the_suite_starts_no_reader_systemctl_unless_a_test_brings_its_runner():
+    """The suite floor: with the spawn tripwire's runner in place no reader unit counts as installed."""
+    assert srv._poller_unit_installed("tt-telemetry.service") is False
+    assert srv._poller_unit_installed(EXPORTER) is False
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_state_read_is_killed(monkeypatch):
+    """The verify's `systemctl is-active` read is bounded, and one past its bound is not left running."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", (EXPORTER,))
+    killed: list = []
+
+    class _Hung:
+        returncode = None
+
+        async def communicate(self):
+            await asyncio.sleep(10)
+
+        def kill(self):
+            killed.append(True)
+
+    async def _exec(*argv, **kw):
+        return _Hung()
+
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _exec)
+    _short_poller_bound(monkeypatch, 0.05)
+    assert await srv._poller_still_running(EXPORTER) == "?"
+    assert len(killed) == 2, "the is-active read and the MainPID read"
+
+
 # --- the bridge reset (also the last-chance sweep) ----------------------------------------------
 
 
