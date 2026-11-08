@@ -11,6 +11,8 @@ bound step is the host rung, not another ladder. No test reaches a real reset or
 
 import dataclasses
 import json
+import os
+import signal
 import time
 from datetime import datetime, timedelta
 
@@ -1112,3 +1114,181 @@ async def test_a_slow_real_startup_gate_after_a_failed_readopted_job_goes_to_the
     monkeypatch.setattr(srv, "_post_reset_debt", lambda: "")
     await srv._device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
     assert not srv.device_hold_logged and srv.fsm.state is ServerState.HEALTHY
+
+
+# Spec 04 I82: the first job after a verified release, stopped by its owner (kill, cancel or preempt) with clean device
+# evidence, proves nothing about the release. The kill-reset hold after it starts its own clock.
+from tests.test_job_kill_reset import _runner_done, _start, _stop, _until, runner_env  # noqa: E402, F401
+
+_OLD_HOLD_SEC = BOUND - 20  # released before its bound, so no bound ladder ran
+
+
+def _verified_carry(monkeypatch, tmp_path, released_ago=30):
+    """A hold of ``_OLD_HOLD_SEC`` released ``released_ago`` s ago on a full check whose fabric pass found every cabled
+    link. Carried on, its clock would be past the bound. Returns its start."""
+    _isolate(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv.health_monitor, "fabric_verdict", lambda: dict(_PASS))
+    since = (datetime.now() - timedelta(seconds=_OLD_HOLD_SEC + released_ago)).isoformat()
+    srv._save_hold_carry(since, _GENERIC_REHOLD)
+    srv._hold_carry["released"] = time.time() - released_ago
+    srv._write_hold_carry()
+    assert srv._hold_carry["verified"] is True and srv._hold_carry["ladder_age"] is None
+    return since
+
+
+async def _first_job_stopped(how, job_id="494", command="sleep 600"):
+    """Run the first job through the real runner and stop it ``how``: the owner's kill, a preemption, or its own
+    timeout. Returns the job once the runner has booked its end."""
+    job, runner = await _start(job_id, command, timeout_sec=1 if how == "timeout" else 600)
+    try:
+        assert await _until(lambda: job.status is srv.JobStatus.RUNNING and job.pid)
+        assert srv._hold_carry.get("job_started"), "the first job opened the carry's job window"
+        if how == "kill":
+            mcp = srv.create_mcp_server()
+            await mcp.call_tool("tt_device_job_kill", {"params": {"job_id": job_id, "owner": job.owner}})
+        elif how == "preempt":
+            srv.preempt_forced_job_ids.add(job_id)
+            job.preempt_killed_monotonic = time.monotonic()
+            os.killpg(job.pid, signal.SIGTERM)
+        assert await _until(lambda: _runner_done(job), tries=800)
+    finally:
+        await _stop(runner)
+    return job
+
+
+def _kill_reset_hold(monkeypatch, job_id="494"):
+    """The post-job gate holds the device for the kill's reset and full check."""
+    events = _record_events(monkeypatch)
+    monkeypatch.setattr(srv, "device_hold_logged", False)
+    monkeypatch.setattr(srv, "device_hold_episode_since", "")
+    srv._note_tenant_gate_verdict(f"device unverified: gate/post-job: job {job_id} ended killed (exit 130)")
+    assert srv.device_hold_logged
+    return events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["kill", "preempt"])
+async def test_replay_an_owner_stop_of_the_first_job_after_a_verified_release_starts_a_fresh_episode(
+    runner_env, monkeypatch, tmp_path, how
+):
+    """A Galaxy host: a hold was released on a full check whose fabric pass found every cabled link, no bound ladder
+    run. Its owner killed the next job within the carry window, no fault on record. The kill-reset hold after it must
+    start at its own start, so its fast path (one reset, then the full check) runs, not the old episode's full ladder."""
+    old = _verified_carry(monkeypatch, tmp_path)
+    job = await _first_job_stopped(how)
+    assert job.status in (srv.JobStatus.KILLED, srv.JobStatus.PREEMPTED)
+    assert srv.fsm.record.why == "job_killed"
+    _kill_reset_hold(monkeypatch)
+    assert srv.device_hold_episode_since != old, "a fresh episode"
+    assert _age() < 60, "its clock starts at the kill-reset hold"
+    assert not srv._hold_bound_cycle_due(_age())
+
+
+@pytest.mark.asyncio
+async def test_a_first_job_that_ran_out_its_own_time_keeps_the_episode(runner_env, monkeypatch, tmp_path):
+    """A job's own timeout is no owner stop: a job that hung may have hung on the device, so the hold after it
+    continues the released episode."""
+    old = _verified_carry(monkeypatch, tmp_path)
+    job = await _first_job_stopped("timeout")
+    assert job.status is srv.JobStatus.TIMEOUT
+    _kill_reset_hold(monkeypatch)
+    assert srv.device_hold_episode_since == old and _age() >= BOUND, "the clock keeps the episode start"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["fault in its log", "fault while it ran"])
+async def test_a_killed_first_job_with_device_evidence_against_it_keeps_the_episode(runner_env, monkeypatch, tmp_path, how):
+    """A kill proves nothing only on a clean device: a job whose log names a device fault, or a fault some check found
+    while it ran, failed on the release, so the hold after it continues the released episode."""
+    old = _verified_carry(monkeypatch, tmp_path)
+    if how == "fault in its log":
+        job, runner = await _start("494", "echo 'waiting for active ethernet core'; sleep 600")
+    else:
+        job, runner = await _start("494", "sleep 600")
+    try:
+        assert await _until(lambda: job.status is srv.JobStatus.RUNNING and job.pid)
+        if how == "fault while it ran":
+            srv._mark_device_dirty("heartbeat stalled on chip 3", why="heartbeat_stalled")
+        mcp = srv.create_mcp_server()
+        await mcp.call_tool("tt_device_job_kill", {"params": {"job_id": "494", "owner": job.owner}})
+        assert await _until(lambda: _runner_done(job), tries=800)
+    finally:
+        await _stop(runner)
+    assert not srv._load_hold_carry().get("neutral_end")
+    monkeypatch.setattr(srv, "device_fault_reported", "")  # the hold below may name the kill alone
+    _kill_reset_hold(monkeypatch)
+    assert srv.device_hold_episode_since == old and _age() >= BOUND, "the clock keeps the episode start"
+
+
+async def _neutral_kill_hold(monkeypatch, tmp_path):
+    """The replay up to the kill-reset hold on its own clock. Returns the released episode's start."""
+    old = _verified_carry(monkeypatch, tmp_path)
+    await _first_job_stopped("kill")
+    _kill_reset_hold(monkeypatch)
+    assert srv.device_hold_episode_since != old and _age() < 60
+    return old
+
+
+@pytest.mark.asyncio
+async def test_a_kill_reset_hold_that_turns_into_a_device_fault_takes_the_carry_then_the_power_cycle(
+    runner_env, monkeypatch, tmp_path
+):
+    """The kill-reset hold only defers the carry: once its check finds a device fault, the hold continues the
+    released episode, past the bound here, so the full ladder runs at once and a full check that still fails asks for
+    the power cycle."""
+    old = await _neutral_kill_hold(monkeypatch, tmp_path)
+    own = srv.device_hold_episode_since
+    escalations, _alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why=srv.FABRIC_RELIFT_WHY, detail="post-job: fabric unverified", fabric_output=MISMATCH
+    )
+    srv.device_hold_episode_since = own
+
+    async def recovered_ladder(kind, indices, expected, log, **_):
+        escalations.append(kind)
+        return OUTCOME_RECOVERED  # chips back, the full check gave no pass: the hold stands
+
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", recovered_ladder)
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert srv.device_hold_episode_since == old, "the fault hold continues the released episode"
+    assert escalations == ["present-forced"], "the full ladder at the carried bound"
+    assert srv._recovery_degraded(), "no release without a passing full check"
+    assert events.count("host_rung") == 1, "the failed check asks for the power cycle"
+
+
+@pytest.mark.asyncio
+async def test_a_kill_reset_hold_naming_only_the_kill_keeps_its_own_clock_at_a_tick(runner_env, monkeypatch, tmp_path):
+    await _neutral_kill_hold(monkeypatch, tmp_path)
+    own = srv.device_hold_episode_since
+    escalations, _alerts, events = _arm_fabric_only_deadline_hold(
+        monkeypatch, why="job_killed", detail="device unverified: gate/post-job: job 494 ended killed (exit 130)"
+    )
+    srv.device_hold_episode_since = own
+    srv._check_hold_deadline(now=datetime.now())
+    await _drain()
+    assert srv.device_hold_episode_since == own and srv._hold_episode_neutral
+    assert escalations == [] and "host_rung" not in events
+
+
+@pytest.mark.asyncio
+async def test_a_kill_reset_hold_lifts_only_on_a_full_check_pass_and_starts_the_next_carry_at_its_own_start(
+    runner_env, monkeypatch, tmp_path
+):
+    """The fresh clock adds no lift path: the post-job gate keeps the hold on a fabric check that counts fewer links
+    than the cabling expects, and only a full pass, fabric included, releases it. The carry that release saves is the
+    kill-reset hold's own episode."""
+    from tests.test_boot_fabric_reverify import _FABRIC_OK, _broker
+    from tests.test_device_safety import _ledger_dir
+
+    await _neutral_kill_hold(monkeypatch, tmp_path)
+    own = srv.device_hold_episode_since
+    _ledger_dir(monkeypatch, tmp_path)
+    short = (False, {"snapshot": {"ok": True}, "fabric": {"ok": False, "detail": f"what(): {MISMATCH}"}})
+    for verdict, held in ((short, True), (_FABRIC_OK, False)):
+        _broker(monkeypatch, tmp_path, srv.fsm, verdict)
+        monkeypatch.setattr(srv, "_post_reset_debt", lambda: "")
+        srv.recovery_mechanism.last_reset_monotonic = time.monotonic() + 1.0  # the kill's reset ran
+        await srv._device_health_gate(None, phase="post-job", run_fabric=True, force_fabric=True)
+        assert srv.device_hold_logged is held, "a short link count is a failure" if held else "a full pass lifts it"
+        assert (srv.fsm.state is ServerState.HEALTHY) is not held
+    assert srv._load_hold_carry()["since"] == own and not srv._hold_episode_neutral

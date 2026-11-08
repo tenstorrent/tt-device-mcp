@@ -1495,6 +1495,14 @@ _hold_episode_tenant = False
 # Whether the open hold is the startup hold a restart opened, still naming no fault (spec 04 I82). It
 # neither takes nor spends a released episode's carry; the first fault it turns into takes it.
 _hold_episode_startup = False
+# Whether the open hold is the kill-reset hold after a first job its owner stopped, the device clean (spec 04 I82). It
+# defers a released episode's carry as a startup hold does; the first fault it turns into takes it.
+_hold_episode_neutral = False
+
+
+def _set_hold_episode_neutral(neutral: bool) -> None:
+    global _hold_episode_neutral
+    _hold_episode_neutral = neutral
 
 
 def _recorded_hold_startup(since: str) -> bool:
@@ -1535,7 +1543,10 @@ def _forget_stale_hold_episode() -> None:
 # window open past _HOLD_CARRY_SEC only while the release is in doubt: its check was no fresh fabric pass on the full
 # cabling, or the episode's bound ladder had run. A verified release whose first job outran the window was not a quick
 # re-hold: one Galaxy host's 29-min first job, killed for its time limit, left the hold after it born 32 min old, past
-# the bound, and escalated at once.
+# the bound, and escalated at once. A first job after a verified release that its owner killed, cancelled or preempted,
+# with clean device evidence, says nothing about the release: the kill-reset hold that follows starts its own clock, so
+# its fast path (one reset, then the full check) is not cut short by the old episode's age. That hold defers the carry
+# as a startup hold does, and takes it only if it turns into a device fault. Its own end by timeout is no such stop.
 HOLD_CARRY_FILE = "hold_carry.json"
 _HOLD_CARRY_SEC = 300
 _hold_carry: Optional[dict] = None
@@ -1614,18 +1625,27 @@ def _drop_hold_carry() -> None:
         _write_hold_carry()
 
 
-def _note_hold_carry_job(edge: str, *, ok: bool = False) -> None:
+def _note_hold_carry_job(edge: str, *, ok: bool = False, neutral: bool = False) -> None:
     """A job started inside the carry window keeps it open until _HOLD_CARRY_SEC after that job ends: the first job
     after a release is the one that shows whether the release was right (spec 04 I82). ``ok``: the job ended completed,
     exit 0, naming no device or fabric fault. That proves the release right, so the carry is dropped and the next hold
     is a fresh episode with its own class path. A job that ends any other way under the startup hold a restart opened
     (it was re-adopted) pins the carry to that hold: the startup gate's reset and full check can outlast the window, and
-    the hold names its fault only when the gate fails, so the carry stays open until the gate's verdict."""
+    the hold names its fault only when the gate fails, so the carry stays open until the gate's verdict. ``neutral``:
+    the job's owner killed, cancelled or preempted it and nothing named a device or fabric fault. After a verified
+    release whose episode ran no bound ladder that proves nothing either way, so the next hold defers the carry
+    (_hold_carry_neutral)."""
     rec = _load_hold_carry()
     if not isinstance(rec, dict):
         return
     if edge == "end" and ok:
         _drop_hold_carry()
+        return
+    if edge == "end" and neutral:
+        if rec.get("job_started") and rec.get("verified") and rec.get("ladder_age") is None:
+            if not rec.get("startup_pinned"):
+                rec["neutral_end"] = True
+                _write_hold_carry()
         return
     now = time.time()
     try:
@@ -1650,6 +1670,25 @@ def _note_full_check_passed(prior: Optional[dict]) -> None:
     check releasing a hold a dead broker left open) is the release itself, not proof since it."""
     if not device_hold_logged and prior is not None and _load_hold_carry() is prior:
         _drop_hold_carry()
+
+
+def _owner_stop_clean() -> bool:
+    """No device evidence against the device at a job's end: no fault on record, no chip isolated, and the fsm not in
+    an episode some check opened while the job ran (spec 04 I82)."""
+    return not device_fault_reported and not isolated_chips and fsm.state is ServerState.HEALTHY
+
+
+def _hold_carry_neutral() -> bool:
+    """Whether a hold opening now follows a first job its owner stopped with clean device evidence, and names nothing
+    but that stop's own wedge risk. Such a hold defers the carry; any other hold takes it (spec 04 I82)."""
+    rec = _load_hold_carry()
+    return (
+        isinstance(rec, dict)
+        and bool(rec.get("neutral_end"))
+        and fsm.record.why == "job_killed"
+        and not device_fault_reported
+        and not isolated_chips
+    )
 
 
 def _take_hold_carry() -> Optional[dict]:
@@ -2815,6 +2854,7 @@ def _reset_for_testing():
     """
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global _hold_episode_restorable, _hold_episode_tenant, _hold_episode_startup, _hold_carry, _hold_carry_loaded
+    global _hold_episode_neutral
     global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic
     global _dispatch_reset_spent, _kill_reset_owed, _kill_reset_owed_at, _pre_reset_blocker
     global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
@@ -2846,6 +2886,7 @@ def _reset_for_testing():
     _hold_episode_restorable = True
     _hold_episode_tenant = False
     _hold_episode_startup = False
+    _hold_episode_neutral = False
     _hold_carry = None
     _hold_carry_loaded = False
     if recovery_mechanism is not None:
@@ -9548,8 +9589,11 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         # (_hold_turned_fault). A restored startup hold that deferred the carry defers it again.
         startup = fsm.record.why == "startup_unverified" and (not restored or _recorded_hold_startup(restored))
         startup = startup and not tenant
-        carry = None if tenant or startup else _take_hold_carry()
-        deferred = _load_hold_carry() if startup else None
+        # Spec 04 I82: the kill-reset hold after a first job its owner stopped, the device clean, defers it as well.
+        neutral = not (tenant or startup) and _hold_carry_neutral()
+        _set_hold_episode_neutral(neutral)
+        carry = None if tenant or startup or neutral else _take_hold_carry()
+        deferred = _load_hold_carry() if startup or neutral else None
         jobs_end = _wall_iso(min(deferred_until, time.time())) if deferred_until is not None else ""
         starts = [s for s in (restored, str(carry["since"]) if carry else "", jobs_end) if s]
         device_hold_episode_since = min(starts, key=datetime.fromisoformat) if starts else row_since
@@ -9638,6 +9682,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         _hold_row = None
         if not _hold_episode_tenant:  # spec 04 I82: a tenant's hold time is not fault time
             _save_hold_carry(device_hold_episode_since, device_hold_episode_reason)
+        _set_hold_episode_neutral(False)
         device_hold_episode_since = ""
         clear_pending_marker()  # spec 04 I88: the hold lifted, no cycle is pending
         # Spec 03 I80: a clock latched inside an op belongs to this episode; the next hold starts its own.
@@ -10703,6 +10748,7 @@ def _hold_turned_fault() -> None:
     clock to disk, and continue a fault carry still in its window as a fault hold opened now would
     (spec 04 I82). Without it the bound runs one more ladder before its host rung."""
     global device_hold_episode_since
+    _set_hold_episode_neutral(False)
     carry = _take_hold_carry()
     if carry:
         device_hold_episode_since = min((device_hold_episode_since, str(carry["since"])), key=datetime.fromisoformat)
@@ -10747,6 +10793,12 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         and fsm.record.why != "startup_unverified"
     ):
         _hold_turned_fault()  # the startup hold turned into a fault hold
+    elif (
+        _hold_episode_neutral
+        and fsm.state in (ServerState.RECOVERING, ServerState.DOWN)
+        and (fsm.record.why != "job_killed" or device_fault_reported or isolated_chips)
+    ):
+        _hold_turned_fault()  # the owner's stop left a device fault behind
     try:
         started = datetime.fromisoformat(device_hold_episode_since)
     except ValueError:
@@ -14792,6 +14844,16 @@ export {JOB_TAG_ENV}={job_tag}
                 fault = _scan_output_for_device_fault(job_log_file)
                 if job.status == JobStatus.COMPLETED and job.exit_code == 0 and not (fault or topo or known):
                     _note_hold_carry_job("end", ok=True)  # spec 04 I82: the release was right
+                elif (
+                    (
+                        job_id in request_killed_job_ids
+                        or job_id in preempt_forced_job_ids
+                        or job.status == JobStatus.PREEMPTED
+                    )
+                    and not (fault or topo or known or killed_by_reset)
+                    and _owner_stop_clean()
+                ):
+                    _note_hold_carry_job("end", neutral=True)  # spec 04 I82: the owner's stop proves nothing
                 if fault:
                     _mark_device_reported_fault(f"job {job_id} {fault}", job=job)
                 elif killed_by_reset:

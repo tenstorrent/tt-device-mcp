@@ -1615,7 +1615,22 @@ each rung fires only when the gentler one failed or cannot apply.
   clock starts at zero and its class path, 10-min ladder and power-cycle escalation run on that
   clock. A re-hold within 300 s of any release still continues the episode, so a hold that flaps
   open again right after a release keeps its clock. A carry an older broker wrote has no `verified`
-  and counts as in doubt. The carry ends, and the next hold is a fresh episode with its own class
+  and counts as in doubt. After such a release, a first job its owner stopped (a kill, a cancel of the running job, a
+  preemption) proves nothing either way when the device evidence is clean: its log names no device or
+  fabric fault, no fault or isolated chip is on record, no reset killed it, and no check opened an
+  episode while it ran. The kill-reset hold after it (spec 03 I69: one reset, then the full check,
+  about 3 min) is then no re-hold of the released episode, however soon it opens: like the startup
+  hold it defers the carry (`carry_deferred`), its clock starts when it opens, and its fast path is
+  not cut short by the old episode's age (before, a kill inside the window carried that age, could
+  open past the bound and ran the full ladder instead). Once it names a device fault (its `why`
+  turns from the kill into a fault class, or a fault or isolated chip is reported) it takes the carry
+  still on record, as a fault hold opened then would (`hold_turned_fault`), and the bound resumes; a
+  pass that releases it saves its own carry. A job that ran out its own time limit is no such stop
+  and keeps the carry: the broker sees a timeout end the same way whether the job hung on its own or
+  on a wedged device, so a clean timeout cannot be told apart at the job's end. A stop with any
+  device evidence against it, a stop after a release in doubt, or a stop under a startup-pinned
+  carry keeps the carry as well. A restart during the kill-reset hold leaves the carry to the
+  startup hold, which defers it as above. The carry ends, and the next hold is a fresh episode with its own class
   path, as soon as the device proves the release right: the first job after it ends completed,
   exit 0, naming no device or fabric fault; or a full health check (fabric included) passes with
   no hold open. The pass that releases a hold is the release itself and does not end the carry it
@@ -1668,6 +1683,7 @@ each rung fires only when the gentler one failed or cannot apply.
   | Bound ladder's check releases, first job fails on the same fault, re-hold (missing port, I42 latch, known fabric fault, 77-only, generic) | open-ended: ladder, release, failed job, new 10-min clock, repeated (one Galaxy host on 2026-10-17: about every 13 min for about 4 h) | carried: no ladder, power-cycle request at max(episode start + 600 s + ladder, I65 cooldown end) + one sampler tick |
   | Release, re-hold within 300 s with no job, below the bound | new 10-min clock | carried: the class path runs as before; the clock keeps the episode start, so the bound fires no later than episode start + 600 s |
   | First job after the release succeeds, or a full check passes with no hold open, then a new fault | new episode | new episode: unchanged; the class's own fast path runs (a whole-tray drop still goes straight to a power cycle) |
+  | Verified release (no bound ladder), first job stopped by its owner inside the window, clean device evidence, kill-reset hold | carried: the hold could open past the bound and ran the full ladder | own clock: one reset, then the full check (about 3 min); a fault it then names takes the carry |
   | Tenant hold released, then a fault hold | new episode | new episode: unchanged; the tenant's time is not counted |
   | Tenant hold turns into a fault hold within 300 s of a bound ladder's release | one more ladder at 10 min (about 10-13 min) before the host rung | carried: no ladder, power-cycle request at once (I65 cooldown still applies) |
   | Hold open across a broker restart | 10-min clock restarted at the restart | escalates no later than episode start + 600 s |
@@ -3567,6 +3583,7 @@ sees a silent fabric pass.
 | I82 with spec 03 I75: a startup hold deferred behind a re-adopted job (no episode open) is pinned by the job's failing end like an open one; the hold opened after it starts a fresh clock (`carry_deferred`) and escalates nothing | `tests/test_readopt_hold_clock.py::test_the_deferred_startup_hold_does_not_take_a_closed_episodes_carry` |
 | I82 the carry ends when the device proves the release right: a successful first job, or a full check that passes with no hold open, gives the next fault a fresh episode and no cycle; the releasing pass keeps the carry it saves | `tests/test_hold_episode_carry.py::test_a_successful_first_job_ends_the_episode`, `::test_a_passing_full_check_with_no_hold_open_drops_the_carry`, `::test_a_passing_full_check_that_releases_a_hold_keeps_the_new_carry`, `::test_a_pass_whose_release_is_refused_keeps_the_carry` |
 | I82 a verified release (fresh full pass on the full cabling) whose first job outruns the window starts the next hold's clock at zero, with nothing escalated early and its own 10-min ladder then power cycle on time; an unverified release (no verdict, failed, short or stale pass) still carries; a re-hold within the window of a verified release still carries; a verified release by the bound ladder still goes to the power cycle | `tests/test_hold_episode_carry.py::test_replay_a_hold_after_a_verified_release_and_a_long_first_job_is_a_new_episode`, `::test_a_new_episode_after_a_verified_release_runs_its_ladder_at_its_own_10_min_mark_then_the_power_cycle`, `::test_a_long_first_job_after_an_unverified_release_keeps_the_episode`, `::test_a_quick_rehold_after_a_verified_release_keeps_the_episode`, `::test_a_verified_release_by_the_bound_ladder_then_a_long_failed_first_job_still_goes_to_the_power_cycle` |
+| I82 after a verified release a first job its owner killed or preempted, the device clean, leaves the kill-reset hold on its own clock; its own timeout, a fault in its log or a fault while it ran keeps the carry; the hold takes the carry once it names a device fault (ladder at the carried bound, then the power cycle), keeps its clock while it names only the kill, and lifts only on a full check pass, fabric included (a short link count fails) | `tests/test_hold_episode_carry.py::test_replay_an_owner_stop_of_the_first_job_after_a_verified_release_starts_a_fresh_episode`, `::test_a_first_job_that_ran_out_its_own_time_keeps_the_episode`, `::test_a_killed_first_job_with_device_evidence_against_it_keeps_the_episode`, `::test_a_kill_reset_hold_that_turns_into_a_device_fault_takes_the_carry_then_the_power_cycle`, `::test_a_kill_reset_hold_naming_only_the_kill_keeps_its_own_clock_at_a_tick`, `::test_a_kill_reset_hold_lifts_only_on_a_full_check_pass_and_starts_the_next_carry_at_its_own_start` |
 | I82 a tenant hold saves no carry and does not take or spend a fault hold's carry | `tests/test_hold_episode_carry.py::test_a_tenant_hold_leaves_no_carry`, `::test_a_tenant_hold_between_does_not_spend_a_fault_holds_carry` |
 | I82 a tenant hold that turns into a fault hold takes a fault carry in its window, not one past it | `tests/test_hold_episode_carry.py::test_a_tenant_hold_that_turns_into_a_fault_hold_takes_the_carry_in_its_window`, `::test_a_tenant_hold_that_turns_into_a_fault_hold_past_the_window_is_a_new_episode` |
 | I82 the first job's end closes the carry window even when a job-end check raises; a clean end drops the carry, a failed one keeps it | `tests/test_hold_episode_carry.py::test_the_first_jobs_end_closes_the_carry_window_even_when_a_job_end_check_raises`, `::test_the_first_jobs_verdict_still_decides_the_carry` |
