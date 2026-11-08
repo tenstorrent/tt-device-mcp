@@ -4218,7 +4218,9 @@ async def test_a_failed_quick_check_after_a_clean_software_exit_ends_as_a_forced
     forced = await run(None, tmp_path / "forced")
     skipped = await run(1, tmp_path / "clean")
 
-    assert skipped == forced, f"{failed}: a clean exit with a failed quick check ended {skipped}, a forced pass {forced}"
+    assert (
+        skipped == forced
+    ), f"{failed}: a clean exit with a failed quick check ended {skipped}, a forced pass {forced}"
     if failed == "eth-no-verdict":
         assert skipped[0] == 1, "an eth read with no verdict let the mesh through without the traffic pass"
     elif failed == "snapshot":
