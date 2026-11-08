@@ -3366,6 +3366,10 @@ def _scoped_reset_backend() -> bool:
     return privileges.has_systemd() and privileges.is_root()
 
 
+# After a runner error's kill ladder, how long the runner waits for the event loop to see the job's exit status.
+RUNNER_ERROR_REAP_WAIT_SEC = 5.0
+
+
 async def _group_gone(pid: int, deadline: float) -> bool:
     """Poll until the process group is fully gone, or ``deadline`` passes."""
     loop = asyncio.get_event_loop()
@@ -14748,15 +14752,28 @@ export {JOB_TAG_ENV}={job_tag}
             # sweep for what is left: as the first signal it gives the runtime no chance to close the device, and its
             # chips stay at the busy clock until something opens and closes them again.
             if job.pid:
+                laddered = False
                 try:
                     _log_job_tree_killed(job_id, f"runner error ({e})", await _terminate_job(job_id, job.pid))
+                    laddered = True
+                    # The ladder sees the group gone once the child is reaped, but the event loop may learn the
+                    # returncode later (a child watcher thread posts it): wait for it, bounded, so the job keeps its
+                    # own exit code (or -9 after SIGKILL) instead of none.
+                    if proc is not None and proc.returncode is None:
+                        await aio.wait_for(proc.wait(), timeout=RUNNER_ERROR_REAP_WAIT_SEC)
                 except asyncio.CancelledError:
                     # Shutdown mid-ladder: leave whatever is left for the next broker to re-adopt.
                     cancelled = True
                     raise
+                except asyncio.TimeoutError:
+                    if logger:
+                        logger.warning(
+                            f"JOB_RUNNER job_id={job_id} no exit status {RUNNER_ERROR_REAP_WAIT_SEC}s after the ladder"
+                        )
                 except Exception as term_err:  # noqa: BLE001 - the sweep below still runs
                     if logger:
-                        logger.warning(f"JOB_RUNNER job_id={job_id} terminate after exception failed: {term_err}")
+                        stage = "reap wait" if laddered else "terminate"
+                        logger.warning(f"JOB_RUNNER job_id={job_id} {stage} after exception failed: {term_err}")
                 # A ladder that had to end in SIGKILL is a signal death, so the wedge check sees it.
                 if proc is not None and proc.returncode is not None:
                     job.exit_code = proc.returncode
