@@ -154,7 +154,8 @@ One job, end to end (details: 01 Behavior, 03 Behavior):
    its submitter), streamed to its log, bounded by the hard timeout ceiling (01, 05).
 5. **Completion** — the process group is killed unconditionally, the exit classified for device
    evidence, the footer written; the post-job gate runs (fabric traffic pass forced on any
-   failure) before the next dispatch (01, 03).
+   failure but a clean software exit with no device event, 03 I36) before the next dispatch
+   (01, 03).
 6. **Recovery** — a gate that finds a fault escalates through the gentlest-first ladder; every
    outcome folds back into the durable FSM (03 ↔ 04 seam).
 

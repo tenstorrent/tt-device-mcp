@@ -118,7 +118,7 @@ async def test_the_runner_holds_a_known_fabric_fault_without_the_dirty_reset(mon
     monkeypatch.setattr(srv, "_mark_device_dirty", lambda reason, job=None, **k: dirty.append(reason))
     monkeypatch.setattr(srv, "_hold_device_fabric_unverified", lambda reason, **k: held.append(reason))
 
-    async def _gate(job_log_file, job_failed=False, noop_failure=False):
+    async def _gate(job_log_file, job_failed=False, clean_exit_code=None):
         gates.append(job_failed)
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _gate)

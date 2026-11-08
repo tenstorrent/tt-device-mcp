@@ -238,7 +238,7 @@ def _runner_setup(monkeypatch, tmp_path):
     async def _admission(job, job_log_file):
         return "" if srv.fsm.state is ServerState.HEALTHY else _HOLD
 
-    async def _gate(job_log_file, job_failed=False, noop_failure=False):
+    async def _gate(job_log_file, job_failed=False, clean_exit_code=None):
         return None
 
     monkeypatch.setattr(srv, "_await_device_free_for_tenant", _free)
