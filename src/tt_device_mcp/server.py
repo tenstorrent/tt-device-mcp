@@ -1274,6 +1274,7 @@ _recovery_deps = RecoveryDeps(
     episode_open=lambda: fsm.state is not ServerState.HEALTHY,
     episode_job=lambda: dict(fsm.record.job),
     eth_rearm=lambda: _rearm_eth_before_check(),
+    quiesce_readers=lambda what, log: _pollers_quiesced_for(what, log),
 )
 
 # The root constructs the health subsystem, once, while still in its BOOT state — never per gate
@@ -1858,8 +1859,9 @@ _offbus_hold_chips: set = set()
 # running another unit that reads or writes the chips (a clock-cap keeper, say) names it in
 # TT_DEVICE_MCP_POLLER_SERVICES. The default lists no clock-cap keeper, which every reset would
 # otherwise stop and restart on every host. A unit a host does not have answers
-# `systemctl` non-zero and is skipped.
-DEFAULT_POLLER_SERVICES = "tt-telemetry.service,tt-metrics-exporter.service"
+# `systemctl` non-zero and is skipped. prometheus-node-exporter is listed because its hwmon
+# collector reads every chip's telemetry through the driver each time it is scraped.
+DEFAULT_POLLER_SERVICES = "tt-telemetry.service,tt-metrics-exporter.service,prometheus-node-exporter.service"
 DEVICE_POLLER_SERVICES = tuple(
     s for s in os.environ.get("TT_DEVICE_MCP_POLLER_SERVICES", DEFAULT_POLLER_SERVICES).split(",") if s.strip()
 )
@@ -1873,6 +1875,9 @@ _pollers_to_restore: Optional[set[str]] = None
 # `systemctl is-active` states of a unit that is running or on its way up: a crash-looping poller
 # reads "activating" between restarts, and it was running all the same.
 _POLLER_RUNNING_STATES = ("active", "activating", "reloading", "refreshing")
+# How long a stop that returned 0 is given to show the unit gone (`systemctl stop` waits for it, so
+# the first read normally shows it), per unit that was running. Inside the 30 s per-unit bound.
+POLLER_STOP_VERIFY_SEC = 5.0
 logger: logging.Logger | None = None
 job_log_dir: Path | None = None
 job_runner_task: asyncio.Task | None = None  # Singleton job runner
@@ -6925,6 +6930,9 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
             # No state read at all counts as running, as every unit did before this record existed.
             if state in _POLLER_RUNNING_STATES or not state:
                 _note_poller_to_restore(svc, True)
+                running.add(svc)
+        elif not active:
+            running.add(svc)
         stage[0] = verb
         proc = await asyncio.create_subprocess_exec(
             "systemctl",
@@ -6937,6 +6945,8 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
         return proc.returncode
 
     touched = []
+    running: set = set()
+    unstopped: dict = {}
     for svc in services:
         stage = [""]
         try:
@@ -6946,20 +6956,31 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
             rc = None
             if stage[0] == "probe":
                 _note_poller_to_restore(svc, True)  # state unknown: restore it, as before
+                running.add(svc)
         if rc == 0:
             touched.append(svc)
             if active:
                 _note_poller_to_restore(svc, False)
-        elif not active and svc in record:
+            elif svc in running:
+                # A stop that returned 0 is not proof the reader is gone: confirm it, bounded.
+                pid = await _poller_still_running(svc)
+                if pid is not None:
+                    unstopped[svc] = pid
+        elif not active and svc in running:
             # Running, and its stop failed or is still running (systemd finishes it): the inline
             # restore may be skipped when no stop returned 0, so the next close to HEALTHY starts it.
             _owe_device_pollers(f"{svc} stop did not complete")
+            unstopped[svc] = await _poller_still_running(svc) or "?"
     if touched:
         log(f"{'restarted' if active else 'stopped'} device pollers: {', '.join(touched)}")
     if active:
         left = [s for s in DEVICE_POLLER_SERVICES if s not in services]
         if left:
             log(f"left device pollers stopped (not running before the stop): {', '.join(left)}")
+    for svc, pid in unstopped.items():
+        # Never blocks the check or reset: it runs beside this reader, which is named so it can be found.
+        log(f"WARNING: device reader {svc} (pid {pid}) is still running; continuing without it stopped")
+        health_event("poller_stop_unverified", service=svc, pid=pid)
     if not touched and services:
         # Pollers were configured, yet the verb reached none of them: on this host they resolve
         # to no active unit. Quiescing was a no-op, so a reset about to run cannot assume it lands
@@ -6970,6 +6991,34 @@ async def _set_device_pollers(active: bool, log) -> list[str]:
         health_event("pollers_none_active", verb=verb, configured=list(services), host_at_risk=not active)
     health_event("pollers_" + ("restarted" if active else "quiesced"), services=touched)
     return touched
+
+
+async def _poller_still_running(svc: str) -> Optional[str]:
+    """None once ``svc`` reads stopped, else its main pid (``"?"`` when unreadable).
+
+    Polls ``systemctl is-active`` for up to ``POLLER_STOP_VERIFY_SEC``. An unreadable state counts as
+    running: the warning it leads to is the safe side."""
+
+    async def _read(*args: str) -> str:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+            )
+            out, _ = await aio.wait_for(proc.communicate(), timeout=5)
+            return out.decode(errors="replace").strip()
+        except (asyncio.TimeoutError, OSError, ValueError):
+            return ""
+
+    deadline = time.monotonic() + POLLER_STOP_VERIFY_SEC
+    while True:
+        state = await _read("is-active", svc)
+        if state and state not in _POLLER_RUNNING_STATES:
+            return None
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+    pid = await _read("show", "-p", "MainPID", "--value", svc)
+    return pid if pid and pid != "0" else "?"
 
 
 @asynccontextmanager
@@ -6990,6 +7039,11 @@ async def _pollers_quiesced_for(what: str, log):
     before the check and one ``start`` after it, each bounded at 30 s per unit."""
     global _pollers_held_for
     stopped: list[str] = []
+    if _pollers_held_for:
+        # Nested in a wider hold (a fabric check inside the startup check): its owner stopped them
+        # and restarts them.
+        yield stopped
+        return
     try:
         stopped = await _set_device_pollers(False, log)
     except Exception as exc:  # noqa: BLE001 - best-effort: never blocks the check

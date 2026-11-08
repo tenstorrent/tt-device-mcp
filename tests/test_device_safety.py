@@ -3046,7 +3046,7 @@ async def test_pollers_quiesce_stays_quiet_when_no_pollers_are_configured(monkey
     assert health.read_health_events(kinds={"pollers_none_active"}) == []
 
 
-DEFAULT_POLLERS = ("tt-telemetry.service", "tt-metrics-exporter.service")
+DEFAULT_POLLERS = ("tt-telemetry.service", "tt-metrics-exporter.service", "prometheus-node-exporter.service")
 
 
 def test_no_clock_cap_keeper_in_the_default_pollers():

@@ -447,6 +447,9 @@ def _seal_real_hardware(monkeypatch, tmp_dirs):
     # setenv from another test, a host-level env file) — clear all three, and the override
     # command itself, so every test starts from the same "nothing configured or installed" floor.
     monkeypatch.setenv("TTDEV_VALIDATOR_ROOT", str(tmp_dirs.mktemp("no-fabric-validator")))
+    # A fabric check stops the host's device readers first (a real `systemctl stop`, which the spawn
+    # tripwire refuses off the marker). A test of that quiesce sets its own.
+    monkeypatch.setattr(srv._recovery_deps, "quiesce_readers", None)
     monkeypatch.delenv("TTDEV_FABRIC_BIN", raising=False)
     monkeypatch.delenv("TTDEV_FABRIC_RUNTIME_ROOT", raising=False)
     monkeypatch.delenv("TTDEV_FABRIC_DESCRIPTOR", raising=False)
@@ -551,6 +554,8 @@ def _seal_real_hardware(monkeypatch, tmp_dirs):
     monkeypatch.setattr(recovery_base, "_reenumerate_withheld_journaled", {})
     # The pollers a quiesce stopped and owes a restore. None: read again from the per-test health dir.
     monkeypatch.setattr(srv, "_pollers_to_restore", None)
+    # A stop is confirmed by re-reading the unit's state; fakes that always read "active" read it once.
+    monkeypatch.setattr(srv, "POLLER_STOP_VERIFY_SEC", 0.0)
     # The reset argv/mode env vars are read live (never cached), so an operator's own shell/CI
     # environment leaks straight into whatever argv a test builds — cleared here for a
     # deterministic floor; a test exercising a declared mode/override sets it itself afterward.

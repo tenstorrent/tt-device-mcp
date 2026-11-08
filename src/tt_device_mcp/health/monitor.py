@@ -15,6 +15,7 @@ that stops a recovered-on-ARC hold from lifting onto an unverified fabric.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -1077,7 +1078,23 @@ class HealthMonitor:
         Never raises.
 
         Wrapped by a thin timer that reports the "fabric" probe metric — the pass whose duration
-        is the one worth alerting on, since it is the closest to its own timeout of the four."""
+        is the one worth alerting on, since it is the closest to its own timeout of the four.
+
+        Runs with the host's device readers stopped (``deps.quiesce_readers``): the check's own
+        traffic beside a telemetry poller's MMIO at a chip that drops mid-check is how a host dies
+        of a machine check. They are restored on every exit, pass, fail, timeout or cancel; the
+        stop's time is outside the check's own timeout."""
+        quiesce = getattr(self._deps, "quiesce_readers", None)
+        scope = quiesce("the fabric check", self._readers_log) if quiesce is not None else contextlib.nullcontext()
+        async with scope:
+            return await self._verify_fabric_health_timed(timeout_sec)
+
+    def _readers_log(self, line: str) -> None:
+        log = self._logger()
+        if log:
+            log.info(f"HEALTH {line}")
+
+    async def _verify_fabric_health_timed(self, timeout_sec: float) -> tuple[Optional[bool], str]:
         _t0 = time.monotonic()
         _fabric_inflight_begin(self._fabric_check_cmd() or "built-in")
         try:
