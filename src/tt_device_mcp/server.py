@@ -6852,10 +6852,10 @@ def _pollers_unfit_reason() -> Optional[str]:
         debt = ""
     if debt:
         return f"fabric unverified since {debt}"
-    from tt_device_mcp.health.monitors import pci as _pci
+    from tt_device_mcp.health import chips_reading_all_ones
 
     try:
-        off = _pci.chips_off_bus()
+        off = chips_reading_all_ones()
     except Exception:  # noqa: BLE001 - an unreadable config space never keeps the pollers off
         off = []
     # A poller never starts over a chip off the bus (spec 04 I112): config reads only, no MMIO.

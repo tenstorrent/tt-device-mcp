@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
 """Device readers stop, verified, before every fabric check and reset path, and come back after (spec 04 I112)."""
 
 import asyncio

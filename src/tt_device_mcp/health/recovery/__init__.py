@@ -548,7 +548,10 @@ class Recovery(ABC):
             ok = await self._recover_isolated_chips_body(log, exclude, not_reset)
             return ok
         finally:
-            await mech.restore_pollers(quiesced or [], log, ok=bool(ok), after="bridge reset")
+            try:
+                await mech.restore_pollers(quiesced or [], log, ok=bool(ok), after="bridge reset")
+            except Exception as e:  # noqa: BLE001 - best-effort: never masks the rung's own outcome
+                log(f"could not restore the device pollers after a bridge reset: {e!r}")
 
     async def _recover_isolated_chips_body(self, log, exclude=frozenset(), not_reset=frozenset()) -> bool:
         """Bring back chips that were cut out of the kernel after leaving the PCIe bus.

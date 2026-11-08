@@ -107,6 +107,7 @@ from tt_device_mcp.health.monitors.pci import (
 # funnel and the gate read it to hold fabric-unverified until a pass settles it. The one in-flight PCI sysfs writer and
 # its PCI-wedged latch (spec 04 I76): server.py wires the latch to the hold and the power-cycle request, and clears it
 # only on a verified lift; telemetry.py's dead-chip valve skips chips while it is set and removes chips only through it.
+from tt_device_mcp.health.monitors import pci as _pci_monitor
 from tt_device_mcp.health.pci_writer import PCI_WRITER, PciWedged
 from tt_device_mcp.health.post_reset import FABRIC_DEBT, POST_RESET_SETTLE_SEC, boot_monotonic
 from tt_device_mcp.health.recovery import (
@@ -180,6 +181,14 @@ from tt_device_mcp.health.recovery.stages.power_cycle import (
 )
 from tt_device_mcp.health.shutdown import note_broker_stopping
 
+
+def chips_reading_all_ones() -> list[str]:
+    """Chips whose config vendor ID reads all-ones (off the bus), from config space only, never MMIO (spec 04 I112).
+
+    Read through the module at call time, so a test's patch of ``pci.chips_off_bus`` reaches server.py."""
+    return _pci_monitor.chips_off_bus()
+
+
 __all__ = [
     # the one in-flight PCI sysfs writer and its PCI-wedged latch (spec 04 I76)
     "PCI_WRITER",
@@ -190,6 +199,7 @@ __all__ = [
     "offbus_chip_ids",
     "chip_pci_bdfs",
     "config_vendor_id",
+    "chips_reading_all_ones",
     "link_active",
     "pci_bus_number",
     "UBB_CHIP_COUNT",

@@ -41,7 +41,7 @@ def test_one_root_port_record_during_the_check_stops_and_fences_within_a_poll(ri
     assert chip_state.is_fenced("13"), "the sampler reads nothing under that port"
     assert not chip_state.is_fenced("14"), "a chip under another port is untouched"
     assert w.pending_stop and w.pending_stop["chips"] == ["13"]
-    assert _rows("check_aer_stop"), "the stop record is on disk once the poll returned (I95)"
+    assert ("event", "check_aer_stop") in log, f"the stop record is written by the poll that stopped (I95): {log}"
 
 
 def test_a_root_port_record_with_no_broker_check_running_stops_and_fences_nothing(rig, monkeypatch):
@@ -83,7 +83,8 @@ async def test_the_trigger_and_stop_record_is_on_disk_before_the_remove(watch, m
     await _contain(burst)
     trig = log.index(("journal", "chip_contain_trigger"))
     assert trig < log.index(("detach", "13")), f"the record came after the remove: {log}"
-    assert log.index(("stop", FABRIC)) < trig, "the SIGSTOP is never behind a disk write"
+    stops = [i for i, e in enumerate(log) if e[0] == "stop"]
+    assert stops and max(stops) < trig, f"the SIGSTOP is never behind a disk write: {log}"
     assert waits["chip_contain_trigger"] == telemetry.PRE_REMOVE_RECORD_WAIT_SEC
     assert telemetry.PRE_REMOVE_RECORD_WAIT_SEC < telemetry.WATCH_HARD_BOUND_SEC
     row = _rows("chip_contain_trigger")[-1]

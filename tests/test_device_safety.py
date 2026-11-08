@@ -3374,7 +3374,7 @@ async def test_pollers_restore_leaves_a_poller_stopped_that_was_stopped_before(m
     await srv._set_device_pollers(False, lines.append)
     restarted = await srv._set_device_pollers(True, lines.append)
 
-    assert restarted == ["tt-metrics-exporter.service"]
+    assert restarted == [s for s in DEFAULT_POLLERS if s != "tt-telemetry.service"]
     assert ("start", "tt-telemetry.service") not in calls
     assert any("left device pollers stopped" in m and "tt-telemetry.service" in m for m in lines), lines
     assert health.read_health_events(kinds={"pollers_none_active"}) == []
