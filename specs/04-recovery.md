@@ -2906,7 +2906,11 @@ each rung fires only when the gentler one failed or cannot apply.
     read until the unit is no longer running, for at most `POLLER_STOP_VERIFY_SEC` (5 s) per unit.
     A unit still running, or whose stop failed or timed out, is logged as a warning with its name and
     main pid and journaled `poller_stop_unverified`; the check or reset runs anyway (never a hold).
-    No process is killed.
+    No process is killed. Worst-case added wait before the step: with the three default units, each
+    stop is bounded at 30 s (state probe and stop together) plus its 5 s verify, so about 105 s, and
+    the restore after it at most 30 s per unit. Before a power-cycle request that is about 105 s on
+    top of the reset ladder (the restore never runs before a cycle that launched); in practice a
+    unit stops in under a second.
   - During the broker's own check, one uncorrectable AER record on a chip's root port is a trigger
     (`AER_CHECK_ROOT_STOP_COUNT`, spec 03 I92), without waiting for a burst or an all-ones read: the
     same incident's root port logged a single uncorrectable record 2.6 s before its chip read
@@ -2914,7 +2918,10 @@ each rung fires only when the gentler one failed or cannot apply.
     1 s) the watch SIGSTOPs the check readers, then fences the chips under that port (03 I97), so
     the sampler reads none of them until a probe read answers, they are contained or a reset step
     ends. Endpoint and switch counters keep the burst count; with no broker check running nothing is
-    stopped.
+    stopped. This fence is a suspicion, not an all-ones read: until a real read of the chip returns
+    all-ones, a read the sampler skips reports it unread (None, `chip_state.placeholder`), never
+    all-ones, so no off-bus test (I94's `aer_stop_offbus`, the dead-chip strikes, the pending stop's
+    answering test) acts on a value nobody read, and a chip that answers is never PCI-removed for it.
   - A containment writes `chip_contain_trigger` (the trigger, the chips, the readers and users
     stopped) after its SIGSTOP and before the PCI remove, waiting for its fsync at most
     `PRE_REMOVE_RECORD_WAIT_SEC` (1 s, inside I99's hard bound); past that the record stays queued
@@ -3638,7 +3645,7 @@ sees a silent fabric pass.
 | I107 a power cycle denied (I65 cooldown, backstop, unreadable ledger), at the check or at the climb, keeps the early mesh reset; only its passing full check with fabric lifts | `tests/test_arc_dead_skips_early_mesh_reset.py::test_a_denied_power_cycle_keeps_the_early_mesh_reset`, `tests/test_arc_dead_skips_early_mesh_reset.py::test_a_denied_power_cycle_lifts_only_on_the_mesh_resets_passing_full_check`, `tests/test_arc_dead_skips_early_mesh_reset.py::test_a_denial_at_the_climb_itself_still_runs_the_early_mesh_reset` |
 | I107 no power cycle armed: the early mesh reset runs before any operator hand-off | `tests/test_arc_dead_skips_early_mesh_reset.py::test_no_power_cycle_armed_runs_the_early_mesh_reset_before_any_hand_off` |
 | I112 fabric checks, bridge resets, power-cycle requests and tt-smi resets stop the device readers, verify the stop (bounded) and restore them on pass, fail, timeout, raise and cancel; an unstoppable reader is warned by name and pid and never blocks the step | `tests/test_reader_quiesce.py` |
-| I112 one root-port AER record during the broker's check SIGSTOPs the check readers and fences the chips under that port within a poll; none with no check running; an endpoint record below the burst count stops nothing; the trigger record is on disk before the remove; a chip whose config vendor ID reads all-ones is never under the fabric check or a starting poller | `tests/test_aer_root_contain.py` |
+| I112 one root-port AER record during the broker's check SIGSTOPs the check readers and fences the chips under that port within a poll; none with no check running; an endpoint record below the burst count stops nothing; a chip so fenced is never contained on a skipped read (unread, not all-ones) until a real read returns all-ones; the trigger record is on disk before the remove; a chip whose config vendor ID reads all-ones is never under the fabric check or a starting poller | `tests/test_aer_root_contain.py`, `tests/test_aer_check_stop.py` |
 | I108 a mesh reset that ran before a chip dropped does not spend the off-bus ladder's mesh reset: mesh reset, sweep, power cycle, in order, across a broker restart too | `tests/test_no_repeat_failed_rung.py::test_a_reset_that_ran_before_the_drop_does_not_spend_the_offbus_mesh_reset` |
 | I108 a mesh reset that faced the dropped chip (off before it, or found off by its own check) still spends it; a regressed reset and one with no sets on record stay spent | `tests/test_no_repeat_failed_rung.py::test_a_reset_that_faced_the_dropped_chip_still_spends_the_offbus_mesh_reset`, `::test_mesh_reset_spent_counts_only_chips_the_reset_faced`, `::test_a_reset_with_no_record_of_its_sets_stays_spent` |
 | I102 with I103: the late-chip second mesh reset runs in the pre-cycle sweep, so its pre-reset scan clears a holder outside every broker scope and runs (at the 10-min bound, on the I97 path, and in the sweep outside the bound); its wait still ends at the step's start plus `LATE_CHIP_STEP_SEC`; a failed full check keeps the hold and the cycle journals the holder; a holder in a broker job's scope or the running job's own process still refuses it, nothing lifts and the hold goes on to the cycle | `tests/test_late_chips_after_driver_wait.py::test_the_late_chip_second_reset_clears_a_foreign_holder_and_keeps_its_bound`, `::test_a_job_holder_still_refuses_the_late_chip_second_reset_and_the_hold_goes_on_to_the_cycle` |

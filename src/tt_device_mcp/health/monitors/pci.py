@@ -210,7 +210,8 @@ def chip_sample() -> dict:
     flat list per chip — [heartbeat, aiclk, arcclk, therm_trips, aer_correctable, aer_fatal].
 
     The four telemetry values are PCIe reads of the chip. A chip confirmed lost reads as [ALL_ONES, None, None, None,
-    ...] without touching it; when its re-read is due (:func:`chip_state.may_read`) only its heartbeat is read, once
+    ...] without touching it (a chip fenced only on a suspicion, never read all-ones, as [None, ...]:
+    :func:`chip_state.placeholder`); when its re-read is due (:func:`chip_state.may_read`) only its heartbeat is read, once
     (spec 03 I66)."""
     out: dict = {}
     try:
@@ -229,13 +230,13 @@ def chip_sample() -> dict:
         attrs = _VOLATILE
         if (lost or fenced) and not chip_state.may_read(idx, ent, probe=fenced):
             attrs = ()
-            row = [chip_state.ALL_ONES, None, None, None]
+            row = [chip_state.placeholder(idx), None, None, None]
         elif (lost and chip_state.is_lost(idx)) or (fenced and chip_state.is_fenced(idx)):
             attrs = _VOLATILE[:1]
         for n, attr in enumerate(attrs):
             # Fenced mid-row by a containment: stop reading the chip.
             if attrs is _VOLATILE and chip_state.read_blocked(idx):
-                row.extend([chip_state.ALL_ONES] if n == 0 else [])
+                row.extend([chip_state.placeholder(idx)] if n == 0 else [])
                 row.extend([None] * (len(_VOLATILE) - len(row)))
                 break
             try:

@@ -287,12 +287,21 @@ def is_lost(idx) -> bool:
         return str(idx) in _lost
 
 
-def fence(ids: Iterable, reason: str, nodes: Optional[dict] = None) -> list:
+def fence(ids: Iterable, reason: str, nodes: Optional[dict] = None, *, unread: bool = False) -> list:
     """Stop the broker's own MMIO reads of chips read as dead (spec 03 I92/I97). Fast on purpose: the
     containment calls it before its first step, so it writes no journal line and reads no chip (the
-    node identity is a stat). Returns the newly fenced ones."""
+    node identity is a stat). Returns the newly fenced ones.
+
+    ``unread``: the chips were fenced on a suspicion (an AER record on their port, 04 I112), not on an
+    all-ones read. Until a real read returns all-ones (:func:`observe`), :func:`placeholder` gives None
+    for them, so no off-bus decision is taken on a value nobody read. A plain fence of an already fenced
+    chip marks its all-ones read."""
     want = [str(i) for i in ids]
     with _lock:
+        if not unread:
+            for i in want:
+                if i in _fenced:
+                    _fenced[i]["ones"] = True
         want = [i for i in want if i not in _fenced]
     if not want:
         return []
@@ -312,9 +321,22 @@ def fence(ids: Iterable, reason: str, nodes: Optional[dict] = None) -> list:
                 "node": idents[idx],
                 "next": NEVER,
                 "read": now,
+                "ones": not unread,
             }
             fresh.append(idx)
     return fresh
+
+
+def placeholder(idx):
+    """The value a reader reports for chip ``idx`` when it skips the chip's read: ALL_ONES for a chip
+    lost or fenced on an all-ones read, None (unread) for one fenced only on a suspicion and not yet
+    read all-ones (:func:`fence` ``unread``). Every off-bus test counts ALL_ONES only."""
+    idx = str(idx)
+    with _lock:
+        if idx in _lost:
+            return ALL_ONES
+        rec = _fenced.get(idx)
+        return None if rec is not None and not rec.get("ones", True) else ALL_ONES
 
 
 def unfence(idx, why: str = "") -> bool:
@@ -484,7 +506,12 @@ def reprobe_due(ids: Optional[Iterable] = None) -> None:
 
 def observe(idx, value) -> None:
     """A real heartbeat read of a lost or fenced chip: a counter that is not all-ones means it is back."""
-    if isinstance(value, int) and value != ALL_ONES:
+    if value == ALL_ONES:
+        with _lock:
+            rec = _fenced.get(str(idx))
+            if rec is not None:
+                rec["ones"] = True
+    elif isinstance(value, int):
         if is_lost(idx):
             clear_lost(idx, "answering again")
         else:

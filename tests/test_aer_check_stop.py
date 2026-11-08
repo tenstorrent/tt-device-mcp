@@ -391,3 +391,57 @@ def test_the_watch_runs_on_its_own_thread_and_stops(rig, monkeypatch):
         w.stop()
         w.thread.join(1)
     assert ("kill", FABRIC) in log and w.thread.name == "check-aer-watch" and not w.thread.is_alive()
+
+
+@pytest.mark.parametrize("mid_row", [False, True])
+def test_a_chip_fenced_on_a_port_aer_is_never_removed_on_a_value_nobody_read(rig, monkeypatch, mid_row):
+    """04 I112 / 03 I97: the AER fence of every chip under the port is a suspicion, not an all-ones read.
+    The sampler's skipped read of such a chip (probe not due, or fenced mid-row) is unread, never
+    ALL_ONES, so the next poll's off-bus test (aer_stop_offbus) does not PCI-remove a chip that answers."""
+    from tt_device_mcp.health import ALL_ONES, chip_state
+    from tt_device_mcp.health.monitors import pci
+
+    for idx in ("13", "14"):
+        node = pci.SYSFS_CLASS_DIR / f"tenstorrent!{idx}"
+        node.mkdir(parents=True, exist_ok=True)
+        for n, attr in enumerate(pci._VOLATILE):
+            (node / attr).write_text(f"{100 + n}\n")
+    w, clock, log, feed = rig
+    feed(_sig(0), _sig(1))
+    assert w.poll_once() is None
+    clock.t += telemetry.LINK_WATCH_SEC
+    assert w.poll_once()
+    assert chip_state.is_fenced("13") and w.pending_stop
+    if mid_row:
+        # The fence lands while the sampler is between chip 13's reads: its row is cut short.
+        real = chip_state.read_blocked
+        monkeypatch.setattr(chip_state, "is_fenced", lambda i: False)
+        monkeypatch.setattr(chip_state, "read_blocked", lambda i: str(i) == "13" and real(i))
+    # Within PROBE_MIN_SEC of the fence: chip 13 is reported without a read.
+    sample = pci.chip_sample()
+    assert sample["14"][0] == 100 and sample["13"][0] != ALL_ONES, sample
+    removed = []
+    monkeypatch.setattr(srv.sampler, "contain_on_thread", lambda chips, *a, **k: removed.append(list(chips)) or {})
+    srv.sampler.ring.append({"ts": time.time() + 0.5, "chips": sample})
+    assert srv.sampler.aer_stop_offbus(["13"]) == ([], [])
+    clock.t += telemetry.LINK_WATCH_SEC
+    w.poll_once()
+    assert removed == [], f"a chip nobody read was contained (PCI remove): {removed}"
+
+
+def test_a_real_all_ones_read_of_a_suspect_fenced_chip_still_counts():
+    """The unread placeholder lasts only until a real read: once a probe read returns all-ones, the
+    skipped reads report ALL_ONES again, so a chip truly off the bus is still contained fast."""
+    from tt_device_mcp.health import ALL_ONES, chip_state
+
+    chip_state.fence(["5"], "AER on the port", unread=True)
+    assert chip_state.placeholder("5") is None
+    chip_state.observe("5", ALL_ONES)
+    assert chip_state.placeholder("5") == ALL_ONES
+    chip_state.fence(["6"], "AER on the port", unread=True)
+    chip_state.fence(["6"], "read all-ones")
+    assert chip_state.placeholder("6") == ALL_ONES
+    chip_state.fence(["7"], "read all-ones")
+    assert chip_state.placeholder("7") == ALL_ONES
+    chip_state.observe("5", 42)
+    assert not chip_state.is_fenced("5")
