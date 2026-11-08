@@ -4109,126 +4109,154 @@ async def test_a_link_drop_after_clean_jobs_pays_at_most_one_fabric_pass_per_int
     assert calls["resets"] == 0
 
 
-def _noop_failure_gate(monkeypatch, tmp_path, *, eth=(True, "all active eth cores advancing"), chips=4, armed=True):
-    """A post-job gate after a failed job, with a green fabric pass 2s ago. Spec 03 I36."""
+def _clean_exit_gate(monkeypatch, tmp_path, *, eth=(True, "all active eth cores advancing"), chips=4, armed=True):
+    """A post-job gate after a job that failed in a clean software exit, with a green last fabric verdict and no device
+    event during the job. Spec 03 I36."""
     calls = _clean_post_job_gate(monkeypatch, tmp_path, eth=eth, chips=chips, armed=armed)
     monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", True)
-    srv.last_fabric_check_monotonic = srv.time.monotonic() - 2.0
+    monkeypatch.setattr(srv, "_pcie_cycle", {"job": "093", "job_rows": []})
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    monkeypatch.setattr(srv, "_kill_reset_debt", lambda: "")
+    monkeypatch.setattr(srv, "_post_reset_debt", lambda: "")
     return calls
 
 
 @pytest.mark.asyncio
-async def test_a_failed_job_that_never_reached_the_device_skips_the_forced_pass_after_a_fresh_green_one(
-    monkeypatch, tmp_path
-):
-    """Spec 03 I36. box A: a job failed in 0s on a missing directory, the gate forced a full traffic pass 2s after a
-    green one, and the host died ~9s into it."""
-    calls = _noop_failure_gate(monkeypatch, tmp_path)
+@pytest.mark.parametrize("pass_age_sec", [2.0, 6 * 3600.0])
+async def test_a_clean_software_exit_skips_the_forced_fabric_pass_and_journals_it(monkeypatch, tmp_path, pass_age_sec):
+    """Spec 03 I36. A job failed on a plain Python PermissionError (exit 1) and the gate forced a full traffic pass on
+    a mesh every quick check had passed; chips dropped inside it. However old the last green pass, a clean software
+    exit gets the eth read instead, and the skip is journaled with its exit code."""
+    calls = _clean_exit_gate(monkeypatch, tmp_path)
+    srv.last_fabric_check_monotonic = srv.time.monotonic() - pass_age_sec
     events = []
     patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
 
-    await srv._verify_device_after_job(None, job_failed=True, noop_failure=True)
+    await srv._verify_device_after_job(None, job_failed=True, clean_exit_code=1)
 
-    skipped = [f for kind, f in events if kind == "forced_fabric_skipped"]
-    assert skipped and skipped[0]["phase"] == "post-job", f"the skip was not journaled: {events}"
+    skipped = [f for kind, f in events if kind == "post_job_fabric_skipped"]
+    assert skipped == [{"phase": "post-job", "reason": "clean_software_exit", "exit_code": 1}], events
     assert calls["eth"] == 1, "the skipped pass was not replaced by the eth read"
     assert calls["eth_timeout"] == ETH_POST_JOB_TIMEOUT_SEC
-    assert calls["fabric"] == 0, "a job that never opened the device forced a second traffic pass"
+    assert calls["fabric"] == 0, "a clean software exit with every quick check OK forced a traffic pass"
     assert calls["resets"] == 0
     assert srv.fsm.state is ServerState.HEALTHY
+
+
+_AER_ROW = {"chip": 3, "bdf": "0000:41:00.0", "root_port": "0000:40:01.1", "tray": 2, "aer": {"correctable": 1}}
+_BUS_ROW = {"chip": 3, "bdf": "0000:41:00.0", "root_port": "0000:40:01.1", "tray": 2, "gone": True}
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "case",
-    ["job-touched-device", "stale-pass", "no-pass-yet", "last-pass-failed", "no-verdict-yet", "disarmed", "dirty"],
+    [
+        "not-a-clean-exit",
+        "last-pass-failed",
+        "no-verdict-yet",
+        "disarmed",
+        "dirty",
+        "aer-during-job",
+        "off-bus-during-job",
+        "contained-chip",
+        "reported-fault",
+        "reset-owed",
+    ],
 )
 async def test_a_failed_job_still_forces_the_fabric_pass_unless_every_skip_condition_holds(monkeypatch, tmp_path, case):
-    """Spec 03 I36. The skip needs all of: a job that never reached the device, a green verdict under
-    NOOP_FAILURE_FABRIC_FRESH_SEC old, an armed eth rung and a clean HEALTHY device."""
-    calls = _noop_failure_gate(monkeypatch, tmp_path, armed=case != "disarmed")
-    noop = case != "job-touched-device"
-    if case == "stale-pass":
-        srv.last_fabric_check_monotonic = srv.time.monotonic() - srv.NOOP_FAILURE_FABRIC_FRESH_SEC - 1
-    elif case == "no-pass-yet":
-        srv.last_fabric_check_monotonic = 0.0
-    elif case == "last-pass-failed":
+    """Spec 03 I36. The skip needs all of: a clean software exit, a green last verdict, an armed eth rung, a clean
+    HEALTHY device and no device event during the job (AER, link or bus change, contained chip, reported fault, a
+    reset owed). Anything else keeps the forced pass."""
+    calls = _clean_exit_gate(monkeypatch, tmp_path, armed=case != "disarmed")
+    events = []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+    code = None if case == "not-a-clean-exit" else 1
+    if case == "last-pass-failed":
         monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", False)
     elif case == "no-verdict-yet":
         monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", None)
     elif case == "dirty":
         fsm_dirty(srv, "job 090 crashed", why="job_killed")
+    elif case == "aer-during-job":
+        monkeypatch.setattr(srv, "_pcie_cycle", {"job": "093", "job_rows": [_AER_ROW]})
+    elif case == "off-bus-during-job":
+        monkeypatch.setattr(srv, "_pcie_cycle", {"job": "093", "job_rows": [_BUS_ROW]})
+    elif case == "contained-chip":
+        monkeypatch.setattr(srv, "isolated_chips", {"3"})
+    elif case == "reported-fault":
+        monkeypatch.setattr(srv, "device_fault_reported", "ARC not ready")
+    elif case == "reset-owed":
+        monkeypatch.setattr(srv, "_post_reset_debt", lambda: "a reset with no passing fabric pass since")
 
-    await srv._verify_device_after_job(None, job_failed=True, noop_failure=noop)
+    await srv._verify_device_after_job(None, job_failed=True, clean_exit_code=code)
 
-    assert calls["fabric"] == 1, f"{case}: a failed job handed the mesh on without the forced pass"
-
-
-@pytest.mark.asyncio
-async def test_a_frozen_eth_read_after_a_skipped_forced_pass_holds_without_a_reset(monkeypatch, tmp_path):
-    """Spec 03 I36 + I16. The eth read that replaces the forced pass keeps its verdict: a frozen core
-    holds the door with no reset and no traffic pass."""
-    calls = _noop_failure_gate(monkeypatch, tmp_path, eth=(False, "a frozen active-eth core: 0-25"))
-
-    await srv._verify_device_after_job(None, job_failed=True, noop_failure=True)
-
-    assert calls["fabric"] == 0, "ran the traffic pass on a frozen core"
-    assert calls["resets"] == 0
-    assert srv.fsm.record.why == "eth_frozen"
-    assert srv._device_unavailable_for_tenant(), "the next tenant would be dispatched onto a frozen core"
+    assert calls["fabric"] >= 1, f"{case}: a failed job handed the mesh on without the forced pass"
+    assert not [e for e in events if e[0] == "post_job_fabric_skipped"], f"{case}: journaled a skip that did not hold"
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failed", ["snapshot", "eth-frozen", "eth-no-verdict"])
+async def test_a_failed_quick_check_after_a_clean_software_exit_ends_as_a_forced_pass_does(
+    monkeypatch, tmp_path, failed
+):
+    """Spec 03 I36. The skip rests on every quick check passing: when one fails, the gate ends exactly as a forced
+    pass ends today (the same traffic pass, reset and hold)."""
+    eth = {"eth-frozen": (False, "a frozen active-eth core: 0-25"), "eth-no-verdict": (None, "eth probe timed out")}
+
+    async def run(code, where):
+        where.mkdir()
+        calls = _clean_exit_gate(monkeypatch, where, eth=eth.get(failed, (True, "all active eth cores advancing")))
+        if failed == "snapshot":
+
+            async def bad_snapshot(expected):
+                return False, f"0 of {expected} chip(s) answered"
+
+            monkeypatch.setattr(srv.health_monitor, "_verify_device", bad_snapshot)
+        await srv._verify_device_after_job(None, job_failed=True, clean_exit_code=code)
+        return calls["fabric"], calls["resets"], srv.fsm.state, srv.fsm.record.why if srv.fsm.record else None
+
+    forced = await run(None, tmp_path / "forced")
+    skipped = await run(1, tmp_path / "clean")
+
+    assert skipped == forced, f"{failed}: a clean exit with a failed quick check ended {skipped}, a forced pass {forced}"
+    if failed == "eth-no-verdict":
+        assert skipped[0] == 1, "an eth read with no verdict let the mesh through without the traffic pass"
+    else:
+        assert skipped[2] is not ServerState.HEALTHY, f"{failed}: released a mesh a quick check failed"
+
+
 @pytest.mark.parametrize(
-    "detail", ["eth probe timed out after 9s", "skipped (eth links unverified): measured 11 of 12 links"]
-)
-async def test_an_eth_read_with_no_verdict_after_a_skipped_forced_pass_runs_the_pass(monkeypatch, tmp_path, detail):
-    """Spec 03 I36. The skip rests on the eth read being OK."""
-    from tt_device_mcp.health.monitor import ETH_LINK_DROP_SKIP
-
-    assert ETH_LINK_DROP_SKIP in detail or "timed out" in detail
-    calls = _noop_failure_gate(monkeypatch, tmp_path, eth=(None, detail))
-
-    await srv._verify_device_after_job(None, job_failed=True, noop_failure=True)
-
-    assert calls["eth"] == 1
-    assert calls["fabric"] == 1, "an eth read with no verdict let a failed job's mesh through unchecked"
-    assert srv.fsm.state is ServerState.HEALTHY
-
-
-@pytest.mark.parametrize(
-    "status, exit_code, runtime, expected",
+    "status, exit_code, expected",
     [
-        ("FAILED", 1, 0.0, True),  # box A job 091: `cd` into a missing directory, 0s
-        ("FAILED", 1, 1.9, True),
-        ("FAILED", 127, 0.1, True),  # command not found at once
-        ("FAILED", 126, 0.1, True),  # not executable at once
-        ("FAILED", 127, 40.0, False),  # set -e script that used the device, then hit a missing command
-        ("FAILED", 126, 40.0, False),
-        ("FAILED", 127, 2.0, False),
-        ("FAILED", 127, None, False),
-        ("FAILED", 1, 2.0, False),  # long enough to have opened the device
-        ("FAILED", 1, None, False),  # no runtime known: assume it did
-        ("FAILED", None, 0.0, False),  # no exit code of its own: a runner error ended it
-        ("FAILED", 139, 0.0, False),  # signal death: wedge-risk, never a no-op
-        ("FAILED", -9, 0.0, False),
-        ("TIMEOUT", None, 0.5, False),
-        ("KILLED", None, 0.5, False),
-        ("HUNG", None, 0.5, False),
-        ("COMPLETED", 0, 0.5, False),
+        ("FAILED", 1, 1),  # a plain Python PermissionError
+        ("FAILED", 2, 2),
+        ("FAILED", 127, 127),  # command not found, after device work or not
+        ("FAILED", 126, 126),
+        ("FAILED", 128, 128),
+        ("FAILED", 160, 160),
+        ("FAILED", 0, None),
+        ("FAILED", None, None),  # no exit code of its own: a runner error ended it
+        ("FAILED", 137, None),  # SIGKILL, shell convention
+        ("FAILED", 139, None),  # SIGSEGV
+        ("FAILED", 129, None),
+        ("FAILED", 159, None),
+        ("FAILED", -9, None),  # SIGKILL, waitpid convention
+        ("FAILED", -6, None),
+        ("TIMEOUT", 1, None),
+        ("TIMEOUT", None, None),
+        ("KILLED", 1, None),
+        ("HUNG", 1, None),
+        ("PREEMPTED", 1, None),
+        ("COMPLETED", 0, None),
     ],
 )
-def test_job_never_reached_device(status, exit_code, runtime, expected):
-    """Spec 03 I36: which failed jobs count as never having reached the device."""
-    start = datetime(2026, 10, 8, 12, 0, 0)
-    job = srv.Job(id="091", owner="tenant", workspace="/tmp", command="cd missing && run", queued_at="t")
+def test_clean_software_exit_code(status, exit_code, expected):
+    """Spec 03 I36: which failed jobs ended in a clean software exit."""
+    job = srv.Job(id="091", owner="tenant", workspace="/tmp", command="python train.py", queued_at="t")
     job.status = srv.JobStatus[status]
     job.exit_code = exit_code
-    job.started_at = start.isoformat()
-    if runtime is not None:
-        job.finished_at = (start + timedelta(seconds=runtime)).isoformat()
 
-    assert srv._job_never_reached_device(job) is expected
+    assert srv._clean_software_exit_code(job) == expected
 
 
 @pytest.mark.asyncio
@@ -4599,7 +4627,7 @@ async def test_broker_row_times_the_stage_it_names(monkeypatch):
 def _quiet_post_job_gate(monkeypatch):
     """The post-job gate is not what these tests are about; keep the runner off the device."""
 
-    async def _noop(job_log_file, job_failed=False, noop_failure=False):
+    async def _noop(job_log_file, job_failed=False, clean_exit_code=None):
         return None
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _noop)
@@ -6258,7 +6286,7 @@ async def test_a_full_log_disk_ends_neither_the_job_nor_the_runner(monkeypatch, 
     _no_workspace_activation(monkeypatch)
     gates = []
 
-    async def _gate(job_log_file, job_failed=False, noop_failure=False):
+    async def _gate(job_log_file, job_failed=False, clean_exit_code=None):
         gates.append(job_failed)
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
@@ -6307,7 +6335,7 @@ async def test_a_full_log_disk_still_gates_a_failed_job_before_the_next(monkeypa
     _no_workspace_activation(monkeypatch)
     gates = []
 
-    async def _gate(job_log_file, job_failed=False, noop_failure=False):
+    async def _gate(job_log_file, job_failed=False, clean_exit_code=None):
         gates.append((job_failed, second.status))
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
@@ -6366,7 +6394,7 @@ async def test_an_error_escaping_job_cleanup_fails_closed(monkeypatch, clear_job
     monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: None)
     gates = []
 
-    async def _gate(job_log_file, job_failed=False, noop_failure=False):
+    async def _gate(job_log_file, job_failed=False, clean_exit_code=None):
         gates.append((job_failed, srv.fsm.record.dirty, second.status))
         srv._clear_device_dirty(verified=True, why="test gate: verified healthy")
 
@@ -6407,7 +6435,7 @@ async def test_an_error_escaping_before_spawn_forgets_the_queued_spec(monkeypatc
     monkeypatch.setattr(srv, "get_activation_script", _boom)
     gates = []
 
-    async def _gate(job_log_file, job_failed=False, noop_failure=False):
+    async def _gate(job_log_file, job_failed=False, clean_exit_code=None):
         gates.append(job_failed)
         srv._clear_device_dirty(verified=True, why="test gate: verified healthy")
 
@@ -6459,7 +6487,7 @@ async def test_a_fail_closed_gate_holds_the_idle_self_test_off_until_it_ends(mon
         monkeypatch.setattr(srv, "get_activation_script", _boom)
     seen = []
 
-    async def _gate(job_log_file, job_failed=False, noop_failure=False):
+    async def _gate(job_log_file, job_failed=False, clean_exit_code=None):
         seen.append(srv.post_job_gate_pending)
         srv._clear_device_dirty(verified=True, why="test gate: verified healthy")
 
@@ -15196,26 +15224,25 @@ async def test_the_dispatch_recheck_off_switch_tenant_and_errors(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "command, exit_code, max_runtime, expected",
+    "command, exit_code, expected",
     [
-        ("cd /nonexistent-t161", 1, 2.0, True),
-        ("cd /nonexistent-t161", 1, 0.0, False),
-        ("tt-device-mcp-no-such-command-t175", 127, 2.0, True),
-        ("tt-device-mcp-no-such-command-t175", 127, 0.0, False),
+        ("cd /nonexistent-t161", 1, 1),
+        ("python3 -c 'raise PermissionError(13)' 2>/dev/null", 1, 1),
+        ("tt-device-mcp-no-such-command-t175", 127, 127),
+        ("exit 137", 137, None),  # a SIGKILLed child, as the shell reports it
     ],
 )
-async def test_the_runner_tells_the_post_job_gate_when_a_failed_job_never_reached_the_device(
-    monkeypatch, clear_job_state, command, exit_code, max_runtime, expected
+async def test_the_runner_tells_the_post_job_gate_when_a_failed_job_ended_in_a_clean_software_exit(
+    monkeypatch, clear_job_state, command, exit_code, expected
 ):
-    """Spec 03 I36. The runner hands the gate its no-op verdict for a failed job: box A's job 091 (`cd` into a missing
-    directory, 0s) is one, and the same exit past the runtime bound is not."""
+    """Spec 03 I36. The runner hands the gate the exit code of a failed job that exited by itself on a code of its own,
+    however long it ran; a signal exit hands it nothing, so the forced pass stands."""
     _free_device_lock(monkeypatch)
     _no_workspace_activation(monkeypatch)
-    monkeypatch.setattr(srv, "NOOP_FAILURE_MAX_RUNTIME_SEC", max_runtime)
     gates = []
 
-    async def _gate(job_log_file, job_failed=False, noop_failure=False):
-        gates.append((job_failed, noop_failure))
+    async def _gate(job_log_file, job_failed=False, clean_exit_code=None):
+        gates.append((job_failed, clean_exit_code))
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
     job = srv.Job(id="091", owner="tenant", workspace="/tmp", command=command, queued_at="t")
@@ -15259,11 +15286,10 @@ async def test_a_startup_gate_77_leaves_a_77_only_hold_that_no_path_resets(monke
 @pytest.mark.asyncio
 @pytest.mark.parametrize("where", ["before-spawn", "after-spawn"])
 async def test_a_runner_error_still_forces_the_post_job_fabric_pass(monkeypatch, clear_job_state, tmp_path, where):
-    """Spec 03 I36. A job the runner itself ended on an error is never a no-op failure, however fast: before the spawn
-    it has no exit code of its own, and after the spawn the broker ended a job that may hold the device."""
+    """Spec 03 I36. A job the runner itself ended on an error is never a clean software exit, however fast: before the
+    spawn it has no exit code of its own, and after the spawn the broker ended a job that may hold the device."""
     _free_device_lock(monkeypatch)
     _no_workspace_activation(monkeypatch)
-    monkeypatch.setattr(srv, "NOOP_FAILURE_MAX_RUNTIME_SEC", 60.0)
     command = "echo one"
     if where == "before-spawn":
 
@@ -15282,8 +15308,8 @@ async def test_a_runner_error_still_forces_the_post_job_fabric_pass(monkeypatch,
         command = "trap 'kill $! 2>/dev/null || true; exit 7' INT; echo hi; sleep 30 & wait"
     gates = []
 
-    async def _gate(job_log_file, job_failed=False, noop_failure=False):
-        gates.append((job_failed, noop_failure))
+    async def _gate(job_log_file, job_failed=False, clean_exit_code=None):
+        gates.append((job_failed, clean_exit_code))
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
     job = srv.Job(id="092", owner="tenant", workspace="/tmp", command=command, queued_at=datetime.now().isoformat())
@@ -15298,7 +15324,7 @@ async def test_a_runner_error_still_forces_the_post_job_fabric_pass(monkeypatch,
         if where == "after-spawn":
             assert job.exit_code == 7, "precondition: the job exited on its own code inside the bound"
         assert "broker cleanup" not in (job.error or ""), "the runner's own completion path did not run"
-        assert gates == [(True, False)], "a runner error was handed to the gate as a no-op failure"
+        assert gates == [(True, None)], "a runner error was handed to the gate as a clean software exit"
     finally:
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
