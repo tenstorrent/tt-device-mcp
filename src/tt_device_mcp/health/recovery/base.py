@@ -19,6 +19,7 @@ from typing import Awaitable, Callable, Optional
 
 from tt_device_mcp import metrics, privileges
 from tt_device_mcp.constants import DEVICE_RESET_OVERRUN_SEC, DEVICE_RESET_TIMEOUT_SEC
+from tt_device_mcp.health import cpld_dump
 from tt_device_mcp.health.evidence import health_dir, health_event
 
 # System-broker resets run as transient scopes under this prefix so PID 1 owns them.
@@ -164,6 +165,49 @@ class RecoveryMechanism:
         # ladder is blocked / exhausted" event to once per episode instead of every gate pass on a
         # held box.
         self._auto_recovery_denied_episode = ""
+
+        # The vendor CPLD DIAG dump owed before recovery (spec 04 I18). ``cpld_episode`` names the
+        # open fault episode (fsm.boot binds it to the FSM record's ``since``); "" means none is
+        # open and no dump is owed. One dump task per episode, shared by every rung that awaits it.
+        self.cpld_episode: Callable[[], str] = lambda: ""
+        self._cpld_task: Optional[asyncio.Task] = None
+        self._cpld_task_episode = ""
+
+    def cpld_dump_start(self, trigger: str, log) -> Optional[asyncio.Task]:
+        """Start the episode's CPLD dump in a worker thread if it has not been taken yet; return its
+        task (None: no episode, already dumped, switched off, or no running loop). Never raises."""
+        try:
+            episode = self.cpld_episode()
+            if not episode or os.environ.get("TT_DEVICE_MCP_CPLD_DUMP", "1") == "0":
+                return None
+            if self._cpld_task_episode == episode:
+                return self._cpld_task
+            if cpld_dump.dumped_episode() == episode:
+                return None
+            loop = asyncio.get_running_loop()
+        except Exception:  # noqa: BLE001 - no loop (a sampler thread) or a broken accessor: the reset site retries
+            return None
+        cpld_dump.mark_episode(episode)
+        self._cpld_task_episode = episode
+        self._cpld_task = loop.create_task(asyncio.to_thread(cpld_dump.take_dump, trigger, episode, log))
+        return self._cpld_task
+
+    async def cpld_dump_before_recovery(self, trigger: str, log) -> None:
+        """Await the episode's CPLD dump before a rung resets or re-powers anything (spec 04 I18).
+        Bounded by :func:`cpld_dump.total_bound_sec`; a dump that fails, raises or overruns is
+        logged and recovery proceeds. Never raises."""
+        try:
+            task = self.cpld_dump_start(trigger, log)
+            if task is None or task.done():
+                return
+            await asyncio.wait_for(asyncio.shield(task), cpld_dump.total_bound_sec())
+        except asyncio.TimeoutError:
+            log(f"cpld dump still running after {cpld_dump.total_bound_sec():.0f}s; recovery proceeds without it")
+            health_event("cpld_dump_skipped", trigger=trigger, episode=self._cpld_task_episode, skipped="overran the cap")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the dump must never stop recovery
+            log(f"cpld dump failed: {exc!r}; recovery proceeds")
 
     def cooling(self) -> bool:
         """True while a reset that already failed is still inside its cooldown window.
@@ -517,6 +561,7 @@ class RecoveryMechanism:
         """
         # Name the command we are actually running. This was hardcoded to the galaxy's -glx_reset, so on
         # every other machine the queue told operators a command that was not the one executing.
+        await self.cpld_dump_before_recovery("reset", log)
         self._set_device_op_detail(f"device reset: {' '.join(argv)} (~60s)")
         quiesced = await self._set_device_pollers(False, log)
         # A reset takes the chips off the bus — that is what it does — so for its duration they
@@ -819,6 +864,7 @@ class RecoveryMechanism:
             return
         self._write_action_log(row_owner, f"{label} — {reason}", 0.0, action, None)
         health_event(f"auto_{ev}_request", reason=reason)
+        await self.cpld_dump_before_recovery(ev, log)
         log(f"{label.upper()}: {detail} ({reason}); opted in + within limits — requesting it now")
         try:
             await asyncio.to_thread(fire)

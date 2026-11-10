@@ -423,6 +423,7 @@ class Recovery(ABC):
             # the identical no-op. Firing a rung that cannot work here only delays the next one, so
             # record the chip inapplicable and fall through now (the incident burnt ~64s spinning
             # a no_bridge reset 3x per gone chip, then again on the stuck-hold escalation).
+            await self.mechanism.cpld_dump_before_recovery("bridge_reset", log)
             for attempt in range(BRIDGE_RESET_MAX_TRIES):
                 result = await asyncio.to_thread(reset_chip_via_bridge, idx, bdf)
                 if result:

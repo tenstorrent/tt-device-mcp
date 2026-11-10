@@ -287,6 +287,10 @@ def isolate_device_state(monkeypatch, tmp_path_factory, device_marked, device_pr
     # fresh on every write_textfile() call (never cached), so any path through the stats
     # persistence loop that reaches it in a test would mkdir a real host path.
     monkeypatch.setenv("TT_DEVICE_MCP_TEXTFILE_DIR", str(tmp_path_factory.mktemp("no-textfile-dir")))
+    # The CPLD dump (spec 04 I18) runs the host's real vendor DIAG through sudo ipmitool, which the
+    # spawn tripwire cannot see behind bash/sudo: off for every test; test_cpld_dump turns it on
+    # against its own fake script and fake ipmitool.
+    monkeypatch.setenv("TT_DEVICE_MCP_CPLD_DUMP", "0")
     # The gate's history lives in module globals — whether a reset just failed, when the
     # fabric was last proved. A test that leaves those set silently changes what the NEXT
     # test's gate decides to do, which is a debugging session nobody wants.

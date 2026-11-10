@@ -240,6 +240,21 @@ each rung fires only when the gentler one failed or cannot apply.
   an unprivileged caller, and that rc would arm the cooldown against a reset that never ran.
   Reading a scope is a separate question from starting one — `scope_active` keys on systemd alone,
   so an unprivileged daemon still adopts a root broker's reset rather than racing it (I5).
+- **I18 — The vendor CPLD dump comes before recovery, once per fault episode.** A reset or
+  re-power clears the CPLD state that says why a tray or chip dropped. So the first rung of an
+  episode (`reset_with_quiesce`, the all-rungs sweep, a UBB re-power, a bridge SBR, a host reboot
+  or power cycle) first awaits `RecoveryMechanism.cpld_dump_before_recovery`, and `on_fault`
+  starts the dump as soon as a degraded fault (`CPLD_DUMP_FAULTS`) opens an episode. The script is
+  the vendor's, unchanged: `/usr/local/bin/cpld-dump.sh` if present, else the V1.03.01 copy
+  pinned by sha256 (a mismatched copy never runs). Its raw stdout lands in
+  `HEALTH_DIR/cpld_dumps/`, and a `cpld_dump` health event carries the path, a one-line fail
+  summary, the script, which copy ran, its version and sha256. It holds the host-wide flock
+  `/run/lock/tt-cpld.lock`, shared with tray-test, opened so root and a user can both take it.
+  It saves each UBB CPLD's debug index (0x50) before and restores and reads it back after.
+  Bounds: a lock wait, a DIAG cap (about 5 s per tray x 4 trays, doubled) and per-call IPMI
+  timeouts. A busy lock, a missing script, a timeout or an error journals `cpld_dump_skipped`
+  with its reason. Recovery always follows. The dumped episode is persisted, so a restart does
+  not dump it again. `TT_DEVICE_MCP_CPLD_DUMP=0` switches it off.
 
 ## Interfaces
 
@@ -499,6 +514,12 @@ NOT be conflated when reading results.
 | I17 the device-scoped resets need no privilege | `tests/test_rung_privilege.py::test_the_device_scoped_resets_survive_without_systemd` |
 | I17 each probe measures a capability, not a declaration | `tests/test_privileges.py::test_root_is_euid_zero_not_the_login_user`, `::test_systemd_is_the_runtime_directory_not_a_binary_on_path`, `::test_setpci_needs_the_binary_and_root`, `::test_ipmi_needs_the_binary_and_a_node_it_can_open`, `::test_an_unopenable_ipmi_node_is_not_a_reachable_bmc` |
 | I17 boot states the privileges, and each OFF rung names the one it lacked | `tests/test_rung_privilege.py::test_boot_states_the_privileges_it_measured`, `::test_the_inventory_names_the_privilege_a_rung_lacked`, `::test_the_bridge_rung_names_which_half_it_lacks`, `tests/test_privileges.py::test_the_snapshot_names_every_probe_for_the_boot_line` |
+| I18 dump before the reset, recovery still runs on failure or timeout | `tests/test_cpld_dump.py::test_the_dump_comes_before_the_reset`, `::test_a_failing_dump_still_lets_recovery_run`, `::test_a_hung_dump_is_killed_at_the_cap_and_recovery_runs` |
+| I18 one dump per episode, across rungs and restarts | `tests/test_cpld_dump.py::test_one_dump_per_episode`, `::test_no_episode_no_dump`, `::test_a_degraded_fault_starts_the_dump` |
+| I18 the event log carries path, summary, script and sha | `tests/test_cpld_dump.py::test_the_event_names_path_summary_and_script`, `::test_raw_stdout_is_saved_unchanged` |
+| I18 host copy first, pinned copy only on its sha | `tests/test_cpld_dump.py::test_host_script_wins`, `::test_a_pinned_copy_with_the_wrong_sha_never_runs` |
+| I18 the host-wide lock: held during the dump, busy skips | `tests/test_cpld_dump.py::test_the_lock_is_held_while_the_dump_runs`, `::test_a_busy_lock_skips_with_a_reason`, `::test_the_lock_opens_an_existing_file_without_o_creat` |
+| I18 index 0x50 saved, restored, verified | `tests/test_cpld_dump.py::test_the_debug_index_is_restored_and_verified`, `::test_an_index_that_does_not_restore_is_named` |
 | I1/I2 platform selection: declared mode wins; unknown → per-target | `tests/test_recovery_select.py::test_declared_mode_wins`, `tests/test_recovery_select.py::test_unknown_falls_to_per_target_loud`, `tests/test_recovery_select.py::test_loudbox_declares_per_target` |
 | Boot-time platform commit / per-pass fallback | `tests/test_boot_platform.py::test_a_declared_mode_commits_without_touching_the_device`, `tests/test_boot_platform.py::test_a_probe_that_reads_galaxy_boards_commits_the_galaxy_ladder`, `tests/test_boot_platform.py::test_an_unreadable_mesh_commits_nothing_and_keeps_the_per_pass_fallback`, `tests/test_boot_platform.py::test_a_committed_platform_short_circuits_per_pass_selection` |
 | Galaxy derivation: unanimous-or-unknown from tt-smi | `tests/test_reset.py::test_an_unidentifiable_board_is_unknown_not_non_galaxy`, `tests/test_reset.py::test_boards_must_agree`, `tests/test_reset.py::test_the_galaxy_list_comes_from_tt_smi_not_from_here` |

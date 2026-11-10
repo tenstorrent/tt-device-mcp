@@ -1151,6 +1151,8 @@ class GalaxyRecovery(Recovery):
         rung, so the two can never drift apart. Never verifies and never raises: a rung that fails to
         launch is logged and the next one is issued anyway — before a reboot or a power cycle there is
         nothing left to lose. The caller owns the guards (tenant, scope), the settle and the verify."""
+        # The CPLD dump comes before the first rung (SBR), not just before the re-power (spec 04 I18).
+        await self.mechanism.cpld_dump_before_recovery("all_rungs", log)
         # Hold reset_in_flight across the whole sweep so the dead-chip sampler defers instead of
         # isolating a tray mid-reset. Cleared on every exit.
         self.mechanism.reset_in_flight = True
@@ -2041,6 +2043,7 @@ class GalaxyRecovery(Recovery):
                     host_at_risk=True,
                 )
                 log(f"per-tray BMC reset {step + 1}/{len(walk)} ({role}): re-powering tray {tray}: `{command}`")
+                await self.mechanism.cpld_dump_before_recovery("ubb_repower", log)
                 try:
                     await asyncio.to_thread(_fire_ubb_reset, bitmap, tray_chip_ids)
                 except Exception as exc:  # noqa: BLE001 - a fire that did not launch falls through, never raises
