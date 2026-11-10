@@ -40,6 +40,16 @@ def _proc_state(pid: int) -> str:
         return ""
 
 
+def _stopped(pid: int, within: float = 5.0) -> bool:
+    """A stop is delivered asynchronously: on a loaded host /proc shows it a little after killpg returns."""
+    deadline = time.monotonic() + within
+    while _proc_state(pid) != "T":
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
 @pytest.fixture
 def signals(monkeypatch):
     """Every killpg the code under test sends, in order, still delivered."""
@@ -112,7 +122,7 @@ async def test_a_latch_during_the_check_ends_it_at_once_with_no_verdict(monkeypa
     ok, detail = await asyncio.wait_for(task, 10)
     assert time.monotonic() - t0 < 2, "no wait for the check's own timeout"
     assert ok is None and "PCI-wedged" in detail, detail
-    assert _proc_state(pid) == "T", "the reader is left stopped"
+    assert _stopped(pid), "the reader is left stopped"
     assert not [s for p, s in signals if p == pid and s in EXIT_SIGNALS], signals
     assert calls == [], "no terminate ladder"
     assert m.last_fabric_ok is None and FABRIC_DEBT.owed, "no verdict, and a full pass is owed"
@@ -144,7 +154,7 @@ async def test_a_timed_out_check_under_the_latch_is_stopped_not_killed(monkeypat
     assert calls == [], "the SIGINT/SIGTERM/SIGKILL ladder never runs under the latch"
     assert (pid, signal.SIGSTOP) in signals
     assert not [s for p, s in signals if p == pid and s in EXIT_SIGNALS], signals
-    assert _proc_state(pid) == "T"
+    assert _stopped(pid)
 
 
 @pytest.mark.asyncio
@@ -158,7 +168,7 @@ async def test_a_holder_the_valve_refused_to_kill_gets_no_kill(monkeypatch, chec
     how = await srv._terminate_check_reader(proc.pid)
     assert "kill refused" in how and calls == []
     assert not [s for p, s in signals if p == proc.pid and s in EXIT_SIGNALS], signals
-    assert _proc_state(proc.pid) == "T"
+    assert _stopped(proc.pid)
 
 
 @pytest.mark.asyncio
@@ -197,7 +207,7 @@ async def test_the_latch_also_ends_the_terminate_wait(monkeypatch, signals, star
     t0 = time.monotonic()
     rc, _ = await asyncio.wait_for(task, 5)
     assert rc is None and time.monotonic() - t0 < 2
-    assert started and _proc_state(started[0]) == "T"
+    assert started and _stopped(started[0])
     assert not [s for p, s in signals if p == started[0] and s in EXIT_SIGNALS], signals
 
 
