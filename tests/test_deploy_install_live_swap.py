@@ -303,8 +303,8 @@ def _validator_bindir(tmp: Path) -> Path:
 def _pin(tmp: Path, sha: str, patches: str = "") -> Path:
     pin = tmp / f"pin-{sha}"
     pin.write_text(
-        (f'TTDEV_VALIDATOR_PATCHES="{patches}"\n' if patches else "") +
-        "TTDEV_VALIDATOR_REPO=https://example.invalid/tt-metal.git\n"
+        (f'TTDEV_VALIDATOR_PATCHES="{patches}"\n' if patches else "")
+        + "TTDEV_VALIDATOR_REPO=https://example.invalid/tt-metal.git\n"
         f"TTDEV_VALIDATOR_SHA={sha}\n"
         "TTDEV_VALIDATOR_TOOLCHAIN=cmake/tc.cmake\n"
         "TTDEV_VALIDATOR_TARGET=a\nTTDEV_DISPATCH_TARGET=b\nTTDEV_PREJOB_DISPATCH_TARGET=c\n"
@@ -329,7 +329,12 @@ def _live_bins(root: Path, bins=_BINS) -> list[str]:
 
 
 def _run_validator(
-    tmp: Path, sha: str, live: list[str], root: str | None = None, patches: str = "", key: bool = False,
+    tmp: Path,
+    sha: str,
+    live: list[str],
+    root: str | None = None,
+    patches: str = "",
+    key: bool = False,
     relative: bool = False,
 ) -> subprocess.CompletedProcess:
     bindir = tmp / "vstubs" if (tmp / "vstubs").exists() else _validator_bindir(tmp)

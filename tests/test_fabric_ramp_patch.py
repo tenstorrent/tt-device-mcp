@@ -73,7 +73,7 @@ def test_ramp_knobs_default_to_one_chip_and_250_ms():
     added = "\n".join(ln[1:] for h in _hunks(_PATCH.read_text()) for ln in h if ln[0] == "+")
     assert 'ramp_env("TTDEV_FABRIC_RAMP_CHIPS", 1)' in added
     assert 'ramp_env("TTDEV_FABRIC_RAMP_GAP_MS", 250)' in added
-    assert set(re.findall(r'getenv\((\w+)\)', added)) == {"name"}, "no other knob"
+    assert set(re.findall(r"getenv\((\w+)\)", added)) == {"name"}, "no other knob"
 
 
 def test_ramp_changes_only_when_each_chip_starts_not_what_is_checked():
@@ -93,7 +93,12 @@ def test_broker_passes_the_ramp_knobs_through_and_keeps_the_pass_rule(tmp_path, 
     binary.parent.mkdir(parents=True)
     binary.write_text("#!/bin/sh\n")
     binary.chmod(0o755)
-    for var in ("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "TTDEV_FABRIC_BIN", "TTDEV_FABRIC_RUNTIME_ROOT", "TTDEV_FABRIC_DESCRIPTOR"):
+    for var in (
+        "TT_DEVICE_MCP_FABRIC_CHECK_CMD",
+        "TTDEV_FABRIC_BIN",
+        "TTDEV_FABRIC_RUNTIME_ROOT",
+        "TTDEV_FABRIC_DESCRIPTOR",
+    ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("TTDEV_VALIDATOR_ROOT", str(tmp_path))
     monkeypatch.setenv("TTDEV_FABRIC_CACHE", str(tmp_path / "cache"))
