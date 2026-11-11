@@ -2893,6 +2893,29 @@ each rung fires only when the gentler one failed or cannot apply.
   every cabled link that has just passed does (I32). Cost: one more mesh reset and its check (about
   70 s) on a drop that follows a failed reset in the same hold, in exchange for the full ladder
   before the power cycle.
+- **I109 — The vendor CPLD dump comes before recovery, once per fault episode.** A reset or
+  re-power clears the CPLD state that says why a tray or chip dropped. So the first rung of an
+  episode (`reset_with_quiesce`, the all-rungs sweep, a bridge SBR or a
+  power cycle) first awaits `RecoveryMechanism.cpld_dump_before_recovery`, and `on_fault`
+  starts the dump as soon as a degraded fault (`CPLD_DUMP_FAULTS`) opens an episode or arrives in
+  one already open. A plain reset of an episode whose fault is not degraded (a killed job's mesh
+  reset) takes no dump, so the dump stays owed to a drop that follows in the same episode. The script is
+  the vendor's, unchanged: `/usr/local/bin/cpld-dump.sh` if present, else the V1.03.01 copy
+  pinned by sha256 (a mismatched copy never runs). Its raw stdout lands in
+  `HEALTH_DIR/cpld_dumps/`, and a `cpld_dump` health event carries the path, a one-line fail
+  summary, the script, which copy ran, its version and sha256. It holds the host-wide flock
+  `/run/lock/tt-cpld.lock`, shared with any other CPLD reader, opened so root and a user can both take it.
+  It saves each UBB CPLD's debug index (0x50) before and restores and reads it back after.
+  Then one read-only `ipmitool sdr elist full` is saved raw beside the dump (`*_psu.txt`); the
+  event carries its path and the PSU and 12 V lines, or the read's error, which never fails the
+  dump. Bounds: a lock wait, a DIAG cap (about 5 s per tray x 4 trays, doubled) enforced by
+  `timeout -k` inside the privileged command so a root child is ended too, per-call IPMI
+  timeouts and a sensor-read cap. The first IPMI call that times out ends the BMC calls: before the
+  DIAG it skips the dump, after it the remaining restores and the sensor read. The power cycle's
+  dump is awaited before its escalation is recorded or `host_action_requested` is set, and the
+  reset's before the mesh preflight. A busy lock, a missing script, a BMC that does not answer, a
+  timeout or an error journals `cpld_dump_skipped` with its reason. Recovery always follows. The dumped episode is persisted, so a restart does
+  not dump it again. `TT_DEVICE_MCP_CPLD_DUMP=0` switches it off.
 
 - **I112 — Fabric checks, bridge resets and power-cycle requests run with device readers stopped and
   verified.** Seen on a Galaxy: a chip dropped off the bus during the post-job fabric check, and the
@@ -3662,4 +3685,13 @@ sees a silent fabric pass.
 | I112 one root-port AER record during the broker's check SIGSTOPs the check readers and fences the chips under that port within a poll; none with no check running; an endpoint record below the burst count stops nothing; a chip so fenced is never contained on a skipped read (unread, not all-ones) until a real read returns all-ones; the trigger record is on disk before the remove; a chip whose config vendor ID reads all-ones is never under the fabric check or a starting poller | `tests/test_aer_root_contain.py`, `tests/test_aer_check_stop.py` |
 | I108 a mesh reset that ran before a chip dropped does not spend the off-bus ladder's mesh reset: mesh reset, sweep, power cycle, in order, across a broker restart too | `tests/test_no_repeat_failed_rung.py::test_a_reset_that_ran_before_the_drop_does_not_spend_the_offbus_mesh_reset` |
 | I108 a mesh reset that faced the dropped chip (off before it, or found off by its own check) still spends it; a regressed reset and one with no sets on record stay spent | `tests/test_no_repeat_failed_rung.py::test_a_reset_that_faced_the_dropped_chip_still_spends_the_offbus_mesh_reset`, `::test_mesh_reset_spent_counts_only_chips_the_reset_faced`, `::test_a_reset_with_no_record_of_its_sets_stays_spent` |
+| I109 dump before the reset, recovery still runs on failure or timeout | `tests/test_cpld_dump.py::test_the_dump_comes_before_the_reset`, `::test_a_failing_dump_still_lets_recovery_run`, `::test_a_hung_dump_is_killed_at_the_cap_and_recovery_runs` |
+| I109 the power cycle is recorded and announced only after the dump; DIAG under `timeout -k`; a silent BMC skips after one call | `tests/test_cpld_dump.py::test_the_power_cycle_is_not_recorded_or_announced_until_the_dump_is_done`, `::test_the_diag_runs_under_a_kill_timeout`, `::test_a_bmc_that_does_not_answer_skips_the_diag_after_one_call` |
+| I109 one dump per episode, across rungs and restarts | `tests/test_cpld_dump.py::test_one_dump_per_episode`, `::test_no_episode_no_dump`, `::test_a_degraded_fault_starts_the_dump` |
+| I109 a killed job's reset leaves the dump to the drop that follows | `tests/test_cpld_dump.py::test_a_killed_jobs_reset_leaves_the_dump_to_the_drop`, `::test_a_drop_inside_an_open_episode_starts_the_dump` |
+| I109 the event log carries path, summary, script and sha | `tests/test_cpld_dump.py::test_the_event_names_path_summary_and_script`, `::test_raw_stdout_is_saved_unchanged` |
+| I109 host copy first, pinned copy only on its sha | `tests/test_cpld_dump.py::test_host_script_wins`, `::test_a_pinned_copy_with_the_wrong_sha_never_runs` |
+| I109 the host-wide lock: held during the dump, busy skips | `tests/test_cpld_dump.py::test_the_lock_is_held_while_the_dump_runs`, `::test_a_busy_lock_skips_with_a_reason`, `::test_the_lock_opens_an_existing_file_without_o_creat` |
+| I109 PSU and 12 V readings beside the dump; a failed read keeps the dump | `tests/test_cpld_dump.py::test_psu_readings_saved_beside_the_dump`, `::test_psu_read_failure_keeps_the_dump` |
+| I109 index 0x50 saved, restored, verified | `tests/test_cpld_dump.py::test_the_debug_index_is_restored_and_verified`, `::test_an_index_that_does_not_restore_is_named` |
 | I102 with I103: the late-chip second mesh reset runs in the pre-cycle sweep, so its pre-reset scan clears a holder outside every broker scope and runs (at the 10-min bound, on the I97 path, and in the sweep outside the bound); its wait still ends at the step's start plus `LATE_CHIP_STEP_SEC`; a failed full check keeps the hold and the cycle journals the holder; a holder in a broker job's scope or the running job's own process still refuses it, nothing lifts and the hold goes on to the cycle | `tests/test_late_chips_after_driver_wait.py::test_the_late_chip_second_reset_clears_a_foreign_holder_and_keeps_its_bound`, `::test_a_job_holder_still_refuses_the_late_chip_second_reset_and_the_hold_goes_on_to_the_cycle` |

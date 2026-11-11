@@ -2356,6 +2356,8 @@ class GalaxyRecovery(Recovery):
             return False
         # The caller ends it after its settle and verify (the host-hang latch, I25).
         pcie_guard.begin_offbus_reset("reset sweep", off_bus)
+        # The CPLD dump comes before the first rung (SBR), not just before the re-power (spec 04 I109).
+        await self.mechanism.cpld_dump_before_recovery("all_rungs", log)
         # Hold reset_in_flight across the whole sweep so the dead-chip sampler defers instead of
         # isolating a tray mid-reset. Cleared on every exit.
         self.mechanism.reset_in_flight = True

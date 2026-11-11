@@ -118,6 +118,12 @@ FAULTS = (
 )
 
 
+# The faults that mean a device degraded (a chip or tray dropped or froze, a probe found the mesh
+# unhealthy): opening an episode on one takes the vendor CPLD dump at once (spec 04 I109). Every
+# other fault still gets the dump before its first reset, from the rung itself.
+CPLD_DUMP_FAULTS = frozenset({"heartbeat", "off_bus", "eth_frozen", "arc_dead", "probe_unhealthy"})
+
+
 @dataclass
 class FsmRecord:
     """One point-in-time snapshot of the FSM. ``why``/``since`` are "" while HEALTHY. ``detail``
@@ -284,6 +290,11 @@ class ServerFsm:
             device_hold_episode_since=deps.device_hold_episode_since,
             isolated_chips=getattr(deps, "isolated_chips", None),
         )
+        # The CPLD dump's once-per-event key (spec 04 I109): the open fault episode's start.
+        self.mechanism.cpld_episode = lambda: (
+            self._record.since if self._record.state in (ServerState.RECOVERING, ServerState.DOWN) else ""
+        )
+        self.mechanism.cpld_degraded = lambda: self._record.why in CPLD_DUMP_FAULTS
         monitor = HealthMonitor(deps)
         if deps.board_types_provider is None:
             deps.board_types_provider = lambda: monitor._board_types
@@ -653,7 +664,15 @@ class ServerFsm:
             self._startup_check = None  # spec 03 I76: a fault hold ends the startup check it reported
         if self._record.state in (ServerState.HEALTHY, ServerState.BOOT):
             self._open_episode(ServerState.RECOVERING, why, detail=detail, job=job, dirty=dirty)
+            # A degraded device: take the CPLD dump now, while the state that says why is fresh
+            # (spec 04 I109). Off the loop (a sampler thread) it waits for the first rung instead.
+            if why in CPLD_DUMP_FAULTS and self.mechanism is not None:
+                self.mechanism.cpld_dump_start(why, _logger.info)
         else:
+            # A chip that drops inside an open episode (a killed job's reset, then off the bus)
+            # still gets its dump, at once; an episode already dumped is not dumped again.
+            if why in CPLD_DUMP_FAULTS and self.mechanism is not None:
+                self.mechanism.cpld_dump_start(why, _logger.info)
             if not (dirty and not self._record.dirty):
                 self._record.why = why
                 self._record.detail = detail or self._record.detail
