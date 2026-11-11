@@ -376,6 +376,80 @@ async def test_tray_down_no_window_power_cycles_when_the_sweep_does_not_recover(
     assert reboots["n"] == 0, "a whole tray off the bus is warm-reboot-futile — never the warm reboot"
 
 
+def _arm_refused_post_reboot(monkeypatch, dumped=""):
+    """The boot after a broker warm reboot finds the whole mesh still off the bus; the power cycle is
+    opted in but the rate gate refuses it. No reset rung runs on this road, so nothing else dumps.
+    The CPLD dump is stubbed to count its calls."""
+    from tt_device_mcp.health import cpld_dump
+
+    g = srv.galaxy_recovery
+    patch_health_event(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(g.mechanism, "boot_from_broker_escalation", lambda _b: {"action": "reboot"})
+    monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
+    monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
+    monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: True)
+    monkeypatch.setattr(srv, "_auto_reboot_enabled", lambda: False)
+    monkeypatch.setattr(g.mechanism, "auto_recovery_allowed", lambda action, tenant_active=False, **k: (False, "rate limit"))
+    cycles = []
+
+    async def fake_pc(log, reason):
+        cycles.append(reason)
+
+    monkeypatch.setattr(srv, "_auto_power_cycle_host", fake_pc)
+    dumps = []
+    monkeypatch.setenv("TT_DEVICE_MCP_CPLD_DUMP", "1")  # conftest switches it off for the suite
+    monkeypatch.setattr(cpld_dump, "take_dump", lambda trigger, episode, log: dumps.append((trigger, episode)) or {})
+    monkeypatch.setattr(cpld_dump, "dumped_episode", lambda: dumped)
+    monkeypatch.setattr(cpld_dump, "mark_episode", lambda _e: None)
+    monkeypatch.setattr(g.mechanism, "cpld_episode", lambda: "2026-11-10T10:00:00")
+    monkeypatch.setattr(g.mechanism, "_cpld_task", None)
+    monkeypatch.setattr(g.mechanism, "_cpld_task_episode", "")
+    return g, cycles, dumps
+
+
+@pytest.mark.asyncio
+async def test_a_power_cycle_the_rate_gate_refuses_still_dumps_once(monkeypatch):
+    """A refused host rung resets nothing, but the episode still owes its CPLD dump: the refusal
+    starts it (no await), and a second refusal in the same episode starts no second one."""
+    g, cycles, dumps = _arm_refused_post_reboot(monkeypatch)
+    for _ in range(2):
+        await g._verify_post_reboot_recovery(off_bus=32, expected=32, log=lambda _m: None)
+        assert g.mechanism._cpld_task is not None, "the refused power cycle started no dump"
+        await g.mechanism._cpld_task
+    assert cycles == [], "the rate gate refused the power cycle"
+    assert dumps == [("power-cycle_refused", "2026-11-10T10:00:00")], dumps
+
+
+@pytest.mark.asyncio
+async def test_a_refused_power_cycle_after_the_episodes_dump_takes_no_second(monkeypatch):
+    g, cycles, dumps = _arm_refused_post_reboot(monkeypatch, dumped="2026-11-10T10:00:00")
+    await g._verify_post_reboot_recovery(off_bus=32, expected=32, log=lambda _m: None)
+    assert cycles == []
+    assert g.mechanism._cpld_task is None and dumps == []
+
+
+@pytest.mark.parametrize(
+    "module, fn",
+    [
+        ("galaxy", "_fire_tray_down_no_window"),
+        ("galaxy", "_climb_to_host_recovery_after_failed_reset"),
+        ("galaxy", "_verify_post_reboot_recovery"),
+        ("server", "device_health_gate"),
+    ],
+)
+def test_every_refused_host_rung_starts_the_dump(module, fn):
+    """Wiring test: every branch where auto_recovery_allowed refuses a host rung starts the
+    episode's CPLD dump before it returns, since no reset rung will run to take it."""
+    src = pathlib.Path((galaxy if module == "galaxy" else srv).__file__).read_text()
+    start = src.index(f"async def {fn}(")
+    body = src[start : src.index("\n_device_health_gate = " if module == "server" else "    async def ", start + 10)]
+    gate = body.index("auto_recovery_allowed(")
+    refused = body[gate:]
+    refused = refused[refused.index("allowed") :]
+    branch = refused[: refused.index('"blocked"', refused.index("held off"))]
+    assert "cpld_dump_start(" in branch, f"{fn}: the refused host rung starts no CPLD dump"
+
+
 @pytest.mark.asyncio
 async def test_tray_down_no_window_holds_under_a_tenant(monkeypatch):
     """The sweep re-powers silicon, so it never runs under a tenant on the device."""

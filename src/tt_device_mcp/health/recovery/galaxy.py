@@ -1345,6 +1345,8 @@ class GalaxyRecovery(Recovery):
         allowed, why = self.mechanism.auto_recovery_allowed(escalation, tenant_active=tenant_active)
         if not allowed:
             log(f"tray-down-no-window sweep did not recover the mesh and a power cycle is opted in but held off: {why}")
+            # The refused rung still owes the episode its CPLD dump; started, not awaited.
+            self.mechanism.cpld_dump_start(f"{escalation}_refused", log)
             self.mechanism._journal_auto_recovery_denied(escalation, why)
             metrics.stage_fired("power_cycle", "blocked")
             return OUTCOME_WAITING
@@ -1797,6 +1799,7 @@ class GalaxyRecovery(Recovery):
                 f"reset dropped the mesh ({off_bus}/{expected} off-bus) and a host {escalation} is "
                 f"opted in but held off: {why}"
             )
+            self.mechanism.cpld_dump_start(f"{escalation}_refused", log)
             self.mechanism._journal_auto_recovery_denied(escalation, why)
             metrics.stage_fired(_HOST_ESCALATION_STAGE.get(escalation, escalation), "blocked")
             return
@@ -1898,6 +1901,7 @@ class GalaxyRecovery(Recovery):
                 f"the warm reboot did not bring the mesh back ({off_bus}/{expected} off the bus) and a "
                 f"power cycle is opted in but held off: {why}"
             )
+            self.mechanism.cpld_dump_start(f"{escalation}_refused", log)
             metrics.stage_fired("power_cycle", "blocked")
             return
         # Last chance before the cold rung: the warm reboot did not re-enumerate the mesh, but it also

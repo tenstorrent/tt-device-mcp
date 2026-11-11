@@ -3967,6 +3967,8 @@ async def device_health_gate(
                 await _fire(stage)
                 return
             _log(f"auto-{action} opted in but held off: {why}")
+            # The refused rung still owes the episode its CPLD dump; started, not awaited.
+            recovery_mechanism.cpld_dump_start(f"{action}_refused", _log)
             recovery_mechanism._journal_auto_recovery_denied(action, why)
             metrics.stage_fired(stage, "blocked")
         # The router held (WAIT). Which of its reasons it was decides what to say about it, and
