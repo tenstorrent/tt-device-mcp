@@ -53,6 +53,7 @@ from tt_device_mcp.health import (
     _is_galaxy,
     _persistent_recovery,
     _select_recovery,
+    cpld_dump,
 )
 from tt_device_mcp.telemetry import CheckAerWatch, TelemetrySampler
 
@@ -295,6 +296,7 @@ class ServerFsm:
             self._record.since if self._record.state in (ServerState.RECOVERING, ServerState.DOWN) else ""
         )
         self.mechanism.cpld_degraded = lambda: self._record.why in CPLD_DUMP_FAULTS
+        cpld_dump.current_episode = self.mechanism.cpld_episode
         monitor = HealthMonitor(deps)
         if deps.board_types_provider is None:
             deps.board_types_provider = lambda: monitor._board_types

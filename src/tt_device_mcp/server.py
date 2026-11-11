@@ -8449,6 +8449,8 @@ async def device_health_gate(
                 return
             _log(f"auto-{action} opted in but held off: {why}")
             recovery_mechanism._journal_auto_recovery_denied(action, why)
+            # Spec 04 I109: a refused host rung still starts the episode's CPLD dump; it never waits for it.
+            recovery_mechanism.cpld_dump_start(action, _log)
             metrics.stage_fired(stage, "blocked")
         # The router held (WAIT). Which of its reasons it was decides what to say about it, and
         # whether the declined rung owes the metric a "blocked": a rung suppressed over an in-flight
@@ -10133,6 +10135,8 @@ async def _hold_bound_host_rung(age: float, log, skipped: str = "", *, sweep: bo
     if not allowed:
         log(f"10-min hold bound: {action} held off: {why}")
         recovery_mechanism._journal_auto_recovery_denied(action, why)
+        # Spec 04 I109: a refused host rung still starts the episode's CPLD dump; it never waits for it.
+        recovery_mechanism.cpld_dump_start(action, log)
         return
     # Spec 04 I79: a 77 climb's own full sweep already ran and read a 77 right before it asked for this cycle; the
     # cooldown that denied it changed nothing on the device, so no second sweep runs at the cooldown's end.
