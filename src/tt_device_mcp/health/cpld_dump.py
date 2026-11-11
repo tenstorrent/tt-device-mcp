@@ -14,18 +14,36 @@ Three things make it safe to run from the broker:
   CPLD debug indexes, and two dumps interleaving their selects read each other's registers.
 - The UBB debug index (register 0x50 on each tray CPLD) is saved before and restored after, then
   read back: other readers expect the index they left.
-- A hard cap on the whole thing. A dump that cannot take the lock, cannot find its script or runs
-  past the cap is skipped or killed with a logged reason; recovery always follows.
+- A hard cap on the whole thing, enforced on the root side: every privileged command runs as
+  ``timeout -s KILL <cap> ...`` under sudo, so the kill reaches the root DIAG and its ipmitool
+  children, which a per-user broker cannot signal itself. A dump that cannot take the lock, cannot
+  find its script, runs past the cap or fails is skipped or killed with a logged reason; the index
+  restore and the lock release follow the DIAG's end, and recovery always follows.
+
+The dump and the incident bundle of the same fault episode (``evidence.capture_incident``) are
+cross-linked: each incident folder of the episode gets a ``cpld_dump.json`` naming the dump, and the
+``cpld_dump`` event (or, for an incident captured after it, a ``cpld_dump_linked`` event) names the
+incident folders.
+
+A broker that is not root needs these sudoers lines (the caps are the defaults; a changed
+``TT_DEVICE_MCP_CPLD_DUMP_CAP_SEC`` changes the DIAG line's number)::
+
+    <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 40 bash /usr/local/bin/cpld-dump.sh DIAG
+    <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 40 bash /usr/local/lib/tt-device-mcp/BH_s7t_cpld_dump_V1.03.01.sh DIAG
+    <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 5 ipmitool raw 0x06 0x52 *
+    <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 20 ipmitool sdr elist full
 
 Never raises.
 """
 
 from __future__ import annotations
 
+import calendar
 import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import select
@@ -45,6 +63,8 @@ PINNED_SCRIPT = "/usr/local/lib/tt-device-mcp/BH_s7t_cpld_dump_V1.03.01.sh"
 PINNED_SHA256 = "ad0f966b78ba9f810f8add56e0942bad2b9bd02c434d0d66eb3ba687de89fc14"
 IPMITOOL = "ipmitool"
 SUDO = ("sudo", "-n")
+# coreutils timeout, run as root: it kills the command's whole process group at the bound.
+TIMEOUT = ("timeout", "-s", "KILL")
 DUMPS_DIR = "cpld_dumps"
 # The four UBB tray CPLDs (I2C bus, 8-bit address) and their debug index register. The vendor's
 # UBB swap only relabels these buses, so saving and restoring all four needs no swap logic.
@@ -59,6 +79,13 @@ IPMI_CALL_SEC = 5.0
 PSU_SDR_SEC = 20.0
 _PSU_LINE = re.compile(r"PSU|PWS|P12V|12V|VIN|IIN|PIN|IOUT|POUT", re.I)
 PROGRESS_SEC = 5.0
+# How long past a root-side bound the broker waits for the command to end before its own backup
+# kill (which reaches only sudo when the broker is not root).
+KILL_GRACE_SEC = 3.0
+# An incident captured this long before its episode opened is still that episode's (the gate can
+# bundle an unhealthy verdict just before the FSM opens the episode).
+LINK_EARLY_SEC = 120.0
+LINK_FILE = "cpld_dump.json"
 
 _SUMMARY = re.compile(r"(\d+)\s+FAILED signals in\s+(\d+)\s+TEST items")
 _VERSION = re.compile(r"^\s*(?:This Script:\s*|VERSION=)(V[\d.]+)", re.M)
@@ -131,18 +158,21 @@ def _take_lock(path: str, wait_sec: float) -> tuple[Optional[int], str, float]:
         time.sleep(0.2)
 
 
-def _privileged(argv: list[str]) -> list[str]:
-    # /dev/ipmi0 is root-only: a per-user broker goes through sudo -n, which fails fast, never prompts.
-    return argv if os.geteuid() == 0 else [*SUDO, *argv]
+def _privileged(argv: list[str], bound_sec: float) -> list[str]:
+    """``argv`` bounded by a root-side ``timeout -s KILL``. /dev/ipmi0 is root-only: a per-user
+    broker goes through sudo -n, which fails fast, never prompts. The timeout runs inside sudo, so
+    its kill reaches the root command and its children; the broker's own kill reaches only sudo."""
+    bounded = [*TIMEOUT, str(int(math.ceil(bound_sec))), *argv]
+    return bounded if os.geteuid() == 0 else [*SUDO, *bounded]
 
 
 def _ipmi(args: list[str]) -> Optional[str]:
     try:
         r = subprocess.run(
-            _privileged([IPMITOOL, "raw", "0x06", "0x52", *args]),
+            _privileged([IPMITOOL, "raw", "0x06", "0x52", *args], IPMI_CALL_SEC),
             capture_output=True,
             text=True,
-            timeout=IPMI_CALL_SEC,
+            timeout=IPMI_CALL_SEC + KILL_GRACE_SEC,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -160,61 +190,106 @@ def _restore_index(bus: str, addr: str, value: str) -> Optional[str]:
     return _read_index(bus, addr)
 
 
-def _run_diag(script: str, out: Path, cap_sec: float, log: Callable[[str], None]) -> tuple[Optional[int], float, str]:
-    """Run ``<script> DIAG``, streaming raw stdout to ``out``. (rc or None on timeout, seconds, tail)."""
+def _run_diag(
+    script: str, out: Path, cap_sec: float, log: Callable[[str], None]
+) -> tuple[Optional[int], float, str, str]:
+    """Run ``<script> DIAG`` under the root-side cap, streaming raw stdout to ``out``.
+
+    (rc or None on timeout or error, seconds, tail, error). Whatever ends the loop (EOF, the cap, a
+    failed write or read), the DIAG has ended before this returns (:func:`_end_diag`)."""
     t0 = time.monotonic()
     tail = b""
     nlines = 0
     try:
         p = subprocess.Popen(
-            _privileged(["bash", script, "DIAG"]),
+            _privileged(["bash", script, "DIAG"], cap_sec),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
     except OSError as e:
-        return None, 0.0, f"launch failed: {e}"
+        return None, 0.0, f"launch failed: {e}", f"launch failed: {e!r}"
     next_progress = t0 + PROGRESS_SEC
-    with open(out, "wb") as f:
-        fd = p.stdout.fileno()
-        while True:
-            now = time.monotonic()
-            if now - t0 >= cap_sec:
-                try:
-                    os.killpg(p.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-                p.wait()
-                f.flush()
-                os.fsync(f.fileno())
-                return None, now - t0, tail.decode(errors="replace")
-            ready, _, _ = select.select([fd], [], [], min(0.5, cap_sec - (now - t0)))
-            if ready:
-                chunk = os.read(fd, 1 << 16)
-                if not chunk:
+    timed_out = eof = False
+    error = ""
+    try:
+        with open(out, "wb") as f:
+            fd = p.stdout.fileno()
+            while True:
+                now = time.monotonic()
+                # The root-side timeout kills the DIAG at the cap, which ends the pipe; past the
+                # grace the broker stops reading and kills what it can.
+                if now - t0 >= cap_sec + KILL_GRACE_SEC:
+                    timed_out = True
                     break
-                f.write(chunk)
-                nlines += chunk.count(b"\n")
-                tail = (tail + chunk)[-4096:]
-            if time.monotonic() >= next_progress:
-                last = tail.rstrip().rsplit(b"\n", 1)[-1].decode(errors="replace").strip()[:80]
-                log(f"cpld dump: {time.monotonic() - t0:.0f}s, {nlines} lines, at: {last}")
-                next_progress += PROGRESS_SEC
-        f.flush()
-        os.fsync(f.fileno())
-    rc = p.wait()
-    return rc, time.monotonic() - t0, tail.decode(errors="replace")
+                ready, _, _ = select.select([fd], [], [], min(0.5, cap_sec + KILL_GRACE_SEC - (now - t0)))
+                if ready:
+                    chunk = os.read(fd, 1 << 16)
+                    if not chunk:
+                        eof = True
+                        break
+                    f.write(chunk)
+                    nlines += chunk.count(b"\n")
+                    tail = (tail + chunk)[-4096:]
+                if time.monotonic() >= next_progress:
+                    last = tail.rstrip().rsplit(b"\n", 1)[-1].decode(errors="replace").strip()[:80]
+                    log(f"cpld dump: {time.monotonic() - t0:.0f}s, {nlines} lines, at: {last}")
+                    next_progress += PROGRESS_SEC
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception as e:  # noqa: BLE001 - a full disk or a failed read still ends the DIAG below
+        error = f"DIAG output: {e!r}"
+    finally:
+        rc = _end_diag(p, t0 + cap_sec + KILL_GRACE_SEC)
+    secs = time.monotonic() - t0
+    # The root-side timeout's KILL takes timeout itself down too: 137 from a shell, -9 from sudo
+    # re-raising it, 124 from an older coreutils.
+    killed_at_cap = rc in (124, 137, -signal.SIGKILL) and secs >= cap_sec - 0.5
+    if error or timed_out or not eof or killed_at_cap:
+        rc = None
+    return rc, secs, tail.decode(errors="replace"), error
+
+
+def _end_diag(p: subprocess.Popen, deadline: float) -> Optional[int]:
+    """End the DIAG and reap it; rc, or None if it is still up. After an error the pipe is drained
+    (output dropped) until the DIAG ends or the root-side timeout kills its whole group at the cap,
+    so no straggler of it outlives this; a pipe that cannot be read is closed (the writer dies of
+    SIGPIPE). Then the broker's own group kill, a backup that reaches only sudo when not root."""
+    try:
+        fd = p.stdout.fileno()
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([fd], [], [], min(0.5, max(0.0, deadline - time.monotonic())))
+            if ready and not os.read(fd, 1 << 16):
+                break
+    except Exception:  # noqa: BLE001 - an unreadable pipe is closed below
+        pass
+    try:
+        p.stdout.close()
+    except OSError:
+        pass
+    try:
+        return p.wait(timeout=max(KILL_GRACE_SEC, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        return p.wait(timeout=KILL_GRACE_SEC)
+    except subprocess.TimeoutExpired:
+        return None
 
 
 def _read_psu(out: Path) -> dict:
     """Save ``ipmitool sdr elist full`` raw to ``out``; return its path and the PSU/12 V lines."""
     try:
         r = subprocess.run(
-            _privileged([IPMITOOL, "sdr", "elist", "full"]),
+            _privileged([IPMITOOL, "sdr", "elist", "full"], PSU_SDR_SEC),
             capture_output=True,
             text=True,
-            timeout=PSU_SDR_SEC,
+            timeout=PSU_SDR_SEC + KILL_GRACE_SEC,
         )
     except subprocess.TimeoutExpired as e:
         text = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
@@ -228,6 +303,19 @@ def _read_psu(out: Path) -> dict:
     if r.returncode != 0:
         rec["psu_error"] = f"rc {r.returncode}: {r.stderr.strip()[-120:]}"
     return rec
+
+
+def _restore_indexes(saved: dict) -> dict:
+    """Restore and read back each UBB index that was read before the DIAG. Never raises."""
+    index = {}
+    for bus, addr in UBB_CPLDS:
+        before = saved.get(bus)
+        try:
+            after = None if before is None else _restore_index(bus, addr, before)
+        except Exception:  # noqa: BLE001 - one CPLD's failure must not skip the others
+            after = None
+        index[bus] = {"before": before, "after": after, "restored": before is not None and after == before}
+    return index
 
 
 def take_dump(trigger: str, episode: str, log: Callable[[str], None]) -> dict:
@@ -249,39 +337,53 @@ def take_dump(trigger: str, episode: str, log: Callable[[str], None]) -> dict:
     if fd is None:
         rec["skipped"] = why
         return _journal(rec, t0, log)
+    saved: dict = {}
+    out: Optional[Path] = None
+    rc, tail = None, ""
     try:
         log(f"cpld dump: lock held, running {which} DIAG {script} (cap {cap:.0f}s) before recovery")
-        saved = {bus: _read_index(bus, addr) for bus, addr in UBB_CPLDS}
+        for bus, addr in UBB_CPLDS:
+            saved[bus] = _read_index(bus, addr)
         root = evidence.health_dir() / DUMPS_DIR
         root.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         out = root / f"{stamp}_{re.sub(r'[^A-Za-z0-9_.-]+', '-', trigger)[:40]}.txt"
-        rc, secs, tail = _run_diag(script, out, cap, log)
-        index = {}
-        for bus, addr in UBB_CPLDS:
-            before = saved[bus]
-            after = None if before is None else _restore_index(bus, addr, before)
-            index[bus] = {"before": before, "after": after, "restored": before is not None and after == before}
-        rec.update(path=str(out), rc=rc, diag_sec=round(secs, 2), index_0x50=index)
+        _note_dump(episode, trigger, out)
+        rc, secs, tail, err = _run_diag(script, out, cap, log)
+        rec.update(path=str(out), rc=rc, diag_sec=round(secs, 2))
+        if err:
+            rec["error"] = err
+    except Exception as e:  # noqa: BLE001 - never raises; the event names what broke
+        rec["error"] = repr(e)
+    finally:
+        # Only after the DIAG has ended (_run_diag waits for it), and before the lock goes.
+        try:
+            rec["index_0x50"] = _restore_indexes(saved)
+        finally:
+            os.close(fd)  # closing the fd releases the flock
+    if out is None or "path" not in rec:
+        rec["skipped"] = f"dump failed: {rec.get('error', 'unknown')}"
+        return _journal(rec, t0, log)
+    try:
         rec.update(_read_psu(out.with_name(out.stem + "_psu.txt")))
         m = _VERSION.search(out.read_text(errors="replace")) if out.exists() else None
         rec["version"] = m.group(1) if m else ""
-        s = _SUMMARY.search(tail)
-        if rc is None:
-            rec["summary"] = f"timed out after {cap:.0f}s (partial output kept)"
-        elif s:
-            rec["summary"] = f"{s.group(1)}/{s.group(2)} failed"
-        else:
-            rec["summary"] = f"no DIAG summary (rc {rc}): {tail.strip().splitlines()[-1][:120] if tail.strip() else 'no output'}"
-        unrestored = [b for b, v in index.items() if v["before"] is not None and not v["restored"]]
-        if unrestored:
-            rec["summary"] += f"; index 0x50 NOT restored on {','.join(unrestored)}"
-        return _journal(rec, t0, log)
-    except (OSError, ValueError) as e:
-        rec["skipped"] = f"dump failed: {e!r}"
-        return _journal(rec, t0, log)
-    finally:
-        os.close(fd)  # closing the fd releases the flock
+    except Exception as e:  # noqa: BLE001
+        rec.setdefault("error", repr(e))
+    s = _SUMMARY.search(tail)
+    if rec.get("error"):
+        rec["summary"] = f"DIAG aborted: {rec['error'][:120]} (partial output kept)"
+    elif rc is None:
+        rec["summary"] = f"timed out after {cap:.0f}s (partial output kept)"
+    elif s:
+        rec["summary"] = f"{s.group(1)}/{s.group(2)} failed"
+    else:
+        rec["summary"] = f"no DIAG summary (rc {rc}): {tail.strip().splitlines()[-1][:120] if tail.strip() else 'no output'}"
+    unrestored = [b for b, v in rec["index_0x50"].items() if v["before"] is not None and not v["restored"]]
+    if unrestored:
+        rec["summary"] += f"; index 0x50 NOT restored on {','.join(unrestored)}"
+    rec["incidents"] = _link_incidents(episode, _link_body(episode, trigger, out))
+    return _journal(rec, t0, log)
 
 
 def _journal(rec: dict, t0: float, log: Callable[[str], None]) -> dict:
@@ -296,10 +398,11 @@ def _journal(rec: dict, t0: float, log: Callable[[str], None]) -> dict:
 
 
 def total_bound_sec() -> float:
-    """The longest :func:`take_dump` can hold recovery: lock wait + DIAG cap + 8 index calls + PSU read + slack."""
+    """The longest :func:`take_dump` can hold recovery: lock wait + DIAG cap and its kill grace +
+    the index calls + PSU read + slack."""
     cap = float(os.environ.get("TT_DEVICE_MCP_CPLD_DUMP_CAP_SEC") or CAP_SEC)
     wait = float(os.environ.get("TT_DEVICE_MCP_CPLD_DUMP_LOCK_WAIT_SEC") or LOCK_WAIT_SEC)
-    return wait + cap + 12 * IPMI_CALL_SEC + PSU_SDR_SEC + 5.0
+    return wait + cap + 3 * KILL_GRACE_SEC + 12 * (IPMI_CALL_SEC + KILL_GRACE_SEC) + PSU_SDR_SEC + KILL_GRACE_SEC + 5.0
 
 
 def last_episode_file() -> Path:
@@ -321,3 +424,82 @@ def mark_episode(episode: str) -> None:
         p.write_text(json.dumps({"episode": episode, "ts": time.time()}))
     except OSError:
         pass
+
+
+# The fault episode open now ("" when none); fsm.boot binds it to the FSM's record, as it does
+# ``RecoveryMechanism.cpld_episode``. capture_incident reads it to find the episode's dump.
+current_episode: Callable[[], str] = lambda: ""
+
+
+def _note_dump(episode: str, trigger: str, out: Path) -> None:
+    """Record the episode's dump path as soon as it is chosen, so an incident captured while the
+    DIAG runs (or after) can link to it."""
+    try:
+        p = last_episode_file()
+        p.write_text(json.dumps({"episode": episode, "ts": time.time(), **_link_body(episode, trigger, out)}))
+    except OSError:
+        pass
+
+
+def _link_body(episode: str, trigger: str, out: Path) -> dict:
+    return {"episode": episode, "trigger": trigger, "path": str(out), "psu_path": str(out.with_name(out.stem + "_psu.txt"))}
+
+
+def _episode_epoch(episode: str) -> Optional[float]:
+    try:
+        return float(calendar.timegm(time.strptime(episode.rstrip("Z"), "%Y-%m-%dT%H:%M:%S")))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _write_link(incident: Path, body: dict) -> bool:
+    """Write ``cpld_dump.json`` into an incident folder, unless it already names another episode."""
+    link = incident / LINK_FILE
+    try:
+        if link.exists() and json.loads(link.read_text()).get("episode") != body["episode"]:
+            return False
+        link.write_text(json.dumps(body, indent=2))
+        return True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _link_incidents(episode: str, body: dict) -> list[str]:
+    """Link the dump into every incident folder of its episode: captured since the episode opened
+    (or up to LINK_EARLY_SEC before). Returns those folders. Never raises."""
+    opened = _episode_epoch(episode)
+    if opened is None:
+        return []
+    linked = []
+    try:
+        dirs = sorted(d for d in (evidence.health_dir() / evidence.INCIDENTS_DIR).iterdir() if d.is_dir())
+    except OSError:
+        return []
+    for d in dirs:
+        try:
+            at = calendar.timegm(time.strptime(d.name.split("_", 1)[0], "%Y%m%dT%H%M%SZ"))
+        except ValueError:
+            continue
+        if at >= opened - LINK_EARLY_SEC and _write_link(d, body):
+            linked.append(str(d))
+    return linked
+
+
+def link_incident(incident: Path) -> Optional[dict]:
+    """capture_incident's side: if an episode is open and its dump has started, write the link file
+    into ``incident`` and journal ``cpld_dump_linked``. The dump links incidents that exist when it
+    ends; this covers the ones captured after. Never raises."""
+    try:
+        episode = current_episode()
+        if not episode:
+            return None
+        rec = json.loads(last_episode_file().read_text())
+        if rec.get("episode") != episode or not rec.get("path"):
+            return None
+        body = {k: rec[k] for k in ("episode", "trigger", "path", "psu_path") if k in rec}
+        if not _write_link(incident, body):
+            return None
+        evidence.health_event("cpld_dump_linked", incident=str(incident), **body)
+        return body
+    except Exception:  # noqa: BLE001 - never raises
+        return None

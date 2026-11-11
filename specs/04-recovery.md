@@ -255,9 +255,26 @@ each rung fires only when the gentler one failed or cannot apply.
   Then one read-only `ipmitool sdr elist full` is saved raw beside the dump (`*_psu.txt`); the
   event carries its path and the PSU and 12 V lines, or the read's error, which never fails the
   dump. Bounds: a lock wait, a DIAG cap (about 5 s per tray x 4 trays, doubled), per-call IPMI
-  timeouts and a sensor-read cap. A busy lock, a missing script, a timeout or an error journals `cpld_dump_skipped`
-  with its reason. Recovery always follows. The dumped episode is persisted, so a restart does
-  not dump it again. `TT_DEVICE_MCP_CPLD_DUMP=0` switches it off.
+  timeouts and a sensor-read cap. Each bound is enforced root-side: every privileged command
+  runs as `sudo -n timeout -s KILL <bound> ...` (no sudo when the broker is root), so the kill
+  reaches the root DIAG and its children, which a non-root broker's own kill cannot; the broker's
+  killpg stays as a backup and the pipe is always closed. Whatever ends the dump (EOF, the cap, a
+  failed output write or pipe read), the DIAG has ended before the index is restored, and only
+  the indexes read before are restored; the error is named in the event. A non-root broker needs
+  these sudoers lines (`<user>` is the broker's account):
+
+      <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 40 bash /usr/local/bin/cpld-dump.sh DIAG
+      <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 40 bash /usr/local/lib/tt-device-mcp/BH_s7t_cpld_dump_V1.03.01.sh DIAG
+      <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 5 ipmitool raw 0x06 0x52 *
+      <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 20 ipmitool sdr elist full
+
+  The dump and the episode's incident folders (`evidence.capture_incident`) are cross-linked both
+  ways: each incident folder of the episode (stamped from episode start minus 120 s on) gets
+  `cpld_dump.json` naming the dump, and the `cpld_dump` event lists those folders under
+  `incidents`; an incident captured after the dump started gets the same file and journals
+  `cpld_dump_linked`. Linking never raises. A busy lock, a missing script, a timeout or an error
+  journals `cpld_dump_skipped` with its reason. Recovery always follows. The dumped episode is
+  persisted, so a restart does not dump it again. `TT_DEVICE_MCP_CPLD_DUMP=0` switches it off.
 
 ## Interfaces
 
@@ -524,6 +541,9 @@ NOT be conflated when reading results.
 | I18 the host-wide lock: held during the dump, busy skips | `tests/test_cpld_dump.py::test_the_lock_is_held_while_the_dump_runs`, `::test_a_busy_lock_skips_with_a_reason`, `::test_the_lock_opens_an_existing_file_without_o_creat`, `::test_the_lock_file_is_never_world_writable` |
 | I18 PSU and 12 V readings beside the dump; a failed read keeps the dump | `tests/test_cpld_dump.py::test_psu_readings_saved_beside_the_dump`, `::test_psu_read_failure_keeps_the_dump` |
 | I18 index 0x50 saved, restored, verified | `tests/test_cpld_dump.py::test_the_debug_index_is_restored_and_verified`, `::test_an_index_that_does_not_restore_is_named` |
+| I18 root-side bound: every privileged call runs under `timeout -s KILL`; a hung DIAG, ipmitool or sensor read behind sudo is gone when the dump returns | `tests/test_cpld_dump.py::test_privileged_commands_carry_a_root_side_kill`, `::test_a_hung_diag_behind_sudo_is_gone_when_the_dump_returns`, `::test_a_hung_ipmitool_behind_sudo_is_killed_at_its_bound`, `::test_a_slow_psu_read_behind_sudo_is_killed_at_its_bound` |
+| I18 error path: the DIAG ends before the index is restored, only read indexes are restored, the error is named | `tests/test_cpld_dump.py::test_a_failed_output_write_ends_the_diag_and_restores_the_index`, `::test_a_failed_pipe_read_ends_the_diag_and_restores_the_index`, `::test_an_error_before_the_diag_restores_only_what_was_read` |
+| I18 the dump and the episode's incident folders are cross-linked both ways | `tests/test_cpld_dump.py::test_a_chip_dead_incident_and_its_dump_are_linked`, `::test_an_incident_after_the_dump_links_to_it`, `::test_an_incident_just_before_the_episode_opened_is_linked`, `::test_no_link_outside_the_episode` |
 | I1/I2 platform selection: declared mode wins; unknown → per-target | `tests/test_recovery_select.py::test_declared_mode_wins`, `tests/test_recovery_select.py::test_unknown_falls_to_per_target_loud`, `tests/test_recovery_select.py::test_loudbox_declares_per_target` |
 | Boot-time platform commit / per-pass fallback | `tests/test_boot_platform.py::test_a_declared_mode_commits_without_touching_the_device`, `tests/test_boot_platform.py::test_a_probe_that_reads_galaxy_boards_commits_the_galaxy_ladder`, `tests/test_boot_platform.py::test_an_unreadable_mesh_commits_nothing_and_keeps_the_per_pass_fallback`, `tests/test_boot_platform.py::test_a_committed_platform_short_circuits_per_pass_selection` |
 | Galaxy derivation: unanimous-or-unknown from tt-smi | `tests/test_reset.py::test_an_unidentifiable_board_is_unknown_not_non_galaxy`, `tests/test_reset.py::test_boards_must_agree`, `tests/test_reset.py::test_the_galaxy_list_comes_from_tt_smi_not_from_here` |

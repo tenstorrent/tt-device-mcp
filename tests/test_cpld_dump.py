@@ -10,10 +10,12 @@ so the save/restore is checked against a register that really changed."""
 from __future__ import annotations
 
 import asyncio
+import errno
 import fcntl
 import hashlib
 import json
 import os
+import shutil
 import sys
 import time
 
@@ -28,6 +30,9 @@ FAKE_IPMI = """#!{py}
 import os, sys
 regs = os.environ["FAKE_CPLD_REGS"]
 a = sys.argv[1:]
+if os.environ.get("FAKE_IPMI_HANG"):
+    open(os.path.join(os.environ["FAKE_DIAG_PIDS"], "ipmi"), "w").write(str(os.getpid()))
+    import time; time.sleep(60)
 if a[:3] == ["sdr", "elist", "full"]:
     if os.environ.get("FAKE_SDR_FAIL"):
         print("Error: no BMC", file=sys.stderr)
@@ -40,6 +45,15 @@ if a[:3] == ["sdr", "elist", "full"]:
 assert a[:3] == ["raw", "0x06", "0x52"], a
 bus, op, reg = a[3], a[5], a[6]
 path = os.path.join(regs, bus)
+pids = os.environ.get("FAKE_DIAG_PIDS")
+if pids and op == "0x00" and os.path.exists(os.path.join(pids, "diag")):
+    # A restore: is the DIAG that moved the index still running?
+    diag = open(os.path.join(pids, "diag")).read().strip()
+    try:
+        alive = open("/proc/%s/stat" % diag).read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        alive = False
+    open(os.path.join(pids, "restores"), "a").write("%s alive=%s\\n" % (bus, alive))
 if os.environ.get("FAKE_CPLD_ABSENT") == bus:
     sys.exit(1)
 if op == "0x01":
@@ -380,3 +394,247 @@ def test_psu_read_failure_keeps_the_dump(fake, monkeypatch):
     assert rec["summary"] == "3/620 failed"
     assert rec["psu_error"].startswith("rc 1") and "no BMC" in rec["psu_error"]
     assert rec["psu"] == []
+
+
+# --- The bound holds on the root side (review #249, finding 2) -------------------------------------
+
+# Like sudo: the command runs as root, out of the broker's reach. Here it runs in its own session,
+# so the broker's killpg of sudo's group misses it, as EPERM does on a real host.
+FAKE_SUDO = """#!{py}
+import subprocess, sys
+a = sys.argv[1:]
+if a[:1] == ["-n"]:
+    a = a[1:]
+rc = subprocess.Popen(a, start_new_session=True).wait()
+sys.exit(rc if rc >= 0 else 128 - rc)
+"""
+
+# A DIAG that hangs silently with a child of its own, as one stuck on a dead BMC would.
+HUNG_DIAG = """#!/bin/bash
+echo $$ > "$FAKE_DIAG_PIDS/diag"
+sleep 300 &
+echo $! > "$FAKE_DIAG_PIDS/child"
+echo "This Script: V1.03.01"
+wait
+"""
+
+# A DIAG that keeps writing for a while, then ends.
+CHATTY_DIAG = """#!/bin/bash
+echo $$ > "$FAKE_DIAG_PIDS/diag"
+for i in $(seq 1 30); do echo "line $i"; sleep 0.05; done
+"""
+
+
+def _alive(pid: int) -> bool:
+    try:
+        return open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+def _pid(fake, name) -> int:
+    return int((fake["pids"] / name).read_text())
+
+
+@pytest.fixture
+def as_user(fake, monkeypatch):
+    """The broker as a normal user: privileged commands go through a fake sudo."""
+    if not os.path.isdir("/proc") or shutil.which("timeout") is None:
+        pytest.skip("needs Linux /proc and coreutils timeout")
+    sudo = fake["tmp"] / "fake-sudo"
+    sudo.write_text(FAKE_SUDO.format(py=sys.executable))
+    sudo.chmod(0o755)
+    pids = fake["tmp"] / "pids"
+    pids.mkdir()
+    monkeypatch.setenv("FAKE_DIAG_PIDS", str(pids))
+    monkeypatch.setattr(cpld_dump, "SUDO", (str(sudo),))
+    monkeypatch.setattr(cpld_dump.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(cpld_dump, "KILL_GRACE_SEC", 1.0)
+    fake["pids"] = pids
+    return fake
+
+
+def _use_diag(fake, monkeypatch, body):
+    diag = fake["tmp"] / "diag-variant.sh"
+    diag.write_text(body)
+    monkeypatch.setenv("TT_DEVICE_MCP_CPLD_DUMP_SCRIPT", str(diag))
+
+
+def test_privileged_commands_carry_a_root_side_kill(fake, monkeypatch):
+    monkeypatch.setattr(cpld_dump, "SUDO", ("sudo", "-n"))
+    monkeypatch.setattr(cpld_dump.os, "geteuid", lambda: 1000)
+    assert cpld_dump._privileged(["bash", "/s.sh", "DIAG"], 40.0) == [
+        "sudo", "-n", "timeout", "-s", "KILL", "40", "bash", "/s.sh", "DIAG"
+    ]
+    assert cpld_dump._privileged(["ipmitool", "raw"], 5.0)[:6] == ["sudo", "-n", "timeout", "-s", "KILL", "5"]
+    monkeypatch.setattr(cpld_dump.os, "geteuid", lambda: 0)
+    assert cpld_dump._privileged(["bash", "/s.sh", "DIAG"], 0.5) == ["timeout", "-s", "KILL", "1", "bash", "/s.sh", "DIAG"]
+
+
+def test_a_hung_diag_behind_sudo_is_gone_when_the_dump_returns(as_user, monkeypatch):
+    _use_diag(as_user, monkeypatch, HUNG_DIAG)
+    monkeypatch.setenv("TT_DEVICE_MCP_CPLD_DUMP_CAP_SEC", "1")
+    t0 = time.monotonic()
+    rec = cpld_dump.take_dump("off_bus", "ep-hung", lambda _s: None)
+    assert time.monotonic() - t0 < 8
+    diag, child = _pid(as_user, "diag"), _pid(as_user, "child")
+    assert not _alive(diag) and not _alive(child), "the root-side DIAG outlived the cap"
+    assert rec["rc"] is None and rec["summary"].startswith("timed out")
+    restores = (as_user["pids"] / "restores").read_text().splitlines()
+    assert len(restores) == 4 and all(r.endswith("alive=False") for r in restores), restores
+    assert all(v["restored"] for v in rec["index_0x50"].values())
+
+
+def test_a_hung_ipmitool_behind_sudo_is_killed_at_its_bound(as_user, monkeypatch):
+    monkeypatch.setenv("FAKE_IPMI_HANG", "1")
+    monkeypatch.setattr(cpld_dump, "IPMI_CALL_SEC", 1.0)
+    t0 = time.monotonic()
+    assert cpld_dump._read_index("0x0D", "0x80") is None
+    assert time.monotonic() - t0 < 5
+    assert not _alive(_pid(as_user, "ipmi")), "the root-side ipmitool outlived its bound"
+
+
+def test_a_slow_psu_read_behind_sudo_is_killed_at_its_bound(as_user, monkeypatch):
+    monkeypatch.setenv("FAKE_IPMI_HANG", "1")
+    monkeypatch.setattr(cpld_dump, "PSU_SDR_SEC", 1.0)
+    t0 = time.monotonic()
+    rec = cpld_dump._read_psu(as_user["tmp"] / "psu.txt")
+    assert time.monotonic() - t0 < 5 and rec.get("psu_error")
+    assert not _alive(_pid(as_user, "ipmi")), "the root-side sensor read outlived its bound"
+
+
+# --- An error mid-DIAG still ends it and restores the index (review #249, finding 3) ----------------
+
+
+class _FullDisk:
+    def __init__(self, f):
+        self._f = f
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self._f.close()
+
+    def fileno(self):
+        return self._f.fileno()
+
+    def flush(self):
+        pass
+
+    def write(self, _b):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+
+def test_a_failed_output_write_ends_the_diag_and_restores_the_index(as_user, monkeypatch):
+    _use_diag(as_user, monkeypatch, CHATTY_DIAG)
+    real_open = open
+    monkeypatch.setattr(
+        cpld_dump,
+        "open",
+        lambda p, m="r", *a, **k: _FullDisk(real_open(p, m)) if m == "wb" else real_open(p, m, *a, **k),
+        raising=False,
+    )
+    rec = cpld_dump.take_dump("chip_dead", "ep-enospc", lambda _s: None)
+    assert not _alive(_pid(as_user, "diag"))
+    restores = (as_user["pids"] / "restores").read_text().splitlines()
+    assert len(restores) == 4 and all(r.endswith("alive=False") for r in restores), restores
+    assert all(v["restored"] for v in rec["index_0x50"].values())
+    (ev,) = _events("cpld_dump")
+    assert "ENOSPC" in ev["error"] or "No space" in ev["error"]
+    assert ev["rc"] is None and ev["summary"].startswith("DIAG aborted")
+    assert _events("cpld_dump_skipped") == []
+
+
+def test_a_failed_pipe_read_ends_the_diag_and_restores_the_index(as_user, monkeypatch):
+    _use_diag(as_user, monkeypatch, CHATTY_DIAG)
+
+    class _BrokenSelect:
+        @staticmethod
+        def select(*_a):
+            raise OSError(errno.EBADF, "select failed")
+
+    monkeypatch.setattr(cpld_dump, "select", _BrokenSelect)
+    rec = cpld_dump.take_dump("chip_dead", "ep-select", lambda _s: None)
+    assert not _alive(_pid(as_user, "diag")), "a DIAG whose pipe is closed dies of SIGPIPE"
+    assert all(v["restored"] for v in rec["index_0x50"].values())
+    assert "select failed" in rec["error"]
+
+
+def test_an_error_before_the_diag_restores_only_what_was_read(fake, monkeypatch):
+    def boom(*_a, **_k):
+        raise RuntimeError("mkdir exploded")
+
+    monkeypatch.setattr(cpld_dump, "_note_dump", boom)
+    writes = []
+    real = cpld_dump._restore_index
+    monkeypatch.setattr(cpld_dump, "_restore_index", lambda b, a, v: writes.append(b) or real(b, a, v))
+    rec = cpld_dump.take_dump("t", "ep-early", lambda _s: None)
+    assert "mkdir exploded" in rec["skipped"]
+    assert writes == ["0x0D", "0x0F", "0x11", "0x13"]
+    assert all(v["restored"] for v in rec["index_0x50"].values())
+    fd = os.open(fake["lock"], os.O_RDONLY)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # the lock was released
+    os.close(fd)
+
+
+# --- The dump and the episode's incidents are linked both ways (review #249, finding 1) -----------
+
+
+@pytest.fixture
+def incidents(monkeypatch):
+    monkeypatch.setattr(cpld_dump, "current_episode", lambda: "")
+    monkeypatch.setattr(health, "_kernel_evidence", lambda *a, **k: "(kernel)")
+    monkeypatch.setattr(health.pci, "chip_snapshot", lambda: [])
+    monkeypatch.setattr(health, "_prune_incidents", lambda: None)
+
+
+def _link(folder):
+    return json.loads((folder / cpld_dump.LINK_FILE).read_text())
+
+
+@pytest.mark.asyncio
+async def test_a_chip_dead_incident_and_its_dump_are_linked(fake, incidents, tmp_path, health_deps):
+    fsm = ServerFsm(tmp_path / "fsm.json")
+    fsm.boot(health_deps)
+    fsm.on_fault("heartbeat", detail="chip 3 fell off the bus")
+    task = fsm.mechanism._cpld_task
+    incident = await asyncio.to_thread(health.capture_incident, "chip_dead", trace=[])
+    await task
+    (ev,) = _events("cpld_dump")
+    assert ev["incidents"] == [str(incident)]
+    assert _link(incident)["path"] == ev["path"] and _link(incident)["episode"] == ev["episode"]
+
+
+@pytest.mark.asyncio
+async def test_an_incident_after_the_dump_links_to_it(fake, incidents, tmp_path, health_deps):
+    fsm = ServerFsm(tmp_path / "fsm.json")
+    fsm.boot(health_deps)
+    fsm.on_fault("off_bus", detail="tray 3 dropped")
+    await fsm.mechanism._cpld_task
+    (ev,) = _events("cpld_dump")
+    incident = health.capture_incident("unhealthy", job={"id": "j7"})
+    assert _link(incident)["path"] == ev["path"] and _link(incident)["psu_path"] == ev["psu_path"]
+    (linked,) = _events("cpld_dump_linked")
+    assert linked["incident"] == str(incident) and linked["path"] == ev["path"]
+
+
+def test_an_incident_just_before_the_episode_opened_is_linked(fake, incidents):
+    incident = health.capture_incident("unhealthy")
+    episode = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 30))
+    rec = cpld_dump.take_dump("probe_unhealthy", episode, lambda _s: None)
+    assert rec["incidents"] == [str(incident)] and _link(incident)["path"] == rec["path"]
+
+
+def test_no_link_outside_the_episode(fake, incidents, monkeypatch):
+    old = health.health_dir() / health.INCIDENTS_DIR / "20200101T000000Z_unhealthy_none"
+    old.mkdir(parents=True)
+    rec = cpld_dump.take_dump("off_bus", "2026-11-10T10:00:00Z", lambda _s: None)
+    assert rec["incidents"] == [] and not (old / cpld_dump.LINK_FILE).exists()
+    # No open episode: a later incident is not linked to the last dump.
+    monkeypatch.setattr(cpld_dump, "current_episode", lambda: "")
+    assert not (health.capture_incident("dirty") / cpld_dump.LINK_FILE).exists()
+    # Another episode open: not linked either.
+    monkeypatch.setattr(cpld_dump, "current_episode", lambda: "2026-11-10T11:00:00Z")
+    assert not (health.capture_incident("dirty") / cpld_dump.LINK_FILE).exists()
+    assert _events("cpld_dump_linked") == []

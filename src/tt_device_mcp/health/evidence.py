@@ -419,6 +419,11 @@ def capture_incident(
         if fabric_output:
             (root / "fabric.log").write_text(fabric_output)
 
+        # The open episode's CPLD dump, if it has started: linked both ways (spec 04 I18).
+        from tt_device_mcp.health import cpld_dump
+
+        cpld_dump.link_incident(root)
+
         for f in root.iterdir():
             try:
                 fd = os.open(f, os.O_RDONLY)
