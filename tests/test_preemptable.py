@@ -1658,7 +1658,9 @@ async def test_the_full_post_job_gate_runs_before_the_waiting_job_gets_the_devic
         id="969",
         owner="t",
         workspace="/tmp",
-        command="trap 'exit 0' INT; while true; do sleep 0.1; done",
+        # One long-lived child, not a fresh `sleep` every 0.1 s: the preempt kill reads the process group from
+        # /proc, and a child exiting mid-read made that read flaky.
+        command="trap 'exit 0' INT; sleep 60 & wait",
         queued_at="t",
         timeout_sec=1,
         preemptable=True,
