@@ -559,7 +559,8 @@ cooldown (spec 04 I65) holds longer.
   these hold: the device is HEALTHY and not dirty (no hold open), the eth rung is armed (I28), the
   last fabric verdict (`HealthMonitor.last_fabric_ok`) is OK, and nothing touched the device's
   health during the job: no AER delta, link change or bus change in the job's PCIe record (I91),
-  no contained chip, no runtime-reported device fault, no kill-reset debt (I69) and no reset
+  no contained chip, no runtime-reported device fault, no kill-reset debt (I69, which a runtime
+  firmware-init failure in the job's own log owes) and no reset
   awaiting its fabric pass (spec 04 I32). The gate then runs the quick checks of a clean exit
   (host-pci, heartbeat, snapshot and the passive eth read, I30) and journals
   `post_job_fabric_skipped` with reason `clean_software_exit` and the exit code. A failed quick
@@ -1015,6 +1016,15 @@ cooldown (spec 04 I65) holds longer.
   inside the minute is not preempted and owes none. A kill mid-run is how a mesh is left wedged mid-collective, and
   a fabric pass that happens to pass does not clear what it cannot see. Every submit path (MCP,
   REST `tt_device_job_run_bg`, the CLI) runs through the same runner, so each owes it the same way.
+  A job that failed on its own (FAILED, any exit code) because the runtime could not bring the
+  device up owes the same reset: its log tail names a firmware-init failure
+  (`_RUNTIME_INIT_FAULT_SIGNATURES`: `failed to initialize fw`, `waiting for physical cores to
+  finish`), or the runtime printed an unrecoverable-device line (`DOOMED_PATTERNS`) and the job
+  exited before the reaper's grace ran out. Such a job ends in a plain exit code, so without the
+  debt the clean-exit shortcut (I36) handed the same wedged mesh to the next job, and every job
+  failed the same way with no reset and no hold. A failed job whose log names neither owes none
+  and keeps I36. Time to recover (the runtime-init class): one reset, then one full check, as below
+  (~3-5 min on a Galaxy).
   The runner records the debt when the job ends, and `_monitor_readopted_scope` records it for a
   re-adopted job (spec 01 I7) that its timeout, a requested kill or a preemption
   stopped; that path drops the job's requested-kill and forced-preemption marks at the job's end

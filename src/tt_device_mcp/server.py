@@ -3577,6 +3577,29 @@ def _scan_output_for_device_fault(job_log_file: Optional[Path], *, tail_bytes: i
     return None
 
 
+# A failed job whose runtime could not bring the device up: its firmware init timed out waiting for the
+# cores, so the job ends itself with a plain exit code. The tensix side is wedged in a way the eth/fabric
+# reads cannot see, and every later job dies the same way until something resets the mesh (03 I69).
+# Lowercase: the tail is lowercased before the match.
+_RUNTIME_INIT_FAULT_SIGNATURES = (
+    "failed to initialize fw",  # device init gave up on the firmware
+    "waiting for physical cores to finish",  # init timed out waiting for the cores
+)
+
+
+def _scan_output_for_runtime_init_fault(job_log_file: Optional[Path], *, tail_bytes: int = 262144) -> Optional[str]:
+    """Scan the tail of a finished job's log for a runtime firmware-init failure
+    (see ``_RUNTIME_INIT_FAULT_SIGNATURES``). Returns a short reason if found, else None.
+    Read-only, bounded, never raises."""
+    blob = _read_job_log_tail(job_log_file, tail_bytes)
+    if blob is None:
+        return None
+    for sig in _RUNTIME_INIT_FAULT_SIGNATURES:
+        if sig in blob:
+            return f"runtime could not initialize the device ('{sig}')"
+    return None
+
+
 def _healthy_reading() -> HealthState:
     """A minimal, vacuously-healthy :class:`HealthState` (no observations, so none is UNHEALTHY) —
     for the many callers that already know the device just verified fit (an operator's own tt-smi
@@ -14699,6 +14722,15 @@ export {JOB_TAG_ENV}={job_tag}
                     and (job.exit_code != 0 or job.status == JobStatus.PREEMPTED)
                 )
                 left_busy = _aiclk_left_busy() if clock_read else {}
+                # Same debt for a job that failed on its own because the runtime could not bring the device up
+                # (its firmware init timed out on the cores) or said the device is unrecoverable before the reaper's
+                # grace ran out: it exits with a plain code, so the clean-exit shortcut (03 I36) would hand the same
+                # wedged mesh to the next job, and every job fails the same way. A plain failure keeps the shortcut.
+                init_fault = None
+                if not killed_by_reset and not known and not topo and job.status == JobStatus.FAILED:
+                    init_fault = _scan_output_for_runtime_init_fault(job_log_file)
+                    if init_fault is None and job.doomed_monotonic is not None:
+                        init_fault = "runtime reported the device unrecoverable"
                 if (
                     not killed_by_reset
                     and not known
@@ -14708,6 +14740,7 @@ export {JOB_TAG_ENV}={job_tag}
                         or job_id in request_killed_job_ids
                         or job_id in preempt_forced_job_ids
                         or left_busy
+                        or init_fault
                     )
                 ):
                     _owe_kill_reset(
@@ -14718,6 +14751,7 @@ export {JOB_TAG_ENV}={job_tag}
                             if left_busy and job.status not in (JobStatus.TIMEOUT, JobStatus.HUNG)
                             else ""
                         )
+                        + (f": {init_fault}" if init_fault else "")
                     )
                     _note_kill_reset_job(
                         {
