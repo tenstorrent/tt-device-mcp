@@ -91,22 +91,23 @@ def resolve_script() -> tuple[Optional[str], str, str]:
 def _open_lock(path: str) -> int:
     """Open the shared lock file so root and a normal user can both take it.
 
+    Read-only: flock needs no write access, so the file is 0644, never world-writable.
     Opened without O_CREAT first: with fs.protected_regular, an O_CREAT open of a file another user
     owns in a sticky world-writable directory (/run/lock) is refused even when its mode allows it.
-    Created 0666 (fchmod past the umask) so whoever comes second can open it read-write."""
+    Created 0644 (fchmod past the umask) so whoever comes second can still open it to read."""
     try:
-        return os.open(path, os.O_RDWR)
+        return os.open(path, os.O_RDONLY)
     except FileNotFoundError:
         pass
     try:
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o666)
+        fd = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_EXCL, 0o644)
         try:
-            os.fchmod(fd, 0o666)
+            os.fchmod(fd, 0o644)
         except OSError:
             pass
         return fd
     except FileExistsError:
-        return os.open(path, os.O_RDWR)
+        return os.open(path, os.O_RDONLY)
 
 
 def _take_lock(path: str, wait_sec: float) -> tuple[Optional[int], str, float]:

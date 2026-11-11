@@ -307,7 +307,34 @@ def test_the_lock_opens_an_existing_file_without_o_creat(fake, monkeypatch):
     fake["lock"].unlink()
     flags_seen.clear()
     os.close(cpld_dump._open_lock(str(fake["lock"])))
-    assert oct(fake["lock"].stat().st_mode & 0o777) == oct(0o666)
+    assert oct(fake["lock"].stat().st_mode & 0o777) == oct(0o644)
+
+
+@pytest.mark.parametrize("exists", [True, False])
+def test_the_lock_file_is_never_world_writable(fake, monkeypatch, exists):
+    """The lock carries no data: it is opened read-only and created 0644 even under umask 0."""
+    if exists:
+        fake["lock"].write_text("")
+        fake["lock"].chmod(0o644)
+    real_open = os.open
+    flags_seen = []
+
+    def spy(path, flags, *a):
+        flags_seen.append(flags)
+        return real_open(path, flags, *a)
+
+    monkeypatch.setattr(cpld_dump.os, "open", spy)
+    old = os.umask(0)
+    try:
+        fd = cpld_dump._open_lock(str(fake["lock"]))
+    finally:
+        os.umask(old)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(fd)
+    assert flags_seen and all(f & os.O_ACCMODE == os.O_RDONLY for f in flags_seen)
+    assert not fake["lock"].stat().st_mode & 0o022
 
 
 def test_the_debug_index_is_restored_and_verified(fake):

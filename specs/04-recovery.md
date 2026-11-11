@@ -249,7 +249,8 @@ each rung fires only when the gentler one failed or cannot apply.
   pinned by sha256 (a mismatched copy never runs). Its raw stdout lands in
   `HEALTH_DIR/cpld_dumps/`, and a `cpld_dump` health event carries the path, a one-line fail
   summary, the script, which copy ran, its version and sha256. It holds the host-wide flock
-  `/run/lock/tt-cpld.lock`, shared with tray-test, opened so root and a user can both take it.
+  `/run/lock/tt-cpld.lock`, shared with tray-test, opened read-only and created 0644 (never
+  world-writable) so root and a user can both take it.
   It saves each UBB CPLD's debug index (0x50) before and restores and reads it back after.
   Then one read-only `ipmitool sdr elist full` is saved raw beside the dump (`*_psu.txt`); the
   event carries its path and the PSU and 12 V lines, or the read's error, which never fails the
@@ -520,7 +521,7 @@ NOT be conflated when reading results.
 | I18 one dump per episode, across rungs and restarts | `tests/test_cpld_dump.py::test_one_dump_per_episode`, `::test_no_episode_no_dump`, `::test_a_degraded_fault_starts_the_dump` |
 | I18 the event log carries path, summary, script and sha | `tests/test_cpld_dump.py::test_the_event_names_path_summary_and_script`, `::test_raw_stdout_is_saved_unchanged` |
 | I18 host copy first, pinned copy only on its sha | `tests/test_cpld_dump.py::test_host_script_wins`, `::test_a_pinned_copy_with_the_wrong_sha_never_runs` |
-| I18 the host-wide lock: held during the dump, busy skips | `tests/test_cpld_dump.py::test_the_lock_is_held_while_the_dump_runs`, `::test_a_busy_lock_skips_with_a_reason`, `::test_the_lock_opens_an_existing_file_without_o_creat` |
+| I18 the host-wide lock: held during the dump, busy skips | `tests/test_cpld_dump.py::test_the_lock_is_held_while_the_dump_runs`, `::test_a_busy_lock_skips_with_a_reason`, `::test_the_lock_opens_an_existing_file_without_o_creat`, `::test_the_lock_file_is_never_world_writable` |
 | I18 PSU and 12 V readings beside the dump; a failed read keeps the dump | `tests/test_cpld_dump.py::test_psu_readings_saved_beside_the_dump`, `::test_psu_read_failure_keeps_the_dump` |
 | I18 index 0x50 saved, restored, verified | `tests/test_cpld_dump.py::test_the_debug_index_is_restored_and_verified`, `::test_an_index_that_does_not_restore_is_named` |
 | I1/I2 platform selection: declared mode wins; unknown → per-target | `tests/test_recovery_select.py::test_declared_mode_wins`, `tests/test_recovery_select.py::test_unknown_falls_to_per_target_loud`, `tests/test_recovery_select.py::test_loudbox_declares_per_target` |
