@@ -287,6 +287,7 @@ visudo -cf /etc/sudoers.d/tt-device-mcp-smi >/dev/null 2>&1 \
 install -m 0755 "$DEPLOY/tt-device-fabric-check.sh"     "$ROOT/fabric-check.sh"
 install -m 0755 "$DEPLOY/install-fabric-validator.sh"   "$ROOT/install-fabric-validator.sh"
 install -m 0644 "$DEPLOY/fabric-validator.pin"          "$ROOT/fabric-validator.pin"
+install -m 0644 "$DEPLOY/fabric-validator-ramp.patch"   "$ROOT/fabric-validator-ramp.patch"
 install -m 0644 "$DEPLOY/tt-device-fabric-validator.service" /etc/systemd/system/tt-device-fabric-validator.service
 install -m 0644 "$DEPLOY/tt-device-fabric-validator.timer"   /etc/systemd/system/tt-device-fabric-validator.timer
 
@@ -420,12 +421,13 @@ if perf stat -a -e ls_locks.bus_lock -- true >/dev/null 2>&1; then
 else
     echo "apply-host-config: ls_locks.bus_lock PMU event unavailable; bus-lock counter not enabled" >&2
 fi
-pinned_sha="$(sed -n 's/^TTDEV_VALIDATOR_SHA=//p' "$ROOT/fabric-validator.pin" 2>/dev/null | head -1)"
+# The pin's prefix name: its SHA plus a hash of its patches (spec 08 I27).
+pinned_key="$("$ROOT/install-fabric-validator.sh" "$ROOT/fabric-validator.pin" --key 2>/dev/null)" || pinned_key=""
 # Either of the pin's two build slots (spec 08 I27).
 pinned_bin=build/tools/scaleout/run_cluster_validation
-if [ -n "$pinned_sha" ] && [ ! -x "/opt/tt-device-broker/validator/$pinned_sha/$pinned_bin" ] \
-        && [ ! -x "/opt/tt-device-broker/validator/$pinned_sha.build/$pinned_bin" ]; then
-    echo "apply-host-config: fabric validator for $pinned_sha not built; starting build out of band" >&2
+if [ -n "$pinned_key" ] && [ ! -x "/opt/tt-device-broker/validator/$pinned_key/$pinned_bin" ] \
+        && [ ! -x "/opt/tt-device-broker/validator/$pinned_key.build/$pinned_bin" ]; then
+    echo "apply-host-config: fabric validator for $pinned_key not built; starting build out of band" >&2
     systemctl reset-failed tt-device-fabric-validator.service 2>/dev/null || true
     systemctl start --no-block tt-device-fabric-validator.service 2>/dev/null || true
 fi
