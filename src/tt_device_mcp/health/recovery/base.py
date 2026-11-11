@@ -559,9 +559,9 @@ class RecoveryMechanism:
 
         Returns (exit code, combined output); the code is None on timeout/launch failure.
         """
+        await self.cpld_dump_before_recovery("reset", log)
         # Name the command we are actually running. This was hardcoded to the galaxy's -glx_reset, so on
         # every other machine the queue told operators a command that was not the one executing.
-        await self.cpld_dump_before_recovery("reset", log)
         self._set_device_op_detail(f"device reset: {' '.join(argv)} (~60s)")
         quiesced = await self._set_device_pollers(False, log)
         # A reset takes the chips off the bus — that is what it does — so for its duration they
@@ -854,6 +854,9 @@ class RecoveryMechanism:
         takes the box down from inside ``fire`` and never reaches here at all)."""
         ev = action.replace("-", "_")
         stage = _ACTION_TO_STAGE[action]
+        # The CPLD dump first (spec 04 I18): an escalation the ledger stops still gets it, and the
+        # ledger, the jobs row and the request event never claim an action the dump is holding back.
+        await self.cpld_dump_before_recovery(ev, log)
         if not self.record_auto_recovery(action, reason):
             log(
                 f"{label.upper()} ABORTED: could not persist the escalation record; refusing to act "
@@ -864,7 +867,6 @@ class RecoveryMechanism:
             return
         self._write_action_log(row_owner, f"{label} — {reason}", 0.0, action, None)
         health_event(f"auto_{ev}_request", reason=reason)
-        await self.cpld_dump_before_recovery(ev, log)
         log(f"{label.upper()}: {detail} ({reason}); opted in + within limits — requesting it now")
         try:
             await asyncio.to_thread(fire)

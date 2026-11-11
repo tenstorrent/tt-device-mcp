@@ -249,18 +249,24 @@ each rung fires only when the gentler one failed or cannot apply.
   pinned by sha256 (a mismatched copy never runs). Its raw stdout lands in
   `HEALTH_DIR/cpld_dumps/`, and a `cpld_dump` health event carries the path, a one-line fail
   summary, the script, which copy ran, its version and sha256. It holds the host-wide flock
-  `/run/lock/tt-cpld.lock`, shared with tray-test, opened read-only and created 0644 (never
+  `/run/lock/tt-cpld.lock`, shared with any other CPLD reader, opened read-only and created 0644 (never
   world-writable) so root and a user can both take it.
   It saves each UBB CPLD's debug index (0x50) before and restores and reads it back after.
   Then one read-only `ipmitool sdr elist full` is saved raw beside the dump (`*_psu.txt`); the
   event carries its path and the PSU and 12 V lines, or the read's error, which never fails the
-  dump. Bounds: a lock wait, a DIAG cap (about 5 s per tray x 4 trays, doubled), per-call IPMI
+  dump. The DIAG talks only to the BMC (`ipmitool raw 0x06 0x52`, I2C to the board CPLDs), never
+  to a chip over PCIe or sysfs. Bounds: a lock wait, a DIAG cap (about 5 s per tray x 4 trays, doubled), per-call IPMI
   timeouts and a sensor-read cap. Each bound is enforced root-side: every privileged command
   runs as `sudo -n timeout -s KILL <bound> ...` (no sudo when the broker is root), so the kill
   reaches the root DIAG and its children, which a non-root broker's own kill cannot; the broker's
   killpg stays as a backup and the pipe is always closed. Whatever ends the dump (EOF, the cap, a
   failed output write or pipe read), the DIAG has ended before the index is restored, and only
-  the indexes read before are restored; the error is named in the event. A non-root broker needs
+  the indexes read before are restored; the error is named in the event. A BMC that stops
+  answering costs one call, not the whole bound: the first IPMI call that runs into its bound
+  ends the dump's BMC calls. Before the DIAG the dump is skipped; after it the remaining index
+  restores and the sensor read are skipped. The event names that call under `bmc_silent`. A
+  host reboot or power cycle awaits the dump before it writes its rate-limit ledger entry, jobs
+  row or request event, so an escalation the ledger stops still gets the dump. A non-root broker needs
   these sudoers lines (`<user>` is the broker's account):
 
       <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 40 bash /usr/local/bin/cpld-dump.sh DIAG
@@ -543,6 +549,8 @@ NOT be conflated when reading results.
 | I18 index 0x50 saved, restored, verified | `tests/test_cpld_dump.py::test_the_debug_index_is_restored_and_verified`, `::test_an_index_that_does_not_restore_is_named` |
 | I18 root-side bound: every privileged call runs under `timeout -s KILL`; a hung DIAG, ipmitool or sensor read behind sudo is gone when the dump returns | `tests/test_cpld_dump.py::test_privileged_commands_carry_a_root_side_kill`, `::test_a_hung_diag_behind_sudo_is_gone_when_the_dump_returns`, `::test_a_hung_ipmitool_behind_sudo_is_killed_at_its_bound`, `::test_a_slow_psu_read_behind_sudo_is_killed_at_its_bound` |
 | I18 error path: the DIAG ends before the index is restored, only read indexes are restored, the error is named | `tests/test_cpld_dump.py::test_a_failed_output_write_ends_the_diag_and_restores_the_index`, `::test_a_failed_pipe_read_ends_the_diag_and_restores_the_index`, `::test_an_error_before_the_diag_restores_only_what_was_read` |
+| I18 a silent BMC costs one call: before the DIAG it is skipped, after it the remaining restores and the PSU read are skipped, the event names why; a fast error is not silence | `tests/test_cpld_dump.py::test_a_silent_bmc_before_the_diag_skips_it_after_one_call`, `::test_a_bmc_silent_after_the_diag_keeps_the_dump_and_skips_the_rest`, `::test_an_ipmitool_past_the_brokers_own_bound_is_a_silent_bmc`, `::test_an_index_that_does_not_restore_is_named` |
+| I18 the dump comes first: before a reboot or power cycle records anything (even one the ledger stops), before the reset names its command, before the bridge reset announces the chip | `tests/test_cpld_dump.py::test_the_escalation_dumps_before_it_records_anything`, `::test_an_escalation_the_ledger_stops_still_dumps`, `::test_the_reset_names_its_command_only_after_the_dump`, `::test_the_bridge_reset_dumps_before_it_announces_the_chip`, `::test_the_host_reboot_waits_for_the_dump` |
 | I18 the dump and the episode's incident folders are cross-linked both ways | `tests/test_cpld_dump.py::test_a_chip_dead_incident_and_its_dump_are_linked`, `::test_an_incident_after_the_dump_links_to_it`, `::test_an_incident_just_before_the_episode_opened_is_linked`, `::test_no_link_outside_the_episode` |
 | I1/I2 platform selection: declared mode wins; unknown → per-target | `tests/test_recovery_select.py::test_declared_mode_wins`, `tests/test_recovery_select.py::test_unknown_falls_to_per_target_loud`, `tests/test_recovery_select.py::test_loudbox_declares_per_target` |
 | Boot-time platform commit / per-pass fallback | `tests/test_boot_platform.py::test_a_declared_mode_commits_without_touching_the_device`, `tests/test_boot_platform.py::test_a_probe_that_reads_galaxy_boards_commits_the_galaxy_ladder`, `tests/test_boot_platform.py::test_an_unreadable_mesh_commits_nothing_and_keeps_the_per_pass_fallback`, `tests/test_boot_platform.py::test_a_committed_platform_short_circuits_per_pass_selection` |

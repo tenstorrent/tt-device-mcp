@@ -30,8 +30,10 @@ FAKE_IPMI = """#!{py}
 import os, sys
 regs = os.environ["FAKE_CPLD_REGS"]
 a = sys.argv[1:]
-if os.environ.get("FAKE_IPMI_HANG"):
-    open(os.path.join(os.environ["FAKE_DIAG_PIDS"], "ipmi"), "w").write(str(os.getpid()))
+pids = os.environ.get("FAKE_DIAG_PIDS")
+if os.environ.get("FAKE_IPMI_HANG") or (pids and os.path.exists(os.path.join(pids, "bmc-gone"))):
+    open(os.path.join(pids, "ipmi"), "w").write(str(os.getpid()))
+    open(os.path.join(pids, "hung_calls"), "a").write(" ".join(a) + "\\n")
     import time; time.sleep(60)
 if a[:3] == ["sdr", "elist", "full"]:
     if os.environ.get("FAKE_SDR_FAIL"):
@@ -45,7 +47,6 @@ if a[:3] == ["sdr", "elist", "full"]:
 assert a[:3] == ["raw", "0x06", "0x52"], a
 bus, op, reg = a[3], a[5], a[6]
 path = os.path.join(regs, bus)
-pids = os.environ.get("FAKE_DIAG_PIDS")
 if pids and op == "0x00" and os.path.exists(os.path.join(pids, "diag")):
     # A restore: is the DIAG that moved the index still running?
     diag = open(os.path.join(pids, "diag")).read().strip()
@@ -152,6 +153,81 @@ async def test_the_host_reboot_waits_for_the_dump(fake):
         log=lambda _s: None,
         reason="test",
     )
+    assert seen == [1]
+
+
+@pytest.mark.asyncio
+async def test_the_escalation_dumps_before_it_records_anything(fake, monkeypatch):
+    m = _mechanism()
+    seen = []
+    record = m.record_auto_recovery
+    monkeypatch.setattr(m, "record_auto_recovery", lambda *a, **k: seen.append(("ledger", len(_events("cpld_dump")))) or record(*a, **k))
+    monkeypatch.setattr(m, "_write_action_log", lambda *a: seen.append(("row", len(_events("cpld_dump")))))
+    await m._fire_recovery_escalation(
+        "power-cycle", row_owner="[broker]power-cycle-request", label="power cycle", detail="test",
+        fire=lambda: None, log=lambda _s: None, reason="test",
+    )
+    assert seen == [("ledger", 1), ("row", 1)]
+    kinds = [e["kind"] for e in health.read_health_events() if e["kind"] in ("cpld_dump", "auto_power_cycle_request")]
+    assert kinds == ["cpld_dump", "auto_power_cycle_request"]
+
+
+@pytest.mark.asyncio
+async def test_an_escalation_the_ledger_stops_still_dumps(fake, monkeypatch):
+    m = _mechanism()
+    fired = []
+    monkeypatch.setattr(m, "record_auto_recovery", lambda *a, **k: False)
+    await m._fire_recovery_escalation(
+        "reboot", row_owner="[broker]reboot-request", label="host reboot", detail="test",
+        fire=lambda: fired.append(1), log=lambda _s: None, reason="test",
+    )
+    assert not fired and _events("auto_reboot_aborted")
+    assert len(_events("cpld_dump")) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_reset_names_its_command_only_after_the_dump(fake):
+    m = _mechanism()
+    details = []
+    m._set_device_op_detail = lambda d: details.append((d, len(_events("cpld_dump"))))
+    await m.reset_with_quiesce([sys.executable, "-c", "pass"], lambda _s: None)
+    assert details and details[0][1] == 1, details
+
+
+@pytest.mark.asyncio
+async def test_the_bridge_reset_dumps_before_it_announces_the_chip(fake, monkeypatch):
+    from unittest.mock import MagicMock
+
+    from tt_device_mcp.health import recovery as recovery_pkg
+
+    class _Bridge(recovery_pkg.Recovery):
+        def next_stage(self, ev):
+            raise NotImplementedError
+
+        def _platform_reset_argv(self, indices):
+            raise NotImplementedError
+
+    class _Stop(Exception):
+        pass
+
+    def no_reset(*_a):
+        raise AssertionError("the test stops before any bridge write")
+
+    monkeypatch.setattr(recovery_pkg, "bridge_reset_enabled", lambda: True)
+    monkeypatch.setattr(recovery_pkg, "reset_chip_via_bridge", no_reset)
+    deps = MagicMock()
+    deps.isolated_chips.return_value = {"0"}
+    deps.device_pci_map.return_value = {"0": "0000:41:00.0"}
+    r = _Bridge(monitor=MagicMock(), mechanism=_mechanism(), deps=deps)
+    seen = []
+
+    def log(line):
+        if line.startswith("recovering chip"):
+            seen.append(len(_events("cpld_dump")))
+            raise _Stop
+
+    with pytest.raises(_Stop):
+        await r._recover_isolated_chips(log)
     assert seen == [1]
 
 
@@ -365,6 +441,7 @@ def test_an_index_that_does_not_restore_is_named(fake, monkeypatch):
     assert rec["index_0x50"]["0x11"] == {"before": "0x02", "after": "0x07", "restored": False}
     assert rec["index_0x50"]["0x13"]["before"] is None
     assert "NOT restored on 0x11" in rec["summary"] and "0x13" not in rec["summary"]
+    assert "bmc_silent" not in rec, "a CPLD that answers with an error is not a silent BMC"
     assert json.loads(json.dumps(_events("cpld_dump")[0]))["index_0x50"]["0x11"]["restored"] is False
 
 
@@ -396,7 +473,7 @@ def test_psu_read_failure_keeps_the_dump(fake, monkeypatch):
     assert rec["psu"] == []
 
 
-# --- The bound holds on the root side (review #249, finding 2) -------------------------------------
+# --- The bound holds on the root side ------------------------------------------------------------
 
 # Like sudo: the command runs as root, out of the broker's reach. Here it runs in its own session,
 # so the broker's killpg of sudo's group misses it, as EPERM does on a real host.
@@ -489,9 +566,60 @@ def test_a_hung_ipmitool_behind_sudo_is_killed_at_its_bound(as_user, monkeypatch
     monkeypatch.setenv("FAKE_IPMI_HANG", "1")
     monkeypatch.setattr(cpld_dump, "IPMI_CALL_SEC", 1.0)
     t0 = time.monotonic()
-    assert cpld_dump._read_index("0x0D", "0x80") is None
+    with pytest.raises(cpld_dump.BmcSilent):
+        cpld_dump._read_index("0x0D", "0x80")
     assert time.monotonic() - t0 < 5
     assert not _alive(_pid(as_user, "ipmi")), "the root-side ipmitool outlived its bound"
+
+
+def test_an_ipmitool_past_the_brokers_own_bound_is_a_silent_bmc(fake, monkeypatch):
+    def hang(argv, **kw):
+        raise cpld_dump.subprocess.TimeoutExpired(argv, kw.get("timeout"))
+
+    monkeypatch.setattr(cpld_dump.subprocess, "run", hang)
+    with pytest.raises(cpld_dump.BmcSilent, match="no answer"):
+        cpld_dump._read_index("0x0D", "0x80")
+
+
+def test_a_silent_bmc_before_the_diag_skips_it_after_one_call(as_user, monkeypatch):
+    monkeypatch.setenv("FAKE_IPMI_HANG", "1")
+    monkeypatch.setattr(cpld_dump, "IPMI_CALL_SEC", 1.0)
+    t0 = time.monotonic()
+    rec = cpld_dump.take_dump("off_bus", "ep-silent", lambda _s: None)
+    secs = time.monotonic() - t0
+    # Without the stop: 4 saves, 4 restores and a sensor read, each run into its bound.
+    assert secs < 5, secs
+    assert (as_user["pids"] / "hung_calls").read_text().count("\n") == 1
+    assert rec["bmc_silent"].startswith("index save on 0x0D") and "DIAG not run" in rec["skipped"]
+    assert "path" not in rec and not list((health.health_dir() / cpld_dump.DUMPS_DIR).glob("*.txt"))
+    (ev,) = _events("cpld_dump_skipped")
+    assert ev["bmc_silent"] == rec["bmc_silent"]
+    assert not any(v["restored"] or v["after"] for v in rec["index_0x50"].values())
+
+
+# The BMC answers until the DIAG is done, then goes silent.
+DIAG_THEN_SILENT = """#!/bin/bash
+echo "This Script: V1.03.01"
+"{ipmi}" raw 0x06 0x52 0x0D 0x80 0x00 0x50 0x3c
+touch "$FAKE_DIAG_PIDS/bmc-gone"
+echo "  2 FAILED signals in 620 TEST items:"
+"""
+
+
+def test_a_bmc_silent_after_the_diag_keeps_the_dump_and_skips_the_rest(as_user, monkeypatch):
+    _use_diag(as_user, monkeypatch, DIAG_THEN_SILENT.format(ipmi=cpld_dump.IPMITOOL))
+    monkeypatch.setattr(cpld_dump, "IPMI_CALL_SEC", 1.0)
+    t0 = time.monotonic()
+    rec = cpld_dump.take_dump("off_bus", "ep-late", lambda _s: None)
+    secs = time.monotonic() - t0
+    assert secs < 6, secs
+    assert (as_user["pids"] / "hung_calls").read_text().splitlines() == ["raw 0x06 0x52 0x0D 0x80 0x00 0x50 0x02"]
+    assert rec["bmc_silent"].startswith("index restore on 0x0D")
+    assert rec["psu_error"].startswith("skipped") and "psu_path" not in rec
+    assert rec["path"] and "2/620 failed" in rec["summary"] and "BMC stopped answering" in rec["summary"]
+    assert "NOT restored on 0x0D,0x0F,0x11,0x13" in rec["summary"]
+    (ev,) = _events("cpld_dump")
+    assert ev["bmc_silent"] == rec["bmc_silent"]
 
 
 def test_a_slow_psu_read_behind_sudo_is_killed_at_its_bound(as_user, monkeypatch):
@@ -503,7 +631,7 @@ def test_a_slow_psu_read_behind_sudo_is_killed_at_its_bound(as_user, monkeypatch
     assert not _alive(_pid(as_user, "ipmi")), "the root-side sensor read outlived its bound"
 
 
-# --- An error mid-DIAG still ends it and restores the index (review #249, finding 3) ----------------
+# --- An error mid-DIAG still ends it and restores the index ----------------------------------------
 
 
 class _FullDisk:
@@ -578,7 +706,7 @@ def test_an_error_before_the_diag_restores_only_what_was_read(fake, monkeypatch)
     os.close(fd)
 
 
-# --- The dump and the episode's incidents are linked both ways (review #249, finding 1) -----------
+# --- The dump and the episode's incidents are linked both ways -----------------------------------
 
 
 @pytest.fixture

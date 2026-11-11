@@ -4,13 +4,14 @@
 """The vendor CPLD DIAG dump, taken once per fault episode before any recovery (spec 04 I18).
 
 A reset or re-power clears the CPLD state that says why a tray or chip dropped, so the DIAG must
-run first. It is the vendor's own script, run unchanged (the copy DC ships as
-``/usr/local/bin/cpld-dump.sh``, else a sha256-pinned V1.03.01 the installer placed), so syseng
-and DC read exactly the vendor dump. Its stdout is saved byte for byte.
+run first. It is the vendor's own script, run unchanged (the host's copy at
+``/usr/local/bin/cpld-dump.sh``, else a sha256-pinned V1.03.01 the installer placed), so whoever
+reads it reads exactly the vendor dump. Its stdout is saved byte for byte. It talks only to the
+BMC (``ipmitool raw 0x06 0x52``, I2C to the board CPLDs), never to a chip over PCIe.
 
-Three things make it safe to run from the broker:
+Four things make it safe to run from the broker:
 
-- One host-wide lock, ``/run/lock/tt-cpld.lock`` (flock), shared with tray-test: the DIAG selects
+- One host-wide lock, ``/run/lock/tt-cpld.lock`` (flock), shared with any other CPLD reader: the DIAG selects
   CPLD debug indexes, and two dumps interleaving their selects read each other's registers.
 - The UBB debug index (register 0x50 on each tray CPLD) is saved before and restored after, then
   read back: other readers expect the index they left.
@@ -19,6 +20,9 @@ Three things make it safe to run from the broker:
   children, which a per-user broker cannot signal itself. A dump that cannot take the lock, cannot
   find its script, runs past the cap or fails is skipped or killed with a logged reason; the index
   restore and the lock release follow the DIAG's end, and recovery always follows.
+- A BMC that stops answering costs one call: the first IPMI call that runs into its bound ends the
+  dump's BMC calls. Before the DIAG, the dump is skipped; after it, the remaining index restores
+  and the sensor read are skipped. The event names the call (``bmc_silent``).
 
 The dump and the incident bundle of the same fault episode (``evidence.capture_incident``) are
 cross-linked: each incident folder of the episode gets a ``cpld_dump.json`` naming the dump, and the
@@ -70,7 +74,7 @@ DUMPS_DIR = "cpld_dumps"
 # UBB swap only relabels these buses, so saving and restoring all four needs no swap logic.
 UBB_CPLDS = (("0x0D", "0x80"), ("0x0F", "0x80"), ("0x11", "0x80"), ("0x13", "0x80"))
 UBB_INDEX_REG = "0x50"
-# About 5 s per tray measured by tray-test's select-read-restore reader, 4 trays, doubled for the
+# About 5 s per tray measured with a select-read-restore reader, 4 trays, doubled for the
 # MB/PDB sections and a slow BMC. The lock wait and the index save/restore have their own bounds.
 CAP_SEC = 40.0
 LOCK_WAIT_SEC = 30.0
@@ -166,7 +170,20 @@ def _privileged(argv: list[str], bound_sec: float) -> list[str]:
     return bounded if os.geteuid() == 0 else [*SUDO, *bounded]
 
 
+class BmcSilent(Exception):
+    """An IPMI call ran into its bound: the BMC is not answering, so the dump makes no more BMC calls."""
+
+
+def _killed_at(rc: Optional[int], secs: float, bound: float) -> bool:
+    """The root-side timeout's KILL takes timeout itself down too: 137 from a shell, -9 from sudo
+    re-raising it, 124 from an older coreutils."""
+    return rc in (124, 137, -signal.SIGKILL) and secs >= bound - 0.5
+
+
 def _ipmi(args: list[str]) -> Optional[str]:
+    """One ``ipmitool raw 0x06 0x52`` call: its hex byte, or None on an error or a bad answer.
+    Raises :class:`BmcSilent` when the call ran into its bound."""
+    t0 = time.monotonic()
     try:
         r = subprocess.run(
             _privileged([IPMITOOL, "raw", "0x06", "0x52", *args], IPMI_CALL_SEC),
@@ -174,8 +191,12 @@ def _ipmi(args: list[str]) -> Optional[str]:
             text=True,
             timeout=IPMI_CALL_SEC + KILL_GRACE_SEC,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        raise BmcSilent(f"ipmitool raw {' '.join(args)} got no answer in {IPMI_CALL_SEC:.0f}s") from None
+    except OSError:
         return None
+    if _killed_at(r.returncode, time.monotonic() - t0, IPMI_CALL_SEC):
+        raise BmcSilent(f"ipmitool raw {' '.join(args)} got no answer in {IPMI_CALL_SEC:.0f}s")
     out = r.stdout.strip()
     return out if r.returncode == 0 and re.fullmatch(r"[0-9a-fA-F]{2}", out) else None
 
@@ -243,9 +264,7 @@ def _run_diag(
     finally:
         rc = _end_diag(p, t0 + cap_sec + KILL_GRACE_SEC)
     secs = time.monotonic() - t0
-    # The root-side timeout's KILL takes timeout itself down too: 137 from a shell, -9 from sudo
-    # re-raising it, 124 from an older coreutils.
-    killed_at_cap = rc in (124, 137, -signal.SIGKILL) and secs >= cap_sec - 0.5
+    killed_at_cap = _killed_at(rc, secs, cap_sec)
     if error or timed_out or not eof or killed_at_cap:
         rc = None
     return rc, secs, tail.decode(errors="replace"), error
@@ -305,17 +324,23 @@ def _read_psu(out: Path) -> dict:
     return rec
 
 
-def _restore_indexes(saved: dict) -> dict:
-    """Restore and read back each UBB index that was read before the DIAG. Never raises."""
+def _restore_indexes(saved: dict, silent: str = "") -> tuple[dict, str]:
+    """Restore and read back each UBB index that was read before the DIAG; (per-CPLD record, why
+    the BMC is silent or ""). Once a call runs into its bound (or ``silent`` says one did), the
+    rest are skipped, not tried. Never raises."""
     index = {}
     for bus, addr in UBB_CPLDS:
         before = saved.get(bus)
-        try:
-            after = None if before is None else _restore_index(bus, addr, before)
-        except Exception:  # noqa: BLE001 - one CPLD's failure must not skip the others
-            after = None
+        after = None
+        if before is not None and not silent:
+            try:
+                after = _restore_index(bus, addr, before)
+            except BmcSilent as e:
+                silent = f"index restore on {bus}: {e}"
+            except Exception:  # noqa: BLE001 - one CPLD's failure must not skip the others
+                pass
         index[bus] = {"before": before, "after": after, "restored": before is not None and after == before}
-    return index
+    return index, silent
 
 
 def take_dump(trigger: str, episode: str, log: Callable[[str], None]) -> dict:
@@ -340,10 +365,17 @@ def take_dump(trigger: str, episode: str, log: Callable[[str], None]) -> dict:
     saved: dict = {}
     out: Optional[Path] = None
     rc, tail = None, ""
+    silent = ""
     try:
         log(f"cpld dump: lock held, running {which} DIAG {script} (cap {cap:.0f}s) before recovery")
         for bus, addr in UBB_CPLDS:
-            saved[bus] = _read_index(bus, addr)
+            try:
+                saved[bus] = _read_index(bus, addr)
+            except BmcSilent as e:
+                silent = f"index save on {bus}: {e}"
+                break
+        if silent:
+            raise BmcSilent(silent)
         root = evidence.health_dir() / DUMPS_DIR
         root.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -353,19 +385,30 @@ def take_dump(trigger: str, episode: str, log: Callable[[str], None]) -> dict:
         rec.update(path=str(out), rc=rc, diag_sec=round(secs, 2))
         if err:
             rec["error"] = err
+    except BmcSilent:
+        # Nothing was written before the DIAG, so nothing needs restoring.
+        rec["bmc_silent"] = silent
+        rec["skipped"] = f"BMC not answering ({silent}); DIAG not run"
     except Exception as e:  # noqa: BLE001 - never raises; the event names what broke
         rec["error"] = repr(e)
     finally:
         # Only after the DIAG has ended (_run_diag waits for it), and before the lock goes.
         try:
-            rec["index_0x50"] = _restore_indexes(saved)
+            rec["index_0x50"], silent = _restore_indexes(saved, silent)
         finally:
             os.close(fd)  # closing the fd releases the flock
+    if "skipped" in rec:
+        return _journal(rec, t0, log)
     if out is None or "path" not in rec:
         rec["skipped"] = f"dump failed: {rec.get('error', 'unknown')}"
         return _journal(rec, t0, log)
+    if silent:
+        rec["bmc_silent"] = silent
     try:
-        rec.update(_read_psu(out.with_name(out.stem + "_psu.txt")))
+        if silent:
+            rec["psu_error"] = "skipped: the BMC stopped answering"
+        else:
+            rec.update(_read_psu(out.with_name(out.stem + "_psu.txt")))
         m = _VERSION.search(out.read_text(errors="replace")) if out.exists() else None
         rec["version"] = m.group(1) if m else ""
     except Exception as e:  # noqa: BLE001
@@ -382,6 +425,8 @@ def take_dump(trigger: str, episode: str, log: Callable[[str], None]) -> dict:
     unrestored = [b for b, v in rec["index_0x50"].items() if v["before"] is not None and not v["restored"]]
     if unrestored:
         rec["summary"] += f"; index 0x50 NOT restored on {','.join(unrestored)}"
+    if silent:
+        rec["summary"] += f"; BMC stopped answering ({silent}), later BMC calls skipped"
     rec["incidents"] = _link_incidents(episode, _link_body(episode, trigger, out))
     return _journal(rec, t0, log)
 

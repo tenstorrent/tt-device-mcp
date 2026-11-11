@@ -6,7 +6,7 @@
 # is not redistributed here: this pins its sha256, and the broker refuses a copy that
 # does not match (health/cpld_dump.py PINNED_SHA256 carries the same value).
 #
-# Source: tenstorrent/metal-internal-workflows, machines/galaxy/BH_s7t_cpld_dump_V1.03.01.sh
+# Script: the vendor's BH_s7t_cpld_dump_V1.03.01.sh (VERSION=V1.03.01)
 # Install: deploy/install-cpld-dump.sh <path to that file>
 TTDEV_CPLD_DUMP_VERSION=V1.03.01
 TTDEV_CPLD_DUMP_SHA256=ad0f966b78ba9f810f8add56e0942bad2b9bd02c434d0d66eb3ba687de89fc14
