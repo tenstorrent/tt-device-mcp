@@ -55,6 +55,9 @@ UBB_INDEX_REG = "0x50"
 CAP_SEC = 40.0
 LOCK_WAIT_SEC = 30.0
 IPMI_CALL_SEC = 5.0
+# One read-only BMC sensor listing after the DIAG: PSU input/output and the 12 V rails at the fault.
+PSU_SDR_SEC = 20.0
+_PSU_LINE = re.compile(r"PSU|PWS|P12V|12V|VIN|IIN|PIN|IOUT|POUT", re.I)
 PROGRESS_SEC = 5.0
 
 _SUMMARY = re.compile(r"(\d+)\s+FAILED signals in\s+(\d+)\s+TEST items")
@@ -203,6 +206,29 @@ def _run_diag(script: str, out: Path, cap_sec: float, log: Callable[[str], None]
     return rc, time.monotonic() - t0, tail.decode(errors="replace")
 
 
+def _read_psu(out: Path) -> dict:
+    """Save ``ipmitool sdr elist full`` raw to ``out``; return its path and the PSU/12 V lines."""
+    try:
+        r = subprocess.run(
+            _privileged([IPMITOOL, "sdr", "elist", "full"]),
+            capture_output=True,
+            text=True,
+            timeout=PSU_SDR_SEC,
+        )
+    except subprocess.TimeoutExpired as e:
+        text = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        out.write_text(text)
+        return {"psu_path": str(out), "psu_error": f"timed out after {PSU_SDR_SEC:.0f}s"}
+    except OSError as e:
+        return {"psu_error": repr(e)}
+    out.write_text(r.stdout + r.stderr)
+    lines = [l.strip() for l in r.stdout.splitlines() if _PSU_LINE.search(l.split("|")[0])]
+    rec: dict = {"psu_path": str(out), "psu": lines[:64]}
+    if r.returncode != 0:
+        rec["psu_error"] = f"rc {r.returncode}: {r.stderr.strip()[-120:]}"
+    return rec
+
+
 def take_dump(trigger: str, episode: str, log: Callable[[str], None]) -> dict:
     """Take one DIAG dump and journal it as a ``cpld_dump`` health event. Returns the event fields."""
     t0 = time.monotonic()
@@ -236,6 +262,7 @@ def take_dump(trigger: str, episode: str, log: Callable[[str], None]) -> dict:
             after = None if before is None else _restore_index(bus, addr, before)
             index[bus] = {"before": before, "after": after, "restored": before is not None and after == before}
         rec.update(path=str(out), rc=rc, diag_sec=round(secs, 2), index_0x50=index)
+        rec.update(_read_psu(out.with_name(out.stem + "_psu.txt")))
         m = _VERSION.search(out.read_text(errors="replace")) if out.exists() else None
         rec["version"] = m.group(1) if m else ""
         s = _SUMMARY.search(tail)
@@ -268,10 +295,10 @@ def _journal(rec: dict, t0: float, log: Callable[[str], None]) -> dict:
 
 
 def total_bound_sec() -> float:
-    """The longest :func:`take_dump` can hold recovery: lock wait + DIAG cap + 8 index calls + slack."""
+    """The longest :func:`take_dump` can hold recovery: lock wait + DIAG cap + 8 index calls + PSU read + slack."""
     cap = float(os.environ.get("TT_DEVICE_MCP_CPLD_DUMP_CAP_SEC") or CAP_SEC)
     wait = float(os.environ.get("TT_DEVICE_MCP_CPLD_DUMP_LOCK_WAIT_SEC") or LOCK_WAIT_SEC)
-    return wait + cap + 12 * IPMI_CALL_SEC + 5.0
+    return wait + cap + 12 * IPMI_CALL_SEC + PSU_SDR_SEC + 5.0
 
 
 def last_episode_file() -> Path:

@@ -28,6 +28,15 @@ FAKE_IPMI = """#!{py}
 import os, sys
 regs = os.environ["FAKE_CPLD_REGS"]
 a = sys.argv[1:]
+if a[:3] == ["sdr", "elist", "full"]:
+    if os.environ.get("FAKE_SDR_FAIL"):
+        print("Error: no BMC", file=sys.stderr)
+        sys.exit(1)
+    print("PSU0_VIN         | 70h | ok  | 10.1 | 207 Volts")
+    print("PSU0_POUT        | 72h | ok  | 10.1 | 1840 Watts")
+    print("P12V_UBB0        | 80h | ok  |  7.1 | 12.06 Volts")
+    print("CPU0_TEMP        | 01h | ok  |  3.1 | 45 degrees C")
+    sys.exit(0)
 assert a[:3] == ["raw", "0x06", "0x52"], a
 bus, op, reg = a[3], a[5], a[6]
 path = os.path.join(regs, bus)
@@ -326,3 +335,21 @@ def test_the_deploy_pin_matches_the_module():
             pin[k] = v
     assert pin["TTDEV_CPLD_DUMP_SHA256"] == cpld_dump.PINNED_SHA256
     assert pin["TTDEV_CPLD_DUMP_PATH"] == cpld_dump.PINNED_SCRIPT
+
+
+def test_psu_readings_saved_beside_the_dump(fake):
+    rec = cpld_dump.take_dump("chip_dead", "ep-psu", lambda _m: None)
+    assert rec["psu_path"].endswith("_psu.txt")
+    raw = open(rec["psu_path"]).read()
+    assert "CPU0_TEMP" in raw  # the whole listing is kept raw
+    assert [l.split("|")[0].strip() for l in rec["psu"]] == ["PSU0_VIN", "PSU0_POUT", "P12V_UBB0"]
+    assert "psu_error" not in rec
+    assert _events("cpld_dump")[-1]["psu_path"] == rec["psu_path"]
+
+
+def test_psu_read_failure_keeps_the_dump(fake, monkeypatch):
+    monkeypatch.setenv("FAKE_SDR_FAIL", "1")
+    rec = cpld_dump.take_dump("chip_dead", "ep-psu-fail", lambda _m: None)
+    assert rec["summary"] == "3/620 failed"
+    assert rec["psu_error"].startswith("rc 1") and "no BMC" in rec["psu_error"]
+    assert rec["psu"] == []

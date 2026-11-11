@@ -251,8 +251,10 @@ each rung fires only when the gentler one failed or cannot apply.
   summary, the script, which copy ran, its version and sha256. It holds the host-wide flock
   `/run/lock/tt-cpld.lock`, shared with tray-test, opened so root and a user can both take it.
   It saves each UBB CPLD's debug index (0x50) before and restores and reads it back after.
-  Bounds: a lock wait, a DIAG cap (about 5 s per tray x 4 trays, doubled) and per-call IPMI
-  timeouts. A busy lock, a missing script, a timeout or an error journals `cpld_dump_skipped`
+  Then one read-only `ipmitool sdr elist full` is saved raw beside the dump (`*_psu.txt`); the
+  event carries its path and the PSU and 12 V lines, or the read's error, which never fails the
+  dump. Bounds: a lock wait, a DIAG cap (about 5 s per tray x 4 trays, doubled), per-call IPMI
+  timeouts and a sensor-read cap. A busy lock, a missing script, a timeout or an error journals `cpld_dump_skipped`
   with its reason. Recovery always follows. The dumped episode is persisted, so a restart does
   not dump it again. `TT_DEVICE_MCP_CPLD_DUMP=0` switches it off.
 
@@ -519,6 +521,7 @@ NOT be conflated when reading results.
 | I18 the event log carries path, summary, script and sha | `tests/test_cpld_dump.py::test_the_event_names_path_summary_and_script`, `::test_raw_stdout_is_saved_unchanged` |
 | I18 host copy first, pinned copy only on its sha | `tests/test_cpld_dump.py::test_host_script_wins`, `::test_a_pinned_copy_with_the_wrong_sha_never_runs` |
 | I18 the host-wide lock: held during the dump, busy skips | `tests/test_cpld_dump.py::test_the_lock_is_held_while_the_dump_runs`, `::test_a_busy_lock_skips_with_a_reason`, `::test_the_lock_opens_an_existing_file_without_o_creat` |
+| I18 PSU and 12 V readings beside the dump; a failed read keeps the dump | `tests/test_cpld_dump.py::test_psu_readings_saved_beside_the_dump`, `::test_psu_read_failure_keeps_the_dump` |
 | I18 index 0x50 saved, restored, verified | `tests/test_cpld_dump.py::test_the_debug_index_is_restored_and_verified`, `::test_an_index_that_does_not_restore_is_named` |
 | I1/I2 platform selection: declared mode wins; unknown → per-target | `tests/test_recovery_select.py::test_declared_mode_wins`, `tests/test_recovery_select.py::test_unknown_falls_to_per_target_loud`, `tests/test_recovery_select.py::test_loudbox_declares_per_target` |
 | Boot-time platform commit / per-pass fallback | `tests/test_boot_platform.py::test_a_declared_mode_commits_without_touching_the_device`, `tests/test_boot_platform.py::test_a_probe_that_reads_galaxy_boards_commits_the_galaxy_ladder`, `tests/test_boot_platform.py::test_an_unreadable_mesh_commits_nothing_and_keeps_the_per_pass_fallback`, `tests/test_boot_platform.py::test_a_committed_platform_short_circuits_per_pass_selection` |
