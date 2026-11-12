@@ -886,6 +886,7 @@ class Job:
     preempt_clean: bool = False  # the kernel saw every process of the tree exit on SIGTERM by its own code
     preempt_exit_status: Optional[int] = None  # the job's own status, witnessed on a clean preemption
     preempt_yielded: bool = False  # it ended itself under contention (past its limit, a job waiting)
+    stopped_clean: bool = False  # the broker's stop ladder saw the whole tree gone before any SIGKILL (03 I69)
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     log_file: Optional[str] = None
@@ -5138,17 +5139,45 @@ def _post_kill_whole_trays(off: set, expected: int) -> list:
     return sorted(t for t, chips in tray_map.items() if chips and {int(c) for c in chips} <= ids)
 
 
-def _post_kill_route(q: dict, expected: int, kill_reset_due: bool) -> str:
+def _post_kill_route(q: dict, expected: int, kill_reset_due: bool, check_passed: bool = False) -> str:
     """Spec 03 I89: the path the post-kill episode takes from the chip read after the settle."""
     if q["job_left"] or q["holders"]:
         return "holder_left"
     if kill_reset_due:
         return "mesh_reset"
+    if check_passed:
+        return "no_reset"
     if q["off"] and (q["whole_trays"] or len(q["off"]) >= expected):
         return "power_cycle"
     if q["off"]:
         return "sbr"
     return "own_rung"
+
+
+def _kill_reset_deferral(q: Optional[dict]) -> Optional[dict]:
+    """Spec 03 I69: whether the open debt may run the full check before its reset, and why. Only a preempted or
+    cancelled job (never a timeout, a hang or a runtime-init fault) whose stop ladder saw the whole tree gone before any
+    SIGKILL, and whose post-kill wait (I89) then found no process of it left, none killed at the bound, no outside
+    holder and every chip readable after the settle. Anything else keeps the reset first."""
+    job = _kill_reset_job
+    if q is None or not job.get("stop_requested"):
+        return None
+    j = jobs.get(job.get("job_id") or "")
+    if j is None or not j.stopped_clean:
+        return None
+    if q["killed"] or q["job_left"] or q["holders"] or q["off"]:
+        return None
+    return {
+        "job": job.get("job_id"),
+        "end": job.get("end"),
+        "why": "every job process exited without SIGKILL and every chip read present after the settle",
+    }
+
+
+def _fast_checks_ok(state) -> bool:
+    """Spec 03 I69: every probe of the pass but the fabric traffic pass passed or did not run: chips present and ARC
+    healthy, so a failed full check is the mesh's, which the present-mesh reset is for."""
+    return not any(o.verdict is Verdict.UNHEALTHY for o in state.observations if o.monitor != "fabric")
 
 
 def _kill_reset_debt() -> str:
@@ -7675,6 +7704,22 @@ async def device_health_gate(
         # Spec 03 I89: on a multi-tray mesh the reset waits until the stopped job is gone and the mesh
         # has settled; the chips read after the settle route it (observe below reads them again).
         post_kill = await _post_kill_quiesce(expected, _log) if kill_reset and expected >= 2 * UBB_CHIP_COUNT else None
+        # Spec 03 I69: a clean stop of a preempted or cancelled job runs the full check first; the reset follows only
+        # if that check fails. A timeout, a hang, a SIGKILL anywhere in the stop and the startup gate keep reset-first.
+        deferral = _kill_reset_deferral(post_kill) if phase == "post-job" else None
+        if deferral is not None:
+            _log(
+                f"{kill_debt}: clean stop ({deferral['why']}) — the full check, fabric included, runs first; "
+                f"the mesh reset follows only if it fails"
+            )
+            health_event(
+                "kill_reset_deferred",
+                phase=phase,
+                expected=expected,
+                job=deferral["job"],
+                end=deferral["end"],
+                why=deferral["why"],
+            )
         # Spec 03 I78: a dirty hold lifts only on a fresh passing full check, fabric included. Pre-job, with no such
         # pass on record, the funnel would refuse this gate's release on every job, and nothing else runs a fabric pass
         # on a dirty hold with jobs queued until the 10-min bound (04 I76). So a held, dirty device with no fresh pass
@@ -7690,7 +7735,7 @@ async def device_health_gate(
         # function that costs real time, and a read-only pass has no rung to spend it on.
         # A reset with no passing fabric pass since (04 I32) runs the pass here too, so the gate
         # settles it in place; a job boundary that followed no reset adds no time.
-        full = (
+        full = deferral is not None or (
             with_recover
             and not kill_reset
             and (
@@ -7779,18 +7824,34 @@ async def device_health_gate(
         # Spec 03 I69: the gate has taken the debt. With every chip present and ARC healthy it is paid
         # by the present-mesh reset below; anything else is another fault, whose own rung (and the
         # full check that rung's verify runs) decides. Either way it is not owed twice.
-        kill_reset_due = kill_reset and healthy
+        # A deferred debt is paid by its full check passing, fabric included with a verdict; a failed one with every
+        # chip present and ARC healthy gets the reset, then the full check again; any other fault takes its own rung.
+        kill_check_passed = deferral is not None and healthy and fabric_ok is True
+        if deferral is not None:
+            kill_reset_due = not kill_check_passed and _fast_checks_ok(state)
+        else:
+            kill_reset_due = kill_reset and healthy
         if kill_reset:
             _clear_kill_reset_debt()
+        if kill_check_passed:
+            _log(f"{kill_debt}: the full check passed after a clean stop — no reset needed")
+            health_event(
+                "kill_reset_not_needed", phase=phase, expected=expected, job=deferral["job"], end=deferral["end"]
+            )
         if kill_reset_due:
             healthy = False
-            _log(
-                f"{kill_debt}: all {expected} chip(s) present and ARC healthy, but a kill mid-run can "
-                f"leave the mesh wedged — one reset, then the full check, before release"
-            )
-            health_event("kill_mesh_reset", phase=phase, expected=expected, why=kill_debt[:200])
+            if deferral is not None:
+                _log(f"{kill_debt}: the full check failed after a clean stop — one reset, then the full check again")
+                why = f"full check failed after a clean stop: {kill_debt}"
+            else:
+                _log(
+                    f"{kill_debt}: all {expected} chip(s) present and ARC healthy, but a kill mid-run can "
+                    f"leave the mesh wedged — one reset, then the full check, before release"
+                )
+                why = kill_debt
+            health_event("kill_mesh_reset", phase=phase, expected=expected, why=why[:200])
         if post_kill is not None:
-            route = _post_kill_route(post_kill, expected, kill_reset_due)
+            route = _post_kill_route(post_kill, expected, kill_reset_due, kill_check_passed)
             off = post_kill["off"]
             held = "".join(f" (pid {h['pid']} {h['verdict']})" for h in post_kill["holders"][:4])
             _log(
@@ -11085,6 +11146,7 @@ async def _preempt_kill(job_id: str, pid: Optional[int], *, witness: bool = Fals
                     )
                 if clean:
                     preempt_forced_job_ids.discard(job_id)
+                _note_stop_clean(job_id, True)
                 _log_job_tree_killed(job_id, reason, f"{stopped}; ladder ended at SIGTERM (preempt kill)")
                 return clean
             await asyncio.sleep(0.1)
@@ -13110,12 +13172,22 @@ async def _terminate_job(job_id: str, pid: Optional[int], grace_sec: float = GRA
     scope = job_scope_unit(job_id)
     if await asyncio.to_thread(_scope_active, scope):
         reaped = await _terminate_scope(scope, grace_sec=grace_sec)
+        _note_stop_clean(job_id, not reaped)
         return f"stopped unit {scope}; ladder ended at " + ("systemctl stop (survived SIGINT)" if reaped else "SIGINT")
     if pid:
         members = await asyncio.to_thread(_pgid_pids, pid)
         step = await _terminate_process_group(pid, grace_sec=grace_sec)
+        _note_stop_clean(job_id, step != "SIGKILL")
         return f"stopped pgid {pid} pids {members or [pid]}; ladder ended at {step}"
     return "nothing to stop (no live scope or pid)"
+
+
+def _note_stop_clean(job_id: str, clean: bool) -> None:
+    """Spec 03 I69: record whether the broker's stop ladder saw the job's whole tree gone before any SIGKILL. A
+    `systemctl stop` reap counts as a SIGKILL: systemd may send one at its own bound."""
+    j = jobs.get(job_id)
+    if j is not None:
+        j.stopped_clean = clean
 
 
 def _readopted_deadline(job: "Job") -> float:
@@ -14759,6 +14831,15 @@ export {JOB_TAG_ENV}={job_tag}
                             "tag": job_tag,
                             "survivors": [(s.pid, s.starttime) for s in survivors if s.starttime],
                             "exited_at": time.monotonic(),
+                            "job_id": job_id,
+                            "end": job.status.value,
+                            # Spec 03 I69: a preempted or cancelled job may skip the reset once its stop
+                            # proves clean (the gate decides); a timeout, a hang or a runtime-init fault never.
+                            "stop_requested": (
+                                job.status in (JobStatus.PREEMPTED, JobStatus.KILLED)
+                                and (job_id in request_killed_job_ids or job_id in preempt_forced_job_ids)
+                                and not init_fault
+                            ),
                         }
                     )
                 request_killed_job_ids.discard(job_id)

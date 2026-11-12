@@ -1041,7 +1041,18 @@ cooldown (spec 04 I65) holds longer.
   elsewhere). Only when every chip reads present and ARC healthy: anything else is a different
   fault and takes its own rung on the same evidence. Only the full post-reset check (fabric
   traffic and dispatch included, spec 04 I32) releases the device; a failed one keeps it held
-  and climbs the bounded ladder like I55, never a release. A spent latch or a reset
+  and climbs the bounded ladder like I55, never a release. One case checks before it resets (I89,
+  multi-tray mesh only): a job that ended PREEMPTED, or KILLED by a requested kill, whose broker
+  stop ladder saw its whole tree gone with no SIGKILL (`Job.stopped_clean`; a `systemctl stop`
+  reap counts as a SIGKILL), when the I89 quiesce killed nothing, found no job process or holder
+  left and read every chip present. The gate journals `kill_reset_deferred` (job, end, why) and
+  runs the full check, fabric over every cabled link included, before any reset. A pass releases
+  with no reset (`kill_reset_not_needed`) and settles the debt. A fail (fewer links than cabled,
+  a fabric pass that could not run, or any other failed probe) on a mesh whose fast checks are
+  healthy journals `kill_mesh_reset` with why `full check failed after a clean stop: ...`, runs
+  the one reset, then the full check again, then the bounded ladder; a fast-check failure goes
+  straight to the ladder. Timeout and HUNG ends, a SIGKILL at either bound, a FW-init debt, a
+  re-adopted job and the startup gate's debt (I74) keep reset-first. A spent latch or a reset
   cooldown journals `kill_reset_skipped`, clears the debt and keeps today's path
   (the dirty exit's fabric pass). Any reset since the job ended also settles the debt. A debt
   still open when the runner takes the next job (a re-adopted job's, which has no post-job gate of
@@ -1122,7 +1133,9 @@ cooldown (spec 04 I65) holds longer.
   (`post_kill_settle: route <route>; ...`) with the route, the reap wait, the settle time, the
   seconds since the last job process was seen alive, the processes killed at the bound, the
   holders left, the per-chip readability before the reset and the chips sent to their bridge
-  reset (`sbr_chips`). An 8-chip mesh and a job that ended itself are unchanged.
+  reset (`sbr_chips`). A clean stop of a preempted or cancelled job takes the
+  `no_reset` route when the full check it runs first passes (I69). An 8-chip mesh and a job that
+  ended itself are unchanged.
 - **I90 — A hold carried into a boot the broker's escalation brought up reads as its pending
   startup check.** The carried episode's detail describes the boot that is gone: after a power cycle
   that brought every chip back, a hold still reading "1/32 chip(s) off the bus" misleads anyone
@@ -2653,6 +2666,7 @@ refuses.
 | I69 (every broker kill logs one KILLED process-tree line) | `tests/test_job_kill_reset.py::test_a_broker_kill_logs_the_process_tree_it_stopped`, `tests/test_job_kill_reset.py::test_a_preempt_kill_that_outlives_sigterm_logs_the_process_tree`, `tests/test_job_kill_reset.py::test_a_reset_that_stops_a_readopted_job_logs_the_process_tree` |
 | I69 (every preemption kill owes the reset unless every process was witnessed to exit by its own code on SIGTERM, which takes the fast check (none when its own status is a proven 0) and its job's own post-job gate pays it, reset then full check, before the waiting job's door; a job that ends itself inside its minute is not preempted; the re-adopted path too, leaving no id) | `tests/test_job_kill_reset.py::test_every_preemption_kill_owes_the_reset`, `tests/test_preemptable.py::test_a_job_that_ends_itself_inside_the_minute_is_a_normal_end`, `tests/test_job_kill_reset.py::test_a_preemption_owes_and_pays_the_reset_before_the_next_job`, `tests/test_job_kill_reset.py::test_a_preemption_debt_resets_then_runs_the_full_check_before_release`, `tests/test_job_kill_reset.py::test_a_preempted_readopted_job_owes_the_reset`, `tests/test_preemptable.py::test_a_preempted_job_that_ends_cleanly_on_sigterm_takes_the_fast_check`, `tests/test_preemptable.py::test_a_preempted_job_that_returns_0_on_sigterm_gets_no_check_and_no_reset`, `tests/test_preemptable.py::test_a_preempted_exit_0_on_a_held_or_owing_device_keeps_its_gate`, `tests/test_preemptable.py::test_a_preempted_job_with_a_signal_death_is_reset_and_fully_checked`, `tests/test_preemptable.py::test_a_preempted_job_that_needed_sigkill_is_reset_and_fully_checked`, `tests/test_preemptable.py::test_an_unwitnessed_preemption_is_reset_and_fully_checked`, `tests/test_preemptable.py::test_a_preemption_witnessed_from_a_pid_namespace_is_reset_and_fully_checked`, `tests/test_preemptable.py::test_a_witness_error_keeps_the_reset_debt_and_the_kill_completes` |
 | I69 (a failed job whose log shows a runtime FW-init failure owes the reset; a plain exit 1 with no debt keeps the clean-exit shortcut; a job our own reset killed owes none) | `tests/test_job_kill_reset.py::test_a_job_that_could_not_initialize_the_device_owes_the_reset`, `tests/test_job_kill_reset.py::test_a_plain_exit_1_with_no_debt_keeps_the_clean_exit_shortcut`, `tests/test_job_kill_reset.py::test_no_fw_init_debt_for_a_job_our_own_reset_killed` |
+| I69 (on a multi-tray mesh a preempted or requested-kill end whose stop sent no SIGKILL runs the full check first: a pass releases with no reset, a fail resets then checks again and climbs, an unrun fabric pass is a fail; timeout, hung, a SIGKILL and startup debt reset first) | `tests/test_kill_reset_deferred.py::test_a_clean_stop_runs_the_full_check_and_a_pass_releases_with_no_reset`, `tests/test_kill_reset_deferred.py::test_a_failed_fabric_check_after_a_clean_stop_resets_then_checks_again`, `tests/test_kill_reset_deferred.py::test_a_check_that_still_fails_after_the_reset_holds_and_climbs`, `tests/test_kill_reset_deferred.py::test_a_fabric_check_that_cannot_run_counts_as_a_fail`, `tests/test_kill_reset_deferred.py::test_timeout_and_hung_ends_reset_first`, `tests/test_kill_reset_deferred.py::test_a_sigkill_at_the_bound_resets_first`, `tests/test_kill_reset_deferred.py::test_a_survivor_the_quiesce_killed_resets_first`, `tests/test_kill_reset_deferred.py::test_startup_kill_debt_resets_first`, `tests/test_kill_reset_deferred.py::test_the_pgid_ladder_records_whether_it_sent_sigkill`, `tests/test_kill_reset_deferred.py::test_a_systemctl_stop_reap_counts_as_a_sigkill` |
 | I69 (a FW-init failure resets, then runs the full check before release; a failed check after that reset stays held) | `tests/test_job_kill_reset.py::test_a_fw_init_failure_resets_then_runs_the_full_check_before_release`, `tests/test_job_kill_reset.py::test_a_failed_check_after_the_fw_init_reset_stays_held` |
 | I69 (the door payment waits out an external step's reservation) | `tests/test_job_kill_reset.py::test_the_door_payment_waits_out_an_external_step` |
 | I89 (the post-kill reset waits for the job's processes, a setsid child included; a job zombie does not block it) | `tests/test_post_kill_settle.py::test_the_reset_waits_for_the_jobs_processes_to_exit`, `tests/test_post_kill_settle.py::test_a_setsid_child_that_ignores_term_is_killed_at_the_bound_and_logged` |
