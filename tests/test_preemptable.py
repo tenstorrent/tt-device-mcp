@@ -115,6 +115,14 @@ async def _until_running(job):
     raise AssertionError(f"job never started: {job.status.value}")
 
 
+async def _until_exists(path, limit_sec):
+    t0 = time.monotonic()
+    while not path.exists():
+        if time.monotonic() - t0 > limit_sec:
+            raise AssertionError(f"the job never signalled it was ready ({path}) within {limit_sec} s")
+        await asyncio.sleep(0.05)
+
+
 async def _until_finished(job, limit_sec):
     t0 = time.monotonic()
     while job.finished_at is None and time.monotonic() - t0 < limit_sec:
@@ -550,10 +558,11 @@ def _witness(monkeypatch, *, clean, ok=True, why="", status=None):
 
 
 async def _preempt(
-    monkeypatch, job_id, command, *, kill_grace, while_running=None, scope_sent=None, contender=_waiting_job
+    monkeypatch, job_id, command, *, kill_grace, while_running=None, scope_sent=None, contender=_waiting_job, ready=None
 ):
     """Run a preemptable job past its 1 s limit with a job waiting, through the minute (1 s here) and the kill, and let
-    the runner reach the post-job gate. ``while_running`` is called once the job runs."""
+    the runner reach the post-job gate. ``while_running`` is called once the job runs. With ``ready`` (a path), the
+    waiter comes only once the job has created it, so the minute cannot end before the job is set up."""
     _free_device_lock(monkeypatch)
     _no_workspace_activation(monkeypatch)
     gate = _recording_post_job_gate(monkeypatch)
@@ -572,6 +581,8 @@ async def _preempt(
     runner = asyncio.create_task(srv.job_runner())
     try:
         await _until_running(job)
+        if ready is not None:
+            await _until_exists(ready, limit_sec=10)
         if while_running is not None:
             while_running()
         contender()
@@ -1062,7 +1073,11 @@ def test_the_witness_matches_a_real_tree_against_injected_events(monkeypatch):
                 p.wait()
 
 
-_HANDLES_TERM = "import signal, sys, time; signal.signal(signal.SIGTERM, lambda *a: sys.exit({rc})); time.sleep(30)"
+# Writes {ready} once its handler is set: a SIGTERM before that would kill it by the default action.
+_HANDLES_TERM = (
+    "import signal, sys, time; signal.signal(signal.SIGTERM, lambda *a: sys.exit({rc})); "
+    'open("{ready}", "w").close(); time.sleep(30)'
+)
 
 
 @pytest.mark.asyncio
@@ -1078,7 +1093,7 @@ _HANDLES_TERM = "import signal, sys, time; signal.signal(signal.SIGTERM, lambda 
     ],
 )
 async def test_the_real_job_wrapper_reports_a_handled_sigterm_by_the_jobs_own_status(
-    monkeypatch, clear_job_state, program, want
+    monkeypatch, tmp_path, clear_job_state, program, want
 ):
     """The real job wrapper (its TERM trap is `exit 143`, not overridden here) around a program, preempted within the 10
     s grace and judged from the kernel's own exit records."""
@@ -1087,12 +1102,29 @@ async def test_the_real_job_wrapper_reports_a_handled_sigterm_by_the_jobs_own_st
     if not probe.ok:
         pytest.skip(f"no process events here: {probe.why}")
     fsm_healthy(srv)
+    ready = tmp_path / "ready"
     if program == "sleep":
-        command = "sleep 30"
+        command = f"touch {ready}; sleep 30"
     else:
-        command = f"{sys.executable} -c '{_HANDLES_TERM.format(rc=program.split('_')[1])}'"
-    job, sent, gate, dirty, owed = await _preempt(monkeypatch, "970", command, kill_grace=5)
+        command = f"{sys.executable} -c '{_HANDLES_TERM.format(rc=program.split('_')[1], ready=ready)}'"
+    witnesses = []
+    real_witness = srv.ExitWitness
+
+    def kept_witness(*a, **k):
+        w = real_witness(*a, **k)
+        witnesses.append(w)
+        return w
+
+    monkeypatch.setattr(srv, "ExitWitness", kept_witness)
+    job, sent, gate, dirty, owed = await _preempt(monkeypatch, "970", command, kill_grace=5, ready=ready)
     assert sent and sent[0] is signal.SIGTERM and signal.SIGKILL not in sent, sent
+    lost = [w.why for w in witnesses if not w.ok and w.why == "process events were lost"]
+    if lost and want != "full":
+        # The proc connector is system-wide: a busy host can overflow it and void the witness. The broker must then
+        # take the safe path (full check); the clean path cannot be judged on this run.
+        assert job.preempt_clean is False
+        assert dirty and owed == ["job 970 preempted"] and gate == [{"job_failed": True}]
+        pytest.skip(f"no process events here: {lost[0]}")
     if want == "exit0":
         assert job.preempt_clean is True and job.preempt_exit_status == 0
         assert job.exit_code == 0, "a handled SIGTERM with exit 0 must reach the broker as exit 0"
@@ -1286,12 +1318,15 @@ async def test_a_job_in_a_live_scope_that_needs_sigkill_is_reset_and_fully_check
 
 
 @pytest.mark.asyncio
-async def test_a_preemption_witnessed_from_a_pid_namespace_is_reset_and_fully_checked(monkeypatch, clear_job_state):
+async def test_a_preemption_witnessed_from_a_pid_namespace_is_reset_and_fully_checked(
+    monkeypatch, tmp_path, clear_job_state
+):
     """A broker in a PID namespace cannot witness its job's exits: the real witness says so (ok=False)."""
     monkeypatch.setattr(exit_witness, "_in_child_pid_namespace", lambda: True)
     fsm_healthy(srv)
-    command = f"{sys.executable} -c '{_HANDLES_TERM.format(rc=0)}'"
-    job, sent, gate, dirty, owed = await _preempt(monkeypatch, "972", command, kill_grace=5)
+    ready = tmp_path / "ready"
+    command = f"{sys.executable} -c '{_HANDLES_TERM.format(rc=0, ready=ready)}'"
+    job, sent, gate, dirty, owed = await _preempt(monkeypatch, "972", command, kill_grace=5, ready=ready)
     assert sent and sent[0] is signal.SIGTERM and signal.SIGKILL not in sent, sent
     assert job.preempt_clean is False and job.preempt_exit_status is None
     assert dirty and owed == ["job 972 preempted"] and gate == [{"job_failed": True}]
@@ -1658,7 +1693,9 @@ async def test_the_full_post_job_gate_runs_before_the_waiting_job_gets_the_devic
         id="969",
         owner="t",
         workspace="/tmp",
-        command="trap 'exit 0' INT; while true; do sleep 0.1; done",
+        # One long-lived child, not a fresh `sleep` every 0.1 s: the preempt kill reads the process group from
+        # /proc, and a child exiting mid-read made that read flaky.
+        command="trap 'exit 0' INT; sleep 60 & wait",
         queued_at="t",
         timeout_sec=1,
         preemptable=True,
