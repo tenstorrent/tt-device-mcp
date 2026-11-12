@@ -1388,6 +1388,8 @@ class GalaxyRecovery(Recovery):
         if not allowed:
             log(f"{what}: power cycle held off: {why}")
             self.mechanism._journal_auto_recovery_denied("power-cycle", why)
+            # Spec 04 I109: a refused host rung still starts the episode's CPLD dump; it never waits for it.
+            self.mechanism.cpld_dump_start("power-cycle", log)
             metrics.stage_fired("power_cycle", "blocked")
             return False
         health_event(
@@ -1441,6 +1443,8 @@ class GalaxyRecovery(Recovery):
             return "held", f"standing back from the power cycle: {standback}"
         allowed, why = self.mechanism.auto_recovery_allowed(escalation, tenant_active=False)
         if not allowed:
+            # Spec 04 I109: a refused host rung still starts the episode's CPLD dump; it never waits for it.
+            self.mechanism.cpld_dump_start(escalation, log)
             return "held", f"{escalation} held off: {why}"
         # The stand-back command can run for its whole timeout: the leftover may have exited, a tenant
         # arrived or a reset scope started meanwhile. Fire only on a fresh scan that still says go.
@@ -2356,6 +2360,8 @@ class GalaxyRecovery(Recovery):
             return False
         # The caller ends it after its settle and verify (the host-hang latch, I25).
         pcie_guard.begin_offbus_reset("reset sweep", off_bus)
+        # The CPLD dump comes before the first rung (SBR), not just before the re-power (spec 04 I109).
+        await self.mechanism.cpld_dump_before_recovery("all_rungs", log)
         # Hold reset_in_flight across the whole sweep so the dead-chip sampler defers instead of
         # isolating a tray mid-reset. Cleared on every exit.
         self.mechanism.reset_in_flight = True
@@ -3286,6 +3292,8 @@ class GalaxyRecovery(Recovery):
                 held_since=hold_since,
                 off_bus=off_bus,
             )
+            # Spec 04 I109: a refused host rung still starts the episode's CPLD dump; it never waits for it.
+            self.mechanism.cpld_dump_start("power-cycle", log)
             # A cooldown denial (I65) is a stated wait the watchdog ends: hold, no reset meanwhile.
             # Any other denial hands back to the plain hold as before.
             cooldown = self.mechanism.power_cycle_cooldown_state
@@ -4412,6 +4420,8 @@ class GalaxyRecovery(Recovery):
             )
             self.mechanism._journal_auto_recovery_denied(escalation, why)
             metrics.stage_fired(_HOST_ESCALATION_STAGE.get(escalation, escalation), "blocked")
+            # Spec 04 I109: a refused host rung still starts the episode's CPLD dump; it never waits for it.
+            self.mechanism.cpld_dump_start(escalation, log)
             self._host_rung_denied_why = why
             return HOST_RUNG_DENIED
         # The recorded cause names what is actually true at this point — the old fixed string

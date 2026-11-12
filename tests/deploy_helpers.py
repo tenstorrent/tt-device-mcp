@@ -79,6 +79,7 @@ rm() {
 
 def _clock(text):
     """The script's seams (au_now, au_cap, au_time, au_root_uid) and its decision log (au_log) as it
-    defines them, ahead of the source: the lap reads the real clock."""
+    defines them, ahead of the source: the lap reads the real clock. The log's journal line goes to a
+    no-op logger, never the host's journal; a test that checks it defines its own logger after this."""
     i = text.index("au_now() {")
-    return text[i : text.index("\n}\n", text.index("au_log() {", i)) + 3]
+    return text[i : text.index("\n}\n", text.index("au_log() {", i)) + 3] + "logger() { :; }\n"

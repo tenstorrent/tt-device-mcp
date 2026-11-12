@@ -559,7 +559,8 @@ cooldown (spec 04 I65) holds longer.
   these hold: the device is HEALTHY and not dirty (no hold open), the eth rung is armed (I28), the
   last fabric verdict (`HealthMonitor.last_fabric_ok`) is OK, and nothing touched the device's
   health during the job: no AER delta, link change or bus change in the job's PCIe record (I91),
-  no contained chip, no runtime-reported device fault, no kill-reset debt (I69) and no reset
+  no contained chip, no runtime-reported device fault, no kill-reset debt (I69, which a runtime
+  firmware-init failure in the job's own log owes) and no reset
   awaiting its fabric pass (spec 04 I32). The gate then runs the quick checks of a clean exit
   (host-pci, heartbeat, snapshot and the passive eth read, I30) and journals
   `post_job_fabric_skipped` with reason `clean_software_exit` and the exit code. A failed quick
@@ -1015,6 +1016,15 @@ cooldown (spec 04 I65) holds longer.
   inside the minute is not preempted and owes none. A kill mid-run is how a mesh is left wedged mid-collective, and
   a fabric pass that happens to pass does not clear what it cannot see. Every submit path (MCP,
   REST `tt_device_job_run_bg`, the CLI) runs through the same runner, so each owes it the same way.
+  A job that failed on its own (FAILED, any exit code) because the runtime could not bring the
+  device up owes the same reset: its log tail names a firmware-init failure
+  (`_RUNTIME_INIT_FAULT_SIGNATURES`: `failed to initialize fw`, `waiting for physical cores to
+  finish`), or the runtime printed an unrecoverable-device line (`DOOMED_PATTERNS`) and the job
+  exited before the reaper's grace ran out. Such a job ends in a plain exit code, so without the
+  debt the clean-exit shortcut (I36) handed the same wedged mesh to the next job, and every job
+  failed the same way with no reset and no hold. A failed job whose log names neither owes none
+  and keeps I36. Time to recover (the runtime-init class): one reset, then one full check, as below
+  (~3-5 min on a Galaxy).
   The runner records the debt when the job ends, and `_monitor_readopted_scope` records it for a
   re-adopted job (spec 01 I7) that its timeout, a requested kill or a preemption
   stopped; that path drops the job's requested-kill and forced-preemption marks at the job's end
@@ -2642,6 +2652,8 @@ refuses.
 | I69 (a debt open at the next job is paid by the post-job gate before its door, the job still QUEUED) | `tests/test_job_kill_reset.py::test_the_runner_pays_an_owed_debt_before_a_queued_job` |
 | I69 (every broker kill logs one KILLED process-tree line) | `tests/test_job_kill_reset.py::test_a_broker_kill_logs_the_process_tree_it_stopped`, `tests/test_job_kill_reset.py::test_a_preempt_kill_that_outlives_sigterm_logs_the_process_tree`, `tests/test_job_kill_reset.py::test_a_reset_that_stops_a_readopted_job_logs_the_process_tree` |
 | I69 (every preemption kill owes the reset unless every process was witnessed to exit by its own code on SIGTERM, which takes the fast check (none when its own status is a proven 0) and its job's own post-job gate pays it, reset then full check, before the waiting job's door; a job that ends itself inside its minute is not preempted; the re-adopted path too, leaving no id) | `tests/test_job_kill_reset.py::test_every_preemption_kill_owes_the_reset`, `tests/test_preemptable.py::test_a_job_that_ends_itself_inside_the_minute_is_a_normal_end`, `tests/test_job_kill_reset.py::test_a_preemption_owes_and_pays_the_reset_before_the_next_job`, `tests/test_job_kill_reset.py::test_a_preemption_debt_resets_then_runs_the_full_check_before_release`, `tests/test_job_kill_reset.py::test_a_preempted_readopted_job_owes_the_reset`, `tests/test_preemptable.py::test_a_preempted_job_that_ends_cleanly_on_sigterm_takes_the_fast_check`, `tests/test_preemptable.py::test_a_preempted_job_that_returns_0_on_sigterm_gets_no_check_and_no_reset`, `tests/test_preemptable.py::test_a_preempted_exit_0_on_a_held_or_owing_device_keeps_its_gate`, `tests/test_preemptable.py::test_a_preempted_job_with_a_signal_death_is_reset_and_fully_checked`, `tests/test_preemptable.py::test_a_preempted_job_that_needed_sigkill_is_reset_and_fully_checked`, `tests/test_preemptable.py::test_an_unwitnessed_preemption_is_reset_and_fully_checked`, `tests/test_preemptable.py::test_a_preemption_witnessed_from_a_pid_namespace_is_reset_and_fully_checked`, `tests/test_preemptable.py::test_a_witness_error_keeps_the_reset_debt_and_the_kill_completes` |
+| I69 (a failed job whose log shows a runtime FW-init failure owes the reset; a plain exit 1 with no debt keeps the clean-exit shortcut; a job our own reset killed owes none) | `tests/test_job_kill_reset.py::test_a_job_that_could_not_initialize_the_device_owes_the_reset`, `tests/test_job_kill_reset.py::test_a_plain_exit_1_with_no_debt_keeps_the_clean_exit_shortcut`, `tests/test_job_kill_reset.py::test_no_fw_init_debt_for_a_job_our_own_reset_killed` |
+| I69 (a FW-init failure resets, then runs the full check before release; a failed check after that reset stays held) | `tests/test_job_kill_reset.py::test_a_fw_init_failure_resets_then_runs_the_full_check_before_release`, `tests/test_job_kill_reset.py::test_a_failed_check_after_the_fw_init_reset_stays_held` |
 | I69 (the door payment waits out an external step's reservation) | `tests/test_job_kill_reset.py::test_the_door_payment_waits_out_an_external_step` |
 | I89 (the post-kill reset waits for the job's processes, a setsid child included; a job zombie does not block it) | `tests/test_post_kill_settle.py::test_the_reset_waits_for_the_jobs_processes_to_exit`, `tests/test_post_kill_settle.py::test_a_setsid_child_that_ignores_term_is_killed_at_the_bound_and_logged` |
 | I89 (driver-named gaps and zombie holders are ruled by 04 I92's rules: an exited zombie ends the wait at once; a zombie with a live holding thread, a live gap pid and an exited zombie whose file is open elsewhere are holders with their verdict, route holder_left, never signalled) | `tests/test_post_kill_settle.py::test_an_exited_zombie_the_driver_still_names_ends_the_wait_at_once`, `tests/test_post_kill_settle.py::test_a_zombie_leader_with_a_live_thread_holding_the_node_is_a_holder`, `tests/test_post_kill_settle.py::test_an_unattributed_live_gap_pid_is_reported_and_never_signalled`, `tests/test_post_kill_settle.py::test_an_exited_zombie_whose_node_is_open_in_a_forked_child_still_holds` |

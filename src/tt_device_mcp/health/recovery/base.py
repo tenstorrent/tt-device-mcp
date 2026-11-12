@@ -23,7 +23,7 @@ from typing import Awaitable, Callable, Optional
 
 from tt_device_mcp import aio, metrics, pre_reset_scan, privileges
 from tt_device_mcp.constants import DEVICE_RESET_OVERRUN_SEC, DEVICE_RESET_TIMEOUT_SEC
-from tt_device_mcp.health import chip_state
+from tt_device_mcp.health import chip_state, cpld_dump
 from tt_device_mcp.health import pci_writer as _pci_writer_mod
 from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.monitors import pci
@@ -701,6 +701,17 @@ class RecoveryMechanism:
         # held box.
         self._auto_recovery_denied_episode = ""
 
+        # The vendor CPLD DIAG dump owed before recovery (spec 04 I109). ``cpld_episode`` names the
+        # open fault episode (fsm.boot binds it to the FSM record's ``since``); "" means none is
+        # open and no dump is owed. One dump task per episode, shared by every rung that awaits it.
+        self.cpld_episode: Callable[[], str] = lambda: ""
+        # Whether the open episode's fault is a degraded one (fsm ``CPLD_DUMP_FAULTS``). A plain
+        # reset of an episode that is not (a killed job's mesh reset) takes no dump, so the dump
+        # stays owed to the drop that follows; the rungs only a lost chip reaches always take it.
+        self.cpld_degraded: Callable[[], bool] = lambda: True
+        self._cpld_task: Optional[asyncio.Task] = None
+        self._cpld_task_episode = ""
+
         # The host-level action (the power cycle) last requested and when (monotonic). Set once
         # its record is on disk, cleared if it fails to launch; read by the hold watchdog, which
         # starts no device reset while one is pending (see host_action_pending).
@@ -747,6 +758,46 @@ class RecoveryMechanism:
                 f"(up to {bound}s); the device stays held until the host comes back and passes the full check"
             )
         return True
+
+    def cpld_dump_start(self, trigger: str, log) -> Optional[asyncio.Task]:
+        """Start the episode's CPLD dump in a worker thread if it has not been taken yet; return its
+        task (None: no episode, already dumped, switched off, or no running loop). Never raises."""
+        try:
+            episode = self.cpld_episode()
+            if not episode or os.environ.get("TT_DEVICE_MCP_CPLD_DUMP", "1") == "0":
+                return None
+            if self._cpld_task_episode == episode:
+                return self._cpld_task
+            if cpld_dump.dumped_episode() == episode:
+                return None
+            loop = asyncio.get_running_loop()
+        except Exception:  # noqa: BLE001 - no loop (a sampler thread) or a broken accessor: the reset site retries
+            return None
+        cpld_dump.mark_episode(episode)
+        self._cpld_task_episode = episode
+        self._cpld_task = loop.create_task(asyncio.to_thread(cpld_dump.take_dump, trigger, episode, log))
+        return self._cpld_task
+
+    async def cpld_dump_before_recovery(self, trigger: str, log) -> None:
+        """Await the episode's CPLD dump before a rung resets or re-powers anything (spec 04 I109).
+        Bounded by :func:`cpld_dump.total_bound_sec`; a dump that fails, raises or overruns is
+        logged and recovery proceeds. Never raises."""
+        try:
+            if trigger == "reset" and not self.cpld_degraded():
+                return
+            task = self.cpld_dump_start(trigger, log)
+            if task is None or task.done():
+                return
+            await asyncio.wait_for(asyncio.shield(task), cpld_dump.total_bound_sec())
+        except asyncio.TimeoutError:
+            log(f"cpld dump still running after {cpld_dump.total_bound_sec():.0f}s; recovery proceeds without it")
+            health_event(
+                "cpld_dump_skipped", trigger=trigger, episode=self._cpld_task_episode, skipped="overran the cap"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the dump must never stop recovery
+            log(f"cpld dump failed: {exc!r}; recovery proceeds")
 
     def cooling(self) -> bool:
         """True while a reset that already failed is still inside its cooldown window.
@@ -1418,6 +1469,8 @@ class RecoveryMechanism:
         unclassified = self._override_unclassified(argv, owner, log)
         if unclassified:
             return None, unclassified
+        # Before the mesh preflight, so the preflight's verdict is not up to a dump's length old.
+        await self.cpld_dump_before_recovery("reset", log)
         mesh = ipmi_guard.is_mesh_reset(argv)
         if mesh:
             refused = await self._mesh_reset_preflight(argv, owner, log)
@@ -2961,6 +3014,8 @@ class RecoveryMechanism:
                 await self.power_cycle_journal(reason)
             except Exception as exc:  # noqa: BLE001 - logging only; never holds the cycle
                 log(f"{label.upper()}: foreign holder journal failed ({exc!r}); going ahead")
+        # The dump comes before the cycle is recorded or announced: while it runs nothing claims a cycle is pending.
+        await self.cpld_dump_before_recovery(ev, log)
         if not self.record_auto_recovery(action, reason):
             log(
                 f"{label.upper()} ABORTED: could not persist the escalation record; refusing to act "

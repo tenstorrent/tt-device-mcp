@@ -687,6 +687,10 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     # fresh on every write_textfile() call (never cached), so any path through the stats
     # persistence loop that reaches it in a test would mkdir a real host path.
     monkeypatch.setenv("TT_DEVICE_MCP_TEXTFILE_DIR", str(tmp_dirs.mktemp("no-textfile-dir")))
+    # The CPLD dump (spec 04 I109) runs the host's real vendor DIAG through sudo ipmitool, which the
+    # spawn tripwire cannot see behind bash/sudo: off for every test; test_cpld_dump turns it on
+    # against its own fake script and fake ipmitool.
+    monkeypatch.setenv("TT_DEVICE_MCP_CPLD_DUMP", "0")
     # The device-op flock defaults to /run/tt-device-broker/device-op.flock, the file the host's own
     # broker holds during its resets. A test that took it there would stall that broker's device op.
     monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_FLOCK", str(tmp_dirs.mktemp("flock") / "device-op.flock"))

@@ -19,6 +19,7 @@
 # kernels from the runtime root, so a lone binary is useless.
 set -euo pipefail
 
+# `<pin> --key` prints the pin's prefix name (see PREFIX below) and builds nothing.
 PIN="${1:-/opt/tt-device-broker/fabric-validator.pin}"
 [ -r "$PIN" ] || { echo "install-fabric-validator: no pin at $PIN" >&2; exit 1; }
 # shellcheck disable=SC1090
@@ -26,7 +27,21 @@ PIN="${1:-/opt/tt-device-broker/fabric-validator.pin}"
 
 ROOT="${TTDEV_VALIDATOR_ROOT:-/opt/tt-device-broker/validator}"
 SHA="${TTDEV_VALIDATOR_SHA:?pin is missing TTDEV_VALIDATOR_SHA}"
-PREFIX="$ROOT/$SHA"
+# The pin's patches, from the pin's own directory, applied in order to the checkout before the build.
+# They are part of the build's identity: the prefix is keyed on the SHA plus a hash of the patches, so
+# a changed patch builds a new prefix and flips to it exactly like a new pin does.
+PATCHES=()
+# Absolute, because `git -C "$BUILD" apply` resolves a relative name from the checkout.
+PIN_DIR="$(cd -- "$(dirname -- "$PIN")" && pwd)"
+for p in ${TTDEV_VALIDATOR_PATCHES:-}; do
+    p="$PIN_DIR/$p"
+    [ -r "$p" ] || { echo "install-fabric-validator: pinned patch $p missing" >&2; exit 1; }
+    PATCHES+=("$p")
+done
+KEY="$SHA"
+[ "${#PATCHES[@]}" -eq 0 ] || KEY="$SHA-$(cat -- "${PATCHES[@]}" | sha256sum | cut -c1-12)"
+if [ "${2:-}" = --key ]; then echo "$KEY"; exit 0; fi
+PREFIX="$ROOT/$KEY"
 CURRENT="$ROOT/current"
 LOCK="$ROOT/.build.lock"
 
@@ -51,7 +66,7 @@ built() {
 # Flip atomically, so a health check can never observe a half-built prefix.
 flip() { ln -sfn "$1" "$CURRENT.tmp" && mv -Tf "$CURRENT.tmp" "$CURRENT"; }
 
-# Spec 08 I27: each pin has two build slots, $SHA and $SHA.build, and a build only ever runs in the
+# Spec 08 I27: each pin has two build slots, $KEY and $KEY.build, and a build only ever runs in the
 # slot `current` does not point at. A built tree cannot be renamed into place afterwards (its RPATH
 # and runtime root are absolute paths into the tree it was built in), so the slot is its final path.
 # A same-pin repair therefore builds beside the live prefix, never in it: the fabric checks keep the
@@ -81,7 +96,7 @@ for slot in ${LIVE:+"$LIVE"} "$PREFIX" "$PREFIX.build"; do
             [ "$other" = "$slot" ] || rm -rf "$other"
         done
     fi
-    log "pin $SHA already built at $slot"
+    log "pin $KEY already built at $slot"
     exit 0
 done
 if [ "$LIVE" = "$PREFIX" ]; then BUILD="$PREFIX.build"; else BUILD="$PREFIX"; fi
@@ -103,8 +118,13 @@ if [ ! -d "$BUILD/.git" ]; then
     git -C "$BUILD" remote add origin "$TTDEV_VALIDATOR_REPO"
 fi
 git -C "$BUILD" fetch -q --depth 1 origin "$SHA"
-git -C "$BUILD" checkout -q --detach FETCH_HEAD
+# -f: a retry finds the previous attempt's patches applied, and they must apply to a clean tree.
+git -C "$BUILD" checkout -q -f --detach FETCH_HEAD
 git -C "$BUILD" submodule update -q --init --recursive --depth 1
+for p in ${PATCHES[@]+"${PATCHES[@]}"}; do
+    git -C "$BUILD" apply "$p" || { log "pinned patch $p does not apply to tt-metal $SHA; not building"; exit 1; }
+    log "applied $p"
+done
 
 TOOLCHAIN="$BUILD/${TTDEV_VALIDATOR_TOOLCHAIN:?pin is missing TTDEV_VALIDATOR_TOOLCHAIN}"
 [ -f "$TOOLCHAIN" ] || { log "toolchain '$TOOLCHAIN' not in the checkout"; exit 1; }
@@ -158,4 +178,4 @@ for rel in "$TTDEV_VALIDATOR_BIN_REL" "$TTDEV_DISPATCH_BIN_REL" "$TTDEV_PREJOB_D
 done
 
 flip "$BUILD"
-log "validator ready: $CURRENT/$TTDEV_VALIDATOR_BIN_REL (tt-metal $SHA)"
+log "validator ready: $CURRENT/$TTDEV_VALIDATOR_BIN_REL (tt-metal $KEY)"

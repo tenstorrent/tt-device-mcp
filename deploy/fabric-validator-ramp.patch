@@ -1,0 +1,88 @@
+Ramp the start of the fabric validator's link traffic (tt-device-mcp, deploy/fabric-validator.pin).
+
+Stock run_cluster_validation starts every chip's traffic workload at the same instant, so a Galaxy
+takes the load of all its links in one step. This launches the per-chip workloads in PCIe order,
+TTDEV_FABRIC_RAMP_CHIPS chips (default 1) at a time, TTDEV_FABRIC_RAMP_GAP_MS ms (default 250)
+apart; 0 ms restores the stock launch. The traffic, the links tested and the pass rule are
+unchanged. Cost: about the gap times (chips - 1), e.g. +1.75 s on 8 chips, +7.75 s on 32.
+
+install-fabric-validator.sh applies this with `git apply` after checking out the pinned SHA and
+fails the build if it does not apply.
+
+--- a/tools/scaleout/validation/utils/cluster_validation_utils.cpp
++++ b/tools/scaleout/validation/utils/cluster_validation_utils.cpp
+@@ -18,6 +18,7 @@
+ #include <tuple>
+ #include <unordered_set>
+ #include <thread>
++#include <cstdlib>
+ 
+ #include "tools/scaleout/validation/utils/ethernet_link_metrics_serialization.hpp"
+ #include "tools/scaleout/validation/utils/ethernet_link_api.hpp"
+@@ -437,16 +438,65 @@
+     const auto& distributed_context = tt::tt_metal::MetalContext::instance().global_distributed_context();
+     distributed_context.barrier();
+ 
++    // Ramp the traffic start: launch the per-chip workloads a group of TTDEV_FABRIC_RAMP_CHIPS chips
++    // (default 1) at a time, TTDEV_FABRIC_RAMP_GAP_MS (default 250) apart, in PCIe device order (so tray by
++    // tray where trays enumerate in turn), chips without their own PCIe device last, by chip id. A gap of 0
++    // launches every chip at once, as before. Every chip still runs the same program on the same links; a
++    // sender whose peer starts later waits for the receiver, so only the start of the load is spread out.
++    const auto ramp_env = [](const char* name, uint32_t fallback) {
++        const char* v = std::getenv(name);
++        if (v == nullptr || *v == '\0') {
++            return fallback;
++        }
++        char* end = nullptr;
++        unsigned long n = std::strtoul(v, &end, 10);
++        return (*end == '\0' && n <= 60000) ? static_cast<uint32_t>(n) : fallback;
++    };
++    const uint32_t ramp_chips = std::max<uint32_t>(1, ramp_env("TTDEV_FABRIC_RAMP_CHIPS", 1));
++    const uint32_t ramp_gap_ms = ramp_env("TTDEV_FABRIC_RAMP_GAP_MS", 250);
++    std::vector<ChipId> launch_order;
++    launch_order.reserve(mesh_workloads.size());
++    for (const auto& [device_id, mesh_workload] : mesh_workloads) {
++        launch_order.push_back(device_id);
++    }
++    const auto& mmio_chips = tt::tt_metal::MetalContext::instance().get_cluster().get_chips_with_mmio();
++    const auto launch_key = [&mmio_chips](ChipId chip) {
++        auto it = mmio_chips.find(chip);
++        return it != mmio_chips.end() ? std::make_pair(0, static_cast<int>(it->second))
++                                      : std::make_pair(1, static_cast<int>(chip));
++    };
++    std::sort(launch_order.begin(), launch_order.end(), [&launch_key](ChipId a, ChipId b) {
++        return launch_key(a) < launch_key(b);
++    });
++
+     // Launch async tasks
+     static std::vector<std::future<void>> futures;  // Static to avoid destructor blocking
+     futures.clear();
+     futures.reserve(mesh_workloads.size());
+-    for (auto& [device_id, mesh_workload] : mesh_workloads) {
++    const auto ramp_start = std::chrono::steady_clock::now();
++    for (std::size_t i = 0; i < launch_order.size(); i++) {
++        if (ramp_gap_ms > 0 && i > 0 && i % ramp_chips == 0) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(ramp_gap_ms));
++        }
++        const ChipId device_id = launch_order[i];
++        auto& mesh_workload = mesh_workloads.at(device_id);
+         futures.push_back(std::async(std::launch::async, [device_id, &mesh_workload, &devices]() {
+             tt::tt_metal::distributed::EnqueueMeshWorkload(
+                 devices.at(device_id)->mesh_command_queue(), mesh_workload, true);
+         }));
+     }
++    std::string launch_order_str;
++    for (const auto chip : launch_order) {
++        launch_order_str += (launch_order_str.empty() ? "" : ",") + std::to_string(chip);
++    }
++    log_info(
++        tt::LogDistributed,
++        "Traffic start ramp: {} chips, {} per step, {} ms gap, order {}, all launched after {} ms",
++        launch_order.size(),
++        ramp_chips,
++        ramp_gap_ms,
++        launch_order_str,
++        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - ramp_start).count());
+ 
+     // All futures are expected to complete within the timeout duration
+     auto start_time = std::chrono::steady_clock::now();

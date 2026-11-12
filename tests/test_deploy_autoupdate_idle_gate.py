@@ -392,6 +392,25 @@ def test_a_job_past_its_cap_never_gets_a_restart(tmp_path):
     assert trace[-1].startswith("restart held ") and "dispatch" not in trace, trace
 
 
+def test_a_deferred_lap_never_writes_to_the_host_journal(tmp_path):
+    """The decision log's journal line goes to a stand-in, never the real logger: a suite run
+    would otherwise leave fake decision=deferred lines in the running user's journal."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "logger-calls"
+    shim = bin_dir / "logger"
+    shim.write_text(f'#!/bin/sh\necho "$*" >> {calls}\n')
+    shim.chmod(0o755)
+    lap = tmp_path / "lap"
+    lap.mkdir()
+    done, trace, hold = _drain(
+        lap, running=10_000, queue=1, scope=True, job_age=1600, env={"PATH": f"{bin_dir}:/usr/bin:/bin"}
+    )
+    _no_restart(done, trace, hold)
+    assert "decision=deferred" in (lap / "logs" / "autoupdate.log").read_text(), "the lap logged no decision"
+    assert not calls.exists(), f"the lap called the real logger: {calls.read_text()}"
+
+
 def _holder(tmp_path, cgroup, jump=(0, 1500)):
     """One device holder (uid 1000) in `cgroup`, and no broker child or listed job scope."""
     proc = tmp_path / "proc" / "4321"

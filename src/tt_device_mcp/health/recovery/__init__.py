@@ -753,6 +753,7 @@ class Recovery(ABC):
                 self.last_bridge_reset_reasons[idx] = {"reason": "no_bridge"}
                 metrics.stage_fired("bridge_reset", "not_applicable")
                 continue
+            await self.mechanism.cpld_dump_before_recovery("bridge_reset", log)
             log(f"recovering chip {idx} ({bdf}) via a reset of its parent bridge")
             # Retry before giving up: the first shot often races the link retrain, and the
             # settle between tries is the difference between a re-bind here and a galaxy reset.

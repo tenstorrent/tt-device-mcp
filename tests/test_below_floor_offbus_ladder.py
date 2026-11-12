@@ -51,6 +51,9 @@ from tt_device_mcp.health.recovery import (
 from tt_device_mcp.health.recovery.stages import bridge_reset as bridge
 
 GONE = "31"
+# A stopped reader's pid that no real process can have (pid_max is at most 2**22): a test that signals it
+# through the real signal guard never reaches a process on the host running the suite.
+_FAKE_READER_PID = 2**22
 ALL = {str(i): 100 for i in range(32)}
 SHORT = {str(i): 100 for i in range(31)}  # chip 31 off the bus: 1 of 32, below the floor of 16
 
@@ -543,7 +546,7 @@ def _dead_link(monkeypatch, tmp_path, order, how):
 
     def freeze(reason):
         order.append("readers stopped")
-        return [{"pid": 4242, "user": "[broker]fabric-check"}]
+        return [{"pid": _FAKE_READER_PID, "user": "[broker]fabric-check"}]
 
     def isolate(idx):
         assert order[-1] == "readers stopped", "no broker-owned reader may touch the chip at its remove"
@@ -566,7 +569,7 @@ async def test_a_dead_link_chip_with_its_node_present_is_isolated_then_sbrd_at_t
     order, events, counters = _rig(monkeypatch, tmp_path, enumerated=True)
     killed = _dead_link(monkeypatch, tmp_path, order, how)
     assert await _bound_ladder() == OUTCOME_TERMINAL
-    assert killed == [(4242, signal.SIGKILL)], "a reader stopped for the remove is ended once it worked"
+    assert killed == [(_FAKE_READER_PID, signal.SIGKILL)], "a reader stopped for the remove is ended once it worked"
     i = order.index("readers stopped")
     assert order[i : i + 3] == ["readers stopped", f"isolate {GONE}", f"sbr ['{GONE}']"]
     assert not any(o.startswith("sbr") for o in order[:i]), "never an SBR before the chip is removed"
@@ -691,7 +694,7 @@ async def test_a_regressed_reset_gets_an_sbr_before_the_power_cycle(
     assert "galaxy_reset_skipped_regressed" in events
     i = order.index("readers stopped")
     assert order[i : i + 3] == ["readers stopped", f"isolate {GONE}", f"sbr ['{GONE}']"]
-    assert killed == [(4242, signal.SIGKILL)]
+    assert killed == [(_FAKE_READER_PID, signal.SIGKILL)]
     assert order.count(f"sbr ['{GONE}']") == 1, "one SBR per chip per hold"
     if heals:
         assert order[i + 3] == "full check", "the bus is whole: the full check runs before any mesh reset"

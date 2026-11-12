@@ -9,7 +9,9 @@ running broker resolves (``$R/venv/bin/python``, ``validator/current/<binary>``)
 the start must still exist. A step that removes one logs MISSING.
 """
 
+import hashlib
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -274,6 +276,7 @@ def _validator_bindir(tmp: Path) -> Path:
         '  init) mkdir -p "$d/.git" ;;\n'
         '  checkout) mkdir -p "$d/cmake" "$d/tt_metal/hw"; : >"$d/cmake/tc.cmake";\n'
         '            printf "set(ARCHS\\n    blackhole\\n)\\n" >"$d/tt_metal/hw/CMakeLists.txt" ;;\n'
+        f'  apply) shift; {shutil.which("git", path=os.defpath)} -C "$d" apply "$@" || exit ;;\n'
         "esac\n"
         'check_live "after git $*"\n',
     )
@@ -297,10 +300,11 @@ def _validator_bindir(tmp: Path) -> Path:
     return bindir
 
 
-def _pin(tmp: Path, sha: str) -> Path:
+def _pin(tmp: Path, sha: str, patches: str = "") -> Path:
     pin = tmp / f"pin-{sha}"
     pin.write_text(
-        "TTDEV_VALIDATOR_REPO=https://example.invalid/tt-metal.git\n"
+        (f'TTDEV_VALIDATOR_PATCHES="{patches}"\n' if patches else "")
+        + "TTDEV_VALIDATOR_REPO=https://example.invalid/tt-metal.git\n"
         f"TTDEV_VALIDATOR_SHA={sha}\n"
         "TTDEV_VALIDATOR_TOOLCHAIN=cmake/tc.cmake\n"
         "TTDEV_VALIDATOR_TARGET=a\nTTDEV_DISPATCH_TARGET=b\nTTDEV_PREJOB_DISPATCH_TARGET=c\n"
@@ -324,13 +328,21 @@ def _live_bins(root: Path, bins=_BINS) -> list[str]:
     return [str(root / "current" / b) for b in bins]
 
 
-def _run_validator(tmp: Path, sha: str, live: list[str], root: str | None = None) -> subprocess.CompletedProcess:
+def _run_validator(
+    tmp: Path,
+    sha: str,
+    live: list[str],
+    root: str | None = None,
+    patches: str = "",
+    key: bool = False,
+    relative: bool = False,
+) -> subprocess.CompletedProcess:
     bindir = tmp / "vstubs" if (tmp / "vstubs").exists() else _validator_bindir(tmp)
     env = _env(tmp, bindir, live)
     env["TTDEV_VALIDATOR_ROOT"] = root or str(tmp / "validator")
-    return subprocess.run(
-        ["bash", str(_VALIDATOR), str(_pin(tmp, sha))], env=env, capture_output=True, text=True, timeout=60
-    )
+    pin = _pin(tmp, sha, patches)
+    argv = ["bash", str(_VALIDATOR), pin.name if relative else str(pin), *(["--key"] if key else [])]
+    return subprocess.run(argv, env=env, cwd=tmp if relative else None, capture_output=True, text=True, timeout=60)
 
 
 def _built(p: Path) -> bool:
@@ -439,5 +451,61 @@ def test_validator_refuses_when_current_resolves_inside_the_build_slot(tmp_path)
 
 def test_host_config_counts_either_build_slot_as_built():
     text = _APPLY.read_text()
-    assert '"/opt/tt-device-broker/validator/$pinned_sha/$pinned_bin"' in text
-    assert '"/opt/tt-device-broker/validator/$pinned_sha.build/$pinned_bin"' in text
+    assert '"$ROOT/install-fabric-validator.sh" "$ROOT/fabric-validator.pin" --key' in text
+    assert '"/opt/tt-device-broker/validator/$pinned_key/$pinned_bin"' in text
+    assert '"/opt/tt-device-broker/validator/$pinned_key.build/$pinned_bin"' in text
+    # Every patch the shipped pin names is staged beside it.
+    pin = (_APPLY.parent / "fabric-validator.pin").read_text()
+    for name in re.search(r'^TTDEV_VALIDATOR_PATCHES="([^"]*)"', pin, re.M).group(1).split():
+        assert f'install -m 0644 "$DEPLOY/{name}"' in text, name
+
+
+# I30: the pin's patches. The stub checkout leaves cmake/tc.cmake empty; real `git apply` patches it.
+_ADD_LINE = "--- a/cmake/tc.cmake\n+++ b/cmake/tc.cmake\n@@ -0,0 +1 @@\n+# patched\n"
+_ADD_SECOND = "--- a/cmake/tc.cmake\n+++ b/cmake/tc.cmake\n@@ -1 +1,2 @@\n # patched\n+# second\n"
+_BAD_CONTEXT = "--- a/cmake/tc.cmake\n+++ b/cmake/tc.cmake\n@@ -1 +1 @@\n-not in the file\n+# patched\n"
+
+
+def _patch(tmp: Path, name: str, text: str) -> str:
+    (tmp / name).write_text(text)
+    return name
+
+
+def _key(sha: str, *texts: str) -> str:
+    return f"{sha}-{hashlib.sha256(''.join(texts).encode()).hexdigest()[:12]}"
+
+
+@pytest.mark.parametrize("relative", [False, True], ids=["absolute-pin", "relative-pin"])
+def test_validator_build_applies_the_pins_patches_under_a_patch_keyed_prefix(tmp_path, relative):
+    names = f"{_patch(tmp_path, 'one.patch', _ADD_LINE)} {_patch(tmp_path, 'two.patch', _ADD_SECOND)}"
+    res = _run_validator(tmp_path, "aaa", [], patches=names, relative=relative)
+    assert res.returncode == 0, res.stderr
+    root = tmp_path / "validator"
+    key = _key("aaa", _ADD_LINE, _ADD_SECOND)
+    assert os.readlink(root / "current") == str(root / key) and _built(root / "current")
+    assert (root / key / "cmake/tc.cmake").read_text() == "# patched\n# second\n", "both, in order"
+    printed = _run_validator(tmp_path, "aaa", [], patches=names, key=True)
+    assert printed.returncode == 0 and printed.stdout.strip() == key
+    assert _run_validator(tmp_path, "aaa", [], key=True).stdout.strip() == "aaa", "no patches: the bare SHA"
+
+
+@pytest.mark.parametrize("text", [_BAD_CONTEXT, None], ids=["context-mismatch", "patch-file-missing"])
+def test_validator_patch_that_does_not_apply_fails_the_build(tmp_path, text):
+    name = _patch(tmp_path, "bad.patch", text) if text is not None else "absent.patch"
+    res = _run_validator(tmp_path, "aaa", [], patches=name)
+    assert res.returncode != 0
+    assert ("does not apply" if text is not None else "missing") in res.stderr, res.stderr
+    assert not [s for s in _log(tmp_path) if s.startswith("step cmake")], "nothing built"
+    assert not os.path.lexists(tmp_path / "validator" / "current")
+
+
+def test_validator_changed_patch_builds_a_new_prefix_beside_the_live_one(tmp_path):
+    root = tmp_path / "validator"
+    _prefix(root, "aaa")  # the stock build of the same pin, live
+    os.symlink(root / "aaa", root / "current")
+    res = _run_validator(tmp_path, "aaa", _live_bins(root), patches=_patch(tmp_path, "r.patch", _ADD_LINE))
+    assert res.returncode == 0, res.stderr
+    assert _missing(tmp_path) == [], "a live broker never loses a validator binary it had"
+    key = _key("aaa", _ADD_LINE)
+    assert os.readlink(root / "current") == str(root / key) and _built(root / key)
+    assert _built(root / "aaa"), "the stock build stays for a one-line revert"

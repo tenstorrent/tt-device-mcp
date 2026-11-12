@@ -153,6 +153,57 @@ async def test_a_debt_owed_after_the_startup_check_is_paid_by_the_post_job_gate(
     assert srv.fsm.state is ServerState.HEALTHY and srv._kill_reset_debt() == ""
 
 
+# A job that failed on its own because the runtime could not bring the device up (firmware init timed out on the cores)
+# exits a plain 1. Its debt keeps the clean-exit shortcut (03 I36) off: one reset, then the full check with fabric.
+_FW_INIT_DEBT = "job 7 failed: runtime could not initialize the device ('failed to initialize fw')"
+
+
+@pytest.fixture
+def fw_init_failed(mesh, monkeypatch):  # noqa: F811
+    """The mesh after a job that ended itself in exit 1: every quick check passes, the last fabric verdict is green and
+    nothing happened during the job, so only a debt stands between it and the I36 shortcut."""
+    mesh["eth"] = ADVANCING
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", True)
+    monkeypatch.setattr(srv, "_pcie_cycle", {"job": "007", "job_rows": []})
+    monkeypatch.setattr(srv, "isolated_chips", set())
+    return mesh
+
+
+async def _clean_exit_1_gate():
+    await srv._verify_device_after_job(None, job_failed=True, clean_exit_code=1)
+
+
+@pytest.mark.asyncio
+async def test_a_fw_init_failure_resets_then_runs_the_full_check_before_release(fw_init_failed):
+    srv._owe_kill_reset(_FW_INIT_DEBT)
+    await _clean_exit_1_gate()
+    assert fw_init_failed["resets"] == [["tt-smi", "-glx_reset"]], "one present-mesh reset, no clean-exit shortcut"
+    assert fw_init_failed["fabric"] == [1], "the full check after the reset ran the fabric pass"
+    assert "kill_mesh_reset" in fw_init_failed["events"]
+    assert "post_job_fabric_skipped" not in fw_init_failed["events"]
+    assert srv.fsm.state is ServerState.HEALTHY, "released only on the post-reset pass"
+    assert srv._kill_reset_debt() == ""
+
+
+@pytest.mark.asyncio
+async def test_a_plain_exit_1_with_no_debt_keeps_the_clean_exit_shortcut(fw_init_failed):
+    await _clean_exit_1_gate()
+    assert fw_init_failed["resets"] == [] and fw_init_failed["fabric"] == [], "a plain failure is not a device event"
+    assert "post_job_fabric_skipped" in fw_init_failed["events"]
+    assert srv.fsm.state is ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_a_failed_check_after_the_fw_init_reset_stays_held(fw_init_failed):
+    fw_init_failed["reset_heals"] = False
+    srv._owe_kill_reset(_FW_INIT_DEBT)
+    await _clean_exit_1_gate()
+    assert fw_init_failed["resets"][0] == ["tt-smi", "-glx_reset"]
+    assert fw_init_failed["fabric"] and min(fw_init_failed["fabric"]) >= 1, "every fabric pass ran after the reset"
+    assert srv.fsm.state is ServerState.RECOVERING, "a failed post-reset check never releases"
+    assert srv._device_unavailable_for_tenant()
+
+
 _PRESENT = dict(
     healthy=False,
     fault_reported=False,
@@ -299,7 +350,7 @@ def _runner_done(job) -> bool:
     return job.finished_at is not None and srv.current_job_id != job.id
 
 
-async def _start(job_id: str, command: str, timeout_sec: int = 600):
+async def _start(job_id: str, command: str, timeout_sec: int = 600, log_file: str = ""):
     job = srv.Job(
         id=job_id,
         owner=srv.submitting_owner(),
@@ -308,6 +359,8 @@ async def _start(job_id: str, command: str, timeout_sec: int = 600):
         queued_at="t",
         timeout_sec=timeout_sec,
     )
+    if log_file:
+        job.log_file = log_file
     srv.jobs[job_id] = job
     await srv.get_job_queue().put(job_id)
     runner = asyncio.create_task(srv.job_runner())
@@ -774,6 +827,55 @@ async def test_a_failed_job_that_left_the_clock_busy_owes_the_reset(runner_env, 
     debt = srv._kill_reset_debt()
     assert debt.startswith("job 936 failed with 2 chip(s) left at the busy AI clock (max 1350 MHz)")
     assert "kill_reset_owed" in runner_env["events"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "output, want",
+    [
+        (
+            "TT_THROW: Device 0: Timeout (10000 ms) waiting for physical cores to finish",
+            "job 940 failed: runtime could not initialize the device ('waiting for physical cores to finish')",
+        ),
+        (
+            "Device 0 init: failed to initialize FW! Try resetting the board.",
+            "job 940 failed: runtime could not initialize the device ('failed to initialize fw')",
+        ),
+        (
+            "Timeout detected (metal_context.cpp:100): device timeout, potential hang detected, the device is unrecoverable",
+            "job 940 failed: runtime reported the device unrecoverable",
+        ),
+        ("AssertionError: expected 3, got 4", ""),
+    ],
+    ids=["cores-timeout", "fw-init", "unrecoverable-marker", "plain-exit-1"],
+)
+async def test_a_job_that_could_not_initialize_the_device_owes_the_reset(runner_env, monkeypatch, output, want):
+    """A job that exits 1 because the runtime could not bring the device up (or said it is unrecoverable) owes one
+    reset and the full check (03 I69); a plain exit 1 owes nothing and keeps the clean-exit shortcut (03 I36)."""
+    monkeypatch.setattr(srv, "_aiclk_left_busy", lambda *a, **k: {})
+    job, runner = await _start("940", f"echo '{output}'; exit 1", log_file=str(runner_env["tmp"] / "940.log"))
+    try:
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert job.status is srv.JobStatus.FAILED and job.exit_code == 1
+    assert srv._kill_reset_debt() == want
+    assert ("kill_reset_owed" in runner_env["events"]) == bool(want)
+
+
+@pytest.mark.asyncio
+async def test_no_fw_init_debt_for_a_job_our_own_reset_killed(runner_env, monkeypatch):
+    """Our reset killed it mid-init: the death is ours, so it owes no second reset."""
+    monkeypatch.setattr(srv, "_aiclk_left_busy", lambda *a, **k: {})
+    srv.reset_killed_job_ids.add("941")
+    job, runner = await _start(
+        "941", "echo 'failed to initialize FW'; exit 1", log_file=str(runner_env["tmp"] / "941.log")
+    )
+    try:
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert srv._kill_reset_debt() == ""
 
 
 @pytest.mark.asyncio
