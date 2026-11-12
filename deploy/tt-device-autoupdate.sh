@@ -285,10 +285,32 @@ broker_broken() {
 # continuous burst restarts at most once an hour, and no sha waits longer than that plus a lap and
 # the drain (the interval counts from the last apply, before the first sha was seen, so it ends
 # within the bound). TTDEV_APPLY_QUIET_SEC=0 turns coalescing off.
+# Stagger (spec 08 I31): boxes that follow one branch see a push within a lap of each other, so
+# without it they all restart (and run the startup check with fabric) at the same minute. Each box
+# adds its own fixed delay to both deadlines: a hash of its hostname into [0, APPLY_STAGGER). The
+# same host always gets the same delay, so its laps agree on when the sha applies. A broken broker
+# still applies at once. TTDEV_APPLY_STAGGER_SEC=0 turns it off; 2700 s spreads the boxes over 45
+# min, so a lone push applies 10-55 min after it lands and no sha waits past APPLY_BOUND + 45 min.
 PENDING_HEAD="$ROOT/pending-head"
 APPLY_QUIET="${TTDEV_APPLY_QUIET_SEC:-600}"
 APPLY_BOUND="${TTDEV_APPLY_BOUND_SEC:-3600}"
-if [ "$APPLY_QUIET" -gt 0 ] 2>/dev/null; then
+APPLY_STAGGER="${TTDEV_APPLY_STAGGER_SEC:-2700}"
+# The delay for host $2 in a window of $3 s, into the variable named $1: FNV-1a (32 bit) of the
+# name, mod the window. Builtins only, no process.
+au_stagger() {
+    local _h=2166136261 _i _c
+    for (( _i = 0; _i < ${#2}; _i++ )); do
+        printf -v _c '%d' "'${2:_i:1}"
+        _h=$(( ((_h ^ (_c & 255)) * 16777619) & 4294967295 ))
+    done
+    printf -v "$1" '%s' $(( _h % $3 ))
+}
+stagger=0
+if [ "$APPLY_STAGGER" -gt 0 ] 2>/dev/null; then
+    au_stagger stagger "${HOSTNAME:-}" "$APPLY_STAGGER"
+fi
+if [ "$APPLY_QUIET" -gt 0 ] 2>/dev/null || [ "$stagger" -gt 0 ]; then
+    [ "$APPLY_QUIET" -gt 0 ] 2>/dev/null || APPLY_QUIET=0
     [ "$APPLY_BOUND" -gt 0 ] 2>/dev/null || APPLY_BOUND=3600
     au_now now
     p_first=""; p_sha=""; p_seen=""; p_raw=""
@@ -303,8 +325,8 @@ if [ "$APPLY_QUIET" -gt 0 ] 2>/dev/null; then
     if [ "$p_raw" != "$p_first $remote_sha $p_seen"$'\n' ] || [ -L "$PENDING_HEAD" ] || [ ! -f "$PENDING_HEAD" ]; then
         { echo "$p_first $remote_sha $p_seen" > "$PENDING_HEAD.$$" && mv -f "$PENDING_HEAD.$$" "$PENDING_HEAD"; } 2>/dev/null || true
     fi
-    quiet_left=$(( p_seen + APPLY_QUIET - now ))
-    bound_left=$(( p_first + APPLY_BOUND - now ))
+    quiet_left=$(( p_seen + APPLY_QUIET + stagger - now ))
+    bound_left=$(( p_first + APPLY_BOUND + stagger - now ))
     if [ "$quiet_left" -gt 0 ] && [ "$bound_left" -gt 0 ]; then
         la=""; { read -r la < "$LAST_APPLY"; } 2>/dev/null || true
         case "$la" in ''|*[!0-9]*) age=0 ;; *) age=$(( now - 10#$la )) ;; esac
@@ -312,9 +334,9 @@ if [ "$APPLY_QUIET" -gt 0 ] 2>/dev/null; then
         broker_broken "$age"
         if [ -z "$broken" ]; then
             left=$quiet_left; [ "$bound_left" -lt "$left" ] && left=$bound_left
-            echo "autoupdate: coalescing: head ${remote_sha:0:9} seen $(( now - p_seen ))s ago (quiet ${APPLY_QUIET}s), oldest unapplied $(( now - p_first ))s ago (bound ${APPLY_BOUND}s); applies in ${left}s if the branch stays put" >&2
+            echo "autoupdate: coalescing: head ${remote_sha:0:9} seen $(( now - p_seen ))s ago (quiet ${APPLY_QUIET}s), oldest unapplied $(( now - p_first ))s ago (bound ${APPLY_BOUND}s), host stagger ${stagger}s; applies in ${left}s if the branch stays put" >&2
             au_time apply_by $(( now + left ))
-            au_log deferred "burst coalescing: head unchanged $(( now - p_seen ))s (quiet ${APPLY_QUIET}s), oldest unapplied $(( now - p_first ))s (bound ${APPLY_BOUND}s); apply_by=$apply_by"
+            au_log deferred "burst coalescing: head unchanged $(( now - p_seen ))s (quiet ${APPLY_QUIET}s), oldest unapplied $(( now - p_first ))s (bound ${APPLY_BOUND}s), stagger ${stagger}s; apply_by=$apply_by"
             exit 0
         fi
         echo "autoupdate: coalescing skipped: the broker $broken; ${remote_sha:0:9} goes on to the rate limit" >&2
@@ -338,6 +360,104 @@ if [ "$MIN_APPLY" -gt 0 ] 2>/dev/null; then
         echo "autoupdate: rate limit skipped: the broker $broken; ${remote_sha:0:9} goes on to the next gates (last apply $(( now - last ))s ago)" >&2
     fi
 fi
+
+# No-restart apply (spec 08 I29). A diff from the installed sha that touches only files no running
+# broker, job subprocess, staged script or host config ever reads moves the tree and installed.sha
+# and restarts nothing: every restart reruns the full startup check, fabric pass included, and a
+# restart that changes no loaded byte buys nothing for that exposure. It drains nothing either: it
+# runs here, after the coalescing and the rate limit above but before the device-op bar, the
+# dispatch hold and the idle gate below, since nothing it touches is read by a job, an op or the
+# broker. An explicit allowlist, and fail-safe: any other path, a path git has to quote (no pattern
+# matches it), a diff that cannot be computed, a clone not at the installed sha (an earlier apply
+# that stopped after its reset may have left the venv or a staged script newer than the running
+# broker), or a broker that is not healthy (I21's reasons; the restart may be its fix) takes the
+# full apply and restart below. last-apply is left alone, so the rate limit counts from the last
+# restart. This script is on the list too: no broker process reads it (the reconcile timer runs
+# the staged copy, and the broker never runs either), so a change to it is staged below and runs
+# from the next lap on. The sibling deploy scripts are not: the broker, its checks or reconcile
+# run them. A restart names every runtime path that caused it (the first RUNTIME_SHOWN, then a
+# count), not only the first in sort order.
+NO_RESTART_PATHS='docs/** tests/** .github/** *.md (outside src/) .pre-commit-config.yaml deploy/tt-device-autoupdate.sh'
+RUNTIME_SHOWN=20
+# Prints why this apply needs the restart, or nothing when it does not.
+restart_needed() {
+    local p head paths la age now n=0 list=""
+    case "$installed_sha" in
+        ''|*[!0-9a-f]*) echo "installed sha '${installed_sha}' is not a commit"; return ;;
+    esac
+    head="$(git -C "$clone" rev-parse --verify -q HEAD 2>/dev/null)"
+    [ "$head" = "$installed_sha" ] || { echo "the clone is at ${head:0:9}, not the installed ${installed_sha:0:9}"; return; }
+    paths="$(git -C "$clone" diff --name-only --no-renames "$installed_sha" "$remote_sha" 2>/dev/null)" \
+        || { echo "cannot diff ${installed_sha:0:9}..${remote_sha:0:9}"; return; }
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        case "$p" in
+            src/*) ;;   # package data: never by extension
+            docs/*|tests/*|.github/*|*.md|.pre-commit-config.yaml|deploy/tt-device-autoupdate.sh) continue ;;
+        esac
+        n=$(( n + 1 ))
+        [ "$n" -gt "$RUNTIME_SHOWN" ] || list="${list:+$list, }$p"
+    done <<< "$paths"
+    if [ "$n" -gt 0 ]; then
+        [ "$n" -le "$RUNTIME_SHOWN" ] || list="$list and $(( n - RUNTIME_SHOWN )) more"
+        echo "changes $list"; return
+    fi
+    la=""; { read -r la < "$LAST_APPLY"; } 2>/dev/null || true
+    au_now now
+    case "$la" in ''|*[!0-9]*) age=0 ;; *) age=$(( now - 10#$la )) ;; esac
+    [ "$age" -ge 0 ] || age=0
+    broker_broken "$age"
+    [ -z "$broken" ] || { echo "the broker $broken"; return; }
+}
+# Decided before any reset: restart_needed reads where the clone was left.
+why_restart="$(restart_needed)"
+changed_paths=""
+if [ -z "$why_restart" ]; then
+    # For the event: restart_needed ran in a subshell, so its list is listed again here.
+    changed_paths="$(git -C "$clone" diff --name-only --no-renames "$installed_sha" "$remote_sha" 2>/dev/null)" \
+        || why_restart="cannot diff ${installed_sha:0:9}..${remote_sha:0:9}"
+fi
+if [ -z "$why_restart" ]; then
+    # Nothing to install: the venv, the other staged scripts and the host config already match
+    # the new tree, which is now the one on disk. A new copy of this script is staged before
+    # installed.sha moves, as the full apply stages it (fail-closed): a failed copy leaves
+    # installed.sha on the old sha with the clone ahead of it, so the next lap takes the full
+    # apply and restart.
+    git -C "$clone" reset --hard -q "$remote_sha" \
+        || { echo "autoupdate: reset failed" >&2; au_log failed "no-restart apply: reset failed; installed.sha unchanged"; exit 1; }
+    staged=""
+    case $'\n'"$changed_paths"$'\n' in
+        *$'\n'deploy/tt-device-autoupdate.sh$'\n'*)
+            install -m 0755 "$clone/deploy/tt-device-autoupdate.sh" "$ROOT/autoupdate.sh" \
+                || { echo "autoupdate: staging autoupdate.sh failed (required); not marking current" >&2
+                     au_log failed "no-restart apply: staging autoupdate.sh failed; installed.sha unchanged, the next lap restarts"; exit 1; }
+            staged="; staged the new autoupdate.sh for the next lap" ;;
+    esac
+    printf '%s\n' "$remote_sha" > "$STATE"
+    # I23: the deferral clock belongs to an update not yet applied; a later one starts its own.
+    rm -f "$ROOT/recovery.defer" 2>/dev/null || true
+    rm -f "$ROOT/pending-head" 2>/dev/null || true   # I21 coalescing: so does the bound
+    echo "autoupdate: ${installed_sha:0:9} -> ${remote_sha:0:9} changes only ${NO_RESTART_PATHS}; tree and installed.sha moved, no drain, broker not restarted${staged}" >&2
+    EVENTS="${TT_DEVICE_MCP_HEALTH_DIR:-/var/lib/tt-device-broker/health}/health_events.jsonl"
+    au_cap now date +%s.%N
+    au_cap iso date -u -d "@${now%.*}" +%Y-%m-%dT%H:%M:%SZ
+    # Each non-empty line, \ and " escaped, quoted and joined by commas: what
+    # `sed -e '/^$/d' -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/.*/"&"/' | paste -sd, -` printed, in the shell.
+    paths_json=""; bs='\'; dq='"'   # quoted replacements: bash 5.2's patsub_replacement leaves them as is
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        path="${path//"$bs"/"$bs$bs"}"; path="${path//"$dq"/"$bs$dq"}"
+        paths_json="${paths_json:+$paths_json,}\"$path\""
+    done <<< "$changed_paths"
+    printf '{"ts": %s, "iso": "%s", "kind": "autoupdate_applied_no_restart", "from_sha": "%s", "to_sha": "%s", "changed_paths": [%s]}\n' \
+        "$now" "$iso" "$installed_sha" "$remote_sha" "$paths_json" \
+        >> "$EVENTS" 2>/dev/null \
+        || echo "autoupdate: warning: could not append autoupdate_applied_no_restart to $EVENTS" >&2
+    au_log applied "no restart: changes only ${NO_RESTART_PATHS}${staged}"
+    exit 0
+fi
+# Logged before any gate below holds or drains, so the journal says what the restart is for.
+echo "autoupdate: restart needed: $why_restart" >&2
 
 # An in-flight device operation is an ABSOLUTE bar — not the bounded defer below.
 # Restarting the broker mid-reset lets KillMode=control-group SIGTERM the running
@@ -722,96 +842,11 @@ fi
 echo "autoupdate: applying ${remote_sha:0:9}" >&2
 trap au_exit EXIT
 
-# No-restart apply (spec 08 I29). A diff from the installed sha that touches only files no running
-# broker, job subprocess, staged script or host config ever reads moves the tree and installed.sha
-# and restarts nothing: every restart reruns the full startup check, fabric pass included, and a
-# restart that changes no loaded byte buys nothing for that exposure. An explicit allowlist, and
-# fail-safe: any other path, a path git has to quote (no pattern matches it), a diff that cannot
-# be computed, a clone not at the installed sha (an earlier apply that stopped after
-# its reset may have left the venv or a staged script newer than the running broker), or a broker
-# that is not healthy (I21's reasons; the restart may be its fix) restarts as before. Nothing here
-# moves the rate limit or the gates above: this runs after them, and leaves last-apply alone.
-# This script is on the list too: no broker process reads it (the reconcile timer runs the staged
-# copy, and the broker never runs either), so a change to it is staged below and runs from the
-# next lap on. The sibling deploy scripts are not: the broker, its checks or reconcile run them.
-NO_RESTART_PATHS='docs/** tests/** .github/** *.md (outside src/) deploy/tt-device-autoupdate.sh'
-# Prints why this apply needs the restart, or nothing when it does not.
-restart_needed() {
-    local p head paths la age now
-    case "$installed_sha" in
-        ''|*[!0-9a-f]*) echo "installed sha '${installed_sha}' is not a commit"; return ;;
-    esac
-    head="$(git -C "$clone" rev-parse --verify -q HEAD 2>/dev/null)"
-    [ "$head" = "$installed_sha" ] || { echo "the clone is at ${head:0:9}, not the installed ${installed_sha:0:9}"; return; }
-    paths="$(git -C "$clone" diff --name-only --no-renames "$installed_sha" "$remote_sha" 2>/dev/null)" \
-        || { echo "cannot diff ${installed_sha:0:9}..${remote_sha:0:9}"; return; }
-    while IFS= read -r p; do
-        [ -n "$p" ] || continue
-        case "$p" in
-            src/*) echo "changes $p"; return ;;   # package data: never by extension
-            docs/*|tests/*|.github/*|*.md|deploy/tt-device-autoupdate.sh) ;;
-            *) echo "changes $p"; return ;;
-        esac
-    done <<< "$paths"
-    la=""; { read -r la < "$LAST_APPLY"; } 2>/dev/null || true
-    au_now now
-    case "$la" in ''|*[!0-9]*) age=0 ;; *) age=$(( now - 10#$la )) ;; esac
-    [ "$age" -ge 0 ] || age=0
-    broker_broken "$age"
-    [ -z "$broken" ] || { echo "the broker $broken"; return; }
-}
-# Decided before the reset below: restart_needed reads where the clone was left.
-why_restart="$(restart_needed)"
-changed_paths=""
-if [ -z "$why_restart" ]; then
-    # For the event: restart_needed ran in a subshell, so its list is listed again here.
-    changed_paths="$(git -C "$clone" diff --name-only --no-renames "$installed_sha" "$remote_sha" 2>/dev/null)" \
-        || why_restart="cannot diff ${installed_sha:0:9}..${remote_sha:0:9}"
-fi
-
 # Reset to the sha this lap decided on, NOT to origin/$BR: the drain above can wait for
 # minutes, and a branch that moved in the meantime would otherwise install something this lap
 # never looked at and never announced — and installed.sha would then name the wrong commit.
 git -C "$clone" reset --hard -q "$remote_sha" \
     || { echo "autoupdate: reset failed" >&2; exit 1; }
-
-if [ -z "$why_restart" ]; then
-    # Nothing to install: the venv, the other staged scripts and the host config already match
-    # the new tree, which is now the one on disk. A new copy of this script is staged before
-    # installed.sha moves, as the full apply stages it (fail-closed): a failed copy leaves
-    # installed.sha on the old sha with the clone ahead of it, so the next lap takes the full
-    # apply and restart.
-    staged=""
-    case $'\n'"$changed_paths"$'\n' in
-        *$'\n'deploy/tt-device-autoupdate.sh$'\n'*)
-            install -m 0755 "$clone/deploy/tt-device-autoupdate.sh" "$ROOT/autoupdate.sh" \
-                || { echo "autoupdate: staging autoupdate.sh failed (required); not marking current" >&2; exit 1; }
-            staged="; staged the new autoupdate.sh for the next lap" ;;
-    esac
-    printf '%s\n' "$remote_sha" > "$STATE"
-    # I23: the deferral clock belongs to an update not yet applied; a later one starts its own.
-    rm -f "$RECOVERY_PENDING" 2>/dev/null || true
-    rm -f "$ROOT/pending-head" 2>/dev/null || true   # I21 coalescing: so does the bound
-    echo "autoupdate: ${installed_sha:0:9} -> ${remote_sha:0:9} changes only ${NO_RESTART_PATHS}; tree and installed.sha moved, broker not restarted${staged}" >&2
-    EVENTS="${TT_DEVICE_MCP_HEALTH_DIR:-/var/lib/tt-device-broker/health}/health_events.jsonl"
-    au_cap now date +%s.%N
-    au_cap iso date -u -d "@${now%.*}" +%Y-%m-%dT%H:%M:%SZ
-    # Each non-empty line, \ and " escaped, quoted and joined by commas: what
-    # `sed -e '/^$/d' -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/.*/"&"/' | paste -sd, -` printed, in the shell.
-    paths_json=""; bs='\'; dq='"'   # quoted replacements: bash 5.2's patsub_replacement leaves them as is
-    while IFS= read -r path; do
-        [ -n "$path" ] || continue
-        path="${path//"$bs"/"$bs$bs"}"; path="${path//"$dq"/"$bs$dq"}"
-        paths_json="${paths_json:+$paths_json,}\"$path\""
-    done <<< "$changed_paths"
-    printf '{"ts": %s, "iso": "%s", "kind": "autoupdate_applied_no_restart", "from_sha": "%s", "to_sha": "%s", "idle": %s, "drained_s": %s, "changed_paths": [%s]}\n' \
-        "$now" "$iso" "$installed_sha" "$remote_sha" "$idle" "$drained_s" "$paths_json" \
-        >> "$EVENTS" 2>/dev/null \
-        || echo "autoupdate: warning: could not append autoupdate_applied_no_restart to $EVENTS" >&2
-    au_log applied "no restart: changes only ${NO_RESTART_PATHS}${staged}"
-    exit 0
-fi
-echo "autoupdate: restart needed: $why_restart" >&2
 
 # The deploy scripts the full apply stages, deploy/<source>:<name under $ROOT>. The eth-heartbeat
 # probe is one of them: its resolution/classification lives in-package (health.monitors.eth) and
@@ -923,7 +958,7 @@ rm -f "$RECOVERY_PENDING" 2>/dev/null || true
 systemctl show tt-device-broker -p NRestarts --value > "$LAST_APPLY_NRESTARTS" 2>/dev/null || true
 if [ "$restart_rc" -eq 0 ]; then
     echo "autoupdate: broker restarted at ${remote_sha:0:9} (via $src_desc)" >&2
-    au_log applied "broker restarted${recovery_why:+ (into a recovery: $recovery_why)}"
+    au_log applied "broker restarted${recovery_why:+ (into a recovery: $recovery_why)}; restart needed: ${why_restart:-unknown}"
 else
     echo "autoupdate: broker restart at ${remote_sha:0:9} failed (rc=$restart_rc, via $src_desc); reconcile starts it" >&2
     au_log failed "broker restart failed (exit $restart_rc)"
