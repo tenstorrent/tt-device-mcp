@@ -25,8 +25,9 @@ import json
 import os
 import pwd
 import queue
+import re
+import shlex
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -34,19 +35,25 @@ import time
 import unicodedata
 from pathlib import Path
 
-from tt_device_mcp import __version__
+from tt_device_mcp import __version__, device_lock
 from tt_device_mcp.constants import (
     DEFAULT_PORT,
     DEFAULT_SOCKET,
+    HUNG_IO_CAP_SEC,
+    HUNG_SILENCE_MAX_SEC,
+    HUNG_SILENCE_MIN_SEC,
     POST_STEP_DEADLINE_DEFAULT_SEC,
     POST_STEP_DEADLINE_ENV,
     PRE_STEP_DEADLINE_DEFAULT_SEC,
     PRE_STEP_DEADLINE_ENV,
+    PREEMPT_GRACE_SEC,
+    PREEMPT_KILL_GRACE_SEC,
+    RESET_STREAM_KEEPALIVE_LINE,
     resolve_socket,
     step_client_timeout_sec,
     user_state_dir,
 )
-from tt_device_mcp.utils import api_call
+from tt_device_mcp.utils import _connect_uds, api_call
 
 # Env vars to capture from caller's environment
 CAPTURED_ENV_VARS = [
@@ -166,7 +173,11 @@ def per_user_daemon_env(log_dir=None) -> dict:
     env = dict(os.environ)
     base = _daemon_state_dir(log_dir)
     env.setdefault("TT_DEVICE_MCP_DEVICE_OP_LOCK", str(base / "device-op.lock"))
-    for var, name in (("TT_DEVICE_MCP_HEALTH_DIR", "health"), ("TT_DEVICE_MCP_JOB_EXIT_DIR", "jobexit")):
+    for var, name in (
+        ("TT_DEVICE_MCP_HEALTH_DIR", "health"),
+        ("TT_DEVICE_MCP_JOB_EXIT_DIR", "jobexit"),
+        ("TT_DEVICE_MCP_JOB_SPOOL_DIR", "jobspool"),
+    ):
         if var in env:
             continue
         try:
@@ -326,6 +337,8 @@ def cmd_run(args) -> int:
             "env": env_file,
             "inherited_env": inherited_env,
             "timeout_sec": timeout,
+            "no_timeout_except_on_contention": bool(getattr(args, "preemptable", False)),
+            "hung_silence_sec": getattr(args, "hung_silence", None),
         },
     )
 
@@ -411,6 +424,8 @@ def cmd_run_bg(args) -> int:
             "env": env_file,
             "inherited_env": inherited_env,
             "timeout_sec": timeout,
+            "no_timeout_except_on_contention": bool(getattr(args, "preemptable", False)),
+            "hung_silence_sec": getattr(args, "hung_silence", None),
         },
     )
 
@@ -605,7 +620,7 @@ def _fmt_when(iso) -> str:
 
 # ANSI styling — applied only when the destination is a terminal (see _overview),
 # so piping `status` into grep/files stays plain text.
-_ANSI = {"hdr": "\033[1;36m", "dim": "\033[2m", "off": "\033[0m"}
+_ANSI = {"hdr": "\033[1;36m", "dim": "\033[2m", "idle": "\033[1;33m", "off": "\033[0m"}
 
 
 def _style(text: str, key: str, color: bool) -> str:
@@ -730,6 +745,8 @@ def overview_lines(running, queued, rjobs, color: bool = False) -> list:
             jid = job.get("id", "?")[:10]
             icon, owner = _fmt_owner(job.get("owner", "?"))
             cmd = job.get("command", "?")[:80]
+            if job.get("preempt"):
+                cmd = f"[{job['preempt']}] {cmd}"
             runtime = "..."
             started = job.get("started_at")
             if started:
@@ -738,6 +755,10 @@ def overview_lines(running, queued, rjobs, color: bool = False) -> list:
                 except Exception:
                     pass
             lines.append(f"  {jid:<10}  {_pad(icon + _ICON_GAP + owner, max_w + 3)}  {runtime:<8} {cmd}")
+            # The job holds the device but has done no device work for over the threshold (spec 03 I54). Only IDLE gets
+            # a line: active is the normal case, and unknown is never shown as idle.
+            if job.get("activity") == "idle":
+                lines.append(_style(f"  {'':<10}  {job.get('activity_label') or 'DEVICE IDLE'}", "idle", color))
     else:
         lines.append(_style("  (none)", "dim", color))
 
@@ -795,7 +816,7 @@ def cmd_status(args) -> int:
 
         print(f"Job:     {result['job_id']}")
         print(f"Owner:   {result.get('owner', '?')}")
-        print(f"Status:  {result['status']}")
+        print(f"Status:  {result['status']}" + (f"  [{result['preempt']}]" if result.get("preempt") else ""))
         if result.get("cause"):
             print(f"Cause:   {result['cause']}")
         print(f"Command: {result.get('command', '?')}")
@@ -803,6 +824,10 @@ def cmd_status(args) -> int:
             print(f"Exit:    {result['exit_code']}")
         if result.get("runtime_sec"):
             print(f"Runtime: {result['runtime_sec']:.1f}s")
+        if result.get("activity_label"):
+            print(f"Device:  {result['activity_label']}")
+        elif result.get("idle_total_sec"):
+            print(f"Idle:    {result['idle_total_sec']:.1f}s with the device held and no device work")
         if result.get("log_file"):
             print(f"Log:     {result['log_file']}")
     else:
@@ -879,7 +904,10 @@ def cmd_logs(args) -> int:
         return 0
 
 
-RESET_TIMEOUT = 300  # `tt-smi -r` on a 32-chip Galaxy takes ~45-60s; well under this.
+# Per read, not per reset: the broker sends a keepalive line on every quiet stretch
+# (RESET_STREAM_KEEPALIVE_SEC), so against a broker that sends keepalives only one that
+# has gone away trips this. An older broker sends none, and a reset quiet this long trips it.
+RESET_TIMEOUT = 300
 
 
 def _open_reset_stream(
@@ -897,9 +925,7 @@ def _open_reset_stream(
     headers = {"Content-Type": "application/json"}
     if socket_path:
         conn = http.client.HTTPConnection("localhost", timeout=timeout)
-        conn.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        conn.sock.settimeout(timeout)
-        conn.sock.connect(socket_path)
+        conn.sock = _connect_uds(socket_path, timeout)
     else:
         conn = http.client.HTTPConnection(host, port, timeout=timeout)
     conn.request("POST", endpoint, body=body, headers=headers)
@@ -935,6 +961,8 @@ def _print_stream_with_dots(resp, interval: float = 2.0):
         if item is DONE:
             break
         for line in item.splitlines():
+            if line == RESET_STREAM_KEEPALIVE_LINE:
+                continue  # the broker is alive; the dots already say we are waiting
             if line.startswith("::status::"):
                 status = line[len("::status::") :].strip()
                 continue
@@ -955,7 +983,7 @@ def cmd_reset(args) -> int:
         return 1
 
     try:
-        conn, resp = _open_reset_stream(args.port, {"force": args.force})
+        conn, resp = _open_reset_stream(args.port, {"force": args.force, "keepalive": True})
     except OSError as exc:
         print(f"Error talking to broker: {exc}")
         return 1
@@ -1200,6 +1228,10 @@ def _wait_and_stream(
                 print(f"Runtime: {result['runtime_sec']:.1f}s")
             if result["status"] == "timeout" and result.get("hint"):
                 print(f"\n!! TIMED OUT after {result.get('timeout_sec')}s !!\n{result['hint']}")
+            if result["status"] == "preempted":
+                print(
+                    f"\n!! PREEMPTED: another job waited {PREEMPT_GRACE_SEC}s past the {result.get('timeout_sec')}s limit !!"
+                )
 
             # Show last N lines summary if requested
             if output_lines > 0 and all_output:
@@ -1212,8 +1244,12 @@ def _wait_and_stream(
         time.sleep(1)
 
 
+WATCH_INTERVAL_SEC = 1.0
+
+
 def cmd_watch(args) -> int:
-    """Live `status`: the same overview, refreshed in place every 2s. Ctrl-C to exit."""
+    """Live `status`: the same overview, refreshed in place every second, so a DEVICE IDLE
+    marker (spec 03 I54) counts up as it happens. Ctrl-C to exit."""
     if not is_daemon_running(args.port):
         print(_server_down_message())
         return 1
@@ -1238,7 +1274,7 @@ def cmd_watch(args) -> int:
             else:
                 sys.stdout.write(frame + "\n")
             sys.stdout.flush()
-            time.sleep(2.0)
+            time.sleep(WATCH_INTERVAL_SEC)
     except KeyboardInterrupt:
         pass
     finally:
@@ -1258,8 +1294,6 @@ _SMI_SAFE_FLAGS = {
     "--version",
     "-l",
     "--local",
-    "-f",
-    "--filename",
     "-h",
     "--help",
 }
@@ -1279,19 +1313,10 @@ def device_nodes() -> list:
 
 
 def _device_locked() -> bool:
-    """True if /dev/tenstorrent is locked (group ttdev, not world-writable)."""
-    import grp
-
+    """True if /dev/tenstorrent is locked: EVERY node 0660 group ttdev. One node left
+    world-rw is a chip anyone opens, so node 0 alone proves nothing (spec 05 I9)."""
     nodes = device_nodes()
-    if not nodes:
-        return False
-    try:
-        st = os.stat(nodes[0])
-        if st.st_mode & 0o002:  # world-writable => cooperative
-            return False
-        return grp.getgrgid(st.st_gid).gr_name == _LOCK_GROUP
-    except (OSError, KeyError):
-        return False
+    return bool(nodes) and not device_lock.node_drift(nodes)
 
 
 def cmd_smi(args) -> int:
@@ -1330,12 +1355,18 @@ _UDEV_RULE_PATH = "/etc/udev/rules.d/99-tenstorrent-ttdev.rules"
 _UDEV_RULE = (
     "# Managed by tt-device-mcp. Restrict /dev/tenstorrent to group ttdev (0660) so\n"
     "# only broker-admitted jobs (gid=ttdev) open the device; bare-metal is denied.\n"
-    'SUBSYSTEM=="tenstorrent", GROUP="ttdev", MODE="0660"\n'
-    'KERNEL=="tenstorrent!*", GROUP="ttdev", MODE="0660"\n'
+    "# ':=' is final: the kmd's own rule sorts later and sets MODE 0666; it must not win.\n"
+    'SUBSYSTEM=="tenstorrent", GROUP:="ttdev", MODE:="0660"\n'
+    'KERNEL=="tenstorrent!*", GROUP:="ttdev", MODE:="0660"\n'
 )
 _LOCK_GROUP = "ttdev"
 _BROKER_UNIT = "/etc/systemd/system/tt-device-broker.service"
+# The host config auto-update re-renders the unit from: TTDEV_LOCK=1 there re-applies the lock.
+_BROKER_DEFAULTS = "/etc/default/tt-device-broker"
+# Unit lines the lock owns: the job gid and the broker's between-jobs flip switch.
+_LOCK_UNIT_KEYS = ("TT_DEVICE_MCP_DEVICE_GROUP", "TT_DEVICE_MCP_DEVICE_LOCK")
 _LOCK_BANNER = "/etc/profile.d/tt-device-mcp-banner.sh"
+_PROC_ROOT = "/proc"
 _LOCK_BANNER_TEXT = (
     'echo "*** Tenstorrent devices are LOCKED for fair sharing! Run device work via '
     "'tt-device-mcp run ...', smi via 'tt-device-mcp smi ...', etc. "
@@ -1362,20 +1393,87 @@ def _udev_reload() -> bool:
     return reload_rc == 0 and trigger_rc == 0
 
 
-def _set_service_device_group(enable: bool) -> None:
-    """Add/remove ``Environment=TT_DEVICE_MCP_DEVICE_GROUP=ttdev`` in the broker unit
-    so privsep jobs run with gid=ttdev (DAC access to the locked node); daemon-reload."""
+def _configured_device_group() -> bool:
+    """True if the broker unit or one of its drop-ins already sets ``TT_DEVICE_MCP_DEVICE_GROUP`` to the lock group."""
+    want = f"TT_DEVICE_MCP_DEVICE_GROUP={_LOCK_GROUP}"
+    paths = [Path(_BROKER_UNIT), *sorted(Path(_BROKER_UNIT + ".d").glob("*.conf"))]
+    for path in paths:
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        for ln in text.splitlines():
+            key, _, value = ln.strip().partition("=")
+            if key != "Environment":
+                continue
+            try:
+                assignments = shlex.split(value)
+            except ValueError:
+                continue
+            if want in assignments:
+                return True
+    return False
+
+
+def _broker_runs_with_device_group() -> bool:
+    """True if the running broker already carries the lock group in its env, or is not
+    running (it picks the env up when it starts). False when that can't be shown."""
+    show = subprocess.run(
+        ["systemctl", "show", "--property=MainPID", "--value", "tt-device-broker"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    pid = (show.stdout or "").strip()
+    if show.returncode != 0 or not pid.isdigit():
+        return False
+    if pid == "0":
+        return True
+    try:
+        env = Path(_PROC_ROOT, pid, "environ").read_bytes().split(b"\0")
+    except OSError:
+        return False
+    return f"TT_DEVICE_MCP_DEVICE_GROUP={_LOCK_GROUP}".encode() in env
+
+
+def _set_service_device_group(enable: bool) -> bool:
+    """Add/remove ``Environment=TT_DEVICE_MCP_DEVICE_GROUP=ttdev`` in the broker unit so privsep jobs run with gid=ttdev
+    (DAC access to the locked node); daemon-reload. Removing also drops ``TT_DEVICE_MCP_DEVICE_LOCK``, the opt-in's flip
+    switch. Returns True only if it changed the unit. Enabling is a no-op when the unit or a drop-in already sets the
+    group."""
     text = Path(_BROKER_UNIT).read_text()
     has = "TT_DEVICE_MCP_DEVICE_GROUP" in text
     line = f"Environment=TT_DEVICE_MCP_DEVICE_GROUP={_LOCK_GROUP}\n"
-    if enable and not has:
+    if enable and not has and not _configured_device_group():
         text = text.replace("Environment=TT_DEVICE_MCP_PRIVSEP=1\n", "Environment=TT_DEVICE_MCP_PRIVSEP=1\n" + line, 1)
-    elif not enable and has:
-        text = "".join(ln for ln in text.splitlines(keepends=True) if "TT_DEVICE_MCP_DEVICE_GROUP" not in ln)
+    elif not enable and any(k in text for k in _LOCK_UNIT_KEYS):
+        text = "".join(ln for ln in text.splitlines(keepends=True) if not any(k in ln for k in _LOCK_UNIT_KEYS))
     else:
-        return
+        return False
     Path(_BROKER_UNIT).write_text(text)
     subprocess.run(["systemctl", "daemon-reload"], check=False)
+    return True
+
+
+def _clear_lock_opt_in() -> bool:
+    """Set ``TTDEV_LOCK=0`` in /etc/default/tt-device-broker, so the next auto-update does not
+    re-render the lock into the unit and re-apply it. Returns True only if it changed the file;
+    a host without the file or the key is left alone."""
+    p = Path(_BROKER_DEFAULTS)
+    try:
+        text = p.read_text()
+    except FileNotFoundError:
+        return False
+    key = re.compile(r"^\s*(?:export\s+)?TTDEV_LOCK=")
+    lines = text.splitlines(keepends=True)
+    new = ["TTDEV_LOCK=0\n" if key.match(ln) else ln for ln in lines]
+    if new == lines:
+        return False
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text("".join(new))
+    os.chmod(tmp, p.stat().st_mode & 0o7777)
+    os.replace(tmp, p)
+    return True
 
 
 # Read-only tt-smi wrapper so `tt-device-mcp smi` works on a locked host: any user
@@ -1393,7 +1491,7 @@ for arg in "$@"; do
     case "$arg" in
     -*)
         case "$arg" in
-        -ls|--list|-s|--snapshot|--snapshot_no_tty|-v|--version|-l|--local|-f|--filename|-h|--help) ;;
+        -ls|--list|-s|--snapshot|--snapshot_no_tty|-v|--version|-l|--local|-h|--help) ;;
         *) echo "tt-device-mcp-smi-ro: refusing non-read-only flag: $arg" >&2; exit 2 ;;
         esac ;;
     esac
@@ -1445,19 +1543,26 @@ def _remove_smi_ro_wrapper() -> None:
             pass
 
 
-# Negative self-check payload: exits 13 on EACCES (the node denied a non-ttdev open, so
-# the lock holds) and 0 if it opened cleanly (the lock leaked). A distinct 13 separates a
-# real denial from a probe that never ran — a systemd-run failure returns its own code.
-_DENY_PROBE = (
+# Self-check payload, run as the probed identity. access() asks the kernel's permission check
+# only; it opens nothing, so no chip sees a probe. Exits 0 when `quantifier` (all/any) of the
+# nodes grant read+write, 13 when not (denied), 1 when a node is missing (no verdict). A distinct
+# 13 separates a real denial from a probe that never ran — a systemd-run failure returns its own code.
+_ACCESS_PROBE = (
     "import os, sys\n"
-    "try:\n"
-    "    os.close(os.open(%r, os.O_RDONLY))\n"
-    "    sys.exit(0)\n"
-    "except PermissionError:\n"
-    "    sys.exit(13)\n"
-    "except OSError:\n"
+    "nodes = %r\n"
+    "if not all(os.path.exists(n) for n in nodes):\n"
     "    sys.exit(1)\n"
+    "sys.exit(0 if %s(os.access(n, os.R_OK | os.W_OK) for n in nodes) else 13)\n"
 )
+
+
+def _access_probe_rc(nodes: list, quantifier: str, admitted: bool) -> int:
+    """Run the access probe as ``nobody`` (with the lock group when ``admitted``)."""
+    argv = ["systemd-run", "--scope", "--quiet", "--uid=nobody"]
+    if admitted:
+        argv.append(f"--gid={_LOCK_GROUP}")
+    argv += [sys.executable, "-c", _ACCESS_PROBE % (list(nodes), quantifier)]
+    return subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
 
 
 def cmd_lock(args) -> int:
@@ -1467,13 +1572,18 @@ def cmd_lock(args) -> int:
         return 1
     subprocess.run(["groupadd", "--system", _LOCK_GROUP], check=False, stderr=subprocess.DEVNULL)
     # Service env first: privsep jobs must already get gid=ttdev before the node locks.
-    _set_service_device_group(True)
-    restart_rc = subprocess.run(["systemctl", "restart", "tt-device-broker"], check=False).returncode
-    if restart_rc != 0:
-        print(
-            f"Warning: 'systemctl restart tt-device-broker' exited {restart_rc}; privsep jobs "
-            "may not hold gid=ttdev until it restarts — admitted device work can be denied."
-        )
+    # A restart reruns the startup gate (fabric pass included), so restart only when the
+    # broker's env actually changes — a repeat `lock` must leave a healthy broker alone.
+    changed = _set_service_device_group(True)
+    if not changed and _broker_runs_with_device_group():
+        print(f"Broker env already has TT_DEVICE_MCP_DEVICE_GROUP={_LOCK_GROUP} (already locked); not restarting it.")
+    else:
+        restart_rc = subprocess.run(["systemctl", "restart", "tt-device-broker"], check=False).returncode
+        if restart_rc != 0:
+            print(
+                f"Warning: 'systemctl restart tt-device-broker' exited {restart_rc}; privsep jobs "
+                "may not hold gid=ttdev until it restarts — admitted device work can be denied."
+            )
     Path(_UDEV_RULE_PATH).write_text(_UDEV_RULE)
     udev_ok = _udev_reload()
     if not udev_ok:
@@ -1484,40 +1594,20 @@ def cmd_lock(args) -> int:
     time.sleep(1)
     nodes = device_nodes()  # never `by-id/`: opening a directory would pass vacuously
     if nodes:
-        # Positive self-check: an admitted (gid=ttdev) job must still open the node, or the
-        # lock has bricked the box for legitimate broker work.
-        admitted_ok = (
-            subprocess.run(
-                [
-                    "systemd-run",
-                    "--scope",
-                    "--quiet",
-                    "--uid=nobody",
-                    f"--gid={_LOCK_GROUP}",
-                    sys.executable,
-                    "-c",
-                    f"import os; os.close(os.open({nodes[0]!r}, os.O_RDONLY))",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            ).returncode
-            == 0
-        )
+        # Positive self-check: an admitted (gid=ttdev) job must still have read+write on every
+        # node, or the lock has bricked the box for legitimate broker work.
+        admitted_ok = _access_probe_rc(nodes, "all", admitted=True) == 0
         if not admitted_ok:
-            print("Self-check FAILED: an admitted (gid=ttdev) job could not open the device.")
+            print("Self-check FAILED: an admitted (gid=ttdev) job has no read+write access to the device.")
             print("Reverting to cooperative so the host isn't bricked.")
             return cmd_unlock(args)
-        # Negative self-check: a non-ttdev identity must be DENIED, else the "lock" denies
-        # nobody and printing LOCKED would be a lie (silent fail-open). Same nobody uid as
-        # above, minus gid=ttdev — the only difference is the group the node gates on.
-        deny_rc = subprocess.run(
-            ["systemd-run", "--scope", "--quiet", "--uid=nobody", sys.executable, "-c", _DENY_PROBE % nodes[0]],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
+        # Negative self-check: a non-ttdev identity must be DENIED on every node, else the
+        # "lock" denies nobody there and printing LOCKED would be a lie (silent fail-open). Same
+        # nobody uid as above, minus gid=ttdev — the only difference is the group the node gates on.
+        deny_rc = _access_probe_rc(nodes, "any", admitted=False)
         if deny_rc == 0:
             print(
-                "Self-check FAILED: /dev/tenstorrent is still openable without gid=ttdev — "
+                "Self-check FAILED: /dev/tenstorrent is still accessible without gid=ttdev — "
                 "the lock did not take effect; bare-metal is NOT denied."
             )
             print("Reverting to cooperative so the state isn't a false lock.")
@@ -1534,7 +1624,12 @@ def cmd_lock(args) -> int:
             return 1
     _install_smi_ro_wrapper()
     Path(_LOCK_BANNER).write_text(_LOCK_BANNER_TEXT)
+    if nodes:
+        device_lock.mark_applied()
     print(f"LOCKED: /dev/tenstorrent is 0660 root:{_LOCK_GROUP}; bare-metal denied.")
+    # A member of the group opens the node without the broker: name each one (spec 05 I9).
+    for line in device_lock.not_effective_lines(device_lock.human_members(_LOCK_GROUP)):
+        print(f"Warning: {line} (member of {_LOCK_GROUP}; remove with: sudo gpasswd -d <user> {_LOCK_GROUP})")
     print("Undo: sudo tt-device-mcp unlock")
     return 0
 
@@ -1549,7 +1644,12 @@ def cmd_unlock(args) -> int:
     except FileNotFoundError:
         pass
     _udev_reload()
-    _set_service_device_group(False)
+    device_lock.clear_markers()
+    # Clear the opt-in before the unit: an update in between would otherwise re-render both lines.
+    if _clear_lock_opt_in():
+        print(f"Set TTDEV_LOCK=0 in {_BROKER_DEFAULTS}: updates no longer re-apply the lock.")
+    if _set_service_device_group(False):
+        print(f"Removed {' and '.join(_LOCK_UNIT_KEYS)} from {_BROKER_UNIT}.")
     try:
         Path(_LOCK_BANNER).unlink()
     except FileNotFoundError:
@@ -1654,6 +1754,23 @@ def cmd_refresh_banner(args) -> int:
 # ============== Main ==============
 
 
+_NO_TIMEOUT_HELP = (
+    f"No timeout except on contention: -t is the time limit, but while no other job waits the job "
+    f"is never stopped for time. Once the limit has passed and a job is waiting, it has "
+    f"{PREEMPT_GRACE_SEC}s to end itself (no signal is sent), then it gets SIGTERM and, "
+    f"{PREEMPT_KILL_GRACE_SEC}s later, SIGKILL. Returning 0 (on its own or on SIGTERM) means no "
+    f"check and no reset; ending cleanly on SIGTERM with another status gets the fast check; a "
+    f"SIGKILL means a device reset and the full check before the next job. Status shows "
+    f"PREEMPTABLE <x>min, then PREEMPTING <s>s. You MUST watch the broker (tt-device-mcp status)."
+)
+
+_HUNG_SILENCE_HELP = (
+    f"This job's hung limit in seconds ({HUNG_SILENCE_MIN_SEC}-{HUNG_SILENCE_MAX_SEC}; default: the "
+    f"host's, 300 unless changed): reaped as hung after this long with neither output nor storage IO. "
+    f"Storage IO keeps a silent job for at most {HUNG_IO_CAP_SEC}s (or this limit, if longer); CPU use never does."
+)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="TT Device MCP - Tenstorrent device queue server",
@@ -1692,6 +1809,14 @@ Examples:
     run_parser.add_argument("-e", "--env", help="Env file path")
     run_parser.add_argument("-t", "--timeout", type=int, default=600, help="Timeout in seconds")
     run_parser.add_argument(
+        "--no-timeout-except-on-contention",
+        "--preemptable",
+        dest="preemptable",
+        action="store_true",
+        help=_NO_TIMEOUT_HELP,
+    )
+    run_parser.add_argument("--hung-silence", type=int, default=None, metavar="SEC", help=_HUNG_SILENCE_HELP)
+    run_parser.add_argument(
         "-o", "--output-lines", type=int, default=0, help="Show last N lines summary at end (default: 0 = no summary)"
     )
 
@@ -1715,6 +1840,14 @@ Examples:
     run_bg_parser.add_argument("-w", "--workspace", help="Workspace path (default: cwd)")
     run_bg_parser.add_argument("-e", "--env", help="Env file path")
     run_bg_parser.add_argument("-t", "--timeout", type=int, default=600, help="Timeout in seconds")
+    run_bg_parser.add_argument(
+        "--no-timeout-except-on-contention",
+        "--preemptable",
+        dest="preemptable",
+        action="store_true",
+        help=_NO_TIMEOUT_HELP,
+    )
+    run_bg_parser.add_argument("--hung-silence", type=int, default=None, metavar="SEC", help=_HUNG_SILENCE_HELP)
 
     status_parser = subparsers.add_parser(
         "status", help="[N] [-j ID]  — queue + last N recent (all users, default 15); -j for one job's detail"
@@ -1756,13 +1889,13 @@ Examples:
     smi_parser.add_argument("smi_args", nargs=argparse.REMAINDER, help="tt-smi args (read-only; reset/config rejected)")
 
     reset_parser = subparsers.add_parser(
-        "reset", help="[--force]  — reset devices (refused if a foreign tenant holds them)"
+        "reset", help="[--force]  — reset devices (refused if a foreign tenant holds them or a job runs)"
     )
     reset_parser.add_argument(
         "-f",
         "--force",
         action="store_true",
-        help="Override the reset gate even if another user's process holds the device",
+        help="Reset even if a broker job is running or another user's process holds the device",
     )
 
     subparsers.add_parser("pre-step", help="health pass before a job step (Slurm Prolog); exit 0 iff fit and free")

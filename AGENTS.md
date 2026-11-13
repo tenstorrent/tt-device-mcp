@@ -77,6 +77,8 @@ The cross-cutting ones an agent must never violate (each anchored in its spec):
 4. **The gate never resets over a tenant**, and an incomplete holder scan counts as a tenant
    (03 I13, 04 I6/I7).
 5. **The fabric traffic pass never runs on a submitter's clock** (03 I12).
+   One stated exception: a held, dirty device whose lift 03 I78 would refuse runs one full
+   check pre-job (~45-100 s), after the 1G hugepages exist.
 6. **Health singletons are constructed once, at boot** — never per gate pass (03 I1).
 7. **A restart is never trusted healthy** — the startup gate re-proves the mesh (03 I4).
 8. **Under privsep, a job runs as its submitter or is refused — never root by fallback**

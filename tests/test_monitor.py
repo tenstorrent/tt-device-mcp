@@ -6,6 +6,7 @@ into a HealthState and stores it as the readings blackboard."""
 
 import pytest
 
+from tt_device_mcp.constants import ETH_POST_JOB_TIMEOUT_SEC
 from tt_device_mcp.health.core import Verdict
 from tt_device_mcp.health.monitor import HealthMonitor
 
@@ -220,6 +221,81 @@ async def test_update_still_runs_the_fabric_pass_when_eth_is_skipped(monkeypatch
     assert calls["fabric"] == 1, "an eth SKIP must not suppress the definitive traffic pass"
     assert st.fabric_ran is True
     assert st.eth_frozen is False
+
+
+def _run_eth_monitor(monkeypatch, health_deps, eth):
+    """A HealthMonitor with a passing snapshot, an eth read returning `eth`, and a passing fabric
+    pass, all counted. Spec 03 I30."""
+    m = HealthMonitor(health_deps)
+    calls = {"eth": 0, "eth_timeout": None, "fabric": 0}
+
+    async def healthy_pci(expected):
+        return True, "ok"
+
+    async def eth_read(timeout_sec=60.0):
+        calls["eth"] += 1
+        calls["eth_timeout"] = timeout_sec
+        return eth
+
+    async def fabric(*a, **k):
+        calls["fabric"] += 1
+        return True, "links healthy"
+
+    monkeypatch.setattr(m, "_verify_device", healthy_pci)
+    monkeypatch.setattr(m, "verify_eth_heartbeat", eth_read)
+    monkeypatch.setattr(m, "verify_fabric_health", fabric)
+    return m, calls
+
+
+@pytest.mark.asyncio
+async def test_update_run_eth_reads_eth_with_the_post_job_bound_and_skips_fabric(monkeypatch, health_deps):
+    """run_eth alone is the clean post-job read: the passive eth read, bounded to
+    ETH_POST_JOB_TIMEOUT_SEC rather than the fabric path's 60s, and no traffic pass after it."""
+    m, calls = _run_eth_monitor(monkeypatch, health_deps, (True, "all advancing"))
+
+    st = await m.update("post-job", run_fabric=False, run_eth=True)
+
+    assert calls["eth"] == 1
+    assert calls["eth_timeout"] == ETH_POST_JOB_TIMEOUT_SEC
+    assert calls["fabric"] == 0, "a clean exit whose eth cores all advance paid for a traffic pass"
+    assert st.fabric_ran is False
+    assert st.healthy is True
+
+
+@pytest.mark.asyncio
+async def test_update_run_eth_runs_fabric_when_eth_reaches_no_verdict(monkeypatch, health_deps):
+    """A run_eth read that reaches no verdict (its own timeout, a crash) runs the traffic pass in
+    the same update(): on an armed host that read is the stuck-read shape a fabric failure follows."""
+    m, calls = _run_eth_monitor(monkeypatch, health_deps, (None, "eth probe timed out after 9s"))
+
+    st = await m.update("post-job", run_fabric=False, run_eth=True)
+
+    assert calls["fabric"] == 1, "a stuck eth read on a clean exit let the mesh through unchecked"
+    assert st.fabric_ran is True
+    assert st.eth_frozen is False
+
+
+@pytest.mark.asyncio
+async def test_update_run_eth_never_runs_fabric_after_a_frozen_eth_core(monkeypatch, health_deps):
+    """A frozen run_eth read stops the pass like any frozen read: no traffic pass across it."""
+    m, calls = _run_eth_monitor(monkeypatch, health_deps, (False, "a frozen active-eth core"))
+
+    st = await m.update("post-job", run_fabric=False, run_eth=True)
+
+    assert calls["fabric"] == 0, "ran the traffic pass across a frozen eth core"
+    assert st.eth_frozen is True
+    assert st.healthy is False
+
+
+@pytest.mark.asyncio
+async def test_update_without_run_eth_or_fabric_reads_no_eth(monkeypatch, health_deps):
+    """The default stays the light pass: no eth read unless a caller asks for it."""
+    m, calls = _run_eth_monitor(monkeypatch, health_deps, (True, "all advancing"))
+
+    await m.update("post-job", run_fabric=False)
+
+    assert calls["eth"] == 0
+    assert calls["fabric"] == 0
 
 
 @pytest.mark.asyncio

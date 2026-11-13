@@ -8,7 +8,7 @@ PCI, real /dev, real /proc identity, real probe resolution) while keeping the du
 seals on: no test here writes the running broker's journal or FSM record.
 
 Two things this file may never do, enforced by conftest rather than by care: reboot or
-power-cycle the host (`_fire_host_reboot`/`_fire_ubb_reset` stay AssertionError tripwires,
+power-cycle the host (`_fire_ubb_reset` stays an AssertionError tripwire,
 both rungs pinned off), and spawn anything from `_NEVER_SPAWN`. `tt-smi -r` is the ceiling.
 
 Where a test would otherwise perturb someone else's work it is scoped rather than weakened:

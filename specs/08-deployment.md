@@ -13,7 +13,8 @@ the per-user installer (`deploy/install-user.sh`), autoupdate/reconcile
 pipeline (`deploy/install-fabric-validator.sh`, `deploy/tt-device-fabric-check.sh`,
 `deploy/fabric-validator.pin`), the crash recorder (`deploy/install-crash-recorder.sh`,
 `deploy/tt-crash-recorder.py`), the eth-heartbeat probe artifact
-(`deploy/tt-device-eth-heartbeat-probe.py`), client wiring (`deploy/tt-device-client-setup.sh`),
+(`deploy/tt-device-eth-heartbeat-probe.py`), the idle-time health probe
+(`deploy/tt-device-health-probe.{service,timer}`, `tt_device_mcp.health_probe`), client wiring (`deploy/tt-device-client-setup.sh`),
 login-heal (`deploy/tt-device-mcp-login-heal.sh`), and the Slurm hooks (`deploy/slurm/prolog.sh`,
 `deploy/slurm/epilog.sh`). Paths and variables are spec 06's; what the broker does once running is
 specs 01–05. This spec owns the pipeline.
@@ -61,15 +62,26 @@ job log, so every "installed" claim below is verified, not assumed.
 - **I7 — An in-flight device operation is an unconditional bar to autoupdate.** The device-op
   inhibit lock (live pid) or a running `ttdev-reset-*` scope defers the update outright —
   restarting the broker mid-reset SIGTERMs the running `tt-smi` and half-resets the mesh. This
-  bar is separate from the *busy/idle* gate, which is OFF by default: `TTDEV_MAX_DEFER_SEC=0`
-  applies immediately even on a busy box (jobs are re-adopted across the restart); a host that
-  wants an idle window sets it to a max wait, clocked from the FIRST pending update so a commit
-  burst cannot starve a busy host forever.
+  bar is separate from the *busy/idle* gate (I24), which is always on: a busy box is drained (I20)
+  at once and the update applies at the job boundary, never under a running job. The job-cap bound
+  of a drain never lifts this bar: a device op still in flight at the cap restarts nothing. The
+  broker does not bound an op: a reset scope that outlives `DEVICE_RESET_TIMEOUT_SEC` is left
+  running, not killed mid-reset, and the lock's pid lives as long as the op. So the hold an op
+  keeps with no job running is bounded by the lap, at `OP_CAP` (I20, I24), never by the op's end;
+  past it the lap restarts nothing, leaves `installed.sha` on the old sha, drops the hold and the
+  next lap retries. No bound lets a restart go over an op. One case is not an op under the broker:
+  a broker that went down during a drain leaves at most a reset scope, its own unit, which the
+  restart that starts the broker does not stop and whose end the new broker's startup waits for
+  before its queue opens (I20); a live-pid lock still bars that restart.
 - **I8 — Autoupdate marks a sha current only after every required stage lands.** Staging the
   deploy scripts (`reconcile.sh`, `client-setup.sh`, `autoupdate.sh`, `fabric-check.sh`,
   `eth-heartbeat-probe.py`) and the host-config apply are each fail-closed: on failure
   `installed.sha` stays at last-known-good so the next reconcile lap retries, and the broker is
-  not restarted onto a half-applied host config. Every staged file must exist in `deploy/`.
+  not restarted onto a half-applied host config. Every staged file must exist in `deploy/`. Before
+  the venv install the full apply checks that every source it stages or runs is in the pulled tree,
+  so a missing one changes nothing on the host. A file an
+  older deployed updater stages as required stays in `deploy/` (a stub once its feature is gone)
+  until no host runs that updater: the old copy runs its own staging list against the new tree.
 - **I9 — A stray broker is detected and made loud, never killed.** Reconcile enumerates socket
   listeners (from `ss`, not `pgrep` — an ephemeral stdio adapter binds nothing) whose cmdline
   runs `tt_device_mcp.server` but whose cgroup is not `tt-device-broker.service`, and logs each
@@ -101,6 +113,7 @@ job log, so every "installed" claim below is verified, not assumed.
   observe a half-built prefix. The build runs only out of band (systemd oneshot, `Nice=19`,
   retried hourly by its timer) — never inside the health gate or the updater. Until it lands the
   fabric check reports CANNOT CHECK (exit 77), and the broker does not guess (spec 03).
+  The one foreground run is a fresh install's, before the broker's first start (I25).
 - **I15 — The eth-heartbeat probe's exit codes are the contract and a crash cannot forge
   FROZEN.** 0 = every measured core advancing; 3 = FROZEN (deliberate, evidenced — at least one
   up-link core measured); 77 = could not measure (attach failure, no device, any unexpected
@@ -119,10 +132,328 @@ job log, so every "installed" claim below is verified, not assumed.
   host that cannot reach the network, and a branch that does not exist are each named and the lap
   exits 0 — no-op-and-say-so, retried next minute. A leftover directory that is not a repository
   is removed rather than left to fail every future lap. **The commit installed is the one the lap
-  resolved and announced**, not `origin/$BRANCH` re-read afterwards: the idle gate can defer for
+  resolved and announced**, not `origin/$BRANCH` re-read afterwards: the drain (I20) can wait for
   minutes, and a branch that moved in that window must not be installed unannounced under a sha
   `installed.sha` would then misname.
+  **The one other source is also fixed in code**: a bare repository at `$TTDEV_ROOT/mirror.git`.
+  A lap uses it instead of the public repository only when root alone can have filled it: it
+  and `$TTDEV_ROOT` are real directories (not links), owned by root, writable by no group or
+  other user, and it is bare; otherwise the public literal, unchanged. No fallback within a lap:
+  a mirror that fails is reported like an unreachable repository. Each lap points the clone's
+  `origin` at its choice before the fetch, both ways, and records a switch in the decision log
+  (I22). Root reads the mirror as a local file, so neither source needs a credential. A source
+  that keeps failing is named on the first failing lap of the outage only (the marker
+  `$TTDEV_ROOT/.source-unreachable` holds when it began), and the first good fetch says
+  once how long it lasted.
 
+- **I17 — The idle-time health probe acts only on an idle broker, and pages once per episode.**
+  `tt-device-health-probe.timer` (every 2 min) runs `python -m tt_device_mcp.health_probe` as root,
+  in the broker's venv (apply renders it from `TTDEV_VENV`). It stands back, touching nothing,
+  unless the broker's `/health` answers with no hold, `fsm_state` `healthy`, no degraded flag and no
+  job running or queued, the restart-inhibit file (spec 06, `TT_DEVICE_MCP_DEVICE_OP_LOCK`) names no
+  live device op, its device-op flock (spec 06 I8) is free, and no tenant holds the device outside
+  the job table (spec 03 I13 holder scan; root and system accounts such as the pollers are not
+  tenants, and an incomplete scan counts as a tenant). It asks again right before each action, so a
+  broker that turns busy mid-lap stops it. The broker stops the pollers around a reset, and a probe
+  that restarted them would fight it. Its actions are non-destructive only: a PCI bus rescan when
+  fewer chips are present than expected (at most one per 30 min while short; the one write is made
+  under the device-op flock, taken non-blocking, and skipped while the broker holds it), and
+  `reset-failed` + `start` of a poller in the broker's own list (`TT_DEVICE_MCP_POLLER_SERVICES`,
+  same default as the broker's) that is `failed` or `inactive` and enabled. A poller that is absent, disabled or masked is off on
+  purpose and left off; one that is `activating` is systemd's to finish and is not restarted. After
+  a start it waits the settle time and re-reads `/health` and the inhibit file; if a hold, a
+  degraded flag, a non-healthy FSM or a device op appeared meanwhile, it stops the poller again. The
+  residual window is that settle time: the I8 contract forbids holding the flock across a subprocess
+  such as `systemctl start`, so a reset that begins inside it can meet the poller the probe just
+  started until the probe stops it. The expected count is the broker's own (spec 03 I11:
+  `TT_DEVICE_MCP_EXPECTED_CHIPS`, else the high-water `chip_baseline.json`, read and never written),
+  so no chip count is hardcoded. The chip count, poller list, inhibit and flock files
+  and health dir come from the running broker's environment unless the probe's unit sets them. What
+  it cannot fix is logged as an `ALERT` line, once per episode: chips still missing after a
+  rescan; a poller still down after a restart, down again within an episode (a flap), or
+  `activating` for 3 laps in a row; AER fatal/non-fatal counters rising, at most once an hour. A
+  poller's episode closes only after 3 laps in a row up, so a crash loop pages once; a first restart
+  that comes up stays quiet. The first lap after a boot takes the AER counters as a baseline and
+  pages nothing. Episodes and counters live in `health_probe_state.json` in the health dir and reset
+  on reboot. Apply installs and arms it on every host (`TTDEV_HEALTH_PROBE=0` disarms it) and warns
+  but does not abort if it will not arm. Only once the new timer is active does it retire the
+  unmanaged `tt-health-probe.timer` it replaces: that timer is disabled and its unit files are moved
+  aside to `*.retired-by-tt-device-mcp`, never deleted. An opted-out host, or one where the new
+  timer did not arm, keeps the old timer running. Apply installs and arms the units only when the
+  broker venv can import `tt_device_mcp.health_probe`; a venv without it gets no units, and a timer
+  an earlier build left armed is stopped with a warning (it could only fail).
+- **I18 — An applying update holds dispatch from its busy check through the restart, and a
+  queued job counts as busy.** Before it counts anything the updater writes the dispatch hold
+  (spec 01 I18: `<pid> <epoch>` in `/run/tt-device-broker/dispatch-hold`, written under a
+  temporary name and renamed into place, so the broker never reads it half-written) and waits
+  `TTDEV_HOLD_SETTLE_SEC` (default 2) for a dispatch already past the broker's check to show up
+  as a child. The hold also preempts a no-timeout-except-on-contention job past its limit, as a
+  queued job would (spec 01 I20; I20 below). Busy is then: a broker child, a user process holding `/dev/tenstorrent`, an
+  active `ttdev-job-*.scope` (a re-adopted job is no child of the new broker), or a persisted
+  queued spec (`<log-dir>/queued/*.json`). Counting only children and holders let a job queued
+  behind one that had just ended be dispatched two seconds before the restart, which cut its
+  output pipe and failed it. A lap that restarts nothing drops the hold at once; an applying lap keeps it
+  until `systemctl restart` returns (systemd also removes it with the RuntimeDirectory), so
+  queued jobs wait, persisted, for the new broker. An exit on any other path drops it too.
+- **I19 — reconcile never revives a broker that is already starting or stopping.** Step 1 reads
+  `systemctl is-active`: `activating`, `reloading` and `deactivating` are a job systemd already
+  runs (the broker sits in `activating` through its startup check, minutes after a boot), so
+  reconcile runs neither `reset-failed` nor `start` and logs "in progress" once per episode (the
+  state is kept in `/run/tt-device-broker/reconcile_inprogress`, cleared once the broker is
+  `active` or down). Every other non-`active` state is still reset and started.
+- **I20 — A busy box is drained at once, and no job is killed for it.** A lap that finds the box
+  busy (I24) drains in the same lap: it keeps the I18 hold, so the running job finishes and nothing
+  new starts, polls every 5 s until no broker child, device holder or job scope remains and no
+  device op (I7) is in flight, and applies at that job boundary, one poll after the job ends at
+  most; queued jobs wait, persisted, for the new broker. A queued spec alone is not running work
+  and does not hold a drain up. The wait under the hold is bounded by the broker's hard job limit,
+  `MAX_TIMEOUT_SEC` + `GRACEFUL_KILL_GRACE_SEC` (1500 + 60 = 1560 s), counted from the start of
+  the youngest running `ttdev-job-*` scope as systemd records it (a re-adopted job keeps its age
+  across restarts; a start that cannot be read counts as now). **A broker job still running at
+  that bound, of any age, never gets a restart**: a broker child, a running `ttdev-job-*` scope,
+  or a device holder whose cgroup is a `ttdev-job-*` scope (a re-adopted job, seen even when the
+  scope list cannot be read). The lap restarts nothing, drops the hold, and the next lap retries,
+  so the update applies at the first lap after that job ends, however long it runs. A capped job
+  ends by the broker's job-limit kill, at most one job cap after its start. A
+  no-timeout-except-on-contention job (spec 01 I20) is not killed for time, but the hold is
+  contention for it: past its limit the broker counts the live hold as one waiting job and
+  preempts it (`PREEMPT_GRACE_SEC` + `PREEMPT_KILL_GRACE_SEC`, 60 + 10 s, after it first sees the
+  hold past the limit). So when `/health` reports exactly one running job and it is preemptable,
+  the bound is its `preempt_limit_left_sec` plus `PREEMPT_TAIL` (100 s: 60 + 10 s and 30 s for its
+  exit to show), counted from the start of this wait and never shorter than the job cap's own
+  bound. Once that job has ended (its `ttdev-job-<id>` scope, listed when the wait began, is gone,
+  or `/health` answers without naming it), the broker runs its post-job gate before the job
+  boundary (spec 01 I20: the fast check, the full check with fabric, or a kill reset and the full
+  check after a SIGKILL), with its probes as broker children and its reset under the device-op lock.
+  The drain holds that for at most `GATE_CAP` (936 s: `OP_CAP` for the kill reset, plus
+  `FABRIC_CHECK_TIMEOUT_SEC` + `FULL_CHECK_PER_CHIP_SEC` on 32 chips, 180 + 96 s, for the full check)
+  from when it first sees the job ended, so a lap whose hold preempted the job applies under the
+  same hold; past it the lap restarts nothing and lets go (I7). A limit too far off for
+  `preempt_limit_left_sec` + `PREEMPT_TAIL` to fit under the job cap is never held through: the lap
+  lets go of dispatch at once, before the limit, so the hold preempts nothing on a lap that cannot
+  apply, and a later lap nearer the limit applies. With no answer from `/health`, or another job
+  running beside it, the job cap's bound applies as before. A
+  device op in flight at the bound is handled the same way (I7). A device op with no job running
+  holds the drain for at most `OP_CAP` (660 s, under the broker's `DISPATCH_HOLD_MAX_SEC` of 900 s),
+  counted from when it is all that is left, then the lap gives up the same way. Only a device holder outside every
+  broker job, which no broker kill ends and a restart does not touch, stops holding the update at
+  the bound: the lap applies. A broker that is not running (not `active`, `activating`, `deactivating` or
+  `reloading`) protects no job by waiting, and the drain would block the reconcile that starts it,
+  so the drain ends and the restart starts it, over a listed reset scope too (the new broker's
+  startup waits it out before its queue opens); only a live-pid device-op lock still bars it. The hold is rewritten on every poll and once more
+  as the apply starts, so the broker's overdue bound (`DISPATCH_HOLD_MAX_SEC`) counts from the
+  updater's last sign of life, never from the start of a long drain. A drain blocks its lap, and
+  the reconcile that runs it, for at most its bound plus `OP_CAP`; a lap that finds a broker job already past it
+  holds dispatch for the settle only (`TTDEV_HOLD_SETTLE_SEC`, 2 s) and exits. The restart after an apply is an ordinary
+  broker start, so the queue opens only once the startup check (spec 03 I4: the forced fabric
+  pass, after the 1G hugepage pool is ready) has passed.
+- **I21 — Applies are rate-limited per box, and the limit only moves when an apply happens.**
+  Every apply restarts the broker (except a docs/tests/CI/updater-only one, I29), and every start runs the
+  full startup check, fabric traffic pass included (spec 03 I4), so a burst of pushes is a burst of restarts and fabric passes, each
+  holding the queue. The limit is on by default: `TTDEV_MIN_APPLY_INTERVAL_SEC` defaults to 1800 s
+  in the script itself, so no box needs config to get it (0 turns it off). A lap that finds
+  a new sha less than that long after the last apply exits 0 and says when the sha will apply; the
+  first lap past the interval applies the newest sha, so a burst becomes one restart. The check
+  runs before the device-op bar and the I18 hold, so a rate-limited lap holds nothing. The last
+  apply is the epoch in `$ROOT/last-apply`, written just before `systemctl restart`, so an apply
+  that fails before the restart is retried on the next lap; a missing, non-numeric or future stamp
+  bars nothing; the stamp is read base 10. The dispatch hold, drain and busy gate (I18, I20, I24)
+  are unchanged, and the startup check after the restart is never skipped, deferred or shortened. **The limit applies to a
+  healthy broker only**: the next sha may be the fix for a broker the last apply broke, so a lap
+  inside the interval applies at once (past the rate limit; later gates may still defer it), and logs `rate limit skipped` with the reason, when the
+  broker is not `active` (failed, activating, inactive), when its systemd `NRestarts` grew past the
+  count saved in `$ROOT/last-apply-nrestarts` right after the last apply's restart (a crash loop),
+  or when `/health` does not answer, reports `held`, or reports an FSM that is `recovering` or
+  `down`. Skipping the limit does not skip the I23 recovery deferral: a held or
+  recovering broker still waits for its recovery, at most that bound, and no longer. One exception: every start opens `recovering` with `fsm_why` `startup_unverified` and
+  holds the device until its startup check passes (hugepage wait, 120 s, spec 03 I33, then one full
+  gate pass with fabric, at most 436 s, spec 04). That broker is booting, not broken, and stays
+  limited while it is within `STARTUP_BOUND` (600 s: 120 + 436 s plus 44 s for the restart) of the
+  last apply and held for nothing but that check (`held` false while the gate runs, or
+  `held_reason` `device unverified: ...`). Past the bound, held for a fault found during the check
+  (a dirty episode), or after a failed check (which names its fault in `fsm_why`), it applies at
+  once.
+  Worst-case deploy latency of a sha to a healthy broker: `TTDEV_MIN_APPLY_INTERVAL_SEC` (1800 s by
+  default) + one 60 s lap + the I20/I24 drain on a busy box (the running job's end, plus one 60 s lap when it ran past
+  the cap and one more job if the queue dispatched one before that lap). A capped job ends by the
+  broker's job-limit kill at most one job cap, 1560 s, after it started; a
+  no-timeout-except-on-contention job (spec 01 I20) is preempted by the update's own hold once past
+  its limit, so it adds at most its time left before the limit plus 100 s and its post-job gate
+  (at most `GATE_CAP`, 936 s); a limit more than 1460 s off adds laps until it is nearer. To a
+  broken broker the limit adds
+  nothing. The limit paces only when autoupdate applies a new sha; it gates no reset, ladder rung,
+  power cycle or hold escalation. The by-hand escape is
+  `rm $ROOT/last-apply`: the config file is sourced over the environment, so
+  `TTDEV_MIN_APPLY_INTERVAL_SEC=0` on the command line does not override a configured value.
+  **Bursts coalesce.** The interval alone paces a burst to one restart per interval for as long
+  as the branch keeps moving. So a new sha also waits until the branch head has stayed the same
+  for `APPLY_QUIET` (600 s) or the oldest sha not yet applied has waited `APPLY_BOUND` (3600 s),
+  whichever comes first; then the interval and every gate below apply as before. Both are code
+  defaults (`TTDEV_APPLY_QUIET_SEC`, `TTDEV_APPLY_BOUND_SEC` exist for tests; quiet 0 turns
+  coalescing off); no box sets them. 600 s is above the gap between merges in a landing burst, so a
+  burst is one apply, and is all a lone push waits; 3600 s is twice the interval, so a burst that
+  never pauses restarts at most once an hour. Every lap records the head it saw in
+  `$ROOT/pending-head` (`<first_seen> <sha> <sha_seen>`) before any gate can exit, so time spent
+  waiting on the interval or another gate counts; an apply (with or without a restart) removes the
+  record, and so does a lap that finds the branch back at the installed sha; a missing, bad or
+  future time counts from now. A broken broker (the reasons above) is not coalesced. The check
+  runs before the rate limit, so a coalesced lap holds nothing either. With it, the worst-case
+  latency to a healthy, idle broker is `APPLY_BOUND` + one lap (the interval counts from the apply
+  before the sha was first seen, so it has ended by then), plus the drain on a busy box.
+- **I22 — Every update decision is logged with its time and both shas, where a reboot does not
+  erase it.** A lap that has an update to make appends one line per decision to
+  `<log-dir>/autoupdate.log` (`TTDEV_LOG_DIR`, default `/var/log/tt-device-broker`) and sends the
+  same line to the journal under the tag `tt-device-autoupdate`: an ISO-8601 local time with its
+  offset, `decision=` (`deferred`, `applied` or `failed`), `branch=`, `old=` and `new=` (full shas)
+  and `reason=`. A deferral names its gate (the apply rate limit or burst coalescing of I21, device op, reset scope, recovery in
+  progress, a broker job or device op still running at the job cap of a drain or the last look, a preemptable job's limit too far off to hold through, or its post-job gate past `GATE_CAP`, I20 and I24); a deferral
+  for the rate limit, a device op, a reset scope or a recovery also names its deadline,
+  `apply_by=`: for the rate limit the end of its interval, for coalescing the end of the quiet or the bound if the branch stays put, for a recovery the time its deferral ends (the bound from the hold's start or from
+  the first deferral, whichever is sooner), for a device op or reset scope the end of that bounded
+  op; an apply records the restart (a no-restart apply, I29, records `applied` and says no restart), and a lap that stops after it decided to apply, or
+  whose restart fails, records `failed` with the exit code. At 1 MiB the file moves to
+  `autoupdate.log.1`. A lap with nothing to update writes nothing.
+- **I23 — An update never restarts the broker into a recovery it is in the middle of, and waits
+  for one at most a bounded time.** The I7 bar covers a rung while it runs, not the hold around
+  it: between rungs (a settle, a backoff, the wait for the hold deadline) no device op is in
+  flight, and a restart there sends the episode back to the startup check, a forced fabric pass on
+  a mesh the broker already knows is bad. So after the I7 bar the updater asks the broker's
+  `/health`: while it reports `held`, or `fsm_state` `recovering` or `down`, the lap defers. The
+  deferral ends once the hold is `TTDEV_RECOVERY_DEFER_SEC` old (`held_age_sec`; default 1200,
+  capped at 1800, 0 turns it off) or once this pending update has waited that long in all, clocked
+  from its first deferral in `$ROOT/recovery.defer` (a newer commit or a hold that comes back does
+  not restart it). The clock belongs only to an update not yet applied: every apply that moves
+  `installed.sha`, the I29 no-restart apply included, clears it, so a later update starts its own
+  clock at its own first deferral. The default sits above each fault class's own time-to-recover budget (the
+  slowest, a heal through a power cycle or a hand-off to the operator, is 15 min) plus the
+  post-reset health check, so a restart never lands inside a recovery still within that budget,
+  while one over the bound is over budget and gets the update, which may be its fix, at once. It
+  does not sit above a hold that waits out the power-cycle cooldown (spec 04 I65: 30 min, doubling
+  up to 4 h after unhealed cycles): such a hold outlasts the bound and gets the update inside it.
+  The cooldown's anchors are durable (the I9 ledger, the host boot, the power-cycle history), so
+  the restart does not move the cycle's deadline, and the new broker's startup check keeps a device
+  that still fails held. A broker that does not answer `/health` is not deferred for. The deferral
+  delays only the update's restart: no rung, reset, power cycle, reboot or hold escalation waits on
+  it or is switched off by it. Every recovery deferral is decided before the install: the updater
+  asks `/health` once more after the I18 dispatch hold and any I20 drain, which can wait out a whole
+  job, and a hold that began meanwhile defers per the rule above, drops the dispatch hold and ends
+  the lap before the tree, the venv or `installed.sha` move. Once pip has run, the venv, units and
+  timer are new, and an old broker left on them (it imports some modules lazily, at a fault's
+  onset) is worse than a restart, so a hold that begins during the install is logged and the
+  restart goes ahead; the only stop after the install is the I7 device-op bar of the I24 last look.
+  The restart is still an ordinary start (I20: the startup check with the fabric pass, after the
+  hugepage pool, gates the queue).
+- **I24 — An update never restarts the broker under a running tenant job.** A running job is
+  re-adopted across a restart (spec 01), but the restart still costs it: its client's socket
+  drops for seconds, a client that reads the drop as a failure kills the job (and the kill owes a
+  reset), and the new broker holds the queue for its startup checks until the re-adopted job ends.
+  So the busy gate is always on, with no setting: a busy lap drains (I20) at once. The defer
+  setting of earlier versions (`TTDEV_MAX_DEFER_SEC`) is read by nothing; a value left in the
+  config file changes nothing. After the install, just before it writes `installed.sha` and
+  restarts, the lap looks once more under the I18 hold (rewritten as it polls): a broker child,
+  device holder or job scope still running (a tenant that opened the device on its own, or a
+  dispatch after the broker dropped an overdue hold), or a device op (I7), is waited out as a drain
+  is, under the same bound (a preemptable job's included, I20); a broker job still running at the bound restarts nothing and leaves
+  `installed.sha` on the old sha, so the next lap retries. A device op with no job running is
+  waited out under the hold, polled every 5 s, for at most `OP_CAP` = `DEVICE_RESET_TIMEOUT_SEC` +
+  `GRACEFUL_KILL_GRACE_SEC` (600 + 60 = 660 s), and the restart follows one poll after it ends; an
+  op still in flight past `OP_CAP`, or at the job cap, is never restarted over (I7): the lap
+  restarts nothing, leaves `installed.sha` on the old sha, and the next lap retries. A stopped broker (MainPID 0)
+  has no children to count. Worst case on a busy box: the update applies at the first lap after
+  the running job ends. A capped job ends by the broker's job-limit kill at most one job cap
+  (1560 s) after it started (a re-adopted job keeps the time it already served); a
+  no-timeout-except-on-contention job (spec 01 I20) runs past it until it ends or a queued job
+  contends for it, so while nothing is queued the update waits with no bound. The drain delays only the restart: no reset,
+  ladder rung, power cycle or hold escalation waits on it.
+
+- **I25 — A fresh install builds the pinned validator before the broker's first start.**
+  `install-tt-device-broker.sh` checks that `validator/current` holds all three pinned binaries
+  (and the cabling descriptor, when one is configured) after apply-host-config. If not, it runs
+  `systemctl start tt-device-fabric-validator.service` in the foreground (it joins the run
+  apply-host-config kicked with `--no-block`) and only then enables and restarts the broker. A failed
+  build, or one that leaves `current` incomplete, exits 1 naming the unit's journal, and the broker
+  is not (re)started. An upgrade keeps the old `current` until the new build flips it, so it never
+  waits here. Reason: a broker started before the validator exists gets a 77 from its startup
+  fabric pass and holds the device fabric-unverified, so a fresh install never comes up verified.
+
+- **I26 — The installer never removes the venv a live broker runs from.** `$R/venv` is a relative
+  symlink to a versioned venv, `$R/venv.<short-sha>.<random>` (`deploy/broker-venv.sh`). The
+  installer builds the new venv at that final path (a venv is not relocatable), pip-installs this
+  tree into it and verifies it: `import tt_device_mcp.server`, `import tt_smi` and `tt-smi --help`
+  all succeed. A failed build or verification removes only the new venv, leaves `$R/venv` as it was
+  and exits 1. The flip is `ln -sfn` + `mv -Tf`, one rename, and comes right before
+  apply-host-config (which renders the unit from `$R/venv` and probes it). A legacy real-directory
+  venv moves aside to `venv.legacy` first, so a migration has a gap of two renames, not a rebuild.
+  Every `venv.*` the link does not point at is removed only after the restarted broker answers
+  `/health`; a failed install keeps the old venv for a rollback. Reason: until the restart, the
+  running broker resolves tt-smi (every reset rung), its lazy imports and its stdio adapters through
+  `$R/venv`. Removing it for the minute a rebuild takes left every reset rung unable to run in that
+  window. Autoupdate does not run the installer; it pip-installs into the venv `$R/venv` resolves to.
+
+- **I27 — A validator repair never removes the prefix `current` points at.** Each pin has two build
+  slots, `validator/<sha>` and `validator/<sha>.build`, and a build runs only in the slot `current`
+  does not point at, then flips `current` to it (I14). A validator tree is not relocatable (its
+  RPATH and runtime root are absolute paths into the tree), so the slot is its final path. A run
+  that finds a complete slot `current` does not point at flips to it; one that finds the live slot
+  complete changes nothing, so the link's own mtime stays the time of its last real flip. The other
+  same-pin slot is removed only once `current` has pointed at the live one for an hour, far longer
+  than any fabric check. apply-host-config counts either slot as built. Reason: a same-pin repair
+  used to wipe and rebuild the live prefix, so every fabric check in the tens of minutes of the
+  build ran a missing validator and returned 77. The live slot is found by resolved path (the
+  link's target and both slots canonicalized), never by the link's text, so a root spelled
+  differently from the run that wrote `current` (a trailing slash, a symlinked parent) still finds
+  it. A `current` that exists but cannot be resolved, or that resolves into the chosen build slot,
+  stops the run with an error rather than building there.
+- **I28 — A fresh install knows the expected chip count from what the machine is, never from how
+  many chips answer.** When neither `TTDEV_EXPECTED_CHIPS` (operator or `/etc/default`) nor the
+  current unit gives a count, apply-host-config derives one with `deploy/tt-device-expected-chips.sh`:
+  a board type of any chip that answered the installer's `tt-smi -s` snapshot (`tt-galaxy-wh`,
+  `tt-galaxy-bh` → 32), else a DMI product name containing "Galaxy" (→ 32), else reset mode
+  `galaxy` (→ 32). The number of chips that answered is never an input, so a tray already off the
+  bus at install still gets 32. Card boards (n150, n300, p100, p150, p300) decide nothing: their
+  type gives chips per card, not cards per box, and a count set below the real one would bypass
+  the high-water mark. Card boards, unknown or mixed types, a card that disagrees with a galaxy
+  DMI product or reset mode, and no source at all leave the key unset with a loud warning naming
+  the reason, so `/health` shows the count as unknown. The operator value, then the unit's, always
+  wins; the chosen source is logged. The derived value is backfilled into `/etc/default` like any
+  resolved knob, so later updates read it back. Reason: with no declared count the broker's bar is
+  a high-water mark of chips seen; a whole-tray drop already present at the first start became the
+  bar and was never detected. With 32 declared, fewer chips present fails the check (03) and the
+  hold takes its normal recovery path.
+- **I29 — An update that changes no file the broker uses moves the tree and installed.sha without
+  restarting the broker.** Once a lap has passed every gate above (the I21 rate limit, the
+  device-op bar, the I18 hold and the I24/I20 idle gate and drain, all unchanged), it diffs the
+  installed sha against the new one in the clone. When every changed path is on an explicit
+  allowlist, `docs/**`, `tests/**`, `.github/**`, a `*.md` outside `src/` or
+  `deploy/tt-device-autoupdate.sh`, and the broker is healthy (none of I21's reasons), the lap
+  resets the clone to the new sha, writes it to `installed.sha`, appends one
+  `autoupdate_applied_no_restart` event (`from_sha`, `to_sha`, `changed_paths`, `idle`,
+  `drained_s`) to the broker's journal, and installs and restarts nothing; `last-apply` is left
+  alone, so the rate limit still counts from the last restart. The updater script is on the list
+  because no broker process reads it: the reconcile timer runs its staged copy. When it changed,
+  the lap stages the new copy as the full apply does, fail-closed and before `installed.sha`
+  moves (a failed copy leaves the clone ahead of `installed.sha`, so the next lap takes the full
+  apply and restart), and the next lap runs it; nothing else is staged. Any
+  other path (package code and data under `src/`, every other `deploy/` script and unit, the validator pin,
+  `pyproject.toml`, anything unknown), a path git has to quote, a diff that cannot be computed, an
+  installed sha that is not a commit, a clone not at the installed sha (an earlier apply that
+  stopped after its reset may have left a newer venv or staged script) or a broker that is not
+  healthy takes the full apply and restart as before, and the lap logs why. Reason: every restart
+  reruns the full startup check, fabric pass included, and on a box whose chips can drop that
+  check is an exposure; a restart that changes no byte the broker, its job subprocesses, its staged
+  scripts or the host config read buys nothing for it. The restarts that remain run the startup
+  check unchanged (spec 03 I4).
+- **I30 — Every validator build applies the pin's patches, and one that does not apply fails the
+  build.** `TTDEV_VALIDATOR_PATCHES` in the pin names patch files beside it; after checking out the
+  pinned SHA (forced, so a retry starts from a clean tree) the build `git apply`s each in order and
+  stops with an error, building and flipping nothing, at the first that does not apply. The prefix is
+  keyed on the SHA plus the first 12 hex digits of the patches' sha256 (`<sha>-<hash>`; the bare SHA
+  when there are none), so a changed patch builds a new prefix beside the live one and flips to it
+  as a new pin does (I27, I14); `install-fabric-validator.sh <pin> --key` prints that name, and
+  apply-host-config uses it to see the pin is not built and start the build out of band. Reason: a
+  patch is part of what the validator is; keyed on the SHA alone, a patched build would never reach
+  a host that already had the stock one, and a patch that silently failed to apply would ship the
+  stock validator under the patched name.
 ## Interfaces
 
 **`/etc/default/tt-device-broker`** — written by the installer, sourced by `apply-host-config.sh`,
@@ -136,27 +467,32 @@ table. Two key groups: pipeline config (`TTDEV_ROOT`, `TTDEV_VENV`, `TTDEV_AUTOU
 `TTDEV_BRANCH`) consumed by the scripts themselves, and per-host
 broker knobs (`TTDEV_RESET_MODE`, `TTDEV_FABRIC_CHECK_CMD`, `TTDEV_FABRIC_DESCRIPTOR`,
 `TTDEV_ETH_HEARTBEAT_CMD`, `TTDEV_RESET_MIN_DEAD_FRAC`, `TTDEV_SELFHEAL_RELIFT`,
-`TTDEV_EXPECTED_CHIPS`, `TTDEV_AUTO_REBOOT`, `TTDEV_AUTO_POWER_CYCLE`, `TTDEV_AUTO_UBB_RESET`,
-`TTDEV_PREJOB_DISPATCH`, `TTDEV_ETH_CHECK_PYTHON`) that `apply-host-config.sh` renders into
+`TTDEV_EXPECTED_CHIPS`, `TTDEV_AUTO_POWER_CYCLE`,
+`TTDEV_PREJOB_DISPATCH`, `TTDEV_ETH_CHECK_PYTHON`, `TTDEV_POLLER_SERVICES`) that `apply-host-config.sh` renders into
 same-named `Environment=TT_DEVICE_MCP_*` (or `TTDEV_*`) unit lines. An unset knob renders **no
 line** (the code default rules); a set knob reaches the unit verbatim. This rendering is the ONLY
 route from `/etc/default` into the broker process — nothing else sources the file into the unit,
-so a knob without a render line is unreachable.
+so a knob without a render line is unreachable. `TTDEV_LOCK=1` (spec 05 I9) renders two lines,
+`TT_DEVICE_MCP_DEVICE_GROUP=ttdev` and `TT_DEVICE_MCP_DEVICE_LOCK=1`, inside the update's own restart.
 
 **Systemd units and timers installed** (system shape):
 
 | Unit | Installed by | Schedule / trigger |
 |---|---|---|
-| `tt-device-broker.service` | apply-host-config (rendered) | `Type=notify`, `WatchdogSec=300`, `Restart=on-failure`, socket-only (`--no-http`) |
+| `tt-device-broker.service` | apply-host-config (rendered) | `Type=notify`, `WatchdogSec=300`, `Restart=on-failure`, socket-only (`--no-http`), `LimitMEMLOCK=infinity` (jobs inherit it through their scope) |
 | `tt-device-reconcile.timer` → `.service` | apply-host-config; enabled by installer | `OnBootSec=30s`, `OnUnitActiveSec=60s` — runs `/opt/tt-device-broker/reconcile.sh` |
 | `tt-device-fabric-validator.timer` → `.service` | apply-host-config (enabled there) | `OnBootSec=10min`, `OnUnitInactiveSec=1h` — retries the pinned build (oneshot, `TimeoutStartSec=7200`) |
 | `tt-device-buslock.service` | apply-host-config / install-crash-recorder | continuous `perf stat -e ls_locks.bus_lock -I 60000` to `buslock.log`; enabled only where the PMU event counts |
 | `tt-crash-recorder.service` | install-crash-recorder | oneshot at boot (`After=multi-user.target`) |
+| `tt-device-health-probe.timer` → `.service` | apply-host-config (enabled there unless `TTDEV_HEALTH_PROBE=0`) | `OnBootSec=90s`, `OnUnitActiveSec=2min` — oneshot `python -m tt_device_mcp.health_probe` (I17) |
 
 Also installed by apply-host-config: `/usr/local/bin/tt-device-mcp-smi-ro` +
 `/etc/sudoers.d/tt-device-mcp-smi` (spec 05), `/etc/logrotate.d/tt-device-broker`, a journald
 retention drop-in (~30 days; journald restarted best-effort), `/etc/profile.d/tt-device-mcp-heal.sh`
-(login-heal) and `/etc/profile.d/tt-device-mcp-client.sh` (runs client-setup at login).
+(login-heal), `/etc/profile.d/tt-device-mcp-client.sh` (runs client-setup at login) and
+`/usr/lib/systemd/system-shutdown/tt-device-mcp-power-cycle.shutdown` (the broker's power cycle
+after a clean OS shutdown, spec 04 I88; also under `/lib/systemd/system-shutdown/` on a split
+`/lib`). The hook install is required: a failure stops apply, as for the unit.
 
 **The validator pin file** (`deploy/fabric-validator.pin`, staged to
 `$TTDEV_ROOT/fabric-validator.pin`): sourced shell defining `TTDEV_VALIDATOR_REPO`, a full
@@ -182,9 +518,9 @@ path resolves `command -v tt-device-mcp`, then the broker venv, then the per-use
 
 **Staged copies under `$TTDEV_ROOT`** (`/opt/tt-device-broker`): `reconcile.sh`,
 `autoupdate.sh`, `client-setup.sh`, `fabric-check.sh`, `eth-heartbeat-probe.py`,
-`install-fabric-validator.sh`, `fabric-validator.pin`, `installed.sha`, `wheel/`, `venv/`,
-`eth-venv/` (pinned `tt-exalens` interpreter for the heartbeat probe), `validator/<sha>/` +
-`validator/current`, `slurm/prolog.sh` + `slurm/epilog.sh` (staged by BOTH
+`install-fabric-validator.sh`, `fabric-validator.pin`, `installed.sha`, `wheel/`, `venv` (a
+symlink to `venv.<short-sha>.<random>/`, I26), `eth-venv/` (pinned `tt-exalens` interpreter for the
+heartbeat probe), `validator/<sha>/` and `validator/<sha>.build/` (I27) + `validator/current`, `slurm/prolog.sh` + `slurm/epilog.sh` (staged by BOTH
 `install-tt-device-broker.sh` and `apply-host-config.sh`, like `fabric-check.sh` above — the
 first install and every subsequent auto-update both refresh them, since auto-update never
 re-runs the installer, only `apply-host-config.sh`).
@@ -196,13 +532,16 @@ explicitly; then `exec` the mode's installer. The per-user installer gets the re
 as `$1`. Root running the per-user shape on a systemd host is allowed with a note.
 
 **System install flow (`install-tt-device-broker.sh`), in order.** (1) Root check. (2) Venv
-rebuild: `rm -rf $R/venv`, fresh venv, pip-install this tree, stage the wheel, `chmod -R a+rX`.
-The removal happens while any previous broker is still running; live stdio adapters exec out of
-that venv, so an adapter alive across the rebuild is executing a path that no longer exists. (3) `/usr/local/bin/tt-device-mcp` symlink into
+build (I26): a new versioned venv beside the live one, pip-install this tree, verify it, stage the
+wheel, `chmod -R a+rX`. The live `$R/venv` is untouched until the flip, which comes right before
+apply-host-config; the old venv is pruned once the restarted broker answers `/health`. (3) `/usr/local/bin/tt-device-mcp` symlink into
 the venv. (4) Lock policy: cooperative by default; `TTDEV_LOCK=1` opts in, applied only *after*
 the broker is up via `tt-device-mcp lock` (self-checks and reverts); `TTDEV_NO_LOCK=1` forces
 cooperative (back-compat). (5) Machine detection: `tt-smi -s` board_type containing "galaxy" (or
-preset `TT_DEVICE_MCP_RESET_MODE`) selects Galaxy reset mode. (6) Stage `fabric-check.sh`
+preset `TT_DEVICE_MCP_RESET_MODE`) selects Galaxy reset mode. The same snapshot's board types (one
+per answering chip) are passed to apply-host-config as `TTDEV_BOARD_TYPES` for the expected chip
+count (I28); the snapshot is skipped only when both the reset mode and `TTDEV_EXPECTED_CHIPS` are
+preset. (6) Stage `fabric-check.sh`
 (fail-closed under `set -e` — a broker with no fabric check full-resets after every abnormal
 exit) and the eth-heartbeat probe (loud but non-fatal: optional pre-read, staging best-effort);
 scrub the retired `eth-heartbeat-check.sh` wrapper. (7) Write `/etc/default/tt-device-broker`
@@ -218,7 +557,8 @@ poll, fail-closed (I3). (11) Optional lock.
 autoupdate — the single source of truth for the host surface, so a unit/sudoers change reaches
 every host on the next version bump. Reads `/etc/default`; for each knob absent there, falls back
 to the value in the currently rendered unit (a migrating host never loses an operator's setting),
-then backfills resolved values into `/etc/default` (`ensure_default`: missing or present-but-empty
+derives the expected chip count when neither gives one (I28), then backfills resolved values
+into `/etc/default` (`ensure_default`: missing or present-but-empty
 keys only — an empty key is a key predating its value, and leaving it made the file disagree with
 the running unit). Renders the unit (knob rules per Interfaces; the device-lock `DEVICE_GROUP`
 line is preserved across re-renders so an update never silently unlocks a shared host), then
@@ -229,6 +569,17 @@ if the pinned SHA is not built, and refreshes the login banner from the lock sta
 `--print-unit` is a dry-run seam: render the unit to stdout from a given config, touch no host
 path, need no root — every install step is downstream of the render, so tests drive it on any
 host.
+The unit orders after `dev-hugepages\x2d1G.mount` (`Wants=` + `After=`) and never after
+`tenstorrent-hugepages.service`: that unit is `After=multi-user.target`, while the broker and
+a serving unit (`After=` the broker) come before multi-user.target, so the ordering is a cycle and
+systemd breaks it at boot by deleting the broker's or that unit's start job. A drop-in cannot
+remove the vendor's `After=`; the broker waits for the page count itself (spec 03 I33).
+The broker installer's preflight (before the broker's first start) warns, and never fails or waits,
+when a host needs a 1G pool nothing sets up: a Tenstorrent function behind no IOMMU or an identity
+one needs one page (the rule of the broker's startup wait and the fabric-check wrapper, one
+function in `health.monitors.hostpci`), the pool holds fewer (or the kernel has none) and no
+`tenstorrent-hugepages.service` is installed. The warning names the missing pool and the page
+count. A host whose functions are all behind a translating IOMMU (DMA, DMA-FQ) needs none.
 
 **Autoupdate flow (`autoupdate.sh`).** Invoked every reconcile lap; self-gated
 (`TTDEV_AUTOUPDATE=1` and all config keys present, else silent no-op). Serialized by `flock` on
@@ -238,20 +589,31 @@ clones it into `$ROOT/src` under `umask 077` on the first lap (removing any non-
 leftover first), fetches the tracked branch thereafter, and reads the sha with
 `rev-parse --verify -q refs/remotes/origin/$TTDEV_BRANCH`; an unmakeable clone, an unreachable
 network and a missing branch each name the fault and exit 0. If that sha equals `installed.sha`,
-exit. Otherwise: device-op bar and reset-scope check
-(I7 — the scope check asks systemd, because a reset outlives the broker by design); busy/idle
-gate per I7; then materialize the tree — `reset --hard` to **the sha this lap resolved**, not to
-`origin/<branch>` re-read after the gate, so a branch that moved during a defer is not installed
-under a sha `installed.sha` would misname; pip install into the broker venv (on failure, clear broken
+exit (removing any coalescing record). Otherwise: burst coalescing, then the apply rate limit (I21); device-op bar and reset-scope check
+(I7 — the scope check asks systemd, because a reset outlives the broker by design); the bounded
+recovery deferral (I23); dispatch hold and busy/idle gate per I7, I18, I20 and I24; the recovery
+deferral once more, its last chance (I23); then materialize
+the tree — `reset --hard` to **the sha this lap resolved**, not to `origin/<branch>` re-read after
+the gate, so a branch that moved during a deferral or a drain is not installed
+under a sha `installed.sha` would misname; check that every source staged or run below is in the
+pulled tree (I8); pip install into the broker venv (on failure, clear broken
 `dist-info` metadata and retry `--ignore-installed` — recovery from a half-installed venv that
 would otherwise wedge every future update); stage the required scripts fail-closed (I8);
 provision `$ROOT/eth-venv` with the pinned `tt-exalens` if missing (fail-OPEN: a box that cannot
 build it reports the rung OFF, which is loud on its own); run `apply-host-config.sh` from the
-pulled tree fail-closed (I8); write `installed.sha`; restart the broker.
+pulled tree fail-closed (I8); look again for a running job or device op (I24, I7; a new recovery
+is only logged, I23); write
+`installed.sha`; restart the broker. Each decision is logged (I22). After the restart it appends
+one `autoupdate_apply` line to the broker's `health_events.jsonl` (the broker's journal dir,
+`TT_DEVICE_MCP_HEALTH_DIR` or root's default, spec 06): `from_sha`, `to_sha`, `idle` (false when
+this lap drained a job or waited at the restart point), `drained_s` (the seconds it waited),
+`restart_rc` (the restart's exit code: a failed restart is recorded, not shown as a clean apply),
+plus the usual `ts`/`iso`. A failed write only warns; it adds no wait and changes no gate.
 
 **Reconcile semantics (`reconcile.sh`, per minute + 30s after boot).** Idempotent, quiet when
 nothing drifts. (0) Run autoupdate (its own gates apply). (1) Broker liveness: the exact
-predicate is `systemctl is-active tt-device-broker != "active"` → `reset-failed` + `start`. This
+predicate is `systemctl is-active tt-device-broker` not `active` and not a start or stop in
+progress (I19) → `reset-failed` + `start`. This
 deliberately covers `failed`/start-limit exhaustion, but the predicate cannot distinguish an
 operator's deliberate `systemctl stop` (`inactive`): a stopped broker is revived within ~60s
 — measured consequence: the revived broker's startup gate reset a device a container daemon was
@@ -275,12 +637,14 @@ self-update, no lock — the operator owns the box.
 
 **Validator build/pin flow (`install-fabric-validator.sh`).** flock-serialized (concurrent
 tt-metal builds corrupt a tree; the timer refires long before a build ends). If all three pinned
-binaries exist for the SHA: re-assert the `current` symlink and exit (idempotent — the timer polls
-freely; checking all three is what keeps a pre-dispatch-probe host from reporting "already built"
-forever). Otherwise: shallow-fetch the exact SHA, verify the pinned toolchain and its compilers
+binaries exist in a slot for the SHA (I27): flip `current` to it if it is not already live, prune the
+other slot once the live one is an hour old, and exit (idempotent — the timer polls freely; checking
+all three is what keeps a pre-dispatch-probe host from reporting "already built" forever).
+Otherwise, in the slot `current` does not point at: shallow-fetch the exact SHA, verify the pinned toolchain and its compilers
 exist by name, configure from scratch (build dir *and* CPM cache — an interrupted download
 poisons the cache reproducibly), require ninja, build only the three named targets, verify each
-binary, flip `current` atomically (I14). Consumption (`fabric-check.sh`, the 0/77/UNHEALTHY
+binary, flip `current` atomically (I14). The pin's patches are applied right after the checkout
+(I30). Consumption (`fabric-check.sh`, the 0/77/UNHEALTHY
 verdict split, the dispatch stage) is spec 03/04 behavior; deployment's contract is that the
 check runs only the pinned build and never builds anything itself.
 
@@ -413,8 +777,12 @@ script exists, the claim stands on the script (listed below).
 | I3 (/health fail-closed, polled) | `tests/test_deploy_broker_health_failclosed.py::test_broker_health_failure_aborts_with_journal_hint`, `tests/test_deploy_broker_health_failclosed.py::test_broker_health_is_polled_in_a_loop` |
 | I4 (sudoers visudo fail-closed, removed first) | `tests/test_deploy_sudoers_failclosed.py::test_invalid_shipped_sudoers_aborts`, `tests/test_deploy_sudoers_failclosed.py::test_invalid_shipped_sudoers_is_removed_before_aborting` |
 | I5/I6 (timers enabled AND verified active) | `tests/test_deploy_timer_enable_failclosed.py::test_reconcile_timer_enable_is_verified`, `tests/test_deploy_timer_enable_failclosed.py::test_fabric_validator_timer_enable_is_verified`, `tests/test_deploy_timer_enable_failclosed.py::test_is_active_check_follows_the_enable` |
-| I7 (idle gate off by default; opt-in window; device-op bar unconditional) | `tests/test_deploy_autoupdate_idle_gate.py::test_the_idle_gate_is_off_by_default`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_host_can_still_ask_for_an_idle_window`, `tests/test_deploy_autoupdate_idle_gate.py::test_an_in_flight_device_op_still_bars_the_update` |
-| I8 (autoupdate required stages fail-closed; apply precedes installed.sha; staged sources exist) | `tests/test_deploy_required_install_failclosed.py::test_autoupdate_required_stages_fail_closed`, `tests/test_deploy_required_install_failclosed.py::test_autoupdate_host_config_apply_fails_closed`, `tests/test_deploy_required_install_failclosed.py::test_autoupdate_host_config_apply_precedes_installed_sha`, `tests/test_deploy_required_install_failclosed.py::test_autoupdate_staged_sources_exist_in_deploy` |
+| I25 (validator built before the broker's first start) | `tests/test_deploy_validator_before_broker.py::test_validator_build_runs_before_the_broker_starts`, `tests/test_deploy_validator_before_broker.py::test_validator_build_is_blocking_and_failclosed`, `tests/test_deploy_validator_before_broker.py::test_incomplete_build_fails_the_install`, `tests/test_deploy_validator_before_broker.py::test_built_check_covers_all_three_pinned_binaries` |
+| I26 (live venv never removed: versioned venv built and verified beside it, one-rename flip before apply-host-config, prune after /health) | `tests/test_deploy_install_live_swap.py::test_installer_venv_step_never_removes_the_live_venv`, `tests/test_deploy_install_live_swap.py::test_fresh_install_builds_verifies_and_links_a_versioned_venv`, `tests/test_deploy_install_live_swap.py::test_upgrade_keeps_the_live_venv_until_prune`, `tests/test_deploy_install_live_swap.py::test_reinstall_of_the_same_commit_never_builds_over_the_live_venv`, `tests/test_deploy_install_live_swap.py::test_a_venv_that_fails_verification_is_discarded_and_the_live_one_kept`, `tests/test_deploy_install_live_swap.py::test_migration_from_a_real_dir_venv_has_only_the_two_rename_gap`, `tests/test_deploy_install_live_swap.py::test_installer_flips_before_host_config_and_prunes_after_health` |
+| I27 (validator repair builds in the slot `current` does not point at; stale slot pruned after an hour) | `tests/test_deploy_install_live_swap.py::test_validator_fresh_build_publishes_current`, `tests/test_deploy_install_live_swap.py::test_validator_upgrade_keeps_the_old_pin_live_until_the_flip`, `tests/test_deploy_install_live_swap.py::test_validator_same_pin_repair_builds_beside_the_live_prefix`, `tests/test_deploy_install_live_swap.py::test_validator_second_repair_returns_to_the_first_slot`, `tests/test_deploy_install_live_swap.py::test_validator_already_built_pin_does_not_refresh_the_link`, `tests/test_deploy_install_live_swap.py::test_validator_repair_with_trailing_slash_root_builds_beside_the_live_prefix`, `tests/test_deploy_install_live_swap.py::test_validator_repair_with_symlinked_parent_root_builds_beside_the_live_prefix`, `tests/test_deploy_install_live_swap.py::test_validator_refuses_when_current_resolves_inside_the_build_slot`, `tests/test_deploy_install_live_swap.py::test_host_config_counts_either_build_slot_as_built` |
+| I28 (expected chip count from board type / DMI product / galaxy reset mode, never from the chips that answer; operator and unit win; cannot tell = unset + warning) | `tests/test_deploy_expected_chips.py::test_a_galaxy_board_type_maps_to_32`, `tests/test_deploy_expected_chips.py::test_the_count_never_follows_how_many_chips_answered`, `tests/test_deploy_expected_chips.py::test_a_card_board_cannot_tell`, `tests/test_deploy_expected_chips.py::test_no_source_that_can_tell_never_guesses`, `tests/test_deploy_expected_chips.py::test_the_operator_value_wins_over_every_derived_source`, `tests/test_deploy_expected_chips.py::test_the_existing_unit_value_wins_over_derivation`, `tests/test_deploy_expected_chips.py::test_cannot_tell_leaves_it_unset_and_says_so_loudly`, `tests/test_deploy_expected_chips.py::test_a_fresh_galaxy_install_writes_32_with_no_operator_input`, `tests/test_deploy_expected_chips.py::test_a_fresh_galaxy_install_with_a_tray_already_missing_still_gets_32`, `tests/test_deploy_expected_chips.py::test_a_fresh_galaxy_install_with_no_chip_answering_gets_32_from_dmi`, `tests/test_deploy_expected_chips.py::test_fewer_chips_than_the_declared_count_fails_the_check`, `tests/test_apply_host_config_render.py::test_expected_chips_unset_renders_no_line` |
+| I7 (device-op bar unconditional, separate from the I24 busy gate; the job-cap bound never lifts it, and an op with no job running holds dispatch for at most OP_CAP, then the lap restarts nothing and the next lap retries) | `tests/test_deploy_autoupdate_idle_gate.py::test_an_in_flight_device_op_still_bars_the_update`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_in_flight_holds_a_drained_apply`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_in_flight_still_bars_the_restart_past_the_cap`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_at_the_restart_point_blocks_the_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_at_the_restart_point_blocks_the_restart_until_it_ends`, `tests/test_deploy_autoupdate_idle_gate.py::test_an_op_that_never_ends_at_the_restart_point_is_never_restarted_over`, `tests/test_deploy_autoupdate_idle_gate.py::test_an_op_with_no_job_holds_dispatch_for_op_cap_not_the_job_cap`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_running_job_holds_the_update_past_every_cap_and_an_idle_broker_applies` |
+| I8 (autoupdate required stages fail-closed; apply precedes installed.sha; staged sources exist, an older updater's too; a missing source changes nothing) | `tests/test_deploy_required_install_failclosed.py::test_autoupdate_required_stages_fail_closed`, `tests/test_deploy_required_install_failclosed.py::test_autoupdate_host_config_apply_fails_closed`, `tests/test_deploy_required_install_failclosed.py::test_autoupdate_host_config_apply_precedes_installed_sha`, `tests/test_deploy_required_install_failclosed.py::test_autoupdate_staged_sources_exist_in_deploy`, `tests/test_deploy_required_install_failclosed.py::test_older_updater_stages_this_tree`, `tests/test_deploy_required_install_failclosed.py::test_a_tree_missing_a_required_source_changes_nothing` |
 | Installer staging split (fabric fatal; heartbeat loud-not-fatal) | `tests/test_deploy_required_install_failclosed.py::test_installer_fabric_check_stage_is_fatal_not_swallowed`, `tests/test_deploy_required_install_failclosed.py::test_installer_eth_heartbeat_stage_is_loud_but_not_fatal` |
 | I9 (stray broker: detected, not killed, deduped) | `tests/test_deploy_stray_broker_detected.py::test_reconcile_detects_a_stray_broker`, `tests/test_deploy_stray_broker_detected.py::test_reconcile_does_not_kill_the_stray`, `tests/test_deploy_stray_broker_detected.py::test_reconcile_dedups_a_persistent_stray` |
 | I10 (per-user daemon-start fail-closed; status echo not swallowed into the verdict) | `tests/test_deploy_user_daemon_failclosed.py::test_daemon_start_failure_aborts_before_done`, `tests/test_deploy_user_daemon_failclosed.py::test_daemon_status_verdict_not_swallowed` |
@@ -423,12 +791,17 @@ script exists, the claim stands on the script (listed below).
 | I13 (one daemon environment from every start path; nothing persisted) | `tests/test_install_modes.py::test_the_install_persists_no_authority_profile`, `tests/test_install_modes.py::test_the_daemon_env_declares_no_rung_policy`, `tests/test_install_modes.py::test_start_fg_gets_the_same_environment_as_start`, `tests/test_install_modes.py::test_the_per_user_daemon_health_gates_like_any_other` |
 | Cron contract (none installed; no self-update; stale entries removed) | `tests/test_install_modes.py::test_no_cron_entry_is_installed`, `tests/test_install_modes.py::test_the_self_update_command_is_gone_not_merely_unscheduled`, `tests/test_install_modes.py::test_a_stale_self_update_cron_is_removed` |
 | Branch defaults to `main` everywhere; no retired-branch default | `tests/test_deploy_default_branch.py::test_broker_installer_defaults_branch_to_main`, `tests/test_deploy_default_branch.py::test_user_installer_defaults_branch_to_main`, `tests/test_deploy_default_branch.py::test_no_in_repo_default_tracks_anything_but_main` |
-| Unit render: unset knob → no line; set knob reaches the unit; existing render preserved | `tests/test_apply_host_config_render.py::test_seam_preserves_the_existing_render`, `tests/test_apply_host_config_render.py::test_eth_heartbeat_unset_renders_no_line`, `tests/test_apply_host_config_render.py::test_eth_heartbeat_set_reaches_the_unit`, `tests/test_apply_host_config_render.py::test_reset_floor_knobs_unset_render_no_line`, `tests/test_apply_host_config_render.py::test_reset_floor_knobs_set_reach_the_unit`, `tests/test_apply_host_config_render.py::test_expected_chips_unset_renders_no_line`, `tests/test_apply_host_config_render.py::test_expected_chips_set_reaches_the_unit`, `tests/test_apply_host_config_render.py::test_cold_rung_knobs_unset_render_no_line`, `tests/test_apply_host_config_render.py::test_cold_rung_knobs_set_reach_the_unit`, `tests/test_apply_host_config_render.py::test_ubb_reset_force_off_unset_renders_no_line`, `tests/test_apply_host_config_render.py::test_ubb_reset_force_off_reaches_the_unit`, `tests/test_apply_host_config_render.py::test_prejob_dispatch_unset_renders_no_line`, `tests/test_apply_host_config_render.py::test_prejob_dispatch_set_reaches_the_unit`, `tests/test_apply_host_config_render.py::test_eth_check_python_unset_renders_no_line`, `tests/test_apply_host_config_render.py::test_eth_check_python_reaches_the_unit` |
+| Unit render: unset knob → no line; set knob reaches the unit; existing render preserved | `tests/test_apply_host_config_render.py::test_seam_preserves_the_existing_render`, `::test_eth_heartbeat_unset_renders_no_line`, `::test_eth_heartbeat_set_reaches_the_unit`, `::test_reset_floor_knobs_unset_render_no_line`, `::test_reset_floor_knobs_set_reach_the_unit`, `::test_expected_chips_unset_renders_no_line`, `::test_expected_chips_set_reaches_the_unit`, `::test_cold_rung_knobs_unset_render_no_line`, `::test_cold_rung_knobs_set_reach_the_unit`, `::test_an_unset_knob_renders_no_line`, `::test_prejob_dispatch_set_reaches_the_unit`, `::test_eth_check_python_reaches_the_unit` |
+| Unit never ordered after `tenstorrent-hugepages.service` (boot ordering cycle) | `tests/test_apply_host_config_render.py::test_the_unit_never_orders_after_the_vendor_hugepages_service` |
+| Installer 1G hugepage preflight (warns, never fails or waits; same rule as the broker's wait and the fabric-check wrapper) | `tests/test_install_hugepage_preflight.py::test_a_translating_iommu_needs_no_page_and_gets_no_warning`, `::test_an_identity_iommu_with_no_pool_warns_with_the_page_count`, `::test_a_function_with_no_iommu_group_needs_a_page`, `::test_an_installed_hugepages_service_gets_no_warning`, `::test_the_preflight_the_broker_and_the_wrapper_count_the_same_pages`, `::test_the_installer_warns_and_carries_on`, `::test_the_preflight_runs_before_the_broker_starts` |
+| Unit lifts `LimitMEMLOCK` so scoped jobs can pin host memory | `tests/test_apply_host_config_render.py::test_the_unit_lifts_the_memlock_limit_jobs_inherit` |
 | Retired heartbeat wrapper scrubbed on apply | `tests/test_apply_host_config_render.py::test_eth_heartbeat_pointed_at_the_retired_wrapper_is_scrubbed` |
 | I15 (probe exit contract: crash folds to 77, never bare 1; verdict pass-through) | `tests/test_eth_heartbeat_probe.py::test_run_folds_crash_to_cannot_check_never_bare_one`, `tests/test_eth_heartbeat_probe.py::test_run_passes_through_main_return`, `tests/test_eth_heartbeat_probe.py::test_run_propagates_system_exit`, `tests/test_eth_heartbeat_probe.py::test_main_frozen_core_is_frozen`, `tests/test_eth_heartbeat_probe.py::test_main_all_advancing_is_ok`, `tests/test_eth_heartbeat_probe.py::test_main_attach_failure_is_cannot_check`, `tests/test_eth_heartbeat_probe.py::test_main_no_devices_is_cannot_check`, `tests/test_eth_heartbeat_probe.py::test_main_read_error_skips_core_not_frozen`, `tests/test_eth_heartbeat_probe.py::test_main_offbus_heartbeat_not_counted` |
 | I16 (the source is a literal that expands nothing, assigned once; the config's only operator input is the branch) | `tests/test_deploy_update_source.py::test_the_update_source_is_a_literal_with_no_expansion`, `tests/test_deploy_update_source.py::test_nothing_else_assigns_the_source`, `tests/test_deploy_update_source.py::test_the_only_operator_input_in_the_config_is_the_branch` |
 | I16 (root-owned clone, private from creation) | `tests/test_deploy_update_source.py::test_the_clone_lives_under_the_broker_root_never_in_a_home`, `tests/test_deploy_update_source.py::test_the_clone_is_created_private` |
 | I16 (installs the sha it resolved; unreachable source is a no-op lap that says why; leftover cleared) | `tests/test_deploy_update_source.py::test_the_lap_installs_the_sha_it_resolved`, `tests/test_deploy_update_source.py::test_every_unreachable_source_is_a_no_op_lap_that_says_why`, `tests/test_deploy_update_source.py::test_a_leftover_non_repository_is_cleared_rather_than_retried_forever` |
+| I16 (the local mirror: used only when root-owned, not linked, not group/other writable and bare; origin follows the choice; no fallback within a lap) | `tests/test_deploy_autoupdate_source_mirror.py::test_a_valid_mirror_is_the_source_from_the_first_clone_on`, `tests/test_deploy_autoupdate_source_mirror.py::test_a_mirror_root_alone_cannot_have_filled_is_ignored`, `tests/test_deploy_autoupdate_source_mirror.py::test_the_clone_origin_follows_the_choice_both_ways_and_the_decision_log_says_so`, `tests/test_deploy_autoupdate_source_mirror.py::test_a_mirror_without_the_branch_does_not_fall_back_to_the_public_repo`, `tests/test_deploy_autoupdate_source_mirror.py::test_the_mirror_is_a_fixed_path_under_the_broker_root` |
+| I16 (a failing source is named once per outage, then once when it is back; no hold, no restart) | `tests/test_deploy_autoupdate_source_mirror.py::test_an_unreachable_source_is_logged_once_over_five_laps_then_reachable_again_once`, `tests/test_deploy_autoupdate_source_mirror.py::test_a_missing_branch_is_logged_once_per_outage`, `tests/test_deploy_autoupdate_source_mirror.py::test_a_failed_fetch_takes_no_hold_and_restarts_nothing` |
 | I16 (the branch stays operator input, bash-escaped, round-trips an apostrophe) | `tests/test_deploy_update_source.py::test_the_branch_is_written_bash_escaped`, `tests/test_deploy_update_source.py::test_the_config_round_trips_a_branch_containing_an_apostrophe` |
 | Slurm hooks exist, parse, and propagate the CLI's exit code | `tests/test_slurm_steps.py::test_the_slurm_hooks_exist_and_are_executable`, `tests/test_slurm_steps.py::test_the_slurm_hooks_are_shell_clean`, `tests/test_slurm_steps.py::test_the_hooks_propagate_the_cli_exit_code` |
 | The epilog carries Slurm's job exit code inward | `tests/test_slurm_steps.py::test_the_epilog_passes_slurms_job_exit_code_through` |
@@ -436,6 +809,17 @@ script exists, the claim stands on the script (listed below).
 | Epilog prefers a non-zero `SLURM_JOB_DERIVED_EC` over `SLURM_JOB_EXIT_CODE`, and still falls back to it when DERIVED_EC is zero | `tests/test_slurm_steps.py::test_the_epilog_prefers_slurm_job_derived_ec_when_nonzero`, `tests/test_slurm_steps.py::test_the_epilog_falls_back_to_slurm_job_exit_code_when_derived_ec_is_zero` |
 | The installer stages both hooks at the path `deploy/README.md` documents, and auto-update (via `apply-host-config.sh`) keeps them current on an already-installed host | `tests/test_slurm_steps.py::test_the_installer_stages_the_slurm_hooks_at_the_documented_path`, `tests/test_slurm_steps.py::test_apply_host_config_also_stages_the_slurm_hooks` |
 | Each hook exports its own step-deadline var from `/etc/default/tt-device-broker` to the CLI child, and the export is harmless when the var was never set | `tests/test_slurm_steps.py::test_the_hooks_export_their_deadline_var_from_etc_default`, `tests/test_slurm_steps.py::test_the_hooks_do_not_require_the_deadline_var_to_be_set` |
+| I17 (idle-time probe: stands back unless idle, no device op and no tenant; re-checks before and after acting; broker's chip count and poller list; enabled failed/inactive pollers only; one page per episode, flaps included; AER first-lap baseline; apply arms it, optional, retires the old timer only after arming, moved aside) | `tests/test_health_probe.py::test_idle_verdict_requires_an_idle_healthy_broker`, `tests/test_health_probe.py::test_a_busy_broker_is_left_alone`, `tests/test_health_probe.py::test_a_broker_turning_busy_stops_the_rescan`, `tests/test_health_probe.py::test_expected_chips_reads_the_broker_count`, `tests/test_health_probe.py::test_missing_chips_rescan_then_alert_once`, `tests/test_health_probe.py::test_rescan_recovers_without_alert`, `tests/test_health_probe.py::test_telemetry_restart_and_alert`, `tests/test_health_probe.py::test_a_poller_stopped_and_disabled_on_purpose_is_left_off`, `tests/test_health_probe.py::test_an_activating_poller_is_left_to_systemd_then_paged_once`, `tests/test_health_probe.py::test_a_start_that_is_still_activating_does_not_page`, `tests/test_health_probe.py::test_a_flapping_poller_pages_once_per_episode`, `tests/test_health_probe.py::test_a_poller_that_stays_up_between_rare_falls_is_restarted_quietly`, `tests/test_health_probe.py::test_the_pollers_are_the_broker_list`, `tests/test_health_probe.py::test_the_probe_default_is_the_broker_default`, `tests/test_health_probe.py::test_the_poller_list_comes_from_the_broker_env`, `tests/test_health_probe.py::test_a_device_op_in_flight_stops_the_lap`, `tests/test_health_probe.py::test_a_tenant_holding_the_device_outside_the_job_table_stops_the_lap`, `tests/test_health_probe.py::test_a_device_op_that_starts_during_the_settle_stops_the_poller_again`, `tests/test_health_probe.py::test_a_job_starting_during_the_settle_keeps_the_poller`, `tests/test_health_probe.py::test_device_op_lock_reads_the_broker_inhibit_file`, `tests/test_health_probe.py::test_tenant_holders_fail_closed`, `tests/test_health_probe.py::test_the_broker_device_op_flock_is_tested_and_the_rescan_written_under_it`, `tests/test_health_probe.py::test_a_rescan_the_flock_refused_is_retried_next_lap`, `tests/test_health_probe.py::test_aer_growth_alerts_once_an_hour`, `tests/test_health_probe.py::test_aer_already_counted_at_the_first_lap_is_a_baseline_not_a_page`, `tests/test_health_probe.py::test_the_chip_count_comes_from_the_broker_env`, `tests/test_health_probe.py::test_apply_installs_and_arms_the_probe_optionally`, `tests/test_health_probe.py::test_an_armed_probe_moves_the_old_timer_aside`, `tests/test_health_probe.py::test_an_opted_out_host_keeps_the_old_timer`, `tests/test_health_probe.py::test_a_probe_that_will_not_arm_keeps_the_old_timer`, `tests/test_health_probe.py::test_a_host_without_the_old_timer_only_arms`, `tests/test_health_probe.py::test_the_probe_unit_runs_the_broker_venv`, `tests/test_health_probe.py::test_a_venv_without_the_probe_module_gets_no_probe_units`, `tests/test_health_probe.py::test_a_venv_without_the_probe_module_stops_a_stale_timer`, `tests/test_health_probe.py::test_a_venv_with_the_probe_module_is_never_skipped` |
+| I18 (dispatch hold from the busy check through the restart; queued specs and job scopes count as busy) | `tests/test_deploy_autoupdate_idle_gate.py::test_the_hold_is_taken_before_anything_is_counted`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_hold_appears_whole`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_queued_job_alone_applies_at_once_under_the_hold`, `tests/test_deploy_autoupdate_idle_gate.py::test_an_idle_box_applies_and_keeps_the_hold_until_the_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_running_job_scope_holds_dispatch_and_the_update_applies_when_it_ends` |
+| I19 (an in-progress broker is not reset or started; logged once) | `tests/test_deploy_reconcile_activating.py::test_an_in_progress_broker_is_not_reset_or_started`, `tests/test_deploy_reconcile_activating.py::test_an_in_progress_broker_logs_once_per_episode`, `tests/test_deploy_reconcile_activating.py::test_a_down_broker_is_still_reset_and_started`, `tests/test_deploy_reconcile_activating.py::test_an_active_broker_is_left_alone` |
+| I20 (a busy box drains at once: the hold is kept until the running job ends, then the update applies within one poll; a back-to-back queue cannot slip a job in; bounded under the hold by the job cap from the youngest job scope's start; a broker job past it, re-adopted or not, gets no restart and the next lap retries, a lone non-broker holder past it does; a down broker ends the drain, over a listed reset scope too but never over a live-pid op lock; a device op holds the apply, with no job running for at most OP_CAP; the restart opens the queue only after the startup fabric pass, after hugepages) | `tests/test_deploy_autoupdate_idle_gate.py::test_the_job_cap_is_the_brokers_hard_limit_plus_its_kill_grace`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_running_job_scope_holds_dispatch_and_the_update_applies_when_it_ends`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_busy_box_drains_at_once_and_applies_at_the_job_boundary`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_back_to_back_queue_cannot_slip_a_job_into_the_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_job_past_its_cap_never_gets_a_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_re_adopted_job_never_gets_a_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_holder_outside_any_broker_job_stops_holding_the_update_at_the_cap`, `tests/test_deploy_autoupdate_idle_gate.py::test_an_idle_box_applies_and_keeps_the_hold_until_the_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_down_broker_ends_the_drain`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_down_broker_with_only_a_reset_scope_left_is_restarted`, `tests/test_deploy_autoupdate_idle_gate.py::test_an_op_with_no_job_holds_dispatch_for_op_cap_not_the_job_cap`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_in_flight_holds_a_drained_apply`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_drain_refreshes_the_hold`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_apply_ends_in_a_full_broker_restart`, `tests/test_restart_drain.py::test_a_job_held_across_an_update_waits_for_the_startup_fabric_pass`, `tests/test_restart_drain.py::test_a_failed_startup_pass_after_an_update_keeps_the_queue_held`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_preemptable_job_past_its_limit_is_drained_by_the_hold`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_preemptable_job_before_its_limit_keeps_the_hold_until_the_limit_and_the_preemption`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_limit_too_far_off_for_the_job_cap_is_never_held_through`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_limit_that_just_fits_the_job_cap_is_held_through`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_preempted_job_whose_post_job_gate_runs_long_still_applies_under_the_same_hold`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_post_job_gate_that_never_ends_lets_go_at_the_gate_cap`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_gate_cap_is_a_kill_reset_plus_a_full_check_on_32_chips`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_job_past_the_cap_still_defers_unless_the_only_running_job_is_preemptable` |
+| I21 (apply rate limit: on by default at 1800 s, 0 turns it off; a burst of pushes is one restart onto the newest sha after the interval; checked before the device-op bar and the hold; the stamp is written only by an apply that restarts; a missing, bad or future stamp bars nothing; a broker that is not active, crash-loops, is silent, held or recovering/down applies at once; a healthy broker, or one in its startup check (recovering/startup_unverified, held only for that check) within STARTUP_BOUND of the last apply, stays limited; past the bound or held for a fault it applies at once; bursts coalesce: a new sha waits for 600 s of quiet or a 3600 s bound from the oldest unapplied sha, whichever is first, unless the broker is broken; the start after it still runs the forced fabric pass and stays held until it passes) | `tests/test_deploy_autoupdate_coalesce.py::test_the_defaults_are_code_defaults`, `tests/test_deploy_autoupdate_coalesce.py::test_a_push_every_5_min_for_150_min_is_at_most_3_restarts`, `tests/test_deploy_autoupdate_coalesce.py::test_a_lone_push_after_an_hour_of_quiet_waits_only_the_quiet_period`, `tests/test_deploy_autoupdate_coalesce.py::test_no_sha_waits_longer_than_the_bound_plus_a_lap`, `tests/test_deploy_autoupdate_coalesce.py::test_a_coalescing_lap_says_when_it_applies_and_logs_its_deferral`, `tests/test_deploy_autoupdate_coalesce.py::test_an_apply_or_a_branch_back_at_the_installed_sha_clears_the_record`, `tests/test_deploy_autoupdate_coalesce.py::test_a_bad_or_future_record_counts_from_now`, `tests/test_deploy_autoupdate_coalesce.py::test_a_broken_broker_is_not_coalesced`, `tests/test_deploy_autoupdate_coalesce.py::test_quiet_0_turns_coalescing_off`, `tests/test_deploy_autoupdate_coalesce.py::test_coalescing_comes_before_the_rate_limit_and_every_gate_that_holds`, `tests/test_deploy_autoupdate_coalesce.py::test_a_docs_only_push_coalesces_then_applies_with_no_restart`, `tests/test_deploy_autoupdate_coalesce.py::test_a_code_push_coalesces_then_drains_a_running_job_and_restarts`, `tests/test_deploy_autoupdate_coalesce.py::test_the_start_after_a_coalesced_apply_runs_the_forced_fabric_pass_before_the_queue_opens`, `tests/test_deploy_autoupdate_coalesce.py::test_the_start_after_a_coalesced_apply_stays_held_on_fewer_links_than_the_cabling`, `tests/test_deploy_autoupdate_rate_limit.py::test_the_rate_limit_is_on_by_default_at_1800s`, `tests/test_deploy_autoupdate_rate_limit.py::test_an_interval_of_0_turns_the_rate_limit_off`, `tests/test_deploy_autoupdate_rate_limit.py::test_a_push_burst_under_the_default_is_paced_to_one_restart_per_interval`, `tests/test_deploy_autoupdate_rate_limit.py::test_a_burst_of_pushes_becomes_one_restart_onto_the_newest_sha`, `tests/test_deploy_autoupdate_rate_limit.py::test_the_wait_names_the_time_left`, `tests/test_deploy_autoupdate_rate_limit.py::test_no_stamp_a_bad_stamp_or_a_future_stamp_bars_nothing`, `tests/test_deploy_autoupdate_rate_limit.py::test_a_rate_limited_lap_holds_nothing_and_skips_no_check`, `tests/test_deploy_autoupdate_rate_limit.py::test_the_stamp_is_written_only_by_an_apply_that_restarts`, `tests/test_deploy_autoupdate_rate_limit.py::test_a_broken_broker_applies_a_new_sha_inside_the_interval`, `tests/test_deploy_autoupdate_rate_limit.py::test_a_broken_broker_applies_at_once_under_the_default_interval`, `tests/test_deploy_autoupdate_rate_limit.py::test_a_healthy_broker_stays_rate_limited`, `tests/test_deploy_autoupdate_rate_limit.py::test_the_startup_bound_covers_the_hugepage_wait_and_the_fabric_check`, `tests/test_deploy_autoupdate_rate_limit.py::test_a_booting_broker_stays_rate_limited`, `tests/test_deploy_autoupdate_rate_limit.py::test_a_startup_check_past_its_bound_or_held_applies_at_once`, `tests/test_deploy_autoupdate_rate_limit.py::test_the_crash_loop_baseline_is_the_count_after_the_last_apply`, `tests/test_deploy_autoupdate_rate_limit.py::test_a_missing_stamp_is_silent_and_a_leading_zero_stamp_is_decimal` |
+| I22 (each decision: time with offset, branch, old and new sha, reason, in the log dir and the journal tag; failed applies logged; kept to 1 MiB) | `tests/test_deploy_autoupdate_recovery_defer.py::test_each_decision_line_has_time_both_shas_and_a_reason`, `tests/test_deploy_autoupdate_recovery_defer.py::test_an_apply_that_stops_is_logged_as_failed`, `tests/test_deploy_autoupdate_recovery_defer.py::test_the_log_is_kept_to_about_a_mebibyte`, `tests/test_deploy_autoupdate_recovery_defer.py::test_the_script_defaults`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_clean_apply_restarts_and_logs_it`, `tests/test_deploy_autoupdate_recovery_defer.py::test_each_deferral_names_its_deadline`, `tests/test_deploy_autoupdate_rate_limit.py::test_a_rate_limited_lap_logs_its_deferral` |
+| I23 (a hold, or a recovering or down FSM, defers the update; bounded by the hold age and by the update's own wait, 20 min default, 30 min cap, 0 off; no answer is no deferral; the I7 bar still comes first; no recovery switch touched; after the drain and before the install a new hold defers, dropping the dispatch hold; once the install has run nothing defers for a recovery, only the I7 device-op bar stops the restart; any apply, a no-restart one included, clears the deferral clock) | `tests/test_deploy_autoupdate_recovery_defer.py::test_a_fresh_hold_defers_the_update`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_recovering_or_down_fsm_defers_without_a_held_flag`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_healthy_broker_is_not_deferred_for`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_broker_that_does_not_answer_is_not_deferred_for`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_hold_older_than_the_bound_lets_the_update_apply`, `tests/test_deploy_autoupdate_recovery_defer.py::test_an_update_waits_at_most_the_bound_across_holds`, `tests/test_deploy_autoupdate_recovery_defer.py::test_the_bound_is_capped_at_30_minutes_and_0_turns_it_off`, `tests/test_deploy_autoupdate_recovery_defer.py::test_the_script_defaults`, `tests/test_deploy_autoupdate_recovery_defer.py::test_the_device_op_bar_still_comes_first_and_is_logged`, `tests/test_deploy_autoupdate_recovery_defer.py::test_the_deferral_touches_no_recovery_switch`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_clean_apply_restarts_and_logs_it`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_hold_that_began_during_the_drain_defers_before_the_install`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_hold_that_began_during_the_install_does_not_stop_the_restart`, `tests/test_deploy_autoupdate_recovery_defer.py::test_no_recovery_deferral_comes_after_the_install_starts`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_device_op_at_restart_time_is_waited_out`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_device_op_that_outlives_the_wait_is_never_restarted_over`, `tests/test_deploy_autoupdate_recovery_defer.py::test_the_restart_still_comes_after_the_last_look`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_running_reset_scope_always_defers_even_past_the_bound`, `tests/test_deploy_autoupdate_recovery_defer.py::test_a_running_job_on_a_healthy_broker_is_left_to_the_idle_rule`, `tests/test_deploy_autoupdate_no_restart.py::test_a_no_restart_apply_clears_the_recovery_deferral_clock` |
+| I24 (no restart under a running tenant job: busy gate always on with no setting, old defer settings inert; a job running at the restart point is waited out to the job cap, and one past it blocks the restart; a device op there with no job running is waited out for at most OP_CAP = reset timeout + kill grace, never restarted over, and installed.sha stays old; a running broker job holds the update past every cap and an idle broker applies it; MainPID 0 counts no children) | `tests/test_deploy_autoupdate_idle_gate.py::test_the_idle_gate_is_always_on_with_no_setting`, `tests/test_deploy_autoupdate_idle_gate.py::test_old_defer_settings_do_not_turn_the_drain_off`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_job_running_at_the_restart_point_is_waited_out_to_its_cap`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_job_that_ends_at_the_restart_point_is_waited_out`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_job_past_its_cap_at_the_restart_point_gets_no_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_at_the_restart_point_blocks_the_restart`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_device_op_at_the_restart_point_blocks_the_restart_until_it_ends`, `tests/test_deploy_autoupdate_idle_gate.py::test_an_op_that_never_ends_at_the_restart_point_is_never_restarted_over`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_running_job_holds_the_update_past_every_cap_and_an_idle_broker_applies`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_op_cap_is_the_reset_timeout_plus_its_kill_grace`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_stopped_broker_has_no_children_to_count` |
+| I29 (no restart for a docs/tests/CI/updater-only update, the updater staged fail-closed; any other path, an uncomputable diff, a clone off the installed sha or an unhealthy broker restarts; rate limit and idle gate still apply) | `tests/test_deploy_autoupdate_no_restart.py::test_a_docs_tests_and_ci_only_update_moves_the_tree_and_installed_sha_with_no_restart`, `tests/test_deploy_autoupdate_no_restart.py::test_a_mixed_update_restarts`, `tests/test_deploy_autoupdate_no_restart.py::test_an_update_touching_anything_the_broker_uses_restarts`, `tests/test_deploy_autoupdate_no_restart.py::test_a_diff_that_cannot_be_computed_restarts`, `tests/test_deploy_autoupdate_no_restart.py::test_an_unreadable_installed_sha_restarts`, `tests/test_deploy_autoupdate_no_restart.py::test_a_clone_left_ahead_by_an_unfinished_apply_restarts`, `tests/test_deploy_autoupdate_no_restart.py::test_a_broker_that_is_not_healthy_still_gets_its_restart`, `tests/test_deploy_autoupdate_no_restart.py::test_the_rate_limit_still_gates_a_no_restart_apply`, `tests/test_deploy_autoupdate_no_restart.py::test_the_idle_gate_still_drains_before_a_no_restart_apply`, `tests/test_deploy_autoupdate_no_restart.py::test_the_allowlist_is_the_one_the_spec_names` |
+| I30 (the pin's patches applied to every build, one that does not apply fails it; prefix keyed on SHA plus patch hash) | `tests/test_deploy_install_live_swap.py::test_validator_build_applies_the_pins_patches_under_a_patch_keyed_prefix`, `tests/test_deploy_install_live_swap.py::test_validator_patch_that_does_not_apply_fails_the_build`, `tests/test_deploy_install_live_swap.py::test_validator_changed_patch_builds_a_new_prefix_beside_the_live_one`, `tests/test_deploy_install_live_swap.py::test_host_config_counts_either_build_slot_as_built`, `tests/test_fabric_ramp_patch.py::test_ramp_patch_is_the_one_the_pin_names`, `tests/test_fabric_ramp_patch.py::test_ramp_patch_applies_to_the_source_lines_it_needs`, `tests/test_fabric_ramp_patch.py::test_ramp_knobs_default_to_one_chip_and_250_ms`, `tests/test_fabric_ramp_patch.py::test_ramp_changes_only_when_each_chip_starts_not_what_is_checked`, `tests/test_fabric_ramp_patch.py::test_broker_passes_the_ramp_knobs_through_and_keeps_the_pass_rule` |
+| Autoupdate flow: one `autoupdate_apply` event per apply, in the broker's journal dir and schema; `restart_rc` records a failed restart; `idle`/`drained_s` come from the lap's own drain; a failed write only warns | `tests/test_deploy_autoupdate_idle_gate.py::test_apply_appends_one_autoupdate_apply_event_in_the_broker_schema`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_failed_restart_is_recorded_as_failed`, `tests/test_deploy_autoupdate_idle_gate.py::test_the_event_goes_to_the_brokers_journal_dir`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_failed_event_write_only_warns`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_lap_reports_idle_and_its_drain_time`, `tests/test_deploy_autoupdate_idle_gate.py::test_a_wait_at_the_restart_point_adds_to_the_drain_time` |
 
 **Unanchored (the claim stands on the script):** I2 (wheel/venv from this tree —
 `install-tt-device-broker.sh`); the installer's flow ordering and lock opt-in; Galaxy detection

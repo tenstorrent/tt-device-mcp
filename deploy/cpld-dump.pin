@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The vendor CPLD DIAG script the broker runs before recovery when a host has no
+# /usr/local/bin/cpld-dump.sh of its own (spec 04 I109). The script is the vendor's and
+# is not redistributed here: this pins its sha256, and the broker refuses a copy that
+# does not match (health/cpld_dump.py PINNED_SHA256 carries the same value).
+#
+# Source: the vendor (BH_s7t_cpld_dump_V1.03.01.sh, as supplied with the Blackhole galaxy).
+# Install: deploy/install-cpld-dump.sh <path to that file>
+TTDEV_CPLD_DUMP_VERSION=V1.03.01
+TTDEV_CPLD_DUMP_SHA256=ad0f966b78ba9f810f8add56e0942bad2b9bd02c434d0d66eb3ba687de89fc14
+TTDEV_CPLD_DUMP_PATH=/usr/local/lib/tt-device-mcp/BH_s7t_cpld_dump_V1.03.01.sh

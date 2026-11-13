@@ -3,7 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """The server FSM: BOOT/HEALTHY/RECOVERING/DOWN, and the durable record behind it."""
 
-from tt_device_mcp.fsm import FsmRecord, ServerFsm, ServerState
+import json
+from datetime import datetime
+
+from tt_device_mcp.fsm import STARTUP_PENDING_PREFIX, FsmRecord, ServerFsm, ServerState, unwrap_startup_pending
+from tt_device_mcp.health import OUTCOME_RECOVERED, OUTCOME_TERMINAL
+from tt_device_mcp.health.core import HealthState
 
 
 def _fsm(tmp_path):
@@ -294,3 +299,221 @@ def test_boot_merge_reattributes_only_the_current_boot(tmp_path):
     d = f.record.detail
     assert d.count("boot attributed") == 1, "no stale-plus-new duplicate"
     assert "recorded at NEW" in d and "recorded at OLD" not in d
+
+
+def test_boot_merge_attributes_the_escalation_only_on_the_boots_first_broker_start(tmp_path):
+    """The ledger names the escalation that brought THIS boot up, and stays adjacent to it for the whole boot."""
+    path = tmp_path / "fsm.json"
+    escalation = {"action": "power-cycle", "at": "2026-09-16T05:21:11"}
+    first = ServerFsm(path, current_boot_id="boot-A")
+    first.boot_merge(open_episode=None, attributed_boot=escalation)
+    assert "boot attributed to a broker-fired power-cycle" in first.record.detail
+
+    again = ServerFsm(path, current_boot_id="boot-A")  # restart within the same boot
+    again.boot_merge(open_episode=None, attributed_boot=escalation)
+    assert "boot attributed" not in (again.record.detail or "")
+
+    carried = ServerFsm(path, current_boot_id="boot-A")  # a carried episode loses the stale clause too
+    carried.boot_merge(
+        open_episode=FsmRecord(state=ServerState.RECOVERING, why="eth_frozen", detail=first.record.detail),
+        attributed_boot=escalation,
+    )
+    assert "boot attributed" not in (carried.record.detail or "")
+
+    next_boot = ServerFsm(path, current_boot_id="boot-B")  # a new boot it brought up attributes again
+    next_boot.boot_merge(open_episode=None, attributed_boot={"action": "reboot", "at": "2026-10-13T20:30:00"})
+    assert "boot attributed to a broker-fired reboot" in next_boot.record.detail
+
+
+def test_boot_merge_names_a_refuted_cycle_a_warm_reboot(tmp_path):
+    """Spec 04 I88: the BMC refuted the broker's power cycle, so this boot was a warm reboot; the
+    attribution must not say a broker-fired power-cycle brought it up. The clause still strips on carry."""
+    f = ServerFsm(tmp_path / "fsm.json", current_boot_id="boot-A")
+    f.boot_merge(
+        open_episode=None, attributed_boot={"action": "power-cycle", "at": "T1", "cycle_refuted": "soft reset"}
+    )
+    d = f.record.detail
+    assert "boot attributed to a warm reboot" in d and "BMC restart cause soft reset" in d
+    assert "broker-fired power-cycle recorded" not in d
+    carried = ServerFsm(tmp_path / "fsm2.json", current_boot_id="boot-B")
+    carried.boot_merge(
+        open_episode=FsmRecord(state=ServerState.RECOVERING, why="eth_frozen", detail=d), attributed_boot=None
+    )
+    assert "boot attributed" not in (carried.record.detail or "")
+
+
+OFF_BUS = "gate/pre-job: 1/32 chip(s) off the bus, below the reset floor — held for self-heal, not reset"
+
+
+def test_a_hold_carried_into_a_power_cycled_boot_reads_as_its_pending_startup_check(tmp_path):
+    """Spec 03 I90: after the power cycle the old off-bus count describes the boot that is gone; the carried hold reads
+    as the pending startup check first, the old detail kept inside it, the hold itself (state, why, dirty) unchanged."""
+    open_ep = FsmRecord(state=ServerState.RECOVERING, why="chips_off_bus", detail=OFF_BUS, dirty=True)
+    f = ServerFsm(tmp_path / "fsm.json", current_boot_id="boot-B")
+    f.boot_merge(open_episode=open_ep, attributed_boot={"action": "power-cycle", "at": "T1"})
+    d = f.record.detail
+    assert d.startswith("startup check pending") and d.startswith(STARTUP_PENDING_PREFIX + OFF_BUS + ")")
+    assert d.endswith("boot attributed to a broker-fired power-cycle recorded at T1")
+    assert "off the bus" in d, "text matches on the carried detail still see it"
+    assert (f.record.state, f.record.why, f.record.dirty) == (ServerState.RECOVERING, "chips_off_bus", True)
+
+
+def test_the_pending_wrapper_never_nests_across_boots_or_restarts(tmp_path):
+    path = tmp_path / "fsm.json"
+    first = ServerFsm(path, current_boot_id="boot-B")
+    first.boot_merge(
+        open_episode=FsmRecord(state=ServerState.RECOVERING, why="chips_off_bus", detail=OFF_BUS),
+        attributed_boot={"action": "power-cycle", "at": "T1"},
+    )
+    again = ServerFsm(path, current_boot_id="boot-B")  # a restart within that boot: no new attribution
+    again.boot_merge(
+        open_episode=FsmRecord(state=ServerState.RECOVERING, why="chips_off_bus", detail=first.record.detail),
+        attributed_boot={"action": "power-cycle", "at": "T1"},
+    )
+    assert again.record.detail == STARTUP_PENDING_PREFIX + OFF_BUS + ")"
+    later = ServerFsm(path, current_boot_id="boot-C")  # a second cycle's boot
+    later.boot_merge(
+        open_episode=FsmRecord(state=ServerState.RECOVERING, why="chips_off_bus", detail=again.record.detail),
+        attributed_boot={"action": "power-cycle", "at": "T2"},
+    )
+    d = later.record.detail
+    assert d.count("startup check pending") == 1 and d.count("boot attributed") == 1 and "recorded at T2" in d
+    assert d.startswith(STARTUP_PENDING_PREFIX + OFF_BUS + ") boot attributed") and unwrap_startup_pending(d) == OFF_BUS
+    assert unwrap_startup_pending(again.record.detail) == OFF_BUS and unwrap_startup_pending(OFF_BUS) == OFF_BUS
+
+
+def test_a_boot_without_an_escalation_keeps_the_carried_detail_as_it_was(tmp_path):
+    f = ServerFsm(tmp_path / "fsm.json", current_boot_id="boot-B")
+    f.boot_merge(open_episode=FsmRecord(state=ServerState.RECOVERING, why="chips_off_bus", detail=OFF_BUS))
+    assert f.record.detail == OFF_BUS
+
+
+def test_on_next_close_fires_once_on_whichever_path_reaches_healthy(tmp_path):
+    """A caller pairing an opening event with its close (the startup hold's release row) registers
+    once and must hear about the close exactly once — not on a refreshed fault mid-episode, not
+    again on a later episode — whether a healthy read or a recovered rung closes it."""
+    f = _fsm(tmp_path)
+    f.boot_merge(open_episode=None, attributed_boot=None)
+    closed = []
+    f.on_next_close(closed.append)
+
+    f.on_fault("foreign_holder", detail="pid 42 holds it", dirty=False)  # same episode, new why
+    assert closed == []
+    f.on_outcome(OUTCOME_RECOVERED)
+    assert [(r.state, r.why) for r in closed] == [(ServerState.RECOVERING, "foreign_holder")]
+
+    f.on_fault("job_killed")
+    f.on_readings(HealthState(phase="test", at=datetime.now(), expected=0))
+    assert len(closed) == 1, "a one-shot close hook fired again on a later episode"
+
+
+def test_a_failing_close_hook_does_not_break_the_transition(tmp_path):
+    f = _fsm(tmp_path)
+    f.on_fault("job_killed")
+
+    def boom(_record):
+        raise RuntimeError("journal unwritable")
+
+    f.on_next_close(boom)
+    f.on_readings(HealthState(phase="test", at=datetime.now(), expected=0))
+    assert f.state is ServerState.HEALTHY
+
+
+def _startup_hold(path, boot_id="boot-aaa"):
+    f = ServerFsm(path, current_boot_id=boot_id)
+    f.boot_merge(open_episode=None)  # RECOVERING(startup_unverified)
+    return f
+
+
+def test_readopted_jobs_persist_and_survive_a_same_boot_restart(tmp_path):
+    """Spec 03 I76: fsm.json carries the re-adopted jobs the startup hold waits on, so a client that
+    reads the file can tell that hold from a fault; it survives a broker restart within the boot."""
+    path = tmp_path / "fsm.json"
+    f = _startup_hold(path)
+    assert f.readopted_jobs == [] and json.loads(path.read_text())["readopted_jobs"] == []
+    f.set_readopted_jobs(["428", "430"])
+    assert json.loads(path.read_text())["readopted_jobs"] == ["428", "430"]
+
+    g = ServerFsm(path, current_boot_id="boot-aaa")
+    assert g.readopted_jobs == ["428", "430"]
+    assert ServerFsm(path, current_boot_id="boot-bbb").readopted_jobs == [], "no job survives a reboot"
+
+
+def test_readopted_jobs_clear_on_release_and_on_down(tmp_path):
+    """Spec 03 I76: a release (the startup gate's healthy verdict) or DOWN ends what the field reports."""
+    path = tmp_path / "fsm.json"
+    f = _startup_hold(path)
+    f.set_readopted_jobs(["428"])
+    f.on_readings(HealthState(phase="startup", at=datetime.now(), expected=0))
+    assert f.state is ServerState.HEALTHY
+    assert f.readopted_jobs == [] and json.loads(path.read_text())["readopted_jobs"] == []
+    f.set_readopted_jobs(["428"])
+    assert f.readopted_jobs == [], "only a held device (boot or recovering) reports re-adopted jobs"
+
+    g = _startup_hold(tmp_path / "down.json")
+    g.set_readopted_jobs(["428"])
+    g.on_outcome(OUTCOME_TERMINAL)
+    assert g.state is ServerState.DOWN
+    assert json.loads((tmp_path / "down.json").read_text())["readopted_jobs"] == []
+
+
+def test_readopted_jobs_clear_when_the_job_ends(tmp_path):
+    path = tmp_path / "fsm.json"
+    f = _startup_hold(path)
+    f.set_readopted_jobs(["428"])
+    f.set_readopted_jobs([])
+    assert json.loads(path.read_text())["readopted_jobs"] == []
+    assert f.state is ServerState.RECOVERING and f.record.why == "startup_unverified", "the hold stands"
+
+
+def test_startup_check_in_progress_is_set_while_the_check_runs_and_cleared_by_its_end(tmp_path):
+    """Spec 03 I76: fsm.json says plainly whether the startup check is in progress, with its start and deadline, so a
+    client that reads the file keeps its queued job through the check."""
+    path = tmp_path / "fsm.json"
+
+    def disk():
+        raw = json.loads(path.read_text())
+        return raw["startup_check_in_progress"], raw["startup_check_started_at"], raw["startup_check_deadline"]
+
+    f = _startup_hold(path)
+    assert disk() == (False, None, None) and not f.startup_check_in_progress
+    f.set_startup_check("2026-01-01T10:00:00", None, in_progress=True)
+    assert disk() == (True, "2026-01-01T10:00:00", None) and f.startup_check_in_progress
+    f.set_startup_check("2026-01-01T10:00:00", "2026-01-01T10:11:00", in_progress=True)
+    assert disk() == (True, "2026-01-01T10:00:00", "2026-01-01T10:11:00")
+    raw = json.loads(path.read_text())
+    assert (raw["state"], raw["why"]) == ("recovering", "startup_unverified"), "the fallback values stand"
+    f.on_fault("startup_unverified", dirty=False)
+    assert disk()[0] is True, "a refresh of the startup hold itself is not a fault hold"
+    f.on_readings(HealthState(phase="startup", at=datetime.now(), expected=0))
+    assert f.state is ServerState.HEALTHY and disk() == (False, None, None), "the check passed"
+    f.set_startup_check("2026-01-01T10:00:00", None, in_progress=True)
+    assert disk()[0] is False, "only a held device reports a startup check"
+
+    g = _startup_hold(path)
+    g.set_startup_check("2026-01-01T10:00:00", None, in_progress=True)
+    g.on_fault("eth_frozen", dirty=False)
+    assert g.state is ServerState.RECOVERING and disk() == (False, None, None), "a fault hold ends it"
+    assert ServerFsm(path, current_boot_id="boot-aaa").startup_check_in_progress is False
+
+
+def test_an_fsm_file_without_readopted_jobs_still_loads(tmp_path):
+    """Spec 03 I76: a file written before the field existed loads whole, with readopted_jobs []; a
+    malformed value degrades to [] too."""
+    path = tmp_path / "fsm.json"
+    old = {
+        "state": "recovering",
+        "why": "startup_unverified",
+        "since": "2026-10-17T05:08:50",
+        "detail": "",
+        "job": {},
+        "dirty": False,
+        "latches": {"x": True},
+        "boot_id": "boot-aaa",
+    }
+    path.write_text(json.dumps(old))
+    f = ServerFsm(path, current_boot_id="boot-aaa")
+    assert f.state is ServerState.RECOVERING and f.record.why == "startup_unverified" and f.latch("x")
+    assert f.readopted_jobs == []
+    path.write_text(json.dumps({**old, "readopted_jobs": "428"}))
+    assert ServerFsm(path, current_boot_id="boot-aaa").readopted_jobs == []

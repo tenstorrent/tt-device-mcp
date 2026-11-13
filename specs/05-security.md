@@ -70,7 +70,12 @@ that did not come through the broker at all.
   did not watch exit — one re-adopted across a broker restart. A broker that reaped the process
   itself uses `proc.returncode` and deletes the file unread. A re-adopted job that left no exit
   status is reported FAILED with an explanation, never COMPLETED; malformed content reads as no
-  status. A per-user (redirected) exit directory is never widened world-writable.
+  status. A per-user (redirected) exit directory is never widened world-writable. Each job starts
+  on a fresh exit file owned by the uid it runs as, renamed into place in one step, never one another
+  user or an earlier job with the same id left; a file that is not one plain regular file owned by
+  the broker or the job's submitter reads as no status (spec 01 I8). A re-adopted job's submitter
+  is the uid the broker wrote into its own log header at submit, never a value a tenant could
+  write; without it the job has no submitter and only a broker-owned file counts.
 - **I8 — `tt_device_exec` is gated, and force is scoped to exactly one gate.** Exec refuses:
   (a) under privsep, an identity-less or unhonorable caller (I2/I3); (b) while a job owned by
   someone else is running — unless `force=true`, which admits the diagnostic *alongside* the
@@ -78,25 +83,55 @@ that did not come through the broker at all.
   command); (c) whenever the device is degraded for tenants — the same live-probe verdict the job
   runner gates on, including faults that set no in-memory flag (a chip off the bus). `force`
   covers only (b), never (c) or a broker device-op in flight.
-- **I9 — The bare-metal lock is root-only and self-verifying.** `tt-device-mcp lock`/`unlock`
-  refuse without euid 0 and without an installed broker unit (the lock applies only to a broker
-  host). `lock` moves `/dev/tenstorrent` to `0660 root:ttdev` via a udev rule and then proves both
-  directions before claiming success: an admitted (gid=ttdev) open must succeed — else it reverts
-  rather than brick the host — and a non-ttdev open must be denied — else it reverts rather than
-  print a false LOCKED. An inconclusive deny probe is reported as UNVERIFIED, not claimed.
-  `unlock` restores world-rw. Both are idempotent.
+- **I9 — The bare-metal lock is root-only, holds against later rules, and never claims more
+  than it checked.** `tt-device-mcp lock`/`unlock` refuse without euid 0 and without an installed
+  broker unit (the lock applies only to a broker host). The udev rule moves `/dev/tenstorrent` to
+  `0660 root:ttdev` with final assignments (`GROUP:=`, `MODE:=`), so no rule read after it — the
+  kernel driver package ships one that sorts later and sets `MODE="0666"` — can reopen the node.
+  Locked means *every* device node is mode `0660` and group `ttdev`, never node 0 alone. `lock`
+  proves both directions on every node before claiming success, with `access()` probes that open
+  no chip: an admitted (`nobody:ttdev`) identity must have read and write — else it reverts rather
+  than brick the host — and a non-ttdev identity must have neither — else it reverts rather than
+  print a false LOCKED. A probe that reaches no verdict is reported as UNVERIFIED, not claimed.
+  The group must stay empty: `lock`, reconcile and `/health` name every `ttdev` member with uid
+  ≥ 1000 as "lock not effective for <user>" (a member opens the node without the broker).
+  `unlock` restores world-rw and durably undoes the opt-in below: it sets `TTDEV_LOCK=0` in
+  `/etc/default/tt-device-broker` (a host without the key is left alone) and strips both the
+  `TT_DEVICE_MCP_DEVICE_GROUP` and `TT_DEVICE_MCP_DEVICE_LOCK` lines from the unit, so the next
+  update's re-render neither re-installs the rule nor re-flips the nodes. Both are idempotent:
+  a repeat `lock` on a locked host never restarts the broker (a restart reruns the startup
+  gate, fabric pass included, on a healthy device).
+  *Opt-in through host config.* `TTDEV_LOCK=1` in `/etc/default/tt-device-broker` makes the
+  update path's `apply-host-config.sh` install the rule (reload only), render the unit's
+  `TT_DEVICE_MCP_DEVICE_GROUP=ttdev` and `TT_DEVICE_MCP_DEVICE_LOCK=1` lines (taken up by the
+  update's own restart, never an extra one), keep the read-only smi wrapper, and remove each
+  uid ≥ 1000 member from `ttdev` (jobs get the gid through `--gid`, so none needs membership).
+  The mode flip itself (`udevadm trigger --subsystem-match=tenstorrent`) is the broker's, run only
+  while no job is running and no re-adopted scope is live: a job started before the restart
+  still carries its old gid and would get EACCES on its next open. `TTDEV_LOCK` unset or `0`
+  leaves the host exactly as before (an existing unit's device-group line is preserved, nothing
+  is written).
+  *Drift.* Once the lock is in effect (every node seen locked), reconcile checks mode and group on
+  every node; on drift it re-triggers udev and stats again. Drift that persists is logged, recorded
+  as a `device_lock_drift` health event and shown in `/health` (`device_lock`). Nothing reverts
+  the host to cooperative on its own.
+  *Recovery is untouched.* The ladder, `glx_reset`, power cycle, the startup check and the full
+  health check with fabric run as root as before: privsep wraps only tenant jobs, the job
+  output-dir preflight and `exec`, never a recovery path.
 - **I10 — Read-only telemetry on a locked host stays read-only.** The `smi` path grants no write
   or reset capability: the client CLI rejects non-allowlisted flags before invoking anything, and
   the root-owned NOPASSWD wrapper installed by `lock` re-enforces the same read-only allowlist
   itself (any user may exec it, so it cannot trust its caller). The streaming server-side smi
   applies the same allowlist (`smi_args_ok`) before running as the broker. A sudoers drop-in that
-  fails `visudo -c` is not installed.
+  fails `visudo -c` is not installed. `-f`/`--filename` is not allowlisted: it writes a snapshot to
+  a path the caller picks, which is a root write primitive. Workaround: `tt-device-mcp smi -s > file`.
 - **I11 — An anonymous caller owns no holder.** Where an action is gated on device holders
   (the reset gate, spec 04), the caller's identity is the socket peer uid. Over HTTP on a privsep
   host there is no identity to scope the gate to, so every tenant holder counts as foreign and the
   gate fails closed; off privsep, HTTP keeps the legacy single-tenant skip. `MIN_TENANT_UID`
   (1000) divides tenants from infrastructure: holders below it (root, telemetry daemons) never
-  count as foreign.
+  count as foreign, unless they sit in a broker job or exec scope or their uid is named in
+  `TT_DEVICE_MCP_TENANT_UIDS` (`device_holders.is_tenant`, 04 I6).
 
 ## Interfaces
 
@@ -121,19 +156,32 @@ Consumed by other subsystems and by tests:
   directly" (privsep off, no peer, caller is root, or no passwd entry);
   `privsep_refusal(peer_uid, env) -> str | None` — the refusal reason when `None` from
   `privsep_prefix_for` must NOT be read as "run it anyway". Env knobs: `TT_DEVICE_MCP_PRIVSEP`
-  (opt-in), `TT_DEVICE_MCP_DEVICE_GROUP` (lockdown gid; `DEFAULT_DEVICE_GROUP = "ttdev"`).
+  (opt-in), `TT_DEVICE_MCP_DEVICE_GROUP` (lockdown gid; `DEFAULT_DEVICE_GROUP = "ttdev"`),
+  `TT_DEVICE_MCP_DEVICE_LOCK=1` (the broker applies the mode flip between jobs; rendered from
+  `TTDEV_LOCK=1`).
 - **`server.py` authz helpers**: `authz_owner(reported) -> (owner, authenticated)`;
   `owner_matches(job_owner, caller_owner) -> bool`; `privsep_identity_error() -> dict | None`
   (the transport-level guard); `Job.peer_uid` — the submitter's SO_PEERCRED uid captured at queue
   time, `None` over HTTP, carried in the durable queued-job spec so a restart preserves the
   privsep target.
 - **`device_holders.MIN_TENANT_UID`** (= 1000): the tenant/infrastructure boundary, used by the
-  reset gate (spec 04) and the health gate's holder checks (spec 03).
+  reset gate (spec 04) and the health gate's holder checks (spec 03) through
+  `device_holders.is_tenant`, which also counts a broker-scoped holder, a holder in a
+  container's cgroup (docker, containerd, podman; any uid) and a `TT_DEVICE_MCP_TENANT_UIDS`
+  uid. A container still holding the device after a job ends holds it (`foreign_holder`) until
+  the 10-min bound's ladder clears it and a full check passes (04 I103).
 - **Lock surface** (`cli.py`): `cmd_lock` / `cmd_unlock` (sudo; `tt-device-mcp lock|unlock`);
   artifacts managed by them: the udev rule (`99-tenstorrent-ttdev.rules`), the
-  `TT_DEVICE_MCP_DEVICE_GROUP=ttdev` line in the broker unit, the read-only smi wrapper +
-  its sudoers drop-in, the login banner. `_device_locked()` — group+mode sniff of a real device
-  node (never `by-id/`) — selects the CLI `smi` path.
+  `TT_DEVICE_MCP_DEVICE_GROUP=ttdev` and `TT_DEVICE_MCP_DEVICE_LOCK=1` lines in the broker unit,
+  `TTDEV_LOCK` in `/etc/default/tt-device-broker` (`unlock` sets it to `0`), the read-only smi
+  wrapper + its sudoers drop-in, the login banner. `_device_locked()` — group+mode check of every real
+  device node (never `by-id/`) — selects the CLI `smi` path.
+- **`device_lock.py`**: `device_nodes()`, `node_drift(nodes)` (nodes not `0660` group `ttdev`),
+  `human_members()` (uid ≥ 1000 members of `ttdev`), `opted_in(env)`, `health_view()` (the
+  `/health` `device_lock` block) and `flip()` (the broker's one mode flip, called only between jobs).
+- **`deploy/tt-device-lock.sh`** (installed as `$ROOT/device-lock.sh`): `apply` (rule, group,
+  member removal; called by `apply-host-config.sh` under `TTDEV_LOCK=1`) and `check` (reconcile's
+  drift and member report).
 
 ## Behavior
 
@@ -187,11 +235,14 @@ lifecycle can assert that a remaining holder is a straggler rather than a tenant
 pids present in its own first scan — a pid that appears only in a later rescan is a holder that
 opened the device after the reclaim began, not a straggler of the allocation that just ended, and
 is reported as a survivor rather than escalated onto. Two exclusions are structural: it never
-signals uids below `MIN_TENANT_UID` (infrastructure that survives a board reset), and it never
+signals a holder `is_tenant` does not count (infrastructure below `MIN_TENANT_UID` that survives a
+board reset), and it never
 signals itself or its own process group. It has no way to recognize "a broker-owned job" as such
 — under privsep that job runs as its submitter's uid and looks like any other tenant holder — so
 protecting a live broker job from the reclaim is the in-flight guard's job (`_broker_work_in_flight`,
-re-checked after the reclaim returns), not a property of this function. A job the broker itself
+re-checked after the reclaim returns), not a property of this function. The guard also refuses
+while a re-adopted job's scope has not ended, even once the job reads KILLED: its processes may
+still be winding down, and a SIGTERM there skips the scope's own graceful stop. A job the broker itself
 means to end still terminates through `_kill_job`.
 
 **Job-step routes are root-only.** `/api/tt_device_pre_step` and `/api/tt_device_post_step`
@@ -201,13 +252,28 @@ an allocation over is not a tenant's.
 
 **Lock mechanics.** `lock`: create the `ttdev` system group; write the device-group line into the
 broker unit and restart it *first* (privsep jobs must already carry gid=ttdev before the node
-locks, or admitted work is denied in the gap); write the udev rule and re-trigger the subsystem;
-then self-check on a real device node — positive (systemd-run as `nobody:ttdev` must open the
-node; failure reverts via `unlock`) and negative (same uid without the group must get EACCES,
-distinguished by a dedicated exit code from a probe that never ran; an open reverts, an
-inconclusive probe is reported unverified); finally install the read-only smi wrapper (root-owned
-`0700`, validated sudoers `0400 root:root`) and the login banner. `unlock` removes the rule,
-re-triggers, strips the unit line, removes banner and wrapper, restarts the broker.
+locks, or admitted work is denied in the gap). The restart happens only when it changes something:
+when the unit or a drop-in already sets the group and the running broker's env carries it (or the
+broker is stopped), `lock` prints "already locked" and leaves the unit and the broker alone.
+Then write the udev rule and re-trigger the subsystem;
+then self-check every device node with `access(R_OK|W_OK)` (no open, so no chip is touched) —
+positive (systemd-run as `nobody:ttdev` must have access to every node; failure reverts via
+`unlock`) and negative (same uid without the group must have access to none, the denial told
+apart by a dedicated exit code from a probe that never ran; access reverts, an inconclusive probe
+is reported unverified); report each `ttdev` member with uid ≥ 1000; finally install the read-only
+smi wrapper (root-owned `0700`, validated sudoers `0400 root:root`) and the login banner. `unlock`
+removes the rule, re-triggers, strips the unit line, removes banner and wrapper, restarts the
+broker.
+
+**Opt-in lock flip.** With `TT_DEVICE_MCP_DEVICE_LOCK=1` and the device group in its env, the broker
+checks every 30 s whether any node is not yet `0660 ttdev`; once no job is running and no
+re-adopted scope is live, and the device is healthy (no recovery or reset in flight), it runs `udevadm trigger --subsystem-match=tenstorrent`, settles and
+stats every node again. All nodes locked marks the lock in effect
+(`/run/tt-device-broker/device_lock_applied`, which arms reconcile's re-trigger); any node still
+open is recorded once as `device_lock_drift` and the loop stops — it never retries without bound
+and never unlocks. A job dispatched during the flip is safe: under the opt-in every job since
+the broker started carries the device gid, so only a job re-adopted from before that start could
+lose access, and the flip waits for those.
 
 **Read-only smi.** On a locked host `tt-device-mcp smi` execs the wrapper via `sudo -n`; on a
 cooperative host it execs `tt-smi` directly. Both the CLI and the wrapper independently enforce
@@ -244,7 +310,12 @@ converts "unprotected" into "believed protected".
 **Why `MIN_TENANT_UID`.** System uids (< 1000) belong to infrastructure that legitimately holds
 the device continuously — telemetry exporters, the broker's own tooling. Treating them as tenants
 would make every holder-gated action permanently refusable on any instrumented host. Treating
-uids ≥ 1000 as tenants is the conservative default: a human's process is never reset over. Spec 04
+uids ≥ 1000 as tenants is the conservative default: a human's process is never reset over. A job
+submitted by a service account is still a tenant's job: its processes sit in the broker's
+`ttdev-job-*.scope`, which they cannot leave, so a straggler that outlives the job's KILLED or
+finished status (seconds while the scope winds down) still blocks. A service account that also
+runs device work outside the broker is named in `TT_DEVICE_MCP_TENANT_UIDS`. Root is never one,
+even if named: its daemons hold the device permanently and would block every gate for good. Spec 04
 (I6, I7) defines how the reset gate and the automatic ladder consume the boundary.
 
 **Why the exit file defers to the broker's own reaping.** A record written by the job is the only
@@ -276,11 +347,21 @@ job-side record to the one case with no alternative.
 | I6 (uid rendering) | `tests/test_peercred.py::TestUsernameForUid::test_root_resolves`, `tests/test_peercred.py::TestUsernameForUid::test_unknown_uid_falls_back`, `tests/test_peercred.py::TestUsernameForUid::test_credentials_username_property` |
 | I7 (re-adopted exit recovery) | `tests/test_readopt.py::test_readopted_job_recovers_its_real_exit_code`, `tests/test_readopt.py::test_a_signalled_job_records_a_real_exit_status` |
 | I7 (no status ≠ completed) | `tests/test_readopt.py::test_readopted_job_with_no_exit_status_is_not_called_completed` |
+| I7 (fresh file per job; a co-tenant's or linked file is no status) | `tests/test_job_exit_file.py::test_a_co_tenant_cannot_win_the_path_while_the_fresh_file_is_made`, `tests/test_job_exit_file.py::test_an_exit_file_another_user_owns_reads_as_unknown`, `tests/test_job_exit_file.py::test_an_exit_file_that_is_not_one_plain_file_reads_as_unknown`, `tests/test_job_exit_file.py::test_a_co_tenants_exit_0_never_releases_a_readopted_job_without_a_reset`, `tests/test_job_exit_file.py::test_a_readopted_privsep_jobs_clean_exit_is_still_its_own`, `tests/test_job_exit_file.py::test_a_co_tenants_file_is_still_unknown_for_a_readopted_job`, `tests/test_job_exit_file.py::test_a_log_another_user_could_have_written_names_no_submitter` |
 | I7 (redirected dir not widened) | `tests/test_readopt.py::test_a_redirected_job_exit_dir_is_not_made_world_writable`, `tests/test_readopt.py::test_the_job_exit_dir_is_redirectable` |
 | I8 (degraded / live-probe gate) | `tests/test_device_safety.py::test_exec_refuses_the_device_the_broker_is_working_on`, `tests/test_device_safety.py::test_exec_refuses_a_chip_off_the_bus` |
 | I8 (force alongside foreign, audited) | `tests/test_device_safety.py::test_exec_force_runs_a_diagnostic_alongside_a_foreign_job` |
 | I8 (scoped exec reaping) | `tests/test_device_safety.py::test_exec_timeout_scope_routes_a_privsep_diagnostic`, `tests/test_device_safety.py::test_exec_timeout_kills_the_command_it_gave_up_on` |
 | I9 (self-checks decide) | `tests/test_cli.py::test_cmd_lock_locks_when_deny_probe_is_refused`, `tests/test_cli.py::test_cmd_lock_refuses_when_deny_probe_opens_the_node` |
+| I9 (final rule beats a later 0666 rule) | `tests/test_device_lock.py::test_the_rule_assigns_group_and_mode_final`, `tests/test_device_lock.py::test_a_later_kmd_rule_cannot_reopen_the_node` |
+| I9 (every node, not node 0) | `tests/test_device_lock.py::test_device_locked_checks_every_node`, `tests/test_device_lock.py::test_check_retriggers_and_records_persistent_drift`, `tests/test_device_lock.py::test_check_heals_drift_without_an_event`, `tests/test_device_lock.py::test_check_never_triggers_before_the_lock_is_in_effect` |
+| I9 (probes open no chip) | `tests/test_device_lock.py::test_lock_probes_use_access_on_every_node_and_never_open`, `tests/test_device_lock.py::test_lock_reports_unverified_when_the_probe_has_no_verdict` |
+| I9 (group must be empty) | `tests/test_device_lock.py::test_human_members_skips_system_accounts`, `tests/test_device_lock.py::test_lock_names_members_it_is_not_effective_for`, `tests/test_device_lock.py::test_check_reports_members`, `tests/test_device_lock.py::test_apply_empties_the_group_and_installs_the_rule` |
+| I9 (opt-in via host config; off leaves the host as is) | `tests/test_device_lock.py::test_lock_opt_in_renders_both_unit_lines`, `tests/test_device_lock.py::test_lock_off_renders_no_lock_lines`, `tests/test_device_lock.py::test_lock_off_preserves_an_existing_group_line`, `tests/test_device_lock.py::test_apply_runs_only_under_the_opt_in` |
+| I9 (unlock clears the opt-in; an update after it stays unlocked) | `tests/test_device_lock.py::test_unlock_clears_the_opt_in_and_both_unit_lines`, `tests/test_device_lock.py::test_unlock_leaves_a_host_without_the_opt_in_alone`, `tests/test_device_lock.py::test_an_update_after_unlock_renders_no_lock_lines` |
+| I9 (broker flips only between jobs; drift shown, never reverted) | `tests/test_device_lock.py::test_flip_waits_for_a_running_job`, `tests/test_device_lock.py::test_flip_waits_for_a_readopted_scope`, `tests/test_device_lock.py::test_flip_marks_the_lock_in_effect`, `tests/test_device_lock.py::test_flip_records_drift_once_and_never_unlocks`, `tests/test_device_lock.py::test_health_shows_drift_and_members` |
+| I9 (recovery never wrapped by privsep) | `tests/test_device_lock.py::test_privsep_wraps_no_recovery_path` |
+| I9 (repeat lock never restarts the broker) | `tests/test_cli.py::test_cmd_lock_skips_restart_when_already_locked`, `tests/test_cli.py::test_cmd_lock_skips_restart_when_a_drop_in_sets_the_group`, `tests/test_cli.py::test_cmd_lock_skips_restart_when_broker_is_stopped_and_unit_is_set`, `tests/test_cli.py::test_cmd_lock_restarts_when_it_adds_the_group`, `tests/test_cli.py::test_cmd_lock_restarts_when_live_broker_lacks_the_group` |
 | I9 (banner tracks state) | `tests/test_cli.py::test_refresh_banner_tracks_lock_state` |
 | I10 (wrapper + sudoers) | `tests/test_cli.py::test_install_smi_ro_wrapper_creates_wrapper_and_sudoers`, `tests/test_cli.py::test_install_smi_ro_wrapper_skips_sudoers_on_visudo_failure`, `tests/test_cli.py::test_smi_ro_wrapper_rejects_reset_flag`, `tests/test_cli.py::test_remove_smi_ro_wrapper_is_idempotent` |
 | I10 (streaming smi allowlist) | `tests/test_reset.py::test_smi_args_ok_allows_readonly_rejects_reset` |
