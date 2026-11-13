@@ -7,10 +7,14 @@ recovery. Every other kill (timeout, hung, a SIGKILL, startup debt) keeps reset-
 
 The gate tests run the real probe pass on the kill-reset tests' 32-chip mesh (leaf probes stubbed)."""
 
+import signal
+
 import pytest
 
 from tests.conftest import fsm_dirty, patch_health_event
 from tests.test_eth_timeout_reset import ADVANCING, mesh  # noqa: F401 (fixture)
+from tests.test_job_kill_reset import _runner_done, _start, _stop, _until, runner_env  # noqa: F401 (fixture)
+from tests.test_preemptable import _preempt, _witness
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
 
@@ -200,3 +204,109 @@ async def test_a_systemctl_stop_reap_counts_as_a_sigkill(monkeypatch, clear_job_
     monkeypatch.setattr(srv, "_terminate_scope", scope_stop)
     await srv._terminate_job("5", None)
     assert srv.jobs["5"].stopped_clean is clean
+
+
+# ---------------------------------------------------------------- the runner's stop_requested
+
+
+def _recording_notes(monkeypatch) -> list:
+    """Every job end the runner notes behind an I69 debt, as the runner built it."""
+    notes = []
+    real = srv._note_kill_reset_job
+
+    def note(job):
+        notes.append(dict(job))
+        real(job)
+
+    monkeypatch.setattr(srv, "_note_kill_reset_job", note)
+    return notes
+
+
+@pytest.mark.asyncio
+async def test_the_runner_marks_a_requested_kill_as_a_requested_stop(runner_env, monkeypatch):  # noqa: F811
+    notes = _recording_notes(monkeypatch)
+    job, runner = await _start("951", "sleep 600")
+    try:
+        assert await _until(lambda: job.status is srv.JobStatus.RUNNING and job.pid)
+        mcp = srv.create_mcp_server()
+        await mcp.call_tool("tt_device_job_kill", {"params": {"job_id": "951", "owner": job.owner}})
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert job.status is srv.JobStatus.KILLED
+    assert [(n["job_id"], n["end"], n["stop_requested"]) for n in notes] == [("951", "killed", True)]
+    assert srv._kill_reset_job["stop_requested"] is True
+
+
+@pytest.mark.asyncio
+async def test_the_runner_marks_an_unwitnessed_preempt_that_ended_on_sigterm_as_a_requested_stop(
+    monkeypatch, clear_job_state
+):
+    notes = _recording_notes(monkeypatch)
+    _witness(monkeypatch, clean=True, ok=False, why="cannot subscribe to process events")
+    job, sent, gate, dirty, owed = await _preempt(monkeypatch, "952", "sleep 60", kill_grace=5)
+    assert sent and sent[0] is signal.SIGTERM and signal.SIGKILL not in sent, sent
+    assert owed == ["job 952 preempted"], owed
+    assert [(n["job_id"], n["end"], n["stop_requested"]) for n in notes] == [("952", "preempted", True)]
+
+
+@pytest.mark.asyncio
+async def test_the_runner_marks_a_timeout_as_no_requested_stop(runner_env, monkeypatch):  # noqa: F811
+    notes = _recording_notes(monkeypatch)
+    job, runner = await _start("953", "sleep 600", timeout_sec=1)
+    try:
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert job.status is srv.JobStatus.TIMEOUT
+    assert [(n["job_id"], n["end"], n["stop_requested"]) for n in notes] == [("953", "timeout", False)]
+    assert srv._kill_reset_job["stop_requested"] is False
+
+
+@pytest.mark.asyncio
+async def test_the_runner_marks_a_hung_reap_as_no_requested_stop(runner_env, monkeypatch):  # noqa: F811
+    notes = _recording_notes(monkeypatch)
+    monkeypatch.setattr(srv, "HUNG_SILENCE_SEC", 1)
+    monkeypatch.setattr(srv, "HUNG_POLL_SEC", 0.05)
+    job, runner = await _start("954", "echo working; sleep 600")
+    try:
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert job.status is srv.JobStatus.HUNG and job.doomed_monotonic is None
+    assert [(n["job_id"], n["end"], n["stop_requested"]) for n in notes] == [("954", "hung", False)]
+
+
+@pytest.mark.asyncio
+async def test_the_runner_marks_a_doomed_reap_as_no_requested_stop(runner_env, monkeypatch):  # noqa: F811
+    """The runtime said the device is unrecoverable and kept talking: the doomed reaper ends it (HUNG)."""
+    notes = _recording_notes(monkeypatch)
+    monkeypatch.setattr(srv, "HUNG_SILENCE_SEC", 3600)
+    monkeypatch.setattr(srv, "DOOMED_GRACE_SEC", 1)
+    monkeypatch.setattr(srv, "HUNG_POLL_SEC", 0.05)
+    job, runner = await _start(
+        "955",
+        "echo 'TT_THROW: TIMEOUT: device timeout, potential hang detected, the device is unrecoverable'; "
+        "for i in $(seq 1 120); do echo unwinding $i; sleep 0.5; done",
+    )
+    try:
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert job.status is srv.JobStatus.HUNG and job.doomed_monotonic is not None
+    assert [(n["job_id"], n["end"], n["stop_requested"]) for n in notes] == [("955", "hung", False)]
+
+
+@pytest.mark.asyncio
+async def test_the_runner_marks_a_runtime_init_fault_as_no_requested_stop(runner_env, monkeypatch):  # noqa: F811
+    notes = _recording_notes(monkeypatch)
+    monkeypatch.setattr(srv, "_aiclk_left_busy", lambda *a, **k: {})
+    job, runner = await _start(
+        "956", "echo 'failed to initialize FW'; exit 1", log_file=str(runner_env["tmp"] / "956.log")
+    )
+    try:
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert job.status is srv.JobStatus.FAILED
+    assert [(n["job_id"], n["end"], n["stop_requested"]) for n in notes] == [("956", "failed", False)]
