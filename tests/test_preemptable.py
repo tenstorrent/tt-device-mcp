@@ -930,33 +930,103 @@ def test_the_witness_on_a_real_tree():
                 p.wait()
 
 
-def test_the_witness_keeps_up_with_a_busy_host_between_polls():
-    """A burst of process events larger than the receive buffer while the caller does not poll (an unprivileged socket
-    holds a few hundred) must not void the witness: a reader thread drains it as events arrive."""
-    p = subprocess.Popen(["sleep", "30"], start_new_session=True)
+class _BoundedConnector:
+    """A connector socket with a receive queue of ``k`` datagrams, fed by the test: a push onto a full queue loses the
+    event and the next recv raises ENOBUFS, as the kernel does when a listener falls behind. A real socketpair end is
+    readable exactly while the queue holds an event, so the witness's select() wakes as it would on the real socket."""
+
+    def __init__(self, k):
+        self.k, self.sent, self._q, self._lost = k, [], [], False
+        self._lock = threading.Lock()
+        self._r, self._w = socket.socketpair()
+        self._r.setblocking(False)
+        self.drained = threading.Event()
+        self.drained.set()
+
+    def push(self, msg):
+        with self._lock:
+            if len(self._q) >= self.k:
+                self._lost = True
+                return
+            if not self._q:
+                self._w.send(b"x")
+                self.drained.clear()
+            self._q.append(msg)
+
+    def recv(self, n):
+        with self._lock:
+            if self._lost:
+                raise OSError(errno.ENOBUFS, os.strerror(errno.ENOBUFS))
+            if not self._q:
+                raise BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN))
+            msg = self._q.pop(0)
+            if not self._q:
+                self._r.recv(1)
+                self.drained.set()
+            return msg
+
+    def setsockopt(self, *a):
+        pass
+
+    def bind(self, addr):
+        pass
+
+    def send(self, msg):
+        self.sent.append(struct.unpack_from("=I", msg, len(msg) - 4)[0])
+        return len(msg)
+
+    def setblocking(self, flag):
+        pass
+
+    def fileno(self):
+        return self._r.fileno()
+
+    def close(self):
+        pass
+
+    def shut(self):
+        self._r.close()
+        self._w.close()
+
+
+def test_the_witness_keeps_up_with_a_busy_host_between_polls(monkeypatch):
+    """A burst of process events larger than the receive queue while the caller does not poll (an unprivileged socket
+    holds a few hundred) must not void the witness: a reader thread drains it as events arrive. The connector is a
+    bounded fake that loses events like the kernel's, so the burst is the test's own and not the host's churn."""
+    k, job = 64, 4_000_000  # no such process: the tree is the test's
+    conn = _BoundedConnector(k)
+    fake = type("_Sockets", (), {"socket": staticmethod(lambda *a: conn)})
+    for name in ("AF_NETLINK", "SOCK_DGRAM", "SOL_SOCKET", "SO_RCVBUF"):
+        setattr(fake, name, getattr(socket, name))
+    monkeypatch.setattr(exit_witness, "socket", fake)
+    monkeypatch.setattr(exit_witness, "_in_child_pid_namespace", lambda: False)
+    monkeypatch.setattr(exit_witness, "_tree", lambda pgid, scope: {job})
     try:
-        w = ExitWitness(p.pid, None)
-        if not w.ok:
-            pytest.skip(f"no process events here: {w.why}")
+        w = ExitWitness(job, None)
         try:
-            for _ in range(400):
-                subprocess.run(["true"], check=True)
-            time.sleep(0.5)
             assert w.ok, w.why
-            p.terminate()
-            p.wait(timeout=10)
-            deadline = time.monotonic() + 2
-            while p.pid not in w.exits and time.monotonic() < deadline:
-                time.sleep(0.05)
+            # ten queues' worth of other processes' events, never a drain() from this thread
+            other, pushed = job + 1, 0
+            while pushed < 10 * k:
+                for _ in range(k - 1):
+                    conn.push(_fork(other, other + 1) if pushed % 2 else _exit(other, 0))
+                    other, pushed = other + 2, pushed + 1
+                assert conn.drained.wait(5), f"the reader left {len(conn._q)} events queued after {pushed}"
+                assert w.ok, w.why
+            assert pushed > k and w.tree == {job} and w.exits == {}
+            conn.push(_exit(job, signal.SIGTERM))
+            deadline = time.monotonic() + 5
+            while job not in w.exits and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert w.exits == {job: signal.SIGTERM}, "the reader thread drains as events arrive"
             assert w.ok, w.why
-            assert w.clean() is False and "signal" in w.why, "sleep dies from SIGTERM"
+            assert w.clean() is False and "signal" in w.why, "the job died from SIGTERM"
         finally:
             w.close()
+        assert conn.sent == [PROC_CN_MCAST_LISTEN, PROC_CN_MCAST_IGNORE]
         assert w._sock is None and not w._reader.is_alive()
     finally:
-        if p.poll() is None:
-            p.kill()
-            p.wait()
+        conn.shut()
 
 
 def test_the_witness_fails_safe_in_a_pid_namespace(monkeypatch, tmp_path):
