@@ -59,7 +59,10 @@ async def _gate():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("end", ["preempted", "killed"])
 async def test_a_clean_stop_runs_the_full_check_and_a_pass_releases_with_no_reset(
-    mesh, events, monkeypatch, end,  # noqa: F811
+    mesh,  # noqa: F811
+    events,
+    monkeypatch,
+    end,
 ):
     _stopped(mesh, monkeypatch, end=end)
     await _gate()
@@ -77,7 +80,9 @@ async def test_a_clean_stop_runs_the_full_check_and_a_pass_releases_with_no_rese
 
 @pytest.mark.asyncio
 async def test_a_failed_fabric_check_after_a_clean_stop_resets_then_checks_again(
-    mesh, events, monkeypatch,  # noqa: F811
+    mesh,  # noqa: F811
+    events,
+    monkeypatch,
 ):
     _stopped(mesh, monkeypatch)
     mesh["fabric_bad"] = True  # the reset stub heals it
@@ -93,7 +98,10 @@ async def test_a_failed_fabric_check_after_a_clean_stop_resets_then_checks_again
 
 @pytest.mark.asyncio
 async def test_a_check_that_still_fails_after_the_reset_holds_and_climbs(
-    mesh, events, monkeypatch, armed_power_cycle,  # noqa: F811
+    mesh,  # noqa: F811
+    events,
+    monkeypatch,
+    armed_power_cycle,
 ):
     _stopped(mesh, monkeypatch)
     mesh["fabric_bad"] = True
