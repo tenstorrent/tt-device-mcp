@@ -310,3 +310,33 @@ async def test_the_runner_marks_a_runtime_init_fault_as_no_requested_stop(runner
         await _stop(runner)
     assert job.status is srv.JobStatus.FAILED
     assert [(n["job_id"], n["end"], n["stop_requested"]) for n in notes] == [("956", "failed", False)]
+
+
+@pytest.mark.asyncio
+async def test_the_runner_marks_a_kill_requested_as_the_timeout_fires_as_no_requested_stop(
+    runner_env, monkeypatch  # noqa: F811
+):
+    """A kill that lands while the runner is walking a timed-out job down leaves its id in
+    request_killed_job_ids, but the runner then records the end as TIMEOUT: a timeout never skips the
+    reset (I69), so only a PREEMPTED or KILLED end may count as a requested stop."""
+    notes = _recording_notes(monkeypatch)
+    mcp = srv.create_mcp_server()
+    real = srv._terminate_job
+    asked = []
+
+    async def terminate(job_id, pid, *args, **kwargs):
+        if not asked:  # the timeout's own walk-down: the owner's kill arrives now
+            asked.append(job_id)
+            await mcp.call_tool("tt_device_job_kill", {"params": {"job_id": job_id, "owner": job.owner}})
+        return await real(job_id, pid, *args, **kwargs)
+
+    monkeypatch.setattr(srv, "_terminate_job", terminate)
+    job, runner = await _start("957", "sleep 600", timeout_sec=1)
+    try:
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert asked == ["957"]
+    assert job.status is srv.JobStatus.TIMEOUT
+    assert [(n["job_id"], n["end"], n["stop_requested"]) for n in notes] == [("957", "timeout", False)]
+    assert srv._kill_reset_job["stop_requested"] is False
