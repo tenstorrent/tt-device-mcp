@@ -104,9 +104,12 @@ def test_the_clone_is_created_private():
 def test_the_lap_installs_the_sha_it_resolved():
     """The idle gate can defer for minutes. Resetting to `origin/$BR` afterwards would install
     a commit this lap never resolved, never printed, and that `installed.sha` then misnames."""
-    stmt = _one_code(_AUTOUPDATE, "reset --hard")
-    assert '"$remote_sha"' in stmt, f"the reset does not pin the resolved sha: {stmt}"
-    assert "origin/" not in stmt, f"the reset re-reads the branch after the gate: {stmt}"
+    # Two resets: the no-restart apply's (spec 08 I29) and the full apply's. Both pin the sha.
+    stmts = [s for s in _code(_AUTOUPDATE) if "reset --hard" in s]
+    assert len(stmts) == 2, stmts
+    for stmt in stmts:
+        assert '"$remote_sha"' in stmt, f"the reset does not pin the resolved sha: {stmt}"
+        assert "origin/" not in stmt, f"the reset re-reads the branch after the gate: {stmt}"
 
 
 def test_every_unreachable_source_is_a_no_op_lap_that_says_why():

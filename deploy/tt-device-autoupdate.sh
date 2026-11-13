@@ -429,8 +429,7 @@ if [ -z "$why_restart" ]; then
     case $'\n'"$changed_paths"$'\n' in
         *$'\n'deploy/tt-device-autoupdate.sh$'\n'*)
             install -m 0755 "$clone/deploy/tt-device-autoupdate.sh" "$ROOT/autoupdate.sh" \
-                || { echo "autoupdate: staging autoupdate.sh failed (required); not marking current" >&2
-                     au_log failed "no-restart apply: staging autoupdate.sh failed; installed.sha unchanged, the next lap restarts"; exit 1; }
+                || { echo "autoupdate: staging autoupdate.sh failed (required); not marking current" >&2; au_log failed "no-restart apply: staging autoupdate.sh failed; installed.sha unchanged, the next lap restarts"; exit 1; }
             staged="; staged the new autoupdate.sh for the next lap" ;;
     esac
     printf '%s\n' "$remote_sha" > "$STATE"
