@@ -223,7 +223,7 @@ def _recording_notes(monkeypatch) -> list:
 
 
 @pytest.mark.asyncio
-async def test_the_runner_marks_a_requested_kill_as_a_requested_stop(runner_env, monkeypatch):
+async def test_the_runner_marks_a_requested_kill_as_a_requested_stop(runner_env, monkeypatch):  # noqa: F811
     notes = _recording_notes(monkeypatch)
     job, runner = await _start("951", "sleep 600")
     try:
@@ -251,7 +251,7 @@ async def test_the_runner_marks_an_unwitnessed_preempt_that_ended_on_sigterm_as_
 
 
 @pytest.mark.asyncio
-async def test_the_runner_marks_a_timeout_as_no_requested_stop(runner_env, monkeypatch):
+async def test_the_runner_marks_a_timeout_as_no_requested_stop(runner_env, monkeypatch):  # noqa: F811
     notes = _recording_notes(monkeypatch)
     job, runner = await _start("953", "sleep 600", timeout_sec=1)
     try:
@@ -264,7 +264,7 @@ async def test_the_runner_marks_a_timeout_as_no_requested_stop(runner_env, monke
 
 
 @pytest.mark.asyncio
-async def test_the_runner_marks_a_hung_reap_as_no_requested_stop(runner_env, monkeypatch):
+async def test_the_runner_marks_a_hung_reap_as_no_requested_stop(runner_env, monkeypatch):  # noqa: F811
     notes = _recording_notes(monkeypatch)
     monkeypatch.setattr(srv, "HUNG_SILENCE_SEC", 1)
     monkeypatch.setattr(srv, "HUNG_POLL_SEC", 0.05)
@@ -278,7 +278,7 @@ async def test_the_runner_marks_a_hung_reap_as_no_requested_stop(runner_env, mon
 
 
 @pytest.mark.asyncio
-async def test_the_runner_marks_a_doomed_reap_as_no_requested_stop(runner_env, monkeypatch):
+async def test_the_runner_marks_a_doomed_reap_as_no_requested_stop(runner_env, monkeypatch):  # noqa: F811
     """The runtime said the device is unrecoverable and kept talking: the doomed reaper ends it (HUNG)."""
     notes = _recording_notes(monkeypatch)
     monkeypatch.setattr(srv, "HUNG_SILENCE_SEC", 3600)
@@ -298,7 +298,7 @@ async def test_the_runner_marks_a_doomed_reap_as_no_requested_stop(runner_env, m
 
 
 @pytest.mark.asyncio
-async def test_the_runner_marks_a_runtime_init_fault_as_no_requested_stop(runner_env, monkeypatch):
+async def test_the_runner_marks_a_runtime_init_fault_as_no_requested_stop(runner_env, monkeypatch):  # noqa: F811
     notes = _recording_notes(monkeypatch)
     monkeypatch.setattr(srv, "_aiclk_left_busy", lambda *a, **k: {})
     job, runner = await _start(
