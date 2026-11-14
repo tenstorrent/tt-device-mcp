@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from tt_device_mcp.health import chip_state, evidence
+from tt_device_mcp.health import chip_state, evidence, pcie_quiet
 
 SYSFS_CLASS_DIR = Path(os.environ.get("TT_DEVICE_MCP_SYSFS_DIR", "/sys/class/tenstorrent"))
 
@@ -129,10 +129,10 @@ def chip_snapshot() -> dict:
                 if lost or chip_state.read_blocked(idx):
                     lost = True
                     break
-                try:
-                    rec[key] = _read_attr(pci / f).strip()
-                except OSError:
-                    pass
+                # Config-space reads of the chip: the last value read is served inside the quiet window (I101).
+                val = pcie_quiet.read_attr(pci / f, _read_attr)
+                if val is not None:
+                    rec[key] = val
             for f, key in (
                 ("aer_dev_correctable", "aer_correctable"),
                 ("aer_dev_nonfatal", "aer_nonfatal"),
@@ -356,13 +356,15 @@ def link_signals() -> dict:
 def config_vendor_id(bdf: str) -> Optional[int]:
     """The vendor ID in ``bdf``'s config space, one 2-byte config read (spec 03 I96), or None when unreadable. 0xFFFF is
     the all-ones a function off the bus answers. Unlike :func:`link_signals` this read reaches the device, so only the
-    dead-chip watch takes it, once per trigger, and only behind its own constant."""
-    try:
-        with open(f"/sys/bus/pci/devices/{bdf}/config", "rb", buffering=0) as f:
-            raw = f.read(2)
-    except OSError:
-        return None
-    return int.from_bytes(raw, "little") if len(raw) == 2 else None
+    dead-chip watch takes it, once per trigger, and only behind its own constant.
+
+    Inside the PCIe quiet window (spec 03 I101) the chip is not read: a link its upstream port shows down answers
+    0xFFFF, else the last value read outside the window answers."""
+    dev = Path(f"/sys/bus/pci/devices/{bdf}")
+    if pcie_quiet.active() and pcie_quiet.link_down_quiet(dev):
+        return 0xFFFF
+    raw = pcie_quiet.read_config(dev / "config", 2)
+    return int.from_bytes(raw, "little") if raw is not None and len(raw) == 2 else None
 
 
 def chips_off_bus() -> list:
@@ -390,7 +392,8 @@ def chips_off_bus() -> list:
 
 def link_active(bdf: str) -> Optional[bool]:
     """Data Link Layer Link Active (PCIe Link Status bit 13) of the port ``bdf``, or None when it cannot be read (spec
-    03 I96). Meant for a chip's root port, never the chip: config reads of the port's own capability list."""
+    03 I96). Meant for a chip's root port, never the chip: config reads of the port's own capability list, which the
+    port answers itself, so the PCIe quiet window (I101) does not gate them."""
     try:
         with open(f"/sys/bus/pci/devices/{bdf}/config", "rb", buffering=0) as f:
             cfg = f.read(256)
