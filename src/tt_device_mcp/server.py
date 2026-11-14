@@ -218,6 +218,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     pci_bus_number,
     pcie_aer,
     pcie_guard_at_start,
+    pcie_quiet,
     previous_boot_bus_locks,
     previous_boot_error,
     read_health_events,
@@ -3659,9 +3660,12 @@ async def _pcie_job_start(job_id: str) -> None:
     _pcie_cycle.clear()
     pcie_aer.new_cycle()
     _pcie_cycle.update(job=job_id, start=await _pcie_snapshot())
+    # Spec 03 I101: the job's workload starts the device now; no chip config read while it does.
+    pcie_quiet.open_window("job_start", for_sec=pcie_quiet.JOB_START_SEC)
 
 
 async def _pcie_job_end(job_id: str) -> None:
+    pcie_quiet.close_window("job_start")
     end = await _pcie_snapshot()
     if _pcie_cycle.get("job") != job_id:
         _pcie_cycle.clear()
@@ -9463,6 +9467,9 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
     # Spec 03 I72: the hold's class, start, next rung and per-tray presence, read-only.
     if fsm.state in (ServerState.RECOVERING, ServerState.DOWN):
         payload.update(_hold_report(now))
+    # Spec 03 I101: whether chip link reads are being served from the cache now (a check, reset or device start is
+    # running), why, and the age of the oldest value served; the hold report's presence then comes from the ports.
+    payload["pcie_quiet"] = pcie_quiet.status()
     # Spec 04 I70: an unkillable leftover fencing every reset, with its deadline and rung stage.
     payload["leftover_fence"] = _leftover_fence_payload()
     # Spec 04 I92: the tenant or reader the last pre-reset holder scan refused a reset for.

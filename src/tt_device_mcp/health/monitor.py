@@ -33,7 +33,7 @@ from tt_device_mcp.constants import (
     FABRIC_CHECK_TIMEOUT_SEC,
 )
 from tt_device_mcp.device_holders import note_broker_internal
-from tt_device_mcp.health import chip_state
+from tt_device_mcp.health import chip_state, pcie_quiet
 from tt_device_mcp.health.core import HealthState, Observation, Verdict
 from tt_device_mcp.health.evidence import capture_incident, health_dir, health_event
 from tt_device_mcp.health.monitors import eth, fabric, hostpci, pci
@@ -288,6 +288,13 @@ FABRIC_KILLED_BY_ISOLATION = "fabric check KILLED by dead-chip isolation"
 SNAPSHOT_KILLED_BY_ISOLATION = "tt-smi snapshot STOPPED by dead-chip isolation"
 
 
+def _check_window_owner() -> str:
+    """The quiet-window owner of the probe pass running in this task: a pass that returned before it opened its
+    window closes nothing of another's."""
+    task = asyncio.current_task()
+    return f"check:{id(task) if task is not None else 0}"
+
+
 class HealthMonitor:
     """Runs the probe pass and holds its state: the board-type snapshot cache, the fabric probe's
     last-real-verdict latch, the in-flight fabric-check process handle, and the last ``readings``
@@ -469,6 +476,8 @@ class HealthMonitor:
             if broker_log and broker_log is not log:
                 broker_log.warning(f"HEALTH {line}")
             raise
+        finally:
+            pcie_quiet.close_window(_check_window_owner(), own=True)
 
     async def _update(
         self,
@@ -527,6 +536,10 @@ class HealthMonitor:
         await asyncio.to_thread(pcie_guard.expire_offbus_reset_latch, expected, hp_ok, log or (lambda m: None))
         if hp_ok is False:
             return _store()
+        # Spec 03 I101: from here the pass may start the device (the snapshot, the eth read, the fabric traffic pass);
+        # no gated reader sends a chip a config read until update() closes the window. The host-PCI stage above was
+        # the pass's own read and left the values the window serves.
+        pcie_quiet.open_window(_check_window_owner(), own=True)
 
         # Skipped only where the driver never exposed the attribute — not as a way to excuse a
         # device that failed the probe. See health.monitors.heartbeat.heartbeat_supported(). Routed
@@ -1101,7 +1114,9 @@ class HealthMonitor:
         quiesce = getattr(self._deps, "quiesce_readers", None)
         scope = quiesce("the fabric check", self._readers_log) if quiesce is not None else contextlib.nullcontext()
         async with scope:
-            return await self._verify_fabric_health_timed(timeout_sec)
+            # Spec 03 I101: the traffic pass starts the device; no gated chip config read until it ends.
+            with pcie_quiet.window("fabric"):
+                return await self._verify_fabric_health_timed(timeout_sec)
 
     def _readers_log(self, line: str) -> None:
         log = self._logger()

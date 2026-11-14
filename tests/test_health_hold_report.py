@@ -871,3 +871,33 @@ def test_a_fenced_chip_link_is_never_read_and_none_while_the_dead_chip_watch_is_
     monkeypatch.setattr(srv.sampler, "fast_active", lambda: True)
     _payload()
     assert reads == [], "no link read while the watch is armed"
+
+
+def test_health_during_a_device_op_reads_no_chip_link_whoever_calls(held, monkeypatch):
+    """Spec 03 I101: while a check, a reset or a device start runs, /health's hold report sends no chip a config
+    read, for any caller (a status poll, the CLI's reachability check, a timer); it says it is serving the cache."""
+    import pathlib
+
+    from tt_device_mcp.health import pcie_quiet
+
+    reads = []
+    real = pathlib.Path.read_text
+
+    def read_text(self, *a, **k):
+        if self.name in pcie_quiet.CONFIG_SPACE_ATTRS:
+            reads.append(str(self))
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", read_text)
+    monkeypatch.setattr(srv.sampler, "fast_active", lambda: False)
+    for op in ("check", "fabric", "job_start"):
+        pcie_quiet.open_window(op)
+        try:
+            p = _payload()
+        finally:
+            pcie_quiet.close_window(op)
+        assert reads == [], f"/health read a chip link during {op}: {reads[:3]}"
+        assert p["pcie_quiet"]["quiet"] is True and p["pcie_quiet"]["why"] == [op]
+    p = _payload()
+    assert reads, "outside a device op the hold report reads the links again"
+    assert p["pcie_quiet"]["quiet"] is False

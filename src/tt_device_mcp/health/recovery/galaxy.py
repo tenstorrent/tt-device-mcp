@@ -24,6 +24,7 @@ from typing import Callable, Optional
 from tt_device_mcp import metrics, pre_reset_scan
 from tt_device_mcp.constants import PRE_RESET_ZOMBIE_WAIT_SEC
 from tt_device_mcp.device_holders import discount_broker_internal, holder_comm, is_tenant, username_for_uid
+from tt_device_mcp.health import pcie_quiet
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitor import _UNIDENTIFIED_BOARDS, _normalized_board
 from tt_device_mcp.health.monitors.heartbeat import (
@@ -2366,6 +2367,9 @@ class GalaxyRecovery(Recovery):
         # isolating a tray mid-reset. Cleared on every exit.
         self.mechanism.reset_in_flight = True
         self.mechanism.reset_since_release = True
+        # The sweep's own reads stay live in the PCIe quiet window (spec 03 I101) for all of it, past the mesh reset's
+        # own end of reset_in_flight.
+        pcie_quiet.own_reads(True)
         try:
             # 1) SBR — only when the caller has something surgical to fire at. The tray branch always
             # does (the dead tray's own chips); the last-chance sweep passes do_sbr only when a chip is
@@ -2403,6 +2407,7 @@ class GalaxyRecovery(Recovery):
             health_event("last_chance_reset_sweep_error", error=repr(exc))
         finally:
             self.mechanism.reset_in_flight = False
+            pcie_quiet.own_reads(False)
         return True
 
     async def _late_chips_mesh_reset(self, argv: list, expected: int, log, deadline: Optional[float]) -> None:
