@@ -27,7 +27,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from tt_device_mcp.health import chip_state
+from tt_device_mcp.health import chip_state, pcie_quiet
 from tt_device_mcp.health.monitors import pci
 from tt_device_mcp.health.monitors.hostpci import LINK_DOWN_WIDTH
 from tt_device_mcp.health.recovery import pcie_guard
@@ -109,6 +109,9 @@ def snapshot(suspect=()) -> dict:
             rec["link_skipped"] = "all_ones"
         elif resetting:
             rec["link_skipped"] = "reset"
+        elif pcie_quiet.active():
+            # A config-space read of the chip: none while a check, reset or device start runs (spec 03 I101).
+            rec["link_skipped"] = "quiet"
         elif dead:
             rec["link_skipped"] = "all_ones"
         else:

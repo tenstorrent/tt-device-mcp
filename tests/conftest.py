@@ -731,6 +731,10 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     from tt_device_mcp.health import chip_state
 
     chip_state.reset()
+    # Spec 03 I101: no quiet window or cached link value leaks from one test into the next.
+    from tt_device_mcp.health import pcie_quiet
+
+    pcie_quiet.reset()
     # Spec 04 I88: the pending power-cycle marker goes to the test's own tmp dir, never /run.
     from tt_device_mcp.health.recovery.stages import power_cycle as _pc
 
