@@ -856,6 +856,9 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     monkeypatch.setattr(
         recovery_galaxy, "_settle_before_host_rung_sec", lambda: 0
     )  # no real pre-host-rung settle in tests
+    # Nor the settle after the mesh reset before the host rung (spec 04 I97): about 45 bound-ladder tests slept it, 10 s
+    # each. A test of that deadline sets it, or reads it from its own fake clock.
+    monkeypatch.setattr(recovery_galaxy, "MESH_RESET_BEFORE_HOST_RUNG_SETTLE_SEC", 0)
 
     async def _no_gap_sleep(seconds):
         return None
