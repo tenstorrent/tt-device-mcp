@@ -1996,7 +1996,7 @@ cooldown (spec 04 I65) holds longer.
   status attribute of a chip (`current_link_speed`, `current_link_width`, `max_link_speed`, `max_link_width`), its
   `config` file and an `lspci -vv` of it are configuration requests that cross the link to the chip; kernel-cached
   attributes (`vendor`, `device`, the `aer_dev_*` counters, a node existing, `driver`) are not, and stay free. The
-  PCIe quiet window (`health/pcie_quiet.py`) is open during: a probe pass, from the end of its host-PCI stage to its
+  PCIe quiet window (`health/pcie_quiet.py`) is open during: a probe pass, from its start to its
   end; the fabric traffic pass wherever it runs; a reset or recovery step on the chips (`chip_state.recovering`) and
   `SETTLE_SEC` (15 s) after one ends; and the first `JOB_START_SEC` (30 s) of a job, ended early by the job's end.
   Inside it no broker reader beside the work sends one of those reads: /health's hold report, the host-PCI and pci evidence reads,
@@ -2006,8 +2006,9 @@ cooldown (spec 04 I65) holds longer.
   inside the window still reads as down at once and every off-bus count and containment step decides as before;
   where the port cannot tell, the last value read outside the window answers, and with none cached nothing is
   claimed. /health's `pcie_quiet` says whether reads are served this way, why, since when and the age of the oldest
-  value served. The host-PCI stage runs before the window and is the pass's own read: it refreshes the values the
-  window serves. The step or pass that opened a scoped window (a reset step and the whole last-chance sweep, a probe
+  value served. The host-PCI stage is the pass's own read, taken live inside the window (also inside the `SETTLE_SEC` after a
+  reset step, so the check that follows a reset sees the links as they retrained, never the values from before it):
+  it refreshes the values the window serves to every other reader. The step or pass that opened a scoped window (a reset step and the whole last-chance sweep, a probe
   pass, the fabric pass) keeps its own reads live, in its own task and the threads it hands work to: they run one
   after another and never while its device start runs, as a reset step's own reads always did (I66), and a presence
   decision taken there from a stale cache could read a dead chip or power-cycle a live one. A job's start window has
@@ -2745,6 +2746,7 @@ refuses.
 | I79/I99 (a lone chip off the bus is removed within 5 s of its first evidence, all-ones first or AER first, with slow fsyncs and a slow kernel remove; a lone all-ones read that clears on the next sample is never contained; a reading right after a reset step keeps `FAST_CONFIRM_SEC`) | `tests/test_containment_latency.py` (all), `tests/test_offbus_early_watch.py::test_an_armed_watch_confirms_a_dead_chip_at_the_second_fast_sample`, `test_a_reading_that_began_right_after_a_reset_step_keeps_the_longer_bound` |
 | I99 | `tests/test_containment_off_loop.py::test_a_remove_still_running_at_the_hard_bound_latches_pci_wedged`, `tests/test_containment_off_loop.py::test_slow_journal_state_and_log_writes_never_delay_the_stop_or_the_remove`, `tests/test_containment_off_loop.py::test_the_periodic_stats_write_runs_off_the_event_loop`, `tests/test_containment_off_loop.py::test_the_stats_write_keeps_its_file_and_current_link`, `tests/test_health_hold_report.py::test_a_fenced_chip_link_is_never_read_and_none_while_the_dead_chip_watch_is_armed`, `tests/test_removed_chip_rescan.py::test_the_records_file_write_never_holds_up_the_remove`, `tests/test_dead_chip_watch.py::test_a_remove_that_times_out_latches_pci_wedged_and_asks_for_the_power_cycle` |
 | I101 | `tests/test_pcie_quiet.py` (all), `tests/test_health_hold_report.py::test_health_during_a_device_op_reads_no_chip_link_whoever_calls` |
+| I101 the host-PCI stage of a check right after a reset step reads the links live (a link that retrained degraded fails it) while another task's reader is still served the cache | `tests/test_pcie_quiet.py::test_the_post_reset_check_reads_the_links_live_inside_the_settle_window`, `tests/test_pcie_quiet.py::test_a_check_pass_owns_the_window_from_its_start_host_pci_stage_included` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,
