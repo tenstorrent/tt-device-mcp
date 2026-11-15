@@ -203,12 +203,13 @@ def test_health_status_names_the_window_and_the_age_of_what_it_served(sysfs):
 
 
 @pytest.mark.asyncio
-async def test_a_check_pass_opens_the_window_after_its_host_pci_stage(monkeypatch, health_deps):
+async def test_a_check_pass_owns_the_window_from_its_start_host_pci_stage_included(monkeypatch, health_deps):
     m = HealthMonitor(health_deps)
     seen = {}
 
     def host_pci():
         seen["hostpci"] = pcie_quiet.owners()
+        seen["hostpci_gated"] = pcie_quiet.active()
         return True, "ok", {}
 
     async def snapshot(*a, **k):
@@ -218,8 +219,63 @@ async def test_a_check_pass_opens_the_window_after_its_host_pci_stage(monkeypatc
     monkeypatch.setattr(hostpci, "host_pci_verdict", host_pci)
     monkeypatch.setattr(m, "_verify_device", snapshot)
     await m.update("post-job", run_fabric=False)
-    assert seen == {"hostpci": [], "snapshot": ["check"]}
+    assert seen == {"hostpci": ["check"], "hostpci_gated": False, "snapshot": ["check"]}
     assert pcie_quiet.owners() == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_host_pci_stage_closes_the_window_and_the_task_owns_nothing_after(monkeypatch, health_deps):
+    m = HealthMonitor(health_deps)
+    monkeypatch.setattr(hostpci, "host_pci_verdict", lambda: (False, "link degraded", {}))
+    await m.update("post-job", run_fabric=False)
+    assert pcie_quiet.owners() == []
+    assert pcie_quiet.active() is False
+
+    def boom():
+        raise RuntimeError("probe crashed")
+
+    monkeypatch.setattr(hostpci, "host_pci_verdict", boom)
+    with pytest.raises(RuntimeError):
+        await m.update("post-job", run_fabric=False)
+    assert pcie_quiet.owners() == []
+
+
+@pytest.mark.asyncio
+async def test_the_post_reset_check_reads_the_links_live_inside_the_settle_window(sysfs, monkeypatch, health_deps):
+    """A step ends and the links retrain degraded; the check that follows at once, inside SETTLE_SEC, sees the new
+    width (host-PCI unhealthy) while a reader in another task is still served the value from before the reset."""
+    chip = sysfs["chip"]
+    drivers = sysfs["devices"].parent / "drivers" / hostpci.DRIVER_NAME
+    drivers.mkdir(parents=True)
+    os.symlink(drivers, chip / "driver")
+    monkeypatch.setattr(hostpci, "_load_link_baseline", lambda: {})
+    monkeypatch.setattr(hostpci, "_bank_link_baseline", lambda *a: None)
+    (chip / "current_link_width").write_text("8\n")
+    ok, detail, _ = hostpci.host_pci_verdict()  # the healthy reading before the reset, cached
+    assert ok is True, detail
+    chip_state.set_recovering("op:test", True)
+    chip_state.set_recovering("op:test", False)
+    assert pcie_quiet.owners() == ["settle"]
+    (chip / "current_link_width").write_text("1\n")
+
+    assert contextvars.Context().run(pcie_quiet.read_attr, sysfs["devices"] / CHIP / "current_link_width") == "8"
+    m = HealthMonitor(health_deps)
+    seen = {}
+    real = hostpci.host_pci_verdict
+
+    def host_pci():
+        out = real()
+        seen["verdict"] = out
+        return out
+
+    monkeypatch.setattr(hostpci, "host_pci_verdict", host_pci)
+    await m.update("post-reset", run_fabric=False)
+    assert seen["verdict"][0] is False and "degraded" in seen["verdict"][1], seen["verdict"]
+    assert "settle" in pcie_quiet.owners()
+    sysfs["reads"].clear()
+    cached = contextvars.Context().run(pcie_quiet.read_attr, sysfs["devices"] / CHIP / "current_link_width")
+    assert cached == "1"  # the pass refreshed the cache for the readers it gates
+    assert sysfs["reads"] == [], "a non-owner reader sent the chip a config read"
 
 
 @pytest.mark.asyncio

@@ -456,6 +456,12 @@ class HealthMonitor:
 
         A probe the host shutdown or the broker's own stop killed raises ``CheckInterruptedByShutdown`` out of here,
         logged once: no readings are stored, and the caller unwinds as from a cancellation, counting nothing (I63)."""
+        # Spec 03 I101: the pass owns the quiet window from its start. Its own reads, the host-PCI stage's link reads
+        # first among them, stay live (right after a reset step they must see the links as retrained, not the cache the
+        # settle window serves) and refresh the values served to everyone else. From here the pass may also start the
+        # device (the snapshot, the eth read, the fabric traffic pass), so no other reader sends a chip a config read
+        # until the ``finally`` below closes the window, on every exit path.
+        pcie_quiet.open_window(_check_window_owner(), own=True)
         try:
             return await self._update(
                 phase,
@@ -536,11 +542,6 @@ class HealthMonitor:
         await asyncio.to_thread(pcie_guard.expire_offbus_reset_latch, expected, hp_ok, log or (lambda m: None))
         if hp_ok is False:
             return _store()
-        # Spec 03 I101: from here the pass may start the device (the snapshot, the eth read, the fabric traffic pass);
-        # no gated reader sends a chip a config read until update() closes the window. The host-PCI stage above was
-        # the pass's own read and left the values the window serves.
-        pcie_quiet.open_window(_check_window_owner(), own=True)
-
         # Skipped only where the driver never exposed the attribute — not as a way to excuse a
         # device that failed the probe. See health.monitors.heartbeat.heartbeat_supported(). Routed
         # through deps, not the module-level function, so a test that monkeypatches
