@@ -38,7 +38,18 @@ _HEALTHY = '{"status":"ok","held":false,"fsm_state":"healthy","fsm_why":null}'
 
 
 def _lap(
-    tmp_path, *, now, sha, interval=None, quiet=0, active="active", nrestarts="0", health=_HEALTHY, stand_ins=True
+    tmp_path,
+    *,
+    now,
+    sha,
+    interval=None,
+    quiet=0,
+    stagger=0,
+    host="test-host",
+    active="active",
+    nrestarts="0",
+    health=_HEALTHY,
+    stand_ins=True,
 ):
     """One lap at fake time `now` that has just resolved `sha`: the already-current check, burst coalescing and the rate
     limit, then (as if every gate passed) the tail that marks the sha current and restarts."""
@@ -66,7 +77,12 @@ systemctl() {{
 curl() {{ printf '%s' '{quoted_health}'; }}
 logger() {{ :; }}
 {LAP_STAND_INS if stand_ins else ""}"""
-    env = {"PATH": "/usr/bin:/bin", "TTDEV_LOG_DIR": str(tmp_path / "logs")}
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "TTDEV_LOG_DIR": str(tmp_path / "logs"),
+        "TTDEV_APPLY_STAGGER_SEC": str(stagger),
+        "HOSTNAME": host,
+    }
     if interval is not None:
         env["TTDEV_MIN_APPLY_INTERVAL_SEC"] = str(interval)
     if quiet is not None:

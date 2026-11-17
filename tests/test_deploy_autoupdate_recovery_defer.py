@@ -100,7 +100,13 @@ count_busy() {{ kids=0; holders=0; scopes=0; queued=0; busy=0; }}
 {stand_ins}
 """
     # Coalescing off (I21): these laps are about the recovery gate, and the /health answers are in call order.
-    env = {"PATH": "/usr/bin:/bin", "TTDEV_LOG_DIR": str(logs), "TTDEV_APPLY_QUIET_SEC": "0", **(env or {})}
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "TTDEV_LOG_DIR": str(logs),
+        "TTDEV_APPLY_QUIET_SEC": "0",
+        "TTDEV_APPLY_STAGGER_SEC": "0",
+        **(env or {}),
+    }
     done = subprocess.run(["bash", "-c", prelude + body], capture_output=True, text=True, env=env, timeout=60)
     lines = trace.read_text().splitlines() if trace.exists() else []
     log = logs / "autoupdate.log"
@@ -348,7 +354,8 @@ def test_no_recovery_deferral_comes_after_the_install_starts():
     bar (I7, I24) and a broker job still running at the job cap, which a restart may never cross."""
     text = _SCRIPT.read_text()
     install = text.index('"$VENV/bin/pip" install')
-    assert text.rindex("if recovery_gate; then") < text.index('git -C "$clone" reset --hard') < install
+    # The restart path's reset (the last one); a no-restart apply's reset never reaches a restart.
+    assert text.rindex("if recovery_gate; then") < text.rindex('git -C "$clone" reset --hard') < install
     after = text[install:]
     assert "if recovery_gate" not in after
     deferrals = re.findall(r'au_log deferred "([^"]*)"', after)

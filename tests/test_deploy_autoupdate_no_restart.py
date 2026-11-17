@@ -173,6 +173,7 @@ curl() {{ printf '%s' '{health}'; }}
         "HOME": str(tmp),
         "TTDEV_HOLD_SETTLE_SEC": "0",
         "TTDEV_APPLY_QUIET_SEC": "0",
+        "TTDEV_APPLY_STAGGER_SEC": "0",
         "TTDEV_LOG_DIR": str(tmp / "logs"),
     }
     done = subprocess.run(["bash", "-c", prelude + body], capture_output=True, text=True, env=run_env, timeout=60)
@@ -242,8 +243,8 @@ def test_a_docs_tests_and_ci_only_update_moves_the_tree_and_installed_sha_with_n
     done, lines, events = _lap(box, new)
     assert done.returncode == 0, done.stderr
     assert _restarts(lines) == [], lines
-    # Nothing installed, staged or applied: none of it changed (the one sleep is the hold's settle).
-    assert lines == [f"sleep {box['installed']}"], lines
+    # Nothing installed, staged, drained or applied: none of it changed, and no hold was taken.
+    assert lines == [], lines
     assert _installed(box) == new == _head(box)
     assert "broker not restarted" in done.stderr, done.stderr
     assert not (box["tmp"] / "root" / "last-apply").exists(), "a no-restart apply moved the rate limit"
@@ -319,7 +320,7 @@ def test_an_updater_only_update_stages_the_new_updater_and_does_not_restart(box)
     assert done.returncode == 0, done.stderr
     assert _restarts(lines) == [], lines
     # Only the updater is staged, and it is staged while installed.sha still names the old sha.
-    assert lines == [f"sleep {box['installed']}", f"stage {box['clone']}/{_UPDATER} {box['installed']}"], lines
+    assert lines == [f"stage {box['clone']}/{_UPDATER} {box['installed']}"], lines
     assert (box["tmp"] / "root" / "autoupdate.sh").read_text() == "#!/bin/sh\n# v2\n"
     assert _installed(box) == new == _head(box)
     assert "broker not restarted; staged the new autoupdate.sh" in done.stderr, done.stderr
@@ -348,7 +349,7 @@ def test_a_docs_only_update_stages_nothing(box):
     new = _push(box, {"docs/guide.md": "g\n"})
     done, lines, _ = _lap(box, new)
     assert done.returncode == 0, done.stderr
-    assert lines == [f"sleep {box['installed']}"], lines
+    assert lines == [], lines
     assert "staged" not in done.stderr and _installed(box) == new
 
 
@@ -459,24 +460,60 @@ def test_the_rate_limit_still_gates_a_no_restart_apply(box):
     assert (box["tmp"] / "root" / "last-apply").read_text().strip() == "10000"
 
 
-def test_the_idle_gate_still_drains_before_a_no_restart_apply(box):
+def test_a_no_restart_apply_does_not_drain_a_running_job(box):
+    """The no-restart decision comes before the device-op bar, the dispatch hold and the drain: a job
+    running on the device is left alone, and the tree and installed.sha move at once."""
     new = _push(box, {"docs/guide.md": "g\n"})
     done, lines, events = _lap(box, new, job_polls=3)
     assert done.returncode == 0, done.stderr
-    assert "draining" in done.stderr and "drained after" in done.stderr, done.stderr
-    # The hold's settle and every poll of the drain ran with the old sha still installed; the move came after them.
-    polls = [x for x in lines if x.startswith("sleep")]
-    assert len(polls) == 3 and all(x == f"sleep {box['installed']}" for x in polls), lines
+    assert "draining" not in done.stderr and "drained after" not in done.stderr, done.stderr
+    assert "no drain" in done.stderr, done.stderr
+    assert [x for x in lines if x.startswith("sleep")] == [], lines
     assert _installed(box) == new and _restarts(lines) == []
     (ev,) = events
-    assert ev["kind"] == "autoupdate_applied_no_restart" and ev["idle"] is False
+    assert ev["kind"] == "autoupdate_applied_no_restart"
+    assert "idle" not in ev and "drained_s" not in ev, ev
+
+
+def test_a_pre_commit_config_only_update_does_not_restart(box):
+    new = _push(box, {".pre-commit-config.yaml": "repos: []\n", "tests/test_x.py": "def test(): assert 3\n"})
+    done, lines, events = _lap(box, new, job_polls=3)
+    assert done.returncode == 0, done.stderr
+    assert _restarts(lines) == [] and lines == [], lines
+    assert _installed(box) == new == _head(box)
+    (ev,) = events
+    assert ev["kind"] == "autoupdate_applied_no_restart"
+
+
+def test_a_restart_names_every_runtime_path_it_saw(box):
+    """The log names all the runtime paths that forced the restart, not the first in sort order."""
+    new = _push(
+        box,
+        {".pre-commit-config.yaml": "repos: []\n", "pyproject.toml": "x\n", "src/tt_device_mcp/a.py": "a\n"},
+    )
+    done, lines, _ = _lap(box, new)
+    assert done.returncode == 0, done.stderr
+    assert "restart needed: changes pyproject.toml, src/tt_device_mcp/a.py\n" in done.stderr, done.stderr
+    assert _restarts(lines) == [f"restart {new}"], lines
+    logged = (box["tmp"] / "logs" / "autoupdate.log").read_text()
+    assert "restart needed: changes pyproject.toml, src/tt_device_mcp/a.py" in logged, logged
+
+
+def test_a_restart_caps_the_runtime_path_list(box):
+    files = {f"src/tt_device_mcp/m{i:02d}.py": f"{i}\n" for i in range(23)}
+    new = _push(box, files)
+    done, _, _ = _lap(box, new)
+    assert done.returncode == 0, done.stderr
+    (line,) = [x for x in done.stderr.splitlines() if x.startswith("autoupdate: restart needed:")]
+    assert line.endswith("src/tt_device_mcp/m19.py and 3 more"), line
+    assert "m20.py" not in line
 
 
 def test_the_allowlist_is_the_one_the_spec_names():
     text = _SCRIPT.read_text()
-    allow = "docs/*|tests/*|.github/*|*.md|deploy/tt-device-autoupdate.sh) ;;"
+    allow = "docs/*|tests/*|.github/*|*.md|.pre-commit-config.yaml|deploy/tt-device-autoupdate.sh) continue ;;"
     assert allow in text
-    i = text.index("src/*) echo")
+    i = text.index("src/*) ;;")
     assert i < text.index(allow), "src/ must be refused before *.md matches"
 
 
