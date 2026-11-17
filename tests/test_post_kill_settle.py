@@ -29,7 +29,7 @@ from tt_device_mcp.job_reap import JOB_TAG_ENV
 
 CHIPS = 32
 # The one line each post-kill reset logs; nothing else in the broker uses the name.
-LINE_RE = re.compile(r"\bpost_kill_settle: route (mesh_reset|sbr|power_cycle|holder_left|own_rung);")
+LINE_RE = re.compile(r"\bpost_kill_settle: route (mesh_reset|sbr|power_cycle|holder_left|own_rung|no_reset);")
 _SYS_EXIT = {"x86_64": 60, "aarch64": 93}.get(platform.machine())
 FAKE_PID = 4_000_000  # above any pid_max: never a real process, so nothing real is read or signalled
 
