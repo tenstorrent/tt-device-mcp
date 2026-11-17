@@ -92,12 +92,16 @@ def upstream_bridge(bdf: str) -> Optional[str]:
 
 def lspci_targets(addrs: list) -> list:
     """The lspci targets for the off chips' recorded PCI addresses: each one's upstream bridge, and
-    the endpoint too while it is still enumerated. Deduplicated, in order."""
+    the endpoint too while it is still enumerated. Deduplicated, in order. ``lspci -vv`` of the endpoint reads the
+    chip's config space, so inside the PCIe quiet window (spec 03 I101) only the bridges are read."""
+    from tt_device_mcp.health import pcie_quiet
+
+    quiet = pcie_quiet.active()
     out: list = []
     for addr in addrs:
         if not _PCI_ADDR.match(addr or ""):
             continue
-        endpoint = addr if (pci.PCI_DEVICES_DIR / addr).exists() else None
+        endpoint = addr if not quiet and (pci.PCI_DEVICES_DIR / addr).exists() else None
         for target in (upstream_bridge(addr), endpoint):
             if target and target not in out:
                 out.append(target)

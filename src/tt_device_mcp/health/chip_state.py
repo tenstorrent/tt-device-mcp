@@ -91,6 +91,8 @@ HOLD_POLL_SEC = 0.1
 # Evidence older than this before the next sign starts a new episode.
 EVIDENCE_GAP_SEC = 60.0
 _grace_until = 0.0
+# When the last reset or recovery step ended (monotonic): the PCIe quiet window's settle (spec 03 I101).
+_step_ended: Optional[float] = None
 _last_written: Optional[str] = None
 
 
@@ -124,7 +126,7 @@ _expected: Callable[[], int] = _no_baseline
 
 def reset() -> None:
     """Forget everything (tests; a fresh process starts here)."""
-    global _grace_until, _last_written, _present, _expected
+    global _grace_until, _last_written, _present, _expected, _step_ended
     with _lock:
         _lost.clear()
         _fenced.clear()
@@ -132,6 +134,7 @@ def reset() -> None:
         _held.clear()
         _recovering.clear()
         _grace_until = 0.0
+        _step_ended = None
         _last_written = None
         _present = _sysfs_indices
         _expected = _no_baseline
@@ -171,7 +174,7 @@ def node_identity(node: Path) -> Optional[tuple]:
 def set_recovering(owner: str, on: bool) -> None:
     """A reset or recovery step started (``on``) or ended on the chips. The end opens the post-reset
     grace window, so the step's verify reads every lost chip for real."""
-    global _grace_until
+    global _grace_until, _step_ended
     changed = False
     with _lock:
         if on and owner not in _recovering:
@@ -180,6 +183,7 @@ def set_recovering(owner: str, on: bool) -> None:
         elif not on and owner in _recovering:
             del _recovering[owner]
             _grace_until = time.monotonic() + GRACE_SEC
+            _step_ended = time.monotonic()
             for rec in _lost.values():
                 rec["next"] = 0.0
             # A reset step ends every fence: the post-reset check reads the chips for real.
@@ -194,6 +198,12 @@ def recovering() -> bool:
     """Whether a reset or recovery step is running on the chips. Pollers read nothing while it is."""
     with _lock:
         return bool(_recovering)
+
+
+def step_ended_at() -> Optional[float]:
+    """When the last reset or recovery step ended (monotonic), None before the first."""
+    with _lock:
+        return _step_ended
 
 
 def op_running() -> bool:

@@ -23,7 +23,7 @@ from typing import Awaitable, Callable, Optional
 
 from tt_device_mcp import aio, metrics, pre_reset_scan, privileges
 from tt_device_mcp.constants import DEVICE_RESET_OVERRUN_SEC, DEVICE_RESET_TIMEOUT_SEC
-from tt_device_mcp.health import chip_state, cpld_dump
+from tt_device_mcp.health import chip_state, cpld_dump, pcie_quiet
 from tt_device_mcp.health import pci_writer as _pci_writer_mod
 from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.monitors import pci
@@ -1626,6 +1626,8 @@ class RecoveryMechanism:
     def reset_in_flight(self, on: bool) -> None:
         # Published as the chips' ``recovering`` state (spec 03 I66): while it is set the pollers
         # (sampler, /health) read no chip, and only this step's own reads reach them.
+        if bool(on) != self._reset_in_flight:  # the step's own reads stay live in the PCIe quiet window (03 I101)
+            pcie_quiet.own_reads(bool(on))
         self._reset_in_flight = bool(on)
         chip_state.set_recovering(f"op:{id(self)}", bool(on))
 

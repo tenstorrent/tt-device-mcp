@@ -35,7 +35,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from tt_device_mcp.health import evidence
+from tt_device_mcp.health import evidence, pcie_quiet
 from tt_device_mcp.health.monitors import pci
 
 # Tenstorrent's PCI vendor id, as sysfs renders it.
@@ -116,10 +116,20 @@ LINK_DOWN_WIDTH = "63"
 def link_down(bdf: str, devices_dir: Optional[Path] = None) -> bool:
     """Whether this function's PCIe link reads as down (speed ``Unknown`` or width 63), so a listed
     node is not counted as a chip on the bus. An attribute that cannot be read is no evidence: False.
-    ``devices_dir`` defaults to :data:`pci.PCI_DEVICES_DIR`."""
+    ``devices_dir`` defaults to :data:`pci.PCI_DEVICES_DIR`.
+
+    Both attributes are config-space reads of the chip. Inside the PCIe quiet window (spec 03 I101) the chip is not
+    read: its upstream port says whether the link is up, and where the port cannot tell, the last values read outside
+    the window answer."""
     dev = (devices_dir or pci.PCI_DEVICES_DIR) / bdf
-    speed = _read(dev / "current_link_speed")
-    return (speed is not None and speed.startswith("Unknown")) or _read(dev / "current_link_width") == LINK_DOWN_WIDTH
+    if pcie_quiet.active():
+        down = pcie_quiet.link_down_quiet(dev)
+        if down is not None:
+            return down
+    speed = pcie_quiet.read_attr(dev / "current_link_speed")
+    if speed is not None and speed.startswith("Unknown"):
+        return True
+    return pcie_quiet.read_attr(dev / "current_link_width") == LINK_DOWN_WIDTH
 
 
 # A live read of a function's config-space vendor id (spec 04 I24). The kernel keeps the cached
@@ -136,13 +146,15 @@ def config_vendor_state(bdf: str, devices_dir: Optional[Path] = None) -> str:
     """:data:`CONFIG_PRESENT` when the first two bytes of ``<bdf>/config`` read 0x1e52 now, :data:`CONFIG_MISSING` when
     they read 0xffff (nothing answers at that address), else :data:`CONFIG_UNREADABLE` (an OSError, a short read, any
     other value): no evidence either way, never taken as present or missing. Read-only: no ``/dev/tenstorrent`` open, no
-    config write. One small read; call it only for a chip already suspect, never for every chip between jobs."""
-    try:
-        with open((devices_dir or pci.PCI_DEVICES_DIR) / bdf / "config", "rb", buffering=0) as f:
-            raw = f.read(2)
-    except OSError:
-        return CONFIG_UNREADABLE
-    if len(raw) < 2:
+    config write. One small read; call it only for a chip already suspect, never for every chip between jobs.
+
+    Inside the PCIe quiet window (spec 03 I101) the chip is not read: a link its upstream port shows down is
+    :data:`CONFIG_MISSING`, else the last value read outside the window answers."""
+    dev = (devices_dir or pci.PCI_DEVICES_DIR) / bdf
+    if pcie_quiet.active() and pcie_quiet.link_down_quiet(dev):
+        return CONFIG_MISSING
+    raw = pcie_quiet.read_config(dev / "config", 2)
+    if raw is None or len(raw) < 2:
         return CONFIG_UNREADABLE
     vendor = int.from_bytes(raw, "little")
     if vendor == _TT_VENDOR:
@@ -273,7 +285,8 @@ def host_pci_verdict() -> tuple[Optional[bool], str, dict]:
             ("max_link_speed", "link_speed_max"),
             ("max_link_width", "link_width_max"),
         ):
-            val = _read(dev / attr)
+            # Config-space reads of the chip: served from the last read inside the quiet window (spec 03 I101).
+            val = pcie_quiet.read_attr(dev / attr)
             if val is not None:
                 rec[key] = val
         group = _read(dev / "iommu_group")
@@ -340,6 +353,7 @@ def _judge_link(dev: Path, port: Optional[Path], rec: dict, banked: dict, links:
     link's reading in ``links`` (banked by the caller only when the whole check passes). An
     unreadable attribute is no evidence: a link with no readable width is not judged on width."""
     width, speed = _link_width(rec.get("link_width")), _link_speed(rec.get("link_speed"))
+    # The port's own caps: config reads the port answers itself, never the chip below it (spec 03 I101).
     port_width = _read(port / "max_link_width") if port is not None else None
     port_speed = _read(port / "max_link_speed") if port is not None else None
     if port_width is not None:
