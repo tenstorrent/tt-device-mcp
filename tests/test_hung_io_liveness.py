@@ -295,7 +295,9 @@ class _BlockedIo:
 
 
 @pytest.fixture
-def blocked_io(monkeypatch):
+async def blocked_io(monkeypatch):
+    # Async, so its teardown runs before the test's event loop closes: the loop's close joins its executor
+    # threads, and the stuck sample would hold that join for the rest of its 60 s wait.
     io = _BlockedIo()
     monkeypatch.setattr(srv, "job_io_bytes", io)
     yield io
