@@ -192,7 +192,6 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     dead_chips,
     enodata_presence,
     eth,
-    eth_read_timed_out,
     fabric,
     gone_chip_bridge_reset_enabled,
     health_dir,
@@ -4967,19 +4966,6 @@ def _names_topology_mismatch(text: str) -> bool:
     return text.startswith(_TOPOLOGY_HOLD) or _TOPOLOGY_VALIDATOR_LINE in text
 
 
-def _eth_timeout_reset_shape(evidence: dict) -> bool:
-    """Whether a probe pass took the spec 03 I61 skip: its eth read timed out with no verdict, host-pci
-    and the snapshot were OK, and no fabric pass ran. Any other shape keeps today's path."""
-    eth_ev = evidence.get("eth_heartbeat") or {}
-    return (
-        eth_ev.get("ok") is None
-        and eth_read_timed_out(str(eth_ev.get("detail") or ""))
-        and (evidence.get("hostpci") or {}).get("ok") is True
-        and (evidence.get("snapshot") or {}).get("ok") is True
-        and "fabric" not in evidence
-    )
-
-
 def _owe_kill_reset(why: str) -> None:
     """Spec 03 I69: a job the broker stopped mid-run owes the mesh one reset, then the full check."""
     global _kill_reset_owed, _kill_reset_owed_at, _kill_reset_job
@@ -7757,19 +7743,6 @@ async def device_health_gate(
         run_eth = (
             with_recover and phase in ("post-job", "post-step") and not full and not kill_reset and eth_check_armed
         )
-        # Spec 03 I61: on a clean post-job exit this episode's one present-mesh reset is still
-        # grantable, so a timed-out eth read may skip the pre-reset fabric pass and reset instead.
-        # Each guard here is one a reset would otherwise trip on; any that fails keeps today's pass.
-        eth_timeout_reset = (
-            run_eth
-            and phase == "post-job"
-            and expected > 1
-            and not dirty
-            and not device_fault_reported
-            and not isolated_chips
-            and not _dispatch_reset_spent
-            and not recovery_mechanism.cooling()
-        )
         # Spec 04 I32: a multi-tray mesh settles after the reset the full check is owed for, held.
         if full:
             await _post_reset_settle(expected, recovery, _log)
@@ -7783,7 +7756,6 @@ async def device_health_gate(
             run_fabric=full,
             run_eth=run_eth,
             fabric_stale=stale or skip_forced,
-            eth_timeout_reset=eth_timeout_reset,
             phase=phase,
             recovery=recovery,
         )
@@ -7814,17 +7786,6 @@ async def device_health_gate(
                 dirty_job = {**dirty_job, "pcie": pcie}
         if fabric_ok is not None:
             last_fabric_check_monotonic = time.monotonic()
-        # The probe pass took the I61 skip: the read timed out, host-pci and the snapshot (every chip,
-        # ARC healthy) were OK, and no fabric pass ran. The mesh is not proven, so it is not healthy.
-        eth_timeout_due = eth_timeout_reset and healthy and _eth_timeout_reset_shape(evidence)
-        if eth_timeout_due:
-            healthy = False
-            eth_reason = str((evidence.get("eth_heartbeat") or {}).get("detail") or "")
-            _log(
-                f"eth-heartbeat timed out after a clean exit with all {expected} chips present, host-pci OK "
-                f"and ARC healthy ({eth_reason}) — one present-mesh reset, then the full check"
-            )
-            health_event("eth_timeout_mesh_reset", phase=phase, expected=expected, eth=eth_reason[:200])
         # Spec 03 I69: the gate has taken the debt. With every chip present and ARC healthy it is paid
         # by the present-mesh reset below; anything else is another fault, whose own rung (and the
         # full check that rung's verify runs) decides. Either way it is not owed twice.
@@ -7913,11 +7874,7 @@ async def device_health_gate(
         if not healthy or dirty:
             bundle = await asyncio.to_thread(
                 capture_incident,
-                (
-                    "eth_timeout"
-                    if eth_timeout_due
-                    else "job_killed" if kill_reset_due else "unhealthy" if not healthy else "dirty"
-                ),
+                "job_killed" if kill_reset_due else "unhealthy" if not healthy else "dirty",
                 job=dirty_job,
                 job_log=job_log_file,
                 trace=list(sampler.ring),
@@ -8183,9 +8140,7 @@ async def device_health_gate(
             )
             return
 
-        reasons = ["failed health check"] if not healthy and not eth_timeout_due and not kill_reset_due else []
-        if eth_timeout_due:
-            reasons.append("eth-heartbeat read timed out after a clean exit")
+        reasons = ["failed health check"] if not healthy and not kill_reset_due else []
         if kill_reset_due:
             reasons.append(f"{kill_debt}: reset before release")
         if device_fault_reported:
@@ -8260,9 +8215,6 @@ async def device_health_gate(
         dispatch_failed = fabric_ok is False and fabric.names_dispatch_failure(health_monitor.last_fabric_output or "")
         if dispatch_failed and not _dispatch_reset_spent:
             ev = replace(ev, dispatch_reset_due=True)
-        # Spec 03 I61: the same one reset, shared latch, for a clean exit's timed-out eth read.
-        if eth_timeout_due and not _dispatch_reset_spent:
-            ev = replace(ev, eth_timeout_reset_due=True)
         # Spec 03 I69: the same one reset, shared latch, for a job the broker stopped mid-run.
         if kill_reset_due and not _dispatch_reset_spent:
             ev = replace(ev, kill_reset_due=True)
@@ -8275,7 +8227,7 @@ async def device_health_gate(
             caller is done. Reads ``ev``/``beats`` as they stand at the call, which is the evidence
             the decision being fired was made from."""
             if fsm.state is ServerState.HEALTHY:
-                # A rung fired from a clean exit (spec 03 I55/I61 on a present mesh) has no episode
+                # A rung fired from a clean exit (spec 03 I55/I69 on a present mesh) has no episode
                 # open yet. Open it before the reset, so a failed post-reset check leaves the door
                 # held and the ladder climbing; only the full check's pass releases it.
                 _mark_device_dirty(f"gate/{phase}: {'; '.join(reasons) or 'unhealthy'} — {rung}", why="probe_unhealthy")
@@ -8436,7 +8388,7 @@ async def device_health_gate(
             # The latch is spent only once a reset actually started (the clock moves at reset begin):
             # one the per-host gate refused leaves the episode's reset unspent.
             if (
-                (ev.dispatch_reset_due or ev.eth_timeout_reset_due or ev.kill_reset_due)
+                (ev.dispatch_reset_due or ev.kill_reset_due)
                 and stage == STAGE_SMI_RESET
                 and recovery_mechanism.last_reset_monotonic != reset_clock
             ):

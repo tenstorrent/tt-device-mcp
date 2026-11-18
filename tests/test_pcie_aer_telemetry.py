@@ -17,7 +17,7 @@ import types
 import pytest
 
 from tests.conftest import fsm_dirty
-from tests.test_eth_timeout_reset import ADVANCING, _gate, mesh  # noqa: F401 - the gate fixture
+from tests.test_eth_timeout_retry import ADVANCING, _gate, mesh  # noqa: F401 - the gate fixture
 from tests.test_restart_drain import _job, _quiet_runner
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState

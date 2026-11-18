@@ -20,7 +20,7 @@ import httpx2
 import pytest
 
 from tests.conftest import fsm_dirty
-from tests.test_eth_timeout_reset import ADVANCING, mesh  # noqa: F401 (fixture)
+from tests.test_eth_timeout_retry import ADVANCING, mesh  # noqa: F401 (fixture)
 from tt_device_mcp import constants
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
@@ -54,7 +54,7 @@ async def test_a_timeout_resets_then_runs_the_full_check_before_release(killed):
     assert killed["events"].count("kill_mesh_reset") == 1
     assert killed["captured"][0][0] == "job_killed"
     assert srv.fsm.state is ServerState.HEALTHY, "the full check after the reset released it"
-    assert srv._dispatch_reset_spent is True, "the reset spends the shared I55/I61 latch"
+    assert srv._dispatch_reset_spent is True, "the reset spends the shared I55/I69 latch"
     assert srv._kill_reset_debt() == ""
 
 
