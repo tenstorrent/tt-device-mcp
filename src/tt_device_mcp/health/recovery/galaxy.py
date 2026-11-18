@@ -73,6 +73,7 @@ from tt_device_mcp.health.recovery.base import (
     pci_rescan,
     reenumerate_withheld,
 )
+from tt_device_mcp.health.recovery.power_cycle_reason import PowerCycleReason, build_chips
 from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
 from tt_device_mcp.health.recovery.stages.power_cycle import note_cycle_possible
 
@@ -1025,6 +1026,33 @@ class GalaxyRecovery(Recovery):
             return {}
         return self.deps.chip_buses_provider() or {}
 
+    def _power_cycle_reason(
+        self,
+        text: str,
+        *,
+        trigger: str,
+        fault_class: str = "unknown",
+        chips=(),
+        failed_check: str = "",
+        failed_result: str = "",
+        hold_since: str = "",
+    ) -> PowerCycleReason:
+        """The record a host power cycle carries (spec 04 I113), from the broker's memory only (no chip is read): the
+        named chips with their PCI address, tray and upstream root port, the last failed check and its result, the
+        rungs this hold ran, and the hold's start and age."""
+        buses = {str(k): v for k, v in self._chip_buses_now().items()}
+        since = hold_since or self.deps.device_hold_episode_since() or ""
+        return PowerCycleReason(
+            text,
+            trigger=trigger,
+            fault_class=fault_class,
+            chips=build_chips({str(c): buses.get(str(c)) for c in chips}, self._tray_map_now()),
+            failed_check=failed_check,
+            failed_result=failed_result,
+            hold_since=since,
+            rungs=self.mechanism.rungs_since(since),
+        ).completed()
+
     def next_stage(self, ev: Evidence) -> str:
         # host_escalation/reboot_blocked are folded here, not carried on Evidence (see its own
         # docstring): only the post-galaxy-reset phase ever needs them.
@@ -1404,8 +1432,16 @@ class GalaxyRecovery(Recovery):
         )
         log(f"{what}: no further reset heals this class — power-cycling the host now (spec 04 I37)")
         named = _offbus_fault_class(off_bus, expected, whole=fault_class == FAULT_CLASS_WHOLE_TRAY)
+        reason = self._power_cycle_reason(
+            f"{what}; no further reset heals this class",
+            trigger="tray_down" if fault_class == FAULT_CLASS_WHOLE_TRAY else "all_chips_off",
+            fault_class=fault_class,
+            chips=offbus_chips,
+            failed_check=context,
+            failed_result=f"{off_bus}/{expected} chip(s) off the bus",
+        )
         with offbus_power_cycle.direct_cycle(named, offbus_chips):  # what the cycle names (I88)
-            await self.deps.auto_power_cycle_host(log, f"{what}; no further reset heals this class")
+            await self.deps.auto_power_cycle_host(log, reason)
         return True
 
     async def leftover_host_rung(self, leftover_pids, expected: int, log, *, what: str) -> tuple[str, str]:
@@ -1452,7 +1488,14 @@ class GalaxyRecovery(Recovery):
         guard = await self._leftover_scan_guard(leftovers)
         if guard is not None:
             return guard
-        reason = f"{what}; no reset can free it (spec 04 I70)"
+        reason = self._power_cycle_reason(
+            f"{what}; no reset can free it (spec 04 I70)",
+            trigger="leftover_holder",
+            fault_class="unkillable_holder",
+            chips=_offbus_chip_ids(beats, expected) if expected > 1 else (),
+            failed_check="leftover holder scan",
+            failed_result=f"{what}; {off_bus}/{expected} chip(s) off the bus",
+        )
         log(f"{what}: past its budget, no reset can free it — requesting the host {escalation} (spec 04 I70)")
         await self.deps.auto_power_cycle_host(log, reason)
         return "requested", f"{escalation} ({off_bus}/{expected} chip(s) off the bus)"
@@ -1642,6 +1685,7 @@ class GalaxyRecovery(Recovery):
                     expected,
                     "the reset ladder could not recover the device",
                     "the reset ladder could not recover the device",
+                    trigger="gate_ladder",
                 )
                 if await self.deps.auto_power_cycle_host(log, cause) is False:
                     self._hold_after_cycle_launch_failure(log, cause)
@@ -3303,8 +3347,14 @@ class GalaxyRecovery(Recovery):
             # Any other denial hands back to the plain hold as before.
             cooldown = self.mechanism.power_cycle_cooldown_state
             return False if cooldown is not None and cooldown.get("why") == deny else None
-        reason = (
-            f"{off_bus}/{expected} chip(s) off the bus, {int(age)}s past the last rung, no reset can end it ({why})"
+        reason = self._power_cycle_reason(
+            f"{off_bus}/{expected} chip(s) off the bus, {int(age)}s past the last rung, no reset can end it ({why})",
+            trigger="offbus_gated",
+            fault_class=fault_class,
+            chips=offbus_now,
+            failed_check="off-bus hold past its grace",
+            failed_result=f"{off_bus}/{expected} chip(s) off the bus, {int(age)}s past the last rung",
+            hold_since=hold_since,
         )
         # On disk before anything runs: a cycle that takes the broker down with it still counts
         # against the rate limit on the boot that comes back.
@@ -3709,21 +3759,40 @@ class GalaxyRecovery(Recovery):
         self.deps.clear_device_dirty(verified=True, why=why)
         return True
 
-    async def _host_rung_cause_now(self, expected: int, prefix: str, fallback: str) -> str:
+    async def _host_rung_cause_now(
+        self, expected: int, prefix: str, fallback: str, *, trigger: str = "idle_escalation"
+    ) -> PowerCycleReason:
         """The power cycle's reason from the bus as it reads now, after every rung before it (spec 04
         I97): the chips off the bus and the chips ARC-not-ready, never a count read before the sweep.
         ``fallback`` when the heartbeats cannot be read, or must not be: a reset still cycling in its
-        own scope (each heartbeat is a PCIe read of a chip it may have off the bus)."""
+        own scope (each heartbeat is a PCIe read of a chip it may have off the bus). Always a record
+        (spec 04 I113); the last failed check is the one after the reset ladder."""
+        check = "post-reset-ladder check"
         if await asyncio.to_thread(self.mechanism.scope_active):
-            return f"{prefix}: the reset is still cycling in its own scope after the reset ladder"
+            return self._power_cycle_reason(
+                f"{prefix}: the reset is still cycling in its own scope after the reset ladder",
+                trigger=trigger,
+                failed_check=check,
+                failed_result="a reset is still cycling in its own scope; the bus was not read",
+            )
         try:
             beats = await asyncio.to_thread(self.deps.read_heartbeats)
         except Exception:  # noqa: BLE001 - the reason text must never stop the power cycle
-            return fallback
+            return self._power_cycle_reason(
+                fallback, trigger=trigger, failed_check=check, failed_result="the heartbeats could not be read"
+            )
         beats = beats or {}
         not_ready = arc_not_ready_chips(beats)
         off = offbus_count(beats, expected, not_ready)
-        return f"{prefix}: {off}/{expected} chip(s) off the bus, {len(not_ready)} ARC not ready after the reset ladder"
+        result = f"{off}/{expected} chip(s) off the bus, {len(not_ready)} ARC not ready"
+        return self._power_cycle_reason(
+            f"{prefix}: {result} after the reset ladder",
+            trigger=trigger,
+            fault_class=_offbus_fault_class(off, expected, whole=False) if off else "unknown",
+            chips=sorted(set(_offbus_chip_ids(beats, expected)) | set(not_ready), key=int),
+            failed_check=check,
+            failed_result=result,
+        )
 
     # The hold episode whose spec 04 I97 mesh reset has run: once per episode.
     _whole_mesh_reset_spent: Optional[str] = None
@@ -4437,6 +4506,7 @@ class GalaxyRecovery(Recovery):
             if off_bus == 0
             else f"idle escalation: {off_bus}/{expected} chip(s) off the bus after the reset ladder"
         )
+
         # Last chance: every reset type once more, back-to-back, then one settle and one verify. This
         # is the road MOST real power cycles took (the idle/stuck-hold escalation), and before ladder-v2
         # it climbed to the host rung without ever re-trying the cheaper rungs. Skipped only when the
@@ -4452,9 +4522,24 @@ class GalaxyRecovery(Recovery):
         if not cause_given:
             # The sweep or the SBR ran since off_bus was read: name what fails now (spec 04 I97).
             cause = await self._host_rung_cause_now(expected, "idle escalation", cause)
+        else:
+            # The caller named the cause (the I29 77 climb): a record of it, with the chips off the bus now.
+            fabric = cause == FABRIC_77_HOST_RUNG_CAUSE
+            cause = self._power_cycle_reason(
+                cause,
+                trigger="fabric_unverified" if fabric else "idle_escalation",
+                chips=await self._offbus_ids_now(expected) or (),
+                failed_check="full check with fabric" if fabric else "post-reset-ladder check",
+                failed_result="fabric unverified (77) after the reset and the last-chance sweep" if fabric else cause,
+            )
         if on_fire is not None:
             on_fire()
-        health_event("stuck_hold_host_escalation", escalation=escalation, off_bus=off_bus)
+        health_event(
+            "stuck_hold_host_escalation",
+            escalation=escalation,
+            off_bus=off_bus,
+            power_cycle_reason=cause.as_dict(),
+        )
         if await self.deps.auto_power_cycle_host(log, cause) is False:
             self._hold_after_cycle_launch_failure(log, cause)
         return HOST_RUNG_FIRED

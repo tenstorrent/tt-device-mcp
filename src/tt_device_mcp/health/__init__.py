@@ -130,6 +130,7 @@ from tt_device_mcp.health.recovery import (
     _declared_reset_mode,
     _persistent_recovery,
     offbus_power_cycle,
+    power_cycle_reason,
 )
 from tt_device_mcp.health.recovery import select_recovery as _select_recovery  # noqa: F401
 from tt_device_mcp.health.recovery.base import (
@@ -162,6 +163,7 @@ from tt_device_mcp.health.recovery.galaxy import (
 )
 from tt_device_mcp.health.recovery.pcie_guard import pcie_guard_at_start
 from tt_device_mcp.health.recovery.per_target import PerTargetRecovery
+from tt_device_mcp.health.recovery.power_cycle_reason import PowerCycleReason
 from tt_device_mcp.health.recovery.stages.bridge_reset import (
     bridge_reset_enabled,
     bridge_reset_unavailable_reason,
@@ -316,6 +318,9 @@ __all__ = [
     # the bounded off-bus hold (spec 04 I27): the gate's hold-deadline check asks it when the
     # grace has run out and records the forced pass it spawned for that episode
     "offbus_power_cycle",
+    # the reason record every host power cycle carries and the state file it is kept in (spec 04 I113)
+    "power_cycle_reason",
+    "PowerCycleReason",
     # the post-reset fabric debt (spec 04 I32): no reset releases until a fabric pass settles it
     "FABRIC_DEBT",
     # and the settle a multi-tray mesh gets after a reset before that pass runs

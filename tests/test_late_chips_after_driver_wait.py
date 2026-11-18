@@ -489,7 +489,7 @@ def _scanned_late(monkeypatch, tmp_path, *, i97, holders, late_holder=None, runn
     monkeypatch.setattr(mech, "power_cycle_journal", srv._journal_power_cycle_foreign_holders)
     monkeypatch.setattr(srv, "health_dir", lambda: tmp_path)
     monkeypatch.setattr(recovery_base, "health_dir", lambda: tmp_path)
-    monkeypatch.setattr(srv, "_fire_power_cycle", lambda: order.append("power cycle"))
+    monkeypatch.setattr(srv, "_fire_power_cycle", lambda *_: order.append("power cycle"))
     monkeypatch.setattr(srv, "_auto_power_cycle_host", _real_auto_power_cycle_host)
     rigged, scans = mech.reset_with_quiesce, []
     counters["scans"] = scans

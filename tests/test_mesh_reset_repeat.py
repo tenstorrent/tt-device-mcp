@@ -36,7 +36,7 @@ def _arm_power_cycle(monkeypatch):
     fired = []
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     monkeypatch.setattr(privileges, "can_ipmi", lambda: True)
-    monkeypatch.setattr(srv, "_fire_power_cycle", lambda: fired.append(("power-cycle", _hold_age())))
+    monkeypatch.setattr(srv, "_fire_power_cycle", lambda *_: fired.append(("power-cycle", _hold_age())))
     return fired
 
 

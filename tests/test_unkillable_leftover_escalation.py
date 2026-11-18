@@ -353,7 +353,7 @@ def both(fence, monkeypatch, clear_job_state):  # noqa: F811 - the imported fixt
     monkeypatch.setattr(srv, "_auto_power_cycle_host", _REAL_POWER_CYCLE)
     state = {"fires": 0, "outcome": "launched"}
 
-    def fire():
+    def fire(*_):
         state["fires"] += 1
         if state["outcome"] == "timed-out":  # the cycler may still act: the request stays pending
             raise recovery_base.HostActionTimedOut("power-cycle command timed out after 30s")

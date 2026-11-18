@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Optional
 
 from tt_device_mcp.health.evidence import health_dir, health_event
+from tt_device_mcp.health.recovery.power_cycle_reason import PowerCycleReason
 
 STATE_FILE = "offbus_power_cycle.json"
 GRACE_SEC = 300
@@ -420,7 +421,7 @@ def page_if_blocked(episode: str, age: float, log, why: str, *, bound: Optional[
         )
 
 
-def fire_command(argv: list, reason: str, timeout: float = FIRE_TIMEOUT_DEFAULT_SEC) -> None:
+def fire_command(argv: list, reason: PowerCycleReason, timeout: float = FIRE_TIMEOUT_DEFAULT_SEC) -> None:
     """Run the host's power-cycle command with the host OS brought down cleanly first (spec 04 I88): the shutdown hook
     runs ``argv`` once the filesystems are read-only, with the reason in ``TT_DEVICE_MCP_POWER_CYCLE_REASON`` and
     ``TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC`` per try (clamped to fit systemd-shutdown). Never runs it under a live
@@ -428,10 +429,12 @@ def fire_command(argv: list, reason: str, timeout: float = FIRE_TIMEOUT_DEFAULT_
     Tests replace it: no test may cycle the host."""
     from tt_device_mcp.health.recovery.stages.power_cycle import fire_os_first
 
-    fire_os_first(argv, reason, _int_env("TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC", int(timeout)))
+    fire_os_first(
+        argv, PowerCycleReason.require(reason), _int_env("TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC", int(timeout))
+    )
 
 
-def fire_and_record(argv: list, reason: str, state: dict) -> None:
+def fire_and_record(argv: list, reason: PowerCycleReason, state: dict) -> None:
     """``fire_command``, keeping a failure's cause in the state file for the rate-limited page."""
     try:
         fire_command(argv, reason)

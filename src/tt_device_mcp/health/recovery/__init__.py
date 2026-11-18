@@ -275,6 +275,7 @@ class RecoveryDeps:
     # server-owned (the gate journals that event itself, and the power cycle's ledger row and job
     # entry are server state), so they are injected rather than moved.
     # Returns False when the cycle certainly did not launch (spec 04 I71: hold, page, retry).
+    # The reason is a PowerCycleReason record (spec 04 I113); a plain string is refused.
     auto_power_cycle_host: Callable[[Callable, str], Awaitable[Optional[bool]]]
     emit_all_off_bus_power_cycle_required: Callable[[Callable, int, int, str], None]
     host_escalation_kwargs: Callable[[], dict]

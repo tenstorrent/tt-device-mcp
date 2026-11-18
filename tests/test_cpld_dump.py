@@ -21,6 +21,7 @@ import time
 
 import pytest
 
+from tests.conftest import power_cycle_reason
 from tt_device_mcp.fsm import ServerFsm, ServerState
 from tt_device_mcp.health import cpld_dump
 from tt_device_mcp.health import evidence as health
@@ -156,7 +157,7 @@ async def test_the_escalation_dumps_before_it_records_anything(fake, monkeypatch
         detail="test",
         fire=lambda: None,
         log=lambda _s: None,
-        reason="test",
+        reason=power_cycle_reason("test"),
     )
     assert seen == [("ledger", 1), ("row", 1)]
     kinds = [e["kind"] for e in health.read_health_events() if e["kind"] in ("cpld_dump", "auto_power_cycle_request")]
@@ -175,7 +176,7 @@ async def test_an_escalation_the_ledger_stops_still_dumps(fake, monkeypatch):
         detail="test",
         fire=lambda: fired.append(1),
         log=lambda _s: None,
-        reason="test",
+        reason=power_cycle_reason("test"),
     )
     assert not fired and _events("auto_power_cycle_aborted")
     assert len(_events("cpld_dump")) == 1
@@ -794,7 +795,7 @@ async def test_the_power_cycle_waits_for_the_dump(fake):
         detail="test",
         fire=lambda: seen.append(len(_events("cpld_dump"))),
         log=lambda _s: None,
-        reason="test",
+        reason=power_cycle_reason("test"),
     )
     assert seen == [1]
 
@@ -817,7 +818,7 @@ async def test_the_power_cycle_is_not_recorded_or_announced_until_the_dump_is_do
         detail="test",
         fire=lambda: None,
         log=lambda _s: None,
-        reason="test",
+        reason=power_cycle_reason("test"),
     )
     assert seen == [(1, None, 0)]
 

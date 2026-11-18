@@ -135,6 +135,8 @@ cooldown (spec 04 I65) holds longer.
   the device tool is the one thing a wedged host cannot afford.
 - **I10 — `HealthMonitor.status()` never probes and never blocks.** It is the read side of the
   last `update()` pass — `None` before one has run — and may be minutes stale by contract.
+  `/health` also carries `last_power_cycle` (time, reason, trigger, fault class, chips, last failed
+  check, hold age, outcome), read from the file a power-cycle request writes (spec 04 I113).
 - **I11 — `expected()` is a high-water baseline, never the survivor count.** A mesh that lost a
   tray must not lower its own bar. `TT_DEVICE_MCP_EXPECTED_CHIPS` overrides; the baseline only
   ratchets up; an unreadable baseline file fails closed to a nonzero expectation (its existence

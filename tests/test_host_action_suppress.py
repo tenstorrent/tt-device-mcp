@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from tests.conftest import fsm_dirty, patch_health_event, patch_recovery
+from tests.conftest import fsm_dirty, patch_health_event, patch_recovery, power_cycle_reason
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy
@@ -23,7 +23,9 @@ from tt_device_mcp.health.recovery.offbus_power_cycle import (
     fire_command as _real_fire_command,  # before the conftest tripwire
 )
 
-REASON = "last-chance sweep: every reset ran and the mesh did not verify"
+REASON = power_cycle_reason(
+    "last-chance sweep: every reset ran and the mesh did not verify", trigger="gate_ladder", fault_class="unknown"
+)
 SINCE = datetime(2026, 10, 15, 11, 50, 0)
 
 
@@ -40,7 +42,7 @@ def held(monkeypatch, tmp_path):
     monkeypatch.delenv("TT_DEVICE_MCP_HOST_ACTION_PENDING_SEC", raising=False)
     monkeypatch.delenv("TT_DEVICE_MCP_FORCE_ESCALATE", raising=False)
     fired = []
-    monkeypatch.setattr(srv, "_fire_power_cycle", lambda: fired.append("power-cycle"))
+    monkeypatch.setattr(srv, "_fire_power_cycle", lambda *_: fired.append("power-cycle"))
     spawned = []
 
     async def _escalation():
@@ -129,7 +131,7 @@ async def test_escalation_waiting_on_the_lock_runs_no_rung(monkeypatch):
 async def test_power_cycle_that_fails_to_launch_does_not_suppress(held, monkeypatch):
     """A fire that did not launch took nothing down: the ladder must keep its teeth."""
 
-    def _boom():
+    def _boom(*_):
         raise RuntimeError("power cycle command exited 1")
 
     monkeypatch.setattr(srv, "_fire_power_cycle", _boom)
@@ -310,7 +312,7 @@ async def test_a_power_cycle_command_that_timed_out_stays_pending(held, monkeypa
         _real_fire_command(["cycler"], REASON)
     assert not isinstance(err.value, recovery_base.HostActionTimedOut)
 
-    def _timed_out():
+    def _timed_out(*_):
         raise recovery_base.HostActionTimedOut("power-cycle command timed out after 30s")
 
     monkeypatch.setattr(srv, "_fire_power_cycle", _timed_out)
