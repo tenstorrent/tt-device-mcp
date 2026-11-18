@@ -16,6 +16,8 @@ import time
 from typing import Callable, Optional
 
 from tt_device_mcp.health.evidence import health_dir, health_event
+from tt_device_mcp.health.recovery import power_cycle_reason as _reason_record
+from tt_device_mcp.health.recovery.power_cycle_reason import PowerCycleReason
 
 _logger = logging.getLogger("tt-device-mcp")
 
@@ -34,11 +36,12 @@ class PowerCycleNotLaunched(RuntimeError):
         self.why = why
 
 
-def _fire_power_cycle() -> None:
+def _fire_power_cycle(reason: PowerCycleReason) -> None:
     """The BMC chassis power cycle — the one action that recovers a whole-bus wedge a warm reboot
     leaves wedged (measured on box D) — with the host OS brought down cleanly first (spec 04 I88).
-    Every test replaces it. Raises PowerCycleNotLaunched when the clean path cannot start."""
-    fire_os_first(list(DEFAULT_POWER_CYCLE_ARGV), "auto BMC power cycle", DEFAULT_POWER_CYCLE_TIMEOUT_SEC)
+    ``reason`` is the cycle's record (spec 04 I113), required. Every test replaces it. Raises
+    PowerCycleNotLaunched when the clean path cannot start."""
+    fire_os_first(list(DEFAULT_POWER_CYCLE_ARGV), PowerCycleReason.require(reason), DEFAULT_POWER_CYCLE_TIMEOUT_SEC)
 
 
 # Spec 04 I88. The power cycle brings the OS down first: the broker leaves the cycle's argv in
@@ -700,9 +703,10 @@ def _stop_fallback(unit: str) -> bool:
     return rc is not None and rc != 0
 
 
-def fire_os_first(argv: list, reason: str, timeout: float = DEFAULT_POWER_CYCLE_TIMEOUT_SEC) -> str:
+def fire_os_first(argv: list, reason: PowerCycleReason, timeout: float = DEFAULT_POWER_CYCLE_TIMEOUT_SEC) -> str:
     """Power-cycle the host with its OS brought down cleanly first (spec 04 I88). Never cuts power under a running OS
-    from here.
+    from here. ``reason`` is the cycle's record (spec 04 I113): a plain string raises TypeError before anything runs.
+    The record is logged as one WARNING line and written, fsynced, before the reboot is issued.
 
     Checks the BMC read-only (:func:`preflight_argv`), writes the request, starts the fallback unit (fires ``argv`` once
     :func:`shutdown_bound_sec` passes), then ``systemctl reboot``; the shutdown hook fires ``argv`` once the filesystems
@@ -710,6 +714,7 @@ def fire_os_first(argv: list, reason: str, timeout: float = DEFAULT_POWER_CYCLE_
     and raises PowerCycleNotLaunched: nothing fired, the caller holds and pages. The one exception: a fallback unit that
     outlives a failed reboot may still fire at its bound, so that returns "fallback_pending" and the action stays
     pending."""
+    reason = PowerCycleReason.require(reason)
     argv = [str(a) for a in argv]
     why = os_first_unavailable()
     if not why and (not argv or any("\n" in a for a in argv)):
@@ -742,6 +747,9 @@ def fire_os_first(argv: list, reason: str, timeout: float = DEFAULT_POWER_CYCLE_
     if not why:
         _mark_cycle_requested(reason)
         trigger = _journal_trigger(reason, unit)
+        # Spec 04 I113: the record is logged and on disk before anything can reboot or cycle the host.
+        _reason_record.write_state(reason, unit=unit)
+        _logger.warning(reason.line())
         rc, out = _run_step(fallback_argv(argv, bound, unit, reason=reason, timeout=timeout, trigger=trigger))
         if rc == 0:
             started = True
@@ -755,7 +763,8 @@ def fire_os_first(argv: list, reason: str, timeout: float = DEFAULT_POWER_CYCLE_
             health_event(
                 "power_cycle_os_first",
                 phase="reboot_requested",
-                reason=reason,
+                reason=str(reason),
+                power_cycle_reason=reason.as_dict(),
                 bound_sec=bound,
                 unit_timeout_sec=_json_seconds(unit_timeout),
                 unit=unit,
@@ -771,7 +780,14 @@ def fire_os_first(argv: list, reason: str, timeout: float = DEFAULT_POWER_CYCLE_
     if started and not _stop_fallback(unit):
         # It may still fire at its bound: the action stays pending (no device reset under it) rather
         # than reading as never launched.
-        health_event("power_cycle_os_first", phase="fallback_pending", reason=reason, why=why[-300:], unit=unit)
+        health_event(
+            "power_cycle_os_first",
+            phase="fallback_pending",
+            reason=str(reason),
+            power_cycle_reason=reason.as_dict(),
+            why=why[-300:],
+            unit=unit,
+        )
         _logger.error(
             "POWER CYCLE: %s, and the fallback unit %s could not be stopped; it fires at %ss unless "
             "stopped — keeping the action pending",
@@ -781,6 +797,13 @@ def fire_os_first(argv: list, reason: str, timeout: float = DEFAULT_POWER_CYCLE_
         )
         return "fallback_pending"
     _drop_request()
-    health_event("power_cycle_os_first", phase="not_launched", reason=reason, why=why[-300:])
+    _reason_record.mark_outcome("not_launched", reason.requested_epoch, why=why[-300:])
+    health_event(
+        "power_cycle_os_first",
+        phase="not_launched",
+        reason=str(reason),
+        power_cycle_reason=reason.as_dict(),
+        why=why[-300:],
+    )
     _logger.error("POWER CYCLE NOT LAUNCHED: %s; nothing fired, the device stays held", why)
     raise PowerCycleNotLaunched(why)

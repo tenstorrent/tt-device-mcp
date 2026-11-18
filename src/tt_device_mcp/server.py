@@ -214,7 +214,9 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     note_power_cycle_trigger,
     offbus_chip_ids,
     offbus_count,
+    PowerCycleReason,
     offbus_power_cycle,
+    power_cycle_reason,
     pci_bus_number,
     pcie_aer,
     pcie_guard_at_start,
@@ -7304,18 +7306,37 @@ def _emit_all_off_bus_power_cycle_required(log, off_bus: int, expected: int, *, 
     )
 
 
-async def _auto_power_cycle_host(log, reason: str) -> bool:
+async def _auto_power_cycle_host(log, reason: PowerCycleReason) -> bool:
     """Fire the final recovery rung: a BMC chassis power cycle, the only host rung (spec 04 I71). The caller has already
     confirmed both the env opt-in AND ``RecoveryMechanism.auto_recovery_allowed``. False when it certainly did not
-    launch: the caller keeps the hold, pages, and asks again on the next pass — there is no reboot fallback."""
+    launch: the caller keeps the hold, pages, and asks again on the next pass — there is no reboot fallback.
+
+    ``reason`` is the record every power cycle carries (spec 04 I113): a plain string raises TypeError. What the caller
+    left out (the chips with their tray and root port, the hold's start and the rungs it ran) is filled in here from the
+    broker's memory."""
+    PowerCycleReason.require(reason)
+    try:
+        fault_class, bdfs, hold = _power_cycle_context()
+        record = reason.completed(
+            fault_class=fault_class,
+            bdfs=bdfs,
+            tray_map=galaxy_recovery._tray_map_now() if galaxy_recovery is not None else None,
+            hold_since=hold or "",
+            rungs=recovery_mechanism.rungs_since(hold or ""),
+        )
+    except Exception:  # noqa: BLE001 - a record that cannot be completed never holds the cycle: it goes as passed
+        logging.getLogger("tt-device-mcp").exception(
+            "host power cycle: could not complete the reason record from memory"
+        )
+        record = reason
     return await recovery_mechanism._fire_recovery_escalation(
         "power-cycle",
         row_owner="[broker]power-cycle-request",
         label="auto BMC power cycle",
         detail="the reset ladder could not recover the device",
-        fire=_fire_power_cycle,
+        fire=lambda: _fire_power_cycle(record),
         log=log,
-        reason=reason,
+        reason=record,
     )
 
 
@@ -9470,6 +9491,8 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
     # Spec 03 I101: whether chip link reads are being served from the cache now (a check, reset or device start is
     # running), why, and the age of the oldest value served; the hold report's presence then comes from the ports.
     payload["pcie_quiet"] = pcie_quiet.status()
+    # Spec 04 I113: when the broker last asked for a host power cycle, and why (null before the first).
+    payload["last_power_cycle"] = power_cycle_reason.last_power_cycle()
     # Spec 04 I70: an unkillable leftover fencing every reset, with its deadline and rung stage.
     payload["leftover_fence"] = _leftover_fence_payload()
     # Spec 04 I92: the tenant or reader the last pre-reset holder scan refused a reset for.
@@ -10245,7 +10268,20 @@ async def _hold_bound_host_rung(age: float, log, skipped: str = "", *, sweep: bo
             return
     # _note_hold_bound_ladder records the bound's ladder (and clears a kept skip) before any post-ladder ask.
     ladder_ran = not _hold_bound_skip and _hold_bound_ladder_age is not None
-    cause = _hold_bound_cause(age, skipped or _hold_bound_skip, ladder_ran)
+    cause = PowerCycleReason(
+        _hold_bound_cause(age, skipped or _hold_bound_skip, ladder_ran),
+        trigger="pci_wedged" if PCI_WRITER.latched else device_hold_escalation_kind or "hold_deadline",
+        fault_class="unknown",
+        failed_check="PCI write blocked" if PCI_WRITER.latched else "10-min hold bound ladder",
+        failed_result=(
+            str(PCI_WRITER.reason)
+            if PCI_WRITER.latched
+            else f"the ladder was skipped: {skipped or _hold_bound_skip}"
+            if skipped or _hold_bound_skip
+            else "the full ladder did not heal the hold"
+        ),
+        hold_age_sec=int(age),
+    )
     log(f"{cause} — firing the {action}")
     if await _auto_power_cycle_host(log, cause) is False:
         _hold_bound_rung_pending = True

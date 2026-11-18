@@ -38,6 +38,7 @@ from tt_device_mcp.health.monitors import eth, heartbeat, pci
 from tt_device_mcp.health.recovery import RecoveryDeps, offbus_power_cycle, pcie_guard
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy as recovery_galaxy
+from tt_device_mcp.health.recovery.power_cycle_reason import PowerCycleReason
 from tt_device_mcp.health.recovery.stages import power_cycle as power_cycle_stage
 from tt_device_mcp.server import (
     _ensure_async_primitives,
@@ -52,6 +53,14 @@ from tt_device_mcp.server import (
 # aliases are the seams almost every test monkeypatches. probe_platform stays off: a test that
 # cares about the platform declares TT_DEVICE_MCP_RESET_MODE or drives resolve_platform itself.
 srv.boot_broker()
+
+
+
+def power_cycle_reason(text="test power cycle", **fields):
+    """A host power-cycle reason record (spec 04 I113): every path that requests a cycle must pass one."""
+    fields.setdefault("trigger", "test")
+    fields.setdefault("fault_class", "test")
+    return PowerCycleReason(text, **fields)
 
 
 @pytest.fixture(autouse=True)
@@ -1375,7 +1384,7 @@ def armed_power_cycle(monkeypatch):
     fired = []
     monkeypatch.setenv("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1")
     monkeypatch.setattr(privileges, "can_ipmi", lambda: True)
-    monkeypatch.setattr(srv, "_fire_power_cycle", lambda: fired.append("power-cycle"))
+    monkeypatch.setattr(srv, "_fire_power_cycle", lambda *_: fired.append("power-cycle"))
     return fired
 
 

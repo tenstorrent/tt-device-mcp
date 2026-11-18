@@ -13,7 +13,7 @@ import types
 
 import pytest
 
-from tests.conftest import patch_health_event
+from tests.conftest import patch_health_event, power_cycle_reason
 from tests.test_device_safety import (
     _arm_offbus_stuck_hold,
     _ledger_dir,
@@ -314,7 +314,7 @@ async def test_fire_recovery_escalation_reports_whether_the_action_may_have_laun
         detail="the ladder could not recover",
         fire=fire,
         log=lambda m: None,
-        reason="wedge",
+        reason=power_cycle_reason("wedge", trigger="test", fault_class="test"),
     )
     assert got is returns
     assert fired == ([] if case == "ledger write fails" else [case]), "no record, no fire"

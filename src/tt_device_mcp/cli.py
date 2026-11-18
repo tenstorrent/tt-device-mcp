@@ -34,6 +34,7 @@ import threading
 import time
 import unicodedata
 from pathlib import Path
+from typing import Optional
 
 from tt_device_mcp import __version__, device_lock
 from tt_device_mcp.constants import (
@@ -730,10 +731,20 @@ def recent_lines(jobs, color: bool = False) -> list:
     return out
 
 
-def overview_lines(running, queued, rjobs, color: bool = False) -> list:
+def last_power_cycle_line(last: Optional[dict], color: bool = False) -> str:
+    """The `status` line for the broker's last host power cycle: when it was requested and why (spec 04 I113).
+    Empty when the broker has made none."""
+    if not isinstance(last, dict) or not last.get("reason"):
+        return ""
+    outcome = last.get("outcome") or "requested"
+    return _style(f"Last power cycle: {last.get('requested_at', '?')}  {last['reason']}  [{outcome}]", "dim", color)
+
+
+def overview_lines(running, queued, rjobs, color: bool = False, last_power_cycle: Optional[dict] = None) -> list:
     """The full overview — RUNNING, QUEUED, RECENT — as text lines. The single
     renderer behind both `status` (one frame) and `watch` (looped). RUNNING/QUEUED
-    keep the per-section icon+runtime layout; RECENT is the durable history table."""
+    keep the per-section icon+runtime layout; RECENT is the durable history table. The last host power cycle (time and
+    reason), when the broker has made one, closes it."""
     from datetime import datetime
 
     max_w = max([5] + [len(_fmt_owner(j.get("owner", "?"))[1]) for j in running + queued])
@@ -779,6 +790,9 @@ def overview_lines(running, queued, rjobs, color: bool = False) -> list:
         lines.append("")
         lines.append(_style(f"RECENT (last {len(rjobs)})", "hdr", color))
         lines.extend(recent_lines(rjobs, color))
+    cycle = last_power_cycle_line(last_power_cycle, color)
+    if cycle:
+        lines.extend(["", cycle])
     return lines
 
 
@@ -791,7 +805,9 @@ def _overview(port, limit=20, color=False):
         return None, qs["error"]
     recent = mcp_tool_call(port, "tt_device_recent_jobs", {"limit": limit})
     rjobs = recent.get("jobs", []) if isinstance(recent, dict) else []
-    return overview_lines(qs.get("running", []), qs.get("queued", []), rjobs, color), None
+    health = api_call(port, "/health", method="GET", timeout=10)
+    last = health.get("last_power_cycle") if isinstance(health, dict) else None
+    return overview_lines(qs.get("running", []), qs.get("queued", []), rjobs, color, last), None
 
 
 def cmd_status(args) -> int:

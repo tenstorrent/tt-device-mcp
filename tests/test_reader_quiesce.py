@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from tests.conftest import stub_device_pollers
+from tests.conftest import power_cycle_reason, stub_device_pollers
 from tests.test_device_safety import _short_poller_bound, _systemctl_scripted, _systemctl_with_units
 from tt_device_mcp import health
 from tt_device_mcp import server as srv
@@ -425,7 +425,7 @@ async def test_a_power_cycle_request_stops_readers_before_it_fires(monkeypatch, 
         detail="the ladder could not recover",
         fire=fire,
         log=lambda m: None,
-        reason="wedge",
+        reason=power_cycle_reason("wedge", trigger="test", fault_class="test"),
     )
 
     assert seen == [[False]], "stopped before the cycle fires"
@@ -459,7 +459,7 @@ async def test_an_unstoppable_reader_never_blocks_the_power_cycle_request(monkey
         detail="the ladder could not recover",
         fire=lambda: fired.append(True),
         log=lambda m: None,
-        reason="wedge",
+        reason=power_cycle_reason("wedge", trigger="test", fault_class="test"),
     )
     assert got is True and fired == [True]
 

@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
@@ -30,7 +31,8 @@ from tt_device_mcp.health.monitors import pci
 from tt_device_mcp.health.monitors.heartbeat import returned_chips
 from tt_device_mcp.health.pci_writer import PCI_WRITER, PciWedged
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
-from tt_device_mcp.health.recovery import ipmi_guard
+from tt_device_mcp.health.recovery import ipmi_guard, power_cycle_reason
+from tt_device_mcp.health.recovery.power_cycle_reason import PowerCycleReason
 
 # System-broker resets run as transient scopes under this prefix so PID 1 owns them.
 # A daemon without systemd uses the local lock below for the same restart-adoption contract.
@@ -548,7 +550,10 @@ class RecoveryMechanism:
         self._set_device_pollers = set_device_pollers
         self._set_device_op_detail = set_device_op_detail
         self._begin_action_row = begin_action_row
-        self._write_action_log = write_action_log
+        # Spec 04 I113: every reset command the broker logs is also listed, so a power cycle's record names the
+        # rungs the hold ran. The newest are kept.
+        self.rung_history: deque = deque(maxlen=64)
+        self._write_action_log = self._listing_action_log(write_action_log)
         self._device_hold_episode_since = device_hold_episode_since
         self._local_reset_dir = local_reset_dir or health_dir
         # The broker's isolated-chip set, re-read after every reset's rescan (drop_returned_isolated).
@@ -2462,6 +2467,10 @@ class RecoveryMechanism:
         if verdict == "refuted":
             mark.update(took_host_down=False, cycle_refuted=cause)
         mark.update(self._os_first_shutdown_marks(argv, verdict, sel_off, at, btime))
+        # Spec 04 I113: the record written before the reboot, read back and put on the confirmation.
+        kept = power_cycle_reason.record_for_boot(at - 1, btime)
+        if kept is not None:
+            power_cycle_reason.mark_outcome(verdict, kept["requested_epoch"])
         rec.update(mark)
         try:
             self._rewrite_ledger_marks({(rec.get("boot_id"), rec.get("at_epoch")): mark})
@@ -2475,14 +2484,26 @@ class RecoveryMechanism:
                     extra[k] = mark[k]
             if cause is None:
                 extra["restart_cause_unavailable"] = cause_why
-            health_event("power_cycle_confirmed", requested_at=requested, restart_cause=cause, **extra)
+            health_event(
+                "power_cycle_confirmed",
+                requested_at=requested,
+                restart_cause=cause,
+                **extra,
+                **self._reason_fields(kept, rec),
+            )
         elif verdict == "unconfirmed":
             log.warning(
                 f"power cycle requested at {requested} not confirmed by the BMC (restart cause "
                 f"{cause or 'unreadable: ' + cause_why}): counted as a cycle (spec 04 I88)"
             )
             extra = {"restart_cause_unavailable": cause_why} if cause is None else {}
-            health_event("power_cycle_unconfirmed", requested_at=requested, restart_cause=cause, **extra)
+            health_event(
+                "power_cycle_unconfirmed",
+                requested_at=requested,
+                restart_cause=cause,
+                **extra,
+                **self._reason_fields(kept, rec),
+            )
         else:
             retry = self.power_cycle_miss_state(ledger, now_epoch=now_epoch)
             retry_at = _local_time(retry["until"]) if retry else "the next escalation"
@@ -2494,6 +2515,14 @@ class RecoveryMechanism:
             )
             self._journal_missed_power_cycles([rec], ledger, now_epoch, refuted=cause)
         return verdict
+
+    @staticmethod
+    def _reason_fields(kept: Optional[dict], rec: dict) -> dict:
+        """What the cycle's confirmation says about why it was requested (spec 04 I113): the record read back from
+        the file written before the reboot, else the ledger row's one-line reason."""
+        if kept is not None:
+            return {"reason": kept.get("reason"), "power_cycle_reason": kept}
+        return {"reason": rec.get("reason")} if rec.get("reason") else {}
 
     def _os_first_shutdown_marks(
         self, argv: list, verdict: str, sel_off: Optional[float], at: float, btime: float
@@ -2991,8 +3020,31 @@ class RecoveryMechanism:
         except OSError:
             pass
 
+    def _listing_action_log(self, write_action_log):
+        """``write_action_log`` that also lists the command in :attr:`rung_history` (spec 04 I113). Never raises."""
+
+        def logged(owner, command, runtime_sec, status, exit_code, *args, **kwargs):
+            try:
+                ended = status if exit_code in (None, 0) else f"{status} rc {exit_code}"
+                self.rung_history.append(power_cycle_reason.rung_row(time.time(), command, ended))
+            except Exception:  # noqa: BLE001 - a list for a log record; never stops the action log
+                pass
+            return write_action_log(owner, command, runtime_sec, status, exit_code, *args, **kwargs)
+
+        return logged
+
+    def rungs_since(self, hold_since: str) -> list:
+        """The rungs this hold ran (spec 04 I113): the listed commands from the hold's start; all kept ones when the
+        start is unknown."""
+        rows = list(self.rung_history)
+        try:
+            floor = datetime.fromisoformat(hold_since).astimezone().timestamp() if hold_since else None
+        except ValueError:
+            floor = None
+        return [r for r in rows if floor is None or r["epoch"] >= floor]
+
     async def _fire_recovery_escalation(
-        self, action: str, *, row_owner: str, label: str, detail: str, fire, log, reason: str
+        self, action: str, *, row_owner: str, label: str, detail: str, fire, log, reason: PowerCycleReason
     ) -> bool:
         """Shared body of the host-level recovery rung (the BMC power cycle, the only host rung, spec 04 I71). Records
         the escalation durably — the rate limiter — and leaves a visible jobs-list row BEFORE the action takes the box
@@ -3009,6 +3061,7 @@ class RecoveryMechanism:
         Returns False when the action certainly did not launch (the record could not be written, or ``fire`` raised
         anything but a timeout): the caller keeps the hold, pages once per episode and asks again on the next pass (spec
         04 I71). True when it was issued or timed out and may still act."""
+        reason = PowerCycleReason.require(reason)  # spec 04 I113: no host power cycle without its record
         ev = action.replace("-", "_")
         stage = _ACTION_TO_STAGE[action]
         if action == "power-cycle" and self.power_cycle_journal is not None:
@@ -3042,7 +3095,7 @@ class RecoveryMechanism:
 
         pcie_guard.close_offbus_reset_before_host_action(action, log)
         self._write_action_log(row_owner, f"{label} — {reason}", 0.0, action, None)
-        health_event(f"auto_{ev}_request", reason=reason)
+        health_event(f"auto_{ev}_request", reason=str(reason), power_cycle_reason=reason.as_dict())
         log(f"{label.upper()}: {detail} ({reason}); opted in + within limits — requesting it now")
         try:
             await asyncio.to_thread(fire)

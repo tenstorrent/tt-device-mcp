@@ -24,6 +24,7 @@ from tests.conftest import (
     fsm_healthy,
     patch_health_event,
     patch_recovery,
+    power_cycle_reason,
     step_sampler_clock,
     stub_device_pollers,
 )
@@ -6106,9 +6107,11 @@ async def test_auto_power_cycle_records_durably_before_it_fires(monkeypatch, tmp
 
     order = []
     monkeypatch.setattr(srv.recovery_mechanism, "record_auto_recovery", lambda *a, **k: order.append("record") or True)
-    monkeypatch.setattr(srv, "_fire_power_cycle", lambda: order.append("fire"))
+    monkeypatch.setattr(srv, "_fire_power_cycle", lambda *_: order.append("fire"))
 
-    await srv._auto_power_cycle_host(lambda _m: None, "reset and reboot could not recover it")
+    await srv._auto_power_cycle_host(
+        lambda _m: None, power_cycle_reason("reset and reboot could not recover it")
+    )
 
     assert order == ["record", "fire"], "recorded the escalation before pulling power"
     rows = [r for r in srv._recent_jobs(20) if r["owner"] == "[broker]power-cycle-request"]
@@ -6127,9 +6130,11 @@ async def test_auto_power_cycle_aborts_when_the_ledger_cannot_be_written(monkeyp
     monkeypatch.setattr(srv.recovery_mechanism, "record_auto_recovery", lambda *a, **k: False)
 
     fired = []
-    monkeypatch.setattr(srv, "_fire_power_cycle", lambda: fired.append(True))
+    monkeypatch.setattr(srv, "_fire_power_cycle", lambda *_: fired.append(True))
 
-    await srv._auto_power_cycle_host(lambda _m: None, "reset and reboot could not recover it")
+    await srv._auto_power_cycle_host(
+        lambda _m: None, power_cycle_reason("reset and reboot could not recover it")
+    )
 
     assert fired == [], "must NOT power-cycle when the escalation could not be recorded"
     assert [r for r in srv._recent_jobs(20) if r["owner"] == "[broker]power-cycle-request"] == []
@@ -12349,7 +12354,7 @@ async def test_a_power_cycle_that_fails_to_launch_retracts_its_ledger_entry(monk
         detail="reset+reboot could not recover",
         fire=failing_fire,
         log=logs.append,
-        reason="wedge",
+        reason=power_cycle_reason("wedge"),
     )
 
     ledger = srv.health_dir() / recovery_base.AUTO_RECOVERY_LEDGER
