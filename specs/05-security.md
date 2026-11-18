@@ -103,8 +103,9 @@ that did not come through the broker at all.
   drop-in already sets is not added again) and runs `daemon-reload`; it restarts the broker only
   when the group line is new or the running broker lacks it. A flip line added alone takes
   effect at the broker's next restart, so a repeat `lock` on a locked host never restarts the
-  broker (a restart reruns the startup gate, fabric pass included, on a healthy device). Both
-  are idempotent.
+  broker (a restart reruns the startup gate, fabric pass included, on a healthy device). The
+  update's re-render keeps both lines a host's unit has, so a `lock` after an `unlock` survives
+  the next update. Both are idempotent.
   *Opt-in through host config.* `TTDEV_LOCK=1` in `/etc/default/tt-device-broker` makes the
   update path's `apply-host-config.sh` install the rule (reload only), render the unit's
   `TT_DEVICE_MCP_DEVICE_GROUP=ttdev` and `TT_DEVICE_MCP_DEVICE_LOCK=1` lines (taken up by the

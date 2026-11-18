@@ -329,6 +329,9 @@ def test_lock_names_members_it_is_not_effective_for(tmp_path, monkeypatch, capsy
 # --- item 5: opt-in via TTDEV_LOCK --------------------------------------------------------------
 
 
+_REAL_RUN = subprocess.run  # the sandbox below stubs subprocess.run for the CLI; the render must stay real
+
+
 def _render(tmp_path, defaults: dict, unit_text: str | None = None) -> str:
     conf = tmp_path / "default"
     conf.write_text("".join(f"{k}={v}\n" for k, v in defaults.items()))
@@ -341,7 +344,7 @@ def _render(tmp_path, defaults: dict, unit_text: str | None = None) -> str:
         "TTDEV_UNIT_PATH": str(unit),
         "TTDEV_DMI_PRODUCT_FILE": str(tmp_path / "absent.product_name"),
     }
-    r = subprocess.run(
+    r = _REAL_RUN(
         ["bash", str(_APPLY), "--print-unit", str(_REPO)], env=env, capture_output=True, text=True, timeout=60
     )
     assert r.returncode == 0, r.stderr
@@ -407,6 +410,23 @@ def test_unlock_clears_the_opt_in_and_both_unit_lines(tmp_path, monkeypatch, cap
     assert "TT_DEVICE_MCP_DEVICE_GROUP" not in left and "TT_DEVICE_MCP_DEVICE_LOCK" not in left
     out = capsys.readouterr().out
     assert "TTDEV_LOCK=0" in out and "TT_DEVICE_MCP_DEVICE_LOCK" in out
+
+
+def test_unit_survives_an_update_render_after_unlock_then_lock(tmp_path, monkeypatch):
+    # `unlock` leaves TTDEV_LOCK=0 in /etc/default; the update's re-render must keep what `lock` restored.
+    conf, unit = _unlock_sandbox(tmp_path, monkeypatch, "TTDEV_VENV=/v\nTTDEV_LOCK=1\n")
+    assert cli.cmd_unlock(SimpleNamespace()) == 0
+    assert "TTDEV_LOCK=0" in conf.read_text()
+    assert cli._set_service_device_group(True) is True
+    rendered = _render(tmp_path, {**_base(tmp_path), "TTDEV_LOCK": "0"}, unit_text=unit.read_text()).splitlines()
+    assert rendered.count(_GROUP_LINE) == 1 and rendered.count(_LOCK_LINE) == 1
+
+
+def test_update_render_after_unlock_drops_both_lines(tmp_path, monkeypatch):
+    conf, unit = _unlock_sandbox(tmp_path, monkeypatch, "TTDEV_LOCK=1\n")
+    assert cli.cmd_unlock(SimpleNamespace()) == 0
+    rendered = _render(tmp_path, {**_base(tmp_path), "TTDEV_LOCK": "0"}, unit_text=unit.read_text())
+    assert "TT_DEVICE_MCP_DEVICE_GROUP" not in rendered and "TT_DEVICE_MCP_DEVICE_LOCK" not in rendered
 
 
 def test_lock_after_unlock_restores_both_unit_lines(tmp_path, monkeypatch):

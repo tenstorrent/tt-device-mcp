@@ -1601,7 +1601,9 @@ def cmd_lock(args) -> int:
     if not changed and _broker_runs_with_device_group():
         print(f"Broker env already has TT_DEVICE_MCP_DEVICE_GROUP={_LOCK_GROUP} (already locked); not restarting it.")
         if flip_pending:
-            print("Added TT_DEVICE_MCP_DEVICE_LOCK=1 to the unit; the lock flip starts at the next broker restart.")
+            print(
+                "Added TT_DEVICE_MCP_DEVICE_LOCK=1 to the unit; the lock flip starts at the next broker restart unless a later drop-in overrides it."
+            )
     else:
         restart_rc = subprocess.run(["systemctl", "restart", "tt-device-broker"], check=False).returncode
         if restart_rc != 0:
