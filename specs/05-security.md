@@ -114,8 +114,8 @@ that did not come through the broker at all.
   The mode flip itself (`udevadm trigger --subsystem-match=tenstorrent`) is the broker's, run only
   while no job is running and no re-adopted scope is live: a job started before the restart
   still carries its old gid and would get EACCES on its next open. `TTDEV_LOCK` unset or `0`
-  leaves the host exactly as before (an existing unit's device-group line is preserved, nothing
-  is written).
+  leaves the host exactly as before (an existing unit's `TT_DEVICE_MCP_DEVICE_GROUP` and
+  `TT_DEVICE_MCP_DEVICE_LOCK` lines are preserved, nothing is written).
   *Drift.* Once the lock is in effect (every node seen locked), reconcile checks mode and group on
   every node; on drift it re-triggers udev and stats again. Drift that persists is logged, recorded
   as a `device_lock_drift` health event and shown in `/health` (`device_lock`). Nothing reverts
