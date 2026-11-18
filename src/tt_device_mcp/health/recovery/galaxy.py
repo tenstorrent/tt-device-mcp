@@ -73,8 +73,8 @@ from tt_device_mcp.health.recovery.base import (
     pci_rescan,
     reenumerate_withheld,
 )
-from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
 from tt_device_mcp.health.recovery.power_cycle_reason import PowerCycleReason, build_chips
+from tt_device_mcp.health.recovery.stages.bridge_reset import gone_chip_bridge_reset_enabled
 from tt_device_mcp.health.recovery.stages.power_cycle import note_cycle_possible
 
 _logger = logging.getLogger("tt-device-mcp")

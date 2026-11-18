@@ -158,6 +158,7 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     Evidence,
     GalaxyRecovery,
     HealthState,
+    PowerCycleReason,
     RecoveryDeps,
     Verdict,
     _declared_reset_mode,
@@ -214,13 +215,12 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     note_power_cycle_trigger,
     offbus_chip_ids,
     offbus_count,
-    PowerCycleReason,
     offbus_power_cycle,
-    power_cycle_reason,
     pci_bus_number,
     pcie_aer,
     pcie_guard_at_start,
     pcie_quiet,
+    power_cycle_reason,
     previous_boot_bus_locks,
     previous_boot_error,
     read_health_events,
@@ -10276,9 +10276,11 @@ async def _hold_bound_host_rung(age: float, log, skipped: str = "", *, sweep: bo
         failed_result=(
             str(PCI_WRITER.reason)
             if PCI_WRITER.latched
-            else f"the ladder was skipped: {skipped or _hold_bound_skip}"
-            if skipped or _hold_bound_skip
-            else "the full ladder did not heal the hold"
+            else (
+                f"the ladder was skipped: {skipped or _hold_bound_skip}"
+                if skipped or _hold_bound_skip
+                else "the full ladder did not heal the hold"
+            )
         ),
         hold_age_sec=int(age),
     )

@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.conftest import GALAXY_BUS_IDS, patch_health_event, power_cycle_reason
-from tests.test_classac_power_cycle_direct import EXPECTED, _beats_without, _gate, _off, rig  # noqa: F401 - the fixture
+from tests.test_classac_power_cycle_direct import EXPECTED, _beats_without, _gate, _off, rig  # noqa: F401
 from tests.test_power_cycle_os_first import BOOT_NOW, CYCLE, _steps, booted, escalation, os_first  # noqa: F401
 from tt_device_mcp import cli
 from tt_device_mcp import server as srv

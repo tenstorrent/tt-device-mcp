@@ -6109,9 +6109,7 @@ async def test_auto_power_cycle_records_durably_before_it_fires(monkeypatch, tmp
     monkeypatch.setattr(srv.recovery_mechanism, "record_auto_recovery", lambda *a, **k: order.append("record") or True)
     monkeypatch.setattr(srv, "_fire_power_cycle", lambda *_: order.append("fire"))
 
-    await srv._auto_power_cycle_host(
-        lambda _m: None, power_cycle_reason("reset and reboot could not recover it")
-    )
+    await srv._auto_power_cycle_host(lambda _m: None, power_cycle_reason("reset and reboot could not recover it"))
 
     assert order == ["record", "fire"], "recorded the escalation before pulling power"
     rows = [r for r in srv._recent_jobs(20) if r["owner"] == "[broker]power-cycle-request"]
@@ -6132,9 +6130,7 @@ async def test_auto_power_cycle_aborts_when_the_ledger_cannot_be_written(monkeyp
     fired = []
     monkeypatch.setattr(srv, "_fire_power_cycle", lambda *_: fired.append(True))
 
-    await srv._auto_power_cycle_host(
-        lambda _m: None, power_cycle_reason("reset and reboot could not recover it")
-    )
+    await srv._auto_power_cycle_host(lambda _m: None, power_cycle_reason("reset and reboot could not recover it"))
 
     assert fired == [], "must NOT power-cycle when the escalation could not be recorded"
     assert [r for r in srv._recent_jobs(20) if r["owner"] == "[broker]power-cycle-request"] == []

@@ -55,7 +55,6 @@ from tt_device_mcp.server import (
 srv.boot_broker()
 
 
-
 def power_cycle_reason(text="test power cycle", **fields):
     """A host power-cycle reason record (spec 04 I113): every path that requests a cycle must pass one."""
     fields.setdefault("trigger", "test")
