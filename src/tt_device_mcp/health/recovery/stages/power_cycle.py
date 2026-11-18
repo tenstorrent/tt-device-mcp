@@ -17,7 +17,7 @@ from typing import Callable, Optional
 
 from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.recovery import power_cycle_reason as _reason_record
-from tt_device_mcp.health.recovery.power_cycle_reason import PowerCycleReason
+from tt_device_mcp.health.recovery.power_cycle_reason import PowerCycleReason, _one_line
 
 _logger = logging.getLogger("tt-device-mcp")
 
@@ -228,10 +228,6 @@ def os_first_unavailable() -> str:
     if not os.access("/bin/bash", os.X_OK):
         return "/bin/bash not found (the fallback needs it)"
     return ""
-
-
-def _one_line(reason: str) -> str:
-    return " ".join(str(reason).split())[:300]
 
 
 # Spec 04 I88. What asked for the cycle, journaled just before the fallback unit starts: the broker's

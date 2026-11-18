@@ -31,7 +31,7 @@ POWER_CYCLE_REASON_FILE = "power_cycle_reason.json"
 MAX_RUNGS = 12
 
 
-def _iso(epoch: float) -> str:
+def _utc_iso(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -163,7 +163,7 @@ class PowerCycleReason(str):
             "hold_since": self.hold_since,
             "hold_age_sec": self.hold_age_sec,
             "requested_epoch": round(self.requested_epoch, 3),
-            "requested_at": _iso(self.requested_epoch),
+            "requested_at": _utc_iso(self.requested_epoch),
         }
 
     def line(self) -> str:
@@ -191,7 +191,7 @@ class PowerCycleReason(str):
 
 def rung_row(epoch: float, command: str, status: str) -> dict:
     """One rung the hold ran, as the record lists it: when, its command and how it ended."""
-    return {"at": _iso(epoch), "epoch": round(epoch, 1), "rung": _one_line(command, 80), "status": status}
+    return {"at": _utc_iso(epoch), "epoch": round(epoch, 1), "rung": _one_line(command, 80), "status": status}
 
 
 def write_state(reason: PowerCycleReason, *, unit: str = "") -> float:
