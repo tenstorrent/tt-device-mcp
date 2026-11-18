@@ -409,6 +409,36 @@ def test_unlock_clears_the_opt_in_and_both_unit_lines(tmp_path, monkeypatch, cap
     assert "TTDEV_LOCK=0" in out and "TT_DEVICE_MCP_DEVICE_LOCK" in out
 
 
+def test_lock_after_unlock_restores_both_unit_lines(tmp_path, monkeypatch):
+    conf, unit = _unlock_sandbox(tmp_path, monkeypatch, "TTDEV_LOCK=1\n")
+    locked = unit.read_text()
+    assert cli.cmd_unlock(SimpleNamespace()) == 0
+    assert cli._set_service_device_group(True) is True
+    lines = unit.read_text().splitlines()
+    assert lines.count(_GROUP_LINE) == 1 and lines.count(_LOCK_LINE) == 1
+    assert sorted(unit.read_text().splitlines()) == sorted(locked.splitlines())
+    assert cli._set_service_device_group(True) is False  # a repeat changes nothing
+    assert unit.read_text().splitlines().count(_LOCK_LINE) == 1
+
+
+def test_lock_on_a_unit_with_both_lines_is_a_no_op(tmp_path, monkeypatch):
+    _, unit = _unlock_sandbox(tmp_path, monkeypatch, "TTDEV_LOCK=1\n")
+    before = unit.read_text()
+    assert cli._set_service_device_group(True) is False
+    assert unit.read_text() == before
+
+
+def test_lock_with_the_group_in_a_drop_in_adds_no_duplicate(tmp_path, monkeypatch):
+    _, unit = _unlock_sandbox(tmp_path, monkeypatch, "TTDEV_LOCK=1\n")
+    assert cli.cmd_unlock(SimpleNamespace()) == 0
+    dropin = Path(str(unit) + ".d")
+    dropin.mkdir()
+    (dropin / "group.conf").write_text(f"[Service]\n{_GROUP_LINE}\n")
+    assert cli._set_service_device_group(True) is False  # the group needs no restart: only the flip line is new
+    lines = unit.read_text().splitlines()
+    assert _GROUP_LINE not in lines and lines.count(_LOCK_LINE) == 1
+
+
 def test_unlock_leaves_a_host_without_the_opt_in_alone(tmp_path, monkeypatch):
     conf, _ = _unlock_sandbox(tmp_path, monkeypatch, "TTDEV_VENV=/v\n")
     assert cli.cmd_unlock(SimpleNamespace()) == 0

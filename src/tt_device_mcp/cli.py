@@ -1393,9 +1393,8 @@ def _udev_reload() -> bool:
     return reload_rc == 0 and trigger_rc == 0
 
 
-def _configured_device_group() -> bool:
-    """True if the broker unit or one of its drop-ins already sets ``TT_DEVICE_MCP_DEVICE_GROUP`` to the lock group."""
-    want = f"TT_DEVICE_MCP_DEVICE_GROUP={_LOCK_GROUP}"
+def _unit_sets_env(assignment: str) -> bool:
+    """True if the broker unit or one of its drop-ins already has ``Environment=<assignment>``."""
     paths = [Path(_BROKER_UNIT), *sorted(Path(_BROKER_UNIT + ".d").glob("*.conf"))]
     for path in paths:
         try:
@@ -1410,9 +1409,14 @@ def _configured_device_group() -> bool:
                 assignments = shlex.split(value)
             except ValueError:
                 continue
-            if want in assignments:
+            if assignment in assignments:
                 return True
     return False
+
+
+def _configured_device_group() -> bool:
+    """True if the broker unit or one of its drop-ins already sets ``TT_DEVICE_MCP_DEVICE_GROUP`` to the lock group."""
+    return _unit_sets_env(f"TT_DEVICE_MCP_DEVICE_GROUP={_LOCK_GROUP}")
 
 
 def _broker_runs_with_device_group() -> bool:
@@ -1437,22 +1441,40 @@ def _broker_runs_with_device_group() -> bool:
 
 
 def _set_service_device_group(enable: bool) -> bool:
-    """Add/remove ``Environment=TT_DEVICE_MCP_DEVICE_GROUP=ttdev`` in the broker unit so privsep jobs run with gid=ttdev
-    (DAC access to the locked node); daemon-reload. Removing also drops ``TT_DEVICE_MCP_DEVICE_LOCK``, the opt-in's flip
-    switch. Returns True only if it changed the unit. Enabling is a no-op when the unit or a drop-in already sets the
-    group."""
-    text = Path(_BROKER_UNIT).read_text()
-    has = "TT_DEVICE_MCP_DEVICE_GROUP" in text
-    line = f"Environment=TT_DEVICE_MCP_DEVICE_GROUP={_LOCK_GROUP}\n"
-    if enable and not has and not _configured_device_group():
-        text = text.replace("Environment=TT_DEVICE_MCP_PRIVSEP=1\n", "Environment=TT_DEVICE_MCP_PRIVSEP=1\n" + line, 1)
-    elif not enable and any(k in text for k in _LOCK_UNIT_KEYS):
+    """Add/remove the lock's unit lines in the broker unit; daemon-reload, never a restart.
+
+    Enabling adds ``Environment=TT_DEVICE_MCP_DEVICE_GROUP=ttdev`` (privsep jobs run with gid=ttdev, DAC access to the
+    locked node) and ``Environment=TT_DEVICE_MCP_DEVICE_LOCK=1`` (the broker's between-jobs flip switch), as
+    ``apply-host-config.sh`` renders them; a line the unit or a drop-in already sets is not added again. Disabling
+    removes both. Returns True only if the group line changed: that is the change a running broker needs a restart
+    for. A flip line added alone takes effect at the broker's next restart."""
+    original = text = Path(_BROKER_UNIT).read_text()
+    group_line = f"Environment=TT_DEVICE_MCP_DEVICE_GROUP={_LOCK_GROUP}\n"
+    if enable:
+        add_group = "TT_DEVICE_MCP_DEVICE_GROUP" not in text and not _configured_device_group()
+        add_flip = not _unit_sets_env("TT_DEVICE_MCP_DEVICE_LOCK=1")
+        lines = (group_line if add_group else "") + ("Environment=TT_DEVICE_MCP_DEVICE_LOCK=1\n" if add_flip else "")
+        if not lines:
+            return False
+        # The flip line follows the unit's own group line when there is one, as the host config renders the pair.
+        anchors = ["Environment=TT_DEVICE_MCP_PRIVSEP=1\n", "[Service]\n"]
+        for anchor in ([] if add_group else [group_line]) + anchors:
+            if anchor in text:
+                text = text.replace(anchor, anchor + lines, 1)
+                break
+        else:
+            return False
+        changed_group = add_group
+    elif any(k in text for k in _LOCK_UNIT_KEYS):
         text = "".join(ln for ln in text.splitlines(keepends=True) if not any(k in ln for k in _LOCK_UNIT_KEYS))
+        changed_group = True
     else:
+        return False
+    if text == original:
         return False
     Path(_BROKER_UNIT).write_text(text)
     subprocess.run(["systemctl", "daemon-reload"], check=False)
-    return True
+    return changed_group
 
 
 def _clear_lock_opt_in() -> bool:
@@ -1574,9 +1596,12 @@ def cmd_lock(args) -> int:
     # Service env first: privsep jobs must already get gid=ttdev before the node locks.
     # A restart reruns the startup gate (fabric pass included), so restart only when the
     # broker's env actually changes — a repeat `lock` must leave a healthy broker alone.
+    flip_pending = not _unit_sets_env("TT_DEVICE_MCP_DEVICE_LOCK=1")
     changed = _set_service_device_group(True)
     if not changed and _broker_runs_with_device_group():
         print(f"Broker env already has TT_DEVICE_MCP_DEVICE_GROUP={_LOCK_GROUP} (already locked); not restarting it.")
+        if flip_pending:
+            print("Added TT_DEVICE_MCP_DEVICE_LOCK=1 to the unit; the lock flip starts at the next broker restart.")
     else:
         restart_rc = subprocess.run(["systemctl", "restart", "tt-device-broker"], check=False).returncode
         if restart_rc != 0:
