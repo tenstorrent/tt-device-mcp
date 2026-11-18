@@ -473,7 +473,6 @@ def _route(
     reboot_blocked: bool,
     holding_fabric_unverified: bool = False,
     dispatch_reset_due: bool = False,
-    eth_timeout_reset_due: bool = False,
     kill_reset_due: bool = False,
     arc_not_ready: int = 0,
 ) -> str:
@@ -535,9 +534,8 @@ def _route(
     * ``dispatch_reset_due`` with every chip present and none frozen -> ``STAGE_SMI_RESET``: the
       fabric passed traffic but mesh dispatch failed, which no self-heal clears; the caller grants
       this once per hold episode, and the full check, fabric included, decides the release
-      (spec 03 I55). ``eth_timeout_reset_due`` takes the same rung: a clean post-job eth read timed
-      out with no verdict on a present mesh (spec 03 I61), and so does ``kill_reset_due``: a job the
-      broker stopped mid-run, by its timeout or a requested kill (spec 03 I69).
+      (spec 03 I55). ``kill_reset_due`` takes the same rung: a job the broker stopped mid-run, by
+      its timeout or a requested kill (spec 03 I69).
     * ``arc_not_ready > 0`` with nothing off the bus -> ``STAGE_SMI_RESET`` (spec 04 I105): every
       chip is on the bus and at least one reads ENODATA on a bound, link-up endpoint (I24), so the
       driver is waiting for the post-reset init only the mesh reset (POST_RESET, board re-init)
@@ -588,7 +586,7 @@ def _route(
         return DEFER
     if sbr_candidates > 0 and last_action != STAGE_BRIDGE_RESET:
         return STAGE_BRIDGE_RESET
-    if (dispatch_reset_due or eth_timeout_reset_due or kill_reset_due) and off_bus == 0 and frozen_chips == 0:
+    if (dispatch_reset_due or kill_reset_due) and off_bus == 0 and frozen_chips == 0:
         return STAGE_SMI_RESET
     if arc_not_ready > 0 and off_bus == 0:
         return STAGE_SMI_RESET
@@ -1088,7 +1086,6 @@ class GalaxyRecovery(Recovery):
             reboot_blocked=reboot_blocked,
             holding_fabric_unverified=ev.holding_fabric_unverified,
             dispatch_reset_due=ev.dispatch_reset_due,
-            eth_timeout_reset_due=ev.eth_timeout_reset_due,
             kill_reset_due=ev.kill_reset_due,
             arc_not_ready=ev.arc_not_ready,
         )
