@@ -576,6 +576,52 @@ def test_privileged_commands_carry_a_root_side_kill(fake, monkeypatch):
     ]
 
 
+def test_the_diag_runs_under_a_wrapper_that_owns_its_process_group(fake, monkeypatch):
+    monkeypatch.setattr(cpld_dump, "SUDO", ("sudo", "-n"))
+    monkeypatch.setattr(cpld_dump.os, "geteuid", lambda: 1000)
+    argv = cpld_dump._diag_argv("/s.sh", 40.0)
+    assert argv == [
+        "sudo", "-n", "timeout", "-s", "KILL", "42", "bash", "-c", cpld_dump.DIAG_BOUND, "40", "bash", "/s.sh", "DIAG",
+    ]  # fmt: skip
+    # The sudoers line pins the wrapper text as it stands: none of the characters sudoers escapes.
+    assert not set(cpld_dump.DIAG_BOUND) & set(",:=\\")
+    monkeypatch.setattr(cpld_dump.os, "geteuid", lambda: 0)
+    assert cpld_dump._diag_argv("/s.sh", 0.5)[:7] == ["timeout", "-s", "KILL", "3", "bash", "-c", cpld_dump.DIAG_BOUND]
+
+
+# A timeout that, like uutils', kills only its direct child at the bound and leaves the rest of the tree.
+DIRECT_CHILD_TIMEOUT = """#!{py}
+import subprocess, sys
+a = sys.argv[1:]
+assert a[:2] == ["-s", "KILL"]
+p = subprocess.Popen(a[3:])
+try:
+    sys.exit(p.wait(timeout=float(a[2])))
+except subprocess.TimeoutExpired:
+    p.kill()
+    p.wait()
+    sys.exit(124)
+"""
+
+
+@pytest.mark.parametrize("variant", [HUNG_DIAG, LATE_DIAG], ids=["hung", "late"])
+def test_the_tree_is_gone_when_timeout_kills_only_its_direct_child(as_user, monkeypatch, variant):
+    bindir = as_user["tmp"] / "direct-timeout"
+    bindir.mkdir()
+    (bindir / "timeout").write_text(DIRECT_CHILD_TIMEOUT.format(py=sys.executable))
+    (bindir / "timeout").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    _use_diag(as_user, monkeypatch, variant)
+    monkeypatch.setenv("TT_DEVICE_MCP_CPLD_DUMP_CAP_SEC", "1")
+    rec = cpld_dump.take_dump("off_bus", "ep-direct", lambda _s: None)
+    diag, child = _pid(as_user, "diag"), _pid(as_user, "child")
+    assert not _alive(diag) and not _alive(child), "the DIAG's tree outlived the cap"
+    assert "diag_alive" not in rec and rec["rc"] is None and rec["summary"].startswith("timed out")
+    restores = (as_user["pids"] / "restores").read_text().splitlines()
+    assert len(restores) == 4 and all(r.endswith("alive=False") for r in restores), restores
+    assert all(v["restored"] for v in rec["index_0x50"].values())
+
+
 def test_a_hung_diag_behind_sudo_is_gone_when_the_dump_returns(as_user, monkeypatch):
     _use_diag(as_user, monkeypatch, HUNG_DIAG)
     monkeypatch.setenv("TT_DEVICE_MCP_CPLD_DUMP_CAP_SEC", "1")
