@@ -17,7 +17,7 @@ TTSMI="${TTDEV_VENV:-/opt/tt-device-broker/venv}/bin/tt-smi"
 
 # Allowlist of read-only flags; bare (no args) = the interactive dashboard.
 # Any other flag (reset/config/blinky) is refused.
-SAFE=" -ls --list -s --snapshot --snapshot_no_tty -v --version -l --local -f --filename -h --help "
+SAFE=" -ls --list -s --snapshot --snapshot_no_tty -v --version -l --local -h --help "
 for a in "$@"; do
     case "$a" in
         -*) case "$SAFE" in *" $a "*) ;; *) echo "tt-smi-ro: '$a' is not allowed (read-only)" >&2; exit 2;; esac ;;

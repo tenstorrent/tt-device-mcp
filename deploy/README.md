@@ -33,6 +33,35 @@ tt-device-mcp    # piped stdin -> stdio MCP adapter; tty -> CLI help
 
 **Never add interactive users to `ttdev`** — that re-opens bare-metal access.
 
+**Off-bus power cycle (spec 04 I27).** Setting `TT_DEVICE_MCP_POWER_CYCLE_CMD` lets the broker
+power-cycle the host when chips stay off the bus and every reset is refused. It stands back while
+an operator is recovering the host, which it asks `TT_DEVICE_MCP_MANUAL_RECOVERY_CMD`; unset, it
+uses `/opt/tt-device-broker/manual-recovery-check.sh` (staged from
+`deploy/tt-manual-recovery-check.sh` by `apply-host-config.sh`: it reads the sudo journal and
+auth.log). With neither, or a check that cannot read its sources, the cycle never fires and the
+broker pages instead. The broker runs as root, so it can read both.
+
+**Clean shutdown before a power cycle (spec 04 I88).** Every broker power cycle (the auto
+cycle and `TT_DEVICE_MCP_POWER_CYCLE_CMD`) first reboots the OS cleanly; the system-shutdown hook
+`tt-device-mcp-power-cycle.shutdown`, installed by `apply-host-config.sh`, cuts power once the
+filesystems are read-only. A fallback unit cuts it anyway after
+a bound sized from the host's systemd unit timeouts (90 s + the longer of `DefaultTimeoutStartSec`
+and `DefaultTimeoutStopSec` + 30 s: 210 s on a stock host, at most 600 s;
+`TT_DEVICE_MCP_POWER_CYCLE_SHUTDOWN_BOUND_SEC` may only raise it), even if the shutdown hangs after
+systemd hands over to systemd-shutdown. The configured command then runs with the network down, so
+it must be in-band (for example local `ipmitool`); the hook gives it 5-15 s per try
+(`TT_DEVICE_MCP_POWER_CYCLE_CMD_TIMEOUT_SEC`, clamped), 3 tries. A service that unloads the IPMI
+drivers on its stop (the OpenIPMI init script does, and deletes `/dev/ipmi0`) would leave in-band
+`ipmitool` no way to the BMC, so the hook and the fallback load `ipmi_msghandler`, `ipmi_devintf` and
+`ipmi_si` again and make `/dev/ipmi0` from sysfs when it is missing; the hook also leaves an OEM SEL
+record (`TTPC`) before the cycle and after a cycle that failed. The broker never cuts power with
+the OS up: for an `ipmitool ... chassis power cycle` command it first checks the BMC read-only
+(`mc info`, 10 s), and if that, the hook, `systemd-run` or the reboot request is missing or fails,
+nothing fires, the device stays held and the broker pages `power_cycle_not_launched`. On the next
+boot it reads the raw restart cause (`ipmitool raw 0x00 0x07`) to confirm the cycle; for a BMC that
+reports no cause it looks for a power-off in the BMC's SEL instead, and the record names why the
+cause was unavailable. With neither, a warm reboot in its place still counts as a cycle.
+
 ## What is verified vs. what needs on-box validation
 
 Unit-tested (no hardware): the privsep gating + `systemd-run` argv construction
@@ -56,6 +85,41 @@ before relying on it:
 4. **Kill path.** Confirm the existing `killpg(os.setsid)` cleanup still reaps the
    job under the `systemd-run --scope` wrapper; if a scope lingers, switch the
    kill path to `systemctl stop` the transient unit.
+
+## Autoupdate pacing
+
+`tt-device-autoupdate.sh` applies a new sha of the tracked branch only when the broker is idle, at
+most once per 1800 s, and only once the branch has been quiet for 600 s or the oldest unapplied sha
+has waited 3600 s, whichever comes first. A burst of pushes thus costs about one broker restart (and
+one startup fabric check) per hour, not one per push; a lone push waits 10 min. A broken broker gets
+a new sha at once. Spec 08 I21.
+
+## Autoupdate source: local mirror
+
+The updater fetches the public repository, or a local bare mirror at `$TTDEV_ROOT/mirror.git`
+(`/opt/tt-device-broker/mirror.git` by default) when one is present that root alone can have
+filled: it and `$TTDEV_ROOT` are real directories owned by root, writable by no group or other
+user, and it is a bare repository. Anything else is ignored and the public repository is used.
+Each lap points the clone's `origin` at the source it chose and logs a switch in `autoupdate.log`.
+Spec 08 I16.
+
+To use one, create it as root and fill it from a machine that can read the repository:
+
+```bash
+sudo git init --bare /opt/tt-device-broker/mirror.git
+# from the machine that can read the repository, after each fetch:
+git push --mirror --receive-pack='sudo -n git receive-pack' <host>:/opt/tt-device-broker/mirror.git
+```
+
+`--receive-pack` runs as root on the box, so every object and ref stays root-owned. No credential,
+key or helper lands on the box: root reads the mirror as a local file. An updater older than this
+source choice fetches its clone's `origin` as is; on such a host, point it once with
+`sudo git -C /opt/tt-device-broker/src remote set-url origin file:///opt/tt-device-broker/mirror.git`.
+Remove the mirror to go back to the public repository; the next lap repoints `origin`.
+
+A source that keeps failing is named once, on the first failing lap (the marker
+`$TTDEV_ROOT/.source-unreachable` records when it began), and once more when a fetch works again.
+A failing lap changes nothing: no dispatch hold, no restart.
 
 ## Slurm
 
@@ -108,10 +172,10 @@ SchedulerParameters=nohold_on_prolog_fail
 - **`PrologFlags=Alloc`** runs the prologue when the allocation is granted rather than at the
   first job step. Without it the health check happens later than you think it does.
 - **No `HealthCheckProgram`.** slurmd kills it at 60 s, which cannot contain a `tt-smi -r`
-  (~15 s) plus a fabric traffic pass (45–100 s), let alone a bridge or tray rung. A periodic
+  (~15 s) plus a fabric traffic pass (45–100 s), let alone a bridge or mesh reset. A periodic
   SIGKILL mid-reset wedges the device it was meant to check.
 - **Un-draining after a repair is manual.** Drain survives a reboot, so a node the broker's
-  reboot rung fixed comes back still drained with a stale reason. Return it with
+  power cycle fixed comes back still drained with a stale reason. Return it with
   `scontrol update NodeName=<node> State=RESUME`.
 - **The hooks resolve `tt-device-mcp` themselves — PATH is a fallback, not the primary source.**
   Slurm's own docs: "these programs do not have a search path set." Because these hooks run as

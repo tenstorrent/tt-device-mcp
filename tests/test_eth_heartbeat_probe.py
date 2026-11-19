@@ -287,3 +287,68 @@ def test_run_propagates_system_exit(monkeypatch):
 def test_run_passes_through_main_return(monkeypatch):
     monkeypatch.setattr(probe, "main", lambda: probe.EXIT_OK)
     assert probe._run() == probe.EXIT_OK
+
+
+# --- the link count: a down link is counted, not silently skipped ----------------------------
+# The verdict only covers links that are up, so a link that went down is one core fewer and the
+# run still reads all-advancing. The count line is what lets the broker see that loss (spec 03
+# I28). It never changes an exit code.
+
+LOC_UP = object()
+LOC_DOWN = object()
+
+
+def _per_core_reader(monkeypatch, cores):
+    """read_word_from_device keyed by (core, register): each core gets its own register map."""
+    reads = {"n": 0}
+
+    def _read(loc, addr, context=None):
+        reads["n"] += 1
+        v = cores[loc][addr]
+        return v(reads["n"]) if callable(v) else v
+
+    monkeypatch.setattr(probe, "read_word_from_device", _read)
+
+
+_UP_ADVANCING = {
+    probe.BLACKHOLE.port_status: 1,
+    probe.BLACKHOLE.rx_link_up: 0x1,
+    probe.BLACKHOLE.heartbeat: lambda n: 100 + n,
+}
+_PORT_DOWN = {probe.BLACKHOLE.port_status: 2, probe.BLACKHOLE.rx_link_up: 0, probe.BLACKHOLE.heartbeat: 0}
+
+
+def test_main_counts_a_down_link_and_still_reads_ok(monkeypatch, capsys):
+    _fast_window(monkeypatch)
+    _attach(monkeypatch, [FakeDevice(0, "blackhole", [LOC_UP, LOC_DOWN])])
+    _per_core_reader(monkeypatch, {LOC_UP: _UP_ADVANCING, LOC_DOWN: _PORT_DOWN})
+    assert probe.main() == probe.EXIT_OK
+    out = capsys.readouterr().out.splitlines()
+    assert "eth-links: measured=1 down=1 unreadable=0" in out
+    assert out[-1] == "all 1 active-eth core heartbeat(s) advancing", "the verdict stays the last line"
+
+
+def test_main_frozen_keeps_its_exit_code_with_the_count_line(monkeypatch, capsys):
+    _fast_window(monkeypatch)
+    _attach(monkeypatch, [FakeDevice(0, "blackhole", [LOC_UP, LOC_DOWN])])
+    frozen = {**_UP_ADVANCING, probe.BLACKHOLE.heartbeat: 0x1234}
+    _per_core_reader(monkeypatch, {LOC_UP: frozen, LOC_DOWN: _PORT_DOWN})
+    assert probe.main() == probe.EXIT_FROZEN
+    assert "eth-links: measured=1 down=1 unreadable=0" in capsys.readouterr().out
+
+
+def test_main_all_links_down_is_still_cannot_check(monkeypatch, capsys):
+    _fast_window(monkeypatch)
+    _attach(monkeypatch, [FakeDevice(0, "blackhole", [LOC_DOWN])])
+    _per_core_reader(monkeypatch, {LOC_DOWN: _PORT_DOWN})
+    assert probe.main() == probe.EXIT_CANNOT_CHECK
+    assert "eth-links: measured=0 down=1 unreadable=0" in capsys.readouterr().out
+
+
+def test_main_counts_an_off_bus_core_as_unreadable(monkeypatch, capsys):
+    _fast_window(monkeypatch)
+    _attach(monkeypatch, [FakeDevice(0, "blackhole", [LOC_UP, LOC])])
+    offbus = {**_UP_ADVANCING, probe.BLACKHOLE.heartbeat: probe.OFF_BUS}
+    _per_core_reader(monkeypatch, {LOC_UP: _UP_ADVANCING, LOC: offbus})
+    assert probe.main() == probe.EXIT_OK
+    assert "eth-links: measured=1 down=0 unreadable=1" in capsys.readouterr().out

@@ -20,6 +20,11 @@ TTDEV_VALIDATOR_REPO=https://github.com/tenstorrent/tt-metal.git
 # remote ref").
 TTDEV_VALIDATOR_SHA=09a878e5419b4c2c8d1465381f04ff6b91300dfc
 
+# Patches applied, in order, to the pinned checkout before the build; names relative to this file.
+# They are part of the build's identity: changing one rebuilds into a new prefix, as a new SHA does.
+# fabric-validator-ramp.patch spreads the start of the traffic pass over the chips (see its header).
+TTDEV_VALIDATOR_PATCHES="fabric-validator-ramp.patch"
+
 # tt-metal rejects anything below GCC-12, and the distro default on these hosts is
 # GCC-11 — an unconfigured cmake picks it and the build dies at configure time. Use
 # the toolchain tt-metal ships, and the same one the working dev trees on this

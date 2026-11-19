@@ -24,6 +24,7 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 _ANCHOR = re.compile(r"`tests/([\w/]+\.py)::([\w\[\]\-.]+)`")
 _TESTDEF = re.compile(r"^\s*(?:async )?def (test_\w+)", re.M)
+_ROW_ANCHOR = re.compile(r"`(?:tests/([\w/]+\.py))?::([\w\[\]\-.]+)`")
 
 
 def _defined_tests() -> set[str]:
@@ -31,6 +32,24 @@ def _defined_tests() -> set[str]:
     for f in (_ROOT / "tests").rglob("test_*.py"):
         names |= set(_TESTDEF.findall(f.read_text()))
     return names
+
+
+def _dangling_bare_anchors(line: str) -> list[str]:
+    """A bare `::name` after a full anchor on the same row names a test in that anchor's file."""
+    dangling, rel = [], None
+    for full, node in _ROW_ANCHOR.findall(line):
+        if full:
+            rel = full
+        elif rel:
+            f = _ROOT / "tests" / rel
+            if node.split("[", 1)[0] not in (_TESTDEF.findall(f.read_text()) if f.exists() else ()):
+                dangling.append(f"tests/{rel}::{node}")
+    return dangling
+
+
+def test_a_bare_anchor_resolves_against_the_last_full_anchors_file():
+    row = "`tests/test_spec_anchors.py::test_x`, `::test_every_spec_anchor_names_a_test_that_exists`, `::test_gone`"
+    assert _dangling_bare_anchors(row) == ["tests/test_spec_anchors.py::test_gone"]
 
 
 def test_every_spec_anchor_names_a_test_that_exists():
@@ -43,6 +62,7 @@ def test_every_spec_anchor_names_a_test_that_exists():
                 fn = node.split("[", 1)[0]
                 if fn not in defined:
                     dangling.append(f"{spec.name}:{lineno} -> tests/{rel}::{node}")
+            dangling += [f"{spec.name}:{lineno} -> {a}" for a in _dangling_bare_anchors(line)]
     assert not dangling, "spec anchors naming tests that do not exist:\n  " + "\n  ".join(dangling)
 
 

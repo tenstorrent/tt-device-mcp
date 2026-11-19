@@ -24,6 +24,7 @@ dependencies = [
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "pytest-timeout>=2.1.0",
 ]
 
 [project.scripts]
@@ -44,6 +45,8 @@ include = ["src/tt_device_mcp"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# A hung test fails in minutes with its stacks printed, instead of holding CI for hours.
+timeout = 120
 
 [tool.black]
 line-length = 120
@@ -62,3 +65,5 @@ select = ["E4", "E7", "E9", "F", "I"]
 "tests/conftest.py" = ["E402"]
 "src/tt_device_mcp/server.py" = ["E402"]
 "src/tt_device_mcp/metrics.py" = ["E402"]
+# Reuses the power-cycle rig fixtures by import; a test taking one as an argument is not a redefinition.
+"tests/test_power_cycle_reason.py" = ["F811"]

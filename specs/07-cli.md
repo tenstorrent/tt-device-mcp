@@ -69,7 +69,8 @@ start` is the only supported way to bring one up.
   overrun, unreachable broker — is 1. A scheduler reads that bit to drain a node and requeue a
   job, so folding transport failure in with device failure is deliberate: neither is a device
   anyone should dispatch onto. `post-step`'s `--exit-code` carries the finished step's status
-  inward (it forces the fabric pass); nothing carries outward but the bit and the printed reason.
+  inward (nonzero forces the fabric pass; zero, on a host whose eth rung is armed, buys the
+  passive eth read, spec 03 I30); nothing carries outward but the bit and the printed reason.
 
   `--exit-code` accepts every shape a scheduler actually reports one in, because only its
   zero/nonzero bit is consumed. Slurm's are not the plain small integers their names suggest:
@@ -123,8 +124,8 @@ isolation knob).
 | `daemon stop` | — | none (pid file + signals) | `Stopped` / `Not running` | always 0 |
 | `daemon status` | — | `GET /health` | `Running (socket ...)` / `Not running` | 0 running; 1 not |
 | `daemon start-fg` | — | none (in-process `server.main`) | server's own output | server's |
-| `run` | `<cmd> [-w dir] [-e file] [-t sec] [-o N]` | `/api/tt_device_job_run_bg`, then poll `/api/tt_device_job_status` | queue banner, streamed log, finish summary (+ last N lines with `-o`) | 0 iff `completed` (I4); 1 otherwise / server down / submit refused |
-| `run-bg` | `<cmd> [-w dir] [-e file] [-t sec]` | `/api/tt_device_job_run_bg` | job id, queue position, log path | 0 queued; 1 refused / server down |
+| `run` | `<cmd> [-w dir] [-e file] [-t sec] [--no-timeout-except-on-contention] [-o N]` | `/api/tt_device_job_run_bg`, then poll `/api/tt_device_job_status` | queue banner, streamed log, finish summary (+ last N lines with `-o`) | 0 iff `completed` (I4); 1 otherwise / server down / submit refused |
+| `run-bg` | `<cmd> [-w dir] [-e file] [-t sec] [--no-timeout-except-on-contention]` | `/api/tt_device_job_run_bg` | job id, queue position, log path | 0 queued; 1 refused / server down |
 | `status` | `[N] [-j ID]` | `/api/tt_device_queue_status` + `/api/tt_device_recent_jobs`; with `-j`: `/api/tt_device_job_status` | overview (RUNNING/QUEUED/RECENT, default 15 recent) or one job's detail | 0; 1 on error / server down |
 | `logs` | `[job_id] [-f] [-n N]` | `/api/tt_device_job_status` (+ queue lookup for default job); plain: `/api/tt_device_job_logs` | log tail (default 100 lines) or a local `tail -f` | 0; 1 no job found / error |
 | `kill` | `[job_id]` | `/api/tt_device_job_status`, `/api/tt_device_queue_status`, `/api/tt_device_job_kill` | confirmation / interactive picker / result | 0 killed, nothing to kill, or user aborted; 1 refused / invalid choice |
@@ -133,7 +134,7 @@ isolation knob).
 | `pre-step` | — (root) | `/api/tt_device_pre_step` | one verdict line; holders named when present | 0 iff device fit **and** free; 1 unfit / refused / inconclusive / server down |
 | `post-step` | `[--exit-code N] [--no-reclaim]` (root) | `/api/tt_device_post_step` | reclaim + verdict lines | 0 iff device ends fit; 1 otherwise |
 | `exec` | `<cmd> [-t sec] [-f/--force]` | `/api/tt_device_exec` | stdout→stdout, stderr→stderr | the diagnostic's `exit_code`; 1 on refusal / server down |
-| `watch` | `[N]` | `/api/tt_device_queue_status` + `/api/tt_device_recent_jobs` (looped) | the `status` overview, redrawn every 2 s | 0 (Ctrl-C); 1 server down at start |
+| `watch` | `[N]` | `/api/tt_device_queue_status` + `/api/tt_device_recent_jobs` (looped) | the `status` overview, redrawn every 1 s | 0 (Ctrl-C); 1 server down at start |
 | `smi` | `[tt-smi args]` | none — local exec (I7) | tt-smi owns the terminal | tt-smi's; 2 disallowed flag; 1 launch failure / missing wrapper |
 | `timezone` | `[City \| ±N \| pacific] [--list [TEXT]]` | none — local file | current zone + source, listing, or the new label | 0; 1 unknown/ambiguous zone, bad offset |
 | `lock` / `unlock` | — (sudo) | none — udev rule, unit edit, self-checks (mechanics: spec 05) | LOCKED/UNLOCKED or self-check verdict | 0 verified; 1 not root / no broker unit / self-check failed or inconclusive |
@@ -170,7 +171,9 @@ server's ceiling so the failure is a clear line rather than a validation error. 
 `-j ID` flag — job ids are bare digits, so they cannot share the positional (a numeric id in the
 positional is read as a count). A non-digit positional is silently ignored. The overview is one
 frame of `watch`: RUNNING and QUEUED from `queue_status`, RECENT from `recent_jobs` (durable
-across restarts; includes broker-owned resets and execs, marked by owner icon). ANSI styling only
+across restarts; includes broker-owned resets and execs, marked by owner icon). A running job
+that does no device work gets a `DEVICE IDLE for <n>` line under its row (spec 03 I54; active and
+unknown get none); `status -j ID` prints it as `Device:`, and a finished job's total as `Idle:`. ANSI styling only
 when stdout is a tty, so piping stays plain text. The TIME column renders server-side naive-UTC
 timestamps in the caller's zone (below); recent rows are stamped with start time (execution
 order), not queue time — WAIT already carries the queue delay.
@@ -186,8 +189,12 @@ server's peercred check (spec 05 I5), so nothing the CLI sends can grant a forei
 socket. A server refusal prints the error
 and exits 1.
 
-**`reset`.** Opens the streaming route with a 300 s connection timeout, prints each progress line
-as it arrives, and prints a `.` every 2 s while waiting so a long `tt-smi -r` is visibly alive.
+**`reset`.** Opens the streaming route asking for keepalives (`{"force", "keepalive": true}`, spec
+02 REST semantics), prints each progress line as it arrives, and prints a `.` every 2 s while
+waiting so a long `tt-smi -r` is visibly alive. Keepalive lines are not printed. `RESET_TIMEOUT`
+(300 s) is the longest allowed gap between reads, not a cap on the reset: a broker that sends
+keepalives never leaves a gap that long, so only a broker that has gone away trips it. An older
+broker sends none, and a reset that is silent for 300 s still reads as a stream error there.
 The trailing `::status::<x>` sentinel (spec 02 REST semantics) decides the exit code; no sentinel
 is a failure. Gate, quiesce, and audit are the server's (spec 04).
 
@@ -209,7 +216,8 @@ same value in both — a deployment property, not something this code enforces (
 where each process gets its copy; `deploy/README.md`'s Slurm section covers what happens when
 only one side is set).
 
-**`watch`.** Client-side loop: fetch the same overview every 2 s and redraw. On a tty it enters
+**`watch`.** Client-side loop: fetch the same overview every 1 s and redraw, so a running job's
+`DEVICE IDLE for <n>` line (spec 03 I54) counts up live. On a tty it enters
 the alternate screen with the cursor hidden (like `top`), homes, redraws with per-line erase, and
 erases the remainder — no scrollback pollution — restoring the screen on Ctrl-C; piped output
 writes frames sequentially, plain. The header shows the caller's zone and current time.
@@ -301,6 +309,9 @@ non-zero keeps that bit honest; `exec` propagates the real exit code because a d
 | I9 (a deferred dispatch is diagnosable: health_event + log line, holder named in queue/status) | `tests/test_slurm_steps.py::test_a_deferred_dispatch_is_visible_in_the_health_log_and_the_queue_status` |
 | I9 (a non-finite deadline env var falls back to the default, in both the deadline and the derived client timeout) | `tests/test_cli.py::test_a_non_finite_step_deadline_falls_back_to_the_default`, `tests/test_cli.py::test_a_non_finite_step_deadline_env_var_does_not_disable_the_cli_socket_timeout` |
 | `post-step` carries the step's exit code and the reclaim switch | `tests/test_cli.py::test_post_step_sends_the_exit_code_and_reclaim_flag` |
+| `reset` asks for keepalives | `tests/test_cli.py::test_cmd_reset_opens_the_stream_with_the_arguments_it_was_given` |
+| `reset` hides keepalives and still reads the status | `tests/test_cli.py::test_reset_stream_hides_keepalives_and_still_reads_the_status` |
+| `watch` redraws every 1 s; `status` shows DEVICE IDLE (03 I54) | `tests/test_device_activity.py::test_watch_redraws_every_second`, `tests/test_device_activity.py::test_the_cli_overview_marks_only_an_idle_job`, `tests/test_device_activity.py::test_cli_status_of_one_job_prints_its_device_line` |
 | step verbs exist under the names a site scripts | `tests/test_cli.py::test_cli_step_commands_exist` |
 
 Unanchored (verified against `cli.py` directly, no test exercises them): I4's exit-code mapping
