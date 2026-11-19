@@ -18,8 +18,12 @@ Four things make it safe to run from the broker:
 - A hard cap on the whole thing, enforced on the root side: every privileged command runs as
   ``timeout -s KILL <cap> ...`` under sudo, so the kill reaches the root DIAG and its ipmitool
   children, which a per-user broker cannot signal itself. A dump that cannot take the lock, cannot
-  find its script, runs past the cap or fails is skipped or killed with a logged reason; the index
-  restore and the lock release follow the DIAG's end, and recovery always follows.
+  find its script, runs past the cap or fails is skipped or killed with a logged reason, and
+  recovery always follows. The broker's own kill reaches only sudo, so the dump then waits, bounded
+  (the cap from when the root side started, plus one grace), until the DIAG's whole process tree is
+  gone (``/proc``), a background child included. Only then do the index restore and the lock release
+  follow. A tree that outlives the bound is named in the event (``diag_alive``), the indexes are left
+  alone (the root DIAG may still write them) and recovery proceeds.
 - A BMC that stops answering costs one call: the first IPMI call that runs into its bound ends the
   dump's BMC calls. Before the DIAG, the dump is skipped; after it, the remaining index restores
   and the sensor read are skipped. The event names the call (``bmc_silent``).
@@ -86,6 +90,9 @@ PROGRESS_SEC = 5.0
 # How long past a root-side bound the broker waits for the command to end before its own backup
 # kill (which reaches only sudo when the broker is not root).
 KILL_GRACE_SEC = 3.0
+# How often the DIAG tree is rescanned while the dump runs, and how often it is polled once the dump ends.
+TREE_SCAN_SEC = 0.25
+TREE_POLL_SEC = 0.1
 # An incident captured this long before its episode opened is still that episode's (the gate can
 # bundle an unhealthy verdict just before the FSM opens the episode).
 LINK_EARLY_SEC = 120.0
@@ -211,13 +218,87 @@ def _restore_index(bus: str, addr: str, value: str) -> Optional[str]:
     return _read_index(bus, addr)
 
 
+def _proc_stat(pid: int) -> Optional[tuple[str, int, int, int, str]]:
+    """(state, ppid, pgrp, session, starttime) of a process from ``/proc``, or None."""
+    try:
+        f = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return f[0], int(f[1]), int(f[2]), int(f[3]), f[19]
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+class _DiagTree:
+    """The processes of one DIAG run: sudo, the root-side timeout, the DIAG and everything it
+    started. A member is a descendant of one already seen, or shares a group or session with one
+    (sudo's own session included), so a child orphaned when sudo is killed is still found. Pids carry
+    their start time, so a reused pid is not mistaken for a member. Without ``/proc`` it sees nothing."""
+
+    def __init__(self, root_pid: int) -> None:
+        self.root = root_pid
+        self.members: dict[int, str] = {}
+        self.groups: set[int] = set()
+        self.sessions: set[int] = {root_pid}
+        self.first_seen: Optional[float] = None  # when anything but sudo itself first showed up
+        self._own = {os.getpgrp(), os.getsid(0)} if hasattr(os, "getsid") else set()
+
+    def scan(self) -> list[int]:
+        """Add what has joined since the last scan; the members still running (zombies are dead)."""
+        try:
+            names = [n for n in os.listdir("/proc") if n.isdigit()]
+        except OSError:
+            return []
+        rows = {}
+        for n in names:
+            st = _proc_stat(int(n))
+            if st is not None:
+                rows[int(n)] = st
+        grew = True
+        while grew:
+            grew = False
+            for pid, (_state, ppid, pgrp, sid, start) in rows.items():
+                if self.members.get(pid) == start or pid == os.getpid():
+                    continue
+                parent_known = ppid in self.members and rows.get(ppid, ("", 0, 0, 0, ""))[4] == self.members[ppid]
+                joined = (
+                    (pid == self.root and not self.members)
+                    or parent_known
+                    or pgrp in self.groups
+                    or sid in self.sessions
+                )
+                if not joined:
+                    continue
+                self.members[pid] = start
+                grew = True
+                if pid != self.root and self.first_seen is None:
+                    self.first_seen = time.monotonic()
+                self.groups.update({pgrp} - self._own)
+                self.sessions.update({sid} - self._own)
+        return sorted(
+            pid for pid, start in self.members.items() if pid in rows and rows[pid][4] == start and rows[pid][0] != "Z"
+        )
+
+
+def _wait_tree(tree: _DiagTree, cap_sec: float) -> list[int]:
+    """Wait until the DIAG's process tree is gone; the pids still running at the bound. The root-side
+    timeout kills it ``cap_sec`` after the root side started (seen no earlier than ``first_seen``),
+    so the bound is that plus one grace. The broker cannot signal root processes, so this only waits."""
+    left = tree.scan()
+    now = time.monotonic()
+    deadline = max(now, (tree.first_seen or now) + cap_sec) + KILL_GRACE_SEC
+    while left and time.monotonic() < deadline:
+        time.sleep(min(TREE_POLL_SEC, max(0.0, deadline - time.monotonic())))
+        left = tree.scan()
+    return left
+
+
 def _run_diag(
     script: str, out: Path, cap_sec: float, log: Callable[[str], None]
-) -> tuple[Optional[int], float, str, str]:
+) -> tuple[Optional[int], float, str, str, list[int]]:
     """Run ``<script> DIAG`` under the root-side cap, streaming raw stdout to ``out``.
 
-    (rc or None on timeout or error, seconds, tail, error). Whatever ends the loop (EOF, the cap, a
-    failed write or read), the DIAG has ended before this returns (:func:`_end_diag`)."""
+    (rc or None on timeout or error, seconds, tail, error, pids of its tree still running). Whatever
+    ends the loop (EOF, the cap, a failed write or read), this returns only once the DIAG's whole
+    process tree is gone, or its bound has run out (:func:`_end_diag`, :func:`_wait_tree`)."""
     t0 = time.monotonic()
     tail = b""
     nlines = 0
@@ -230,7 +311,9 @@ def _run_diag(
             start_new_session=True,
         )
     except OSError as e:
-        return None, 0.0, f"launch failed: {e}", f"launch failed: {e!r}"
+        return None, 0.0, f"launch failed: {e}", f"launch failed: {e!r}", []
+    tree = _DiagTree(p.pid)
+    tree.scan()
     next_progress = t0 + PROGRESS_SEC
     timed_out = eof = False
     error = ""
@@ -244,7 +327,7 @@ def _run_diag(
                 if now - t0 >= cap_sec + KILL_GRACE_SEC:
                     timed_out = True
                     break
-                ready, _, _ = select.select([fd], [], [], min(0.5, cap_sec + KILL_GRACE_SEC - (now - t0)))
+                ready, _, _ = select.select([fd], [], [], min(TREE_SCAN_SEC, cap_sec + KILL_GRACE_SEC - (now - t0)))
                 if ready:
                     chunk = os.read(fd, 1 << 16)
                     if not chunk:
@@ -253,6 +336,7 @@ def _run_diag(
                     f.write(chunk)
                     nlines += chunk.count(b"\n")
                     tail = (tail + chunk)[-4096:]
+                tree.scan()
                 if time.monotonic() >= next_progress:
                     last = tail.rstrip().rsplit(b"\n", 1)[-1].decode(errors="replace").strip()[:80]
                     log(f"cpld dump: {time.monotonic() - t0:.0f}s, {nlines} lines, at: {last}")
@@ -262,43 +346,55 @@ def _run_diag(
     except Exception as e:  # noqa: BLE001 - a full disk or a failed read still ends the DIAG below
         error = f"DIAG output: {e!r}"
     finally:
-        rc = _end_diag(p, t0 + cap_sec + KILL_GRACE_SEC)
+        rc = _end_diag(p, t0 + cap_sec + KILL_GRACE_SEC, tree)
+        left = _wait_tree(tree, cap_sec)
     secs = time.monotonic() - t0
     killed_at_cap = _killed_at(rc, secs, cap_sec)
-    if error or timed_out or not eof or killed_at_cap:
+    if error or timed_out or not eof or killed_at_cap or left:
         rc = None
-    return rc, secs, tail.decode(errors="replace"), error
+    return rc, secs, tail.decode(errors="replace"), error, left
 
 
-def _end_diag(p: subprocess.Popen, deadline: float) -> Optional[int]:
+def _end_diag(p: subprocess.Popen, deadline: float, tree: _DiagTree) -> Optional[int]:
     """End the DIAG and reap it; rc, or None if it is still up. After an error the pipe is drained
     (output dropped) until the DIAG ends or the root-side timeout kills its whole group at the cap,
     so no straggler of it outlives this; a pipe that cannot be read is closed (the writer dies of
-    SIGPIPE). Then the broker's own group kill, a backup that reaches only sudo when not root."""
+    SIGPIPE). Then the broker's own group kill, a backup that reaches only sudo when not root. The
+    tree is scanned all along, so what sudo started late or left behind is known to the caller."""
     try:
         fd = p.stdout.fileno()
         while time.monotonic() < deadline:
-            ready, _, _ = select.select([fd], [], [], min(0.5, max(0.0, deadline - time.monotonic())))
+            ready, _, _ = select.select([fd], [], [], min(TREE_SCAN_SEC, max(0.0, deadline - time.monotonic())))
             if ready and not os.read(fd, 1 << 16):
                 break
+            tree.scan()
     except Exception:  # noqa: BLE001 - an unreadable pipe is closed below
         pass
     try:
         p.stdout.close()
     except OSError:
         pass
-    try:
-        return p.wait(timeout=max(KILL_GRACE_SEC, deadline - time.monotonic()))
-    except subprocess.TimeoutExpired:
-        pass
+    rc = _wait_proc(p, max(KILL_GRACE_SEC, deadline - time.monotonic()), tree)
+    if rc is not None:
+        return rc
+    tree.scan()
     try:
         os.killpg(p.pid, signal.SIGKILL)
     except OSError:
         pass
-    try:
-        return p.wait(timeout=KILL_GRACE_SEC)
-    except subprocess.TimeoutExpired:
-        return None
+    return _wait_proc(p, KILL_GRACE_SEC, tree)
+
+
+def _wait_proc(p: subprocess.Popen, timeout: float, tree: _DiagTree) -> Optional[int]:
+    """``p.wait`` that scans the tree every quarter second; None on timeout."""
+    end = time.monotonic() + timeout
+    while True:
+        try:
+            return p.wait(timeout=max(0.0, min(TREE_SCAN_SEC, end - time.monotonic())))
+        except subprocess.TimeoutExpired:
+            tree.scan()
+            if time.monotonic() >= end:
+                return None
 
 
 def _read_psu(out: Path) -> dict:
@@ -366,6 +462,7 @@ def take_dump(trigger: str, episode: str, log: Callable[[str], None]) -> dict:
     out: Optional[Path] = None
     rc, tail = None, ""
     silent = ""
+    left: list[int] = []
     try:
         log(f"cpld dump: lock held, running {which} DIAG {script} (cap {cap:.0f}s) before recovery")
         for bus, addr in UBB_CPLDS:
@@ -381,8 +478,10 @@ def take_dump(trigger: str, episode: str, log: Callable[[str], None]) -> dict:
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         out = root / f"{stamp}_{re.sub(r'[^A-Za-z0-9_.-]+', '-', trigger)[:40]}.txt"
         _note_dump(episode, trigger, out)
-        rc, secs, tail, err = _run_diag(script, out, cap, log)
+        rc, secs, tail, err, left = _run_diag(script, out, cap, log)
         rec.update(path=str(out), rc=rc, diag_sec=round(secs, 2))
+        if left:
+            rec["diag_alive"] = left
         if err:
             rec["error"] = err
     except BmcSilent:
@@ -392,9 +491,15 @@ def take_dump(trigger: str, episode: str, log: Callable[[str], None]) -> dict:
     except Exception as e:  # noqa: BLE001 - never raises; the event names what broke
         rec["error"] = repr(e)
     finally:
-        # Only after the DIAG has ended (_run_diag waits for it), and before the lock goes.
+        # Only after the DIAG's tree has ended (_run_diag waits for it), and before the lock goes. A
+        # tree that outlived its bound may still write the indexes: they are left alone then.
         try:
-            rec["index_0x50"], silent = _restore_indexes(saved, silent)
+            if rec.get("diag_alive"):
+                rec["index_0x50"] = {
+                    b: {"before": saved.get(b), "after": None, "restored": False} for b, _a in UBB_CPLDS
+                }
+            else:
+                rec["index_0x50"], silent = _restore_indexes(saved, silent)
         finally:
             os.close(fd)  # closing the fd releases the flock
     if "skipped" in rec:
@@ -405,7 +510,9 @@ def take_dump(trigger: str, episode: str, log: Callable[[str], None]) -> dict:
     if silent:
         rec["bmc_silent"] = silent
     try:
-        if silent:
+        if rec.get("diag_alive"):
+            rec["psu_error"] = "skipped: the DIAG is still running"
+        elif silent:
             rec["psu_error"] = "skipped: the BMC stopped answering"
         else:
             rec.update(_read_psu(out.with_name(out.stem + "_psu.txt")))
@@ -418,6 +525,8 @@ def take_dump(trigger: str, episode: str, log: Callable[[str], None]) -> dict:
         rec["summary"] = f"DIAG aborted: {rec['error'][:120]} (partial output kept)"
     elif rc is None:
         rec["summary"] = f"timed out after {cap:.0f}s (partial output kept)"
+        if rec.get("diag_alive"):
+            rec["summary"] += f"; DIAG process(es) {','.join(map(str, rec['diag_alive']))} still running"
     elif s:
         rec["summary"] = f"{s.group(1)}/{s.group(2)} failed"
     else:
@@ -446,10 +555,12 @@ def _journal(rec: dict, t0: float, log: Callable[[str], None]) -> dict:
 
 def total_bound_sec() -> float:
     """The longest :func:`take_dump` can hold recovery: lock wait + DIAG cap and its kill grace +
-    the index calls + PSU read + slack."""
+    the wait for its process tree (a further cap and grace) + the index calls + PSU read + slack."""
     cap = float(os.environ.get("TT_DEVICE_MCP_CPLD_DUMP_CAP_SEC") or CAP_SEC)
     wait = float(os.environ.get("TT_DEVICE_MCP_CPLD_DUMP_LOCK_WAIT_SEC") or LOCK_WAIT_SEC)
-    return wait + cap + 3 * KILL_GRACE_SEC + 12 * (IPMI_CALL_SEC + KILL_GRACE_SEC) + PSU_SDR_SEC + KILL_GRACE_SEC + 5.0
+    return (
+        wait + 2 * cap + 4 * KILL_GRACE_SEC + 12 * (IPMI_CALL_SEC + KILL_GRACE_SEC) + PSU_SDR_SEC + KILL_GRACE_SEC + 5.0
+    )
 
 
 def last_episode_file() -> Path:
