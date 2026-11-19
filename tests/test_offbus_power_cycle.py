@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import patch_recovery
+from tests.conftest import patch_recovery, power_cycle_reason
 from tests.test_device_safety import _arm_offbus_stuck_hold
 from tests.test_ladder_v2 import _ev
 from tt_device_mcp import server as srv
@@ -419,7 +419,7 @@ def test_fire_command_never_runs_the_command_under_a_live_os(tmp_path, monkeypat
     out = tmp_path / "ran"
     ok = _script(tmp_path, "ok", f"touch {out}")
     with pytest.raises(pc.PowerCycleNotLaunched, match="no hook"):
-        _REAL_FIRE([ok], "3/32 off the bus")
+        _REAL_FIRE([ok], power_cycle_reason("3/32 off the bus"))
     assert not out.exists()
 
 

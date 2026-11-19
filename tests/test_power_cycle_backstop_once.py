@@ -53,7 +53,7 @@ def _arm_all_off_with_two_cycles(monkeypatch, tmp_path):
     monkeypatch.setattr(srv, "_boot_btime_id", lambda: str(int(now - 1800)))
     monkeypatch.setattr(srv, "write_action_log", lambda *a, **k: None)
     cycles = []
-    monkeypatch.setattr(srv, "_fire_power_cycle", lambda: cycles.append(time.time()))
+    monkeypatch.setattr(srv, "_fire_power_cycle", lambda *_: cycles.append(time.time()))
     alerts = []
     events = []
     patch_health_event(monkeypatch, lambda name, *a, **k: events.append(name))

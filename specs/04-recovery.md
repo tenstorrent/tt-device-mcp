@@ -1863,7 +1863,8 @@ each rung fires only when the gentler one failed or cannot apply.
   cannot be stopped (`systemctl stop`, then `kill`, and `is-active` still says active or cannot
   answer), it may still fire at its bound, so `fire_os_first` returns `fallback_pending`, the ledger
   entry stays and the host action stays pending (I34). A `power_cycle_os_first` event records each
-  path (`reboot_requested` with the bound, `not_launched` or `fallback_pending` with why).
+  path (`reboot_requested` with the bound, `not_launched` or `fallback_pending` with why), each
+  with the request's full reason record (I113).
 
   **The next boot checks that the cycle happened.** At broker startup, before the I72
   late-power-cycle mark, `confirm_power_cycle_on_boot` looks at the last escalation recorded before
@@ -2999,6 +3000,56 @@ each rung fires only when the gentler one failed or cannot apply.
   listed unit running, a few `systemctl` calls (milliseconds) per check or reset; with one running,
   its stop and start, bounded at 30 s each per unit as in I12, plus at most 5 s of verify per unit.
 
+- **I113 — Every host power cycle records its full reason, on every path, before the reboot.** The
+  logs of three auto power cycles on one host showed `auto_power_cycle_request` with one line of
+  text, `stuck_hold_host_escalation` with only the escalation and the off-bus count,
+  `power_cycle_os_first` with a generic "auto BMC power cycle", and `power_cycle_confirmed` with no
+  reason: nobody could say which chip, which tray, which check or how long the hold had run. Now a
+  request cannot be made without a `PowerCycleReason` (`health/recovery/power_cycle_reason.py`): the
+  one-line text, and
+  - `trigger` (why now: `idle_escalation`, `fabric_unverified`, `gate_ladder`, `tray_down`,
+    `all_chips_off`, `offbus_gated`, `leftover_holder`, `pci_wedged`, and for the hold-bound cycle the
+    window that claimed it: `offbus_one_shot`, `ceiling_window`, `fabric_link_short`,
+    `hold_bound_cycle`, else `hold_deadline`) and `fault_class` (the I27/I76 class, `unknown` where the path does not
+    classify);
+  - the affected chips, each with `chip`, PCI address (`bdf`), `tray` and upstream root port
+    (`root_port`, read from sysfs by `bmc_capture.upstream_bridge`; `None` where unknown);
+  - the last failed check and its result (`failed_check`, `failed_result`);
+  - the rungs this hold ran, newest last, at most 12 (`rung`, `status`, `at`), from the mechanism's
+    own action log;
+  - `hold_since` (the hold episode's start) and `hold_age_sec`.
+  A plain string is refused with `TypeError` before any ledger row, event, file or step: the record
+  is a required argument of `fire_os_first`, `_fire_power_cycle`, `_fire_recovery_escalation`,
+  `offbus_power_cycle.fire_command` and `fire_and_record`, and of the server's
+  `_auto_power_cycle_host`, which fills what the caller did not know from memory and sysfs. It is
+  built only from state the broker already holds plus one sysfs symlink read per chip: no chip is
+  read, no `lspci`/`setpci` runs, and a lookup that fails leaves that field unknown and never stops
+  the cycle. The paths are the idle and stuck-hold escalation, the direct whole-tray and
+  all-chips-off cycle (I39), the leftover-holder cycle, the gated off-bus cycle (I27), the
+  hold-deadline and PCI-wedged cycle (I76; the one-shot off-bus and ceiling-window cycles are its
+  windows). There is no
+  operator-requested broker power cycle: a host cycled by hand is seen only at the next boot, with
+  no record to read back, and says so.
+  The record goes to:
+  1. the request event (`auto_power_cycle_request`, `auto_*_request`, and `stuck_hold_host_escalation`
+     for its own fields): `reason` as before, plus `power_cycle_reason` (the whole record);
+  2. `power_cycle_os_first`, on every phase (`reboot_requested`, `fallback_pending`,
+     `not_launched`), in place of the generic text;
+  3. `power_cycle_reason.json` in the health directory, written with a temporary file, `fsync` and
+     rename before the fallback unit is started and before `systemctl reboot` (outcome `requested`;
+     the later outcome is `confirmed`, `unconfirmed` or `not_launched`). A write that fails is
+     logged at ERROR and never stops or delays the cycle;
+  4. `power_cycle_confirmed` and `power_cycle_unconfirmed` after the boot: `reason` and
+     `power_cycle_reason` are read back from that file when its request time lies in the ledger
+     row's window (else the ledger row's `reason`, and no record is attached);
+  5. `tt-device-mcp status` (`Last power cycle: <time>  <reason>  [<outcome>]`) and `/health`
+     (`last_power_cycle`);
+  6. one WARNING line through the broker's logger with the prefix `host power cycle:`
+     (`trigger=… class=… chips=[…] last_check=… result=… rungs=[…] hold_since=… hold_age=…s
+     reason=…`), before the reboot.
+  Recovery is unchanged: ladder order, timings, thresholds, gates, and the full check with fabric
+  before any hold lifts (I32) are not touched; the record only describes the request.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -3705,6 +3756,13 @@ sees a silent fabric pass.
 | I107 no power cycle armed: the early mesh reset runs before any operator hand-off | `tests/test_arc_dead_skips_early_mesh_reset.py::test_no_power_cycle_armed_runs_the_early_mesh_reset_before_any_hand_off` |
 | I112 fabric checks, bridge resets, power-cycle requests and tt-smi resets stop the device readers, verify the stop (bounded) and restore them on pass, fail, timeout, raise and cancel; an unstoppable reader is warned by name and pid and never blocks the step; a reader with no unit file in the search path costs no process, and a fabric check on a host with none installed starts none | `tests/test_reader_quiesce.py` |
 | I112 one root-port AER record during the broker's check SIGSTOPs the check readers and fences the chips under that port within a poll; none with no check running; an endpoint record below the burst count stops nothing; a chip so fenced is never contained on a skipped read (unread, not all-ones) until a real read returns all-ones; the trigger record is on disk before the remove; a chip whose config vendor ID reads all-ones is never under the fabric check or a starting poller | `tests/test_aer_root_contain.py`, `tests/test_aer_check_stop.py` |
+| I113 a host power cycle cannot be requested without the record: a plain string raises `TypeError` before any step, file, ledger row or event, at `fire_os_first`, `_fire_power_cycle`, `_fire_recovery_escalation`, `_auto_power_cycle_host`, `fire_command` and `fire_and_record`; the record needs a trigger and a fault class | `tests/test_power_cycle_reason.py::test_a_request_without_the_record_is_refused`, `::test_the_record_needs_its_trigger_and_fault_class`, `::test_the_os_first_fire_refuses_a_plain_string_before_anything_runs`, `::test_an_escalation_without_the_record_is_refused_before_it_is_recorded` |
+| I113 the record holds trigger, fault class, chips with address, tray and root port (from memory and sysfs, never a chip read; an unreadable root port is unknown), last failed check and result, the hold's rungs and its start and age; the server fills what the caller lacked | `tests/test_power_cycle_reason.py::test_the_record_keeps_the_one_line_text_and_every_field`, `::test_the_chips_carry_tray_and_root_port_from_memory_and_sysfs`, `::test_a_root_port_that_cannot_be_read_is_none_never_an_error`, `::test_completed_fills_only_what_the_record_lacks`, `::test_the_server_completes_the_record_from_memory_without_a_chip_read`, `::test_the_rungs_the_hold_ran_are_listed_newest_last` |
+| I113 the WARNING line has the stable prefix and every field; the state file is fsynced and on disk, and the line logged, before the fallback unit and the reboot; a write failure never stops the cycle | `tests/test_power_cycle_reason.py::test_the_warning_line_has_the_stable_prefix_and_every_field`, `::test_the_line_says_unknown_where_a_field_is_not_known`, `::test_the_record_is_logged_and_on_disk_before_the_unit_and_the_reboot`, `::test_the_state_file_is_fsynced_and_read_back`, `::test_a_state_file_that_cannot_be_written_never_stops_the_cycle` |
+| I113 `power_cycle_os_first` carries the record on every phase in place of the generic text; the request event carries it | `tests/test_power_cycle_reason.py::test_the_os_first_event_carries_the_record_not_the_generic_text`, `::test_the_default_bmc_cycle_passes_the_callers_record_through`, `::test_the_bmc_fallback_that_stays_pending_keeps_the_record`, `::test_a_cycle_that_did_not_launch_says_so_in_the_record`, `::test_the_request_event_carries_the_record_on_every_escalation` |
+| I113 each path sends its own record: idle escalation, direct tray-down and all-chips-off, hold-deadline | `tests/test_power_cycle_reason.py::test_a_tray_down_cycle_names_the_trays_chips_and_the_check`, `::test_an_all_chips_off_cycle_is_recorded_as_such`, `::test_the_galaxy_record_lists_the_rungs_and_the_hold_age`, `::test_the_idle_escalation_cause_is_a_record_of_the_bus_as_it_reads_now`, `::test_the_hold_deadline_cycle_carries_its_trigger_and_hold_age` |
+| I113 the boot reads the record back into `power_cycle_confirmed` and `power_cycle_unconfirmed`; only the record of its own request; none falls back to the ledger reason; the outcome is marked | `tests/test_power_cycle_reason.py::test_the_confirmation_after_the_boot_reads_the_record_back`, `::test_an_unconfirmed_cycle_names_its_reason_too`, `::test_a_boot_with_no_record_falls_back_to_the_ledger_reason`, `::test_a_record_of_another_request_is_not_attached`, `::test_the_boot_reads_only_the_record_of_its_own_request`, `::test_no_record_no_last_power_cycle` |
+| I113 status and `/health` show the last power cycle's time and reason | `tests/test_power_cycle_reason.py::test_the_status_shows_the_last_power_cycle_time_and_reason`, `::test_the_health_payload_carries_the_last_power_cycle` |
 | I108 a mesh reset that ran before a chip dropped does not spend the off-bus ladder's mesh reset: mesh reset, sweep, power cycle, in order, across a broker restart too | `tests/test_no_repeat_failed_rung.py::test_a_reset_that_ran_before_the_drop_does_not_spend_the_offbus_mesh_reset` |
 | I108 a mesh reset that faced the dropped chip (off before it, or found off by its own check) still spends it; a regressed reset and one with no sets on record stay spent | `tests/test_no_repeat_failed_rung.py::test_a_reset_that_faced_the_dropped_chip_still_spends_the_offbus_mesh_reset`, `::test_mesh_reset_spent_counts_only_chips_the_reset_faced`, `::test_a_reset_with_no_record_of_its_sets_stays_spent` |
 | I109 dump before the reset, recovery still runs on failure or timeout | `tests/test_cpld_dump.py::test_the_dump_comes_before_the_reset`, `::test_a_failing_dump_still_lets_recovery_run`, `::test_a_hung_dump_is_killed_at_the_cap_and_recovery_runs` |

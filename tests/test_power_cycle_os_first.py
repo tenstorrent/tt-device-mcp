@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.conftest import GALAXY_BUS_IDS, patch_health_event
+from tests.conftest import GALAXY_BUS_IDS, patch_health_event, power_cycle_reason
 from tests.test_classac_power_cycle_direct import EXPECTED, _beats_without, _gate, _off, rig  # noqa: F401 - the fixture
 from tests.test_offbus_power_cycle import _below_floor_episode, _gate_below_floor, _spy_gated_power_cycle
 from tt_device_mcp import server as srv
@@ -36,7 +36,9 @@ _real_auto_power_cycle_host = srv._auto_power_cycle_host  # before a rig stubs i
 REPO = Path(__file__).resolve().parent.parent
 HOOK = REPO / "deploy" / "tt-device-mcp-power-cycle.shutdown"
 APPLY = REPO / "deploy" / "apply-host-config.sh"
-REASON = "10-min hold bound: the full ladder did not heal it"
+REASON = power_cycle_reason(
+    "10-min hold bound: the full ladder did not heal it", trigger="hold_deadline", fault_class="unknown"
+)
 CYCLE = ["ipmitool", "chassis", "power", "cycle"]
 CYCLE_ABS = ["/usr/bin/ipmitool", "chassis", "power", "cycle"]
 
@@ -350,13 +352,15 @@ class _Journal:
         self.errors.append(msg % args)
 
 
-TRIGGER_REASON = "idle escalation: 1/32 chip(s) off the bus after the reset ladder"
+TRIGGER_REASON = power_cycle_reason(
+    "idle escalation: 1/32 chip(s) off the bus after the reset ladder", trigger="idle_escalation", fault_class="unknown"
+)
 
 
 def test_the_trigger_is_journaled_before_the_unit_starts_and_names_it(os_first, monkeypatch):
     monkeypatch.setattr(pc, "_logger", _Journal(os_first["calls"]))
     pc.note_power_cycle_trigger(TRIGGER_REASON, "partial_offbus", {"0": "0000:01:00.0"}, "2026-01-01T00:00:00")
-    assert pc.fire_os_first(CYCLE, "auto BMC power cycle") == "os_first"
+    assert pc.fire_os_first(CYCLE, REASON) == "os_first"
     assert _steps(os_first) == ["preflight", "journal", "systemd-run", "reboot"]
     line = os_first["calls"][1][1][0]
     unit = os_first["calls"][2][1][1].split("=", 1)[1]
@@ -480,7 +484,7 @@ def test_the_marker_reads_requested_when_the_unit_starts(os_first, monkeypatch):
 
     monkeypatch.setattr(pc, "_run_step", reading)
     pc.note_power_cycle_trigger(TRIGGER_REASON, "partial_offbus", {"0": "0000:01:00.0"}, "2026-01-01T00:00:00")
-    assert pc.fire_os_first(CYCLE, "auto BMC power cycle") == "os_first"
+    assert pc.fire_os_first(CYCLE, REASON) == "os_first"
     assert _steps(os_first) == ["preflight", "systemd-run", "reboot"]
     assert [(m["state"], m["fault_class"], m["chips"], m["reason"], m["hold_since"]) for m in seen] == [
         (

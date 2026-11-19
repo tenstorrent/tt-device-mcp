@@ -18,7 +18,7 @@ import types
 
 import pytest
 
-from tests.conftest import patch_health_event, patch_recovery
+from tests.conftest import patch_health_event, patch_recovery, power_cycle_reason
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.health.monitors import pci
@@ -360,10 +360,12 @@ async def test_a_sweep_that_fails_its_verify_leaves_no_intent_for_the_power_cycl
     patch_recovery(monkeypatch, "_verify_device", verify)
     fsyncs = _watch_dir_fsyncs(monkeypatch)
     fired = []
-    monkeypatch.setattr(srv, "_fire_power_cycle", lambda: fired.append((intent.exists(), list(fsyncs))))
+    monkeypatch.setattr(srv, "_fire_power_cycle", lambda *_: fired.append((intent.exists(), list(fsyncs))))
 
     assert await g._settle_and_verify_before_host_rung(32, lambda m: None, "idle", offbus_chips=set()) is False
-    await srv._auto_power_cycle_host(lambda m: None, "idle escalation: 8/32 chip(s) off the bus")
+    await srv._auto_power_cycle_host(
+        lambda m: None, power_cycle_reason("idle escalation: 8/32 chip(s) off the bus", trigger="idle_escalation")
+    )
 
     assert during == [True], "the sweep ran under its intent"
     assert len(fired) == 1
@@ -391,7 +393,7 @@ async def test_a_broker_host_action_closes_an_open_intent_durably_before_it_fire
         detail="test",
         fire=lambda: fired.append((intent.exists(), list(fsyncs), m.read_auto_recovery_ledger()[-1]["action"])),
         log=lambda msg: None,
-        reason="test",
+        reason=power_cycle_reason("test"),
     )
     assert fired == [(False, [False], action)], "intent removed and synced after the ledger row, before the fire"
     assert pcie_guard._INTENT_OPEN is False
