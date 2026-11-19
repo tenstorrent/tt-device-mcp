@@ -139,6 +139,29 @@ MCP and finds the broker socket on its own.
 To point an agent at the queue, copy [add-to-AGENTS.md](add-to-AGENTS.md) into
 your project's `AGENTS.md`.
 
+### Claude Code skill: tt-device-dev
+
+[skills/tt-device-dev](skills/tt-device-dev/SKILL.md) gives Claude Code a fixed way to
+run a project on a broker host:
+
+- an idempotent setup script for the workspace
+- a search for existing work before planning
+- a plan before any code
+- GitHub issues for tracking, and `project.md` for the mission
+- a hostile review before any issue closes
+
+Install it once per user:
+
+```bash
+mkdir -p ~/.claude/skills && ln -sfn "$PWD/tt-device-mcp/skills/tt-device-dev" ~/.claude/skills/tt-device-dev
+```
+
+Then, from a workspace root (the folder holding `tt-metal/`):
+
+```bash
+~/.claude/skills/tt-device-dev/scripts/setup-dev-env.sh --check
+```
+
 ### Tools
 
 | Tool | Description |
