@@ -2915,9 +2915,15 @@ each rung fires only when the gentler one failed or cannot apply.
   runs as `sudo -n timeout -s KILL <bound> ...` (no sudo when the broker is root), so the kill
   reaches the root DIAG and its children, which a non-root broker's own kill cannot; the broker's
   killpg stays as a backup and the pipe is always closed. Whatever ends the dump (EOF, the cap, a
-  failed output write or pipe read, any other error), the DIAG has ended before the index is
-  restored, and only the indexes read before are restored and verified; the lock is released and
-  the error is named in the event. A BMC that stops answering costs one call, not the whole bound:
+  failed output write or pipe read, any other error), the DIAG's whole process tree has ended
+  before the index is restored: the broker follows the tree in `/proc` (sudo, the root-side
+  timeout, the DIAG and any child, even one orphaned or one sudo started late) and waits, bounded
+  by the cap from when the root side started plus one grace, until none is left running. It cannot
+  signal root processes, so it only waits. A tree that outlives that bound is named in the event
+  (`diag_alive`, the pids) and the summary, the indexes are not written (the root DIAG may still
+  write them) and are reported not restored, the sensor read is skipped, the lock is released and
+  recovery proceeds. Otherwise only the indexes read before are restored and verified; the lock is
+  released and the error is named in the event. A BMC that stops answering costs one call, not the whole bound:
   the first IPMI call that runs into its bound ends the dump's BMC calls. Before the DIAG the dump
   is skipped; after it the remaining index restores and the sensor read are skipped. The event
   names that call under `bmc_silent`. The power cycle's dump is awaited before its escalation is
@@ -3776,6 +3782,7 @@ sees a silent fabric pass.
 | I109 index 0x50 saved, restored, verified | `tests/test_cpld_dump.py::test_the_debug_index_is_restored_and_verified`, `::test_an_index_that_does_not_restore_is_named` |
 | I109 a refused host rung still starts the dump, once per episode, without waiting | `tests/test_cpld_dump.py::test_a_refused_host_rung_starts_the_dump`, `::test_a_refusal_starts_the_dump_once_per_episode` |
 | I109 root-side bound: every privileged call runs under `timeout -s KILL`; a hung DIAG, ipmitool or sensor read behind sudo is gone when the dump returns | `tests/test_cpld_dump.py::test_privileged_commands_carry_a_root_side_kill`, `::test_a_hung_diag_behind_sudo_is_gone_when_the_dump_returns`, `::test_a_hung_ipmitool_behind_sudo_is_killed_at_its_bound`, `::test_a_slow_psu_read_behind_sudo_is_killed_at_its_bound` |
+| I109 the DIAG's whole process tree is gone before the index restore and the return, bounded: a root-side timeout that starts late, a background child; a tree that outlives the bound is named and the indexes are left alone | `tests/test_cpld_dump.py::test_a_late_starting_root_side_timeout_is_waited_for`, `::test_a_background_child_of_the_diag_is_waited_for`, `::test_a_straggler_that_never_ends_is_named_and_the_indexes_are_left_alone` |
 | I109 error path: the DIAG ends before the index is restored, only read indexes are restored, the lock is released, the error is named | `tests/test_cpld_dump.py::test_a_failed_output_write_ends_the_diag_and_restores_the_index`, `::test_a_failed_pipe_read_ends_the_diag_and_restores_the_index`, `::test_an_error_before_the_diag_restores_only_what_was_read` |
 | I109 a silent BMC costs one call: before the DIAG it is skipped, after it the remaining restores and the PSU read are skipped, the event names why | `tests/test_cpld_dump.py::test_a_silent_bmc_before_the_diag_skips_it_after_one_call`, `::test_a_bmc_silent_after_the_diag_keeps_the_dump_and_skips_the_rest`, `::test_an_ipmitool_past_the_brokers_own_bound_is_a_silent_bmc` |
 | I109 the dump and the episode's incident folders are cross-linked both ways | `tests/test_cpld_dump.py::test_a_chip_dead_incident_and_its_dump_are_linked`, `::test_an_incident_after_the_dump_links_to_it`, `::test_an_incident_just_before_the_episode_opened_is_linked`, `::test_no_link_outside_the_episode` |

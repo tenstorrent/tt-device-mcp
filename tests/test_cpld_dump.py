@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import sys
 import time
 
@@ -475,10 +476,12 @@ def test_psu_read_failure_keeps_the_dump(fake, monkeypatch):
 # Like sudo: the command runs as root, out of the broker's reach. Here it runs in its own session,
 # so the broker's killpg of sudo's group misses it, as EPERM does on a real host.
 FAKE_SUDO = """#!{py}
-import subprocess, sys
+import os, subprocess, sys, time
 a = sys.argv[1:]
 if a[:1] == ["-n"]:
     a = a[1:]
+if "DIAG" in a:
+    time.sleep(float(os.environ.get("FAKE_SUDO_DELAY", "0")))
 rc = subprocess.Popen(a, start_new_session=True).wait()
 sys.exit(rc if rc >= 0 else 128 - rc)
 """
@@ -490,6 +493,18 @@ sleep 300 &
 echo $! > "$FAKE_DIAG_PIDS/child"
 echo "This Script: V1.03.01"
 wait
+"""
+
+# The same, started after the broker closed the pipe: it must outlive the SIGPIPE its first line earns.
+LATE_DIAG = HUNG_DIAG.replace("#!/bin/bash\n", "#!/bin/bash\ntrap '' PIPE\n")
+
+# A DIAG that ends on its own while a background child, output closed, runs on.
+ORPHAN_DIAG = """#!/bin/bash
+echo $$ > "$FAKE_DIAG_PIDS/diag"
+sleep ${FAKE_ORPHAN_SEC:-2} > /dev/null 2>&1 &
+echo $! > "$FAKE_DIAG_PIDS/child"
+echo "This Script: V1.03.01"
+sleep 0.7
 """
 
 # A DIAG that keeps writing for a while, then ends.
@@ -573,6 +588,53 @@ def test_a_hung_diag_behind_sudo_is_gone_when_the_dump_returns(as_user, monkeypa
     restores = (as_user["pids"] / "restores").read_text().splitlines()
     assert len(restores) == 4 and all(r.endswith("alive=False") for r in restores), restores
     assert all(v["restored"] for v in rec["index_0x50"].values())
+
+
+def test_a_late_starting_root_side_timeout_is_waited_for(as_user, monkeypatch):
+    """sudo starts the root-side timeout after the broker stopped reading and killed sudo: the
+    DIAG must still be dead, and the indexes restored after it, when the dump returns."""
+    _use_diag(as_user, monkeypatch, LATE_DIAG)
+    monkeypatch.setenv("TT_DEVICE_MCP_CPLD_DUMP_CAP_SEC", "1")
+    monkeypatch.setenv("FAKE_SUDO_DELAY", "2.5")
+    rec = cpld_dump.take_dump("off_bus", "ep-late", lambda _s: None)
+    diag, child = _pid(as_user, "diag"), _pid(as_user, "child")
+    assert not _alive(diag) and not _alive(child), "the root-side DIAG outlived the dump"
+    assert "diag_alive" not in rec and rec["rc"] is None and rec["summary"].startswith("timed out")
+    restores = (as_user["pids"] / "restores").read_text().splitlines()
+    assert len(restores) == 4 and all(r.endswith("alive=False") for r in restores), restores
+    assert all(v["restored"] for v in rec["index_0x50"].values())
+
+
+def test_a_background_child_of_the_diag_is_waited_for(as_user, monkeypatch):
+    _use_diag(as_user, monkeypatch, ORPHAN_DIAG)
+    monkeypatch.setenv("FAKE_ORPHAN_SEC", "1.2")
+    monkeypatch.setenv("TT_DEVICE_MCP_CPLD_DUMP_CAP_SEC", "1")
+    rec = cpld_dump.take_dump("off_bus", "ep-orphan", lambda _s: None)
+    assert not _alive(_pid(as_user, "child")), "a child of the DIAG outlived the dump"
+    assert "diag_alive" not in rec
+    restores = (as_user["pids"] / "restores").read_text().splitlines()
+    assert len(restores) == 4 and all(r.endswith("alive=False") for r in restores), restores
+
+
+def test_a_straggler_that_never_ends_is_named_and_the_indexes_are_left_alone(as_user, monkeypatch):
+    _use_diag(as_user, monkeypatch, ORPHAN_DIAG)
+    monkeypatch.setenv("FAKE_ORPHAN_SEC", "30")
+    monkeypatch.setenv("TT_DEVICE_MCP_CPLD_DUMP_CAP_SEC", "1")
+    t0 = time.monotonic()
+    rec = None
+    try:
+        rec = cpld_dump.take_dump("off_bus", "ep-straggler", lambda _s: None)
+        child = _pid(as_user, "child")
+        assert time.monotonic() - t0 < cpld_dump.total_bound_sec()
+        assert rec["diag_alive"] == [child]
+        assert "still running" in rec["summary"] and "NOT restored" in rec["summary"]
+        assert not any(v["restored"] for v in rec["index_0x50"].values())
+        assert not (as_user["pids"] / "restores").exists(), "an index was written while the DIAG tree ran"
+    finally:
+        try:
+            os.kill(_pid(as_user, "child"), signal.SIGKILL)
+        except (OSError, FileNotFoundError):
+            pass
 
 
 def test_a_hung_ipmitool_behind_sudo_is_killed_at_its_bound(as_user, monkeypatch):
