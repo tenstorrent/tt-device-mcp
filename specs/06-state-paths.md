@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 # State paths & configuration
 
 Scope: every durable path in both deployment shapes (system broker and per-user daemon), the
-install-base vs runtime-state split, path-resolution and directory-permission rules, and the
+install-base vs runtime-state split, path-resolution, permission and logging rules, and the
 consolidated environment-variable index. What each variable *does* is its owning spec's contract;
 this spec owns where state lives and how a path is resolved.
 
@@ -98,10 +98,34 @@ and job exit statuses never hit disk.
   root, or else report the error and fall back to its old checks, never treat `EACCES` as a free
   lock. The lock is advisory and only covers the broker's own device ops, not tenant jobs, which
   run outside `_device_op()`.
+- **I9 — The system broker's logs and state are readable by every local user.** Under
+  `/var/log/tt-device-broker` and `/var/lib/tt-device-broker`, every directory is 0755 and every
+  regular file 0644, set by the writer and never left to the umask; a directory the broker did not
+  create keeps its mode. The log dir, the state root and its `health/` are brought to 0755 on every
+  start, and only when they are the system default paths; failing that fails the start (log dir) or
+  the I7 preflight (health dir). The one private file is `<health dir>/local-reset.lock` (0600):
+  anyone who can open it can hold its `flock` and defer every local reset (spec 04 I5). Readable
+  never means writable. The per-user base stays 0700 (I6).
+- **I10 — Every process the deployment runs logs to its own file in the log dir, and the same lines
+  to stderr.** The broker writes `<log dir>/server.log` and byte-identical lines on stderr, survives
+  a rename rotation, and logs an uncaught exception there before it dies (Ctrl-C is logged as a
+  stop). uvicorn logs through the broker's handlers, with its access log off. The health probe
+  (`python -m tt_device_mcp.health_probe`) logs through the same `setup_logging`, to
+  `health-probe.log`, keeping only the stderr copy when it cannot write the file. One mechanism per
+  language: Python processes use `setup_logging`, shell scripts the shared log helper, `log.sh`.
+  `reconcile.sh`, `autoupdate.sh`, `install-fabric-validator.sh`, `apply-host-config.sh` and
+  `device-lock.sh` emit status lines only through it, to `<name>.log` in the log dir; autoupdate's
+  decision records (spec 08 I22) are among them. The journal is a second copy, never the only one
+  (spec 08). Deploy-script log names never match the job-log name pattern (spec 01). Outside the
+  rule: the broker-launched probes (`fabric-check.sh`, the eth heartbeat, the manual-recovery
+  check, `present_reinit`), whose output the broker captures; the buslock unit (a measurement, to
+  `health/buslock.log`); the crash recorder (health dir; it also runs on hosts with no log dir);
+  and the power-cycle shutdown hook, which runs once the filesystems are read-only and so writes
+  `/dev/kmsg`.
 
 ## Path matrix
 
-`<state>` = `constants.user_state_dir()` = `/tmp/tt-device-mcp-<uid>` unless
+`<state>` = `constants.user_state_dir()` = `/tmp/tt-device-mcp-<uid>/state` unless
 `TT_DEVICE_MCP_STATE_DIR` (or `--log-dir`, which repoints the whole base) says otherwise.
 
 | State | System broker (root) | Per-user daemon | Override |
@@ -110,7 +134,7 @@ and job exit statuses never hit disk.
 | Runtime state base | n/a (system paths below) | `<install>/state` | `TT_DEVICE_MCP_STATE_DIR` (independent of the install base), `--log-dir` |
 | Socket | `/run/tt-device-broker/broker.sock` (`RuntimeDirectory=`, chmod 0666) | `<state>/daemon.sock` | `--socket` / `TT_DEVICE_MCP_SOCKET` |
 | FSM state file | `/var/lib/tt-device-broker/health/fsm.json` | `<state>/health/fsm.json` | follows the health dir |
-| Health journal (events, telemetry trace, buslock, chip and eth-link baselines, incidents/, the idle-time probe's `health_probe_state.json`) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | `TT_DEVICE_MCP_HEALTH_DIR` |
+| Health journal (events, telemetry trace, buslock, chip and eth-link baselines, incidents/, the idle-time probe's `health_probe_state.json`) | `/var/lib/tt-device-broker/health/` (0755, files 0644 — I9) | `<state>/health/` | `TT_DEVICE_MCP_HEALTH_DIR` |
 | Off-bus reset intent and host-hang latch (`offbus_reset_intent.json`, `offbus_reset_hold.json`) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Gated off-bus power-cycle attempts (`offbus_power_cycle.json`, spec 04 I27) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | BMC restart-cause capability stamp (`power_cycle_restart_cause_capable.json`, written the first time the BMC reports a real restart cause; lets a later `unknown` refute a power cycle, spec 04 I88) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
@@ -122,17 +146,18 @@ and job exit statuses never hit disk.
 | Chip-to-PCI-bus map at the last clean fabric pass (`fabric_ok_asic_bus.json`, spec 03 I42) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Topology mismatch cached per chip-to-bus map and descriptor (`fabric_topology_mismatch.json`, spec 03 I45) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
 | Killed holders stuck on a dead chip, with the boot id and the episode start (`dead_chip_stuck.json`, spec 04 I77) | `/var/lib/tt-device-broker/health/` | `<state>/health/` | follows the health dir |
-| Server log + job logs | `/var/log/tt-device-broker/` (the unit passes `--log-dir`; the bare server defaults to CWD) | `<state>/` | `--log-dir` |
+| Server log + job logs | `/var/log/tt-device-broker/` (0755, files 0644 — I9; the unit passes `--log-dir`; the bare server defaults to CWD) | `<state>/` | `--log-dir` |
+| Health-probe log (`health-probe.log` — I10) | `/var/log/tt-device-broker/` (0644, via `setup_logging`) | n/a (system unit only) | `TTDEV_LOG_DIR` |
+| Deploy-script logs (`reconcile.log`, `autoupdate.log` with its decision records — spec 08 I22, `fabric-validator.log`, `apply-host-config.log`, `device-lock.log` — I10) | `/var/log/tt-device-broker/` (0644, via `deploy/tt-device-log.sh`, staged as `$TTDEV_ROOT/log.sh`) | n/a (no units in this shape) | `TTDEV_LOG_DIR` (deploy-owned) |
 | Stats | `<log-dir>/stats/` → `/var/log/tt-device-broker/stats/` | `<state>/stats/` | follows `--log-dir` |
 | Metrics textfile | `/var/lib/prometheus/node-exporter/tt_device_mcp.prom` | `<state>/metrics/tt_device_mcp.prom` | `TT_DEVICE_MCP_TEXTFILE_DIR` |
 | Job exit records | `/run/tt-device-broker/jobexit/` (sticky 1777) | `<state>/jobexit/` (exported by the CLI, 0700 base) | `TT_DEVICE_MCP_JOB_EXIT_DIR` |
 | Device-op inhibit lock | `/run/tt-device-broker/device-op.lock` | `<state>/device-op.lock` (exported by the CLI) | `TT_DEVICE_MCP_DEVICE_OP_LOCK` |
 | Job output spool | `/run/tt-device-broker-spool/` (0700; outside the unit's RuntimeDirectory, so it survives a broker restart) | `<state>/jobspool/` (exported by the CLI) | `TT_DEVICE_MCP_JOB_SPOOL_DIR` |
 | Dispatch hold (autoupdate) | `/run/tt-device-broker/dispatch-hold` | `<state>/dispatch-hold` (sibling of the inhibit lock) | `TT_DEVICE_MCP_DISPATCH_HOLD` |
-| Autoupdate decision log (spec 08 I22) | `/var/log/tt-device-broker/autoupdate.log` (+ `.1`), and the journal tag `tt-device-autoupdate` | n/a (system autoupdate only) | follows `TTDEV_LOG_DIR` |
 | Device-op advisory flock (I8) | `/run/tt-device-broker/device-op.flock` | `<state>/device-op.flock` (sibling of the inhibit lock) | `TT_DEVICE_MCP_DEVICE_OP_FLOCK` |
 | Chip state (published, 03 I66) | `/run/tt-device-broker/chip-state.json` (0644, atomic rename) | `<state>/chip-state.json` (sibling of the inhibit lock) | `TT_DEVICE_MCP_CHIP_STATE_FILE` |
-| Daemon pid / daemon stdout | n/a (systemd / journald) | `<state>/daemon.pid`, `<state>/daemon.log` | follows the state base |
+| Daemon pid / daemon stdout | n/a (journal by systemd's default, a second copy of `server.log` — I10) | `<state>/daemon.pid`, `<state>/daemon.log` (I10) | follows the state base |
 | Host config | `/etc/default/tt-device-broker` (written by installer, sourced by apply-host-config, autoupdate, and the Slurm hooks) | n/a | `TTDEV_ETC_DEFAULT` (apply-host-config's render/test seam; also a real runtime override for the Slurm hooks, which source it unconditionally on every invocation) |
 | Per-user client prefs (CLI-side, any shape) | `~/.config/tt-device-mcp/timezone` (`XDG_CONFIG_HOME` honored) | same | `TT_DEVICE_MCP_TZ` beats the saved timezone |
 
@@ -179,6 +204,26 @@ tenant.
 - *Job logs / stats*: `main()` creates them at start; a failure there is a startup failure, not a
   runtime degrade.
 
+**Readable logs and state (I9).** Broker writers in the two trees create files through
+`utils.open_readable` / `write_text_readable`, whose create carries the 0644, and directories
+through `readable_mkdir`, which modes only the components it created. A test fails on any other
+create in the package that is not named as outside both trees. A mode that cannot be set never fails
+the write and is logged once per path; the roots' chmod raises, because a root its readers cannot
+open is a failed start. A host upgraded in place is brought to the rule by the host-config apply's
+migration sweep (spec 08).
+
+**Deploy-script log helper (I10).** `deploy/tt-device-log.sh`, staged as `$TTDEV_ROOT/log.sh`, gives
+each script a `log` that writes `<YYYY-MM-DD HH:MM:SS UTC> | <name> | <message>` to
+`$TTDEV_LOG_DIR/<name>.log` and to stderr. It creates the dir and file at 0755 / 0644 whatever the
+caller's umask, and always returns 0: an unwritable dir costs one warning, never the stderr line or
+a `set -e` exit. `TTDEV_LOG_STDERR_ONLY=1` writes no file at all — the host-config apply's
+`--print-unit` render sets it, since that seam writes no host path. A unit script that cannot source
+the helper defines a stderr-only `log` in its place, so a missing helper costs the file, never the
+line.
+
+**Server log rotation (I10).** logrotate renames `server.log`; the broker's handler reopens the path
+and brings the new file to 0644 before its first line.
+
 **Stats persistence cadence.** `stats_persistence_loop` saves the session stats JSON every
 `STATS_UPDATE_SEC` (30 s), repoints the `current` symlink at the latest session file, and publishes
 the Prometheus textfile on the same cadence plus once on clean shutdown.
@@ -197,7 +242,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | Variable | Default | Effect | Spec |
 |---|---|---|---|
 | `TT_DEVICE_MCP_SOCKET` | unset | Socket override; resolution: explicit/env > broker socket > user daemon socket | 02 |
-| `TT_DEVICE_MCP_STATE_DIR` | `/tmp/tt-device-mcp-<uid>` | Per-user runtime state base | 06 |
+| `TT_DEVICE_MCP_STATE_DIR` | `/tmp/tt-device-mcp-<uid>/state` | Per-user runtime state base | 06 |
 | `TT_DEVICE_MCP_HEALTH_DIR` | euid-split (matrix) | Health journal dir (and via it the FSM file); must be set pre-import (I5) | 06 |
 | `TT_DEVICE_MCP_TEXTFILE_DIR` | euid-split (matrix) | Prometheus textfile directory | 06 |
 | `TT_DEVICE_MCP_JOB_EXIT_DIR` | `/run/tt-device-broker/jobexit` | Where jobs record their own exit status | 06 |
@@ -294,6 +339,9 @@ Behavior).
 | `TTDEV_VENV` | required in config | Broker venv path the unit execs from |
 | `TTDEV_ROOT` | `/opt/tt-device-broker` | Broker install root (also read by src fabric/dispatch resolvers via `TTDEV_VALIDATOR_ROOT` default) |
 | `TTDEV_UNIT_PATH` | `/etc/systemd/system/tt-device-broker.service` | Unit path (render seam) |
+| `TTDEV_LOG_DIR` | `/var/log/tt-device-broker` | Where `log.sh` writes the deploy-script logs and the health probe writes `health-probe.log` (I10); the same directory the unit hands the broker as `--log-dir`. Empty means unset. Tests point it at a temp dir |
+| `TTDEV_LOG_STDERR_ONLY` | `0` | `1`: `log.sh` writes stderr only, no file (I10). Set by the apply's `--print-unit` render seam |
+| `TTDEV_LOG_NAME` | set by each sourcing script | The deploy-script log's basename (`reconcile`, `autoupdate`, `fabric-validator`, `apply-host-config`, `device-lock`); not an operator knob |
 | `TTDEV_BRANCH` | `main` | Branch autoupdate tracks — the **only** settable part of the update source (08 I16); the repository itself is a constant in `autoupdate.sh`, not configuration |
 | `TTDEV_AUTOUPDATE` | `1` | Autoupdate master switch. Read at install to seed the config file, and by every lap; `sudo TTDEV_AUTOUPDATE=0 ./install.sh` turns a host off outright (after `sudo`, which resets the environment) |
 | `TTDEV_RECOVERY_DEFER_SEC` | 1200 (capped at 1800; 0 off) | Seconds an update waits while the broker is held or recovering: it applies once the hold is that old or the update has waited that long (spec 08 I23). Delays only the update's restart, never a recovery step |
@@ -380,6 +428,24 @@ ahead loses only what the lock adds (a cooperating tool skipping its write), whi
 behaviour without the lock. The WARNING and the journal event make it visible. A holder that dies
 releases the lock with its last fd, as every flock does.
 
+**World-readable by design, not by umask.** On a shared host the broker is root's and its users
+have no sudo; logs only root can read make "it is stuck" the whole bug report. The directory modes
+used to fall out of `mkdir -p` and the installing umask (0750 on strict-umask hosts, 0755
+elsewhere), so the rule states them. On a default-umask host nothing new becomes readable. On a
+strict-umask host the migration sweep also opens existing history, job-log `ENVIRONMENT VARIABLES`
+blocks included; that is accepted, because no spec promised the logs were private and an in-memory
+job's log was already readable over the socket (`tt_device_job_logs`). Keeping the accidental
+privacy would have needed migration machinery in the broker's startup path.
+
+**The tee lives in the process, not in the unit.** systemd gives each stream one target and no tee:
+`StandardOutput=append:` makes the file the only copy, and a pipeline in `ExecStart` replaces the
+main pid that `Type=notify` and the watchdog track. Two handlers in the broker and a shell helper in
+the scripts give one directory, one line format and one rotation rule, and keep the journal copy.
+
+**The per-user duplicate is accepted.** `daemon.log` and `server.log` both hold the logger's lines.
+Dropping the capture loses failures before logging is set up; one file with two writers interleaves
+lines. The base is boot-cleared (I4), so the duplicate does not accumulate.
+
 ## Test anchors
 
 | Claim | Anchors (pytest node ids) |
@@ -401,3 +467,5 @@ releases the lock with its last fd, as every flock does.
 | I8 (children never inherit it) | `tests/test_device_op_flock.py::test_children_never_inherit_the_flock` |
 | I8 (path: sibling of the inhibit file, own override) | `tests/test_device_op_flock.py::test_the_flock_defaults_to_a_sibling_of_the_inhibit_file` |
 | I8 (a short hold delays; one past the timeout is logged and does not stall the op; unopenable path is inert) | `tests/test_device_op_flock.py::test_a_short_external_hold_only_delays_the_op`, `tests/test_device_op_flock.py::test_a_holder_that_outlasts_the_timeout_does_not_stall_the_op`, `tests/test_device_op_flock.py::test_an_unopenable_flock_path_changes_nothing` |
+| I9 (both trees readable under a 077 umask, by a walk; the lock stays private; roots moded only at the system defaults; a root that cannot be moded fails per tree; helpers never raise; a create carries its mode, and a create outside the helpers fails unless named outside the trees; the unit states `UMask=0022`) | `tests/test_state_paths.py::test_every_file_and_directory_under_both_trees_is_readable_under_a_strict_umask`, `tests/test_device_safety.py::test_the_local_reset_lock_stays_private_because_a_readable_lock_lets_anyone_defer_every_reset`, `tests/test_state_paths.py::test_the_tree_roots_are_brought_to_mode_only_at_the_system_default_paths`, `tests/test_state_paths.py::test_a_per_user_base_is_never_brought_to_mode_at_its_root`, `tests/test_state_paths.py::test_a_redirected_health_dir_the_operator_made_keeps_its_mode_while_what_the_broker_writes_inside_is_readable`, `tests/test_state_paths.py::test_a_log_dir_root_that_cannot_be_brought_to_mode_fails_the_start`, `tests/test_state_paths.py::test_a_health_dir_root_that_cannot_be_brought_to_mode_follows_the_i7_preflight_rule[health-checks-on-fails]`, `tests/test_state_paths.py::test_a_health_dir_root_that_cannot_be_brought_to_mode_follows_the_i7_preflight_rule[health-checks-off-warns]`, `tests/test_state_paths.py::test_the_readable_helpers_never_raise_and_log_once_per_path`, `tests/test_apply_host_config_render.py::test_the_rendered_unit_states_umask_0022`, `tests/test_state_paths.py::test_open_readable_creates_and_reasserts_0644_under_a_strict_umask`, `tests/test_state_paths.py::test_every_create_in_the_package_goes_through_the_i9_helpers_or_is_named_outside_the_trees`, `tests/test_deploy_log_files.py::test_a_shell_health_event_append_creates_the_journal_at_0644_under_a_strict_umask[autoupdate_applied_no_restart]`, `tests/test_deploy_log_files.py::test_a_shell_health_event_append_creates_the_journal_at_0644_under_a_strict_umask[autoupdate_apply]`, `tests/test_deploy_log_files.py::test_a_shell_health_event_append_creates_the_journal_at_0644_under_a_strict_umask[device_lock_drift]` |
+| I10 (one file and one stderr handler per logger, rename-safe at 0644; a unit script without its helper still logs to stderr; the excepthook and Ctrl-C; uvicorn through the broker's handlers; the two unit-writer exceptions; `log.sh` line, modes, umask, return code, unwritable dir and stderr-only seam; each script logs only through it; no unit redirects its streams or runs a pipeline; per-user `daemon.log`) | `tests/test_logging_shape.py::test_setup_logging_installs_one_file_and_one_stderr_handler_sharing_a_formatter`, `tests/test_logging_shape.py::test_a_renamed_server_log_is_followed_by_a_fresh_file_at_the_path`, `tests/test_logging_shape.py::test_an_uncaught_exception_reaches_server_log_through_the_excepthook`, `tests/test_logging_shape.py::test_a_ctrl_c_is_logged_as_a_stop_and_nothing_else_is`, `tests/test_logging_shape.py::test_uvicorn_logs_through_the_brokers_handlers_with_access_logging_off`, `tests/test_deploy_log_files.py::test_the_buslock_unit_and_the_crash_recorder_write_to_the_health_dir_at_the_stated_paths`, `tests/test_deploy_log_helper.py::test_log_appends_the_three_field_line_to_the_named_file_and_echoes_it_to_stderr`, `tests/test_deploy_log_helper.py::test_log_creates_an_absent_dir_0755_and_an_absent_file_0644_whatever_the_umask`, `tests/test_deploy_log_helper.py::test_the_append_itself_states_the_mode_so_a_rotation_between_create_and_append_leaves_0644`, `tests/test_deploy_log_helper.py::test_the_stderr_only_switch_keeps_the_line_and_creates_no_file_anywhere`, `tests/test_deploy_log_helper.py::test_log_defaults_its_dir_to_the_system_log_dir`, `tests/test_apply_host_config_render.py::test_the_render_seam_logs_to_stderr_only_and_writes_no_log_file`, `tests/test_deploy_log_helper.py::test_log_leaves_the_callers_umask_alone`, `tests/test_deploy_log_helper.py::test_log_returns_zero`, `tests/test_deploy_log_helper.py::test_an_unwritable_log_dir_keeps_the_stderr_copy_warns_once_and_never_ends_a_set_e_shell`, `tests/test_deploy_log_helper.py::test_each_unit_script_sources_the_helper_by_adjacency_and_sets_its_name`, `tests/test_deploy_log_helper.py::test_each_unit_script_emits_no_status_line_outside_log`, `tests/test_deploy_log_files.py::test_no_shipped_or_rendered_unit_sets_standard_output_or_standard_error`, `tests/test_apply_host_config_render.py::test_the_rendered_unit_sets_no_standard_output_or_standard_error`, `tests/test_deploy_log_files.py::test_no_shipped_or_rendered_unit_runs_a_pipeline_as_its_exec_start`, `tests/test_install_modes.py::test_daemon_start_redirects_the_child_to_daemon_log_and_leaves_server_log_to_the_logger`, `tests/test_deploy_log_helper.py::test_a_unit_script_without_its_helper_logs_to_stderr_and_carries_on[reconcile]`, `tests/test_deploy_log_helper.py::test_a_unit_script_without_its_helper_logs_to_stderr_and_carries_on[autoupdate]`, `tests/test_deploy_log_helper.py::test_a_unit_script_without_its_helper_logs_to_stderr_and_carries_on[fabric-validator]`, `tests/test_logging_shape.py::test_the_health_probe_logs_through_the_broker_shape_to_its_own_file`, `tests/test_logging_shape.py::test_a_health_probe_that_cannot_write_its_log_keeps_stderr_and_carries_on`, `tests/test_deploy_log_helper.py::test_a_unit_script_without_its_helper_logs_to_stderr_and_carries_on[device-lock]`, `tests/test_deploy_log_helper.py::test_the_stamp_is_utc_whatever_the_callers_zone`, `tests/test_deploy_log_helper.py::test_an_empty_log_dir_set_after_sourcing_means_the_default_not_stderr_only`, `tests/test_logging_shape.py::test_the_health_probe_entry_point_sets_up_its_log_before_it_runs` |

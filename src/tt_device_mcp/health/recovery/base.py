@@ -33,6 +33,7 @@ from tt_device_mcp.health.pci_writer import PCI_WRITER, PciWedged
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import ipmi_guard, power_cycle_reason
 from tt_device_mcp.health.recovery.power_cycle_reason import PowerCycleReason
+from tt_device_mcp.utils import open_readable, readable_mkdir, write_text_readable
 
 # System-broker resets run as transient scopes under this prefix so PID 1 owns them.
 # A daemon without systemd uses the local lock below for the same restart-adoption contract.
@@ -858,8 +859,8 @@ class RecoveryMechanism:
         path = health_dir() / RESET_RECORD_FILE
         tmp = path.with_name(path.name + ".tmp")
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(tmp, "w", encoding="utf-8") as f:
+            readable_mkdir(path.parent)
+            with open_readable(tmp, "w", encoding="utf-8") as f:
                 f.write(json.dumps(rec))
                 f.flush()
                 os.fsync(f.fileno())
@@ -1013,7 +1014,11 @@ class RecoveryMechanism:
         """
         path = self._local_reset_lock_path()
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            readable_mkdir(path.parent)
+            # 0600, not open_readable: the one file in the tree that stays the owner's (spec 06
+            # I9). A 0644 lock lets any local user open it read-only and hold LOCK_EX on that
+            # descriptor, which this very predicate would then report as a reset in flight — and
+            # every local reset on the box would defer to a tenant who holds no device at all.
             fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         except OSError:
             return False
@@ -1138,7 +1143,9 @@ class RecoveryMechanism:
         proc = None
         output_path = base / f"{LOCAL_RESET_NAME}-{os.getpid()}-{self.reset_scope_seq}.log"
         try:
-            base.mkdir(parents=True, exist_ok=True)
+            readable_mkdir(base)
+            # The lock stays 0600 — see local_reset_active for why a readable lock is a denial of
+            # every local reset.
             lock_fd = os.open(self._local_reset_lock_path(), os.O_CREAT | os.O_RDWR, 0o600)
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1148,7 +1155,7 @@ class RecoveryMechanism:
                 health_event("reset_launch_deferred", unit=unit, argv=argv, reason=text)
                 self._write_action_log(owner, command, dt, "deferred", None)
                 return None, text
-            output_file = open(output_path, "w+b")
+            output_file = open_readable(output_path, "w+b")
             proc = await asyncio.create_subprocess_exec(
                 *self._launch_argv(argv),
                 stdout=output_file,
@@ -2371,7 +2378,7 @@ class RecoveryMechanism:
                 ln = json.dumps(rec, default=str)
             out.append(ln)
         tmp = path.with_name(path.name + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open_readable(tmp, "w", encoding="utf-8") as f:
             f.write("".join(f"{ln}\n" for ln in out))
             f.flush()
             os.fsync(f.fileno())
@@ -2435,7 +2442,7 @@ class RecoveryMechanism:
         mapped = cause is not None and power_cycle_stage.restart_cause_is_mapped(cause)
         if mapped and cause != "unknown" and not capable:
             with contextlib.suppress(OSError):
-                stamp.write_text(json.dumps({"at_epoch": now_epoch, "cause": cause}) + "\n", encoding="utf-8")
+                write_text_readable(stamp, json.dumps({"at_epoch": now_epoch, "cause": cause}) + "\n", encoding="utf-8")
             capable = True
         if mapped and power_cycle_stage.restart_cause_is_cycle(cause):
             verdict = "confirmed"
@@ -2748,8 +2755,8 @@ class RecoveryMechanism:
         rec.update(set_at=now_epoch, deadline=_local_time(state["until"]), unstamped_cycles=unstamped)
         tmp = path.with_name(path.name + ".tmp")
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(json.dumps(rec))
+            readable_mkdir(path.parent)
+            write_text_readable(tmp, json.dumps(rec))
             os.replace(tmp, path)
         except OSError:
             pass
@@ -2814,8 +2821,8 @@ class RecoveryMechanism:
             )
         try:
             path = health_dir() / POWER_CYCLE_HEALED_FILE
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps({"at_epoch": now_epoch, "at": _local_time(now_epoch)}))
+            readable_mkdir(path.parent)
+            write_text_readable(path, json.dumps({"at_epoch": now_epoch, "at": _local_time(now_epoch)}))
         except OSError:
             pass
 
@@ -2893,8 +2900,8 @@ class RecoveryMechanism:
             rec["off_bus"] = list(self.whole_tray_off)  # spec 04 I73: which tray this cycle was for
         path = health_dir() / AUTO_RECOVERY_LEDGER
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "a", encoding="utf-8") as f:
+            readable_mkdir(path.parent)
+            with open_readable(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, default=str) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
@@ -2923,7 +2930,7 @@ class RecoveryMechanism:
             if rec.get("action") == action and rec.get("boot_id") == boot:
                 del lines[i]
                 try:
-                    path.write_text("".join(f"{ln}\n" for ln in lines), encoding="utf-8")
+                    write_text_readable(path, "".join(f"{ln}\n" for ln in lines), encoding="utf-8")
                 except OSError:
                     pass
                 return
@@ -3014,8 +3021,8 @@ class RecoveryMechanism:
         path = health_dir() / AUTO_RECOVERY_VERIFIED
         tmp = path.with_name(path.name + ".tmp")
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(json.dumps(rec, default=str))
+            readable_mkdir(path.parent)
+            write_text_readable(tmp, json.dumps(rec, default=str))
             os.replace(tmp, path)
         except OSError:
             pass

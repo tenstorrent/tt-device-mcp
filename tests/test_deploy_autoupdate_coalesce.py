@@ -151,7 +151,7 @@ def test_a_coalescing_lap_says_when_it_applies_and_logs_its_deferral(tmp_path):
     assert restarts == [], done.stderr
     assert "coalescing: head b2 seen 0s ago (quiet 600s)" in done.stderr, done.stderr
     assert "applies in 600s if the branch stays put" in done.stderr, done.stderr
-    (logged,) = (tmp_path / "logs" / "autoupdate.log").read_text().splitlines()
+    (logged,) = [x for x in (tmp_path / "logs" / "autoupdate.log").read_text().splitlines() if "decision=" in x]
     assert "decision=deferred" in logged and "new=b2" in logged and "reason=burst coalescing:" in logged, logged
     assert "apply_by=" in logged, logged
     assert (root / "pending-head").read_text().split() == [str(T0), "b2", str(T0)]

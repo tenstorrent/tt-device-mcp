@@ -73,6 +73,13 @@ class PeerCredMiddleware:
 PEERCRED_MARKER = "peercred"
 
 
+# One logging shape (spec 06 I10): uvicorn's own loggers propagate to the broker's root pair
+# (server.log + stderr) instead of installing the stderr/stdout handlers its default config
+# carries, and the per-request access line is off — the broker logs every tool call and submission
+# itself. Both transports build their Config from this one constant so they cannot drift apart.
+UVICORN_LOGGING = {"log_config": None, "access_log": False}
+
+
 def _is_mcp_path(path: str) -> bool:
     """Whether ``path`` is the MCP endpoint or a child of it."""
     return path == MCP_PATH or path.startswith(MCP_PATH + "/")
@@ -142,6 +149,7 @@ async def serve_unix_socket(app, socket_path: str) -> "object":
         uds=socket_path,
         http=_build_peercred_protocol(),
         log_level="info",
+        **UVICORN_LOGGING,
     )
     server = uvicorn.Server(config)
     # Keep a handle to the serve task so callers/tests can cancel it cleanly.

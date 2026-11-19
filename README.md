@@ -267,8 +267,20 @@ See [deploy/README.md](deploy/README.md) for the timeout arithmetic
 **A job is queued and nothing runs.**
 
 - `tt-device-mcp status` names the running job and its owner.
-- A held queue means the gate found the device unfit. The daemon log has the
-  evidence.
+- A held queue means the gate found the device unfit. The broker log has the
+  evidence: `/var/log/tt-device-broker/server.log` on a system install,
+  `/tmp/tt-device-mcp-<uid>/state/server.log` for a per-user daemon
+  (`tt-device-mcp daemon start`).
+
+**Where the logs and state are.** On a system install every user can read them,
+no sudo or journal access needed:
+
+- `/var/log/tt-device-broker/` — `server.log`, one log per job
+  (`<YYYY-MM-DD_HHMMSS>_<id>.log`, kept 30 days), and the deploy scripts' logs.
+- `/var/lib/tt-device-broker/health/` — the FSM state (`fsm.json`), health
+  events, telemetry and incident bundles.
+
+The full table is in [deploy/README.md](deploy/README.md#where-the-logs-are).
 
 **The device is hung.**
 

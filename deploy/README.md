@@ -121,6 +121,55 @@ A source that keeps failing is named once, on the first failing lap (the marker
 `$TTDEV_ROOT/.source-unreachable` records when it began), and once more when a fetch works again.
 A failing lap changes nothing: no dispatch hold, no restart.
 
+## Where the logs are
+
+The broker and the deploy scripts each write their own file in `/var/log/tt-device-broker/` and
+the same lines to stderr, which the journal keeps as a second copy (spec 06 I10). The broker's
+state lives in `/var/lib/tt-device-broker/health/` (spec 06 path matrix).
+
+| Path | What | Writer |
+|---|---|---|
+| `/var/log/tt-device-broker/server.log` | broker log: gate verdicts, holds, resets, crash tracebacks | the broker |
+| `/var/log/tt-device-broker/<YYYY-MM-DD_HHMMSS>_<id>.log` | one per job: header (owner, command, environment), output, exit footer | the broker |
+| `/var/log/tt-device-broker/health-probe.log` | the idle-time health probe (every 2 min): PCI rescans, poller restarts, alerts | `tt-device-health-probe.service` |
+| `/var/log/tt-device-broker/queued/<id>.json` | specs of jobs still queued, restored after a restart | the broker |
+| `/var/log/tt-device-broker/stats/` | queue statistics (`current` links the live file) | the broker |
+| `/var/log/tt-device-broker/{reconcile,autoupdate,fabric-validator,apply-host-config,device-lock}.log` | deploy-script status lines; `autoupdate.log` also carries one `decision=` record per update decision (spec 08 I22): `grep decision= autoupdate.log` | the deploy scripts, through `deploy/tt-device-log.sh` (staged as `/opt/tt-device-broker/log.sh`) |
+| `/var/lib/tt-device-broker/health/fsm.json` | health FSM state | the broker |
+| `/var/lib/tt-device-broker/health/health_events.jsonl` | health event journal | the broker, the crash recorder, autoupdate and the device lock |
+| `/var/lib/tt-device-broker/health/telemetry.jsonl`, `chip_baseline.json` | telemetry trace, per-chip baseline | the broker |
+| `/var/lib/tt-device-broker/health/incidents/<incident>/` | incident bundles: `incident.json`, `kernel.log`, `telemetry_trace.json`, `job.log`, `reset.log`, `fabric.log` | the broker |
+| `/var/lib/tt-device-broker/health/buslock.log` | split-lock counter | the buslock unit |
+| `/opt/tt-device-broker/validator/<key>/build.log`, `<key>.build/build.log` | the validator build's cmake transcript, in the slot it built (latest attempt; the one before is `build.log.prev`) | the validator build |
+
+Both state trees (`/var/log/tt-device-broker`, `/var/lib/tt-device-broker`) are 0755 directories
+of 0644 files, and so is the validator tree (spec 08), so anyone on the host can read them without
+sudo or journal access (spec 06 I9). The one exception is `health/local-reset.lock` (0600): anyone
+who could open it could hold its `flock` and defer every local reset. These logs rotate by
+rename (`/etc/logrotate.d/tt-device-broker`). Job logs are never rotated: the broker keeps the
+newest 2000 or 512 MB of them (spec 01 I71), and `reconcile.sh` deletes any older than 30 days.
+
+A per-user daemon (`tt-device-mcp daemon start`, no root) keeps the same files under one private
+base instead, `/tmp/tt-device-mcp-<uid>/state/` (0700, cleared at reboot; `TT_DEVICE_MCP_STATE_DIR`
+overrides it): `server.log`, the job logs, `queued/` and `stats/` at its top, the health files
+under `health/`, plus `daemon.log` (the daemon's captured stdout/stderr) and `daemon.pid`. It has
+no deploy-script logs, no buslock or crash recorder, and no logrotate.
+
+Job logs carry their job's resolved environment in the header, so they are readable by every
+user on the host: keep tokens out of `-e` env files and the `env` argument.
+
+```bash
+tail -f /var/log/tt-device-broker/server.log                 # follow the broker
+ls -t /var/log/tt-device-broker/*_*.log | head               # newest job logs
+cat /var/lib/tt-device-broker/health/fsm.json                # health state
+tail -n 20 /var/lib/tt-device-broker/health/health_events.jsonl
+grep decision= /var/log/tt-device-broker/autoupdate.log      # every update decision (spec 08 I22)
+```
+
+The journal copy of the deploy scripts' lines is their unit's: autoupdate and device-lock run under
+reconcile, so `journalctl -u tt-device-reconcile`. Autoupdate has no journal tag of its own;
+`journalctl -t tt-device-autoupdate` finds nothing.
+
 ## Slurm
 
 `deploy/install-tt-device-broker.sh` stages both hooks into `/opt/tt-device-broker/slurm/`;

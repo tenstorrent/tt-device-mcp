@@ -590,6 +590,10 @@ def test_apply_installs_and_arms_the_probe_optionally():
     assert "rm -f" not in _shell_fn("arm_health_probe")  # the old probe is moved aside, never deleted
 
 
+# The functions alone have no log.sh; `log` keeps the helper's stderr copy, the line it says.
+_LOG = "log() { printf '%s\\n' \"$*\" >&2; }"
+
+
 def _shell_fn(name: str) -> str:
     """One shell function from apply-host-config.sh, to run alone against a sandbox."""
     m = re.search(rf"^{name}\(\) {{\n.*?^}}\n", APPLY.read_text(), re.S | re.M)
@@ -625,6 +629,7 @@ def _arm(tmp_path, *, opt_out: bool = False, arms: bool = True, old: bool = True
     log = tmp_path / "systemctl.log"
     log.touch()
     script = f"""set -euo pipefail
+{_LOG}
 systemctl() {{
     echo "$*" >> {log}
     [ "$*" = "is-active --quiet tt-device-health-probe.timer" ] && return {0 if arms else 3}
@@ -693,6 +698,7 @@ def _install_units(tmp_path, *, ships: bool = True):
     units = tmp_path / "units"
     units.mkdir()
     script = f"""set -euo pipefail
+{_LOG}
 VENV={venv}
 DEPLOY={APPLY.parent}
 {_shell_fn("health_probe_ships")}

@@ -91,6 +91,10 @@ print(hugepages_install_warning() or "")')" \
 # with no fabric-check falls back to a full board reset after every abnormal exit.
 install -m 0755 "$REPO/deploy/tt-device-fabric-check.sh" "$R/fabric-check.sh"
 FABRIC_CHECK_CMD="$R/fabric-check.sh"
+# The deploy-script logging helper reconcile.sh, autoupdate.sh and the validator build source by
+# adjacency (spec 06 I10). Required like fabric-check.sh: without it a unit script logs to stderr
+# only. apply-host-config.sh stages it again on every auto-update.
+install -m 0755 "$REPO/deploy/tt-device-log.sh" "$R/log.sh"
 FABRIC_DESCRIPTOR=""
 
 # Passive eth-heartbeat pre-read (runs before the traffic pass; frozen core -> hold, not reset).
@@ -199,7 +203,8 @@ echo "==> wait for broker /health"
 # `enable --now` returns once the unit launched, not once the socket serves — the broker
 # may still be binding, or may have started and then crashed. On a locked host a dead broker
 # is a total device outage, so a broker that never answers /health is a failed install, not a
-# warning: poll until it answers, then hard-fail with where to look.
+# warning: poll until it answers, then hard-fail with where to look — the server log first, which a
+# user without journal access can read (spec 06 I10), then the journal's second copy.
 BROKER_UP=0
 for _ in $(seq 1 30); do
     if curl -sf --max-time 5 --unix-socket "$SOCK" http://localhost/health >/dev/null 2>&1; then
@@ -208,7 +213,7 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 [ "$BROKER_UP" = 1 ] \
-    || { echo "install: broker did not answer /health after enable — check: journalctl -u tt-device-broker -e" >&2; exit 1; }
+    || { echo "install: broker did not answer /health after enable — check: /var/log/tt-device-broker/server.log, then journalctl -u tt-device-broker -e" >&2; exit 1; }
 echo "==> health:"; curl -s --max-time 5 --unix-socket "$SOCK" http://localhost/health
 # The restarted broker runs from the new venv; only now may the old one go.
 venv_prune "$R"

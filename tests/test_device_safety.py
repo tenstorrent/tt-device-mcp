@@ -10,8 +10,10 @@ is a real failure this broker caused in production, so each gets a test.
 
 import asyncio
 import dataclasses
+import fcntl
 import json
 import os
+import stat
 import sys
 import time
 from datetime import datetime, timedelta
@@ -22,13 +24,14 @@ import pytest
 from tests.conftest import (
     fsm_dirty,
     fsm_healthy,
+    local_reset_mechanism,
     patch_health_event,
     patch_recovery,
     power_cycle_reason,
     step_sampler_clock,
     stub_device_pollers,
 )
-from tt_device_mcp import device_holders, privileges
+from tt_device_mcp import device_holders, privileges, utils
 from tt_device_mcp import server as srv
 from tt_device_mcp.constants import ETH_POST_JOB_TIMEOUT_SEC, FABRIC_CHECK_CANNOT_CHECK_RC
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
@@ -6305,6 +6308,8 @@ async def test_a_full_log_disk_ends_neither_the_job_nor_the_runner(monkeypatch, 
         return real_open(path, mode, *args, **kwargs)
 
     monkeypatch.setattr(srv, "open", _open, raising=False)
+    # Job logs open through open_readable (spec 06 I9), whose own open is utils'.
+    monkeypatch.setattr(utils, "open", _open, raising=False)
     job = srv.Job(id="904", owner="tenant", workspace="/tmp", command="echo one; echo two", queued_at="t")
     job.log_file = str(log)
     srv.jobs["904"] = job
@@ -16576,3 +16581,32 @@ async def test_fsm_json_readopted_jobs_empty_when_the_job_is_gone_or_a_fault_sho
     assert _fsm_file_readopted_jobs() == [], "a re-adopted job that disappeared holds nothing"
     assert srv._device_unavailable_for_tenant(), "the hold itself stands"
     srv._startup_verify_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_the_local_reset_lock_stays_private_because_a_readable_lock_lets_anyone_defer_every_reset(
+    tmp_path, monkeypatch
+):
+    """The one file in the state tree spec 06 I9 leaves at 0600, created by both of its opens — the
+    liveness probe and the launcher. The reason is the second half: a descriptor opened READ-ONLY
+    on the lock can still take LOCK_EX, and local_reset_active() then reports a reset in flight
+    that nobody is running. A 0644 lock hands that descriptor to every local user, and with it the
+    power to defer every local reset on the box (spec 04 I5 adopts a held lock, never races it)."""
+    mechanism = local_reset_mechanism(tmp_path, monkeypatch)
+    lock = tmp_path / recovery_base.LOCAL_RESET_LOCK
+
+    assert mechanism.local_reset_active() is False  # the probe's open created it
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+
+    rc, _output = await mechanism.run_scoped([sys.executable, "-c", "pass"], lambda _m: None)
+    assert rc == 0  # the launcher's open, and the detached child that inherited the lock
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600, "the launcher must not widen the lock either"
+    assert mechanism.local_reset_active() is False
+
+    reader = os.open(lock, os.O_RDONLY)  # all a 0644 lock would grant a tenant: read access
+    try:
+        fcntl.flock(reader, fcntl.LOCK_EX | fcntl.LOCK_NB)  # ...which is enough to hold the lock
+        assert mechanism.local_reset_active() is True, "a read-only holder reads as a reset in flight"
+    finally:
+        os.close(reader)
+    assert mechanism.local_reset_active() is False

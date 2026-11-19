@@ -6,6 +6,7 @@
 import asyncio
 import errno
 import fnmatch
+import logging
 import os
 import shutil
 import signal
@@ -1391,3 +1392,83 @@ async def settle_isolations(sampler) -> None:
     """Wait for every detached holder release wait to finish."""
     while sampler.isolations:
         await asyncio.gather(*list(sampler.isolations), return_exceptions=True)
+
+
+# Spec 01 Behavior — the job-log name is the ledger's key. `server.log`, the deploy-script logs and
+# every underscore-bearing near-miss are nobody's job record: no reader of the log dir sees them,
+# and the two readers that act on a match (the pre-down row consumer deletes it, the re-adoption
+# lookup rebuilds a Job from it) leave every one of these alone.
+JOB_LOG_NAME_NEAR_MISSES = (
+    "server.log",
+    "reconcile.log",
+    "autoupdate.log",
+    "fabric-validator.log",
+    "apply-host-config.log",
+    "device-lock.log",
+    "health-probe.log",
+    "foo_bar.log",
+    "foo_123.log",
+    "2026-01-01_120000_7.log.bak",
+    "2026-01-01_120000_7.log.1.gz",
+    "x_2026-01-01_120000_7.log",
+)
+
+
+def local_reset_mechanism(lock_dir: Path, monkeypatch) -> recovery_base.RecoveryMechanism:
+    """A RecoveryMechanism on the local (no-systemd) backend with every server-state accessor
+    stubbed, its lock and reset output under ``lock_dir`` — the detached local reset and its
+    cross-process lock (spec 04 I4/I5) and nothing else."""
+    # The conftest latch says systemd is present, which makes scope_active() list the host's real
+    # reset scopes; a reset running on the machine under test would then look like this one's.
+    from tt_device_mcp import privileges
+
+    monkeypatch.setitem(privileges._LATCHED, "systemd", False)
+
+    async def pollers(_active, _log):
+        return []
+
+    return recovery_base.RecoveryMechanism(
+        current_boot_id=lambda: "boot",
+        boot_btime_id=lambda: "0",
+        scoped_reset_backend=lambda: False,
+        set_device_pollers=pollers,
+        set_device_op_detail=lambda _detail: None,
+        begin_action_row=lambda *_a: None,
+        write_action_log=lambda *_a: None,
+        device_hold_episode_since=lambda: "",
+        local_reset_dir=lambda: lock_dir,
+    )
+
+
+@pytest.fixture
+def strict_umask():
+    """umask 077 for the duration: under it the only thing that can leave a file readable by
+    anyone but its owner is a mode the writer itself asserted after the create (spec 06 I9)."""
+    previous = os.umask(0o077)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
+@pytest.fixture
+def pristine_loggers(monkeypatch):
+    """Leave the root and `tt-device-mcp` loggers, and `sys.excepthook`, as they were: a test that
+    runs `setup_logging` (directly, or through `main()`) would otherwise hand every later test a
+    file handler on a deleted tmp file, a non-propagating broker logger and the broker's own
+    excepthook."""
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    targets = [logging.getLogger(), logging.getLogger("tt-device-mcp")]
+    saved = [(lg, list(lg.handlers), lg.level, lg.propagate) for lg in targets]
+    yield
+    for lg, handlers, level, propagate in saved:
+        # Everything the test installed goes, and the snapshot comes back — nothing else, so a
+        # capture handler pytest swapped in during the call phase does not linger as a stale copy.
+        for h in list(lg.handlers):
+            lg.removeHandler(h)
+            if h not in handlers:
+                h.close()
+        for h in handlers:
+            lg.addHandler(h)
+        lg.setLevel(level)
+        lg.propagate = propagate

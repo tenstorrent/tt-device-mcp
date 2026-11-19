@@ -18,6 +18,7 @@ from typing import Callable, Optional
 from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.recovery import power_cycle_reason as _reason_record
 from tt_device_mcp.health.recovery.power_cycle_reason import PowerCycleReason, _one_line
+from tt_device_mcp.utils import open_readable, readable_mkdir
 
 _logger = logging.getLogger("tt-device-mcp")
 
@@ -645,9 +646,9 @@ def _write_os_first_marker(requested: float, bound: Optional[int], unit_timeout:
         "unit": unit,
     }
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        readable_mkdir(path.parent)
         tmp = path.with_name(path.name + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open_readable(tmp, "w", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
             f.flush()
             os.fsync(f.fileno())

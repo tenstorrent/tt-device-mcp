@@ -220,6 +220,24 @@ def test_retention_never_prunes_a_tracked_or_fresh_log(tmp_path):
     assert [p.name[-7:] for p in gone] == ["003.log"]
 
 
+def test_the_store_selects_job_logs_by_the_one_job_log_name_pattern(tmp_path):
+    """Spec 01 Behavior: the job-log name is stated once (constants.JOB_LOG_NAME_RE); the store's
+    lookup and retention use that same pattern, so no reader can count a file another skips. ASCII
+    digits only: a name with other scripts' digits is nobody's job log, and retention never
+    deletes it."""
+    from tt_device_mcp.constants import JOB_LOG_NAME_RE
+
+    assert store.JOB_LOG_NAME_RE is JOB_LOG_NAME_RE
+    _old_log(tmp_path, "2026-10-22_000000_003.log")
+    _old_log(tmp_path, "2026-10-23_000000_004.log")
+    stranger = "\u0662\u0660\u0662\u0666-10-24_000000_005.log"  # Arabic-Indic digits
+    _old_log(tmp_path, stranger)
+    gone = store.prune_job_logs(tmp_path, max_count=0, max_bytes=1 << 30)
+    assert sorted(p.name for p in gone) == ["2026-10-22_000000_003.log", "2026-10-23_000000_004.log"]
+    assert (tmp_path / stranger).exists()
+    assert store.find_job_log(tmp_path, "005") is None
+
+
 def test_read_log_tail_edge_cases(tmp_path):
     p = tmp_path / "a.log"
     p.write_bytes(b"")

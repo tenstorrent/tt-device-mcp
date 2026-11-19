@@ -77,7 +77,7 @@ def _gate(
     install between the gate and it; the restart then follows the STATE write."""
     text = _SCRIPT.read_text()
     start = text.index("# Dispatch hold (spec 08 I18")
-    end = text.index('echo "autoupdate: applying', start)
+    end = text.index('log "applying', start)
     gate = text[start:end]
     if install is not None:
         look = text.index("# Last look before the restart (spec 08 I24)")
@@ -185,7 +185,7 @@ def test_an_idle_box_applies_and_keeps_the_hold_until_the_restart(tmp_path):
     assert [t for t in trace if t.startswith("restart")] and trace[-1].startswith("restart held "), trace
     # Nothing between the gate and the restart lets go of it.
     text = _SCRIPT.read_text()
-    apply = text[text.index('echo "autoupdate: applying') : text.index("systemctl restart tt-device-broker")]
+    apply = text[text.index('log "applying') : text.index("systemctl restart tt-device-broker")]
     assert "$HOLD" not in apply
 
 
@@ -537,7 +537,7 @@ def test_the_apply_ends_in_a_full_broker_restart():
     """The update's restart is an ordinary stop and start, so the new broker runs its whole startup check (spec 03 I4)
     before its queue opens: no reload, no kill, no knob that skips it."""
     text = _SCRIPT.read_text()
-    tail = text[text.index('echo "autoupdate: applying') :]
+    tail = text[text.index('log "applying') :]
     assert tail.count("systemctl restart tt-device-broker") == 1
     for shortcut in ("reload", "kill -HUP", "SKIP", "--no-block"):
         assert shortcut not in tail, shortcut
@@ -751,7 +751,11 @@ def _apply_event(tmp_path, health_dir, idle="true", drained_s=0, restart_rc=0):
         f"RECOVERY_PENDING={tmp_path}/recovery.defer\n"
         f"systemctl() {{ return {restart_rc}; }}\n" + _clock(text) + "au_log() { :; }\n" + block
     )
-    env = {"PATH": "/usr/bin:/bin", "TT_DEVICE_MCP_HEALTH_DIR": str(health_dir)}
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "TT_DEVICE_MCP_HEALTH_DIR": str(health_dir),
+        "TTDEV_LOG_DIR": str(tmp_path / "logs"),
+    }
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=30)
 
 

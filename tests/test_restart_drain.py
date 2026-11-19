@@ -244,7 +244,7 @@ def test_startup_copies_the_uncopied_spool_tail_into_the_log_before_the_sweep(mo
     offsets.set("stdout", len(b"copied line\n"))
     offsets.close()
     monkeypatch.setattr(spool, "SPOOL_SALVAGE_MAX_BYTES", 25)
-    log = tmp_path / "20261014_982.log"
+    log = tmp_path / "2026-10-14_120000_982.log"
     log.write_text("COMMAND: x\n[12:00:00] [stdout] copied line\n")
     monkeypatch.setattr(srv, "job_log_dir", str(tmp_path))
     monkeypatch.setattr(srv, "jobs", {})

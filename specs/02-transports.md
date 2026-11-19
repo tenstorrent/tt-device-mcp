@@ -115,7 +115,7 @@ its job ids are also persisted as `fsm.json` `readopted_jobs`).
 - Host broker socket: `constants.DEFAULT_SOCKET` = `/run/tt-device-broker/broker.sock`
   (systemd unit chmods it 0666 once it appears).
 - Per-user daemon socket: `constants.user_socket_path()` =
-  `<state dir>/daemon.sock`, state dir `/tmp/tt-device-mcp-<uid>` (override
+  `<state dir>/daemon.sock`, state dir `/tmp/tt-device-mcp-<uid>/state` (override
   `TT_DEVICE_MCP_STATE_DIR`).
 - Client-side resolution (`constants.resolve_socket`): explicit arg / `TT_DEVICE_MCP_SOCKET`
   wins unconditionally; else the broker socket if it exists; else the user daemon socket if it

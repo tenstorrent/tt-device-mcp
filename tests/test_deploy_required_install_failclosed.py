@@ -35,6 +35,7 @@ from tests.test_deploy_autoupdate_no_restart import (  # noqa: F401 - fixture
 _DEPLOY = Path(__file__).resolve().parent.parent / "deploy"
 _INSTALLER = _DEPLOY / "install-tt-device-broker.sh"
 _AUTOUPDATE = _DEPLOY / "tt-device-autoupdate.sh"
+_APPLY = _DEPLOY / "apply-host-config.sh"
 
 
 def _install_stmts(script: Path, dest: str) -> list[str]:
@@ -85,6 +86,7 @@ def test_autoupdate_required_stages_fail_closed():
     # Every deploy-script stage in auto-update is required: a failed copy must abort before
     # installed.sha marks the host current, never `|| true` past it.
     assert {dest for _, dest in _required_stages()} == {
+        "log.sh",
         "reconcile.sh",
         "client-setup.sh",
         "autoupdate.sh",
@@ -199,8 +201,40 @@ def test_a_tree_missing_a_required_source_changes_nothing(box, missing, how):  #
     done, lines, _ = _lap(box, new, stand_ins='install() { command install "$@"; }\n')
 
     assert done.returncode == 1, done.stderr
-    assert f"autoupdate: {missing} missing from the pulled tree" in done.stderr
+    assert f" | autoupdate | {missing} missing from the pulled tree" in done.stderr
     assert "nothing changed, not marking current" in done.stderr
     assert "pip" not in lines and not any(x.startswith(("restart", "host-config")) for x in lines), lines
     assert _installed(box) == box["installed"]
     assert {dest: (root / dest).read_text() for dest in staged} == staged
+
+
+def test_installer_stages_log_sh_fatally_like_fabric_check():
+    # The deploy-script logging helper is required (spec 06 I10, spec 08): without it a unit script
+    # logs to stderr only. Bare `install` under `set -e`, no `|| true`, no `2>/dev/null`.
+    stmt = _install_stmt(_INSTALLER, '"$R/log.sh"')
+    assert "deploy/tt-device-log.sh" in stmt
+    assert "|| true" not in stmt
+    assert "2>/dev/null" not in stmt
+
+
+def test_log_sh_is_staged_before_every_script_that_sources_it():
+    # A unit timer can fire mid-upgrade; a script staged ahead of its helper would run with only the
+    # stderr fallback (spec 06 I10). Each stager installs log.sh first; autoupdate stages from its
+    # REQUIRED_STAGES list in order, so there the helper leads the list.
+    for script, helper, consumers in (
+        (_INSTALLER, '"$R/log.sh"', ['"$R/reconcile.sh"', '"$R/autoupdate.sh"']),
+        (_APPLY, '"$ROOT/log.sh"', ['"$ROOT/install-fabric-validator.sh"']),
+    ):
+        stmts = _statements(script)
+        first = stmts.index(_install_stmt(script, helper))
+        for dest in consumers:
+            assert first < stmts.index(_install_stmt(script, dest)), f"{script.name}: {dest} staged before log.sh"
+    assert _required_stages()[0] == ("tt-device-log.sh", "log.sh")
+
+
+def test_autoupdate_stages_log_sh_fail_closed_before_marking_current():
+    # log.sh is a required autoupdate stage (spec 08 I8): it is in REQUIRED_STAGES, whose one staging
+    # loop fails closed before installed.sha is written (test_autoupdate_required_stages_fail_closed
+    # and test_autoupdate_staged_sources_exist_in_deploy pin the loop and its order).
+    assert ("tt-device-log.sh", "log.sh") in _required_stages()
+    assert (_DEPLOY / "tt-device-log.sh").is_file()

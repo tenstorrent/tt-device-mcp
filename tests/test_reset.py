@@ -20,8 +20,7 @@ from starlette.requests import ClientDisconnect
 from starlette.testclient import TestClient
 
 import tt_device_mcp.server as srv
-from tests.conftest import fsm_dirty, patch_health_event, patch_recovery
-from tt_device_mcp import privileges
+from tests.conftest import fsm_dirty, local_reset_mechanism, patch_health_event, patch_recovery
 from tt_device_mcp.device_holders import DeviceHolder, HolderScan
 from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.recovery import _declared_reset_mode, reset_mode_known, select_recovery
@@ -1013,32 +1012,11 @@ def test_the_sampler_recognises_a_streaming_resets_scope(monkeypatch):
     assert seen["pattern"].startswith(recovery_base.RESET_SCOPE_PREFIX)
 
 
-def _local_reset_mechanism(tmp_path, monkeypatch):
-    # The conftest latch says systemd is present, which makes scope_active() list the host's real
-    # reset scopes; a reset running on the machine under test would then look like this one's.
-    monkeypatch.setitem(privileges._LATCHED, "systemd", False)
-
-    async def pollers(_active, _log):
-        return []
-
-    return recovery_base.RecoveryMechanism(
-        current_boot_id=lambda: "boot",
-        boot_btime_id=lambda: "0",
-        scoped_reset_backend=lambda: False,
-        set_device_pollers=pollers,
-        set_device_op_detail=lambda _detail: None,
-        begin_action_row=lambda *_a: None,
-        write_action_log=lambda *_a: None,
-        device_hold_episode_since=lambda: "",
-        local_reset_dir=lambda: tmp_path,
-    )
-
-
 @pytest.mark.asyncio
 async def test_a_reset_without_systemd_runs_detached_and_returns_its_output(monkeypatch, tmp_path):
     """Removing the systemd-only gate must execute the reset, not turn a missing scope into a
     successful no-op."""
-    mechanism = _local_reset_mechanism(tmp_path, monkeypatch)
+    mechanism = local_reset_mechanism(tmp_path, monkeypatch)
     rc, output = await mechanism.run_scoped(
         [sys.executable, "-c", "print('local reset complete')"],
         lambda _message: None,
@@ -1058,8 +1036,8 @@ async def test_a_restarted_daemon_adopts_the_local_reset_lock(monkeypatch, tmp_p
         "-c",
         f"import pathlib,time; p=pathlib.Path({str(release)!r});\nwhile not p.exists(): time.sleep(.01)",
     ]
-    first = _local_reset_mechanism(tmp_path, monkeypatch)
-    restarted = _local_reset_mechanism(tmp_path, monkeypatch)
+    first = local_reset_mechanism(tmp_path, monkeypatch)
+    restarted = local_reset_mechanism(tmp_path, monkeypatch)
     task = asyncio.create_task(first.run_scoped(command, lambda _message: None))
     try:
         for _ in range(100):
@@ -1083,8 +1061,8 @@ async def test_cancelling_the_waiter_does_not_kill_a_local_reset(monkeypatch, tm
         "-c",
         f"import pathlib,time; p=pathlib.Path({str(release)!r});\nwhile not p.exists(): time.sleep(.01)",
     ]
-    mechanism = _local_reset_mechanism(tmp_path, monkeypatch)
-    observer = _local_reset_mechanism(tmp_path, monkeypatch)
+    mechanism = local_reset_mechanism(tmp_path, monkeypatch)
+    observer = local_reset_mechanism(tmp_path, monkeypatch)
     task = asyncio.create_task(mechanism.run_scoped(command, lambda _message: None))
     try:
         for _ in range(100):
@@ -1109,7 +1087,7 @@ async def test_a_daemon_without_systemd_resets_through_the_local_backend(monkeyp
     """A container needs no declared authority to reset: `tt-smi -r` is an ioctl on a device node
     its submitter already holds (spec 04 I17), so lacking a PID-1 scope picks the other backend
     rather than cancelling the reset. The tenant rules (I6/I7) still gate it."""
-    mechanism = _local_reset_mechanism(tmp_path, monkeypatch)
+    mechanism = local_reset_mechanism(tmp_path, monkeypatch)
     rc, _output = await mechanism.run_scoped(
         [sys.executable, "-c", "raise SystemExit(0)"],
         lambda _message: None,
@@ -1155,7 +1133,7 @@ def test_a_streaming_local_reset_is_visible_to_a_restarted_daemon(monkeypatch, t
         target=lambda: response.setdefault("value", client.post("/api/tt_device_reset_stream", json={"force": False}))
     )
     request.start()
-    observer = _local_reset_mechanism(tmp_path, monkeypatch)
+    observer = local_reset_mechanism(tmp_path, monkeypatch)
     try:
         # Wait for the reset script's own start marker (safety-net timeout only), then for the scope.
         for _ in range(6000):
@@ -2492,7 +2470,7 @@ class TestCpldTooOldBanner:
         The loud reset_mode_unknown warning exists for a host nothing could identify. Repeating it
         after the host itself answered would be reporting an open question that is closed.
         """
-        mech = _local_reset_mechanism(tmp_path, monkeypatch)
+        mech = local_reset_mechanism(tmp_path, monkeypatch)
         monkeypatch.delenv("TT_DEVICE_MCP_RESET_MODE", raising=False)
         monkeypatch.delenv("TT_DEVICE_MCP_RESET_ARGS", raising=False)
         monkeypatch.setattr(health_deps, "board_types_provider", lambda: None)
@@ -2508,7 +2486,7 @@ class TestCpldTooOldBanner:
         from tt_device_mcp.health.recovery.galaxy import GalaxyRecovery
         from tt_device_mcp.health.recovery.per_target import PerTargetRecovery
 
-        mech = _local_reset_mechanism(tmp_path, monkeypatch)
+        mech = local_reset_mechanism(tmp_path, monkeypatch)
         monkeypatch.delenv("TT_DEVICE_MCP_RESET_MODE", raising=False)
         monkeypatch.setattr(health_deps, "board_types_provider", lambda: None)
         monitor = object()
@@ -2525,7 +2503,7 @@ class TestCpldTooOldBanner:
         """
         from tt_device_mcp.health.recovery.per_target import PerTargetRecovery
 
-        mech = _local_reset_mechanism(tmp_path, monkeypatch)
+        mech = local_reset_mechanism(tmp_path, monkeypatch)
         mech.cpld_forces_galaxy = True
         monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "per-target")
 

@@ -5,4 +5,7 @@ Description=Reconcile tt-device broker state + per-user MCP client config
 
 [Service]
 Type=oneshot
+# A stated mode, not an inherited umask (spec 08): autoupdate and device-lock run under this unit
+# and append to the health journal; what they create is 0644 in 0755.
+UMask=0022
 ExecStart=/opt/tt-device-broker/reconcile.sh

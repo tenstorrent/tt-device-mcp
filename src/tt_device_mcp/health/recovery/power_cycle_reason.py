@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 from tt_device_mcp.health.evidence import health_dir
+from tt_device_mcp.utils import open_readable, readable_mkdir
 
 _logger = logging.getLogger("tt-device-mcp")
 
@@ -202,9 +203,9 @@ def write_state(reason: PowerCycleReason, *, unit: str = "") -> float:
     path = health_dir() / POWER_CYCLE_REASON_FILE
     row = {**reason.as_dict(), "unit": unit, "outcome": "requested"}
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        readable_mkdir(path.parent)
         tmp = path.with_name(path.name + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open_readable(tmp, "w", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
             f.flush()
             os.fsync(f.fileno())
@@ -235,7 +236,7 @@ def mark_outcome(outcome: str, requested_epoch: Optional[float] = None, **extra)
     path = health_dir() / POWER_CYCLE_REASON_FILE
     try:
         tmp = path.with_name(path.name + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open_readable(tmp, "w", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
             f.flush()
             os.fsync(f.fileno())

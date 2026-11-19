@@ -161,7 +161,7 @@ def test_a_rate_limited_lap_logs_its_deferral(tmp_path):
     its deadline; the apply that set the stamp is logged as applied."""
     _lap(tmp_path, now=5000, sha="a1", interval=3600)
     _lap(tmp_path, now=5600, sha="b2", interval=3600)
-    log = (tmp_path / "logs" / "autoupdate.log").read_text().splitlines()
+    log = [x for x in (tmp_path / "logs" / "autoupdate.log").read_text().splitlines() if "decision=" in x]
     assert len(log) == 2 and "decision=applied" in log[0] and "new=a1" in log[0], log
     assert "decision=deferred" in log[1] and "new=b2" in log[1], log
     assert "reason=apply rate limit: last apply 600s ago (min 3600s); apply_by=" in log[1], log
@@ -334,5 +334,5 @@ def test_a_missing_stamp_is_silent_and_a_leading_zero_stamp_is_decimal(tmp_path)
 
 def test_the_rate_limit_skip_line_does_not_claim_an_apply():
     # Later gates (a device op in flight) can still defer the sha, so the skip line must not say it applies.
-    line = next(x for x in _SCRIPT.read_text().splitlines() if "rate limit skipped" in x and "echo" in x)
+    line = next(x for x in _SCRIPT.read_text().splitlines() if "rate limit skipped" in x and "log " in x)
     assert "goes on to the next gates" in line and "applies" not in line and "applied" not in line

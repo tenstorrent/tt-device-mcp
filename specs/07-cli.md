@@ -239,7 +239,9 @@ so rather than rendering a wrong local time.
 recovery policy (spec 04 I17) and redirects the three root-only
 paths (`TT_DEVICE_MCP_HEALTH_DIR`, `TT_DEVICE_MCP_JOB_EXIT_DIR`, `TT_DEVICE_MCP_DEVICE_OP_LOCK`)
 under the state dir, warning loudly if a redirect target cannot be created — writes the pid file,
-and polls `/health` for up to ~10 s before declaring success. `daemon stop` reads the pid file,
+and polls `/health` for up to ~10 s before declaring success. The spawn redirects the child's
+stdout and stderr to `<state>/daemon.log`, which catches what the process prints before logging is
+set up; after that it duplicates `<state>/server.log` (spec 06 I10). `daemon stop` reads the pid file,
 verifies via `/proc/<pid>/cmdline` that the pid is still a `tt_device_mcp.server` (a stale or
 recycled pid is reported and cleaned, never signalled), SIGTERMs with a 5 s grace then SIGKILLs,
 and removes pid file and socket; it always exits 0. `start-fg` runs the identical configuration
@@ -313,6 +315,7 @@ non-zero keeps that bit honest; `exec` propagates the real exit code because a d
 | `reset` hides keepalives and still reads the status | `tests/test_cli.py::test_reset_stream_hides_keepalives_and_still_reads_the_status` |
 | `watch` redraws every 1 s; `status` shows DEVICE IDLE (03 I54) | `tests/test_device_activity.py::test_watch_redraws_every_second`, `tests/test_device_activity.py::test_the_cli_overview_marks_only_an_idle_job`, `tests/test_device_activity.py::test_cli_status_of_one_job_prints_its_device_line` |
 | step verbs exist under the names a site scripts | `tests/test_cli.py::test_cli_step_commands_exist` |
+| Per-user lifecycle: `daemon start` redirects the child's stdout and stderr to `<state>/daemon.log` and leaves `server.log` to the logger (spec 06 I10) | `tests/test_install_modes.py::test_daemon_start_redirects_the_child_to_daemon_log_and_leaves_server_log_to_the_logger` |
 
 Unanchored (verified against `cli.py` directly, no test exercises them): I4's exit-code mapping
 (`_wait_and_stream` returns 0 iff `completed`), I6's allowlist capture and `-e` mutual exclusion,

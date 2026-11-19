@@ -27,17 +27,19 @@ Run as root: ``python -m tt_device_mcp.health_probe``. Always exits 0 unless it 
 import errno
 import fcntl
 import json
+import logging
 import os
 import subprocess
 import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from tt_device_mcp.constants import DEFAULT_SOCKET
+from tt_device_mcp.constants import DEFAULT_SOCKET, SYSTEM_LOG_DIR
 from tt_device_mcp.device_holders import enumerate_device_holders
 from tt_device_mcp.health.evidence import _default_health_dir
 from tt_device_mcp.health.monitors.pci import _sum_aer
-from tt_device_mcp.utils import _uds_api_call
+from tt_device_mcp.log_setup import setup_logging
+from tt_device_mcp.utils import _uds_api_call, readable_mkdir, write_text_readable
 
 BROKER_UNIT = "tt-device-broker.service"
 # The broker's own poller list and default (server.DEVICE_POLLER_SERVICES): the units it quiesces
@@ -76,8 +78,22 @@ POLLER_RESTARTABLE = ("failed", "inactive")
 POLLER_ENABLED = ("enabled", "enabled-runtime")
 
 
+_logger = logging.getLogger("tt-device-mcp")
+
+
 def log(msg: str) -> None:
-    print(f"tt-health-probe: {msg}", flush=True)  # -> the journal via the unit
+    _logger.info(msg)
+
+
+def _setup_log() -> None:
+    """The broker's logging shape (spec 06 I10): `<log dir>/health-probe.log` and the same line on
+    stderr, which the unit's journal keeps. A log dir it cannot write leaves the stderr copy alone."""
+    log_dir = Path(os.environ.get("TTDEV_LOG_DIR") or SYSTEM_LOG_DIR)
+    try:
+        readable_mkdir(log_dir)
+    except OSError:
+        pass  # setup_logging below reports the file it cannot open
+    setup_logging(log_dir / "health-probe.log", stderr_only_on_failure=True)
 
 
 def device_verdict(health: Optional[dict]) -> Optional[str]:
@@ -252,9 +268,9 @@ class Probe:
 
     def _save_state(self, health_dir: Path) -> None:
         try:
-            health_dir.mkdir(parents=True, exist_ok=True)
+            readable_mkdir(health_dir)
             tmp = health_dir / (STATE_FILE + ".tmp")
-            tmp.write_text(json.dumps(self.state))
+            write_text_readable(tmp, json.dumps(self.state))
             tmp.replace(health_dir / STATE_FILE)
         except OSError as e:
             log(f"could not save {STATE_FILE}: {e}")
@@ -497,6 +513,7 @@ def poller_units() -> list[str]:
 
 
 def main() -> int:
+    _setup_log()
     return Probe().run()
 
 

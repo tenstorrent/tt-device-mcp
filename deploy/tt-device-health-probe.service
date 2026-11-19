@@ -10,3 +10,5 @@ Type=oneshot
 ExecStart=@VENV@/bin/python -m tt_device_mcp.health_probe
 # Settle waits plus one alert-hook run; the probe joins the hook before it exits.
 TimeoutStartSec=300
+# A stated mode, not an inherited umask (spec 08): what this unit writes is 0644 in 0755.
+UMask=0022

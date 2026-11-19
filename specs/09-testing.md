@@ -12,7 +12,7 @@ parity. The suite's subject is the whole broker; this spec's subject is the suit
 
 ## Purpose
 
-The suite (1131 collected tests across 42 files under `tests/`, per
+The suite (5692 collected tests across 201 files under `tests/`, per
 `.venv/bin/pytest --collect-only -q`) is the executable form of the
 invariants in specs 01–06: each spec's `## Test anchors` table names the pytest node ids that
 pin its claims. For that to mean anything the suite must be runnable anywhere — a developer
@@ -223,8 +223,9 @@ carry which spec's anchors. Approximate collected counts in parentheses.
 | `test_broker_telemetry.py` (8) | Sampler snapshot/exposition: tri-state fabric verdict, last-pass-not-running-total, crash-tolerant snapshot | 03 |
 | `test_reset.py` (56), `test_reset_gate.py` (18), `test_device_holders.py` (18), `test_recovery_select.py` (3) | Reset argv per platform, scoped execution and quiesce, holder scan and reset gate (foreign deny, fail-closed, force), platform selection, reclaim pid+starttime identity | 04, 05 |
 | `test_metrics.py` (37) | Stage-metrics classification (inapplicable ≠ blocked) and textfile writer behavior | 04, 06 |
-| `test_state_paths.py` (10), `test_install_modes.py` (34) | euid-split defaults, env overrides beat both defaults, install/state base split, per-user daemon gate-on default | 06 |
-| `test_deploy_*.py` (9 files, 42), `test_apply_host_config_render.py` (16) | Deployment-script fail-closed statements (via `deploy_helpers`) and host-config rendering | 08 |
+| `test_state_paths.py` (20), `test_install_modes.py` (33) | euid-split defaults, env overrides beat both defaults, install/state base split, per-user daemon gate-on default | 06 |
+| `test_deploy_*.py` (22 files, 381), `test_apply_host_config_render.py` (35) | Deployment-script fail-closed statements (via `deploy_helpers`) and host-config rendering | 08 |
+| `test_logging_shape.py` (8) | The one logging shape: one file handler and one stderr handler per logger sharing a formatter, rename-safe rotation at a stated mode, the excepthook, uvicorn through the broker's handlers, the health probe on the same shape | 06 |
 | `test_slurm_steps.py` (54) | Externally-driven `pre-step`/`post-step` routes (deadline, verdict, reclaim/audit, the external-step device reservation, the whole-route reclaim+gate deadline), the `tt-device-mcp pre-step`/`post-step` CLI verbs, and the Slurm Prolog/Epilog hooks (resolution order, exit-code contract, installer/autoupdate staging, deadline-var export) | 02, 03, 05, 07, 08 |
 
 The guarantee is directional: a change that breaks a spec invariant breaks a named anchor.
@@ -261,7 +262,10 @@ owning spec's `## Test anchors` table with the new node ids.
 - Shell-script tests use `tests/deploy_helpers.py`: `_statements()` joins
   backslash-continued lines into logical statements, `_one(script, *needles)` asserts
   exactly one statement matches — tests assert on the statement, they never execute the
-  script against the host.
+  script against the host. `deploy/tt-device-log.sh` and `deploy/tt-device-modes.sh` are also
+  executed, as shell functions over a temp dir. The deploy scripts target GNU/Linux; an executed
+  test that needs GNU `find` (the migration sweep's `-ignore_readdir_race`) skips where
+  `find --version` fails, and the statement-level anchors on the same lines hold everywhere.
 
 **Tripwire rules a new test MUST obey.**
 - Never spawn a forbidden program (I2) — stub the argv-builder (I3) and assert on the argv.

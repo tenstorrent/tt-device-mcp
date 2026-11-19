@@ -1,29 +1,35 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
-# The broker's own log and the per-job logs. This directory had no rotation rule at all
+# The broker's and the health probe's logs, and the deploy scripts' logs. This directory had no rotation rule at all
 # and had reached 3.4GB across ~3000 job logs — a disk that fills is a broker that cannot
 # write, log, or run anything, which is a worse outage than any it was built to survive.
+#
+# Rotation is by RENAME, never copytruncate: copytruncate drops whatever is written between its
+# copy and its truncate (logrotate's own manual says so). The broker's WatchedFileHandler reopens
+# the path after the rename, and the deploy scripts open the file per line, so a rename between
+# two lines loses nothing on either side. `create 0644 root root` states the new file's mode
+# (spec 06 I9), so a rotated log is readable before the first line lands in it.
 #
 # The durable health journal is deliberately NOT here: it lives under /var/lib, caps
 # itself, and must outlive both rotation and the reboots it exists to explain.
 
-/var/log/tt-device-broker/server.log {
+/var/log/tt-device-broker/server.log /var/log/tt-device-broker/health-probe.log /var/log/tt-device-broker/reconcile.log /var/log/tt-device-broker/autoupdate.log /var/log/tt-device-broker/fabric-validator.log /var/log/tt-device-broker/apply-host-config.log /var/log/tt-device-broker/device-lock.log {
     daily
     rotate 30
     compress
     delaycompress
     missingok
     notifempty
-    copytruncate
+    create 0644 root root
 }
 
 # The per-job logs are deliberately NOT rotated here, by any stanza. They are write-once
-# files that the broker reads back by globbing `*.log` for content — recent_jobs serves the
+# files that the broker reads back by their name pattern (spec 01) — recent_jobs serves the
 # ledger from them, and the job-id counter resumes numbering from the newest one. Rotation
 # renames each to `<job>.log.1.gz` and leaves a 0-byte `<job>.log`, so a single nightly run
 # blanks the whole ledger and drops the id floor while the evidence sits on disk under a
 # name nothing reads. logrotate has no expire-only mode that avoids this: every stanza that
 # matches these files renames or deletes the live file (`maxage` still needs a rotation to
 # act, and `rotate 0` deletes today's log outright). Age-expiry is therefore a plain
-# `find -mtime +30 -delete` in tt-device-reconcile.sh, which never touches a current log.
+# `find -regex -mtime +30 -delete` in tt-device-reconcile.sh, which never touches a current log.

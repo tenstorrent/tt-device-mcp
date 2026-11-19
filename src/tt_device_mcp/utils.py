@@ -5,9 +5,12 @@
 
 import http.client
 import json
+import logging
+import os
 import socket
 import sys
 import time
+from pathlib import Path
 
 from tt_device_mcp.constants import resolve_socket
 
@@ -16,6 +19,85 @@ from tt_device_mcp.constants import resolve_socket
 # nothing was sent, so a retried submit can never create a duplicate job.
 DEFAULT_CONNECT_RETRIES = 5
 DEFAULT_CONNECT_DELAY_SEC = 1.0
+
+logger = logging.getLogger("tt-device-mcp")
+
+# Paths whose chmod already failed once this process. The first failure is the whole signal (the
+# shape of metrics.py's once-per-process textfile log), but keyed per path: a journal that cannot
+# be opened to its readers is a different fact from a job log that cannot, and each deserves its
+# one line.
+_mode_failed_logged: set[str] = set()
+
+
+def _mode_failed(path: "str | os.PathLike[str]", mode: int, e: OSError) -> None:
+    key = str(Path(path))
+    if key in _mode_failed_logged:
+        return
+    _mode_failed_logged.add(key)
+    logger.warning(
+        "could not set mode %04o on %s (%s); it may not be readable by every local user (spec 06 I9)",
+        mode,
+        path,
+        e,
+    )
+
+
+def _set_mode(path: "str | os.PathLike[str]", mode: int) -> None:
+    try:
+        os.chmod(path, mode)
+    except OSError as e:
+        _mode_failed(path, mode, e)
+
+
+def _readable_opener(path: str, flags: int) -> int:
+    # The umask masks os.open's mode, so the mode is stated again on the descriptor. A file the
+    # broker cannot chmod (foreign-owned) is still the file it needs: the write goes ahead.
+    fd = os.open(path, flags, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+    except OSError as e:
+        _mode_failed(path, 0o644, e)
+    return fd
+
+
+def open_readable(path: "str | os.PathLike[str]", mode: str = "a", **kwargs):
+    """``open()`` for writing a file in one of the two trees (spec 06 I9): the file is 0644 whatever
+    the umask, whether this call creates it or finds it. Never fails because the mode could not be
+    set; logs that once per path."""
+    return open(path, mode, opener=_readable_opener, **kwargs)
+
+
+def write_text_readable(path: "str | os.PathLike[str]", text: str, **kwargs) -> None:
+    """``Path.write_text`` through :func:`open_readable`."""
+    with open_readable(path, "w", **kwargs) as f:
+        f.write(text)
+
+
+def readable_dir(path: "str | os.PathLike[str]") -> None:
+    """Make a directory the broker just created traversable by every local user (0755, spec 06 I9).
+    Never raises; logs a failure once per path. Only for a directory this process created — a writer
+    that may find its directory already there uses :func:`readable_mkdir`, which brings to mode
+    exactly what it made. Not for the two tree roots, whose chmod raises (spec 06 I9): a root the
+    broker cannot open to its readers is a start it must not complete."""
+    _set_mode(path, 0o755)
+
+
+def readable_mkdir(path: "str | os.PathLike[str]") -> None:
+    """``mkdir -p`` for a directory in one of the two trees, at mode: every component this call
+    creates is brought to 0755, and nothing that already existed is touched (spec 06 I9 — a mode is
+    set once, at creation, by the writer that owns the path). A health dir an operator redirected
+    to a private 0700 directory therefore keeps its mode while the journal files written inside it
+    are 0644, and a bundle directory the broker makes inside it is 0755. Raises what ``mkdir``
+    raises; the callers already treat that as their unwritable-path case."""
+    target = Path(path)
+    created: list[Path] = []
+    probe = target
+    while not probe.exists() and probe.parent != probe:
+        created.append(probe)
+        probe = probe.parent
+    target.mkdir(parents=True, exist_ok=True)
+    for made in created:
+        readable_dir(made)
 
 
 def retry_unreachable(attempt, *, sleep=None, retries=None):

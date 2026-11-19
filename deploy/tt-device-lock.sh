@@ -28,7 +28,12 @@ DRIFT="$RUN/device_lock_drift"
 PENDING="$RUN/device_lock_pending"
 MEMBERS="$RUN/device_lock_members"
 
-log() { echo "device-lock: $*" >&2; }
+# Every line goes through log.sh as `device-lock` (spec 06 I10), to device-lock.log and stderr. The
+# helper is staged beside this script, so it is found by adjacency; without it (a run from the repo,
+# or an upgrade that staged this script first) `log` degrades to stderr only.
+. "$(dirname "$(readlink -f "$0")")/log.sh" 2>/dev/null \
+    || log() { printf '%s | %s | %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')" "${TTDEV_LOG_NAME:-unnamed}" "$*" >&2 || true; }
+TTDEV_LOG_NAME=device-lock
 
 # Members with uid >= 1000, one per line. A name with no passwd entry cannot log in: skipped.
 human_members() {
@@ -118,8 +123,9 @@ cmd_check() {
     nl="$(printf '%s\n' "$bad" | json_list)"
     printf '{"ts": %s, "iso": "%s", "source": "reconcile", "nodes": [%s]}\n' \
         "$now" "$(date -u -d "@${now%.*}" +%Y-%m-%dT%H:%M:%SZ)" "$nl" > "$DRIFT" 2>/dev/null || true
-    printf '{"ts": %s, "iso": "%s", "kind": "device_lock_drift", "source": "reconcile", "nodes": [%s]}\n' \
-        "$now" "$(date -u -d "@${now%.*}" +%Y-%m-%dT%H:%M:%SZ)" "$nl" >> "$EVENTS" 2>/dev/null \
+    # umask 022: if the broker just rolled the journal, this append creates it, at 0644 (spec 06 I9).
+    (umask 022; printf '{"ts": %s, "iso": "%s", "kind": "device_lock_drift", "source": "reconcile", "nodes": [%s]}\n' \
+        "$now" "$(date -u -d "@${now%.*}" +%Y-%m-%dT%H:%M:%SZ)" "$nl" >> "$EVENTS") 2>/dev/null \
         || log "warning: could not append device_lock_drift to $EVENTS"
     return 0
 }
@@ -127,5 +133,5 @@ cmd_check() {
 case "${1:-}" in
     apply) shift; cmd_apply "$@" ;;
     check) cmd_check ;;
-    *) echo "usage: device-lock.sh apply <deploy-dir> | check" >&2; exit 2 ;;
+    *) log "usage: device-lock.sh apply <deploy-dir> | check"; exit 2 ;;
 esac
