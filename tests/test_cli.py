@@ -445,7 +445,8 @@ def test_cmd_lock_locks_when_deny_probe_is_refused(monkeypatch, tmp_path, capsys
 _UNIT_NO_GROUP = (
     "[Service]\nEnvironment=TT_DEVICE_MCP_PRIVSEP=1\nExecStart=/opt/tt-device-broker/venv/bin/tt-device-mcp\n"
 )
-_UNIT_WITH_GROUP = _UNIT_NO_GROUP.replace("PRIVSEP=1\n", "PRIVSEP=1\nEnvironment=TT_DEVICE_MCP_DEVICE_GROUP=ttdev\n")
+_UNIT_GROUP_ONLY = _UNIT_NO_GROUP.replace("PRIVSEP=1\n", "PRIVSEP=1\nEnvironment=TT_DEVICE_MCP_DEVICE_GROUP=ttdev\n")
+_UNIT_WITH_GROUP = _UNIT_GROUP_ONLY.replace("ttdev\n", "ttdev\nEnvironment=TT_DEVICE_MCP_DEVICE_LOCK=1\n")
 
 
 def _stub_lock_restart_env(monkeypatch, cli, tmp_path, unit_text, main_pid="4242", live_env=None):
@@ -518,7 +519,61 @@ def test_cmd_lock_skips_restart_when_a_drop_in_sets_the_group(monkeypatch, tmp_p
     assert rc == 0
     assert "already locked" in capsys.readouterr().out
     assert not _restarted(issued)
+    # Only the flip line is new; the drop-in's group is not duplicated into the unit.
+    flip = "PRIVSEP=1\nEnvironment=TT_DEVICE_MCP_DEVICE_LOCK=1\n"
+    assert unit.read_text() == _UNIT_NO_GROUP.replace("PRIVSEP=1\n", flip)
+
+
+def test_cmd_lock_leaves_the_unit_alone_when_a_drop_in_sets_both(monkeypatch, tmp_path, capsys):
+    """Group and flip both set by a drop-in: no unit edit, no reload, no restart."""
+    sys.path.insert(0, SRC_PATH)
+    from tt_device_mcp import cli
+
+    issued, unit = _stub_lock_restart_env(
+        monkeypatch, cli, tmp_path, _UNIT_NO_GROUP, live_env=["TT_DEVICE_MCP_DEVICE_GROUP=ttdev"]
+    )
+    dropin = tmp_path / "tt-device-broker.service.d"
+    dropin.mkdir()
+    (dropin / "zz-lock.conf").write_text(
+        "[Service]\nEnvironment=TT_DEVICE_MCP_DEVICE_GROUP=ttdev\nEnvironment=TT_DEVICE_MCP_DEVICE_LOCK=1\n"
+    )
+
+    assert cli.cmd_lock(object()) == 0
+    assert not _restarted(issued)
+    assert ["systemctl", "daemon-reload"] not in issued
     assert unit.read_text() == _UNIT_NO_GROUP
+
+
+def test_cmd_lock_adds_the_flip_line_without_a_restart(monkeypatch, tmp_path, capsys):
+    """A unit locked before the flip switch existed (or stripped by a later unlock) has the group but not
+    TT_DEVICE_MCP_DEVICE_LOCK=1: `lock` adds the line and reloads systemd, and never restarts a healthy broker."""
+    sys.path.insert(0, SRC_PATH)
+    from tt_device_mcp import cli
+
+    issued, unit = _stub_lock_restart_env(
+        monkeypatch, cli, tmp_path, _UNIT_GROUP_ONLY, live_env=["TT_DEVICE_MCP_DEVICE_GROUP=ttdev"]
+    )
+
+    assert cli.cmd_lock(object()) == 0
+    out = capsys.readouterr().out
+    assert unit.read_text() == _UNIT_WITH_GROUP
+    assert ["systemctl", "daemon-reload"] in issued
+    assert not _restarted(issued)
+    assert "next broker restart" in out
+
+
+def test_cmd_lock_twice_edits_the_unit_once(monkeypatch, tmp_path):
+    sys.path.insert(0, SRC_PATH)
+    from tt_device_mcp import cli
+
+    issued, unit = _stub_lock_restart_env(
+        monkeypatch, cli, tmp_path, _UNIT_GROUP_ONLY, live_env=["TT_DEVICE_MCP_DEVICE_GROUP=ttdev"]
+    )
+    assert cli.cmd_lock(object()) == 0
+    reloads = issued.count(["systemctl", "daemon-reload"])
+    assert cli.cmd_lock(object()) == 0
+    assert issued.count(["systemctl", "daemon-reload"]) == reloads == 1
+    assert unit.read_text() == _UNIT_WITH_GROUP
 
 
 def test_cmd_lock_skips_restart_when_broker_is_stopped_and_unit_is_set(monkeypatch, tmp_path, capsys):

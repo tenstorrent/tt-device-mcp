@@ -209,7 +209,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_INSTALL_DIR` | `/tmp/tt-device-mcp-<uid>` | Per-user base: venv, CLI symlink, and `state/` (deploy-defined, install-user.sh) | 06/08 |
 | `TT_DEVICE_MCP_PRIVSEP` | unset (off) | Run each job as its submitter via systemd-run | 05 |
 | `TT_DEVICE_MCP_DEVICE_GROUP` | unset (off) | Group-membership admission gate for jobs (device lock) | 05 |
-| `TT_DEVICE_MCP_DEVICE_LOCK` | unset (off) | `1`: the broker re-applies the lock's udev rule to the nodes between jobs (opt-in lock, rendered from `TTDEV_LOCK`) | 05 |
+| `TT_DEVICE_MCP_DEVICE_LOCK` | unset (off) | `1`: the broker re-applies the lock's udev rule to the nodes between jobs (opt-in lock, rendered from `TTDEV_LOCK`; `tt-device-mcp lock` adds it with the group line) | 05 |
 | `TT_DEVICE_MCP_TZ` | unset | CLI TIME-column zone; beats the saved preference | 07 |
 | `TT_DEVICE_MCP_JOB_COOLDOWN_SEC` | 0 | Minimum idle gap between jobs | 01 |
 | `TT_DEVICE_MCP_JOB_BURST_MAX` | 0 (off) | Per-owner burst ceiling | 01 |

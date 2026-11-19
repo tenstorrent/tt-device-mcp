@@ -98,9 +98,14 @@ that did not come through the broker at all.
   `unlock` restores world-rw and durably undoes the opt-in below: it sets `TTDEV_LOCK=0` in
   `/etc/default/tt-device-broker` (a host without the key is left alone) and strips both the
   `TT_DEVICE_MCP_DEVICE_GROUP` and `TT_DEVICE_MCP_DEVICE_LOCK` lines from the unit, so the next
-  update's re-render neither re-installs the rule nor re-flips the nodes. Both are idempotent:
-  a repeat `lock` on a locked host never restarts the broker (a restart reruns the startup
-  gate, fabric pass included, on a healthy device).
+  update's re-render neither re-installs the rule nor re-flips the nodes. `lock` undoes that
+  in full: it adds both unit lines as the host config renders them (a line the unit or a
+  drop-in already sets is not added again) and runs `daemon-reload`; it restarts the broker only
+  when the group line is new or the running broker lacks it. A flip line added alone takes
+  effect at the broker's next restart, so a repeat `lock` on a locked host never restarts the
+  broker (a restart reruns the startup gate, fabric pass included, on a healthy device). The
+  update's re-render keeps both lines a host's unit has, so a `lock` after an `unlock` survives
+  the next update. Both are idempotent.
   *Opt-in through host config.* `TTDEV_LOCK=1` in `/etc/default/tt-device-broker` makes the
   update path's `apply-host-config.sh` install the rule (reload only), render the unit's
   `TT_DEVICE_MCP_DEVICE_GROUP=ttdev` and `TT_DEVICE_MCP_DEVICE_LOCK=1` lines (taken up by the
@@ -109,8 +114,8 @@ that did not come through the broker at all.
   The mode flip itself (`udevadm trigger --subsystem-match=tenstorrent`) is the broker's, run only
   while no job is running and no re-adopted scope is live: a job started before the restart
   still carries its old gid and would get EACCES on its next open. `TTDEV_LOCK` unset or `0`
-  leaves the host exactly as before (an existing unit's device-group line is preserved, nothing
-  is written).
+  leaves the host exactly as before (an existing unit's `TT_DEVICE_MCP_DEVICE_GROUP` and
+  `TT_DEVICE_MCP_DEVICE_LOCK` lines are preserved, nothing is written).
   *Drift.* Once the lock is in effect (every node seen locked), reconcile checks mode and group on
   every node; on drift it re-triggers udev and stats again. Drift that persists is logged, recorded
   as a `device_lock_drift` health event and shown in `/health` (`device_lock`). Nothing reverts

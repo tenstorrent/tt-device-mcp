@@ -200,10 +200,14 @@ if [ -z "$RENDER_ONLY" ]; then
     ensure_default TTDEV_ETH_CHECK_PYTHON "$ETH_PYTHON"
     ensure_default TTDEV_POLLER_SERVICES "$POLLER_SERVICES"
 fi
-# Preserve the lock: `tt-device-mcp lock` adds DEVICE_GROUP to the unit; keep it
-# across a re-render so an update doesn't silently unlock a shared host.
+# Preserve the lock: `tt-device-mcp lock` adds DEVICE_GROUP and the broker's flip switch to the
+# unit; keep both across a re-render so an update doesn't silently unlock a shared host or turn
+# the between-jobs flip off (`lock` after `unlock` leaves TTDEV_LOCK=0 in /etc/default).
 group_env=""; grep -q 'TT_DEVICE_MCP_DEVICE_GROUP' "$UNIT" 2>/dev/null \
     && group_env="Environment=TT_DEVICE_MCP_DEVICE_GROUP=ttdev"
+grep -q '^Environment=TT_DEVICE_MCP_DEVICE_LOCK=1' "$UNIT" 2>/dev/null \
+    && group_env="${group_env:+$group_env
+}Environment=TT_DEVICE_MCP_DEVICE_LOCK=1"
 # The opt-in lock (spec 05 I9): TTDEV_LOCK=1 in /etc/default renders the device group AND the
 # broker's flip switch into the unit, so the lock comes up inside this update's own restart (never
 # an extra one) and the broker re-applies the node modes itself, between jobs. Unset or 0 changes
