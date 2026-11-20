@@ -311,6 +311,37 @@ def test_broker_install_restarts_so_an_upgrade_takes_effect():
     assert "systemctl enable --now tt-device-broker" not in body, "`enable --now` is a no-op on an active unit"
 
 
+def _env_file_block(tmp_path):
+    """The installer's own lines that write /etc/default/tt-device-broker, pointed at a scratch path."""
+    body = _BROKER_INSTALL.read_text()
+    start = body.index("cat > /etc/default/tt-device-broker")
+    end = body.index("chmod 0644 /etc/default/tt-device-broker", start)
+    end = body.index("\n", end)
+    target = tmp_path / "default-file"
+    return body[start:end].replace("/etc/default/tt-device-broker", str(target)), target
+
+
+@pytest.mark.parametrize("umask", ["077", "0"])
+def test_the_broker_env_file_is_0644_whatever_the_callers_umask(tmp_path, umask):
+    block, target = _env_file_block(tmp_path)
+    script = f"umask {umask}\nR=/opt/x RESET_MODE=m FABRIC_CHECK_CMD= FABRIC_DESCRIPTOR= AUTOUPDATE=1 TTDEV_BRANCH=main\n{block}\n"
+    subprocess.run(["bash", "-c", script], check=True)
+    assert target.stat().st_mode & 0o7777 == 0o644
+
+
+def test_the_unit_and_the_state_dirs_get_explicit_modes():
+    """`cat >` and `mkdir -p` take the caller's umask: a unit written under 077 is unreadable to
+    systemd's non-root tooling, and a log or health dir under 077 locks out every non-root reader."""
+    apply = (_ROOT / "deploy" / "apply-host-config.sh").read_text()
+    assert 'exit 0\nchmod 0644 "$UNIT"\n' in apply
+    for path in ('"$ROOT/slurm"', "/var/log/tt-device-broker", "/var/lib/tt-device-broker/health"):
+        assert f"install -d -m 0755 {path}" in apply, path
+    install = _BROKER_INSTALL.read_text()
+    for path in ('"$R"', '"$R/slurm"'):
+        assert f"install -d -m 0755 {path}" in install, path
+    assert "mkdir -p" not in apply and "mkdir -p" not in install
+
+
 def _capture_daemon_env(monkeypatch, tmp_path):
     """Start the per-user daemon with Popen stubbed; return the env the child would have received."""
     captured = {}

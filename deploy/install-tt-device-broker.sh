@@ -28,7 +28,7 @@ echo "==> build venv + install broker from $REPO"
 # only once the restarted broker answers /health.
 # shellcheck source=deploy/broker-venv.sh
 . "$REPO/deploy/broker-venv.sh"
-mkdir -p "$R"
+install -d -m 0755 "$R"
 NEW_VENV="$(venv_build "$R" "$REPO")" || exit 1
 rm -rf "$R/wheel"; "$NEW_VENV/bin/pip" wheel -q --no-deps -w "$R/wheel" "$REPO"
 chmod -R a+rX "$R"
@@ -116,7 +116,7 @@ rm -f "$R/eth-heartbeat-check.sh"
 # Required (like fabric-check.sh above): a site pointing slurm.conf at a path the installer
 # never created gets a Prolog that exits 127 on every node, indistinguishable from every node
 # being unfit.
-mkdir -p "$R/slurm"
+install -d -m 0755 "$R/slurm"
 install -m 0755 "$REPO/deploy/slurm/prolog.sh" "$R/slurm/prolog.sh"
 install -m 0755 "$REPO/deploy/slurm/epilog.sh" "$R/slurm/epilog.sh"
 
@@ -148,6 +148,8 @@ TTDEV_FABRIC_DESCRIPTOR=$FABRIC_DESCRIPTOR
 TTDEV_AUTOUPDATE=$AUTOUPDATE
 TTDEV_BRANCH=$(printf %q "$TTDEV_BRANCH")
 CONF
+# `cat >` keeps the mode of a file that exists and takes the caller's umask for a new one.
+chmod 0644 /etc/default/tt-device-broker
 install -m 0755 "$REPO/deploy/tt-device-client-setup.sh" "$R/client-setup.sh"
 install -m 0755 "$REPO/deploy/tt-device-reconcile.sh" "$R/reconcile.sh"
 install -m 0755 "$REPO/deploy/tt-device-autoupdate.sh" "$R/autoupdate.sh"
