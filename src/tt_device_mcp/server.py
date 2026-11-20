@@ -177,7 +177,6 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     aer_totals,
     append_trace,
     arc_not_ready_chips,
-    boot_monotonic,
     bridge_reset_enabled,
     bridge_reset_unavailable_reason,
     capture_incident,
@@ -1215,7 +1214,7 @@ _recovery_deps = RecoveryDeps(
     write_action_log=lambda *a, **k: write_action_log(*a, **k),
     device_hold_episode_since=lambda: device_hold_episode_since,
     auto_power_cycle_enabled=lambda: _auto_power_cycle_enabled(),
-    terminate_process_group=lambda pid: _terminate_process_group(pid),
+    terminate_process_group=lambda pid: _terminate_check_reader(pid),
     logger=lambda: logger,
     present_chip_indices=lambda: _present_chip_indices(),
     enumerate_device_holders=lambda: enumerate_device_holders(),
@@ -1497,6 +1496,9 @@ _hold_episode_tenant = False
 # Whether the open hold is the startup hold a restart opened, still naming no fault (spec 04 I82). It
 # neither takes nor spends a released episode's carry; the first fault it turns into takes it.
 _hold_episode_startup = False
+# Whether the open hold is the kill-reset hold after a first job its owner stopped, the device clean (spec 04 I82). It
+# defers a released episode's carry as a startup hold does; the first fault it turns into takes it.
+_hold_episode_neutral = False
 
 
 def _recorded_hold_startup(since: str) -> bool:
@@ -1616,18 +1618,27 @@ def _drop_hold_carry() -> None:
         _write_hold_carry()
 
 
-def _note_hold_carry_job(edge: str, *, ok: bool = False) -> None:
+def _note_hold_carry_job(edge: str, *, ok: bool = False, neutral: bool = False) -> None:
     """A job started inside the carry window keeps it open until _HOLD_CARRY_SEC after that job ends: the first job
     after a release is the one that shows whether the release was right (spec 04 I82). ``ok``: the job ended completed,
     exit 0, naming no device or fabric fault. That proves the release right, so the carry is dropped and the next hold
     is a fresh episode with its own class path. A job that ends any other way under the startup hold a restart opened
     (it was re-adopted) pins the carry to that hold: the startup gate's reset and full check can outlast the window, and
-    the hold names its fault only when the gate fails, so the carry stays open until the gate's verdict."""
+    the hold names its fault only when the gate fails, so the carry stays open until the gate's verdict. ``neutral``:
+    the job's owner killed, cancelled or preempted it and nothing named a device or fabric fault. After a verified
+    release whose episode ran no bound ladder that proves nothing either way, so the next hold defers the carry
+    (_hold_carry_neutral)."""
     rec = _load_hold_carry()
     if not isinstance(rec, dict):
         return
     if edge == "end" and ok:
         _drop_hold_carry()
+        return
+    if edge == "end" and neutral:
+        if rec.get("job_started") and rec.get("verified") and rec.get("ladder_age") is None:
+            if not rec.get("startup_pinned"):
+                rec["neutral_end"] = True
+                _write_hold_carry()
         return
     now = time.time()
     try:
@@ -1652,6 +1663,25 @@ def _note_full_check_passed(prior: Optional[dict]) -> None:
     check releasing a hold a dead broker left open) is the release itself, not proof since it."""
     if not device_hold_logged and prior is not None and _load_hold_carry() is prior:
         _drop_hold_carry()
+
+
+def _owner_stop_clean() -> bool:
+    """No device evidence against the device at a job's end: no fault on record, no chip isolated, and the fsm not in
+    an episode some check opened while the job ran (spec 04 I82)."""
+    return not device_fault_reported and not isolated_chips and fsm.state is ServerState.HEALTHY
+
+
+def _kill_hold_clean() -> bool:
+    """The open hold names nothing but its owner's stop (``job_killed``), with no fault or isolated chip on record
+    (spec 04 I82)."""
+    return fsm.record.why == "job_killed" and not device_fault_reported and not isolated_chips
+
+
+def _hold_carry_neutral() -> bool:
+    """Whether a hold opening now follows a first job its owner stopped with clean device evidence, and names nothing
+    but that stop's own wedge risk. Such a hold defers the carry; any other hold takes it (spec 04 I82)."""
+    rec = _load_hold_carry()
+    return isinstance(rec, dict) and bool(rec.get("neutral_end")) and _kill_hold_clean()
 
 
 def _take_hold_carry() -> Optional[dict]:
@@ -2817,6 +2847,7 @@ def _reset_for_testing():
     """
     global job_queue, lock, _action_row, _hold_row, device_hold_logged, device_hold_episode_since, device_hold_episode_reason
     global _hold_episode_restorable, _hold_episode_tenant, _hold_episode_startup, _hold_carry, _hold_carry_loaded
+    global _hold_episode_neutral
     global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic
     global _dispatch_reset_spent, _kill_reset_owed, _kill_reset_owed_at, _pre_reset_blocker
     global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
@@ -2848,6 +2879,7 @@ def _reset_for_testing():
     _hold_episode_restorable = True
     _hold_episode_tenant = False
     _hold_episode_startup = False
+    _hold_episode_neutral = False
     _hold_carry = None
     _hold_carry_loaded = False
     if recovery_mechanism is not None:
@@ -3340,6 +3372,10 @@ def _scoped_reset_backend() -> bool:
     return privileges.has_systemd() and privileges.is_root()
 
 
+# After a runner error's kill ladder, how long the runner waits for the event loop to see the job's exit status.
+RUNNER_ERROR_REAP_WAIT_SEC = 5.0
+
+
 async def _group_gone(pid: int, deadline: float) -> bool:
     """Poll until the process group is fully gone, or ``deadline`` passes."""
     loop = asyncio.get_event_loop()
@@ -3395,6 +3431,35 @@ async def _terminate_process_group(pid: int, grace_sec: float = GRACEFUL_KILL_GR
     except (ProcessLookupError, OSError):
         return f"{step} (gone before SIGKILL)"
     return "SIGKILL"
+
+
+async def _terminate_check_reader(pid: int) -> str:
+    """End a broker check's timed-out process group, honouring the dead-chip valve (spec 03 I84, spec 04 I76).
+
+    While the PCI-wedged latch is set, or a live member of the group is a holder the valve refused to kill,
+    the group is stopped (SIGSTOP), never signalled to exit: a stop issues no reads and closes no fd, and the
+    power cycle the hold bound requests ends it. Anything else gets the usual SIGINT/SIGTERM/SIGKILL ladder."""
+    why = ""
+    if PCI_WRITER.latched:
+        why = "PCI-wedged"
+    elif _kill_refused_pids:  # the /proc scan only when the valve refused a kill, off the event loop
+        refused = dict(_kill_refused_pids)
+
+        def _holds_refused() -> bool:
+            members = [pid, *_pgid_pids(pid)]
+            return any(m in refused and _read_proc_starttime(m) == refused[m] for m in members)
+
+        if await asyncio.to_thread(_holds_refused):
+            why = "the dead-chip valve refused to kill it"
+    if not why:
+        return await _terminate_process_group(pid)
+    try:
+        os.killpg(pid, signal.SIGSTOP)
+    except OSError:
+        pass
+    if logger:
+        logger.warning(f"check process group {pid} left stopped, not killed ({why}); the power cycle ends it")
+    return f"SIGSTOP (kill refused: {why})"
 
 
 def _pgid_pids(pgid: int) -> list[int]:
@@ -9411,7 +9476,7 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
         if j.status == JobStatus.RUNNING and j.preemptable:
             payload["preempt"] = preempt_label(j)
             payload["preempt_job_id"] = j.id
-            # Spec 01 I20: why it is being preempted ('queued' or 'update'); absent with no contention.
+            # Spec 01 I20: why it is being preempted ('queued', 'update' or 'hold_bound'); absent with no contention.
             cause = preempt_cause(j)
             if cause:
                 payload["preempt_cause"] = cause
@@ -9508,7 +9573,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     global device_hold_tenant_deferred, device_hold_offbus_prior_bucket, device_hold_offbus_tenant_wait
     global device_hold_escalated_monotonic, _hold_row, _hold_episode_restorable
     global device_hold_job_bound_escalated, _dispatch_reset_spent, _carried_hold, device_held_since
-    global _hold_startup_deferred
+    global _hold_startup_deferred, _hold_episode_neutral
     if reason and not device_hold_logged and _startup_hold_behind_readopted_job():
         return  # spec 03 I75: the device is the re-adopted job's; the hold's clock starts at its end
     # A hold opens now, or the device passed: the deferral is over. It ended at the jobs' end, when the
@@ -9537,8 +9602,10 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         # (_hold_turned_fault). A restored startup hold that deferred the carry defers it again.
         startup = fsm.record.why == "startup_unverified" and (not restored or _recorded_hold_startup(restored))
         startup = startup and not tenant
-        carry = None if tenant or startup else _take_hold_carry()
-        deferred = _load_hold_carry() if startup else None
+        # Spec 04 I82: the kill-reset hold after a first job its owner stopped, the device clean, defers it as well.
+        _hold_episode_neutral = not (tenant or startup) and _hold_carry_neutral()
+        carry = None if tenant or startup or _hold_episode_neutral else _take_hold_carry()
+        deferred = _load_hold_carry() if startup or _hold_episode_neutral else None
         jobs_end = _wall_iso(min(deferred_until, time.time())) if deferred_until is not None else ""
         starts = [s for s in (restored, str(carry["since"]) if carry else "", jobs_end) if s]
         device_hold_episode_since = min(starts, key=datetime.fromisoformat) if starts else row_since
@@ -9627,6 +9694,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
         _hold_row = None
         if not _hold_episode_tenant:  # spec 04 I82: a tenant's hold time is not fault time
             _save_hold_carry(device_hold_episode_since, device_hold_episode_reason)
+        _hold_episode_neutral = False
         device_hold_episode_since = ""
         clear_pending_marker()  # spec 04 I88: the hold lifted, no cycle is pending
         # Spec 03 I80: a clock latched inside an op belongs to this episode; the next hold starts its own.
@@ -10329,6 +10397,10 @@ def _describe_bound_blocker(blocker: dict) -> str:
         return "a tenant holds the device"
     if blocker.get("job_id"):
         desc += f" (re-adopted job {blocker['job_id']}, past its stated end {blocker.get('service_end')})"
+    if blocker.get("blocker") == "job_running" and any(
+        j.status == JobStatus.RUNNING and j.preemptable for j in jobs.values()
+    ):
+        desc += f"; preemptable: stopped {PREEMPT_GRACE_SEC}s after its limit, then the ladder runs (spec 01 I20)"
     return desc
 
 
@@ -10693,7 +10765,8 @@ def _hold_turned_fault() -> None:
     (its full check failed, or a re-adopted job ended on one), is a fault hold from now on: write its
     clock to disk, and continue a fault carry still in its window as a fault hold opened now would
     (spec 04 I82). Without it the bound runs one more ladder before its host rung."""
-    global device_hold_episode_since
+    global device_hold_episode_since, _hold_episode_neutral
+    _hold_episode_neutral = False
     carry = _take_hold_carry()
     if carry:
         device_hold_episode_since = min((device_hold_episode_since, str(carry["since"])), key=datetime.fromisoformat)
@@ -10738,6 +10811,8 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
         and fsm.record.why != "startup_unverified"
     ):
         _hold_turned_fault()  # the startup hold turned into a fault hold
+    elif _hold_episode_neutral and fsm.state in (ServerState.RECOVERING, ServerState.DOWN) and not _kill_hold_clean():
+        _hold_turned_fault()  # the owner's stop left a device fault behind
     try:
         started = datetime.fromisoformat(device_hold_episode_since)
     except ValueError:
@@ -10966,18 +11041,45 @@ def _dispatch_hold_waiter(now: float) -> Optional[tuple]:
     return _dispatch_hold_waiter_seen
 
 
+HOLD_BOUND_WAITER_PREFIX = "hold-bound:"
+_hold_bound_waiter_seen: Optional[tuple] = None
+
+
+def _hold_bound_waiter(now: float) -> Optional[tuple]:
+    """The open hold's 10-min bound as (waiter id, arrival on time.monotonic()) while a running broker job is all that
+    keeps its ladder off the device (spec 04 I76, spec 01 I20), else None. A held device refuses tenants, so no job can
+    queue behind a preemptable job past its limit. It arrives when the broker first sees the bound blocked, per hold
+    episode. Never raises."""
+    global _hold_bound_waiter_seen
+    blocker = _hold_bound_tenant_blocker
+    since = device_hold_episode_since
+    if (
+        not since
+        or _hold_bound_episode != since
+        or not isinstance(blocker, dict)
+        or blocker.get("blocker") != "job_running"
+    ):
+        _hold_bound_waiter_seen = None
+        return None
+    waiter = f"{HOLD_BOUND_WAITER_PREFIX}{since}"
+    if _hold_bound_waiter_seen is None or _hold_bound_waiter_seen[0] != waiter:
+        _hold_bound_waiter_seen = (waiter, now)
+    return _hold_bound_waiter_seen
+
+
 def _waiter_arrivals(now: Optional[float] = None, *, update: bool = True) -> dict:
     """Every job now waiting for the device, by id, with when (time.monotonic) it was queued.
     The monotonic clock keeps a wall-clock step or DST change from moving the kill. A job queued
     before a broker restart has only its queued_at, read against the wall clock once and kept as
     its queued_monotonic; one that does not parse counts as arriving at that read. With `update`,
-    a pending update (the auto-updater's live dispatch hold) is one more waiter (spec 01 I20)."""
+    a pending update (the auto-updater's live dispatch hold) is one more waiter (spec 01 I20), and so
+    is a hold whose 10-min bound a running job blocks (_hold_bound_waiter)."""
     now = time.monotonic() if now is None else now
     arrivals = {}
     if update:
-        held = _dispatch_hold_waiter(now)
-        if held is not None:
-            arrivals[held[0]] = min(now, held[1])
+        for held in (_dispatch_hold_waiter(now), _hold_bound_waiter(now)):
+            if held is not None:
+                arrivals[held[0]] = min(now, held[1])
     for j in jobs.values():
         if j.status != JobStatus.QUEUED:
             continue
@@ -11060,11 +11162,14 @@ def preempt_label(job: "Job") -> Optional[str]:
 
 def preempt_cause(job: "Job") -> Optional[str]:
     """Why a running preemptable job is under contention: 'queued' while a job waits for the
-    device, 'update' while only a pending broker update does (spec 01 I20); None otherwise."""
+    device, 'update' while only a pending broker update does (beside the hold bound or not), 'hold_bound' while only
+    the open hold's 10-min bound does (spec 01 I20); None otherwise."""
     label = preempt_label(job)
     if not label or not label.startswith("PREEMPTING") or not job.contention_waiters:
         return None
-    if all(w.startswith(DISPATCH_HOLD_WAITER_PREFIX) for w in job.contention_waiters):
+    if all(w.startswith(HOLD_BOUND_WAITER_PREFIX) for w in job.contention_waiters):
+        return "hold_bound"
+    if all(w.startswith((DISPATCH_HOLD_WAITER_PREFIX, HOLD_BOUND_WAITER_PREFIX)) for w in job.contention_waiters):
         return "update"
     return "queued"
 
@@ -14521,6 +14626,11 @@ export {JOB_TAG_ENV}={job_tag}
                                     f"PREEMPTING: a broker update is waiting past the limit; end within {left}s "
                                     "or be killed"
                                 )
+                            elif preempt_cause(job) == "hold_bound":
+                                note(
+                                    f"PREEMPTING: the device hold's 10-min recovery bound is waiting past the limit; "
+                                    f"end within {left}s or be killed"
+                                )
                             else:
                                 note(f"PREEMPTING: a job is waiting past the limit; end within {left}s or be killed")
                         else:
@@ -14656,15 +14766,28 @@ export {JOB_TAG_ENV}={job_tag}
             # sweep for what is left: as the first signal it gives the runtime no chance to close the device, and its
             # chips stay at the busy clock until something opens and closes them again.
             if job.pid:
+                laddered = False
                 try:
                     _log_job_tree_killed(job_id, f"runner error ({e})", await _terminate_job(job_id, job.pid))
+                    laddered = True
+                    # The ladder sees the group gone once the child is reaped, but the event loop may learn the
+                    # returncode later (a child watcher thread posts it): wait for it, bounded, so the job keeps its
+                    # own exit code (or -9 after SIGKILL) instead of none.
+                    if proc is not None and proc.returncode is None:
+                        await aio.wait_for(proc.wait(), timeout=RUNNER_ERROR_REAP_WAIT_SEC)
                 except asyncio.CancelledError:
                     # Shutdown mid-ladder: leave whatever is left for the next broker to re-adopt.
                     cancelled = True
                     raise
+                except asyncio.TimeoutError:
+                    if logger:
+                        logger.warning(
+                            f"JOB_RUNNER job_id={job_id} no exit status {RUNNER_ERROR_REAP_WAIT_SEC}s after the ladder"
+                        )
                 except Exception as term_err:  # noqa: BLE001 - the sweep below still runs
                     if logger:
-                        logger.warning(f"JOB_RUNNER job_id={job_id} terminate after exception failed: {term_err}")
+                        stage = "reap wait" if laddered else "terminate"
+                        logger.warning(f"JOB_RUNNER job_id={job_id} {stage} after exception failed: {term_err}")
                 # A ladder that had to end in SIGKILL is a signal death, so the wedge check sees it.
                 if proc is not None and proc.returncode is not None:
                     job.exit_code = proc.returncode
@@ -14791,6 +14914,16 @@ export {JOB_TAG_ENV}={job_tag}
                 fault = _scan_output_for_device_fault(job_log_file)
                 if job.status == JobStatus.COMPLETED and job.exit_code == 0 and not (fault or topo or known):
                     _note_hold_carry_job("end", ok=True)  # spec 04 I82: the release was right
+                elif (
+                    (
+                        job_id in request_killed_job_ids
+                        or job_id in preempt_forced_job_ids
+                        or job.status == JobStatus.PREEMPTED
+                    )
+                    and not (fault or topo or known or killed_by_reset)
+                    and _owner_stop_clean()
+                ):
+                    _note_hold_carry_job("end", neutral=True)  # spec 04 I82: the owner's stop proves nothing
                 if fault:
                     _mark_device_reported_fault(f"job {job_id} {fault}", job=job)
                 elif killed_by_reset:
@@ -16214,9 +16347,8 @@ async def run_startup_tasks() -> None:
     log_rung_inventory()
     # A broker start is never trusted, whatever the last broker saw: the startup gate's own fabric
     # pass (after hugepages) settles this before anything is released (04 I32).
-    # A start right after a boot owes it from the boot: the startup check lets a multi-tray mesh settle
-    # from there (04 I32); a start long after one waits for nothing.
-    FABRIC_DEBT.note_reset("broker start", at=boot_monotonic())
+    # It owes no settle: its reset time is unknown (0.0).
+    FABRIC_DEBT.note_reset("broker start", at=0.0)
     # A hold the last broker died holding has no row yet; give it one before anything opens
     # a new episode over the top of it.
     carried_hold = None

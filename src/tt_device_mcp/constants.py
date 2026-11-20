@@ -187,9 +187,9 @@ ETH_REAP_SEC = 2.0
 FABRIC_CHECK_CANNOT_CHECK_RC = 77
 
 # The fabric check exits with this when the validator listed cabling-descriptor links that are
-# missing and no extra link that could explain them (a moved tray shows both): a cable that is
-# absent or dead. A hardware verdict, not a skip and not a reset: no reset or rung can fix a
-# cable, so the broker holds as a known fabric fault and pages once (spec 03 I47).
+# missing and none extra: a cable that is absent or dead. A hardware verdict, not a skip and not
+# a reset: no reset or rung can fix a cable, so the broker holds as a known fabric fault and pages
+# once (spec 03 I47).
 FABRIC_CHECK_HARDWARE_FAULT_RC = 78
 
 # The recovery ladder's three named rungs, in severity order (0..2) — the one place that names
