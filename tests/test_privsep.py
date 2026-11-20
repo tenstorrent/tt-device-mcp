@@ -5,6 +5,8 @@
 
 from tt_device_mcp import privsep
 
+_PW = privsep.pwd.struct_passwd(("u", "x", 1234, 1000, "", "/home/u", "/bin/zsh"))
+
 
 def test_systemd_run_prefix_cooperative_keeps_user_gid():
     # No device_group (cooperative): run with the user's own gid, no -p props.
@@ -16,27 +18,36 @@ def test_systemd_run_prefix_cooperative_keeps_user_gid():
 
 
 def test_systemd_run_prefix_lockdown_uses_device_gid_and_keeps_groups():
-    # Lockdown: the device group is the primary gid (DAC opens the 0660 node) and the submitter's
-    # supplementary groups survive. A scope rejects -p SupplementaryGroups and systemd-run --uid
-    # clears the groups, so setpriv does the drop.
+    # Lockdown: device group as primary gid, the submitter's groups kept.
     argv = privsep.systemd_run_prefix(uid=1000, gid=1000, device_group="ttdev", unit="u.scope", groups=[27, 1000, 1500])
     assert argv[:5] == ["systemd-run", "--scope", "--quiet", "--collect", "--unit=u.scope"]
     assert argv[5:] == ["--", "setpriv", "--reuid=1000", "--regid=ttdev", "--groups=27,1000,1500"]
     assert "-p" not in argv and "--uid=1000" not in argv
 
 
-def test_lockdown_prefix_for_passes_the_submitters_groups(monkeypatch):
+def test_lockdown_prefix_for_keeps_the_submitters_groups_and_login_env(monkeypatch):
+    # setpriv sets no variable: the job must still get the submitter's HOME/USER/LOGNAME/SHELL.
     monkeypatch.setattr(privsep, "should_privsep", lambda env=None: True)
-    monkeypatch.setattr(privsep, "_gid_for_uid", lambda uid: 1000)
-    monkeypatch.setattr(privsep, "_groups_for_uid", lambda uid: [27, 1000])
-    argv = privsep.privsep_prefix_for(1000, env={"TT_DEVICE_MCP_DEVICE_GROUP": "ttdev"})
-    assert argv[-1] == "--groups=27,1000"
+    monkeypatch.setattr(privsep, "_passwd", lambda uid: _PW)
+    monkeypatch.setattr(privsep.os, "getgrouplist", lambda name, gid: [1000, 27])
+    argv = privsep.privsep_prefix_for(1234, env={"TT_DEVICE_MCP_DEVICE_GROUP": "ttdev"})
+    tail = argv[argv.index("setpriv") :]
+    assert tail == [
+        "setpriv",
+        "--reuid=1234",
+        "--regid=ttdev",
+        "--groups=27,1000",
+        "env",
+        "HOME=/home/u",
+        "USER=u",
+        "LOGNAME=u",
+        "SHELL=/bin/zsh",
+    ]
 
 
-def test_groups_for_uid_includes_primary_and_supplementary(monkeypatch):
-    monkeypatch.setattr(privsep.pwd, "getpwuid", lambda uid: type("P", (), {"pw_name": "u", "pw_gid": 1000})())
+def test_groups_for_includes_primary_and_supplementary(monkeypatch):
     monkeypatch.setattr(privsep.os, "getgrouplist", lambda name, gid: [1000, 27, 27, 44])
-    assert privsep._groups_for_uid(1000) == [27, 44, 1000]
+    assert privsep._groups_for(_PW) == [27, 44, 1000]
 
 
 def test_privsep_enabled_flag(monkeypatch):
@@ -63,7 +74,7 @@ def test_should_privsep_requires_root_and_systemd(monkeypatch):
 def _enable(monkeypatch):
     monkeypatch.setattr(privsep.shutil, "which", lambda _: "/usr/bin/systemd-run")
     monkeypatch.setattr(privsep.os, "geteuid", lambda: 0)
-    monkeypatch.setattr(privsep, "_gid_for_uid", lambda uid: 1000)
+    monkeypatch.setattr(privsep, "_passwd", lambda uid: _PW)
 
 
 def test_privsep_prefix_for_returns_none_when_disabled():
@@ -75,7 +86,7 @@ def test_privsep_prefix_for_skips_root_and_unknown_uid(monkeypatch):
     _enable(monkeypatch)
     assert privsep.privsep_prefix_for(None, env=env) is None  # HTTP, no peer identity
     assert privsep.privsep_prefix_for(0, env=env) is None  # already root
-    monkeypatch.setattr(privsep, "_gid_for_uid", lambda uid: None)  # no passwd entry
+    monkeypatch.setattr(privsep, "_passwd", lambda uid: None)  # no passwd entry
     assert privsep.privsep_prefix_for(1234, env=env) is None
 
 
@@ -128,7 +139,7 @@ def test_privsep_refusal_refuses_uid_without_passwd(monkeypatch):
     # privsep_prefix_for returns None and the job would fall through to exec as root. Refuse.
     env = {"TT_DEVICE_MCP_PRIVSEP": "1"}
     _enable(monkeypatch)
-    monkeypatch.setattr(privsep, "_gid_for_uid", lambda uid: None)
+    monkeypatch.setattr(privsep, "_passwd", lambda uid: None)
     reason = privsep.privsep_refusal(1234, env=env)
     assert reason is not None and "passwd" in reason
 

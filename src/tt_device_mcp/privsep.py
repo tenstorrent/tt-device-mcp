@@ -58,19 +58,15 @@ def should_privsep(env=None) -> bool:
     return True
 
 
-def _gid_for_uid(uid: int) -> Optional[int]:
+def _passwd(uid: int) -> Optional[pwd.struct_passwd]:
     try:
-        return pwd.getpwuid(uid).pw_gid
+        return pwd.getpwuid(uid)
     except KeyError:
         return None
 
 
-def _groups_for_uid(uid: int) -> List[int]:
+def _groups_for(pw: pwd.struct_passwd) -> List[int]:
     """The submitter's group ids: its primary gid plus every supplementary group."""
-    try:
-        pw = pwd.getpwuid(uid)
-    except KeyError:
-        return []
     return sorted(set(os.getgrouplist(pw.pw_name, pw.pw_gid)))
 
 
@@ -81,6 +77,7 @@ def systemd_run_prefix(
     device_group: Optional[str] = None,
     unit: Optional[str] = None,
     groups: Optional[Sequence[int]] = None,
+    pw: Optional[pwd.struct_passwd] = None,
 ) -> List[str]:
     """Build the ``systemd-run`` argv that runs a job as ``uid``.
 
@@ -98,6 +95,8 @@ def systemd_run_prefix(
     ``systemd-run --uid/--gid`` clears the supplementary groups. So in lockdown the
     scope runs ``setpriv`` as root, which drops to the submitter with ``device_group``
     as primary gid and the submitter's own ``groups`` kept (default: just ``gid``).
+    setpriv changes no variable, so ``env`` then sets the HOME, USER, LOGNAME and SHELL
+    that ``--uid`` would have set, from the submitter's passwd entry ``pw``.
     Cooperative mode keeps ``--uid/--gid``.
     """
     argv = [
@@ -110,7 +109,16 @@ def systemd_run_prefix(
         if unit is not None:
             argv.append(f"--unit={unit}")
         kept = ",".join(str(g) for g in (groups or [gid]))
-        return [*argv, "--", "setpriv", f"--reuid={uid}", f"--regid={device_group}", f"--groups={kept}"]
+        argv += ["--", "setpriv", f"--reuid={uid}", f"--regid={device_group}", f"--groups={kept}"]
+        if pw is not None:
+            argv += [
+                "env",
+                f"HOME={pw.pw_dir}",
+                f"USER={pw.pw_name}",
+                f"LOGNAME={pw.pw_name}",
+                f"SHELL={pw.pw_shell}",
+            ]
+        return argv
     argv += [f"--uid={uid}", f"--gid={gid}"]
     if unit is not None:
         argv.append(f"--unit={unit}")
@@ -137,14 +145,14 @@ def privsep_prefix_for(peer_uid: Optional[int], *, env=None, unit: Optional[str]
     if peer_uid is None or peer_uid == 0:
         # No peer identity (HTTP) or already root — don't fabricate a target user.
         return None
-    gid = _gid_for_uid(peer_uid)
-    if gid is None:
+    pw = _passwd(peer_uid)
+    if pw is None:
         logger.warning("privsep: uid=%s has no passwd entry — no scope built", peer_uid)
         return None
     env = os.environ if env is None else env
     device_group = env.get("TT_DEVICE_MCP_DEVICE_GROUP") or None
     return systemd_run_prefix(
-        uid=peer_uid, gid=gid, device_group=device_group, unit=unit, groups=_groups_for_uid(peer_uid)
+        uid=peer_uid, gid=pw.pw_gid, device_group=device_group, unit=unit, groups=_groups_for(pw), pw=pw
     )
 
 
@@ -167,7 +175,7 @@ def privsep_refusal(peer_uid: Optional[int], *, env=None) -> Optional[str]:
         )
     if peer_uid == 0:
         return None
-    if _gid_for_uid(peer_uid) is None:
+    if _passwd(peer_uid) is None:
         return (
             f"privsep is active but uid={peer_uid} has no passwd entry to run as — "
             f"refusing rather than running it as the broker (root)"
