@@ -158,8 +158,6 @@ _OLD_STAGING = r"""
         || { echo "autoupdate: staging fabric-check.sh failed (required); not marking current" >&2; exit 1; }
     install -m 0755 "$clone/deploy/tt-device-eth-heartbeat-probe.py" "$ROOT/eth-heartbeat-probe.py" \
         || { echo "autoupdate: staging eth-heartbeat-probe.py failed (required); not marking current" >&2; exit 1; }
-    install -m 0755 "$clone/deploy/tt-device-aiclk-ceiling.py" "$ROOT/aiclk-ceiling.py" \
-        || { echo "autoupdate: staging aiclk-ceiling.py failed (required); not marking current" >&2; exit 1; }
 """
 
 
@@ -173,6 +171,15 @@ def test_older_updater_stages_this_tree(tmp_path):
         timeout=30,
     )
     assert r.returncode == 0, r.stderr
+
+
+def test_apply_removes_the_retired_aiclk_ceiling_orphan(tmp_path):
+    rm = [ln for ln in (_DEPLOY / "apply-host-config.sh").read_text().splitlines() if "aiclk-ceiling.py" in ln]
+    assert len(rm) == 1, rm
+    orphan = tmp_path / "aiclk-ceiling.py"
+    orphan.write_text("x")
+    r = subprocess.run(["bash", "-c", f"RENDER_ONLY=; ROOT={tmp_path}; {rm[0]}"], capture_output=True, text=True)
+    assert r.returncode == 0 and not orphan.exists(), r.stderr
 
 
 @pytest.mark.xdist_group("forks")

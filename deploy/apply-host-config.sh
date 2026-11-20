@@ -89,6 +89,8 @@ fi
 # install-tt-device-broker.sh, but auto-update never re-runs the installer, only this script,
 # so a host that had it staged before retirement would otherwise keep the file forever.
 [ -n "$RENDER_ONLY" ] || rm -f "$ROOT/eth-heartbeat-check.sh"
+# Likewise the retired aiclk-ceiling helper that an older updater staged.
+[ -n "$RENDER_ONLY" ] || rm -f "$ROOT/aiclk-ceiling.py"
 # The reset-path activation knobs. server.py reads TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC (a below-floor
 # off-bus drop HOLDS instead of resetting) and TT_DEVICE_MCP_SELFHEAL_RELIFT (a self-healed hold
 # lifts from the idle sampler). Both are OFF when unset, so this wiring renders no line until a host
@@ -217,7 +219,7 @@ LOCK="${TTDEV_LOCK:-0}"
 [ "$LOCK" = 1 ] && group_env="Environment=TT_DEVICE_MCP_DEVICE_GROUP=ttdev
 Environment=TT_DEVICE_MCP_DEVICE_LOCK=1"
 
-[ -n "$RENDER_ONLY" ] || mkdir -p /var/log/tt-device-broker
+[ -n "$RENDER_ONLY" ] || install -d -m 0755 /var/log/tt-device-broker
 # Render to stdout under the seam; write the real unit otherwise.
 unit_dest="$UNIT"; [ -n "$RENDER_ONLY" ] && unit_dest=/dev/stdout
 cat > "$unit_dest" <<UNIT
@@ -273,6 +275,7 @@ LimitMEMLOCK=infinity
 WantedBy=multi-user.target
 UNIT
 [ -n "$RENDER_ONLY" ] && exit 0
+chmod 0644 "$UNIT"
 
 # Read-only smi grant (so `tt-device-mcp smi` works on a locked host).
 install -m 0755 "$DEPLOY/tt-smi-ro.sh" /usr/local/bin/tt-device-mcp-smi-ro
@@ -313,13 +316,13 @@ fi
 # re-runs the installer, only this script (this file's own header comment), so an autoupdating
 # host would otherwise never receive deploy/slurm/*.sh at all, and deploy/README.md's
 # Prolog=/opt/tt-device-broker/slurm/prolog.sh would point at a path that never exists on it.
-mkdir -p "$ROOT/slurm"
+install -d -m 0755 "$ROOT/slurm"
 install -m 0755 "$DEPLOY/slurm/prolog.sh" "$ROOT/slurm/prolog.sh"
 install -m 0755 "$DEPLOY/slurm/epilog.sh" "$ROOT/slurm/epilog.sh"
 
 # Bus-lock counter: the discriminator between AMD erratum 1431 and a core stalled on a hung
 # accelerator. Both crash the box identically; only 1431 needs a bus lock. See the unit.
-mkdir -p /var/lib/tt-device-broker/health
+install -d -m 0755 /var/lib/tt-device-broker/health
 install -m 0644 "$DEPLOY/tt-device-buslock.service" /etc/systemd/system/tt-device-buslock.service
 
 # Rotation for the broker + per-job logs. This directory had no rule at all and had grown
