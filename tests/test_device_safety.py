@@ -15335,6 +15335,82 @@ async def test_a_runner_error_still_forces_the_post_job_fabric_pass(monkeypatch,
         await asyncio.gather(runner, return_exceptions=True)
 
 
+class _LateExitStatus:
+    """A spawned job whose exit status reaches the event loop only after the reap, as with a child watcher thread
+    that posts it with call_soon_threadsafe: the group is gone (killpg says ESRCH) while returncode still reads None."""
+
+    def __init__(self, proc, delay_sec):
+        self._proc = proc
+        self._delay_sec = delay_sec
+        self._posted = False
+
+    def __getattr__(self, name):
+        return getattr(self._proc, name)
+
+    @property
+    def returncode(self):
+        return self._proc.returncode if self._posted else None
+
+    async def wait(self):
+        await self._proc.wait()
+        await asyncio.sleep(self._delay_sec)
+        self._posted = True
+        return self._proc.returncode
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        ("own-exit", "trap 'kill $! 2>/dev/null || true; exit 7' INT; echo hi; sleep 30 & wait", 7),
+        ("sigkill", "trap '' INT TERM; echo hi; sleep 30 & wait", -9),  # SIGKILL
+    ],
+    ids=lambda c: c[0],
+)
+async def test_a_runner_error_keeps_the_exit_status_the_loop_learns_after_the_reap(
+    monkeypatch, clear_job_state, tmp_path, case
+):
+    """Spec 03 I36 with the wedge check: after a runner error's kill ladder, the job keeps its own exit code (or the
+    SIGKILL death the ladder ended in) even when the loop learns it only after the process group is gone."""
+    _, command, want = case
+    _free_device_lock(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    monkeypatch.setattr(srv, "DOOMED_PATTERNS", _BrokerFault())
+    monkeypatch.setattr(srv, "SIGTERM_GRACE_SEC", 0.5)
+    grace = 30 if want == 7 else 0.5
+
+    async def _ladder(job_id, pid, grace_sec=srv.GRACEFUL_KILL_GRACE_SEC):
+        await srv._terminate_process_group(pid, grace_sec=grace)  # no scope off privsep
+
+    monkeypatch.setattr(srv, "_terminate_job", _ladder)
+    real_spawn = asyncio.create_subprocess_shell
+
+    async def _spawn(*a, **k):
+        return _LateExitStatus(await real_spawn(*a, **k), delay_sec=0.3)
+
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_shell", _spawn)
+    gates = []
+
+    async def _gate(job_log_file, job_failed=False, clean_exit_code=None):
+        gates.append((job_failed, clean_exit_code))
+
+    monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
+    job = srv.Job(id="093", owner="tenant", workspace="/tmp", command=command, queued_at=datetime.now().isoformat())
+    job.log_file = str(tmp_path / "093.log")
+    srv.jobs[job.id] = job
+    await srv.get_job_queue().put(job.id)
+
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await _wait_until(lambda: len(gates) == 1)
+        assert job.status is srv.JobStatus.FAILED and "EXCEPTION" in (job.error or "")
+        assert job.exit_code == want, "the job's exit status was lost to a returncode the loop had not seen yet"
+        assert gates == [(True, None)]
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_the_deadline_escalation_holds_a_known_fabric_fault_without_a_reset(monkeypatch, clear_job_state):
     """03 I46 with 04 I30: below the 10-min bound (04 I76), a known fabric fault holds and pages even when an old pass

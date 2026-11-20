@@ -13,6 +13,7 @@ SERVICE_NAME = "tt-device-mcp"
 # Canonical host broker socket (root, multi-tenant). Present → clients use it
 # automatically; override with TT_DEVICE_MCP_SOCKET.
 DEFAULT_SOCKET = "/run/tt-device-broker/broker.sock"
+BROKER_UNIT_PATH = "/etc/systemd/system/tt-device-broker.service"
 JOB_RETENTION_SEC = 300  # 5 minutes - grace period before removing finished jobs from memory
 STATS_UPDATE_SEC = 30  # How often to persist stats to disk
 
@@ -169,6 +170,10 @@ def pre_reset_zombie_ladder_reserve_sec(chips: int) -> float:
 # gate runs the full pass; this bound expiring is frozen evidence (I16) and holds. An operator override's inner bound is
 # this same bound, so its timeout is frozen evidence here as on every other path.
 ETH_POST_JOB_TIMEOUT_SEC = 10.0
+# The wait before the post-job read is tried once more after it timed out with no verdict (spec 03 I61). The timeouts
+# cluster on the first job after a mesh reset and the same device reads in ~1s a moment later, so a short settle is
+# enough; the budget between jobs (~10s) rules out more. A retry that is still unmeasured runs the fabric pass.
+ETH_POST_JOB_RETRY_SETTLE_SEC = 2.0
 # The most the eth-heartbeat read waits for its own reader to finish exiting after killing it on
 # a timeout (see monitor._verify_eth_heartbeat_body): a SIGKILLed reader is normally gone in
 # milliseconds, and until it is, a holder scan still sees its pid through the driver.
@@ -182,9 +187,9 @@ ETH_REAP_SEC = 2.0
 FABRIC_CHECK_CANNOT_CHECK_RC = 77
 
 # The fabric check exits with this when the validator listed cabling-descriptor links that are
-# missing and no extra link that could explain them (a moved tray shows both): a cable that is
-# absent or dead. A hardware verdict, not a skip and not a reset: no reset or rung can fix a
-# cable, so the broker holds as a known fabric fault and pages once (spec 03 I47).
+# missing and none extra: a cable that is absent or dead. A hardware verdict, not a skip and not
+# a reset: no reset or rung can fix a cable, so the broker holds as a known fabric fault and pages
+# once (spec 03 I47).
 FABRIC_CHECK_HARDWARE_FAULT_RC = 78
 
 # The recovery ladder's three named rungs, in severity order (0..2) — the one place that names
@@ -279,13 +284,19 @@ def user_socket_path() -> str:
     return str(user_state_dir() / "daemon.sock")
 
 
+def system_broker_installed() -> bool:
+    """True on a broker host: the system unit is installed, whether or not it is running."""
+    return os.path.exists(BROKER_UNIT_PATH)
+
+
 def resolve_socket(explicit=None) -> str:
     """The socket to reach a server, in priority order: explicit/env override,
-    the host broker, then this user's standalone daemon. None if nothing's up."""
+    the host broker, then this user's standalone daemon (never on a broker host,
+    where jobs go to the system broker only). None if nothing's up."""
     cand = explicit or os.environ.get("TT_DEVICE_MCP_SOCKET")
     if cand:
         return cand
-    for p in (DEFAULT_SOCKET, user_socket_path()):
+    for p in (DEFAULT_SOCKET,) if system_broker_installed() else (DEFAULT_SOCKET, user_socket_path()):
         if os.path.exists(p):
             return p
     return None

@@ -39,7 +39,9 @@ transport. The HTTP/TCP listener predates it, attaches no identity, and is to be
 - **I4 — The stdio shim is a socket-only MCP proxy.** The shim (`stdio_shim.py`) serves stdio MCP
   to its client and forwards `tools/list` and `tools/call` to the broker over its unix socket —
   never TCP. Upstream resolution order: explicit/`TT_DEVICE_MCP_SOCKET`, else the host broker
-  socket, else this user's standalone daemon, lazy-started if absent.
+  socket, else this user's standalone daemon, lazy-started if absent. On a broker host (the
+  system unit is installed) there is no standalone daemon: the shim never starts one and never
+  routes to one, and with the broker down it tells the user to ask an admin to start it.
 - **I5 — One binary, unambiguous routing.** The bare `tt-device-mcp` binary with a piped (non-tty)
   stdin is an MCP client attaching: `cli.main` routes to the stdio shim. On a tty it is a human:
   the CLI (help) answers, never the shim.
@@ -118,8 +120,8 @@ its job ids are also persisted as `fsm.json` `readopted_jobs`).
   `<state dir>/daemon.sock`, state dir `/tmp/tt-device-mcp-<uid>` (override
   `TT_DEVICE_MCP_STATE_DIR`).
 - Client-side resolution (`constants.resolve_socket`): explicit arg / `TT_DEVICE_MCP_SOCKET`
-  wins unconditionally; else the broker socket if it exists; else the user daemon socket if it
-  exists; else none.
+  wins unconditionally; else the broker socket if it exists; else, unless the system unit is
+  installed, the user daemon socket if it exists; else none.
 - Server-side (`socket_transport.resolve_socket_path`): `--socket` flag, else
   `TT_DEVICE_MCP_SOCKET`, else the socket transport is off.
 
@@ -263,7 +265,7 @@ CONTRIBUTING's workflow) — spec diff first, then the removal, in its own PR.
 | I2 | `tests/test_device_safety.py::test_rest_submit_clamps_timeout_to_the_hard_ceiling`, `tests/test_device_safety.py::test_rest_job_logs_clamps_tail_to_the_tool_cap`, `tests/test_reset.py::test_privsep_streaming_reset_refuses_over_a_foreign_holder` |
 | I3 (uid stamped on socket, none on TCP) | `tests/test_socket_transport.py::TestPeerUidScope::test_peer_uid_from_unix_scope`, `tests/test_socket_transport.py::TestPeerUidScope::test_tcp_scope_has_no_peer_uid`, `tests/test_socket_transport.py::TestPeerUidScope::test_missing_client_is_none`, `tests/test_socket_transport.py::TestPeerUidScope::test_middleware_publishes_and_clears_contextvar`, `tests/test_socket_transport.py::TestPeerUidScope::test_the_middleware_derives_the_surface_from_the_request_path` |
 | I3 (identity is authoritative vs self-report — spec 05 owns mechanics) | `tests/test_authz.py::TestAuthzOwner::test_socket_overrides_reported_owner`, `tests/test_authz.py::TestAuthzOwner::test_http_uses_reported_owner`, `tests/test_authz.py::TestAuthzOwner::test_http_unknown_when_no_owner` |
-| I4 (resolution order, lazy daemon, no TCP) | `tests/test_stdio_shim.py::test_resolve_prefers_explicit_socket`, `tests/test_stdio_shim.py::test_resolve_auto_discovers_broker_socket`, `tests/test_stdio_shim.py::test_resolve_lazy_starts_user_daemon_when_none` |
+| I4 (resolution order, lazy daemon, no TCP) | `tests/test_stdio_shim.py::test_resolve_prefers_explicit_socket`, `tests/test_stdio_shim.py::test_resolve_auto_discovers_broker_socket`, `tests/test_stdio_shim.py::test_resolve_lazy_starts_user_daemon_when_none`, `tests/test_stdio_shim.py::test_system_broker_installed_never_starts_or_uses_a_user_daemon` |
 | Shim retries the connect, never a sent `tools/call` | `tests/test_stdio_shim.py::test_a_broker_restart_mid_call_does_not_re_send_the_call`, `tests/test_stdio_shim.py::test_a_call_made_while_the_broker_is_down_is_sent_once_it_is_back`, `tests/test_stdio_shim.py::test_an_error_reply_from_the_broker_is_passed_on_not_retried`, `tests/test_stdio_shim.py::test_a_call_that_never_reached_a_tool_is_retried`, `tests/test_stdio_shim.py::test_a_wrapped_failure_is_retried_only_if_every_part_says_never_delivered` |
 | Shim read timeout is a gap budget, not a call cap | `tests/test_stdio_shim.py::test_a_tool_call_longer_than_the_read_timeout_completes_on_keepalives` |
 | I5 | `tests/test_cli.py::test_main_bare_piped_stdin_runs_stdio_adapter`, `tests/test_cli.py::test_main_bare_tty_shows_help_not_adapter` |

@@ -15,7 +15,9 @@ import tempfile
 import time
 from typing import Callable, Optional
 
+from tt_device_mcp import privileges
 from tt_device_mcp.health.evidence import health_dir, health_event
+from tt_device_mcp.health.recovery import ipmi_guard
 from tt_device_mcp.health.recovery import power_cycle_reason as _reason_record
 from tt_device_mcp.health.recovery.power_cycle_reason import PowerCycleReason, _one_line
 
@@ -509,7 +511,7 @@ def read_restart_cause_why(argv: list) -> tuple:
     exe = _resolve_command(probe[0])
     if exe is None:
         return None, f"{probe[0]} not found"
-    rc, out = _run_step([exe, *probe[1:]], PREFLIGHT_TIMEOUT_SEC)
+    rc, out = _run_step(ipmi_guard.bmc_argv([exe, *probe[1:]]), PREFLIGHT_TIMEOUT_SEC)
     last = next((ln.strip() for ln in reversed((out or "").splitlines()) if ln.strip()), "")
     if rc is None:
         return None, f"the BMC query did not finish in {PREFLIGHT_TIMEOUT_SEC}s: {last}"[:_CAUSE_WHY_MAX]
@@ -558,7 +560,7 @@ def read_sel_power_off(argv: list, since: float, until: float) -> Optional[float
     exe = _resolve_command(clock[0])
     if exe is None:
         return None
-    rc, out = _run_query([exe, *clock[1:]], SEL_TIMEOUT_SEC)
+    rc, out = _run_query(ipmi_guard.bmc_argv([exe, *clock[1:]]), SEL_TIMEOUT_SEC)
     host_now = time.time()
     bmc_now = None
     for ln in reversed((out or "").splitlines()) if rc == 0 else ():
@@ -568,7 +570,7 @@ def read_sel_power_off(argv: list, since: float, until: float) -> Optional[float
     if bmc_now is None:
         return None
     offset = host_now - bmc_now
-    rc, out = _run_query([exe, *tail[1:]], SEL_TIMEOUT_SEC)
+    rc, out = _run_query(ipmi_guard.bmc_argv([exe, *tail[1:]]), SEL_TIMEOUT_SEC)
     if rc != 0:
         return None
     found = None
@@ -713,6 +715,8 @@ def fire_os_first(argv: list, reason: PowerCycleReason, timeout: float = DEFAULT
     reason = PowerCycleReason.require(reason)
     argv = [str(a) for a in argv]
     why = os_first_unavailable()
+    if not privileges.is_root():
+        why = "the OS-first power cycle needs root (it writes a root-owned request file and starts a system unit)"
     if not why and (not argv or any("\n" in a for a in argv)):
         why = "the power-cycle argv cannot be passed to the shutdown hook"
     if not why:

@@ -15,6 +15,9 @@ import pytest
 
 from tt_device_mcp import privileges
 
+# conftest stubs the sudoers probe for the suite; these tests drive the real one.
+_REAL_SUDO_PROBE = privileges._ipmi_sudo_allowed
+
 
 @pytest.fixture(autouse=True)
 def unprivileged(monkeypatch):
@@ -27,6 +30,7 @@ def unprivileged(monkeypatch):
     monkeypatch.setattr(privileges.shutil, "which", lambda _name: None)
     monkeypatch.setattr(privileges, "SYSTEMD_DIR", "/nonexistent")
     monkeypatch.setattr(privileges, "IPMI_DEVICE_NODES", ())
+    monkeypatch.setattr(privileges, "_ipmi_sudo_allowed", _REAL_SUDO_PROBE)
 
 
 def test_root_is_euid_zero_not_the_login_user(monkeypatch):
@@ -87,7 +91,7 @@ def test_an_unopenable_ipmi_node_is_not_a_reachable_bmc(monkeypatch, tmp_path):
 
 
 def test_the_snapshot_names_every_probe_for_the_boot_line(monkeypatch, tmp_path):
-    """The boot line has to state all four, because a rung reported OFF is only readable if the
+    """The boot line has to state every probe, because a rung reported OFF is only readable if the
     privilege it lacked is named alongside it."""
     monkeypatch.setattr(privileges.os, "geteuid", lambda: 0)
     monkeypatch.setattr(privileges, "SYSTEMD_DIR", str(tmp_path))
@@ -101,6 +105,7 @@ def test_the_snapshot_names_every_probe_for_the_boot_line(monkeypatch, tmp_path)
         "setpci_bin": False,
         "ipmitool": False,
         "ipmi_node": False,
+        "ipmi_sudo": False,
     }
 
 
@@ -127,3 +132,51 @@ def test_the_latch_holds_the_host_it_measured(monkeypatch, tmp_path):
 
     monkeypatch.setattr(privileges, "_LATCHED", None)
     assert privileges.has_systemd() is False, "unlatched, the probes measure live again"
+
+
+def _sudo(monkeypatch, rc):
+    """A non-root host with ipmitool and sudo; `sudo -n -l ipmitool` answers rc."""
+    calls = []
+
+    def run(argv, **kw):
+        calls.append((argv, kw))
+        return privileges.subprocess.CompletedProcess(argv, rc, "", "")
+
+    monkeypatch.setattr(
+        privileges.shutil, "which", lambda name: f"/usr/bin/{name}" if name in ("ipmitool", "sudo") else None
+    )
+    monkeypatch.setattr(privileges.subprocess, "run", run)
+    return calls
+
+
+def test_a_non_root_server_with_the_sudo_rule_keeps_the_host_rung_off(monkeypatch):
+    """Spec 04 I115/I14: the rule is read with `sudo -n -l`, never by running ipmitool or prompting. It
+    serves the mesh reset only: the OS-first power cycle needs root, so the host rung stays OFF."""
+    calls = _sudo(monkeypatch, 0)
+    assert privileges.snapshot()["ipmi_sudo"] is True
+    assert privileges.can_ipmi() is False and privileges.can_power_cycle() is False
+    ((argv, kw),) = calls[-1:]
+    assert argv == ["sudo", "-n", "-l", "ipmitool"] and kw["stdin"] is privileges.subprocess.DEVNULL
+    assert kw["timeout"] <= privileges.SUDO_LIST_TIMEOUT_SEC
+
+
+def test_a_non_root_server_without_the_sudo_rule_cannot_reach_the_bmc(monkeypatch):
+    _sudo(monkeypatch, 1)
+    assert privileges.can_ipmi() is False
+
+
+def test_root_is_never_asked_for_sudo(monkeypatch):
+    calls = _sudo(monkeypatch, 0)
+    monkeypatch.setattr(privileges.os, "geteuid", lambda: 0)
+    assert privileges.snapshot()["ipmi_sudo"] is False and calls == []
+
+
+def test_a_non_root_server_that_opens_the_node_still_has_no_host_rung(monkeypatch, tmp_path):
+    """Spec 04 I14: the OS-first cycle needs root whatever reaches the BMC; root with the node has it."""
+    node = tmp_path / "ipmi0"
+    node.write_text("")
+    monkeypatch.setattr(privileges, "IPMI_DEVICE_NODES", (str(node),))
+    monkeypatch.setattr(privileges.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert privileges.can_ipmi() is True and privileges.can_power_cycle() is False
+    monkeypatch.setattr(privileges.os, "geteuid", lambda: 0)
+    assert privileges.can_power_cycle() is True

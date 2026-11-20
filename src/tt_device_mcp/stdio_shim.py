@@ -11,7 +11,8 @@ caller's real uid via SO_PEERCRED and runs jobs as that user under privsep, so
 identity rides through for free.
 
 Upstream resolution (socket-only — no TCP): TT_DEVICE_MCP_SOCKET, else the host
-broker socket, else this user's standalone daemon (lazy-started if none is up).
+broker socket, else this user's standalone daemon (lazy-started if none is up). On a
+broker host (system unit installed) only the system broker is used: no per-user daemon.
 """
 
 import asyncio
@@ -28,7 +29,7 @@ from mcp.server.stdio import stdio_server
 from mcp.shared.exceptions import MCPError
 from mcp.types import CONNECTION_CLOSED, INVALID_REQUEST
 
-from tt_device_mcp.constants import resolve_socket, user_socket_path
+from tt_device_mcp.constants import resolve_socket, system_broker_installed, user_socket_path
 
 # Host part is ignored for a UDS connection but must be a syntactically valid URL.
 _UDS_URL = "http://tt-device-broker/mcp"
@@ -51,6 +52,9 @@ def _lazy_start_user_daemon():
     import subprocess
     import time
 
+    if system_broker_installed():
+        _log("the system broker is installed but not running; ask an admin: sudo systemctl start tt-device-broker")
+        return None
     sock = user_socket_path()
     if os.path.exists(sock):
         return sock

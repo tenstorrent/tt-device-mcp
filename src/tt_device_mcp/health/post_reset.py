@@ -130,21 +130,6 @@ class FabricDebt:
         return expected > 1 and _fabric_check_configured()
 
 
-_UPTIME = "/proc/uptime"
-
-
-def boot_monotonic() -> float:
-    """When this host booted, on the time.monotonic() clock, or 0.0 when /proc/uptime cannot be read:
-    the reset a broker start owes (spec 04 I32). A boot long ago leaves nothing to settle."""
-    try:
-        with open(_UPTIME) as f:
-            uptime = float(f.read().split()[0])
-    except (OSError, ValueError, IndexError):
-        return 0.0
-    # Linux's monotonic clock starts near 0 at boot; kept above 0.0, which reads as unknown.
-    return max(time.monotonic() - uptime, 1e-6)
-
-
 def _fabric_check_configured() -> bool:
     """Whether a fabric pass can run here at all: ``fabric.build_command`` is not None, read without
     the cache directories that builds as a side effect."""
