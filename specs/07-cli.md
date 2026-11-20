@@ -36,12 +36,14 @@ start` is the only supported way to bring one up.
   when no server answers. `status: "degraded"` counts as reachable — a held device leaves the
   broker up and serving. The refusal distinguishes a wedged server (its socket exists: retry /
   ask an admin to restart) from an absent one (start the broker, or `daemon start` on a reserved
-  box).
+  box; on a broker host only the broker).
 - **I3 — `daemon start` never shadows a broker.** When the system broker socket
   (`constants.DEFAULT_SOCKET`) exists and answers healthy, `daemon start` exits 0 without
   spawning anything — the CLI would prefer the broker socket, so a per-user daemon would never be
   used. When the broker socket exists but does not answer, it exits 1 and points at
   `systemctl restart tt-device-broker` rather than starting a daemon that would be shadowed.
+  When the system unit is installed but its socket is absent (broker stopped), it exits 1 and
+  points at `systemctl start tt-device-broker`; a broker host never runs a per-user daemon.
   (Skipped under `--log-dir`, the tests' isolation knob.)
 - **I4 — `run`'s exit code is the job's outcome, not the submission's.** `run` (and `wait`) exit 0
   iff the job's final status is `completed`; every other terminal status — `failed`, `timeout`,
@@ -284,7 +286,7 @@ non-zero keeps that bit honest; `exec` propagates the real exit code because a d
 | I2 (refusal without a server) | `tests/test_cli.py::test_cli_run_requires_daemon` |
 | I2 (degraded counts as reachable) | `tests/test_cli.py::test_is_daemon_running_treats_a_degraded_broker_as_reachable` |
 | I2 (wedged vs absent wording) | `tests/test_cli.py::test_server_down_message_distinguishes_wedged_from_absent` |
-| I3 | `tests/test_cli.py::test_daemon_start_refuses_on_broker_host` |
+| I3 | `tests/test_cli.py::test_daemon_start_refuses_on_broker_host`, `tests/test_cli.py::test_daemon_start_refuses_when_system_broker_installed_but_stopped` |
 | I5 | `tests/test_cli.py::test_main_bare_piped_stdin_runs_stdio_adapter`, `tests/test_cli.py::test_main_bare_tty_shows_help_not_adapter` |
 | I7 (wrapper self-enforces the allowlist) | `tests/test_cli.py::test_smi_ro_wrapper_rejects_reset_flag` |
 | I7 (lock detection never samples `by-id/`) | `tests/test_cli.py::test_device_nodes_ignores_the_by_id_directory` |

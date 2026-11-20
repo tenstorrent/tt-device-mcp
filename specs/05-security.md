@@ -98,7 +98,8 @@ that did not come through the broker at all.
   `unlock` restores world-rw and durably undoes the opt-in below: it sets `TTDEV_LOCK=0` in
   `/etc/default/tt-device-broker` (a host without the key is left alone) and strips both the
   `TT_DEVICE_MCP_DEVICE_GROUP` and `TT_DEVICE_MCP_DEVICE_LOCK` lines from the unit, so the next
-  update's re-render neither re-installs the rule nor re-flips the nodes. `lock` undoes that
+  update's re-render neither re-installs the rule nor re-flips the nodes. `unlock` restarts the
+  broker only if it is active; it never starts one that is stopped or disabled. `lock` undoes that
   in full: it adds both unit lines as the host config renders them (a line the unit or a
   drop-in already sets is not added again) and runs `daemon-reload`; it restarts the broker only
   when the group line is new or the running broker lacks it. A flip line added alone takes
@@ -363,7 +364,7 @@ job-side record to the one case with no alternative.
 | I9 (probes open no chip) | `tests/test_device_lock.py::test_lock_probes_use_access_on_every_node_and_never_open`, `tests/test_device_lock.py::test_lock_reports_unverified_when_the_probe_has_no_verdict` |
 | I9 (group must be empty) | `tests/test_device_lock.py::test_human_members_skips_system_accounts`, `tests/test_device_lock.py::test_lock_names_members_it_is_not_effective_for`, `tests/test_device_lock.py::test_check_reports_members`, `tests/test_device_lock.py::test_apply_empties_the_group_and_installs_the_rule` |
 | I9 (opt-in via host config; off leaves the host as is) | `tests/test_device_lock.py::test_lock_opt_in_renders_both_unit_lines`, `tests/test_device_lock.py::test_lock_off_renders_no_lock_lines`, `tests/test_device_lock.py::test_lock_off_preserves_an_existing_group_line`, `tests/test_device_lock.py::test_apply_runs_only_under_the_opt_in` |
-| I9 (unlock clears the opt-in; an update after it stays unlocked) | `tests/test_device_lock.py::test_unlock_clears_the_opt_in_and_both_unit_lines`, `tests/test_device_lock.py::test_unlock_leaves_a_host_without_the_opt_in_alone`, `tests/test_device_lock.py::test_an_update_after_unlock_renders_no_lock_lines` |
+| I9 (unlock clears the opt-in; an update after it stays unlocked) | `tests/test_device_lock.py::test_unlock_clears_the_opt_in_and_both_unit_lines`, `tests/test_device_lock.py::test_unlock_leaves_a_host_without_the_opt_in_alone`, `tests/test_device_lock.py::test_an_update_after_unlock_renders_no_lock_lines`, `tests/test_device_lock.py::test_unlock_restarts_only_an_active_broker` |
 | I9 (broker flips only between jobs; drift shown, never reverted) | `tests/test_device_lock.py::test_flip_waits_for_a_running_job`, `tests/test_device_lock.py::test_flip_waits_for_a_readopted_scope`, `tests/test_device_lock.py::test_flip_marks_the_lock_in_effect`, `tests/test_device_lock.py::test_flip_records_drift_once_and_never_unlocks`, `tests/test_device_lock.py::test_health_shows_drift_and_members` |
 | I9 (recovery never wrapped by privsep) | `tests/test_device_lock.py::test_privsep_wraps_no_recovery_path` |
 | I9 (repeat lock never restarts the broker) | `tests/test_cli.py::test_cmd_lock_skips_restart_when_already_locked`, `tests/test_cli.py::test_cmd_lock_skips_restart_when_a_drop_in_sets_the_group`, `tests/test_cli.py::test_cmd_lock_skips_restart_when_broker_is_stopped_and_unit_is_set`, `tests/test_cli.py::test_cmd_lock_restarts_when_it_adds_the_group`, `tests/test_cli.py::test_cmd_lock_restarts_when_live_broker_lacks_the_group` |
