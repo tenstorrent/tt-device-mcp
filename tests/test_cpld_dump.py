@@ -41,6 +41,15 @@ if a[:3] == ["sdr", "elist", "full"]:
     if os.environ.get("FAKE_SDR_FAIL"):
         print("Error: no BMC", file=sys.stderr)
         sys.exit(1)
+    if os.environ.get("FAKE_SDR_BIG"):
+        # A long listing, 12 V lines last, written through stdio as ipmitool does: block-buffered
+        # on a pipe, so a kill mid-listing loses the unflushed tail.
+        for i in range(400):
+            print("FILLER_SENSOR_%03d | 10h | ok  | 7.1 | %d RPM" % (i, i))
+        print("P12V_ADC         | 90h | ok  |  7.1 | 12.04 Volts")
+        print("P12V_AUX_ADC     | 91h | ok  |  7.1 | 12.11 Volts")
+        import time; time.sleep(60)
+        sys.exit(0)
     print("PSU0_VIN         | 70h | ok  | 10.1 | 207 Volts")
     print("PSU0_POUT        | 72h | ok  | 10.1 | 1840 Watts")
     print("P12V_UBB0        | 80h | ok  |  7.1 | 12.06 Volts")
@@ -750,6 +759,18 @@ def test_a_slow_psu_read_behind_sudo_is_killed_at_its_bound(as_user, monkeypatch
     rec = cpld_dump._read_psu(as_user["tmp"] / "psu.txt")
     assert time.monotonic() - t0 < 5 and rec.get("psu_error")
     assert not _alive(_pid(as_user, "ipmi")), "the root-side sensor read outlived its bound"
+
+
+def test_a_psu_capture_over_8192_bytes_keeps_its_last_line(as_user, monkeypatch):
+    """The sensor listing is longer than one stdio block (8192 bytes). A slow BMC makes the root-side
+    bound kill ipmitool mid-listing: the file and the event's ``psu`` list still end on the 12 V lines."""
+    monkeypatch.setenv("FAKE_SDR_BIG", "1")
+    monkeypatch.setattr(cpld_dump, "PSU_SDR_SEC", 1.0)
+    rec = cpld_dump._read_psu(as_user["tmp"] / "psu.txt")
+    text = (as_user["tmp"] / "psu.txt").read_text()
+    assert len(text) > 8192 and "\r" not in text
+    assert text.rstrip().splitlines()[-1].startswith("P12V_AUX_ADC")
+    assert [ln.split("|")[0].strip() for ln in rec["psu"]][-2:] == ["P12V_ADC", "P12V_AUX_ADC"]
 
 
 # --- An error mid-DIAG still ends it and restores the index ----------------------------------------
