@@ -421,37 +421,34 @@ def _wait_proc(p: subprocess.Popen, timeout: float, tree: _DiagTree) -> Optional
                 return None
 
 
-def _run_on_pty(argv: list[str], limit_sec: float) -> tuple[Optional[int], str, str]:
-    """Run ``argv`` with a terminal as its stdout; return ``(rc, stdout, stderr)``.
+def _run_on_pty(argv: list[str], limit_sec: float) -> tuple[Optional[int], str]:
+    """Run ``argv`` with a terminal as its stdout and stderr; return ``(rc, output)``.
 
     ipmitool block-buffers stdout on a pipe (4 KiB multiples), so the root-side ``timeout -s KILL``
-    loses the unflushed tail and the capture ends at 8192 bytes. On a terminal it writes a line at a
-    time, so what it printed before the kill is kept. ``rc`` is None when ``limit_sec`` ended the wait."""
+    loses the unflushed tail. On a terminal it writes a line at a time, so what it printed before
+    the kill is kept. ``rc`` is None when ``limit_sec`` ended the wait."""
     master, slave = pty.openpty()
     try:
         tty.setraw(slave)  # no \n -> \r\n translation
-        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=slave, stderr=subprocess.PIPE)
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=slave, stderr=slave)
     except BaseException:
         os.close(master)
         raise
     finally:
         os.close(slave)
-    err_fd = p.stderr.fileno()
-    got = {master: bytearray(), err_fd: bytearray()}
-    live = set(got)
+    got = bytearray()
     end = time.monotonic() + limit_sec
     try:
-        while live and time.monotonic() < end:
-            ready, _, _ = select.select(list(live), [], [], max(0.0, end - time.monotonic()))
-            for fd in ready:
-                try:
-                    data = os.read(fd, 65536)
-                except OSError:  # EIO: nothing holds the terminal's other side any more
-                    data = b""
-                if data:
-                    got[fd] += data
-                else:
-                    live.discard(fd)
+        while time.monotonic() < end:
+            if not select.select([master], [], [], max(0.0, end - time.monotonic()))[0]:
+                continue
+            try:
+                data = os.read(master, 65536)
+            except OSError:  # EIO: nothing holds the terminal's other side any more
+                data = b""
+            if not data:
+                break
+            got += data
         try:
             rc: Optional[int] = p.wait(timeout=max(0.0, end - time.monotonic()))
         except subprocess.TimeoutExpired:
@@ -460,24 +457,23 @@ def _run_on_pty(argv: list[str], limit_sec: float) -> tuple[Optional[int], str, 
             rc = None
     finally:
         os.close(master)
-        p.stderr.close()
-    return rc, got[master].decode(errors="replace"), got[err_fd].decode(errors="replace")
+    return rc, got.decode(errors="replace")
 
 
 def _read_psu(out: Path) -> dict:
     """Save ``ipmitool sdr elist full`` raw to ``out``; return its path and the PSU/12 V lines."""
     try:
         argv = _privileged([IPMITOOL, "sdr", "elist", "full"], PSU_SDR_SEC)
-        rc, stdout, stderr = _run_on_pty(argv, PSU_SDR_SEC + KILL_GRACE_SEC)
+        rc, output = _run_on_pty(argv, PSU_SDR_SEC + KILL_GRACE_SEC)
     except OSError as e:
         return {"psu_error": repr(e)}
-    out.write_text(stdout + stderr)
-    lines = [ln.strip() for ln in stdout.splitlines() if _PSU_LINE.search(ln.split("|")[0])]
+    out.write_text(output)
+    lines = [ln.strip() for ln in output.splitlines() if _PSU_LINE.search(ln.split("|")[0])]
     rec: dict = {"psu_path": str(out), "psu": lines[:64]}
     if rc is None:
         rec["psu_error"] = f"timed out after {PSU_SDR_SEC:.0f}s"
     elif rc != 0:
-        rec["psu_error"] = f"rc {rc}: {stderr.strip()[-120:]}"
+        rec["psu_error"] = f"rc {rc}: {output.strip()[-120:]}"
     return rec
 
 
