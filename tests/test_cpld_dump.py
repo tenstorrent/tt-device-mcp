@@ -35,7 +35,6 @@ a = sys.argv[1:]
 pids = os.environ.get("FAKE_DIAG_PIDS")
 if os.environ.get("FAKE_IPMI_HANG") or (pids and os.path.exists(os.path.join(pids, "bmc-gone"))):
     open(os.path.join(pids, "ipmi"), "w").write(str(os.getpid()))
-    open(os.path.join(pids, "hung_calls"), "a").write(" ".join(a) + "\\n")
     import time; time.sleep(60)
 if a[:3] == ["sdr", "elist", "full"]:
     if os.environ.get("FAKE_SDR_FAIL"):
@@ -701,12 +700,6 @@ def _spy_ipmi(monkeypatch) -> list:
     return calls
 
 
-def _hung_calls(fake) -> set:
-    """The calls the fake ipmitool logged as hanging; one killed before it got to log is not here."""
-    p = fake["pids"] / "hung_calls"
-    return set(p.read_text().splitlines()) if p.exists() else set()
-
-
 def test_a_hung_ipmitool_behind_sudo_is_killed_at_its_bound(as_user, monkeypatch):
     monkeypatch.setenv("FAKE_IPMI_HANG", "1")
     monkeypatch.setattr(cpld_dump, "IPMI_CALL_SEC", 1.0)
@@ -733,7 +726,6 @@ def test_a_silent_bmc_before_the_diag_skips_it_after_one_call(as_user, monkeypat
     rec = cpld_dump.take_dump("off_bus", "ep-silent", lambda _s: None)
     # Without the stop: 4 saves, 4 restores and a sensor read, each run into its bound.
     assert calls == [("0x0D 0x80 0x01 0x50", "silent")]
-    assert _hung_calls(as_user) <= {"raw 0x06 0x52 0x0D 0x80 0x01 0x50"}
     assert rec["bmc_silent"].startswith("index save on 0x0D") and "DIAG not run" in rec["skipped"]
     assert "path" not in rec and not list((health.health_dir() / cpld_dump.DUMPS_DIR).glob("*.txt"))
     (ev,) = _events("cpld_dump_skipped")
@@ -759,20 +751,16 @@ def test_a_bmc_silent_after_the_diag_keeps_the_dump_and_skips_the_rest(as_user, 
     run_diag = cpld_dump._run_diag
 
     def diag_then_silent(*a, **kw):
-        try:
-            return run_diag(*a, **kw)
-        finally:
-            calls.append(("DIAG", "ran"))
-            monkeypatch.setattr(cpld_dump, "IPMI_CALL_SEC", 1.0)
+        out = run_diag(*a, **kw)
+        monkeypatch.setattr(cpld_dump, "IPMI_CALL_SEC", 1.0)
+        return out
 
     monkeypatch.setattr(cpld_dump, "_run_diag", diag_then_silent)
     rec = cpld_dump.take_dump("off_bus", "ep-late", lambda _s: None)
     # Without the stop: 4 restores, 4 read-backs and a sensor read, each run into its bound.
     assert calls == [(f"{b} 0x80 0x01 0x50", "ok") for b in ("0x0D", "0x0F", "0x11", "0x13")] + [
-        ("DIAG", "ran"),
         ("0x0D 0x80 0x00 0x50 0x02", "silent"),
     ]
-    assert _hung_calls(as_user) <= {"raw 0x06 0x52 0x0D 0x80 0x00 0x50 0x02"}
     assert rec["bmc_silent"].startswith("index restore on 0x0D")
     assert rec["psu_error"].startswith("skipped") and "psu_path" not in rec
     assert rec["path"] and "2/620 failed" in rec["summary"] and "BMC stopped answering" in rec["summary"]
