@@ -2432,7 +2432,9 @@ async def test_one_hold_bound_tick_ends_a_readopted_preemptable_job_end_to_end(m
     monkeypatch.setattr(srv, "time", clock)
     monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
     bound = srv._hold_bound_sec()
-    monkeypatch.setattr(srv, "device_hold_episode_since", (srv.datetime.now() - srv.timedelta(seconds=bound + 30)).isoformat())
+    monkeypatch.setattr(
+        srv, "device_hold_episode_since", (srv.datetime.now() - srv.timedelta(seconds=bound + 30)).isoformat()
+    )
     monkeypatch.setattr(srv, "_hold_bound_episode", "")
     monkeypatch.setattr(srv, "_hold_bound_tenant_blocker", None)
     monkeypatch.setattr(srv, "_hold_bound_waiter_seen", None, raising=False)
@@ -2545,9 +2547,10 @@ async def test_one_hold_bound_tick_ends_a_readopted_preemptable_job_end_to_end(m
         assert job.status is srv.JobStatus.PREEMPTED
 
         await asyncio.wait_for(srv._startup_verify_task, timeout=10)
-        assert order == [("owed reset", "startup"), ("full check", "startup", True, True)], (
-            "the kill's owed reset, then the one full check, fabric included"
-        )
+        assert order == [
+            ("owed reset", "startup"),
+            ("full check", "startup", True, True),
+        ], "the kill's owed reset, then the one full check, fabric included"
         assert climbs == [] and cycles == [], "the startup gate runs before the bound's ladder"
         if check_passes:
             assert srv.fsm.state is ServerState.HEALTHY, "the passing full check lifts the hold"
@@ -2557,9 +2560,10 @@ async def test_one_hold_bound_tick_ends_a_readopted_preemptable_job_end_to_end(m
         assert srv.fsm.state is ServerState.RECOVERING, "a failed full check never lifts the hold"
         await tick()
         assert climbs == ["present-forced"], "the bound's ladder on the first tick after the failed check"
-        assert order[2:] == ["full check before the cycle", "power cycle"], (
-            "the full check after the ladder still fails: then the power cycle"
-        )
+        assert order[2:] == [
+            "full check before the cycle",
+            "power cycle",
+        ], "the full check after the ladder still fails: then the power cycle"
         assert len(cycles) == 1
         assert srv.fsm.state is ServerState.RECOVERING
     finally:

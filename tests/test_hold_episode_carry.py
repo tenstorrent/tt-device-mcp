@@ -1172,11 +1172,12 @@ def _kill_reset_hold(monkeypatch, job_id="494"):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("how", ["kill", "preempt"])
 async def test_replay_an_owner_stop_of_the_first_job_after_a_verified_release_starts_a_fresh_episode(
-    runner_env, monkeypatch, tmp_path, how
+    runner_env, monkeypatch, tmp_path, how  # noqa: F811
 ):
     """A Galaxy host: a hold was released on a full check whose fabric pass found every cabled link, no bound ladder
     run. Its owner killed the next job within the carry window, no fault on record. The kill-reset hold after it must
-    start at its own start, so its fast path (one reset, then the full check) runs, not the old episode's full ladder."""
+    start at its own start, so its fast path (one reset, then the full check) runs, not the old episode's full ladder.
+    """
     old = _verified_carry(monkeypatch, tmp_path)
     job = await _first_job_stopped(how)
     assert job.status in (srv.JobStatus.KILLED, srv.JobStatus.PREEMPTED)
@@ -1188,7 +1189,7 @@ async def test_replay_an_owner_stop_of_the_first_job_after_a_verified_release_st
 
 
 @pytest.mark.asyncio
-async def test_a_first_job_that_ran_out_its_own_time_keeps_the_episode(runner_env, monkeypatch, tmp_path):
+async def test_a_first_job_that_ran_out_its_own_time_keeps_the_episode(runner_env, monkeypatch, tmp_path):  # noqa: F811
     """A job's own timeout is no owner stop: a job that hung may have hung on the device, so the hold after it
     continues the released episode."""
     old = _verified_carry(monkeypatch, tmp_path)
@@ -1200,7 +1201,9 @@ async def test_a_first_job_that_ran_out_its_own_time_keeps_the_episode(runner_en
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("how", ["fault in its log", "fault while it ran"])
-async def test_a_killed_first_job_with_device_evidence_against_it_keeps_the_episode(runner_env, monkeypatch, tmp_path, how):
+async def test_a_killed_first_job_with_device_evidence_against_it_keeps_the_episode(
+    runner_env, monkeypatch, tmp_path, how  # noqa: F811
+):
     """A kill proves nothing only on a clean device: a job whose log names a device fault, or a fault some check found
     while it ran, failed on the release, so the hold after it continues the released episode."""
     old = _verified_carry(monkeypatch, tmp_path)
@@ -1237,7 +1240,7 @@ async def _neutral_kill_hold(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_a_kill_reset_hold_that_turns_into_a_device_fault_takes_the_carry_then_the_power_cycle(
-    runner_env, monkeypatch, tmp_path
+    runner_env, monkeypatch, tmp_path  # noqa: F811
 ):
     """The kill-reset hold only defers the carry: once its check finds a device fault, the hold continues the
     released episode, past the bound here, so the full ladder runs at once and a full check that still fails asks for
@@ -1263,7 +1266,9 @@ async def test_a_kill_reset_hold_that_turns_into_a_device_fault_takes_the_carry_
 
 
 @pytest.mark.asyncio
-async def test_a_kill_reset_hold_naming_only_the_kill_keeps_its_own_clock_at_a_tick(runner_env, monkeypatch, tmp_path):
+async def test_a_kill_reset_hold_naming_only_the_kill_keeps_its_own_clock_at_a_tick(
+    runner_env, monkeypatch, tmp_path  # noqa: F811
+):
     await _neutral_kill_hold(monkeypatch, tmp_path)
     own = srv.device_hold_episode_since
     escalations, _alerts, events = _arm_fabric_only_deadline_hold(
@@ -1278,13 +1283,13 @@ async def test_a_kill_reset_hold_naming_only_the_kill_keeps_its_own_clock_at_a_t
 
 @pytest.mark.asyncio
 async def test_a_kill_reset_hold_lifts_only_on_a_full_check_pass_and_starts_the_next_carry_at_its_own_start(
-    runner_env, monkeypatch, tmp_path
+    runner_env, monkeypatch, tmp_path  # noqa: F811
 ):
     """The fresh clock adds no lift path: the post-job gate keeps the hold on a fabric check that counts fewer links
     than the cabling expects, and only a full pass, fabric included, releases it. The carry that release saves is the
     kill-reset hold's own episode."""
-    from tests.test_boot_fabric_reverify import _FABRIC_OK, _broker
     from tests.conftest import patch_recovery
+    from tests.test_boot_fabric_reverify import _FABRIC_OK, _broker
     from tests.test_device_safety import _ledger_dir
 
     await _neutral_kill_hold(monkeypatch, tmp_path)
