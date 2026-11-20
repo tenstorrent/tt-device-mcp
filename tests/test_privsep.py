@@ -15,13 +15,28 @@ def test_systemd_run_prefix_cooperative_keeps_user_gid():
     assert "-p" not in argv
 
 
-def test_systemd_run_prefix_lockdown_uses_device_gid():
-    # Lockdown: run with the device group as primary gid (DAC opens the 0660 node);
-    # no -p properties (older systemd-run rejects them on a scope).
-    argv = privsep.systemd_run_prefix(uid=1000, gid=1000, device_group="ttdev")
-    assert "--uid=1000" in argv and "--gid=ttdev" in argv
-    assert "--gid=1000" not in argv
-    assert "-p" not in argv
+def test_systemd_run_prefix_lockdown_uses_device_gid_and_keeps_groups():
+    # Lockdown: the device group is the primary gid (DAC opens the 0660 node) and the submitter's
+    # supplementary groups survive. A scope rejects -p SupplementaryGroups and systemd-run --uid
+    # clears the groups, so setpriv does the drop.
+    argv = privsep.systemd_run_prefix(uid=1000, gid=1000, device_group="ttdev", unit="u.scope", groups=[27, 1000, 1500])
+    assert argv[:5] == ["systemd-run", "--scope", "--quiet", "--collect", "--unit=u.scope"]
+    assert argv[5:] == ["--", "setpriv", "--reuid=1000", "--regid=ttdev", "--groups=27,1000,1500"]
+    assert "-p" not in argv and "--uid=1000" not in argv
+
+
+def test_lockdown_prefix_for_passes_the_submitters_groups(monkeypatch):
+    monkeypatch.setattr(privsep, "should_privsep", lambda env=None: True)
+    monkeypatch.setattr(privsep, "_gid_for_uid", lambda uid: 1000)
+    monkeypatch.setattr(privsep, "_groups_for_uid", lambda uid: [27, 1000])
+    argv = privsep.privsep_prefix_for(1000, env={"TT_DEVICE_MCP_DEVICE_GROUP": "ttdev"})
+    assert argv[-1] == "--groups=27,1000"
+
+
+def test_groups_for_uid_includes_primary_and_supplementary(monkeypatch):
+    monkeypatch.setattr(privsep.pwd, "getpwuid", lambda uid: type("P", (), {"pw_name": "u", "pw_gid": 1000})())
+    monkeypatch.setattr(privsep.os, "getgrouplist", lambda name, gid: [1000, 27, 27, 44])
+    assert privsep._groups_for_uid(1000) == [27, 44, 1000]
 
 
 def test_privsep_enabled_flag(monkeypatch):
@@ -84,7 +99,7 @@ def test_lockdown_uses_device_gid_via_env(monkeypatch):
     env = {"TT_DEVICE_MCP_PRIVSEP": "1", "TT_DEVICE_MCP_DEVICE_GROUP": "ttdev"}
     _enable(monkeypatch)
     prefix = privsep.privsep_prefix_for(1234, env=env)
-    assert "--uid=1234" in prefix and "--gid=ttdev" in prefix
+    assert "--reuid=1234" in prefix and "--regid=ttdev" in prefix
 
 
 def test_privsep_refusal_none_when_inactive():

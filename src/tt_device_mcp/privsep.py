@@ -22,7 +22,7 @@ import logging
 import os
 import pwd
 import shutil
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 logger = logging.getLogger("tt-device-mcp")
 
@@ -65,12 +65,22 @@ def _gid_for_uid(uid: int) -> Optional[int]:
         return None
 
 
+def _groups_for_uid(uid: int) -> List[int]:
+    """The submitter's group ids: its primary gid plus every supplementary group."""
+    try:
+        pw = pwd.getpwuid(uid)
+    except KeyError:
+        return []
+    return sorted(set(os.getgrouplist(pw.pw_name, pw.pw_gid)))
+
+
 def systemd_run_prefix(
     *,
     uid: int,
     gid: int,
     device_group: Optional[str] = None,
     unit: Optional[str] = None,
+    groups: Optional[Sequence[int]] = None,
 ) -> List[str]:
     """Build the ``systemd-run`` argv that runs a job as ``uid``.
 
@@ -84,19 +94,24 @@ def systemd_run_prefix(
     by the udev rule): the job runs with ``device_group`` as its **primary gid** so
     DAC lets it open the node, while interactive shells (other gid) are denied.
 
-    We use ``--gid`` rather than ``-p SupplementaryGroups``/``DevicePolicy``: older
-    systemd-run rejects transient ``-p`` properties on a scope, and plain DAC via
-    the gid is sufficient for the lock.
+    A scope rejects ``-p SupplementaryGroups`` (it has no exec context), and
+    ``systemd-run --uid/--gid`` clears the supplementary groups. So in lockdown the
+    scope runs ``setpriv`` as root, which drops to the submitter with ``device_group``
+    as primary gid and the submitter's own ``groups`` kept (default: just ``gid``).
+    Cooperative mode keeps ``--uid/--gid``.
     """
-    job_gid = device_group if device_group else gid
     argv = [
         "systemd-run",
         "--scope",
         "--quiet",
         "--collect",  # GC the transient unit even if the job exits non-zero
-        f"--uid={uid}",
-        f"--gid={job_gid}",
     ]
+    if device_group:
+        if unit is not None:
+            argv.append(f"--unit={unit}")
+        kept = ",".join(str(g) for g in (groups or [gid]))
+        return [*argv, "--", "setpriv", f"--reuid={uid}", f"--regid={device_group}", f"--groups={kept}"]
+    argv += [f"--uid={uid}", f"--gid={gid}"]
     if unit is not None:
         argv.append(f"--unit={unit}")
     return argv
@@ -128,7 +143,9 @@ def privsep_prefix_for(peer_uid: Optional[int], *, env=None, unit: Optional[str]
         return None
     env = os.environ if env is None else env
     device_group = env.get("TT_DEVICE_MCP_DEVICE_GROUP") or None
-    return systemd_run_prefix(uid=peer_uid, gid=gid, device_group=device_group, unit=unit)
+    return systemd_run_prefix(
+        uid=peer_uid, gid=gid, device_group=device_group, unit=unit, groups=_groups_for_uid(peer_uid)
+    )
 
 
 def privsep_refusal(peer_uid: Optional[int], *, env=None) -> Optional[str]:

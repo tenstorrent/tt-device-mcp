@@ -111,7 +111,7 @@ that did not come through the broker at all.
   update path's `apply-host-config.sh` install the rule (reload only), render the unit's
   `TT_DEVICE_MCP_DEVICE_GROUP=ttdev` and `TT_DEVICE_MCP_DEVICE_LOCK=1` lines (taken up by the
   update's own restart, never an extra one), keep the read-only smi wrapper, and remove each
-  uid ≥ 1000 member from `ttdev` (jobs get the gid through `--gid`, so none needs membership).
+  uid ≥ 1000 member from `ttdev` (jobs get the gid through `setpriv --regid`, so none needs membership).
   The mode flip itself (`udevadm trigger --subsystem-match=tenstorrent`) is the broker's, run only
   while no job is running and no re-adopted scope is live: a job started before the restart
   still carries its old gid and would get EACCES on its next open. `TTDEV_LOCK` unset or `0`
@@ -157,7 +157,9 @@ Consumed by other subsystems and by tests:
 - **`privsep.py`** (consumed by the job runner and `_exec_impl`):
   `privsep_enabled(env)` — the opt-in flag alone; `should_privsep(env)` — flag ∧ root ∧
   systemd-run; `systemd_run_prefix(uid, gid, device_group, unit)` — pure argv builder
-  (`systemd-run --scope --quiet --collect --uid=<uid> --gid=<gid> [--unit=<name>]`);
+  (cooperative: `systemd-run --scope --quiet --collect --uid=<uid> --gid=<gid> [--unit=<name>]`;
+  lockdown: `systemd-run --scope --quiet --collect [--unit=<name>] -- setpriv --reuid=<uid>
+  --regid=<device group> --groups=<submitter's groups>`);
   `privsep_prefix_for(peer_uid, env, unit) -> list | None` — the prefix, or `None` meaning "run
   directly" (privsep off, no peer, caller is root, or no passwd entry);
   `privsep_refusal(peer_uid, env) -> str | None` — the refusal reason when `None` from
@@ -308,9 +310,12 @@ and exec check it independently of the transport guard.
 host, one bare-metal `tt-smi` or stray pytest opens the device under a running job and wedges the
 mesh (spec 03/04 exist because of exactly this). The lock moves enforcement from convention to the
 kernel: DAC on the device node denies any process not admitted through a broker scope. Group-based
-DAC via the job's primary gid was chosen over systemd `DevicePolicy`/`SupplementaryGroups`
-properties because older `systemd-run` rejects transient `-p` properties on a scope, and plain DAC
-suffices. The self-checks exist because a lock that silently fails open is worse than no lock: it
+DAC via the job's primary gid was chosen over systemd `DevicePolicy` properties because a
+scope rejects transient `-p` exec properties (`SupplementaryGroups` included: a scope has no exec
+context), and plain DAC suffices. `systemd-run --uid/--gid` also clears the submitter's
+supplementary groups, so a lockdown job is launched through `setpriv`, which sets the device group
+as primary gid and keeps the submitter's own groups (`--groups`). A container a job starts does not
+inherit them: it needs `--group-add` for any group it must keep. The self-checks exist because a lock that silently fails open is worse than no lock: it
 converts "unprotected" into "believed protected".
 
 **Why `MIN_TENANT_UID`.** System uids (< 1000) belong to infrastructure that legitimately holds
@@ -373,5 +378,5 @@ job-side record to the one case with no alternative.
 | I10 (streaming smi allowlist) | `tests/test_reset.py::test_smi_args_ok_allows_readonly_rejects_reset` |
 | I11 (anonymous fails closed) | `tests/test_reset.py::test_privsep_http_reset_refuses_over_a_foreign_holder`, `tests/test_reset.py::test_privsep_http_reset_allows_a_provably_idle_device`, `tests/test_reset.py::test_non_privsep_http_reset_keeps_the_legacy_skip`, `tests/test_reset.py::test_privsep_streaming_reset_refuses_over_a_foreign_holder` |
 | I11 (tenant boundary) | `tests/test_reset_gate.py::TestForeignHolders::test_ignores_system_holders`, `tests/test_reset_gate.py::TestForeignHolders::test_foreign_holders_filters_caller` |
-| B-Privsep launch (gid modes) | `tests/test_privsep.py::test_systemd_run_prefix_cooperative_keeps_user_gid`, `tests/test_privsep.py::test_systemd_run_prefix_lockdown_uses_device_gid`, `tests/test_privsep.py::test_cooperative_mode_keeps_user_gid`, `tests/test_privsep.py::test_lockdown_uses_device_gid_via_env` |
+| B-Privsep launch (gid modes) | `tests/test_privsep.py::test_systemd_run_prefix_cooperative_keeps_user_gid`, `tests/test_privsep.py::test_systemd_run_prefix_lockdown_uses_device_gid_and_keeps_groups`, `tests/test_privsep.py::test_lockdown_prefix_for_passes_the_submitters_groups`, `tests/test_privsep.py::test_groups_for_uid_includes_primary_and_supplementary`, `tests/test_privsep.py::test_cooperative_mode_keeps_user_gid`, `tests/test_privsep.py::test_lockdown_uses_device_gid_via_env` |
 | B-Kill (scope-aware terminate) | `tests/test_reset.py::test_a_live_privsep_kill_signals_the_scope_not_the_pgroup`, `tests/test_reset.py::test_terminate_job_falls_back_to_killpg_without_a_scope` |
