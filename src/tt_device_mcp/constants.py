@@ -5,14 +5,33 @@
 
 import math
 import os
+import re
 from pathlib import Path
 
 DEFAULT_PORT = 8333  # default --port for the legacy HTTP transport; the socket-based broker never binds it
 SERVICE_NAME = "tt-device-mcp"
 
+# The job-log name, `<YYYY-MM-DD_HHMMSS>_<id>.log`, stated once (spec 01 Behavior). Every reader of
+# the log dir selects job logs by exactly this pattern — never by `*.log` minus `server.log` — so
+# the deploy-script logs and any underscore-bearing near-miss (`foo_123.log`, a `.log.bak`) are
+# nobody's job record. Group 1 is the job id. ASCII digits only: the broker names logs with
+# strftime, and `\d` would also take other scripts' digits. The age-out in
+# deploy/tt-device-reconcile.sh (4b) carries the same pattern in shell (spec 08);
+# tests/test_deploy_log_files.py fails if the two drift.
+JOB_LOG_NAME_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}_([0-9A-Za-z-]+)\.log$")
+
 # Canonical host broker socket (root, multi-tenant). Present → clients use it
 # automatically; override with TT_DEVICE_MCP_SOCKET.
 DEFAULT_SOCKET = "/run/tt-device-broker/broker.sock"
+
+# The system broker's two state trees (spec 06 path matrix). Both are brought to mode 0755 on
+# every broker start when the resolved log dir / health dir IS one of these — a path-equality
+# predicate like ensure_job_exit_dir's, never the euid — so a redirected or per-user base is
+# never chmod'ed at its root (spec 06 I9). Constants rather than literals so a test can point
+# them at a temp tree that stands in for the system defaults.
+SYSTEM_LOG_DIR = "/var/log/tt-device-broker"
+SYSTEM_STATE_DIR = "/var/lib/tt-device-broker"
+SYSTEM_HEALTH_DIR = f"{SYSTEM_STATE_DIR}/health"
 JOB_RETENTION_SEC = 300  # 5 minutes - grace period before removing finished jobs from memory
 STATS_UPDATE_SEC = 30  # How often to persist stats to disk
 

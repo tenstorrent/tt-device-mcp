@@ -75,6 +75,7 @@ from tt_device_mcp.constants import (
     HUNG_SIGINT_GRACE_SEC,
     HUNG_SILENCE_MAX_SEC,
     HUNG_SILENCE_MIN_SEC,
+    JOB_LOG_NAME_RE,
     JOB_RETENTION_SEC,
     POST_KILL_POLL_SEC,
     POST_KILL_REAP_WAIT_SEC,
@@ -95,9 +96,13 @@ from tt_device_mcp.constants import (
     STAGE_SMI_RESET,
     STATS_UPDATE_SEC,
     SURVIVOR_KILL_WAIT_SEC,
+    SYSTEM_HEALTH_DIR,
+    SYSTEM_LOG_DIR,
     pre_reset_zombie_ladder_reserve_sec,
 )
 from tt_device_mcp.constants import step_deadline_sec as _shared_step_deadline_sec
+from tt_device_mcp.log_setup import setup_logging
+from tt_device_mcp.utils import open_readable, readable_mkdir, write_text_readable
 
 # Device node directory; module-level so tests can point it at a fixture dir.
 TT_DEV_DIR = "/dev/tenstorrent"
@@ -272,6 +277,7 @@ from tt_device_mcp.pre_reset_scan import (
 )
 from tt_device_mcp.privsep import privsep_enabled, privsep_prefix_for, privsep_refusal, should_privsep
 from tt_device_mcp.socket_transport import (
+    UVICORN_LOGGING,
     PeerCredMiddleware,
     current_peer_uid,
     current_via_mcp,
@@ -800,49 +806,6 @@ class Stats:
                 "total": round(self.wait_total, 1),
             },
         }
-
-
-# Setup logging
-try:
-    from zoneinfo import ZoneInfo
-
-    _PACIFIC = ZoneInfo("America/Los_Angeles")
-except Exception:  # tzdata missing — degrade to UTC-only rather than crash logging
-    _PACIFIC = None
-
-
-class _DualTZFormatter(logging.Formatter):
-    """Stamp each record with both UTC and Pacific wall-clock so logs are readable
-    by a UTC host and a Pacific reader without mental conversion, e.g.
-    ``2026-06-11 15:25:04 UTC / 08:25:04 PDT``."""
-
-    def formatTime(self, record, datefmt=None):  # noqa: ARG002 - datefmt unused by design
-        dt = datetime.fromtimestamp(record.created, tz=timezone.utc)
-        utc = dt.strftime("%Y-%m-%d %H:%M:%S")
-        if _PACIFIC is None:
-            return f"{utc} UTC"
-        return f"{utc} UTC / {dt.astimezone(_PACIFIC).strftime('%H:%M:%S %Z')}"
-
-
-def setup_logging(log_file: Path) -> logging.Logger:
-    """Configure file-based logging."""
-    root = logging.getLogger()
-    root.handlers.clear()
-
-    formatter = _DualTZFormatter(fmt="%(asctime)s | %(levelname)-5s | %(message)s")
-
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setFormatter(formatter)
-
-    root.setLevel(logging.INFO)
-    root.addHandler(file_handler)
-
-    logger = logging.getLogger("tt-device-mcp")
-    logger.setLevel(logging.DEBUG)
-    logger.propagate = False
-    logger.addHandler(file_handler)
-
-    return logger
 
 
 class JobStatus(Enum):
@@ -1431,8 +1394,8 @@ def _persist_hold_episode(since: str, *, tenant: bool = False, startup: bool = F
             rec = {"since": since, "boot_id": _current_boot_id()}
             if _hold_episode_startup:
                 rec["startup"] = True
-            record.write_text(json.dumps(rec))
-            path.write_text(since)
+            write_text_readable(record, json.dumps(rec))
+            write_text_readable(path, since)
         else:
             path.unlink(missing_ok=True)
             record.unlink(missing_ok=True)
@@ -1546,7 +1509,7 @@ def _write_hold_carry() -> None:
     path = health_dir() / HOLD_CARRY_FILE
     try:
         if _hold_carry:
-            path.write_text(json.dumps(_hold_carry))
+            write_text_readable(path, json.dumps(_hold_carry))
         else:
             path.unlink(missing_ok=True)
     except OSError:
@@ -1710,7 +1673,7 @@ def _record_hold_bound_ladder() -> None:
         if isinstance(rec, dict) and rec.get("since") == device_hold_episode_since:
             rec["bound_ladder_age"] = _hold_bound_ladder_age
             rec["bound_ladder_early"] = _hold_bound_early
-            path.write_text(json.dumps(rec))
+            write_text_readable(path, json.dumps(rec))
     except (OSError, ValueError):
         pass
 
@@ -2021,6 +1984,30 @@ def ensure_job_exit_dir() -> None:
         pass
 
 
+def _open_system_log_root(log_dir: Path) -> None:
+    """Bring the log tree's root to 0755 when it is the system default (spec 06 I9).
+
+    The predicate is path equality against the path matrix's default, as ensure_job_exit_dir's
+    is — never the euid — so `sudo python -m tt_device_mcp.server` from a checkout widens nothing
+    under the checkout, and a redirected `--log-dir` or a per-user base (0700, spec 06 I6) is
+    never chmod'ed at its root. Deliberately not the readable_dir helper: that never raises, the
+    right contract for a file the broker can live without. A root it cannot open to its readers
+    is not one — this raises, and main() fails the start exactly as it does for a root it could
+    not create."""
+    if log_dir == Path(SYSTEM_LOG_DIR):
+        os.chmod(log_dir, 0o755)
+
+
+def _open_system_health_roots(hd: Path) -> None:
+    """The state tree's two roots — `/var/lib/tt-device-broker` and its `health/` — to 0755 when
+    the health dir is the system default; same predicate and same raising contract as
+    _open_system_log_root. Caller is the I7 preflight, which turns the OSError into a failure with
+    health checks on and a warning with them off."""
+    if hd == Path(SYSTEM_HEALTH_DIR):
+        os.chmod(hd.parent, 0o755)
+        os.chmod(hd, 0o755)
+
+
 def prepare_job_exit_file(job_id: str, uid: Optional[int] = None) -> bool:
     """Give a job about to start a fresh, empty exit file its own uid can write (spec 01 I8).
 
@@ -2258,7 +2245,7 @@ async def _wait_out_dispatch_hold(job: "Job", job_log_file: Optional[Path]) -> b
     health_event("dispatch_hold_wait", job_id=job.id, holder=holder)
     if job_log_file:
         try:
-            with open(job_log_file, "a") as f:
+            with open_readable(job_log_file, "a") as f:
                 f.write("[waiting: the broker is about to update and restart; this job starts after it]\n")
         except OSError:
             pass
@@ -3013,7 +3000,7 @@ def get_activation_script(
 
 def append_job_log(job_log_file: Path, stream: str, text: str):
     """Append a line to the job log file."""
-    with open(job_log_file, "a") as f:
+    with open_readable(job_log_file, "a") as f:
         timestamp = datetime.now().strftime("%H:%M:%S")
         f.write(f"[{timestamp}] [{stream}] {text}")
 
@@ -3096,7 +3083,7 @@ def job_activity_view(job_id: Optional[str]) -> Optional[dict]:
 
 def write_job_log_footer(job_log_file: Path, job: Job):
     """Write job completion footer to the job log file."""
-    with open(job_log_file, "a") as f:
+    with open_readable(job_log_file, "a") as f:
         f.write("\n" + "=" * 70 + "\n")
         f.write(f"FINISHED:    {job.finished_at}\n")
         f.write(f"STATUS:      {job.status.value}\n")
@@ -3130,9 +3117,27 @@ def write_cancelled_job_log_footer(job_log_file: Path, job: Job, requested_by: s
     """End a job cancelled while queued with the same footer every finished job gets, STATUS:
     killed (its JobStatus, as the job-status API and the outcome metric report it), after a
     marker naming who cancelled it, so the recent list and the log say what the API says."""
-    with open(job_log_file, "a") as f:
+    with open_readable(job_log_file, "a") as f:
         f.write(f"{CANCELLED_QUEUED_MARKER} cancelled by {requested_by}\n")
     write_job_log_footer(job_log_file, job)
+
+
+def _job_log_files() -> list[Path]:
+    """Every job log in the log dir, newest name first (name order is time order).
+
+    Selection is by the job-log name pattern alone (spec 01): `server.log`, the deploy-script
+    logs and an underscore-bearing near-miss (`foo_123.log`, a `.log.bak`, a rotated `.log.1.gz`)
+    are nobody's job record, so no reader — the history, the id seed, the recent-id exclusion, the
+    pre-down row consumer that deletes what it matches, the re-adoption lookup — ever sees one.
+    An unreadable log dir reads as empty, as a missing one always has."""
+    if not job_log_dir:
+        return []
+    try:
+        with os.scandir(job_log_dir) as it:
+            names = sorted((e.name for e in it if JOB_LOG_NAME_RE.match(e.name)), reverse=True)
+    except OSError:
+        return []
+    return [Path(job_log_dir) / n for n in names]
 
 
 def seed_job_counter() -> None:
@@ -3143,8 +3148,8 @@ def seed_job_counter() -> None:
     global job_counter
     if not job_log_dir:
         return
-    for name in sorted((p.name for p in Path(job_log_dir).glob("*.log")), reverse=True):
-        m = re.search(r"_(\d{3})\.log$", name)
+    for p in _job_log_files():
+        m = re.search(r"_(\d{3})\.log$", p.name)
         if m:
             job_counter = int(m.group(1)) % JOB_ID_MODULUS
             return
@@ -3170,12 +3175,7 @@ def recent_log_ids() -> frozenset[str]:
     the thing that gets asked."""
     if not job_log_dir:
         return frozenset()
-    try:
-        with os.scandir(job_log_dir) as it:
-            names = sorted((e.name for e in it if e.name.endswith(".log")), reverse=True)
-    except OSError:
-        return frozenset()
-    found = (re.search(r"_(\d{3})\.log$", n) for n in names[:JOB_ID_RECENT_WINDOW])
+    found = (re.search(r"_(\d{3})\.log$", p.name) for p in _job_log_files()[:JOB_ID_RECENT_WINDOW])
     return frozenset(m.group(1) for m in found if m)
 
 
@@ -3218,7 +3218,7 @@ def _write_action_log_file(
     now = datetime.now()
     try:
         log_file = Path(job_log_dir) / f"{started.strftime('%Y-%m-%d_%H%M%S')}_{aid}.log"
-        with open(log_file, "w") as f:
+        with open_readable(log_file, "w") as f:
             f.write("=" * 70 + "\n")
             f.write(f"JOB ID:      {aid}\nOWNER:       {owner}\nCOMMAND:     {command}\n")
             # QUEUED == started: an action waits for nothing, so its wait is zero, not the
@@ -3252,7 +3252,7 @@ def _begin_action_row(owner: str, command: str) -> None:
     _action_row = {"id": aid, "started_at": started.isoformat(), "owner": owner, "command": command}
     try:
         log_file = Path(job_log_dir) / f"{started.strftime('%Y-%m-%d_%H%M%S')}_{aid}.log"
-        with open(log_file, "w") as f:
+        with open_readable(log_file, "w") as f:
             f.write("=" * 70 + "\n")
             f.write(f"JOB ID:      {aid}\nOWNER:       {owner}\nCOMMAND:     {command}\n")
             f.write(f"QUEUED:      {started.isoformat()}\n" + "=" * 70 + "\n")
@@ -6724,9 +6724,7 @@ def _consume_pre_down_escalation_row(action: str) -> None:
     if not job_log_dir:
         return
     owner = f"[broker]{action}-request"
-    for p in sorted(
-        (q for q in Path(job_log_dir).glob("*.log") if q.name != "server.log"), key=lambda q: q.name, reverse=True
-    ):
+    for p in _job_log_files():
         try:
             with open(p, errors="replace") as fh:
                 head = [next(fh, "") for _ in range(6)]
@@ -6866,8 +6864,8 @@ def _record_previous_boot_error() -> None:
     if boot_id:
         mark_boot(boot_id)
     try:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(datetime.now().isoformat())
+        readable_mkdir(marker.parent)
+        write_text_readable(marker, datetime.now().isoformat())
         # One marker per boot; the old ones are noise.
         for old in health_dir().glob(".boot_recorded_*"):
             if old != marker:
@@ -6954,7 +6952,7 @@ def _note_poller_to_restore(svc: str, owed: bool) -> None:
     path = health_dir() / POLLERS_TO_RESTORE_FILE
     try:
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(sorted(record)))
+        write_text_readable(tmp, json.dumps(sorted(record)))
         os.replace(tmp, path)
     except OSError:
         pass  # never let bookkeeping break a reset; the record in memory still holds
@@ -11683,7 +11681,7 @@ def _write_dead_chip_stuck() -> None:
             ],
         }
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(record))
+        write_text_readable(tmp, json.dumps(record))
         os.replace(tmp, path)
     except OSError as e:
         if logger:
@@ -12005,7 +12003,7 @@ async def _refuse_job_on_degraded_device(
     # history reads back — so a job that never ran does not read as one that vanished.
     if job_log_file:
         try:
-            with open(job_log_file, "a") as f:
+            with open_readable(job_log_file, "a") as f:
                 f.write(
                     f"\n[REFUSED at {job.finished_at}] {label} — {reason}\n"
                     f"The broker did not dispatch this job: {advice}\n"
@@ -12037,7 +12035,7 @@ async def _refuse_job_privsep_identity(job: "Job", job_log_file: Optional[Path],
     _forget_queued_job(job.id)  # refused is terminal: a restart must not revive it
     if job_log_file:
         try:
-            with open(job_log_file, "a") as f:
+            with open_readable(job_log_file, "a") as f:
                 f.write(
                     f"\n[REFUSED at {job.finished_at}] {reason}\n"
                     f"The broker did not dispatch this job: with privsep active it must run "
@@ -12089,7 +12087,7 @@ async def _refuse_job_output_dirs(job: "Job", job_log_file: Optional[Path], prob
                 stats.record_job_completion(job.status, job.wait_sec, job.runtime_sec)
         _forget_queued_job(job.id)  # refused is terminal: a restart must not revive it
         if job_log_file:
-            with open(job_log_file, "a") as f:
+            with open_readable(job_log_file, "a") as f:
                 f.write(
                     f"\n[REFUSED at {job.finished_at}] job setup: tt-metal output dir not writable "
                     f"by the job's user:\n"
@@ -12267,7 +12265,7 @@ async def _hold_job_until_device_fit(job: "Job", job_log_file: Optional[Path], r
         )
     if job_log_file:
         try:
-            with open(job_log_file, "a") as f:
+            with open_readable(job_log_file, "a") as f:
                 f.write(
                     f"[HELD] device degraded — {reason}\n"
                     f"The broker is holding this job until the device is fit; it dispatches "
@@ -12785,11 +12783,7 @@ def _recent_jobs(limit: int = 20, files: Optional[list[Path]] = None) -> list[di
         # and with a deep queue the order jobs were queued in is not the order they ran in — a
         # job queued long ago may have started moments ago, and the reset it provoked runs
         # between it and the next job. Taking the newest `limit` names would drop exactly those.
-        files = sorted(
-            (p for p in Path(job_log_dir).glob("*.log") if p.name != "server.log"),
-            key=lambda p: p.name,
-            reverse=True,
-        )[: max(limit * 4, 60)]
+        files = _job_log_files()[: max(limit * 4, 60)]
 
     # Snapshot the in-memory queue (id -> Job) — the source of truth for what is
     # actually running/queued right now, independent of the durable log footer.
@@ -13114,7 +13108,7 @@ def save_stats():
 def _write_stats(body: dict, path: Path, folder: Path) -> None:
     """The file I/O of :func:`save_stats`, safe on a worker thread: ``body`` is a snapshot."""
     # Write stats file
-    with open(path, "w") as f:
+    with open_readable(path, "w") as f:
         json.dump(body, f, indent=2)
 
     # Update 'current' symlink
@@ -13278,10 +13272,9 @@ def _job_from_log(job_id: str) -> Optional["Job"]:
     """Reconstruct a minimal Job from its persisted log header, for re-adoption."""
     if not job_log_dir:
         return None
-    matches = sorted(Path(job_log_dir).glob(f"*_{job_id}.log"))
-    if not matches:
+    path = find_job_log(job_log_dir, job_id)
+    if path is None:
         return None
-    path = matches[-1]
     hdr, started, first, peer_uid = {}, None, [], None
     try:
         with open(path, errors="replace") as fh:
@@ -13545,7 +13538,7 @@ async def _monitor_readopted_scope(job_id: str, scope: str):
                 # Its line names the reset (spec 01 I70), whatever else the job's error holds.
                 if job_log and not recovery_noted:
                     try:
-                        with open(job_log, "a") as f:
+                        with open_readable(job_log, "a") as f:
                             f.write(f"\n{RESET_KILL_MARKER} {READOPTED_RESET_KILLED_ERROR}\n")
                     except OSError:
                         pass
@@ -13588,7 +13581,7 @@ async def _follow_job_spool(job: "Job", done: Callable[[], bool]) -> None:
             tails.append((name, SpoolTail(paths[name], done, start[name])))
         if job.log_file:
             try:
-                log_fh = open(job.log_file, "a", buffering=1)
+                log_fh = open_readable(job.log_file, "a", buffering=1)
             except OSError:
                 log_fh = None
 
@@ -13630,12 +13623,12 @@ def _salvage_job_spool(job_id: str) -> None:
     tail = read_unread_tail(job_id)
     if not tail or not job_log_dir:
         return
-    matches = sorted(Path(job_log_dir).glob(f"*_{job_id}.log"))
-    if not matches:
+    path = find_job_log(job_log_dir, job_id)
+    if path is None:
         return
     stamp = datetime.now().strftime("%H:%M:%S")
     try:
-        with open(matches[-1], "a") as fh:
+        with open_readable(path, "a") as fh:
             for name, (skipped, data) in tail.items():
                 dropped = f"; its first {skipped} uncopied bytes were dropped" if skipped else ""
                 fh.write(f"[{stamp}] [broker] {name} the job wrote while no broker ran, copied at startup{dropped}\n")
@@ -13795,7 +13788,7 @@ def _pass_hold_for_verification(job: "Job", job_log_file: Optional[Path], reason
         )
     if job_log_file:
         try:
-            with open(job_log_file, "a") as f:
+            with open_readable(job_log_file, "a") as f:
                 f.write(
                     f"[VERIFICATION] the device is held fabric_unverified ({reason}); this operator "
                     f"{job.verification} check runs through the hold, which stays open until a "
@@ -14176,7 +14169,7 @@ async def _job_runner_loop():
             # full log disk must not fail the job before it starts.
             if job_log_file:
                 try:
-                    with open(job_log_file, "a") as f:
+                    with open_readable(job_log_file, "a") as f:
                         f.write(f"[Started at {job.started_at}]\n\n")
                 except OSError as e:
                     if logger:
@@ -14271,7 +14264,7 @@ export {JOB_TAG_ENV}={job_tag}
             log_fh = None
             if job_log_file:
                 try:
-                    log_fh = open(job_log_file, "a", buffering=1)
+                    log_fh = open_readable(job_log_file, "a", buffering=1)
                 except OSError as e:
                     if logger:
                         logger.warning(f"JOB_RUNNER job_id={job_id} cannot open its log, output kept in memory: {e}")
@@ -14742,7 +14735,7 @@ export {JOB_TAG_ENV}={job_tag}
                         stop_after_sweep = True
                 if survivors and job_log_file:
                     try:
-                        with open(job_log_file, "a") as f:
+                        with open_readable(job_log_file, "a") as f:
                             for survivor in survivors:
                                 f.write(f"[broker] process outlived the job and SIGKILL: {survivor.describe()}\n")
                     except OSError:
@@ -15023,8 +15016,9 @@ def _persist_queued_job(job: "Job") -> None:
     if not path:
         return
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
+        readable_mkdir(path.parent)
+        write_text_readable(
+            path,
             json.dumps(
                 {
                     "id": job.id,
@@ -15042,7 +15036,7 @@ def _persist_queued_job(job: "Job") -> None:
                     # The host boot it was queued in: a restart in another boot expires it (I6).
                     "boot_id": _current_boot_id(),
                 }
-            )
+            ),
         )
     except (OSError, TypeError, ValueError) as e:  # a job that cannot be persisted still runs
         if logger:
@@ -15092,9 +15086,10 @@ def _mark_job_device_fault_failed(job_id: str, reason: str) -> None:
     if not path:
         return
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps({"id": job_id, "reason": reason, "at_epoch": time.time(), "at": datetime.now().isoformat()})
+        readable_mkdir(path.parent)
+        write_text_readable(
+            path,
+            json.dumps({"id": job_id, "reason": reason, "at_epoch": time.time(), "at": datetime.now().isoformat()}),
         )
     except (OSError, TypeError, ValueError) as e:
         if logger:
@@ -15124,7 +15119,7 @@ def _finalize_recovery_kill(job: "Job", log_file) -> tuple[str, str]:
     note = f"{RECOVERY_KILL_MARKER} {cause}"
     if log_file:
         try:
-            with open(log_file, "a") as f:
+            with open_readable(log_file, "a") as f:
                 f.write(f"\n{note}\n")
         except OSError:
             pass
@@ -15207,7 +15202,7 @@ def _expire_restored_job(p: Path, job: "Job", reason: str) -> None:
     job.error = f"expired before it started: {reason}"
     if job.log_file:
         try:
-            with open(job.log_file, "a") as f:
+            with open_readable(job.log_file, "a") as f:
                 f.write(
                     f"\n{EXPIRED_QUEUED_MARKER} {reason}\n"
                     "The broker did not dispatch this job; the device was not touched. Submit it "
@@ -16965,7 +16960,7 @@ def create_mcp_server() -> MCPServer:
             timestamp = now.strftime("%Y-%m-%d_%H%M%S")
             job_log_file = str(job_log_dir / f"{timestamp}_{job_id}.log")
             # Write initial header with explicit env vars
-            with open(job_log_file, "w") as f:
+            with open_readable(job_log_file, "w") as f:
                 f.write("=" * 70 + "\n")
                 f.write(f"JOB ID:      {job_id}\n")
                 # Right after JOB ID, ahead of anything a tenant chose: re-adoption trusts this
@@ -18539,7 +18534,9 @@ async def run_transports(mcp: MCPServer, port: int, socket_path: str | None, ser
                 note_broker_stopping(sig)
                 super().handle_exit(sig, frame)
 
-        config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+        # The same logging shape as the socket transport (spec 06 I10): uvicorn's lines reach
+        # server.log through the root pair, no access chatter.
+        config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info", **UVICORN_LOGGING)
         await _BrokerServer(config).serve()
     elif socket_server is not None:
         # Socket-only: block on the socket server's serve task to keep the process alive.
@@ -18724,17 +18721,28 @@ def _preflight_required_capabilities(socket_path: Optional[str]) -> tuple[list[s
     # best-effort by design — so with the checks off this warns rather than refusing to serve, which
     # is what demanding /var/lib did to every non-root daemon.
     hd = health_dir()
+    health_dir_problems = warns if serialize_only or not health_monitor._health_check_enabled() else fails
     try:
-        hd.mkdir(parents=True, exist_ok=True)
+        readable_mkdir(hd)  # at mode only if this start made it; the roots' own chmod is below
         probe = hd / ".preflight"
-        probe.write_text("")
+        write_text_readable(probe, "")
         probe.unlink()
     except OSError as e:
-        msg = (
+        health_dir_problems.append(
             f"health dir {hd} not writable ({e}) — incident capture and the chip baseline "
             "would be silently lost, and the event journal with them"
         )
-        (warns if serialize_only or not health_monitor._health_check_enabled() else fails).append(msg)
+    else:
+        # The state tree's roots are the broker's own by spec 06 I9, whoever created them: a root
+        # it cannot bring to mode hides every record under it from the people it holds the
+        # device from, and is the same failure as one it cannot write — I7's own rule.
+        try:
+            _open_system_health_roots(hd)
+        except OSError as e:
+            health_dir_problems.append(
+                f"health dir {hd} cannot be brought to mode 0755 ({e}) — its journal, incidents and "
+                "chip baseline would stay unreadable to every local user (spec 06 I9)"
+            )
 
     # Host software below what this broker's reset and probe semantics were matched against.
     # Always a warning: an old firmware bundle is a configuration gap, not a missing recovery
@@ -18773,6 +18781,7 @@ def main():
     # Setup logging directory
     log_dir = Path(args.log_dir) if args.log_dir else Path.cwd()
     log_dir.mkdir(parents=True, exist_ok=True)
+    _open_system_log_root(log_dir)  # raises like the mkdir: a root we cannot open is a failed start
 
     log_file = log_dir / "server.log"
     job_log_dir = log_dir  # Job logs go in same folder with timestamps
@@ -18781,14 +18790,14 @@ def main():
 
     # Setup stats directory and file
     stats_dir = log_dir / "stats"
-    stats_dir.mkdir(parents=True, exist_ok=True)
+    readable_mkdir(stats_dir)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     stats_file = stats_dir / f"{timestamp}.json"
 
     # Initialize stats
     stats = Stats()
 
-    logger = setup_logging(log_file)
+    logger = setup_logging(log_file)  # the handler states server.log's mode on every open (spec 06 I9)
 
     logger.info("=" * 60)
     logger.info("TT-DEVICE-MCP SERVER STARTING (Streamable HTTP)")

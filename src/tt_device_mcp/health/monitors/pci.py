@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from tt_device_mcp.health import chip_state, evidence, pcie_quiet
+from tt_device_mcp.utils import readable_mkdir, write_text_readable
 
 SYSFS_CLASS_DIR = Path(os.environ.get("TT_DEVICE_MCP_SYSFS_DIR", "/sys/class/tenstorrent"))
 
@@ -508,9 +509,9 @@ def _save_removed_chips(health_dir: Optional[Path] = None) -> None:
                 chips = dict(REMOVED_CHIPS)
             body = json.dumps({"boot_id": _boot_id(), "chips": chips})
             p = (health_dir or evidence.health_dir()) / REMOVED_CHIPS_FILE
-            p.parent.mkdir(parents=True, exist_ok=True)
+            readable_mkdir(p.parent)
             tmp = p.with_name(p.name + ".tmp")
-            tmp.write_text(body)
+            write_text_readable(tmp, body)
             os.replace(tmp, p)
     except Exception:  # noqa: BLE001 - persistence is best effort; recovery must go on
         pass

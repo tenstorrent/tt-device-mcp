@@ -2,7 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared shell-script assertions for the test_deploy_* fail-closed suites."""
 
+import subprocess
 from pathlib import Path
+
+_APPLY_SCRIPT = Path(__file__).resolve().parent.parent / "deploy" / "apply-host-config.sh"
+_REPO = _APPLY_SCRIPT.parent.parent
 
 
 def _statements(script: Path) -> list[str]:
@@ -78,8 +82,49 @@ rm() {
 
 
 def _clock(text):
-    """The script's seams (au_now, au_cap, au_time, au_root_uid) and its decision log (au_log) as it
-    defines them, ahead of the source: the lap reads the real clock. The log's journal line goes to a
-    no-op logger, never the host's journal; a test that checks it defines its own logger after this."""
+    """The real log.sh as `autoupdate`, then the script's seams (au_now, au_cap, au_time, au_root_uid)
+    and its decision records (au_log) as it defines them, ahead of the source: the lap reads the real
+    clock. Its lines land in TTDEV_LOG_DIR and on stderr; a lap that leaves it unset stops here
+    rather than append to the host's /var/log."""
     i = text.index("au_now() {")
-    return text[i : text.index("\n}\n", text.index("au_log() {", i)) + 3] + "logger() { :; }\n"
+    helper = (
+        ': "${TTDEV_LOG_DIR:?a lap sets TTDEV_LOG_DIR}"\n'
+        f'. "{_REPO / "deploy" / "tt-device-log.sh"}"\nTTDEV_LOG_NAME=autoupdate\n'
+    )
+    return helper + text[i : text.index("\n}\n", text.index("au_log() {", i)) + 3]
+
+
+def _render(tmp_path, defaults: dict, *, eth_cmd: str | None = None) -> str:
+    """Render the unit from a sandboxed config, touching no host path. The unit-read
+    fallback is pointed at a nonexistent file so the render is fully determined by
+    `defaults` (+ eth_cmd), not by whatever unit this host happens to have installed."""
+    conf = tmp_path / "default"
+    conf.write_text("".join(f"{k}={v}\n" for k, v in defaults.items()))
+    env = {
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "TTDEV_ETC_DEFAULT": str(conf),
+        "TTDEV_UNIT_PATH": str(tmp_path / "absent.service"),
+        # No host DMI product either: on a Galaxy host it would derive an expected chip count.
+        "TTDEV_DMI_PRODUCT_FILE": str(tmp_path / "absent.product_name"),
+        # Where the apply would log if its render seam stopped forcing stderr-only: a temp dir, never
+        # /var/log on a root host. The seam itself is pinned by its own test.
+        "TTDEV_LOG_DIR": str(tmp_path / "render-logs"),
+    }
+    if eth_cmd is not None:
+        env["TTDEV_ETH_HEARTBEAT_CMD"] = eth_cmd
+    r = subprocess.run(
+        ["bash", str(_APPLY_SCRIPT), "--print-unit", str(_REPO)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 0, f"render failed: {r.returncode}\n{r.stderr}"
+    return r.stdout
+
+
+_GALAXY = {
+    "TTDEV_VENV": "/opt/tt-device-broker/venv",
+    "TTDEV_ROOT": "/opt/tt-device-broker",
+    "TTDEV_RESET_MODE": "galaxy",
+    "TTDEV_FABRIC_CHECK_CMD": "/opt/tt-device-broker/fabric-check.sh",
+}

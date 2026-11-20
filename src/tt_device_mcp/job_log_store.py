@@ -17,9 +17,10 @@ import time
 from pathlib import Path
 from typing import Iterable, Optional
 
-# A job log is `<YYYY-MM-DD>_<HHMMSS>_<id>.log`; name order is time order. Nothing else in the
-# dir (server.log, its rotations, the queued-spec subdir) matches.
-JOB_LOG_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}_([0-9A-Za-z-]+)\.log$")
+from tt_device_mcp.constants import JOB_LOG_NAME_RE
+
+# A job log is `<YYYY-MM-DD>_<HHMMSS>_<id>.log` (constants.JOB_LOG_NAME_RE, group 1 the id); name
+# order is time order.
 # What a client may pass as a job id: no glob or path characters, so a lookup can only ever match that one id's logs.
 _JOB_ID_RE = re.compile(r"[0-9A-Za-z-]{1,32}")
 

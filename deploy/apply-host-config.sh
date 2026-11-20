@@ -19,10 +19,16 @@ set -euo pipefail
 # downstream of the unit render, so the seam stops the instant the unit is built.
 RENDER_ONLY=""
 [ "${1:-}" = --print-unit ] && { RENDER_ONLY=1; shift; }
-[ -n "$RENDER_ONLY" ] || [ "$(id -u)" = 0 ] || { echo "apply-host-config: must run as root" >&2; exit 1; }
+# Status lines go through the shared helper like every other deploy script (spec 06 I10), to
+# apply-host-config.log. The render seam writes no host path, so there they go to stderr only.
+[ -z "$RENDER_ONLY" ] || TTDEV_LOG_STDERR_ONLY=1
+. "$(dirname "$(readlink -f "$0")")/tt-device-log.sh"
+TTDEV_LOG_NAME=apply-host-config
+. "$(dirname "$(readlink -f "$0")")/tt-device-modes.sh"
+[ -n "$RENDER_ONLY" ] || [ "$(id -u)" = 0 ] || { log "must run as root"; exit 1; }
 SRC="${1:?usage: apply-host-config.sh [--print-unit] <repo-root>}"
 DEPLOY="$SRC/deploy"
-[ -d "$DEPLOY" ] || { echo "apply-host-config: no deploy dir at $DEPLOY" >&2; exit 1; }
+[ -d "$DEPLOY" ] || { log "no deploy dir at $DEPLOY"; exit 1; }
 
 # The config source and unit path are overridable ONLY so the render seam can point them at a
 # sandbox; the defaults are the real host paths, so the installed path resolves identically.
@@ -81,7 +87,7 @@ HEARTBEAT="${TTDEV_ETH_HEARTBEAT_CMD:-}"
 # exact staged path (not a bare basename glob), so an operator's own override script that merely
 # happens to share the filename at some OTHER location is never mistaken for the retired one.
 if [ "$HEARTBEAT" = "$ROOT/eth-heartbeat-check.sh" ]; then
-    echo "apply-host-config: clearing TTDEV_ETH_HEARTBEAT_CMD (pointed at the retired eth-heartbeat-check.sh wrapper; the read is now built-in and arms itself per host at broker startup)" >&2
+    log "clearing TTDEV_ETH_HEARTBEAT_CMD (pointed at the retired eth-heartbeat-check.sh wrapper; the read is now built-in and arms itself per host at broker startup)"
     HEARTBEAT=""
     [ -n "$RENDER_ONLY" ] || sed -i '/^TTDEV_ETH_HEARTBEAT_CMD=/d' /etc/default/tt-device-broker 2>/dev/null || true
 fi
@@ -118,13 +124,13 @@ if [ -z "$EXPECTED_CHIPS" ]; then
         EXPECTED_SRC="${derived#*$'\t'}"
     else
         EXPECTED_SRC=""
-        echo "apply-host-config: WARNING: expected chip count UNKNOWN: ${derived:-derivation failed}." \
+        log "WARNING: expected chip count UNKNOWN: ${derived:-derivation failed}." \
             "The broker falls back to the high-water mark of chips seen, so a chip or tray already missing" \
             "at first start reads as a smaller box. Set it: TTDEV_EXPECTED_CHIPS=<n> in" \
-            "/etc/default/tt-device-broker (applied on the next update), or sudo TTDEV_EXPECTED_CHIPS=<n> ./install.sh." >&2
+            "/etc/default/tt-device-broker (applied on the next update), or sudo TTDEV_EXPECTED_CHIPS=<n> ./install.sh."
     fi
 fi
-[ -n "$EXPECTED_CHIPS" ] && echo "apply-host-config: expected chips $EXPECTED_CHIPS (source: $EXPECTED_SRC)" >&2
+[ -n "$EXPECTED_CHIPS" ] && log "expected chips $EXPECTED_CHIPS (source: $EXPECTED_SRC)"
 # The host rung — the TOP of the recovery cascade. server.py reads TT_DEVICE_MCP_AUTO_POWER_CYCLE (BMC
 # power cycle, the only host rung), default ON (unset or any value but "0" leaves the rung armed; only
 # "0" disarms it). Unset renders no line, leaving the rung armed at its code default, so a host never
@@ -217,7 +223,26 @@ LOCK="${TTDEV_LOCK:-0}"
 [ "$LOCK" = 1 ] && group_env="Environment=TT_DEVICE_MCP_DEVICE_GROUP=ttdev
 Environment=TT_DEVICE_MCP_DEVICE_LOCK=1"
 
-[ -n "$RENDER_ONLY" ] || mkdir -p /var/log/tt-device-broker
+# The state trees (spec 06 I9) and the install root, each at a stated mode, before the first unit
+# start — so the deploy scripts' first `log` call and the broker's first start both find them at
+# mode. `install -d -m` applies the mode to the LEAF only, so every level is named; a stated mode,
+# never the operator's umask. The broker re-asserts the log dir, the state root and `health/` on
+# every start; the two never disagree.
+if [ -z "$RENDER_ONLY" ]; then
+    install -d -m 0755 /var/log/tt-device-broker
+    install -d -m 0755 /var/lib/tt-device-broker
+    install -d -m 0755 /var/lib/tt-device-broker/health
+    install -d -m 0755 "$ROOT"
+    install -d -m 0755 "$ROOT/validator"
+    # Migration sweep (spec 08): a host upgraded in place keeps the 0750 directories an earlier
+    # apply made, and everything inside them. Every directory to 0755, every regular file to 0644,
+    # except each local-reset.lock, which stays 0600 wherever it sits (spec 06 I9). A chmod that
+    # fails on a path that still exists fails the apply.
+    for tree in /var/log/tt-device-broker /var/lib/tt-device-broker; do
+        sweep_to_mode 0755 "$tree" -type d
+        sweep_to_mode 0644 "$tree" -type f ! -name local-reset.lock
+    done
+fi
 # Render to stdout under the seam; write the real unit otherwise.
 unit_dest="$UNIT"; [ -n "$RENDER_ONLY" ] && unit_dest=/dev/stdout
 cat > "$unit_dest" <<UNIT
@@ -242,6 +267,9 @@ NotifyAccess=main
 WatchdogSec=300
 RuntimeDirectory=tt-device-broker
 RuntimeDirectoryMode=0755
+# systemd's own default for a system unit, written down so a drop-in cannot narrow it unnoticed:
+# a backstop under the broker's open_readable/readable_mkdir helpers, not the mechanism (spec 06 I9).
+UMask=0022
 # TT_DEVICE_MCP_HEALTH_DIR / TT_DEVICE_MCP_TEXTFILE_DIR are deliberately absent: with
 # User=root above, the code's own default already resolves to /var/lib/tt-device-broker/health
 # and /var/lib/prometheus/node-exporter (see evidence._default_health_dir, metrics._textfile_dir)
@@ -283,11 +311,15 @@ install -m 0440 "$DEPLOY/tt-device-mcp-smi.sudoers" /etc/sudoers.d/tt-device-mcp
 # silently dropped the smi grant as applied; aborting keeps auto-update on last-known-good until
 # the shipped file is fixed.
 visudo -cf /etc/sudoers.d/tt-device-mcp-smi >/dev/null 2>&1 \
-    || { echo "apply-host-config: shipped smi sudoers fails visudo -c (build defect) — removed, aborting" >&2; rm -f /etc/sudoers.d/tt-device-mcp-smi; exit 1; }
+    || { log "shipped smi sudoers fails visudo -c (build defect) — removed, aborting"; rm -f /etc/sudoers.d/tt-device-mcp-smi; exit 1; }
 
 # Fabric validator: the pinned build, so every host validates with identical code.
 # The check script and the pin are refreshed here (they used to be written once by the
 # installer and never updated, so fixes to them never reached a running host).
+# The deploy-script logging helper (spec 06 I10) goes first: reconcile.sh, autoupdate.sh and
+# install-fabric-validator.sh source it by adjacency, so a validator timer firing mid-apply never
+# finds the script without its helper. Staged here as well as by the installer, like fabric-check.sh.
+install -m 0755 "$DEPLOY/tt-device-log.sh"              "$ROOT/log.sh"
 install -m 0755 "$DEPLOY/tt-device-fabric-check.sh"     "$ROOT/fabric-check.sh"
 install -m 0755 "$DEPLOY/install-fabric-validator.sh"   "$ROOT/install-fabric-validator.sh"
 install -m 0644 "$DEPLOY/fabric-validator.pin"          "$ROOT/fabric-validator.pin"
@@ -318,11 +350,11 @@ install -m 0755 "$DEPLOY/slurm/prolog.sh" "$ROOT/slurm/prolog.sh"
 install -m 0755 "$DEPLOY/slurm/epilog.sh" "$ROOT/slurm/epilog.sh"
 
 # Bus-lock counter: the discriminator between AMD erratum 1431 and a core stalled on a hung
-# accelerator. Both crash the box identically; only 1431 needs a bus lock. See the unit.
-mkdir -p /var/lib/tt-device-broker/health
+# device. Both crash the box identically; only 1431 needs a bus lock. See the unit. Its
+# health dir was created at mode above.
 install -m 0644 "$DEPLOY/tt-device-buslock.service" /etc/systemd/system/tt-device-buslock.service
 
-# Rotation for the broker + per-job logs. This directory had no rule at all and had grown
+# Rotation for the broker and deploy-script logs. This directory had no rule at all and had grown
 # to 3.4GB; a full disk is a worse outage than anything the logs would have explained.
 install -m 0644 "$DEPLOY/tt-device-broker.logrotate" /etc/logrotate.d/tt-device-broker
 
@@ -340,7 +372,7 @@ if [ "$LOCK" = 1 ]; then
     # Group emptied of people, final-assignment rule installed, rules reloaded; the broker flips
     # the nodes between jobs. A failure leaves the host as it was (cooperative), loudly.
     "$ROOT/device-lock.sh" apply "$DEPLOY" \
-        || echo "apply-host-config: warning: device lock apply failed; /dev/tenstorrent stays as it was" >&2
+        || log "warning: device lock apply failed; /dev/tenstorrent stays as it was"
 fi
 
 # Reconcile timer/service + login self-heal + per-user client wiring.
@@ -363,7 +395,7 @@ health_probe_ships() {
 install_health_probe_units() {
     local unitdir="$1"
     if ! health_probe_ships; then
-        echo "apply-host-config: warn: $VENV has no tt_device_mcp.health_probe; tt-device-health-probe units not installed" >&2
+        log "warn: $VENV has no tt_device_mcp.health_probe; tt-device-health-probe units not installed"
         return 0
     fi
     sed "s|@VENV@|$VENV|g" "$DEPLOY/tt-device-health-probe.service" > "$unitdir/tt-device-health-probe.service"
@@ -386,16 +418,16 @@ arm_health_probe() {
     fi
     if ! health_probe_ships; then
         systemctl disable --now tt-device-health-probe.timer >/dev/null 2>&1 || true
-        echo "apply-host-config: warn: $VENV has no tt_device_mcp.health_probe; tt-device-health-probe.timer not armed (an unmanaged tt-health-probe.timer, if any, is left running)" >&2
+        log "warn: $VENV has no tt_device_mcp.health_probe; tt-device-health-probe.timer not armed (an unmanaged tt-health-probe.timer, if any, is left running)"
         return 0
     fi
     if ! systemctl enable --now tt-device-health-probe.timer >/dev/null 2>&1 \
             || ! systemctl is-active --quiet tt-device-health-probe.timer; then
-        echo "apply-host-config: warn: tt-device-health-probe.timer did not arm; idle-time PCI rescan and telemetry re-arm are off (an unmanaged tt-health-probe.timer, if any, is left running)" >&2
+        log "warn: tt-device-health-probe.timer did not arm; idle-time PCI rescan and telemetry re-arm are off (an unmanaged tt-health-probe.timer, if any, is left running)"
         return 0
     fi
     [ -e "$unitdir/tt-health-probe.timer" ] || return 0
-    echo "apply-host-config: retiring the unmanaged tt-health-probe.timer (replaced by tt-device-health-probe.timer; kept as *.retired-by-tt-device-mcp)" >&2
+    log "retiring the unmanaged tt-health-probe.timer (replaced by tt-device-health-probe.timer; kept as *.retired-by-tt-device-mcp)"
     systemctl disable --now tt-health-probe.timer >/dev/null 2>&1 || true
     for f in tt-health-probe.timer tt-health-probe.service; do
         if [ -e "$unitdir/$f" ]; then
@@ -413,17 +445,17 @@ systemctl daemon-reload
 # minutes: an update must never wait on a compile, and until it lands the fabric check
 # reports CANNOT CHECK rather than guessing.
 systemctl enable --now tt-device-fabric-validator.timer >/dev/null 2>&1 \
-    || { echo "apply-host-config: could not enable tt-device-fabric-validator.timer — host loses its authoritative fabric validator" >&2; exit 1; }
+    || { log "could not enable tt-device-fabric-validator.timer — host loses its authoritative fabric validator"; exit 1; }
 # `enable` can report success while the unit stays masked/unarmed; the host then silently
 # runs with no fabric validation, so confirm the timer is actually armed before continuing.
 systemctl is-active --quiet tt-device-fabric-validator.timer \
-    || { echo "apply-host-config: tt-device-fabric-validator.timer enabled but not active — host loses its authoritative fabric validator" >&2; exit 1; }
+    || { log "tt-device-fabric-validator.timer enabled but not active — host loses its authoritative fabric validator"; exit 1; }
 arm_health_probe /etc/systemd/system
 # Only where perf can actually count it; a missing PMU event must not leave a failed unit.
 if perf stat -a -e ls_locks.bus_lock -- true >/dev/null 2>&1; then
     systemctl enable --now tt-device-buslock.service >/dev/null 2>&1 || true
 else
-    echo "apply-host-config: ls_locks.bus_lock PMU event unavailable; bus-lock counter not enabled" >&2
+    log "ls_locks.bus_lock PMU event unavailable; bus-lock counter not enabled"
 fi
 # The pin's prefix name: its SHA plus a hash of its patches (spec 08 I27).
 pinned_key="$("$ROOT/install-fabric-validator.sh" "$ROOT/fabric-validator.pin" --key 2>/dev/null)" || pinned_key=""
@@ -431,7 +463,7 @@ pinned_key="$("$ROOT/install-fabric-validator.sh" "$ROOT/fabric-validator.pin" -
 pinned_bin=build/tools/scaleout/run_cluster_validation
 if [ -n "$pinned_key" ] && [ ! -x "/opt/tt-device-broker/validator/$pinned_key/$pinned_bin" ] \
         && [ ! -x "/opt/tt-device-broker/validator/$pinned_key.build/$pinned_bin" ]; then
-    echo "apply-host-config: fabric validator for $pinned_key not built; starting build out of band" >&2
+    log "fabric validator for $pinned_key not built; starting build out of band"
     systemctl reset-failed tt-device-fabric-validator.service 2>/dev/null || true
     systemctl start --no-block tt-device-fabric-validator.service 2>/dev/null || true
 fi

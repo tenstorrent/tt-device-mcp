@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from tt_device_mcp.health.monitors import pci
+from tt_device_mcp.utils import readable_mkdir, write_text_readable
 
 CAPTURE_DEADLINE_SEC = 10.0
 # A BMC answers IPMI slowly while a tray is browning out; each read gets most of the deadline,
@@ -176,9 +177,9 @@ def capture_tray_down(
     }
     if bundle is not None:
         try:
-            bundle.mkdir(parents=True, exist_ok=True)
-            (bundle / "bmc.txt").write_text("".join(f"$ {k}\n{v}\n\n" for k, v in results.items()))
-            (bundle / "onset.json").write_text(json.dumps({**onset, "capture": summary}, indent=2, default=str))
+            readable_mkdir(bundle)
+            write_text_readable(bundle / "bmc.txt", "".join(f"$ {k}\n{v}\n\n" for k, v in results.items()))
+            write_text_readable(bundle / "onset.json", json.dumps({**onset, "capture": summary}, indent=2, default=str))
             _fsync_tree(bundle)
         except OSError as e:
             summary["write_error"] = repr(e)

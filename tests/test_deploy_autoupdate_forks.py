@@ -155,7 +155,7 @@ def test_a_drain_on_the_real_clock(tmp_path):
 
 def test_a_lap_on_the_real_clock(tmp_path):
     """No stand-in clock: a rate-limited lap reads the real time for its wait and its apply_by, and
-    stamps its decision with the local time, as `date '+%Y-%m-%dT%H:%M:%S%z'` would."""
+    writes both the line stamp and apply_by in UTC (spec 08 I22)."""
     root = tmp_path / "root"
     root.mkdir()
     (root / "installed.sha").write_text("s0\n")
@@ -165,7 +165,7 @@ def test_a_lap_on_the_real_clock(tmp_path):
     done, restarts, _ = _lap(tmp_path, now=None, sha="s1", stand_ins=False)
     t1 = int(time.time())
     assert restarts == [], done.stderr
-    line = (tmp_path / "logs" / "autoupdate.log").read_text().splitlines()[-1]
+    line = [x for x in (tmp_path / "logs" / "autoupdate.log").read_text().splitlines() if "decision=" in x][-1]
     m = re.search(r"last apply (\d+)s ago \(min 1800s\); apply_by=(\S+)", line)
     assert m and t0 - last <= int(m.group(1)) <= t1 - last, line
 
@@ -174,8 +174,9 @@ def test_a_lap_on_the_real_clock(tmp_path):
         return int(out.stdout)
 
     assert epoch(m.group(2)) == last + 1800, line
-    assert re.match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4} decision=deferred ", line), line
-    assert t0 <= epoch(line.split()[0]) <= t1, line
+    assert m.group(2).endswith("Z"), line
+    assert re.match(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC \| autoupdate \| decision=deferred ", line), line
+    assert t0 <= epoch(" ".join(line.split()[:3])) <= t1, line
 
 
 def test_this_file_runs_on_the_forks_worker_under_loadgroup(request):
@@ -209,7 +210,8 @@ v=unset; au_cap v true; printf 'none|%q\n' "$v"
     runs = {}
     for name, seam in (("script", ""), ("stand-in", LAP_STAND_INS)):
         script = f"set -u\nROOT={root}\n{_clock(_SCRIPT.read_text())}{seam}{cases}"
-        done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+        env = {"PATH": "/usr/bin:/bin", "TTDEV_LOG_DIR": str(tmp_path / "logs")}
+        done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=30)
         assert done.returncode == 0 and not done.stderr, done.stderr
         runs[name] = done.stdout.splitlines()
     assert len(runs["script"]) == 9 * 3 + 2

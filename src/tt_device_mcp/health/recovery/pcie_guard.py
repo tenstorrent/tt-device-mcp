@@ -37,6 +37,7 @@ from typing import Callable, Optional
 from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.monitors.heartbeat import dead_chips, read_heartbeats
 from tt_device_mcp.health.monitors.hostpci import link_down
+from tt_device_mcp.utils import open_readable, readable_mkdir, write_text_readable
 
 _logger = logging.getLogger("tt-device-mcp")
 
@@ -111,8 +112,10 @@ def _remember(eps: dict) -> None:
     path = health_dir() / TOPOLOGY_FILE
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps({"root_ports": sorted(seen["root_ports"]), "devices": sorted(seen["devices"])}))
+        readable_mkdir(path.parent)
+        write_text_readable(
+            tmp, json.dumps({"root_ports": sorted(seen["root_ports"]), "devices": sorted(seen["devices"])})
+        )
         os.replace(tmp, path)  # a torn write would read back as nothing seen
     except OSError:
         tmp.unlink(missing_ok=True)
@@ -537,8 +540,8 @@ def begin_offbus_reset(kind: str, off_bus: int) -> None:
     path = health_dir() / INTENT_FILE
     rec = {"kind": kind, "off_bus": off_bus, "boot_id": _boot_id(), "at_epoch": time.time()}
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        readable_mkdir(path.parent)
+        with open_readable(path, "w", encoding="utf-8") as f:
             f.write(json.dumps(rec))
             f.flush()
             os.fsync(f.fileno())
@@ -767,7 +770,7 @@ def check_offbus_reset_latch(log: Callable[[str], None]) -> Optional[dict]:
         return offbus_reset_latched()
     rec = dict(intent, latched_on_boot=_boot_id(), latched_at_epoch=time.time())
     try:
-        (health_dir() / LATCH_FILE).write_text(json.dumps(rec))
+        write_text_readable(health_dir() / LATCH_FILE, json.dumps(rec))
     except OSError as exc:
         log(f"could not persist the host-hang hold: {exc!r}; holding for this boot only")
     log(

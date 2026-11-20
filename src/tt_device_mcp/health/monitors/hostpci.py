@@ -37,6 +37,7 @@ from typing import Optional
 
 from tt_device_mcp.health import evidence, pcie_quiet
 from tt_device_mcp.health.monitors import pci
+from tt_device_mcp.utils import readable_mkdir, write_text_readable
 
 # Tenstorrent's PCI vendor id, as sysfs renders it.
 TT_VENDOR_ID = "0x1e52"
@@ -225,9 +226,9 @@ def _bank_link_baseline(banked: dict, current: dict) -> None:
         return
     try:
         p = evidence.health_dir() / PCIE_LINK_BASELINE_FILE
-        p.parent.mkdir(parents=True, exist_ok=True)
+        readable_mkdir(p.parent)
         tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(json.dumps({"links": out}))
+        write_text_readable(tmp, json.dumps({"links": out}))
         os.replace(tmp, p)
     except OSError:
         pass  # a mark we cannot persist must not break the gate; the caps still judge every link

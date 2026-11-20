@@ -39,6 +39,7 @@ from tt_device_mcp.health.evidence import capture_incident, health_dir, health_e
 from tt_device_mcp.health.monitors import eth, fabric, hostpci, pci
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.shutdown import CheckInterruptedByShutdown, interrupted_by_shutdown
+from tt_device_mcp.utils import write_text_readable
 
 # How much of a fabric run's output the action-log row keeps for a run that got no healthy verdict: all of it, since the
 # validator's first error line (the cause) sits near the head and a wrapper's verdict at the tail. Only past this
@@ -93,7 +94,7 @@ def _save_asic_bus_map() -> None:
     try:
         p = health_dir() / ASIC_BUS_FILE
         tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(m))
+        write_text_readable(tmp, json.dumps(m))
         os.replace(tmp, p)
     except OSError:
         pass
@@ -116,7 +117,7 @@ def _write_json(name: str, data: dict) -> None:
     try:
         p = health_dir() / name
         tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(json.dumps(data))
+        write_text_readable(tmp, json.dumps(data))
         os.replace(tmp, p)
     except OSError:
         pass  # state we cannot persist must not break the gate
@@ -664,7 +665,7 @@ class HealthMonitor:
             return max(present, 1)
         if present > baseline:
             try:
-                path.write_text(json.dumps({"chips": present}))
+                write_text_readable(path, json.dumps({"chips": present}))
             except OSError:
                 pass  # a baseline we cannot persist must not break the gate; present is the floor
             return present

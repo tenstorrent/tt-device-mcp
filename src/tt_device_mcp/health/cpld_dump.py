@@ -66,6 +66,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from tt_device_mcp.health import evidence
+from tt_device_mcp.utils import open_readable, readable_mkdir, write_text_readable
 
 LOCK_PATH = "/run/lock/tt-cpld.lock"
 HOST_SCRIPT = "/usr/local/bin/cpld-dump.sh"
@@ -340,7 +341,7 @@ def _run_diag(
     timed_out = eof = False
     error = ""
     try:
-        with open(out, "wb") as f:
+        with open_readable(out, "wb") as f:
             fd = p.stdout.fileno()
             while True:
                 now = time.monotonic()
@@ -430,11 +431,11 @@ def _read_psu(out: Path) -> dict:
         )
     except subprocess.TimeoutExpired as e:
         text = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
-        out.write_text(text)
+        write_text_readable(out, text)
         return {"psu_path": str(out), "psu_error": f"timed out after {PSU_SDR_SEC:.0f}s"}
     except OSError as e:
         return {"psu_error": repr(e)}
-    out.write_text(r.stdout + r.stderr)
+    write_text_readable(out, r.stdout + r.stderr)
     lines = [ln.strip() for ln in r.stdout.splitlines() if _PSU_LINE.search(ln.split("|")[0])]
     rec: dict = {"psu_path": str(out), "psu": lines[:64]}
     if r.returncode != 0:
@@ -496,7 +497,7 @@ def take_dump(trigger: str, episode: str, log: Callable[[str], None]) -> dict:
         if silent:
             raise BmcSilent(silent)
         root = evidence.health_dir() / DUMPS_DIR
-        root.mkdir(parents=True, exist_ok=True)
+        readable_mkdir(root)
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         out = root / f"{stamp}_{re.sub(r'[^A-Za-z0-9_.-]+', '-', trigger)[:40]}.txt"
         _note_dump(episode, trigger, out)
@@ -600,8 +601,8 @@ def mark_episode(episode: str) -> None:
     """Persist the episode already dumped, so a broker restart mid-episode does not dump it twice."""
     try:
         p = last_episode_file()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({"episode": episode, "ts": time.time()}))
+        readable_mkdir(p.parent)
+        write_text_readable(p, json.dumps({"episode": episode, "ts": time.time()}))
     except OSError:
         pass
 
@@ -617,7 +618,7 @@ def _note_dump(episode: str, trigger: str, out: Path) -> None:
     DIAG runs (or after) can link to it."""
     try:
         p = last_episode_file()
-        p.write_text(json.dumps({"episode": episode, "ts": time.time(), **_link_body(episode, trigger, out)}))
+        write_text_readable(p, json.dumps({"episode": episode, "ts": time.time(), **_link_body(episode, trigger, out)}))
     except OSError:
         pass
 
@@ -644,7 +645,7 @@ def _write_link(incident: Path, body: dict) -> bool:
     try:
         if link.exists() and json.loads(link.read_text()).get("episode") != body["episode"]:
             return False
-        link.write_text(json.dumps(body, indent=2))
+        write_text_readable(link, json.dumps(body, indent=2))
         return True
     except (OSError, ValueError, AttributeError):
         return False

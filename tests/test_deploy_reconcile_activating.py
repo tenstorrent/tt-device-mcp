@@ -39,7 +39,8 @@ def _run(tmp_path: Path, state: str) -> tuple[list[str], str]:
     )
     stub.chmod(0o700)
     script = tmp_path / "step1.sh"
-    script.write_text("set -u\n" + _step1(tmp_path) + "\n")
+    # The block alone has no log.sh; `log` keeps the helper's stderr copy, the line it says.
+    script.write_text("set -u\nlog() { printf '%s\\n' \"$*\" >&2; }\n" + _step1(tmp_path) + "\n")
     env = {"PATH": f"{bindir}:/usr/bin:/bin"}
     r = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr

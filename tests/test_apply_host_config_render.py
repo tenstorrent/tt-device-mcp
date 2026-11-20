@@ -12,46 +12,18 @@ default is UNSET — no line — so wiring it changes nothing until a host opts 
 case is pinned alongside so the wiring cannot start rendering a line by accident.
 """
 
+import os
+import re
+import stat
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from tests.deploy_helpers import _APPLY_SCRIPT, _GALAXY, _REPO, _one, _render, _statements
+from tt_device_mcp.health.recovery import base as recovery_base
+
 _SCRIPT = Path(__file__).resolve().parent.parent / "deploy" / "apply-host-config.sh"
-_REPO = _SCRIPT.parent.parent
-
-
-def _render(tmp_path, defaults: dict, *, eth_cmd: str | None = None) -> str:
-    """Render the unit from a sandboxed config, touching no host path. The unit-read
-    fallback is pointed at a nonexistent file so the render is fully determined by
-    `defaults` (+ eth_cmd), not by whatever unit this host happens to have installed."""
-    conf = tmp_path / "default"
-    conf.write_text("".join(f"{k}={v}\n" for k, v in defaults.items()))
-    env = {
-        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        "TTDEV_ETC_DEFAULT": str(conf),
-        "TTDEV_UNIT_PATH": str(tmp_path / "absent.service"),
-        # No host DMI product either: on a Galaxy host it would derive an expected chip count.
-        "TTDEV_DMI_PRODUCT_FILE": str(tmp_path / "absent.product_name"),
-    }
-    if eth_cmd is not None:
-        env["TTDEV_ETH_HEARTBEAT_CMD"] = eth_cmd
-    r = subprocess.run(
-        ["bash", str(_SCRIPT), "--print-unit", str(_REPO)],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    assert r.returncode == 0, f"render failed: {r.returncode}\n{r.stderr}"
-    return r.stdout
-
-
-_GALAXY = {
-    "TTDEV_VENV": "/opt/tt-device-broker/venv",
-    "TTDEV_ROOT": "/opt/tt-device-broker",
-    "TTDEV_RESET_MODE": "galaxy",
-    "TTDEV_FABRIC_CHECK_CMD": "/opt/tt-device-broker/fabric-check.sh",
-}
 
 
 def test_eth_heartbeat_unset_renders_no_line(tmp_path):
@@ -86,6 +58,30 @@ def test_eth_heartbeat_pointed_at_the_retired_wrapper_is_scrubbed(tmp_path):
     cmd = "/opt/tt-device-broker/eth-heartbeat-check.sh"  # $ROOT/eth-heartbeat-check.sh, exactly
     unit = _render(tmp_path, _GALAXY, eth_cmd=cmd)
     assert "TT_DEVICE_MCP_ETH_HEARTBEAT_CMD" not in unit
+
+
+def test_the_render_seam_logs_to_stderr_only_and_writes_no_log_file(tmp_path):
+    # The scrub above is the one status line the render seam can emit. It goes through the shared
+    # helper (spec 06 I10) but, the seam writing no host path, to stderr only — even with a log dir
+    # exported into the environment.
+    conf = tmp_path / "default"
+    conf.write_text("".join(f"{k}={v}\n" for k, v in _GALAXY.items()))
+    logs = tmp_path / "logs"
+    r = subprocess.run(
+        ["bash", str(_APPLY_SCRIPT), "--print-unit", str(_REPO)],
+        env={
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "TTDEV_ETC_DEFAULT": str(conf),
+            "TTDEV_UNIT_PATH": str(tmp_path / "absent.service"),
+            "TTDEV_ETH_HEARTBEAT_CMD": "/opt/tt-device-broker/eth-heartbeat-check.sh",
+            "TTDEV_LOG_DIR": str(logs),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    assert re.search(r"^\S+ \S+ UTC \| apply-host-config \| clearing TTDEV_ETH_HEARTBEAT_CMD", r.stderr, re.M), r.stderr
+    assert not logs.exists(), "the render seam writes no log file"
 
 
 def test_seam_preserves_the_existing_render(tmp_path):
@@ -240,3 +236,256 @@ def test_the_unit_lifts_the_memlock_limit_jobs_inherit(tmp_path):
     unit = _render(tmp_path, _GALAXY)
     service = unit.split("[Service]", 1)[1].split("[Install]", 1)[0]
     assert "LimitMEMLOCK=infinity" in service.splitlines()
+    assert "TTDEV_ETH_CHECK_PYTHON" not in unit
+
+
+# --- readable logs and state (spec 06 I9/I10, spec 08) -------------------------------------------
+
+
+def test_the_rendered_unit_states_umask_0022(tmp_path):
+    # systemd's own default, written down so a drop-in cannot narrow it unnoticed — the backstop under
+    # the broker's open_readable/readable_mkdir helpers (spec 06 I9).
+    unit = _render(tmp_path, _GALAXY)
+    lines = [ln.strip() for ln in unit.splitlines()]
+    assert "UMask=0022" in lines
+    assert lines.index("UMask=0022") < lines.index(next(ln for ln in lines if ln.startswith("ExecStart=")))
+
+
+def test_the_rendered_unit_sets_no_standard_output_or_standard_error(tmp_path):
+    # stdout/stderr reach the journal by systemd's default as a second copy; the file is server.log,
+    # written by the broker's own handler (spec 06 I10).
+    unit = _render(tmp_path, _GALAXY)
+    for ln in unit.splitlines():
+        assert not ln.strip().startswith(("StandardOutput=", "StandardError=")), ln
+
+
+def _code(script: Path) -> list[str]:
+    return [s for s in _statements(script) if s.strip() and not s.lstrip().startswith("#")]
+
+
+def test_the_apply_creates_all_three_state_directories_with_install_d_m_0755_the_parent_included():
+    # `install -d -m` applies the mode to the leaf only, so every level is named — never `mkdir -p`,
+    # whose mode is the operator's umask (the measured 0750 defect, spec 06 Design decisions).
+    stmts = _code(_SCRIPT)
+    for path in ("/var/log/tt-device-broker", "/var/lib/tt-device-broker", "/var/lib/tt-device-broker/health"):
+        assert [s for s in stmts if s.strip() == f"install -d -m 0755 {path}"], f"no install -d of {path}"
+        assert not [s for s in stmts if "mkdir" in s and path in s], f"no mkdir of {path}"
+
+
+def test_the_apply_creates_the_install_root_and_its_validator_dir_with_install_d_m_0755():
+    # The validator's build.log is readable only if the path above it is traversable (spec 08).
+    _one(_SCRIPT, 'install -d -m 0755 "$ROOT"')
+    _one(_SCRIPT, 'install -d -m 0755 "$ROOT/validator"')
+
+
+def test_the_apply_creates_the_directories_before_the_first_unit_start():
+    stmts = _code(_SCRIPT)
+    last_mkdir = max(i for i, s in enumerate(stmts) if "install -d -m 0755" in s and "tt-device-broker" in s)
+    first_start = min(i for i, s in enumerate(stmts) if "systemctl" in s and ("enable --now" in s or " start " in s))
+    assert last_mkdir < first_start
+
+
+def test_the_directory_creation_and_the_sweep_sit_under_the_render_only_seam():
+    # `--print-unit` touches no host path: the install -d lines and the sweep must be inside the
+    # `if [ -z "$RENDER_ONLY" ]` block that precedes the unit render.
+    stmts = _code(_SCRIPT)
+    guards = [i for i, s in enumerate(stmts) if s.strip() == 'if [ -z "$RENDER_ONLY" ]; then']
+    render = next(i for i, s in enumerate(stmts) if 'cat > "$unit_dest"' in s)
+    for needle in (
+        "install -d -m 0755 /var/log/tt-device-broker",
+        'install -d -m 0755 "$ROOT/validator"',
+        "sweep_to_mode",
+    ):
+        for i, s in enumerate(stmts):
+            if needle not in s:
+                continue
+            guard = max((g for g in guards if g < i), default=None)
+            assert guard is not None, f"{s!r} has no RENDER_ONLY guard before it"
+            end = next(j for j, t in enumerate(stmts) if j > guard and t.strip() == "fi")
+            assert i < end < render, f"{s!r} is outside the RENDER_ONLY guard that precedes the render"
+
+
+def test_the_apply_stages_log_sh_beside_the_scripts_that_source_it():
+    # Staged by apply-host-config.sh as well as by the installer, like fabric-check.sh and the Slurm
+    # hooks: auto-update never re-runs the installer, only this script (spec 08 I8).
+    stmt = _one(_SCRIPT, "install -m 0755", '"$DEPLOY/tt-device-log.sh"', '"$ROOT/log.sh"')
+    assert "|| true" not in stmt
+
+
+def _lmode(p: Path) -> int:
+    return stat.S_IMODE(p.lstat().st_mode)
+
+
+def _gnu_find() -> bool:
+    """The deploy scripts target GNU/Linux (spec 09); `-ignore_readdir_race` is GNU find's. An
+    executed sweep test skips where find is not GNU, the way a device test skips without silicon."""
+    try:
+        return subprocess.run(["find", "--version"], capture_output=True).returncode == 0
+    except OSError:
+        return False
+
+
+_MODES = _SCRIPT.parent / "tt-device-modes.sh"
+_CRASH = _SCRIPT.parent / "install-crash-recorder.sh"
+_SOURCE_MODES = '. "$(dirname "$(readlink -f "$0")")/tt-device-modes.sh"'
+_DIRS = 'sweep_to_mode 0755 "$tree" -type d'
+_FILES = f'sweep_to_mode 0644 "$tree" -type f ! -name {recovery_base.LOCAL_RESET_LOCK}'
+_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def _sweep(tree: Path, path: str = _PATH) -> subprocess.CompletedProcess:
+    """The apply's two sweep statements, exactly as it carries them, over a stand-in tree."""
+    body = f'. "{_MODES}"\ntree="$1"\n{_one(_SCRIPT, _DIRS).strip()}\n{_one(_SCRIPT, _FILES).strip()}\n'
+    return subprocess.run(
+        ["bash", "-e", "-c", body, "_", str(tree)], env={"PATH": path}, capture_output=True, text=True
+    )
+
+
+def _helper_find() -> str:
+    m = re.search(r"^\s*find .*?\{\} \+$", _MODES.read_text(), re.S | re.M)
+    assert m, "sweep_to_mode must run one find"
+    return m.group(0)
+
+
+def test_the_migration_sweep_widens_dirs_to_0755_and_files_to_0644_skipping_every_local_reset_lock():
+    # Recursive under both trees; the lock is skipped by NAME wherever it sits (a redirected health dir
+    # inside either tree keeps its lock private too), and nothing but that name is skipped.
+    dirs, files = _one(_SCRIPT, _DIRS), _one(_SCRIPT, _FILES)
+    assert "local-reset.lock" not in dirs, "the lock's directory is widened like any other"
+    assert files.count("! -name") == 1, "the lock is the only name skipped"
+    loop = _one(_SCRIPT, "for tree in /var/log/tt-device-broker /var/lib/tt-device-broker")
+    stmts = _code(_SCRIPT)
+    source = next(i for i, s in enumerate(stmts) if s.strip() == _SOURCE_MODES)
+    assert source < stmts.index(loop) < stmts.index(dirs) < stmts.index(files)
+
+
+def test_both_sweeps_go_through_the_one_helper_and_neither_script_carries_its_own():
+    # Spec 08: the race handling lives once, in tt-device-modes.sh. A second hand-written
+    # find ... chmod in either caller is a copy that drifts from it.
+    for script in (_SCRIPT, _CRASH):
+        assert _SOURCE_MODES in [s.strip() for s in _code(script)], f"{script.name} must source the helper"
+        own = [s for s in _code(script) if re.search(r"\bfind\b", s) and "chmod" in s]
+        assert own == [], f"{script.name} carries its own sweep: {own}"
+
+
+def test_the_migration_sweep_follows_no_symlink():
+    # -P (never -L / -H): stats/current points at a file that is asserted at its own path.
+    find = _helper_find()
+    assert find.lstrip().startswith('find -P "$root" '), find
+    assert " -L " not in find and " -H " not in find and "-follow" not in find, find
+
+
+def test_the_migration_sweep_tells_find_a_vanished_entry_is_not_an_error():
+    # Spec 08: an entry that vanishes between find's readdir and its own stat would otherwise make
+    # find exit 1 before -exec runs — the half of the race the per-path body cannot see. The option
+    # sits before the caller's tests, so it applies to the whole traversal.
+    assert _helper_find().lstrip().startswith('find -P "$root" -ignore_readdir_race "$@" ! -perm "$mode" ')
+
+
+def test_the_migration_sweep_touches_nothing_on_a_tree_already_at_mode(tmp_path):
+    if not _gnu_find():
+        pytest.skip("the sweep is GNU find's (-ignore_readdir_race); the statement anchors hold here")
+    # Spec 08: the sweep is idempotent. `! -perm` makes that literal — a lap over an at-mode tree
+    # issues no chmod, so it never races the live broker's own creates. A chmod stub on PATH that
+    # always fails proves it: any chmod at all would exit non-zero.
+    tree = tmp_path / "tree"
+    (tree / "health" / "incidents" / "b1").mkdir(parents=True)
+    for f in (tree / "server.log", tree / "health" / "fsm.json", tree / "health" / "incidents" / "b1" / "job.log"):
+        f.write_text("")
+        f.chmod(0o644)
+    lock = tree / "health" / "local-reset.lock"
+    lock.write_text("")
+    lock.chmod(0o600)
+    for d in [tree, *(p for p in tree.rglob("*") if p.is_dir())]:
+        d.chmod(0o755)
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    (stubs / "chmod").write_text("#!/bin/sh\necho 'chmod: a sweep over an at-mode tree must not chmod' >&2\nexit 1\n")
+    (stubs / "chmod").chmod(0o755)
+
+    r = _sweep(tree, f"{stubs}:{_PATH}")
+    assert r.returncode == 0 and r.stderr == "", r.stderr
+    assert _lmode(lock) == 0o600
+
+
+def _sweep_with_chmod_stub(tmp_path: Path, tag: str, on_doomed: str) -> tuple[subprocess.CompletedProcess, Path, Path]:
+    """sweep_to_mode over a two-file tree, with a chmod stub that runs `on_doomed` for one file and
+    the real chmod for everything else."""
+    tree = tmp_path / tag
+    tree.mkdir()
+    doomed, survivor = tree / "queued-spec-whose-job-started.json", tree / "survivor.json"
+    for f in (doomed, survivor):
+        f.write_text("")
+        f.chmod(0o600)
+    stubs = tmp_path / f"stubs-{tag}"
+    stubs.mkdir()
+    (stubs / "chmod").write_text(
+        f'#!/bin/sh\ncase "$2" in *queued-spec-whose-job-started.json) {on_doomed} ;; esac\nexec /bin/chmod "$@"\n'
+    )
+    (stubs / "chmod").chmod(0o755)
+    r = subprocess.run(
+        ["bash", "-e", "-c", f'. "{_MODES}"\nsweep_to_mode 0644 "$1" -type f', "_", str(tree)],
+        env={"PATH": f"{stubs}:{_PATH}"},
+        capture_output=True,
+        text=True,
+    )
+    return r, doomed, survivor
+
+
+def test_the_migration_sweep_skips_a_path_the_broker_deleted_under_it_and_still_aborts_on_any_other_chmod_failure(
+    tmp_path,
+):
+    if not _gnu_find():
+        pytest.skip("the sweep is GNU find's (-ignore_readdir_race); the statement anchors hold here")
+    # The broker is live while the apply runs and deletes short-lived files (a queued spec whose job
+    # started, fsm.json's .tmp). A chmod stub that deletes its own target and then fails stands in
+    # for the broker winning that race: the sweep returns 0 and still brings the survivor to mode. A
+    # stub that fails on a path that still EXISTS stands in for EPERM/EROFS: the sweep returns
+    # non-zero, so the apply's set -e aborts as spec 08 requires.
+    r, doomed, survivor = _sweep_with_chmod_stub(tmp_path, "raced", 'rm -f "$2"; exit 1')
+    assert r.returncode == 0, f"a path gone by its chmod must be skipped, not a failure: {r.stderr}"
+    assert not doomed.exists() and _lmode(survivor) == 0o644, "the paths that still exist are brought to mode"
+
+    r, doomed, _ = _sweep_with_chmod_stub(tmp_path, "refused", "echo 'chmod: stub refusal' >&2; exit 1")
+    assert r.returncode != 0, "a chmod that fails on a path that exists must still fail the apply"
+    assert doomed.exists() and "stub refusal" in r.stderr
+
+
+def test_the_migration_sweep_run_on_a_tree_widens_everything_but_each_local_reset_lock_and_follows_no_symlink(tmp_path):
+    if not _gnu_find():
+        pytest.skip("the sweep is GNU find's (-ignore_readdir_race); the statement anchors hold here")
+    # Nested 0700 directories, a health/x/local-reset.lock at 0600 with a 0600 sibling beside it, a
+    # 0600 file at incident-bundle depth, a lock at the tree root, and a stats/current symlink to a
+    # 0600 file OUTSIDE the tree: afterwards every directory is 0755, every regular file 0644, every
+    # lock still 0600, and the symlink's target untouched.
+    tree = tmp_path / "tree"
+    outside = tmp_path / "outside-target"
+    for d in ("health/x", "incidents/b1/deep", "stats", "queued"):
+        (tree / d).mkdir(parents=True)
+    files_0600 = [
+        tree / "health" / "x" / "sibling.jsonl",
+        tree / "incidents" / "b1" / "deep" / "job.log",
+        tree / "queued" / "7.json",
+        tree / "server.log",
+    ]
+    locks = [tree / "health" / "x" / "local-reset.lock", tree / "local-reset.lock"]
+    for f in files_0600 + locks + [outside]:
+        f.write_text("")
+        f.chmod(0o600)
+    (tree / "stats" / "current").symlink_to(outside)
+    for d in [tree, *(p for p in tree.rglob("*") if p.is_dir() and not p.is_symlink())]:
+        d.chmod(0o700)
+
+    r = _sweep(tree)
+    assert r.returncode == 0, r.stderr
+
+    seen_dirs = [tree] + [p for p in tree.rglob("*") if p.is_dir() and not p.is_symlink()]
+    assert len(seen_dirs) == 8
+    for d in seen_dirs:
+        assert _lmode(d) == 0o755, d
+    for f in files_0600:
+        assert _lmode(f) == 0o644, f
+    for lock in locks:
+        assert _lmode(lock) == 0o600, f"{lock} must stay private wherever it sits"
+    assert _lmode(outside) == 0o600, "the symlink was not followed"
+    assert (tree / "stats" / "current").is_symlink() and os.readlink(tree / "stats" / "current") == str(outside)

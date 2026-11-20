@@ -36,6 +36,7 @@ from typing import Optional
 
 from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.recovery.power_cycle_reason import PowerCycleReason
+from tt_device_mcp.utils import open_readable, readable_mkdir
 
 STATE_FILE = "offbus_power_cycle.json"
 GRACE_SEC = 300
@@ -162,9 +163,9 @@ def load_state() -> dict:
 def save_state(state: dict) -> None:
     """Atomic and fsync'd: an attempt written here survives the power cycle it precedes."""
     path = _state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    readable_mkdir(path.parent)
     tmp = path.with_suffix(".tmp")
-    with open(tmp, "w") as fh:
+    with open_readable(tmp, "w") as fh:
         json.dump(state, fh)
         fh.flush()
         os.fsync(fh.fileno())

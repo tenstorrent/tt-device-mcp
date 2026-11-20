@@ -23,6 +23,7 @@ import time
 import pytest
 
 from tests.conftest import power_cycle_reason
+from tt_device_mcp import utils
 from tt_device_mcp.fsm import ServerFsm, ServerState
 from tt_device_mcp.health import cpld_dump
 from tt_device_mcp.health import evidence as health
@@ -778,12 +779,13 @@ class _FullDisk:
 def test_a_failed_output_write_ends_the_diag_and_restores_the_index(as_user, monkeypatch):
     _use_diag(as_user, monkeypatch, CHATTY_DIAG)
     real_open = open
-    monkeypatch.setattr(
-        cpld_dump,
-        "open",
-        lambda p, m="r", *a, **k: _FullDisk(real_open(p, m)) if m == "wb" else real_open(p, m, *a, **k),
-        raising=False,
-    )
+
+    def _open(p, m="r", *a, **k):
+        return _FullDisk(real_open(p, m, *a, **k)) if m == "wb" else real_open(p, m, *a, **k)
+
+    monkeypatch.setattr(cpld_dump, "open", _open, raising=False)
+    # The dump output opens through open_readable (spec 06 I9), whose own open is utils'.
+    monkeypatch.setattr(utils, "open", _open, raising=False)
     rec = cpld_dump.take_dump("chip_dead", "ep-enospc", lambda _s: None)
     assert not _alive(_pid(as_user, "diag"))
     restores = (as_user["pids"] / "restores").read_text().splitlines()

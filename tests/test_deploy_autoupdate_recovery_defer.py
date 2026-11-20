@@ -110,7 +110,9 @@ count_busy() {{ kids=0; holders=0; scopes=0; queued=0; busy=0; }}
     done = subprocess.run(["bash", "-c", prelude + body], capture_output=True, text=True, env=env, timeout=60)
     lines = trace.read_text().splitlines() if trace.exists() else []
     log = logs / "autoupdate.log"
-    return done, lines, (log.read_text().splitlines() if log.exists() else [])
+    # The decision records (I22), as `grep decision=` lists them among autoupdate's other lines.
+    records = [x for x in log.read_text().splitlines() if " | autoupdate | decision=" in x] if log.exists() else []
+    return done, lines, records
 
 
 def _gate(tmp_path, **kw):
@@ -190,7 +192,7 @@ def test_the_bound_is_capped_at_30_minutes_and_0_turns_it_off(tmp_path):
     "line",
     [
         'RECOVERY_DEFER="${TTDEV_RECOVERY_DEFER_SEC:-1200}"',
-        'AU_LOG="${TTDEV_LOG_DIR:-/var/log/tt-device-broker}/autoupdate.log"',
+        "TTDEV_LOG_NAME=autoupdate",
     ],
     ids=["default-bound-20-min", "log-in-broker-log-dir"],
 )
@@ -409,13 +411,14 @@ def test_each_decision_line_has_time_both_shas_and_a_reason(tmp_path):
     done, trace, log = _gate(tmp_path, health=[_health(held=True, age=60)])
     line = log[0]
     m = re.match(
-        r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4}) decision=deferred branch=main old=(\w+) new=(\w+) reason=(.+)$",
+        r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC) \| autoupdate \| "
+        r"decision=deferred branch=main old=(\w+) new=(\w+) reason=(.+)$",
         line,
     )
     assert m, line
     assert m.group(2) == _OLD and m.group(3) == _NEW and "broker recovery in progress" in m.group(4)
-    # The same line goes to the journal under a stable tag.
-    assert any(t.startswith("logger -t tt-device-autoupdate -- ") and t.endswith(line) for t in trace), trace
+    # The same line goes to stderr, the reconcile unit's journal copy.
+    assert line in done.stderr.splitlines(), done.stderr
 
 
 def test_an_apply_that_stops_is_logged_as_failed(tmp_path):
@@ -425,10 +428,9 @@ def test_an_apply_that_stops_is_logged_as_failed(tmp_path):
     assert len(log) == 1 and "decision=failed" in log[0] and "exit 1" in log[0], log
 
 
-def test_the_log_is_kept_to_about_a_mebibyte(tmp_path):
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    (logs / "autoupdate.log").write_text("x" * 1048576)
-    done, _, log = _gate(tmp_path, health=[_health(held=True, age=60)])
-    assert len(log) == 1 and "decision=deferred" in log[0]
-    assert (logs / "autoupdate.log.1").stat().st_size == 1048576
+def test_the_log_is_rotated_by_logrotate_not_by_the_script():
+    # One rotation rule for every deploy-script log (spec 06 I10): autoupdate.log is in logrotate's
+    # stanza, and the script itself never caps or renames it.
+    text = _SCRIPT.read_text()
+    assert "1048576" not in text and ".log.1" not in text
+    assert "/var/log/tt-device-broker/autoupdate.log" in (_SCRIPT.parent / "tt-device-broker.logrotate").read_text()

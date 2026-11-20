@@ -9,7 +9,7 @@ import pytest
 
 import tt_device_mcp.health.evidence as health
 import tt_device_mcp.server as srv
-from tests.conftest import fsm_dirty
+from tests.conftest import JOB_LOG_NAME_NEAR_MISSES, fsm_dirty
 
 
 def _job_log(p, jid, owner, cmd, runtime):
@@ -1148,3 +1148,67 @@ def test_a_running_job_that_prints_the_cancel_marker_is_not_read_as_cancelled(mo
     assert row["status"] == "completed"
     assert row["wait"] == "1.0s"
     assert not row.get("cause"), row
+
+
+# Spec 01 Behavior — the job-log name is the ledger's key. `server.log`, the deploy-script logs and
+# every underscore-bearing near-miss (conftest's JOB_LOG_NAME_NEAR_MISSES) are nobody's job record:
+# no reader of the log dir sees them.
+_REAL_JOB_LOG = "2026-01-01_120000_007.log"
+
+
+def _job_shaped(jid: str) -> str:
+    """A footerless (interrupted-looking) job log body, so a reader that takes the file shows it."""
+    return f"JOB ID:      {jid}\nOWNER:       ghost\nCOMMAND:     echo boo\nQUEUED:      2026-01-01T12:00:00\n"
+
+
+def _seed_near_misses(d):
+    for name in JOB_LOG_NAME_NEAR_MISSES:
+        (d / name).write_text(_job_shaped("123" if name == "foo_123.log" else "7"))
+
+
+def test_recent_jobs_reads_only_names_matching_the_job_log_pattern(monkeypatch, tmp_path):
+    """`foo_123.log` and `x_2026-01-01_120000_7.log` carry job-shaped headers and would read as
+    interrupted jobs under `*.log` minus `server.log`; `reconcile.log` would the moment reconcile
+    writes it. None is a job. The one real log is."""
+    _seed_near_misses(tmp_path)
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    monkeypatch.setattr(srv, "jobs", {})
+
+    assert srv._recent_jobs(50) == [], "a near-miss was read as a job"
+
+    (tmp_path / _REAL_JOB_LOG).write_text(_job_shaped("007"))
+    recs = srv._recent_jobs(50)
+    assert [r["job_id"] for r in recs] == ["007"]
+    assert recs[0]["log_file"] == str(tmp_path / _REAL_JOB_LOG)
+
+
+def test_seed_job_counter_ignores_names_outside_the_job_log_pattern(monkeypatch, tmp_path):
+    """`foo_123.log` ends in `_123.log` — the id capture alone would reseed the counter to 123."""
+    _seed_near_misses(tmp_path)
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    monkeypatch.setattr(srv, "jobs", {})
+    monkeypatch.setattr(srv, "job_counter", 55)
+
+    srv.seed_job_counter()
+    assert srv.job_counter == 55, "a near-miss reseeded the counter"
+
+    (tmp_path / _REAL_JOB_LOG).write_text(_job_shaped("007"))
+    srv.seed_job_counter()
+    assert srv.job_counter == 7
+
+
+def test_recent_log_ids_never_blocks_an_id_for_a_name_outside_the_pattern(monkeypatch, tmp_path):
+    """The recent-window exclusion (01 I9) answers only to job logs: `foo_123.log` must not hold
+    id 123, and the real `_007.log` must."""
+    _seed_near_misses(tmp_path)
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+    monkeypatch.setattr(srv, "jobs", {})
+
+    assert srv.recent_log_ids() == frozenset(), "a near-miss blocked an id"
+    monkeypatch.setattr(srv, "job_counter", 122)
+    assert srv.next_job_id() == "123", "id 123 was skipped for foo_123.log"
+
+    (tmp_path / _REAL_JOB_LOG).write_text(_job_shaped("007"))
+    assert srv.recent_log_ids() == frozenset({"007"})
+    monkeypatch.setattr(srv, "job_counter", 6)
+    assert srv.next_job_id() == "008", "the real log's id must still be skipped"

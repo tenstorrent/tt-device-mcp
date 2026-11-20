@@ -76,6 +76,7 @@ _BASE = {
     "deploy/tt-device-reconcile.sh": "#!/bin/sh\n",
     "deploy/tt-device-client-setup.sh": "#!/bin/sh\n",
     "deploy/tt-device-eth-heartbeat-probe.py": "\n",
+    "deploy/tt-device-log.sh": "#!/bin/sh\n",
     "deploy/fabric-validator.pin": "PIN=1\n",
     "specs/08-deployment.md": "spec\n",
     "tests/test_x.py": "def test(): pass\n",
@@ -132,7 +133,7 @@ def _lap(box, sha, *, now=10_000, health=_HEALTHY, job_polls=0, stand_ins=""):
 ROOT={root}; CLONE={root}/src; clone={root}/src; STATE={root}/installed.sha; VENV={tmp}/venv
 BR=main; src_desc=test; TT_DEVICE_MCP_HEALTH_DIR={root}
 remote_sha={sha}
-log() {{  # "$* $(cat "$STATE")", read without a fork
+trace() {{  # "$* $(cat "$STATE")", read without a fork
     local _s=""
     if [ -f "$STATE" ] && [ -r "$STATE" ]; then
         IFS= read -r -d '' _s < "$STATE"
@@ -147,9 +148,9 @@ date() {{ echo {now}; }}
 chmod() {{ :; }}
 ls() {{ :; }}
 pgrep() {{ :; }}
-install() {{ log "stage $3"; }}
-bash() {{ log "host-config"; }}
-sleep() {{ log "sleep"; echo x >> {polls}; }}
+install() {{ trace "stage $3"; }}
+bash() {{ trace "host-config"; }}
+sleep() {{ trace "sleep"; echo x >> {polls}; }}
 job_running() {{  # fewer than {job_polls} lines in {polls}, counted without cat | wc
     local _n=0 _l
     if [ -f {polls} ]; then while IFS= read -r _l; do _n=$((_n + 1)); done < {polls}; fi
@@ -157,7 +158,7 @@ job_running() {{  # fewer than {job_polls} lines in {polls}, counted without cat
 }}
 systemctl() {{
     case "$*" in
-        restart*) log restart ;;
+        restart*) trace restart ;;
         is-active*) echo active ;;
         show*NRestarts*) echo 0 ;;
         show*MainPID*) echo 4242 ;;
@@ -249,7 +250,7 @@ def test_a_docs_tests_and_ci_only_update_moves_the_tree_and_installed_sha_with_n
     assert "broker not restarted" in done.stderr, done.stderr
     assert not (box["tmp"] / "root" / "last-apply").exists(), "a no-restart apply moved the rate limit"
     # The decision log (I22) records it as an apply, with both shas and no restart.
-    (logged,) = (box["tmp"] / "logs" / "autoupdate.log").read_text().splitlines()
+    (logged,) = [x for x in (box["tmp"] / "logs" / "autoupdate.log").read_text().splitlines() if "decision=" in x]
     assert "decision=applied" in logged and "no restart" in logged, logged
     assert f"old={box['installed']}" in logged and f"new={new}" in logged, logged
     (ev,) = events
@@ -309,7 +310,7 @@ def test_an_update_touching_anything_the_broker_uses_restarts(box, path):
 
 _UPDATER = "deploy/tt-device-autoupdate.sh"
 # Stages for real, so the test can read what landed in $ROOT.
-_REAL_INSTALL = 'install() { command install "$@" && log "stage $3"; }'
+_REAL_INSTALL = 'install() { command install "$@" && trace "stage $3"; }'
 
 
 def test_an_updater_only_update_stages_the_new_updater_and_does_not_restart(box):
@@ -325,7 +326,7 @@ def test_an_updater_only_update_stages_the_new_updater_and_does_not_restart(box)
     assert _installed(box) == new == _head(box)
     assert "broker not restarted; staged the new autoupdate.sh" in done.stderr, done.stderr
     assert not (box["tmp"] / "root" / "last-apply").exists(), "a no-restart apply moved the rate limit"
-    (logged,) = (box["tmp"] / "logs" / "autoupdate.log").read_text().splitlines()
+    (logged,) = [x for x in (box["tmp"] / "logs" / "autoupdate.log").read_text().splitlines() if "decision=" in x]
     assert "decision=applied" in logged and "no restart" in logged and "staged the new autoupdate.sh" in logged
     (ev,) = events
     assert ev["kind"] == "autoupdate_applied_no_restart" and ev["changed_paths"] == [_UPDATER]
@@ -504,7 +505,7 @@ def test_a_restart_caps_the_runtime_path_list(box):
     new = _push(box, files)
     done, _, _ = _lap(box, new)
     assert done.returncode == 0, done.stderr
-    (line,) = [x for x in done.stderr.splitlines() if x.startswith("autoupdate: restart needed:")]
+    (line,) = [x for x in done.stderr.splitlines() if " | autoupdate | restart needed:" in x]
     assert line.endswith("src/tt_device_mcp/m19.py and 3 more"), line
     assert "m20.py" not in line
 

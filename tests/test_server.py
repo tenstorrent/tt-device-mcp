@@ -14,7 +14,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from tests.conftest import patch_recovery
+import tt_device_mcp.server as srv
+from tests.conftest import JOB_LOG_NAME_NEAR_MISSES, patch_recovery
 from tt_device_mcp.constants import FABRIC_CHECK_CANNOT_CHECK_RC
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.fsm import ServerState
@@ -1077,3 +1078,79 @@ class TestStatistics:
         assert "utilization" in d["device"]
         assert "p50" in d["waits"]
         assert "p95" in d["waits"]
+
+
+# Spec 01 Behavior — the job-log name pattern is the only selector for the two readers that act on
+# what they match: the pre-down row consumer deletes it, the re-adoption lookup rebuilds a Job from it.
+# The near-misses they must leave alone are conftest's JOB_LOG_NAME_NEAR_MISSES.
+
+
+def _request_row(jid: str) -> str:
+    return (
+        f"JOB ID:      {jid}\nOWNER:       [broker]reboot-request\nWORKSPACE:   /\n"
+        f"COMMAND:     auto host reboot\nTIMEOUT:     1500s\nQUEUED:      2026-01-01T12:00:00\n"
+    )
+
+
+def test_consume_pre_down_escalation_row_leaves_names_outside_the_pattern_unread_and_undeleted(monkeypatch, tmp_path):
+    """Every near-miss carries the exact OWNER row the consumer deletes. A reader that took `*.log`
+    minus `server.log` would unlink `reconcile.log`; the pattern-keyed reader touches none of them
+    and still consumes the one real request row."""
+    for name in JOB_LOG_NAME_NEAR_MISSES:
+        (tmp_path / name).write_text(_request_row("7"))
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+
+    srv._consume_pre_down_escalation_row("reboot")
+    for name in JOB_LOG_NAME_NEAR_MISSES:
+        assert (tmp_path / name).exists(), f"{name} was deleted by the pre-down consumer"
+        assert (tmp_path / name).read_text() == _request_row("7"), f"{name} was altered"
+
+    real = tmp_path / "2026-01-01_120000_007.log"
+    real.write_text(_request_row("007"))
+    srv._consume_pre_down_escalation_row("reboot")
+    assert not real.exists(), "the real request row must still be consumed"
+    for name in JOB_LOG_NAME_NEAR_MISSES:
+        assert (tmp_path / name).exists(), f"{name} was deleted alongside the real row"
+
+
+def test_job_from_log_readopts_only_a_name_matching_the_pattern(monkeypatch, tmp_path):
+    """`x_2026-01-01_120000_7.log` ends in `_7.log` and `foo_123.log` in `_123.log`: the id glob
+    alone would rebuild a Job from either. The re-adoption lookup requires the full name."""
+    for name in JOB_LOG_NAME_NEAR_MISSES:
+        (tmp_path / name).write_text(_request_row("7"))
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+
+    assert srv._job_from_log("7") is None, "a near-miss was re-adopted as job 7"
+    assert srv._job_from_log("123") is None, "foo_123.log was re-adopted as job 123"
+    assert srv._job_from_log("007") is None
+
+    (tmp_path / "2026-01-01_120000_007.log").write_text(_request_row("007"))
+    job = srv._job_from_log("007")
+    assert job is not None and job.id == "007"
+    assert job.log_file == str(tmp_path / "2026-01-01_120000_007.log")
+
+
+def test_job_from_log_readopts_the_newest_of_two_logs_with_the_same_id(monkeypatch, tmp_path):
+    """Ids wrap at JOB_ID_MODULUS and job logs live 30 days, so one id on disk twice is normal. The
+    scope being re-adopted is the newer job's; rebuilding the older one's command, owner and deadline
+    over it would be wrong in every field."""
+    old, new = tmp_path / "2026-01-01_120000_007.log", tmp_path / "2026-02-01_120000_007.log"
+    old.write_text("JOB ID:      007\nOWNER:       alice\nCOMMAND:     old command\nTIMEOUT:     60s\n")
+    new.write_text("JOB ID:      007\nOWNER:       bob\nCOMMAND:     new command\nTIMEOUT:     900s\n")
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+
+    job = srv._job_from_log("007")
+    assert job is not None and job.log_file == str(new)
+    assert (job.owner, job.command) == ("bob", "new command")
+
+
+def test_consume_pre_down_escalation_row_removes_only_the_newest_request_row(monkeypatch, tmp_path):
+    """The row to consume is the one the escalation that just took the box down wrote: the newest.
+    An older stranded request row is a different escalation's record and stays."""
+    old, new = tmp_path / "2026-01-01_120000_007.log", tmp_path / "2026-02-01_120000_008.log"
+    old.write_text(_request_row("007"))
+    new.write_text(_request_row("008"))
+    monkeypatch.setattr(srv, "job_log_dir", tmp_path)
+
+    srv._consume_pre_down_escalation_row("reboot")
+    assert not new.exists() and old.exists()

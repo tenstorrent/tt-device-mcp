@@ -25,6 +25,8 @@ After=multi-user.target
 
 [Service]
 Type=simple
+# A stated mode, not an inherited umask (spec 06 I9): what this unit writes is 0644 in 0755.
+UMask=0022
 # -a: all CPUs (a bus lock on any core can hang that core)
 # -I 60000: emit a count every 60s, so the record survives an ungraceful power loss
 ExecStart=/bin/sh -c 'exec perf stat -a -e ls_locks.bus_lock -I 60000 \

@@ -18,6 +18,8 @@ Type=oneshot
 Nice=19
 IOSchedulingClass=idle
 TimeoutStartSec=7200
+# A stated mode, not an inherited umask (spec 08): what this unit writes is 0644 in 0755.
+UMask=0022
 ExecStart=/opt/tt-device-broker/install-fabric-validator.sh /opt/tt-device-broker/fabric-validator.pin
 RemainAfterExit=no
 

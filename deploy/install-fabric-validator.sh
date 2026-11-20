@@ -17,11 +17,22 @@
 # The whole checkout+build tree is kept, not just the binary: run_cluster_validation has an
 # RPATH into the build tree (libtt_metal, libtt-umd, libtt_stl, libtracy) and resolves its
 # kernels from the runtime root, so a lone binary is useless.
+#
+# Progress and verdicts go through log.sh as `fabric-validator` (spec 06 I10): the helper is
+# staged beside this script under $TTDEV_ROOT, so it is found by adjacency — this script sources
+# only its pin and has no TTDEV_ROOT of its own. The build tool's own output is NOT relayed into
+# fabric-validator.log: each cmake step is tee'd to build.log in the slot being built ($BUILD, and to
+# stderr, so the journal copy is unchanged), and the stage lines below name that path.
 set -euo pipefail
+# Without the helper (a checkout run, or an upgrade that staged this script first) `log` degrades
+# to stderr only, the contract log.sh itself keeps for an unwritable log dir.
+. "$(dirname "$(readlink -f "$0")")/log.sh" 2>/dev/null \
+    || log() { printf '%s | %s | %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')" "${TTDEV_LOG_NAME:-unnamed}" "$*" >&2 || true; }
+TTDEV_LOG_NAME=fabric-validator
 
 # `<pin> --key` prints the pin's prefix name (see PREFIX below) and builds nothing.
 PIN="${1:-/opt/tt-device-broker/fabric-validator.pin}"
-[ -r "$PIN" ] || { echo "install-fabric-validator: no pin at $PIN" >&2; exit 1; }
+[ -r "$PIN" ] || { log "no pin at $PIN"; exit 1; }
 # shellcheck disable=SC1090
 . "$PIN"
 
@@ -35,7 +46,7 @@ PATCHES=()
 PIN_DIR="$(cd -- "$(dirname -- "$PIN")" && pwd)"
 for p in ${TTDEV_VALIDATOR_PATCHES:-}; do
     p="$PIN_DIR/$p"
-    [ -r "$p" ] || { echo "install-fabric-validator: pinned patch $p missing" >&2; exit 1; }
+    [ -r "$p" ] || { log "pinned patch $p missing"; exit 1; }
     PATCHES+=("$p")
 done
 KEY="$SHA"
@@ -45,16 +56,32 @@ PREFIX="$ROOT/$KEY"
 CURRENT="$ROOT/current"
 LOCK="$ROOT/.build.lock"
 
-log() { echo "fabric-validator: $*" >&2; }
-
 mkdir -p "$ROOT"
 # One build at a time. Two concurrent tt-metal builds in the same tree corrupt it, and the
-# reconcile timer can fire again long before a build finishes.
+# reconcile timer can fire again long before a build finishes. The lock is PRIVATE (0600) on
+# purpose, for the broker's local-reset lock's reason (spec 06 I9): flock takes LOCK_EX on a
+# read-only descriptor, so a 0644 lock in a 0755 directory would let any local user hold it and
+# stall every build behind "another build is already running". Created at mode and re-asserted
+# every run, which also brings a lock an earlier run left at the umask's mode to 0600 (spec 08).
+[ -e "$LOCK" ] || install -m 0600 /dev/null "$LOCK"
+chmod 0600 "$LOCK"
 exec 9>"$LOCK"
 if ! flock -n 9; then
     log "another build is already running; nothing to do"
     exit 0
 fi
+
+# Modes first, before the early exit below: the unit's UMask=0022 covers only what THIS run
+# creates, and a prefix an earlier run made under a strict umask is 0700 with its transcript
+# unreachable inside — and nothing below runs for a pin that is already built (spec 08).
+# Every pin's prefix, not only the current one: an older transcript is still the record of how
+# that build went, and nothing else ever revisits it.
+chmod 0755 "$ROOT"
+for prefix in "$ROOT"/*/; do
+    [ -d "$prefix" ] || continue
+    chmod 0755 "$prefix"
+    if [ -f "$prefix/build.log" ]; then chmod 0644 "$prefix/build.log"; fi
+done
 
 # All three binaries, or a prefix is not done. Checking only the validator would leave a host that
 # was built before the dispatch probe existed reporting "already built" forever, and the fabric
@@ -109,7 +136,7 @@ case "$CUR_REAL" in
         ;;
 esac
 
-log "building validator from tt-metal $SHA in $BUILD (this takes tens of minutes; the fabric check reports CANNOT CHECK until it lands)"
+log "building validator from tt-metal $SHA in $BUILD; cmake transcript in $BUILD/build.log (this takes tens of minutes; the fabric check reports CANNOT CHECK until it lands)"
 
 if [ ! -d "$BUILD/.git" ]; then
     rm -rf "$BUILD"
@@ -117,6 +144,11 @@ if [ ! -d "$BUILD/.git" ]; then
     git -C "$BUILD" init -q
     git -C "$BUILD" remote add origin "$TTDEV_VALIDATOR_REPO"
 fi
+# One transcript per attempt, at a stated mode (spec 08): the previous attempt's is kept as
+# build.log.prev, the record of the failure this retry follows, and anything older is dropped, so
+# the hourly retry of a pin that keeps failing cannot fill the disk.
+[ ! -e "$BUILD/build.log" ] || mv -f "$BUILD/build.log" "$BUILD/build.log.prev"
+install -m 0644 /dev/null "$BUILD/build.log"
 git -C "$BUILD" fetch -q --depth 1 origin "$SHA"
 # -f: a retry finds the previous attempt's patches applied, and they must apply to a clean tree.
 git -C "$BUILD" checkout -q -f --detach FETCH_HEAD
@@ -150,10 +182,13 @@ rm -rf "$BUILD/build" "$BUILD/.cpmcache"
 command -v ninja >/dev/null || { log "ninja is required to build tt-metal and is not installed"; exit 1; }
 # BUILD_PROGRAMMING_EXAMPLES is off by default and the dispatch probe is one of them: without it
 # the target is not configured at all and the build fails with "no rule to make target".
+# Both cmake steps: the transcript lands in $BUILD/build.log and every line still reaches stderr
+# (hence the journal). `set -o pipefail` above keeps a failing cmake the pipeline's failure, so
+# `set -e` still aborts the build on it; tee's own exit never masks it.
 cmake -S "$BUILD" -B "$BUILD/build" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
     -DBUILD_PROGRAMMING_EXAMPLES=ON \
-    -DCMAKE_BUILD_TYPE=Release >&2
+    -DCMAKE_BUILD_TYPE=Release 2>&1 | tee -a "$BUILD/build.log" >&2
 
 # tt-metal's hw_toolchain writes its linker scripts into the SOURCE tree, but for the
 # wormhole/erisc scripts it creates the output directory with a path relative to the
@@ -166,15 +201,15 @@ archs="$(sed -n '/^set(ARCHS/,/^)/p' "$BUILD/tt_metal/hw/CMakeLists.txt" | sed -
 for arch in $archs; do
     mkdir -p "$BUILD/runtime/hw/toolchain/$arch"
 done
-log "prepared runtime/hw/toolchain for: $(echo $archs | tr '\n' ' ')"
+log "prepared runtime/hw/toolchain for: ${archs//$'\n'/ }"
 
 # Named targets only — a full tt-metal build is far more than we need.
 cmake --build "$BUILD/build" \
     --target "$TTDEV_VALIDATOR_TARGET" "$TTDEV_DISPATCH_TARGET" "$TTDEV_PREJOB_DISPATCH_TARGET" \
-    -j "$(nproc)" >&2
+    -j "$(nproc)" 2>&1 | tee -a "$BUILD/build.log" >&2
 
 for rel in "$TTDEV_VALIDATOR_BIN_REL" "$TTDEV_DISPATCH_BIN_REL" "$TTDEV_PREJOB_DISPATCH_BIN_REL"; do
-    [ -x "$BUILD/$rel" ] || { log "build finished but $rel is missing"; exit 1; }
+    [ -x "$BUILD/$rel" ] || { log "build finished but $rel is missing (transcript: $BUILD/build.log)"; exit 1; }
 done
 
 flip "$BUILD"

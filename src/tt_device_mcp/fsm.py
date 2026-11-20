@@ -56,6 +56,7 @@ from tt_device_mcp.health import (
     cpld_dump,
 )
 from tt_device_mcp.telemetry import CheckAerWatch, TelemetrySampler
+from tt_device_mcp.utils import open_readable, readable_mkdir
 
 if TYPE_CHECKING:
     from tt_device_mcp.health import HealthState, Recovery
@@ -487,8 +488,10 @@ class ServerFsm:
         }
         tmp = self._path.with_name(f"{self._path.name}.{os.getpid()}.tmp")
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            with open(tmp, "w", encoding="utf-8") as f:
+            readable_mkdir(self._path.parent)
+            # Created at mode: it travels with the inode, so fsm.json is 0644 the instant it
+            # appears under its real name (spec 06 I9).
+            with open_readable(tmp, "w", encoding="utf-8") as f:
                 f.write(json.dumps(payload, default=str))
                 f.flush()
                 os.fsync(f.fileno())

@@ -496,3 +496,39 @@ def test_the_per_user_daemon_redirects_the_device_op_lock(monkeypatch, tmp_path)
     monkeypatch.delenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", raising=False)
     env = _capture_daemon_env(monkeypatch, tmp_path)
     assert env.get("TT_DEVICE_MCP_DEVICE_OP_LOCK") == str(tmp_path / "device-op.lock")
+
+
+def test_daemon_start_redirects_the_child_to_daemon_log_and_leaves_server_log_to_the_logger(monkeypatch, tmp_path):
+    """Spec 07 / 06 I10: `daemon start` keeps capturing the child's stdout and stderr into
+    `<state>/daemon.log` — the stderr copy plus anything said before logging exists (an import
+    error, a bad argv) — while `<state>/server.log` is the logger's own file, named only through
+    `--log-dir`. Popen is stubbed: nothing is spawned."""
+    captured = {}
+
+    class _Proc:
+        pid = 4321
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["stdout_name"] = kwargs["stdout"].name
+        captured["same_handle"] = kwargs["stderr"] is kwargs["stdout"]
+        captured["mode"] = kwargs["stdout"].mode
+        return _Proc()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(cli, "is_daemon_running", lambda *a, **k: False)
+    monkeypatch.setattr(cli.time, "sleep", lambda *_a: None)
+    monkeypatch.setattr(cli.os, "kill", lambda *_a: None)
+    install_dir = tmp_path / "install"
+    install_dir.mkdir()
+    monkeypatch.setenv("TT_DEVICE_MCP_INSTALL_DIR", str(install_dir))
+
+    cli.cmd_daemon_start(argparse.Namespace(log_dir=str(tmp_path), port=None))
+
+    assert captured["stdout_name"] == str(tmp_path / "daemon.log")
+    assert captured["same_handle"], "stdout and stderr share the one daemon.log handle"
+    assert captured["mode"] == "a", "appended, so a restart's first words do not erase the last crash"
+    assert (tmp_path / "daemon.log").exists()
+    assert not (tmp_path / "server.log").exists(), "server.log is the logger's to create, not the spawner's"
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--log-dir") + 1] == str(tmp_path), "the logger is pointed at the same state dir"

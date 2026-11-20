@@ -24,8 +24,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from tt_device_mcp.constants import user_state_dir
+from tt_device_mcp.constants import SYSTEM_HEALTH_DIR, user_state_dir
 from tt_device_mcp.health.monitors import pci
+from tt_device_mcp.utils import open_readable, readable_mkdir, write_text_readable
 
 
 def _default_health_dir() -> Path:
@@ -43,7 +44,7 @@ def _default_health_dir() -> Path:
     if override:
         return Path(override)
     if os.geteuid() == 0:
-        return Path("/var/lib/tt-device-broker/health")
+        return Path(SYSTEM_HEALTH_DIR)
     return user_state_dir() / "health"
 
 
@@ -73,14 +74,14 @@ def _append_durable(path: Path, rec: dict, max_bytes: int) -> bool:
     written must not take the broker down with it.
     """
     try:
-        HEALTH_DIR.mkdir(parents=True, exist_ok=True)
+        readable_mkdir(HEALTH_DIR)
         # Roll before writing, so the cap holds even if the process dies mid-append.
         try:
             if path.stat().st_size >= max_bytes:
                 path.replace(path.with_suffix(path.suffix + ".1"))
         except OSError:
             pass
-        with open(path, "a", encoding="utf-8") as f:
+        with open_readable(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, default=str) + "\n")
             f.flush()
             os.fsync(f.fileno())
@@ -424,8 +425,8 @@ def previous_boot_bus_locks() -> Optional[int]:
 def mark_boot(boot_id: str) -> None:
     """Separate this boot's bus-lock counts from the previous boot's."""
     try:
-        HEALTH_DIR.mkdir(parents=True, exist_ok=True)
-        with open(HEALTH_DIR / BUSLOCK_FILE, "a", encoding="utf-8") as f:
+        readable_mkdir(HEALTH_DIR)
+        with open_readable(HEALTH_DIR / BUSLOCK_FILE, "a", encoding="utf-8") as f:
             f.write(f"{_BOOT_MARK}{boot_id} {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
             f.flush()
             os.fsync(f.fileno())
@@ -486,7 +487,7 @@ def capture_incident(
     jid = (job or {}).get("id", "none")
     root = HEALTH_DIR / INCIDENTS_DIR / f"{stamp}_{label}_{jid}"
     try:
-        root.mkdir(parents=True, exist_ok=True)
+        readable_mkdir(root)  # the bundle, and incidents/ itself when this is the first one
 
         # The evidence lanes are the caller's verdicts, sampled BEFORE the fault was discovered —
         # they can lag the live bus (a heartbeat lane that read 8/8 seconds before a chip left).
@@ -512,24 +513,25 @@ def capture_incident(
             else:
                 meta["fabric_output"] = {"at": at_iso, "stale": False}
                 fabric_header = f"# fabric check run started {at_iso}\n"
-        (root / "incident.json").write_text(json.dumps(meta, indent=2, default=str))
+        write_text_readable(root / "incident.json", json.dumps(meta, indent=2, default=str))
 
         # The kernel's view — the piece that a reboot destroys and that nobody has had.
-        (root / "kernel.log").write_text(_kernel_evidence())
+        write_text_readable(root / "kernel.log", _kernel_evidence())
 
         if trace:
-            (root / "telemetry_trace.json").write_text(
+            write_text_readable(
+                root / "telemetry_trace.json",
                 json.dumps(
                     {"fields": pci.SAMPLE_FIELDS, "interval_sec": pci.SAMPLE_INTERVAL_SEC, "samples": trace},
                     default=str,
-                )
+                ),
             )
         if job_log and job_log.exists():
-            (root / "job.log").write_text(_tail_text(job_log, job_log_bytes))
+            write_text_readable(root / "job.log", _tail_text(job_log, job_log_bytes))
         if reset_output:
-            (root / "reset.log").write_text(reset_output)
+            write_text_readable(root / "reset.log", reset_output)
         if fabric_output:
-            (root / "fabric.log").write_text(fabric_header + fabric_output)
+            write_text_readable(root / "fabric.log", fabric_header + fabric_output)
 
         # The open episode's CPLD dump, if it has started: linked both ways (spec 04 I109).
         from tt_device_mcp.health import cpld_dump

@@ -106,7 +106,10 @@ systemctl() {{ echo "$*" >> {calls}; }}
         env={**_GIT_ENV, "HOME": str(tmp), "TTDEV_LOG_DIR": str(tmp / "logs")},
     )
     m = re.search(r"^RESOLVED=(\S*)$", done.stdout, re.M)
-    lines = [x for x in done.stderr.splitlines() if x.startswith("autoupdate:")]
+    # What autoupdate said on stderr, less log.sh's stamp and name; its decision records (I22) are
+    # asserted from autoupdate.log.
+    said = [x.split(" | autoupdate | ", 1)[1] for x in done.stderr.splitlines() if " | autoupdate | " in x]
+    lines = [x for x in said if not x.startswith("decision=")]
     sysctl = calls.read_text().splitlines() if calls.exists() else []
     return done.returncode, m.group(1) if m else None, lines, sysctl
 
@@ -187,11 +190,11 @@ def test_a_mirror_without_the_branch_does_not_fall_back_to_the_public_repo(box):
     _make_mirror(box, branch="other")
     rc, sha, lines, _ = _lap(box)
     assert (rc, sha) == (0, None)
-    assert lines == [f"autoupdate: cannot clone file://{box['root']}/mirror.git (main)"]
+    assert lines == [f"cannot clone file://{box['root']}/mirror.git (main)"]
     _lap(box, root_uid=os.getuid() + 1)  # a clone from the public repo, then a valid mirror again
     rc, sha, lines, _ = _lap(box)
     assert (rc, sha) == (0, None)
-    assert lines[-1] == f"autoupdate: cannot reach file://{box['root']}/mirror.git", lines
+    assert lines[-1] == f"cannot reach file://{box['root']}/mirror.git", lines
 
 
 # --- an unreachable source is said once per outage --------------------------------------------
@@ -206,13 +209,13 @@ def test_an_unreachable_source_is_logged_once_over_five_laps_then_reachable_agai
         assert (rc, sha, calls) == (0, None, []), "a failed fetch made a side effect"
         said += lines
     assert said == [
-        f"autoupdate: source file://{box['public']} -> file://{gone}",
-        f"autoupdate: cannot reach file://{gone}",
+        f"source file://{box['public']} -> file://{gone}",
+        f"cannot reach file://{gone}",
     ]
     box["public"].rename(gone)
     rc, sha, lines, _ = _lap(box, now=10_000 + 60 * 5, repo=gone)
     assert (rc, sha) == (0, box["pub"])
-    assert lines == [f"autoupdate: file://{gone} reachable again after 300s"]
+    assert lines == [f"file://{gone} reachable again after 300s"]
     rc, sha, lines, _ = _lap(box, now=10_000 + 60 * 6, repo=gone)
     assert (rc, sha, lines) == (0, box["pub"], [])
     assert not (box["root"] / ".source-unreachable").exists()
@@ -226,7 +229,7 @@ def test_a_missing_branch_is_logged_once_per_outage(box):
         rc, sha, lines, calls = _lap(box, now=10_000 + 60 * i, branch="nobranch")
         assert (rc, sha, calls) == (0, None, [])
         said += lines
-    assert said == [f"autoupdate: cannot reach file://{box['public']}"]
+    assert said == [f"cannot reach file://{box['public']}"]
 
 
 def test_a_failed_fetch_takes_no_hold_and_restarts_nothing():
