@@ -30,7 +30,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from tt_device_mcp.health.monitors.subproc import Terminate, Track, run_probe
+from tt_device_mcp.health.monitors.subproc import Abort, Terminate, Track, run_probe
 
 # The validator's own throw when generate_link_metrics finds a bad link under --hard-fail. This
 # is the ONE place a board reset can act on: every other non-zero exit means the validator never
@@ -173,12 +173,9 @@ def names_links_missing(text: str) -> bool:
 
 
 def links_missing(marker: str) -> str:
-    """The FAILED detail for a topology marker whose descriptor ports are missing, else "".
-
-    A moved tray renames its links (as many extra as missing, I42) and stays a lift. More missing
-    than extra means links are gone (I71)."""
+    """The FAILED detail when the marker names any missing descriptor port (I71), else ""."""
     m = _MARKER_COUNTS.search(marker or "")
-    if not m or int(m.group(1)) <= int(m.group(2)):
+    if not m or int(m.group(1)) <= 0:
         return ""
     missing, extra = int(m.group(1)), int(m.group(2))
     names = marker_ports(marker)[0]
@@ -198,10 +195,8 @@ def marker_counts(text: str) -> tuple[int, int]:
 
 
 def missing_cables(marker: str) -> int:
-    """How many port/cable connections a topology marker names missing with none extra, else 0.
-
-    A moved tray renames its links, so it shows extra connections beside the missing ones; missing
-    links with nothing extra are cables that are absent or dead, which no reset can bring back."""
+    """How many port/cable connections a topology marker names missing with none extra, else 0:
+    cables that are absent or dead, which no reset can bring back (I47)."""
     m = _MARKER_COUNTS.search(marker or "")
     if not m or int(m.group(2)):
         return 0
@@ -443,6 +438,7 @@ async def check(
     track: Track,
     terminate: Terminate,
     cwd: Optional[str] = None,
+    abort: Optional[Abort] = None,
 ) -> tuple[Optional[int], str]:
     """Run an already-built fabric command (see ``build_command()``) and return ``(rc, output)``.
 
@@ -463,6 +459,14 @@ async def check(
     ``os.environ`` and the broker's own process may already have that variable set.
     """
     rc, raw = await run_probe(
-        argv, timeout_sec=timeout_sec, track=track, stream=True, env=env, cwd=cwd, terminate=terminate, name="fabric"
+        argv,
+        timeout_sec=timeout_sec,
+        track=track,
+        stream=True,
+        env=env,
+        cwd=cwd,
+        terminate=terminate,
+        name="fabric",
+        abort=abort,
     )
     return rc, raw.decode("utf-8", "replace").strip()
