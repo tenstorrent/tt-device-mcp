@@ -173,11 +173,7 @@ def names_links_missing(text: str) -> bool:
 
 
 def links_missing(marker: str) -> str:
-    """The FAILED detail for a topology marker whose descriptor ports are missing, else "".
-
-    A moved tray renames its links (as many extra as missing, I42) and stays a lift. Any missing
-    at all is a failed check (I71): extras elsewhere never hide a lost link, so a box with more
-    cables than its descriptor cannot pass a short fabric off as a relabelling."""
+    """The FAILED detail when the marker names any missing descriptor port (I71), else ""."""
     m = _MARKER_COUNTS.search(marker or "")
     if not m or int(m.group(1)) <= 0:
         return ""
@@ -199,10 +195,8 @@ def marker_counts(text: str) -> tuple[int, int]:
 
 
 def missing_cables(marker: str) -> int:
-    """How many port/cable connections a topology marker names missing with none extra, else 0.
-
-    A moved tray renames its links, so it shows extra connections beside the missing ones; missing
-    links with nothing extra are cables that are absent or dead, which no reset can bring back."""
+    """How many port/cable connections a topology marker names missing with none extra, else 0:
+    cables that are absent or dead, which no reset can bring back (I47)."""
     m = _MARKER_COUNTS.search(marker or "")
     if not m or int(m.group(2)):
         return 0

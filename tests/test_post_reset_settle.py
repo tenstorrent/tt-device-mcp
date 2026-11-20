@@ -76,33 +76,14 @@ def test_settle_left(reset_at, now, served, want):
     assert d.settle_left(POST_RESET_SETTLE_SEC, now=now) == 0.0, "nothing owed waits for nothing"
 
 
-@pytest.mark.parametrize("uptime", ["40.0 100.0\n", "86400.0 1.0\n"])
-def test_a_broker_start_owes_the_pass_and_never_the_settle(monkeypatch, tmp_path, uptime):
-    """Spec 04 I32: the boot itself settled the mesh, so a broker start's debt owes the startup
-    fabric pass but no POST_RESET_SETTLE_SEC wait — whatever the uptime."""
-    f = tmp_path / "uptime"
-    f.write_text(uptime)
-    monkeypatch.setattr(post_reset, "_UPTIME", str(f))
+def test_a_broker_start_owes_the_pass_and_never_the_settle():
+    """Spec 04 I32: a broker start's debt has no reset time, so it owes the startup fabric pass but
+    no POST_RESET_SETTLE_SEC wait; a real reset after it still settles."""
     d = FabricDebt()
-    d.note_reset("broker start", lambda *a, **k: None, at=post_reset.boot_monotonic())
+    d.note_reset("broker start", lambda *a, **k: None, at=0.0)
     assert d.owed == "broker start" and d.settle_left(POST_RESET_SETTLE_SEC) == 0.0
-
-
-def test_a_real_reset_after_a_broker_start_still_settles(monkeypatch, tmp_path):
-    """The settle exemption covers only the broker start's own debt: a real reset after it keeps
-    the settle."""
-    f = tmp_path / "uptime"
-    f.write_text("40.0 100.0\n")
-    monkeypatch.setattr(post_reset, "_UPTIME", str(f))
-    d = FabricDebt()
-    d.note_reset("broker start", lambda *a, **k: None, at=post_reset.boot_monotonic())
-    d.note_reset("tt-smi -glx_reset", lambda *a, **k: None, at=post_reset.boot_monotonic() + 5.0)
+    d.note_reset("tt-smi -glx_reset", lambda *a, **k: None)
     assert d.settle_left(POST_RESET_SETTLE_SEC) > 0.0, "a real reset still settles"
-
-
-def test_an_unreadable_uptime_reads_as_unknown(monkeypatch, tmp_path):
-    monkeypatch.setattr(post_reset, "_UPTIME", str(tmp_path / "missing"))
-    assert post_reset.boot_monotonic() == 0.0
 
 
 # ---- the gate ----
