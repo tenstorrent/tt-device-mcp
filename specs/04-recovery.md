@@ -1418,9 +1418,9 @@ each rung fires only when the gentler one failed or cannot apply.
   opted out (`TT_DEVICE_MCP_AUTO_POWER_CYCLE=0`), or not fireable on this server (no reset or
   power-cycle rights: no ipmitool or no openable `/dev/ipmi*`, e.g. a per-user server), the hold pages
   `hold_bound_no_host_rung` once per episode, its `why` naming which. A server without those rights
-  that did not opt out says so, never as an operator opt-out: a `BOOT recovery unavailable` warning
-  with the rung inventory, `/health` `recovery_unavailable` (its cause; null where the host rung can
-  fire or the operator opted out) and the same field in `hold_bound`. The hold stays; the bound
+  that did not opt out says so, never as an operator opt-out: the `RUNG OFF auto-power-cycle`
+  line in the boot rung inventory and `/health` `recovery_unavailable` (its cause; null where the host
+  rung can fire or the operator opted out). The hold stays; the bound
   still runs the ladder and its full check, and only a pass releases. The operator kill switch
   `TT_DEVICE_MCP_FORCE_ESCALATE=0` turns off only the forced runs below the bound; the bound's ladder
   and host rung ignore it, no env or config switches the bound off, and the boot rung inventory's

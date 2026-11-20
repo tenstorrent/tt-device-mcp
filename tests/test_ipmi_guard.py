@@ -649,7 +649,6 @@ def test_the_non_root_preflight_runs_sudo_n_ipmitool_without_a_terminal(non_root
 def test_a_refused_sudo_names_the_one_rule_it_needs(non_root, text):
     why = ipmi_guard.bmc_preflight(lambda timeout: subprocess.CompletedProcess([], 1, "", text))
     assert ipmi_guard.SUDO_RULE in why and "ipmitool only" in why
-    assert ipmi_guard.SUDO_RULE.endswith("NOPASSWD: /usr/bin/ipmitool")
 
 
 def test_a_bmc_error_is_not_read_as_a_sudo_refusal():

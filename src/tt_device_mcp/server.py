@@ -4635,12 +4635,9 @@ def log_rung_inventory() -> None:
     priv = privileges.snapshot()
     logger.info(
         "BOOT privilege: euid={euid} root={root} systemd={systemd} setpci_bin={setpci_bin} "
-        "ipmitool={ipmitool} ipmi_node={ipmi_node} ipmi_sudo={ipmi_sudo}".format(**{"ipmi_sudo": False, **priv})
+        "ipmitool={ipmitool} ipmi_node={ipmi_node} ipmi_sudo={ipmi_sudo}".format(**priv)
     )
     logger.info("RUNG INVENTORY: " + ", ".join(f"{name}={'on' if on else 'OFF'}" for name, on, _ in rungs))
-    unavailable = _recovery_unavailable()
-    if unavailable:
-        logger.warning(f"BOOT {unavailable}: a hold past its 10-min bound gets the ladder and no power cycle")
     for name, on, why in rungs:
         # eth states its own reason in the self-test — but that only runs on the privsep path, so
         # elsewhere the inventory is the only place its OFF is ever explained.
@@ -10490,9 +10487,6 @@ def _hold_bound_health(now: Optional[datetime] = None) -> Optional[dict]:
         out["blocked_by"] = _describe_bound_blocker(_hold_bound_tenant_blocker)
     if cooling:
         out["cooldown_until"] = datetime.fromtimestamp(cd["until"]).isoformat(timespec="seconds")
-    unavailable = _recovery_unavailable()
-    if unavailable:
-        out["recovery_unavailable"] = unavailable  # the host rung next_step names cannot fire here
     return out
 
 

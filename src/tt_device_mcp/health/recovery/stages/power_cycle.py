@@ -15,6 +15,7 @@ import tempfile
 import time
 from typing import Callable, Optional
 
+from tt_device_mcp import privileges
 from tt_device_mcp.health.evidence import health_dir, health_event
 from tt_device_mcp.health.recovery import ipmi_guard
 from tt_device_mcp.health.recovery import power_cycle_reason as _reason_record
@@ -714,7 +715,7 @@ def fire_os_first(argv: list, reason: PowerCycleReason, timeout: float = DEFAULT
     reason = PowerCycleReason.require(reason)
     argv = [str(a) for a in argv]
     why = os_first_unavailable()
-    if not ipmi_guard.is_root():
+    if not privileges.is_root():
         why = "the OS-first power cycle needs root (it writes a root-owned request file and starts a system unit)"
     if not why and (not argv or any("\n" in a for a in argv)):
         why = "the power-cycle argv cannot be passed to the shutdown hook"

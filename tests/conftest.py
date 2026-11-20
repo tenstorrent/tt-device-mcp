@@ -34,7 +34,7 @@ from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health import shutdown as health_shutdown
 from tt_device_mcp.health.core import HealthState
 from tt_device_mcp.health.monitor import HealthMonitor
-from tt_device_mcp.health.monitors import eth, fabric, heartbeat, pci
+from tt_device_mcp.health.monitors import eth, heartbeat, pci
 from tt_device_mcp.health.recovery import RecoveryDeps, offbus_power_cycle, pcie_guard
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy as recovery_galaxy
@@ -485,8 +485,6 @@ def _seal_real_hardware(monkeypatch, tmp_dirs):
     # A fabric check stops the host's device readers first (a real `systemctl stop`, which the spawn
     # tripwire refuses off the marker). A test of that quiesce sets its own.
     monkeypatch.setattr(srv._recovery_deps, "quiesce_readers", None)
-    # The suite models the root broker whatever uid runs it; the non-root scratch paths have their own tests.
-    monkeypatch.setattr(fabric, "_is_root", lambda: True)
     monkeypatch.delenv("TTDEV_FABRIC_BIN", raising=False)
     monkeypatch.delenv("TTDEV_FABRIC_RUNTIME_ROOT", raising=False)
     monkeypatch.delenv("TTDEV_FABRIC_DESCRIPTOR", raising=False)

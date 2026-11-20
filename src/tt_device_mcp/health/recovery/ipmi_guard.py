@@ -277,8 +277,9 @@ def bmc_preflight(run: Optional[Callable[[float], subprocess.CompletedProcess]] 
     except OSError as exc:
         return f"`ipmitool mc info` could not run: {exc}"
     out = f"{res.stdout or ''}{res.stderr or ''}"
-    if res.returncode != 0 and sudo_refused(out):
-        return sudo_refused(out)
+    refused = sudo_refused(out) if res.returncode != 0 else ""
+    if refused:
+        return refused
     if res.returncode != 0:
         tail = " ".join(out.split())[-200:]
         return f"the BMC did not answer `ipmitool mc info` (exit {res.returncode}: {tail or 'no output'})"
@@ -420,8 +421,6 @@ def _prune_stale_shims(tmp_root: str, now: float) -> None:
     """Remove this user's guard copies left by earlier mesh resets: the wrapper execs into the reset and
     never comes back to remove its own. Only directories this euid owns with the shim prefix, and only
     once older than :data:`USER_SHIM_STALE_SEC`, so a reset still running keeps its copy."""
-    import shutil
-
     try:
         names = os.listdir(tmp_root)
     except OSError:

@@ -14,6 +14,7 @@ import pytest
 
 from tests.conftest import patch_health_event
 from tests.test_startup_fabric_hugepages import _validator
+from tt_device_mcp import privileges
 from tt_device_mcp import server as srv
 from tt_device_mcp.health.monitors import fabric
 
@@ -24,19 +25,8 @@ def _nonroot(tmp_path, monkeypatch):
     (current / "generated").mkdir()
     monkeypatch.delenv("TTDEV_FABRIC_CACHE", raising=False)
     monkeypatch.setenv("TT_DEVICE_MCP_STATE_DIR", str(tmp_path / "state"))
-    monkeypatch.setattr(fabric, "_is_root", lambda: False)
+    monkeypatch.setattr(privileges, "_LATCHED", {**privileges._state(), "root": False})
     return current
-
-
-class _Warned:
-    def __init__(self, into):
-        self.into = into
-
-    def warning(self, m, *a, **k):
-        self.into.append(m)
-
-    def __getattr__(self, _):
-        return lambda *a, **k: None
 
 
 async def _noop(pid):
@@ -96,7 +86,7 @@ def test_nonroot_unwritable_state_fails_closed_without_starting(tmp_path, monkey
 def test_root_path_unchanged(tmp_path, monkeypatch):
     """root-path-unchanged: a root broker runs from the pinned tree with no scratch and no logs override."""
     current = _nonroot(tmp_path, monkeypatch)
-    monkeypatch.setattr(fabric, "_is_root", lambda: True)
+    monkeypatch.setattr(privileges, "_LATCHED", {**privileges._state(), "root": True})
     monkeypatch.setenv("TTDEV_FABRIC_CACHE", str(tmp_path / "cache"))
     _, env = fabric.build_command()
     assert env["TT_METAL_RUNTIME_ROOT"] == env["TT_METAL_HOME"] == str(current)
@@ -148,10 +138,6 @@ def test_no_rights_is_reported_at_startup_health_and_hold_bound(monkeypatch):
     monkeypatch.setattr(srv, "_auto_power_cycle_enabled", lambda: False)
     why = srv._recovery_unavailable()
     assert why.startswith(srv.RECOVERY_UNAVAILABLE)
-    warned = []
-    monkeypatch.setattr(srv, "logger", _Warned(warned))
-    srv.log_rung_inventory()
-    assert any(srv.RECOVERY_UNAVAILABLE in m for m in warned)
     events, lines = [], []
     patch_health_event(monkeypatch, lambda kind, **kw: events.append((kind, kw)))
     monkeypatch.setattr(srv.recovery_mechanism, "scope_active", lambda: False)

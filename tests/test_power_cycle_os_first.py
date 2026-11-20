@@ -640,9 +640,9 @@ def test_a_bmc_that_fails_the_preflight_never_reboots(os_first, rc):
 
 def test_a_non_root_server_never_starts_the_os_first_cycle(os_first, monkeypatch):
     """Spec 04 I115/I14: the request file under /run and the system unit need root, whatever sudo allows."""
-    from tt_device_mcp.health.recovery import ipmi_guard
+    from tt_device_mcp import privileges
 
-    monkeypatch.setattr(ipmi_guard, "is_root", lambda: False)
+    monkeypatch.setattr(privileges, "_LATCHED", {**privileges._state(), "root": False})
     assert "needs root" in _not_launched(os_first)
     assert _steps(os_first) == []
 

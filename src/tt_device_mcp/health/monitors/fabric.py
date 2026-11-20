@@ -31,6 +31,7 @@ import resource
 from pathlib import Path
 from typing import Optional
 
+from tt_device_mcp import privileges
 from tt_device_mcp.constants import user_state_dir
 from tt_device_mcp.health.monitors.subproc import Terminate, Track, run_probe
 
@@ -433,10 +434,6 @@ def _scratch_runtime_root(scratch: Path, source: str) -> str:
     return str(root)
 
 
-def _is_root() -> bool:
-    return os.geteuid() == 0
-
-
 def _no_core_dump() -> None:
     """Child-side, before exec: a crashing validator must not sit for minutes writing a core (and
     run the check into its timeout, which reads as a device fault)."""
@@ -472,7 +469,7 @@ def build_command(descriptor: bool = True) -> Optional[tuple[list[str], dict[str
     binpath, runtime_root, desc = _validator_paths()
     desc_argv = ["--cabling-descriptor-path", desc] if desc and descriptor else []
 
-    scratch = None if _is_root() else user_state_dir() / "fabric-check"
+    scratch = None if privileges.is_root() else user_state_dir() / "fabric-check"
     # Dedicated so the (root-run) check never depends on $HOME and never pollutes a
     # user's own firmware/kernel cache.
     default_cache = str(scratch / "cache") if scratch else "/var/cache/tt-device-broker/fabric-tt-metal-cache"

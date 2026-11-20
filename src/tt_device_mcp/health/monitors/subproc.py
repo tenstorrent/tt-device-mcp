@@ -74,7 +74,6 @@ async def run_probe(
 
     ``preexec_fn`` runs in the child before exec (e.g. to set a resource limit on the probe alone)."""
     proc: Optional[asyncio.subprocess.Process] = None
-    extra = {"preexec_fn": preexec_fn} if preexec_fn is not None else {}
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -83,7 +82,7 @@ async def run_probe(
             env=env,
             cwd=cwd,
             start_new_session=True,
-            **extra,
+            preexec_fn=preexec_fn,
         )
         # The broker's own device work: a holder scan taken while it exits is not a tenant (I59).
         note_broker_internal(proc.pid)
