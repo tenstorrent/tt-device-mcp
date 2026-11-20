@@ -1157,6 +1157,21 @@ class TelemetrySampler:
         if self._deps.owe_device_pollers is not None:
             self._deps.owe_device_pollers(reason)
 
+    def refresh_ring_for_burst(self) -> None:
+        """Spec 03 I94: an AER burst on a ring whose last sample is older than FAST_WINDOW_SEC takes
+        one fresh sample now, with the sampler's own ``chip_sample`` call on this thread, so the
+        burst's off-bus proof is not refused as stale. Never while a reset owns the chips (I66)."""
+        last = self.ring[-1] if self.ring else None
+        if last and time.time() - last.get("ts", 0) <= FAST_WINDOW_SEC:
+            return
+        if self._mechanism.reset_in_flight or self.scope_seen or chip_state.recovering():
+            return
+        try:
+            sample = self._deps.chip_sample()
+        except Exception:  # noqa: BLE001 - a burst read must never raise into the watch
+            return
+        self.ring.append({"ts": time.time(), "chips": sample})
+
     def aer_stop_offbus(self, chips) -> tuple:
         """Spec 03 I94: which of an AER burst's ``chips`` the latest sample read all-ones, and every
         chip that sample read all-ones. From the ring only, so no device or config-space read; safe
@@ -1885,6 +1900,7 @@ class CheckAerWatch:
             return None
         trigger = reason or f"chip node(s) {', '.join(vanished)} vanished from the driver"
         chips = list(self.last_chips) if reason else []
+        self._sampler.refresh_ring_for_burst()
         offbus, all_ones = self._sampler.aer_stop_offbus(chips)
         dead = set(offbus) | set(vanished) | set(self._confirmed([c for c in chips if c not in offbus]))
         blackout = bool(dead) and dead >= known
@@ -2012,6 +2028,7 @@ class CheckAerWatch:
         (the kill after their remove); a chip that answered is never removed. Returns the reason when it acted."""
         pend = self.pending_stop or {}
         chips = list(pend.get("chips") or [])
+        self._sampler.refresh_ring_for_burst()
         offbus, all_ones = self._sampler.aer_stop_offbus(chips)
         if offbus:
             self.pending_stop = None

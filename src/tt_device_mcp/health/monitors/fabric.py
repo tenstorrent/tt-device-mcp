@@ -175,10 +175,11 @@ def names_links_missing(text: str) -> bool:
 def links_missing(marker: str) -> str:
     """The FAILED detail for a topology marker whose descriptor ports are missing, else "".
 
-    A moved tray renames its links (as many extra as missing, I42) and stays a lift. More missing
-    than extra means links are gone (I71)."""
+    A moved tray renames its links (as many extra as missing, I42) and stays a lift. Any missing
+    at all is a failed check (I71): extras elsewhere never hide a lost link, so a box with more
+    cables than its descriptor cannot pass a short fabric off as a relabelling."""
     m = _MARKER_COUNTS.search(marker or "")
-    if not m or int(m.group(1)) <= int(m.group(2)):
+    if not m or int(m.group(1)) <= 0:
         return ""
     missing, extra = int(m.group(1)), int(m.group(2))
     names = marker_ports(marker)[0]

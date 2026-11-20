@@ -78,9 +78,14 @@ class FabricDebt:
 
     def settle_left(self, settle_sec: float, now: Optional[float] = None) -> float:
         """Seconds the newest owed reset still has to settle before the full check runs: 0 when
-        nothing is owed, its time is unknown, it is older than ``settle_sec``, or a gate already
-        waited for it. Never more than ``settle_sec``."""
-        if not self.owed or self.reset_monotonic <= 0.0 or self.settle_served == self.reset_monotonic:
+        nothing is owed, its time is unknown, it is older than ``settle_sec``, a gate already
+        waited for it, or it is a broker start's: the host boot settled the chips (spec 04 I32).
+        Never more than ``settle_sec``."""
+        if (
+            self.owed in ("", "broker start")
+            or self.reset_monotonic <= 0.0
+            or self.settle_served == self.reset_monotonic
+        ):
             return 0.0
         age = (time.monotonic() if now is None else now) - self.reset_monotonic
         return max(0.0, min(settle_sec, settle_sec - age))

@@ -1174,7 +1174,7 @@ class HealthMonitor:
         """The last fabric verdict, for the detail of every hold-lift and release event (spec 03 I78): ``result``
         (pass/fail/skipped/none), ``missing_vs_cabling``/``extra_vs_cabling`` (port connections the links found lack, or
         add, against the cabling descriptor: 0/0 on a clean pass means every cabled link was found), ``links_short``
-        (True when more are missing than extra, which FAILS the check, I71) and ``age_s``. Only the shortfall is logged:
+        (True when any are missing, which FAILS the check, I71) and ``age_s``. Only the shortfall is logged:
         the validator prints no link totals. ``result`` "none" once a reset voided it or before any check ran."""
         v = dict(self._fabric_verdict)
         if not v or self.last_fabric_ok is None and v["result"] != "skipped":
