@@ -282,6 +282,8 @@ See [deploy/README.md](deploy/README.md) for the timeout arithmetic
 
 - A shared host can lock direct device access with `TTDEV_LOCK=1` at install,
   and require users to go through `tt-device-mcp run`.
+- Under the lock a job keeps its submitter's groups. A container the job starts needs
+  `--group-add` for any group it must keep.
 - Hosts are unlocked by default and stay cooperative. A direct run works, and
   collides with whatever the queue is running.
 

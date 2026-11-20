@@ -43,6 +43,7 @@ def test_resolve_lazy_starts_user_daemon_when_none(tmp_path, monkeypatch):
     # (that's what makes the MCP "just work" for agent clients). No TCP fallback.
     monkeypatch.setattr(constants, "DEFAULT_SOCKET", str(tmp_path / "absent.sock"))
     monkeypatch.setattr(constants, "user_socket_path", lambda: str(tmp_path / "absent-user.sock"))
+    monkeypatch.setattr(constants, "BROKER_UNIT_PATH", str(tmp_path / "no-such.service"))
     monkeypatch.delenv("TT_DEVICE_MCP_SOCKET", raising=False)
 
     started = {}
@@ -57,6 +58,26 @@ def test_resolve_lazy_starts_user_daemon_when_none(tmp_path, monkeypatch):
     url, factory = stdio_shim.resolve_upstream()
     assert started.get("called") is True  # tried to start a daemon, not HTTP
     assert url == stdio_shim._UDS_URL and factory is not None
+
+
+def test_system_broker_installed_never_starts_or_uses_a_user_daemon(tmp_path, monkeypatch):
+    # The system unit is installed but its socket is absent (broker stopped): no per-user
+    # daemon is started, and a user daemon's socket that exists is not routed to either.
+    unit = tmp_path / "tt-device-broker.service"
+    unit.write_text("")
+    user_sock = tmp_path / "user.sock"
+    user_sock.write_text("")
+    monkeypatch.setattr(constants, "BROKER_UNIT_PATH", str(unit))
+    monkeypatch.setattr(constants, "DEFAULT_SOCKET", str(tmp_path / "absent.sock"))
+    monkeypatch.setattr(constants, "user_socket_path", lambda: str(user_sock))
+    monkeypatch.setattr(stdio_shim, "user_socket_path", lambda: str(user_sock))
+    monkeypatch.delenv("TT_DEVICE_MCP_SOCKET", raising=False)
+
+    assert constants.resolve_socket() is None
+    spawned = []
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: spawned.append(a))
+    assert stdio_shim._lazy_start_user_daemon() is None
+    assert spawned == []
 
 
 # --- reconnect: retry the connect, never a sent tools/call ----------------------------------------
