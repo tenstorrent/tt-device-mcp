@@ -28,13 +28,12 @@ LATE_CHIP = "31"
 
 
 class Rig:
-    """A fake clock the settle poll's sleep advances, the chips that answer at each fake second, and every step."""
+    """A fake clock the settle poll's sleep advances and the chips that answer at each fake second."""
 
     def __init__(self):
         self.now = 1000.0
         self.t0 = self.now
         self.answer_at: dict = {}  # chip -> seconds after the reset at which it answers (absent: never)
-        self.order: list = []
         self.events: list = []
         self.verifies: list = []
         self.verify_ok = False
@@ -57,13 +56,11 @@ def rig(monkeypatch):
     )
 
     async def fake_sleep(seconds):
-        r.order.append("sleep")
         r.now += seconds
 
     monkeypatch.setattr(galaxy.asyncio, "sleep", fake_sleep)
 
     def present():
-        r.order.append("poll")
         return [str(i) for i in range(EXPECTED) if str(i) != LATE_CHIP or LATE_CHIP in r.answering()]
 
     monkeypatch.setattr(srv, "_present_chip_indices", present)
@@ -74,21 +71,17 @@ def rig(monkeypatch):
     patch_health_event(monkeypatch, lambda kind, **f: r.events.append((kind, f)))
 
     async def sbr(log):
-        r.order.append("sbr")
         return False
 
     async def mesh(argv, log, *a, **k):
-        r.order.append("mesh")
         r.t0 = r.now  # the settle is measured from the reset's end
         return 0, ""
 
     async def verify(expected, log, run_fabric=True, **k):
-        r.order.append("verify")
         r.verifies.append(run_fabric)
         return r.verify_ok, {}
 
     def clear_dirty(*a, **k):
-        r.order.append("clear_dirty")
         r.cleared.append(k)
         return True
 
