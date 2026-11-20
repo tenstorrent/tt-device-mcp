@@ -177,7 +177,6 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     aer_totals,
     append_trace,
     arc_not_ready_chips,
-    boot_monotonic,
     bridge_reset_enabled,
     bridge_reset_unavailable_reason,
     capture_incident,
@@ -16362,9 +16361,8 @@ async def run_startup_tasks() -> None:
     log_rung_inventory()
     # A broker start is never trusted, whatever the last broker saw: the startup gate's own fabric
     # pass (after hugepages) settles this before anything is released (04 I32).
-    # A start right after a boot owes it from the boot: the startup check lets a multi-tray mesh settle
-    # from there (04 I32); a start long after one waits for nothing.
-    FABRIC_DEBT.note_reset("broker start", at=boot_monotonic())
+    # It owes no settle: its reset time is unknown (0.0).
+    FABRIC_DEBT.note_reset("broker start", at=0.0)
     # A hold the last broker died holding has no row yet; give it one before anything opens
     # a new episode over the top of it.
     carried_hold = None

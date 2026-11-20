@@ -78,14 +78,9 @@ class FabricDebt:
 
     def settle_left(self, settle_sec: float, now: Optional[float] = None) -> float:
         """Seconds the newest owed reset still has to settle before the full check runs: 0 when
-        nothing is owed, its time is unknown, it is older than ``settle_sec``, a gate already
-        waited for it, or it is a broker start's: the host boot settled the chips (spec 04 I32).
-        Never more than ``settle_sec``."""
-        if (
-            self.owed in ("", "broker start")
-            or self.reset_monotonic <= 0.0
-            or self.settle_served == self.reset_monotonic
-        ):
+        nothing is owed, its time is unknown, it is older than ``settle_sec``, or a gate already
+        waited for it. Never more than ``settle_sec``."""
+        if not self.owed or self.reset_monotonic <= 0.0 or self.settle_served == self.reset_monotonic:
             return 0.0
         age = (time.monotonic() if now is None else now) - self.reset_monotonic
         return max(0.0, min(settle_sec, settle_sec - age))
@@ -133,21 +128,6 @@ class FabricDebt:
         """Whether a fabric pass can run on this host at all: a mesh (more than one chip) with a fabric
         check configured."""
         return expected > 1 and _fabric_check_configured()
-
-
-_UPTIME = "/proc/uptime"
-
-
-def boot_monotonic() -> float:
-    """When this host booted, on the time.monotonic() clock, or 0.0 when /proc/uptime cannot be read:
-    the reset a broker start owes (spec 04 I32). A boot long ago leaves nothing to settle."""
-    try:
-        with open(_UPTIME) as f:
-            uptime = float(f.read().split()[0])
-    except (OSError, ValueError, IndexError):
-        return 0.0
-    # Linux's monotonic clock starts near 0 at boot; kept above 0.0, which reads as unknown.
-    return max(time.monotonic() - uptime, 1e-6)
 
 
 def _fabric_check_configured() -> bool:

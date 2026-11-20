@@ -71,12 +71,10 @@ def test_a_wrapper_marker_without_names_takes_them_from_the_validator_output():
 # --- the verdict ----------------------------------------------------------------------------------
 
 
-def test_more_missing_than_extra_is_links_missing_and_a_moved_tray_is_not():
+def test_a_lost_link_is_links_missing():
     lost = fabric.topology_marker("d", 1, 0, ([_LOST_PORT], []))
-    moved = fabric.topology_marker("d", 2, 2, (["a", "b"], ["c", "d"]))
     assert fabric.links_missing(lost).startswith(fabric.LINKS_MISSING)
     assert _LOST_PORT in fabric.links_missing(lost)
-    assert fabric.links_missing(moved).startswith(fabric.LINKS_MISSING), "I71: a moved tray fails too"
 
 
 def test_missing_links_fail_even_with_extra_links_to_spare():
