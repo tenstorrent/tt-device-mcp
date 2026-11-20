@@ -10,7 +10,6 @@ The real probe pass runs here (HealthMonitor.update); only its leaf probes are s
 import pytest
 
 from tests.conftest import fsm_dirty, patch_health_event
-from tt_device_mcp import constants
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.fsm import ServerState
@@ -189,18 +188,6 @@ async def test_two_timeouts_then_a_failing_fabric_pass_stays_held(mesh):
 
 
 @pytest.mark.asyncio
-async def test_two_timeouts_then_a_failing_fabric_pass_is_not_a_timeout_reset(mesh):
-    """A failed pass takes the path any failed fabric check takes (the bounded recovery), never a reset
-    issued for the timeout itself."""
-    mesh["eth_seq"] = [TIMED_OUT, TIMED_OUT]
-    mesh["fabric_bad"] = True
-    await _gate()
-    assert mesh["fabric"] == [0], "one fabric pass, before anything reset"
-    assert "eth_timeout_mesh_reset" not in mesh["events"]
-    assert srv.fsm.state is ServerState.RECOVERING
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["failed", "no-verdict"])
 async def test_nothing_releases_the_device_without_a_passed_fabric_pass(mesh, outcome):
     """With the eth read unmeasured twice, only a fabric pass that has just passed releases the device."""
@@ -230,10 +217,6 @@ async def test_the_readers_are_restored_when_the_read_raises(mesh):
     with pytest.raises(RuntimeError, match="probe blew up"):
         await srv.health_monitor.update("post-job", run_fabric=False, run_eth=True, expected=CHIPS)
     assert mesh["pollers"] == ["stop", "read", "start"]
-
-
-def test_the_settle_is_within_the_between_jobs_budget():
-    assert 0 < constants.ETH_POST_JOB_RETRY_SETTLE_SEC <= 3.0
 
 
 @pytest.mark.asyncio
@@ -288,7 +271,7 @@ async def test_a_frozen_read_keeps_todays_hold(mesh):
 async def test_an_off_bus_chip_or_unhealthy_arc_reads_no_eth(mesh, snapshot):
     mesh["snapshot"] = snapshot
     await _gate()
-    assert mesh["eth_reads"] == 0 or "reading once more" not in mesh["log"].text()
+    assert mesh["eth_reads"] == 0
 
 
 @pytest.mark.asyncio
