@@ -34,7 +34,7 @@ from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health import shutdown as health_shutdown
 from tt_device_mcp.health.core import HealthState
 from tt_device_mcp.health.monitor import HealthMonitor
-from tt_device_mcp.health.monitors import eth, heartbeat, pci
+from tt_device_mcp.health.monitors import eth, fabric, heartbeat, pci
 from tt_device_mcp.health.recovery import RecoveryDeps, offbus_power_cycle, pcie_guard
 from tt_device_mcp.health.recovery import base as recovery_base
 from tt_device_mcp.health.recovery import galaxy as recovery_galaxy
@@ -52,7 +52,12 @@ from tt_device_mcp.server import (
 # the subsystem it builds, because srv.health_monitor / srv.recovery_mechanism / the two platform
 # aliases are the seams almost every test monkeypatches. probe_platform stays off: a test that
 # cares about the platform declares TT_DEVICE_MCP_RESET_MODE or drives resolve_platform itself.
+# Boot latches the privilege probes; the sudoers listing (`sudo -n -l ipmitool`) never reaches the host
+# from the suite, not even at import. test_privileges drives the real probe against a stub.
+_real_sudo_probe = privileges._ipmi_sudo_allowed
+privileges._ipmi_sudo_allowed = lambda: False
 srv.boot_broker()
+privileges._ipmi_sudo_allowed = _real_sudo_probe
 
 
 def power_cycle_reason(text="test power cycle", **fields):
@@ -480,6 +485,8 @@ def _seal_real_hardware(monkeypatch, tmp_dirs):
     # A fabric check stops the host's device readers first (a real `systemctl stop`, which the spawn
     # tripwire refuses off the marker). A test of that quiesce sets its own.
     monkeypatch.setattr(srv._recovery_deps, "quiesce_readers", None)
+    # The suite models the root broker whatever uid runs it; the non-root scratch paths have their own tests.
+    monkeypatch.setattr(fabric, "_is_root", lambda: True)
     monkeypatch.delenv("TTDEV_FABRIC_BIN", raising=False)
     monkeypatch.delenv("TTDEV_FABRIC_RUNTIME_ROOT", raising=False)
     monkeypatch.delenv("TTDEV_FABRIC_DESCRIPTOR", raising=False)
@@ -685,6 +692,12 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
             ["ipmitool", "mc", "info"], 0, "Firmware Revision : 0.05\nAux Firmware Rev Info : 0x23 0x00 0x00 0x00\n", ""
         ),
     )
+    # Spec 04 I115: the suite runs the root BMC path (plain ipmitool, the unshare guard) whatever uid
+    # runs pytest; the non-root sudo path is covered by its own tests.
+    monkeypatch.setattr(ipmi_guard, "is_root", lambda: True)
+    # A boot re-latches the privilege probes; the sudoers listing (`sudo -n -l ipmitool`) never
+    # reaches the host from the suite. test_privileges drives the real probe against a stub.
+    monkeypatch.setattr(privileges, "_ipmi_sudo_allowed", lambda: False)
     monkeypatch.setattr(heartbeat, "_heartbeat_supported", None)
     # raising=False so a base tree without the re-arm latch (a fails-on-base stash) still sets up.
     monkeypatch.setattr(heartbeat, "_heartbeat_absent_journaled", False, raising=False)

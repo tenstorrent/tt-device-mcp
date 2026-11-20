@@ -48,6 +48,7 @@ async def run_probe(
     terminate: Terminate = _killpg,
     reap_sec: float = 0.0,
     name: str = "",
+    preexec_fn: Optional[Callable[[], None]] = None,
 ) -> tuple[Optional[int], bytes]:
     """Run ``argv`` to completion or to ``timeout_sec``, whichever comes first.
 
@@ -69,8 +70,11 @@ async def run_probe(
 
     A probe that ends by SIGTERM/SIGKILL while the host or the broker is shutting down raises
     ``shutdown.CheckInterruptedByShutdown`` (``name`` labels it, else ``argv[0]``): the shutdown killed it, it measured
-    nothing, and no caller may count it (spec 03 I63)."""
+    nothing, and no caller may count it (spec 03 I63).
+
+    ``preexec_fn`` runs in the child before exec (e.g. to set a resource limit on the probe alone)."""
     proc: Optional[asyncio.subprocess.Process] = None
+    extra = {"preexec_fn": preexec_fn} if preexec_fn is not None else {}
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -79,6 +83,7 @@ async def run_probe(
             env=env,
             cwd=cwd,
             start_new_session=True,
+            **extra,
         )
         # The broker's own device work: a holder scan taken while it exits is not a tenant (I59).
         note_broker_internal(proc.pid)
