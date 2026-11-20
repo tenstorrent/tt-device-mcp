@@ -678,6 +678,16 @@ def test_the_user_wrapper_puts_the_guard_first_on_path_as_sudo(non_root, monkeyp
     assert ipmi_guard.GUARD_TAG in shim.read_text() and shim.stat().st_mode & 0o777 == 0o700
 
 
+def test_the_user_wrapper_refuses_to_run_when_the_shim_cannot_be_executed(non_root, monkeypatch, tmp_path, capsys):
+    """A noexec temp dir makes the PATH search skip the shim, so tt-smi would reach the real sudo unguarded."""
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda prefix: str(tmp_path))
+    monkeypatch.setattr(ipmi_guard.os, "access", lambda path, mode, **kw: False)
+    execs = []
+    monkeypatch.setattr(ipmi_guard.os, "execvpe", lambda *a: execs.append(a))
+    assert ipmi_guard.main(["--wrap-user", "--", "tt-smi", "-glx_reset"]) == 1
+    assert not execs and ipmi_guard.NOT_ARMED_MARKER in capsys.readouterr().err
+
+
 def _as_sudo(monkeypatch):
     monkeypatch.setattr(ipmi_guard.sys, "argv", ["/tmp/x/sudo"])
     monkeypatch.setattr(ipmi_guard, "_real_tool", lambda name: f"/usr/bin/{name}")

@@ -714,6 +714,8 @@ def fire_os_first(argv: list, reason: PowerCycleReason, timeout: float = DEFAULT
     reason = PowerCycleReason.require(reason)
     argv = [str(a) for a in argv]
     why = os_first_unavailable()
+    if not ipmi_guard.is_root():
+        why = "the OS-first power cycle needs root (it writes a root-owned request file and starts a system unit)"
     if not why and (not argv or any("\n" in a for a in argv)):
         why = "the power-cycle argv cannot be passed to the shutdown hook"
     if not why:
@@ -726,13 +728,9 @@ def fire_os_first(argv: list, reason: PowerCycleReason, timeout: float = DEFAULT
     if not why:
         probe = preflight_argv(argv)
         if probe is not None:
-            # Spec 04 I115: a non-root server's BMC calls go through `sudo -n`. The cycle argv itself does not:
-            # the shutdown hook and the fallback unit fire it as root.
-            rc, out = _run_step(ipmi_guard.bmc_argv(probe), PREFLIGHT_TIMEOUT_SEC)
+            rc, out = _run_step(probe, PREFLIGHT_TIMEOUT_SEC)
             if rc != 0:
-                why = ipmi_guard.sudo_refused(out) or (
-                    f"BMC did not answer the read-only pre-flight {' '.join(probe[-2:])} (rc {rc}): {out}"
-                )
+                why = f"BMC did not answer the read-only pre-flight {' '.join(probe[-2:])} (rc {rc}): {out}"
     unit_timeout: Optional[float] = None
     bound: Optional[int] = None
     if not why:

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 from typing import Callable, Optional
@@ -59,6 +60,8 @@ MOUNT_TIMEOUT_SEC = 10
 BMC_PREFLIGHT_TIMEOUT_SEC = 10
 # Spec 04 I115: the local IPMI nodes ipmitool's default (open) interface uses. A non-root process
 # that can open none of them reaches the BMC with `sudo -n ipmitool`, never a prompt or password.
+# shortcut: privileges.IPMI_DEVICE_NODES lists the same nodes. This file is copied out as the sudo shim and
+# runs `python -I` with no package on its path, so it cannot import privileges; keep the two in step.
 IPMI_DEVICE_NODES = ("/dev/ipmi0", "/dev/ipmi/0", "/dev/ipmidev/0")
 SUDO_RULE = "<user> ALL=(root) NOPASSWD: /usr/bin/ipmitool"
 # What sudo -n prints when it will not run the command without a password or a rule.
@@ -456,11 +459,15 @@ def _wrap_user_main(argv: list[str]) -> int:
         with open(shim, encoding="utf-8") as f:
             if GUARD_TAG not in f.read(4096):
                 raise OSError(f"{shim} is not the guard after writing it")
+        env_path = os.pathsep.join([shim_dir, os.environ.get("PATH", "")])
+        # A noexec temp dir makes the PATH search skip the shim and reach the real sudo unguarded.
+        if not os.access(shim, os.X_OK) or shutil.which("sudo", path=env_path) != shim:
+            raise OSError(f"{shim} cannot be run from {shim_dir} (noexec?)")
     except OSError as exc:
         sys.stderr.write(f"{NOT_ARMED_MARKER}: {exc}; mesh reset NOT run\n")
         sys.stderr.flush()
         return 1
-    env = dict(os.environ, PATH=os.pathsep.join([shim_dir, os.environ.get("PATH", "")]))
+    env = dict(os.environ, PATH=env_path)
     try:
         os.execvpe(argv[0], argv, env)
     except OSError as exc:
