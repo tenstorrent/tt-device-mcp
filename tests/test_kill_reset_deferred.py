@@ -12,7 +12,7 @@ import signal
 import pytest
 
 from tests.conftest import fsm_dirty, patch_health_event
-from tests.test_eth_timeout_reset import ADVANCING, mesh  # noqa: F401 (fixture)
+from tests.test_eth_timeout_retry import ADVANCING, mesh  # noqa: F401 (fixture)
 from tests.test_job_kill_reset import _runner_done, _start, _stop, _until, runner_env  # noqa: F401 (fixture)
 from tests.test_preemptable import _preempt, _witness
 from tt_device_mcp import server as srv

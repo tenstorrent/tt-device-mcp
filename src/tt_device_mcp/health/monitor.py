@@ -26,6 +26,7 @@ from typing import Callable, Optional
 
 from tt_device_mcp import aio, metrics
 from tt_device_mcp.constants import (
+    ETH_POST_JOB_RETRY_SETTLE_SEC,
     ETH_POST_JOB_TIMEOUT_SEC,
     ETH_REAP_SEC,
     FABRIC_CHECK_CANNOT_CHECK_RC,
@@ -263,7 +264,7 @@ FABRIC_LINKS_UNSEEN = "eth links below the high-water mark, which a traffic pass
 
 def eth_read_timed_out(detail: str) -> bool:
     """Whether an eth read's detail is a could-not-check whose cause was the read's own timeout —
-    the stuck read the post-job present-mesh reset answers (spec 03 I61), never a crash or a 77."""
+    the stuck read the post-job gate reads once more (spec 03 I61), never a crash or a 77."""
     return (detail or "").startswith(ETH_COULD_NOT_CHECK) and eth.READ_TIMED_OUT in detail
 
 
@@ -414,7 +415,6 @@ class HealthMonitor:
         force_fabric: bool = False,
         run_eth: bool = False,
         fabric_stale: bool = True,
-        eth_timeout_reset: bool = False,
         indices: Optional[list] = None,
         expected: Optional[int] = None,
         log: Optional[Callable[[str], None]] = None,
@@ -432,10 +432,9 @@ class HealthMonitor:
         caller's interval): the drop persists until an operator re-baselines, so running the pass on it would charge
         every clean job ~45-100s. Otherwise the skip is recorded and the pass ends.
 
-        ``eth_timeout_reset`` says the post-job gate can still grant this hold episode's one present-mesh reset (spec 03
-        I61). A ``run_eth`` read that then TIMED OUT with no verdict, on a pass whose host-pci read is OK and whose
-        snapshot found every chip with a healthy ARC, skips the fabric pass: the gate resets next, and the full check
-        after the reset runs the pass. Any guard that fails keeps the pass.
+        A ``run_eth`` read that TIMED OUT with no verdict, on a pass whose host-pci read is OK, is read once more after a
+        short settle (``_post_job_eth_read``, spec 03 I61). Still unmeasured, it runs the fabric pass in this same pass,
+        like any other no-verdict read: a pass releases the device, a fail holds it and the bounded recovery takes over.
 
         Mirrors ``Recovery._verify_device``'s gentlest-first short-circuiting (a frozen heartbeat or a failed snapshot
         skips every heavier, more perturbing check below it — the traffic pass is only safe to run once nothing is known
@@ -469,7 +468,6 @@ class HealthMonitor:
                 force_fabric=force_fabric,
                 run_eth=run_eth,
                 fabric_stale=fabric_stale,
-                eth_timeout_reset=eth_timeout_reset,
                 indices=indices,
                 expected=expected,
                 log=log,
@@ -493,7 +491,6 @@ class HealthMonitor:
         force_fabric: bool,
         run_eth: bool,
         fabric_stale: bool,
-        eth_timeout_reset: bool,
         indices: Optional[list],
         expected: Optional[int],
         log: Optional[Callable[[str], None]],
@@ -576,7 +573,7 @@ class HealthMonitor:
             elif fabric_asked:
                 eok, edetail = await self.verify_eth_heartbeat()
             else:
-                eok, edetail = await self.verify_eth_heartbeat(timeout_sec=ETH_POST_JOB_TIMEOUT_SEC)
+                eok, edetail = await self._post_job_eth_read(hp_ok, log)
             if log:
                 log(f"eth-heartbeat: {'SKIPPED' if eok is None else ('OK' if eok else 'FROZEN')} — {edetail}")
             _record("eth_heartbeat", eok, edetail)
@@ -592,11 +589,6 @@ class HealthMonitor:
             link_drop_held = (
                 not fabric_asked and link_drop and not unseen and not fabric_stale and self.last_fabric_ok is True
             )
-            # Spec 03 I61: a timed-out read on a present mesh goes straight to the gate's one
-            # present-mesh reset. The pass here failed or skipped after every such timeout measured.
-            reset_due = (
-                eth_timeout_reset and not fabric_asked and eok is None and eth_read_timed_out(edetail) and hp_ok is True
-            )
             if link_drop_held and log and self.last_fabric_skipped:
                 # A 77 since the green pass (it leaves last_fabric_ok alone) reached no verdict: no cover.
                 log(
@@ -607,11 +599,6 @@ class HealthMonitor:
                 log(
                     "eth links unverified after a clean exit — a recent passing fabric pass covers it, not repeating it"
                 )
-            elif reset_due and log:
-                log(
-                    "eth-heartbeat read timed out after a clean exit on a present mesh — skipping the "
-                    "pre-reset fabric pass; the full check runs after the present-mesh reset"
-                )
             elif not fabric_asked and eok is None and log:
                 log("eth-heartbeat reached no verdict after a clean exit — running the fabric traffic pass")
             if unseen:
@@ -619,7 +606,7 @@ class HealthMonitor:
                 if log:
                     log(f"fabric: UNHEALTHY — {fdetail}")
                 _record("fabric", fok, fdetail)
-            elif eok is not False and (fabric_asked or eok is None) and not link_drop_held and not reset_due:
+            elif eok is not False and (fabric_asked or eok is None) and not link_drop_held:
                 self._deps.set_device_op_detail("health check: fabric traffic pass across all links (~45s)")
                 fok, fdetail = await self.verify_fabric_health()
                 if log:
@@ -627,6 +614,32 @@ class HealthMonitor:
                 _record("fabric", fok, fdetail)
 
         return _store()
+
+    async def _post_job_eth_read(
+        self, hp_ok: Optional[bool], log: Optional[Callable[[str], None]]
+    ) -> tuple[Optional[bool], str]:
+        """The clean post-job eth read (spec 03 I61), with the device's readers stopped as for the fabric check.
+
+        A read that timed out with no verdict while host-pci is OK is tried once more after
+        ``ETH_POST_JOB_RETRY_SETTLE_SEC``: the timeouts cluster on the first job after a mesh reset, on a mesh
+        the later read finds healthy. The retry's verdict, measured or not, stands; an unmeasured one runs the
+        fabric pass. Any other first result, and a read whose host-pci is not OK, is returned as it came.
+        The readers are restored on every exit."""
+        quiesce = getattr(self._deps, "quiesce_readers", None)
+        scope = (
+            quiesce("the eth-heartbeat read", self._readers_log) if quiesce is not None else contextlib.nullcontext()
+        )
+        async with scope:
+            eok, edetail = await self.verify_eth_heartbeat(timeout_sec=ETH_POST_JOB_TIMEOUT_SEC)
+            if eok is None and eth_read_timed_out(edetail) and hp_ok is True:
+                if log:
+                    log(
+                        f"eth-heartbeat read timed out after a clean exit ({edetail}) — reading once more "
+                        f"after {ETH_POST_JOB_RETRY_SETTLE_SEC:g}s"
+                    )
+                await asyncio.sleep(ETH_POST_JOB_RETRY_SETTLE_SEC)
+                eok, edetail = await self.verify_eth_heartbeat(timeout_sec=ETH_POST_JOB_TIMEOUT_SEC)
+            return eok, edetail
 
     async def _verify_device(self, expected: int) -> tuple[bool, str]:
         """The tt-smi snapshot probe, off the event loop. A thin seam ``update()`` calls through,

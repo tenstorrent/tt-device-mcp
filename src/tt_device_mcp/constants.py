@@ -169,6 +169,10 @@ def pre_reset_zombie_ladder_reserve_sec(chips: int) -> float:
 # gate runs the full pass; this bound expiring is frozen evidence (I16) and holds. An operator override's inner bound is
 # this same bound, so its timeout is frozen evidence here as on every other path.
 ETH_POST_JOB_TIMEOUT_SEC = 10.0
+# The wait before the post-job read is tried once more after it timed out with no verdict (spec 03 I61). The timeouts
+# cluster on the first job after a mesh reset and the same device reads in ~1s a moment later, so a short settle is
+# enough; the budget between jobs (~10s) rules out more. A retry that is still unmeasured runs the fabric pass.
+ETH_POST_JOB_RETRY_SETTLE_SEC = 2.0
 # The most the eth-heartbeat read waits for its own reader to finish exiting after killing it on
 # a timeout (see monitor._verify_eth_heartbeat_body): a SIGKILLed reader is normally gone in
 # milliseconds, and until it is, a holder scan still sees its pid through the driver.
