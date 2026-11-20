@@ -291,10 +291,13 @@ broker_broken() {
 # same host always gets the same delay, so its laps agree on when the sha applies. A broken broker
 # still applies at once. TTDEV_APPLY_STAGGER_SEC=0 turns it off; 2700 s spreads the boxes over 45
 # min, so a lone push applies 10-55 min after it lands and no sha waits past APPLY_BOUND + 45 min.
+# TTDEV_APPLY_STAGGER_OFFSET_SEC (default 0) is added to the hash delay, mod the window, so an
+# operator can move one box's slot when two hash close together; a non-number counts as 0.
 PENDING_HEAD="$ROOT/pending-head"
 APPLY_QUIET="${TTDEV_APPLY_QUIET_SEC:-600}"
 APPLY_BOUND="${TTDEV_APPLY_BOUND_SEC:-3600}"
 APPLY_STAGGER="${TTDEV_APPLY_STAGGER_SEC:-2700}"
+APPLY_STAGGER_OFFSET="${TTDEV_APPLY_STAGGER_OFFSET_SEC:-0}"
 # The delay for host $2 in a window of $3 s, into the variable named $1: FNV-1a (32 bit) of the
 # name, mod the window. Builtins only, no process.
 au_stagger() {
@@ -308,6 +311,10 @@ au_stagger() {
 stagger=0
 if [ "$APPLY_STAGGER" -gt 0 ] 2>/dev/null; then
     au_stagger stagger "${HOSTNAME:-}" "$APPLY_STAGGER"
+    case "$APPLY_STAGGER_OFFSET" in
+        ''|*[!0-9]*) ;;
+        *) stagger=$(( (stagger + 10#$APPLY_STAGGER_OFFSET) % APPLY_STAGGER )) ;;
+    esac
 fi
 if [ "$APPLY_QUIET" -gt 0 ] 2>/dev/null || [ "$stagger" -gt 0 ]; then
     [ "$APPLY_QUIET" -gt 0 ] 2>/dev/null || APPLY_QUIET=0

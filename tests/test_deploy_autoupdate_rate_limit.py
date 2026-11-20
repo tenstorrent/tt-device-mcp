@@ -45,6 +45,7 @@ def _lap(
     interval=None,
     quiet=0,
     stagger=0,
+    offset=None,
     host="test-host",
     active="active",
     nrestarts="0",
@@ -83,6 +84,8 @@ logger() {{ :; }}
         "TTDEV_APPLY_STAGGER_SEC": str(stagger),
         "HOSTNAME": host,
     }
+    if offset is not None:
+        env["TTDEV_APPLY_STAGGER_OFFSET_SEC"] = str(offset)
     if interval is not None:
         env["TTDEV_MIN_APPLY_INTERVAL_SEC"] = str(interval)
     if quiet is not None:
