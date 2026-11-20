@@ -2910,7 +2910,10 @@ each rung fires only when the gentler one failed or cannot apply.
   It saves each UBB CPLD's debug index (0x50) before and restores and reads it back after.
   Then one read-only `ipmitool sdr elist full` is saved raw beside the dump (`*_psu.txt`); the
   event carries its path and the PSU and 12 V lines, or the read's error, which never fails the
-  dump. Bounds: a lock wait, a DIAG cap (about 5 s per tray x 4 trays, doubled), per-call IPMI
+  dump. The sensor read runs with a terminal as its stdout: ipmitool block-buffers on a pipe, so the
+  root-side kill at the bound would drop the unflushed tail (the file ended at 8192 bytes, before the
+  12 V lines); on a terminal it writes line by line, so the file keeps everything printed before the
+  kill. The pinned sudoers command line is unchanged. Bounds: a lock wait, a DIAG cap (about 5 s per tray x 4 trays, doubled), per-call IPMI
   timeouts and a sensor-read cap. Each bound is enforced root-side: every privileged command
   runs as `sudo -n timeout -s KILL <bound> ...` (no sudo when the broker is root), which a
   non-root broker's own kill cannot reach; the broker's killpg stays as a backup and the pipe is

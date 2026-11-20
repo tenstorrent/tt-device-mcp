@@ -57,11 +57,13 @@ import hashlib
 import json
 import math
 import os
+import pty
 import re
 import select
 import signal
 import subprocess
 import time
+import tty
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -419,26 +421,63 @@ def _wait_proc(p: subprocess.Popen, timeout: float, tree: _DiagTree) -> Optional
                 return None
 
 
+def _run_on_pty(argv: list[str], limit_sec: float) -> tuple[Optional[int], str, str]:
+    """Run ``argv`` with a terminal as its stdout; return ``(rc, stdout, stderr)``.
+
+    ipmitool block-buffers stdout on a pipe (4 KiB multiples), so the root-side ``timeout -s KILL``
+    loses the unflushed tail and the capture ends at 8192 bytes. On a terminal it writes a line at a
+    time, so what it printed before the kill is kept. ``rc`` is None when ``limit_sec`` ended the wait."""
+    master, slave = pty.openpty()
+    try:
+        tty.setraw(slave)  # no \n -> \r\n translation
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=slave, stderr=subprocess.PIPE)
+    except BaseException:
+        os.close(master)
+        raise
+    finally:
+        os.close(slave)
+    err_fd = p.stderr.fileno()
+    got = {master: bytearray(), err_fd: bytearray()}
+    live = set(got)
+    end = time.monotonic() + limit_sec
+    try:
+        while live and time.monotonic() < end:
+            ready, _, _ = select.select(list(live), [], [], max(0.0, end - time.monotonic()))
+            for fd in ready:
+                try:
+                    data = os.read(fd, 65536)
+                except OSError:  # EIO: nothing holds the terminal's other side any more
+                    data = b""
+                if data:
+                    got[fd] += data
+                else:
+                    live.discard(fd)
+        try:
+            rc: Optional[int] = p.wait(timeout=max(0.0, end - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+            rc = None
+    finally:
+        os.close(master)
+        p.stderr.close()
+    return rc, got[master].decode(errors="replace"), got[err_fd].decode(errors="replace")
+
+
 def _read_psu(out: Path) -> dict:
     """Save ``ipmitool sdr elist full`` raw to ``out``; return its path and the PSU/12 V lines."""
     try:
-        r = subprocess.run(
-            _privileged([IPMITOOL, "sdr", "elist", "full"], PSU_SDR_SEC),
-            capture_output=True,
-            text=True,
-            timeout=PSU_SDR_SEC + KILL_GRACE_SEC,
-        )
-    except subprocess.TimeoutExpired as e:
-        text = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
-        out.write_text(text)
-        return {"psu_path": str(out), "psu_error": f"timed out after {PSU_SDR_SEC:.0f}s"}
+        argv = _privileged([IPMITOOL, "sdr", "elist", "full"], PSU_SDR_SEC)
+        rc, stdout, stderr = _run_on_pty(argv, PSU_SDR_SEC + KILL_GRACE_SEC)
     except OSError as e:
         return {"psu_error": repr(e)}
-    out.write_text(r.stdout + r.stderr)
-    lines = [ln.strip() for ln in r.stdout.splitlines() if _PSU_LINE.search(ln.split("|")[0])]
+    out.write_text(stdout + stderr)
+    lines = [ln.strip() for ln in stdout.splitlines() if _PSU_LINE.search(ln.split("|")[0])]
     rec: dict = {"psu_path": str(out), "psu": lines[:64]}
-    if r.returncode != 0:
-        rec["psu_error"] = f"rc {r.returncode}: {r.stderr.strip()[-120:]}"
+    if rc is None:
+        rec["psu_error"] = f"timed out after {PSU_SDR_SEC:.0f}s"
+    elif rc != 0:
+        rec["psu_error"] = f"rc {rc}: {stderr.strip()[-120:]}"
     return rec
 
 
