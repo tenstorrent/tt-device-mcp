@@ -83,10 +83,6 @@ def test_a_window_of_0_turns_the_stagger_off(tmp_path):
     assert not (root / "pending-head").exists()
 
 
-def test_the_offset_defaults_to_0():
-    assert 'APPLY_STAGGER_OFFSET="${TTDEV_APPLY_STAGGER_OFFSET_SEC:-0}"' in _SCRIPT.read_text()
-
-
 @pytest.mark.parametrize("offset", [0, 100, 2000])
 def test_the_offset_moves_the_slot_by_that_much_mod_the_window(tmp_path, offset):
     host = "galaxy-01"

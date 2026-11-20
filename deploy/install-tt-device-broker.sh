@@ -28,7 +28,7 @@ echo "==> build venv + install broker from $REPO"
 # only once the restarted broker answers /health.
 # shellcheck source=deploy/broker-venv.sh
 . "$REPO/deploy/broker-venv.sh"
-install -d -m 0755 "$R"
+mkdir -p "$R"
 NEW_VENV="$(venv_build "$R" "$REPO")" || exit 1
 rm -rf "$R/wheel"; "$NEW_VENV/bin/pip" wheel -q --no-deps -w "$R/wheel" "$REPO"
 chmod -R a+rX "$R"

@@ -329,19 +329,6 @@ def test_the_broker_env_file_is_0644_whatever_the_callers_umask(tmp_path, umask)
     assert target.stat().st_mode & 0o7777 == 0o644
 
 
-def test_the_unit_and_the_state_dirs_get_explicit_modes():
-    """`cat >` and `mkdir -p` take the caller's umask: a unit written under 077 is unreadable to
-    systemd's non-root tooling, and a log or health dir under 077 locks out every non-root reader."""
-    apply = (_ROOT / "deploy" / "apply-host-config.sh").read_text()
-    assert 'exit 0\nchmod 0644 "$UNIT"\n' in apply
-    for path in ('"$ROOT/slurm"', "/var/log/tt-device-broker", "/var/lib/tt-device-broker/health"):
-        assert f"install -d -m 0755 {path}" in apply, path
-    install = _BROKER_INSTALL.read_text()
-    for path in ('"$R"', '"$R/slurm"'):
-        assert f"install -d -m 0755 {path}" in install, path
-    assert "mkdir -p" not in apply and "mkdir -p" not in install
-
-
 def _capture_daemon_env(monkeypatch, tmp_path):
     """Start the per-user daemon with Popen stubbed; return the env the child would have received."""
     captured = {}

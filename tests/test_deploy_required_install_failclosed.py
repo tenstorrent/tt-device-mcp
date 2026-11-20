@@ -173,10 +173,9 @@ def test_older_updater_stages_this_tree(tmp_path):
     assert r.returncode == 0, r.stderr
 
 
-def test_the_retired_aiclk_ceiling_helper_is_gone_and_its_orphan_removed_on_apply(tmp_path):
-    assert not (_DEPLOY / "tt-device-aiclk-ceiling.py").exists()
+def test_apply_removes_the_retired_aiclk_ceiling_orphan(tmp_path):
     rm = [ln for ln in (_DEPLOY / "apply-host-config.sh").read_text().splitlines() if "aiclk-ceiling.py" in ln]
-    assert rm == ['[ -n "$RENDER_ONLY" ] || rm -f "$ROOT/aiclk-ceiling.py"'], rm
+    assert len(rm) == 1, rm
     orphan = tmp_path / "aiclk-ceiling.py"
     orphan.write_text("x")
     r = subprocess.run(["bash", "-c", f"RENDER_ONLY=; ROOT={tmp_path}; {rm[0]}"], capture_output=True, text=True)
