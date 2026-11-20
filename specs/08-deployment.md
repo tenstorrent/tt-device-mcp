@@ -651,6 +651,9 @@ print (never write) the PATH line (I12); `daemon start` fail-closed (I10); remov
 tt-device-mcp cron entry; wire Claude if the `claude` CLI is present. No
 self-update, no lock — the operator owns the box.
 
+**Per-user BMC access (spec 04 I115).** Needs the admin-added sudoers rule
+`<user> ALL=(root) NOPASSWD: /usr/bin/ipmitool`; behavior in spec 04 I115.
+
 **Validator build/pin flow (`install-fabric-validator.sh`).** flock-serialized (concurrent
 tt-metal builds corrupt a tree; the timer refires long before a build ends). If all three pinned
 binaries exist in a slot for the SHA (I27): flip `current` to it if it is not already live, prune the

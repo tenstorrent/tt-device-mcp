@@ -230,6 +230,9 @@ from tt_device_mcp.health import (  # the /health hold report's probes (spec 03 
     version_floor_warnings,
 )
 from tt_device_mcp.health import (
+    IPMI_SUDO_RULE as health_ipmi_sudo_rule,
+)
+from tt_device_mcp.health import (
     hugepages_counts as health_hugepages_counts,
 )
 from tt_device_mcp.health import (
@@ -4566,11 +4569,30 @@ def _opted_out(var: str) -> str:
     return f"{var}=0" if os.environ.get(var, "1").strip() == "0" else ""
 
 
+# A server that cannot fire the host rung though nobody opted out of it (spec 04 I76): its hold bound has
+# no step after the ladder, and it says so at startup, in /health and at the bound, never silently.
+RECOVERY_UNAVAILABLE = "recovery unavailable: no reset/power-cycle rights"
+
+
+def _recovery_unavailable() -> str:
+    """``RECOVERY_UNAVAILABLE`` and its cause, or "" when the power-cycle rung can fire or the operator opted out."""
+    if _opted_out("TT_DEVICE_MCP_AUTO_POWER_CYCLE") or _auto_power_cycle_enabled():
+        return ""
+    return f"{RECOVERY_UNAVAILABLE} ({_no_bmc_reason()})"
+
+
 def _no_bmc_reason() -> str:
-    """Which half of the BMC capability is missing. The two have different fixes: one is a package,
-    the other is a host or container that exposes no local IPMI interface at all."""
+    """Which part of the host rung's capability is missing. Each has its own fix: a package, a root
+    server (spec 04 I115: the sudo rule does not stand in for it), or a host or container that exposes
+    a local IPMI interface at all."""
     if not privileges.snapshot()["ipmitool"]:
         return "ipmitool is not on PATH"
+    if not privileges.is_root():
+        return (
+            "the server is not root — the OS-first power cycle writes its request file under /run and "
+            "starts a system unit, which need root; the sudoers rule "
+            f"`{health_ipmi_sudo_rule}` serves the mesh reset only and does not enable it"
+        )
     return "no openable /dev/ipmi* — this host or container exposes no local BMC interface"
 
 
@@ -4613,7 +4635,7 @@ def log_rung_inventory() -> None:
     priv = privileges.snapshot()
     logger.info(
         "BOOT privilege: euid={euid} root={root} systemd={systemd} setpci_bin={setpci_bin} "
-        "ipmitool={ipmitool} ipmi_node={ipmi_node}".format(**priv)
+        "ipmitool={ipmitool} ipmi_node={ipmi_node} ipmi_sudo={ipmi_sudo}".format(**priv)
     )
     logger.info("RUNG INVENTORY: " + ", ".join(f"{name}={'on' if on else 'OFF'}" for name, on, _ in rungs))
     for name, on, why in rungs:
@@ -7262,7 +7284,7 @@ def _auto_power_cycle_enabled() -> bool:
     to the already-loud BLOCKED path: the cascade emits its power-cycle-required event and holds."""
     if os.environ.get("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1").strip() == "0":
         return False
-    return privileges.can_ipmi()
+    return privileges.can_power_cycle()
 
 
 def _host_rung_opted_in() -> bool:
@@ -9479,6 +9501,8 @@ def _health_payload(now: Optional[datetime] = None) -> dict:
     # Spec 04 I91: why the last mesh reset did not run or did not count (BMC preflight refused, guard
     # not armed, tt-smi's op_mode 0x0 fallback refused or sent); null after a clean mesh reset.
     payload["mesh_reset_bmc_guard"] = getattr(recovery_mechanism, "bmc_guard_state", None)
+    # Spec 04 I76: this server cannot power-cycle (no rights, not an opt-out); null where it can.
+    payload["recovery_unavailable"] = _recovery_unavailable() or None
     # Spec 03 I71: the descriptor's port connections the last fabric pass found missing or extra, by
     # name; null after a clean pass on the full topology.
     payload["fabric_topology"] = (getattr(health_monitor, "fabric_topology", None) or None) if health_monitor else None
@@ -10210,6 +10234,7 @@ async def _hold_bound_host_rung(age: float, log, skipped: str = "", *, sweep: bo
     action = "power-cycle"
     if not _auto_power_cycle_enabled():
         _hold_bound_rung_pending, _hold_bound_cycle_age = False, age
+        why = _recovery_unavailable() or "the operator opted out of the power cycle"
         if _hold_bound_unarmed_paged != device_hold_episode_since:
             _hold_bound_unarmed_paged = device_hold_episode_since
             event = {
@@ -10217,9 +10242,10 @@ async def _hold_bound_host_rung(age: float, log, skipped: str = "", *, sweep: bo
                 "host": socket.gethostname(),
                 "held_since": device_hold_episode_since,
                 "held_age_sec": int(age),
+                "why": why,
             }
             health_event(event["kind"], **{k: v for k, v in event.items() if k != "kind"})
-        log("10-min hold bound: the ladder did not heal the hold and the operator opted out of the power cycle")
+        log(f"10-min hold bound: the ladder did not heal the hold and {why}")
         return
     blocker = await asyncio.to_thread(_bound_tenant_blocker, True)
     if blocker is not None:
@@ -18699,7 +18725,7 @@ def _preflight_required_capabilities(socket_path: Optional[str]) -> tuple[list[s
     # at all — no queue, no gating, every tenant back on bare metal — which is a worse outage
     # than a ladder that stops one rung short. The rung reads as OFF everywhere else (see
     # _auto_power_cycle_enabled), so the shortfall is stated, not assumed.
-    if os.environ.get("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1").strip() != "0" and not privileges.can_ipmi():
+    if os.environ.get("TT_DEVICE_MCP_AUTO_POWER_CYCLE", "1").strip() != "0" and not privileges.can_power_cycle():
         warns.append(
             f"TT_DEVICE_MCP_AUTO_POWER_CYCLE is armed but {_no_bmc_reason()} — the "
             "BMC power-cycle rung is OFF. The ladder has no host rung; a chip "
