@@ -2968,22 +2968,13 @@ class GalaxyRecovery(Recovery):
             return False
         return off_bus == 0 and not isolated
 
-    def _chips_not_answering(self, expected: int) -> int:
-        """How many of the ``expected`` chips do not answer now: not enumerated, or enumerated with no live ARC
-        heartbeat. A chip that is not enumerated is never read."""
-        live = set(arc_live_chips(self.deps.present_chip_indices()))
-        return max(0, expected - len(live))
-
     async def _settle_until_chips_answer(self, expected: int, bound_sec: int, log, *, phase: str) -> None:
-        """The settle before the one verify that decides a power cycle (spec 04 I97, I106): wait for the re-enumeration
-        by polling each expected chip's answer, not by sleeping the whole bound. It ends at once when every expected chip
-        answers, else at ``bound_sec`` (:func:`_settle_before_host_rung_sec`, its env override unchanged). It lifts
-        nothing and counts nothing as healthy: the full check with fabric that follows decides, and a chip that has not
-        answered by the bound is a failed one (the check fails and the power cycle is requested)."""
+        """Poll until every expected chip answers (enumerated, live ARC) or ``bound_sec`` passes (spec 04 I86)."""
         t0 = time.monotonic()
         deadline = t0 + bound_sec
         while True:
-            left = await asyncio.to_thread(self._chips_not_answering, expected)
+            live = await asyncio.to_thread(lambda: arc_live_chips(self.deps.present_chip_indices()))
+            left = max(0, expected - len(live))
             remaining = deadline - time.monotonic()
             if left == 0 or remaining <= 0:
                 break

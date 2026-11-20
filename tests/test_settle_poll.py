@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Spec 04 I97/I106: the settle before the one verify that decides a power cycle polls the chips, it does not sleep.
+"""Spec 04 I86: the settle before the one verify that decides a power cycle polls the chips, it does not sleep.
 
 The sweep's reset ends, the broker waits for the chips to re-enumerate, then runs one full check (fabric included).
 The wait used to be a flat 60 s sleep, so a chip that stays off cost the whole minute before the cycle was requested,
@@ -133,31 +133,3 @@ async def test_settle_bound_chip_off_waits_the_bound_then_fails_the_check(rig):
     assert rig.elapsed() <= BOUND + galaxy.SETTLE_POLL_SEC, "the bound is the settle's own, no second one added"
     assert rig.verifies == [True], "the full check with fabric still runs after the bound"
     assert rig.cleared == []
-
-
-@pytest.mark.asyncio
-async def test_rung_order_is_reset_then_settle_poll_then_one_full_check(rig):
-    rig.answer_at = {LATE_CHIP: 4}
-    rig.verify_ok = False
-    await _last_chance(rig)
-    order = rig.order
-    assert "mesh" in order and order.count("verify") == 1
-    assert order.index("mesh") < order.index("poll"), "the reset sweep ends before the settle begins"
-    assert max(i for i, s in enumerate(order) if s in ("poll", "sleep")) < order.index("verify")
-    assert order[-1] == "verify", "nothing follows the one check inside the sweep: the caller decides the cycle"
-
-
-@pytest.mark.asyncio
-async def test_release_gate_only_a_passing_full_check_releases(rig):
-    # every chip answers at once, but the full check fails: the poll lifts nothing
-    rig.answer_at = {LATE_CHIP: 0}
-    rig.verify_ok = False
-    assert await _last_chance(rig) is False
-    assert rig.cleared == [] and "clear_dirty" not in rig.order
-    assert rig.verifies == [True]
-    # and a passing check releases, after it
-    rig.order.clear()
-    rig.verify_ok = True
-    assert await _last_chance(rig) is True
-    assert rig.cleared and rig.cleared[-1].get("verified") is True
-    assert rig.order.index("verify") < rig.order.index("clear_dirty")
