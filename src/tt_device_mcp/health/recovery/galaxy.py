@@ -266,11 +266,6 @@ def _settle_before_host_rung_sec() -> int:
 SETTLE_POLL_SEC = 2.0
 
 
-async def _settle_poll_sleep(seconds: float) -> None:
-    """One step of the settle poll (its own seam, so a test moves a fake clock instead)."""
-    await asyncio.sleep(seconds)
-
-
 # The two off-bus fault classes that go to the power cycle with no further reset (spec 04 I37). A: one or more whole UBB
 # trays off the bus (no whole-tray drop has healed without a power cycle: 0/50 on one Galaxy host). C: every chip still
 # off the bus after a mesh reset already ran and failed this episode (one mesh reset has healed an all-off bus, so the
@@ -2976,36 +2971,34 @@ class GalaxyRecovery(Recovery):
     def _chips_not_answering(self, expected: int) -> int:
         """How many of the ``expected`` chips do not answer now: not enumerated, or enumerated with no live ARC
         heartbeat. A chip that is not enumerated is never read."""
-        present = [str(i) for i in self.deps.present_chip_indices()]
-        live = set(arc_live_chips(present)) if present else set()
+        live = set(arc_live_chips(self.deps.present_chip_indices()))
         return max(0, expected - len(live))
 
-    async def _settle_until_chips_answer(self, expected: int, bound_sec: int, log, *, phase: str) -> dict:
+    async def _settle_until_chips_answer(self, expected: int, bound_sec: int, log, *, phase: str) -> None:
         """The settle before the one verify that decides a power cycle (spec 04 I97, I106): wait for the re-enumeration
         by polling each expected chip's answer, not by sleeping the whole bound. It ends at once when every expected chip
         answers, else at ``bound_sec`` (:func:`_settle_before_host_rung_sec`, its env override unchanged). It lifts
         nothing and counts nothing as healthy: the full check with fabric that follows decides, and a chip that has not
-        answered by the bound is a failed one (the check fails and the power cycle is requested). A probe that raises
-        reads as no answer, never as a pass."""
+        answered by the bound is a failed one (the check fails and the power cycle is requested)."""
         t0 = time.monotonic()
         deadline = t0 + bound_sec
-        left = expected
         while True:
-            try:
-                left = await asyncio.to_thread(self._chips_not_answering, expected)
-            except Exception as exc:  # noqa: BLE001 - an unreadable probe is a chip that has not answered
-                log(f"settle poll: the chip probe raised {exc!r} — counted as not answering")
-                left = expected
+            left = await asyncio.to_thread(self._chips_not_answering, expected)
             remaining = deadline - time.monotonic()
             if left == 0 or remaining <= 0:
                 break
-            await _settle_poll_sleep(min(SETTLE_POLL_SEC, remaining))
+            await asyncio.sleep(min(SETTLE_POLL_SEC, remaining))
         waited = time.monotonic() - t0
         how = "all answer" if left == 0 else f"{left} still not answering at the bound"
         log(f"settle poll: {expected - left}/{expected} chips answer after {waited:.1f}s of {bound_sec}s ({how})")
-        rec = {"waited_sec": round(waited, 1), "bound_sec": bound_sec, "not_answering": left, "expected": expected}
-        health_event("settle_poll", phase=phase, **rec)
-        return rec
+        health_event(
+            "settle_poll",
+            phase=phase,
+            waited_sec=round(waited, 1),
+            bound_sec=bound_sec,
+            not_answering=left,
+            expected=expected,
+        )
 
     async def _settle_and_verify_sweep(
         self, expected: int, log, gate_phase: str, settle: int, *, context: str, fabric_77_unverified: bool
@@ -3027,10 +3020,9 @@ class GalaxyRecovery(Recovery):
                 "sweep_verify_skipped", context=context or gate_phase, reason="reset_scope_active", scope=scope
             )
             return False, {"skipped": "reset_scope_active", "scope": scope}
-        if settle:
-            log(f"settling up to {settle}s for re-enumeration, then one verify before the host rung")
         try:
             if settle:
+                log(f"settling up to {settle}s for re-enumeration, then one verify before the host rung")
                 await self._settle_until_chips_answer(expected, settle, log, phase=gate_phase)
             healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=gate_phase)
             FABRIC_DEBT.note_evidence(evidence)
@@ -3082,8 +3074,7 @@ class GalaxyRecovery(Recovery):
             log("class A 10-min sweep refused (reset gate) — holding; the cycle follows at the cooldown's end")
             return OUTCOME_WAITING
         try:
-            if settle:
-                await self._settle_until_chips_answer(expected, settle, log, phase="class-a-10min")
+            await self._settle_until_chips_answer(expected, settle, log, phase="class-a-10min")
             healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase="class-a-10min")
             FABRIC_DEBT.note_evidence(evidence)
         finally:

@@ -12,7 +12,6 @@ does not. The full check with fabric that follows still decides: only a pass rel
 
 from __future__ import annotations
 
-import asyncio
 import time as real_time
 from types import SimpleNamespace
 
@@ -61,16 +60,14 @@ def rig(monkeypatch):
         r.order.append("sleep")
         r.now += seconds
 
-    monkeypatch.setattr(galaxy, "_settle_poll_sleep", fake_sleep)
+    monkeypatch.setattr(galaxy.asyncio, "sleep", fake_sleep)
 
     def present():
         r.order.append("poll")
         return [str(i) for i in range(EXPECTED) if str(i) != LATE_CHIP or LATE_CHIP in r.answering()]
 
     monkeypatch.setattr(srv, "_present_chip_indices", present)
-    monkeypatch.setattr(
-        galaxy, "arc_live_chips", lambda chips: [c for c in chips if c in r.answering() or c != LATE_CHIP]
-    )
+    monkeypatch.setattr(galaxy, "arc_live_chips", lambda chips: chips)
     monkeypatch.setattr(pcie_guard, "host_reset_gate", lambda off_bus: (True, ""))
     monkeypatch.setattr(g.mechanism, "scope_active", lambda: None)
     monkeypatch.setattr(srv, "enumerate_device_holders", lambda: HolderScan(holders=[], complete=True))
@@ -160,20 +157,7 @@ async def test_release_gate_only_a_passing_full_check_releases(rig):
     assert rig.verifies == [True]
     # and a passing check releases, after it
     rig.order.clear()
-    rig.events.clear()
     rig.verify_ok = True
     assert await _last_chance(rig) is True
     assert rig.cleared and rig.cleared[-1].get("verified") is True
     assert rig.order.index("verify") < rig.order.index("clear_dirty")
-
-
-@pytest.mark.asyncio
-async def test_a_probe_that_raises_counts_as_no_answer_never_a_pass(rig, monkeypatch):
-    def boom():
-        raise OSError("device nodes unreadable")
-
-    monkeypatch.setattr(srv, "_present_chip_indices", boom)
-    out = await srv.galaxy_recovery._settle_until_chips_answer(EXPECTED, BOUND, lambda m: None, phase="idle")
-    assert out["not_answering"] == EXPECTED
-    assert out["waited_sec"] >= BOUND
-    await asyncio.sleep(0)
