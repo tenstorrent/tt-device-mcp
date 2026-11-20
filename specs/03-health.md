@@ -984,23 +984,23 @@ cooldown (spec 04 I65) holds longer.
   while the device is still held for any reason keeps the job held. The poll stays as the
   governor for holds no release path ends. Queue-resume latency after any hold is about 1 s, not
   up to 60 s, for every fault class.
-- **I61 — A clean exit's timed-out eth read on a present mesh takes the one present-mesh reset.**
-  When a post-job gate after a clean job exit (no dirty mark, no runtime-reported fault, no isolated
-  chip) reads the passive eth heartbeat and the read times out with no verdict (`could not check`:
-  `read timed out`, not a link-drop skip, not a frozen verdict, not a probe crash or exit 77), while
-  host-pci is OK and the snapshot shows every expected chip with ARC healthy on a multi-chip mesh,
-  the gate skips the pre-reset fabric traffic pass and fires the present-mesh rung
-  (`tt-smi -glx_reset`) through the same `STAGE_SMI_RESET` path and the same per-episode latch as
-  I55: one present-mesh reset per hold episode, shared by both. The incident is captured first
-  (`eth_timeout`, with the eth reason), the gate logs one line naming the cause and journals
-  `eth_timeout_mesh_reset`. Only the full post-reset check (fabric traffic and dispatch included)
-  releases the device; a failed one keeps it held and climbs the bounded ladder like I55. A spent
-  latch, a reset cooldown, a dirty exit, an off-bus chip, an
-  unhealthy ARC or host-pci keeps today's path (the fabric pass in the same probe). Time to
-  recover for this class drops by one fabric pass (~45-100 s): 51 of 51 such timeouts measured in production
-  were followed by a failed or skipped pass. No wait
-  is added. A rung the gate fires from a clean exit (I55 or I61) first opens the hold episode
-  (marked dirty, `probe_unhealthy`), so the door is shut while the reset is unproven.
+- **I61 — A clean exit's timed-out eth read is read once more, then the fabric pass decides.**
+  When a post-job gate after a clean job exit reads the passive eth heartbeat and the read times
+  out with no verdict (`could not check`: `read timed out`, not a link-drop skip, not a frozen
+  verdict, not a probe crash or exit 77) while host-pci is OK, the gate waits
+  `ETH_POST_JOB_RETRY_SETTLE_SEC` (2 s) and reads once more, with the same bound. The timeouts
+  cluster on the first job after a mesh reset, on a mesh every other check finds healthy, and a
+  healthy read answers in about 1 s. The retry's verdict stands: a measured one (advancing, frozen,
+  link-drop skip) is handled exactly as a first-try measurement. One still unmeasured runs the full
+  fabric traffic pass in the same probe pass, as every other no-verdict read does: a pass releases
+  the device, a fail holds it and goes to the bounded recovery (I55, I69 and the ladder, with the
+  full check after each reset deciding the release). A timeout never takes a present-mesh reset by
+  itself: a reset the mesh did not need costs about 150 s and risks a chip dropping at the next
+  all-link traffic start. A read whose host-pci is not OK is not retried. The added time on a
+  healthy mesh is the settle plus one read (about 3 s) when the retry measures; when it does not,
+  the fabric pass (about 100 s) replaces the reset. Unchanged: only the full check
+  with fabric, just passed, releases the device. The device's readers (the telemetry poller)
+  are stopped for the reads, as for the fabric check, and restored on every exit, an error included.
 - **I69 — A job the broker stopped mid-run is followed by a reset, then the full check.** A job
   that hit its timeout, one the hung reaper stopped (HUNG), or a running job stopped by a requested
   kill (`tt_device_job_kill`, the REST kill, or a `tt_device_job_run` whose client went away, spec
@@ -1039,7 +1039,7 @@ cooldown (spec 04 I65) holds longer.
   reset that stops a re-adopted job's scope (`reason=device reset`). The next post-job gate pays it: it skips the
   pre-reset fabric traffic pass and the passive eth read, captures the incident (`job_killed`),
   logs one line and journals `kill_mesh_reset`, and fires `STAGE_SMI_RESET` through the same path
-  and per-episode latch as I55/I61 (`tt-smi -glx_reset` on a Galaxy, `tt-smi -r` per target
+  and per-episode latch as I55 (`tt-smi -glx_reset` on a Galaxy, `tt-smi -r` per target
   elsewhere). Only when every chip reads present and ARC healthy: anything else is a different
   fault and takes its own rung on the same evidence. Only the full post-reset check (fabric
   traffic and dispatch included, spec 04 I32) releases the device; a failed one keeps it held
@@ -2542,7 +2542,7 @@ refuses.
 | I9 host PCI: a live link below the lower of both ends' caps is UNHEALTHY; x1 by design is not | `tests/test_hostpci.py::test_a_link_x1_by_design_is_healthy`, `::test_a_link_below_the_lower_cap_fails_the_verdict`, `::test_an_unreadable_port_cap_leaves_the_endpoint_cap` |
 | I9 host PCI: speed judged only for listed device ids, width always | `tests/test_hostpci.py::test_speed_is_judged_only_where_it_cannot_drop_on_its_own`, `::test_width_is_judged_on_a_device_whose_speed_is_not` |
 | I9 host PCI link bank: banked on a pass, ratchets up, keyed to its link, unreadable is empty | `tests/test_hostpci.py::test_a_passing_check_banks_each_link_and_a_later_drop_below_it_fails`, `::test_the_bank_only_ratchets_up`, `::test_a_mark_taken_on_another_link_is_replaced_not_judged`, `::test_an_unreadable_bank_is_no_evidence_and_is_rewritten`, `::test_the_bank_is_not_rewritten_when_nothing_changed` |
-| I9 host PCI: a degraded link holds and never releases | `tests/test_eth_timeout_reset.py::test_a_degraded_pcie_link_holds_and_never_releases` |
+| I9 host PCI: a degraded link holds and never releases | `tests/test_eth_timeout_retry.py::test_a_degraded_pcie_link_holds_and_never_releases` |
 | I9 host PCI BAR rule: an unimplemented BAR is not an unplaced one | `tests/test_hostpci.py::test_an_unimplemented_bar_is_not_an_unplaced_one`, `::test_an_unreadable_resource_file_is_not_a_fault`, `::test_malformed_resource_lines_do_not_raise` |
 | I9 host PCI evidence never alerts (AER, bridge AER, IOMMU) | `tests/test_hostpci.py::test_aer_counters_are_evidence_and_never_a_verdict`, `::test_upstream_bridge_aer_is_recorded`, `::test_the_iommu_mode_is_recorded_but_never_alerts` |
 | I9 host PCI opens no device | `tests/test_hostpci.py::test_the_probe_opens_no_device` |
@@ -2669,11 +2669,11 @@ refuses.
 | I66 (a failed, timed-out or skipped remove seals the chip; a sealed chip is read only in the grace or on a new node; a removed chip is not sealed) | `tests/test_reader_audit.py::test_a_remove_that_failed_timed_out_or_was_skipped_seals_the_chip`, `tests/test_reader_audit.py::test_a_sealed_chip_is_read_by_no_decision_only_by_the_grace_or_a_new_node`, `tests/test_reader_audit.py::test_a_node_the_mark_found_none_for_is_read_once_it_appears`, `tests/test_reader_audit.py::test_a_removed_chip_is_not_sealed` |
 | I66 (a hung present chip is held once and never removed; no hold under a reset or a whole-mesh stall; the hold lifts only on a full check with every cabled link) | `tests/test_reader_audit.py::test_a_hung_present_chip_is_held_once_and_never_removed`, `tests/test_reader_audit.py::test_no_hung_chip_hold_under_a_reset_or_a_whole_mesh_stall`, `tests/test_reader_audit.py::test_a_hung_chip_hold_lifts_only_on_a_full_check_with_every_cabled_link` |
 | I65 (a release wakes a held job at once; a wake while still held never dispatches; wakes cannot spin the gate) | `tests/test_tenant_hold_wake.py::test_startup_release_dispatches_a_held_job_within_a_second`, `tests/test_tenant_hold_wake.py::test_a_wake_while_still_held_does_not_dispatch`, `tests/test_tenant_hold_wake.py::test_a_release_from_another_thread_wakes_the_hold` |
-| I55/I61 (a rung fired from a clean exit opens the hold episode first; a failed post-reset check never releases) | `tests/test_dispatch_failure_reset.py::test_a_clean_exit_dispatch_failure_whose_reset_fails_stays_held`, `tests/test_eth_timeout_reset.py::test_the_door_is_shut_while_the_reset_is_unproven` |
-| I61 (a timed-out eth read on a present mesh: no pre-reset fabric pass, one reset, incident first) | `tests/test_eth_timeout_reset.py::test_a_timed_out_eth_read_resets_once_with_no_pre_reset_fabric_pass`, `tests/test_eth_timeout_reset.py::test_the_incident_is_captured_with_the_eth_reason_before_the_reset`, `tests/test_eth_timeout_reset.py::test_the_probe_pass_skips_the_fabric_pass_only_when_asked` |
-| I61 (the full post-reset check gates the release; a failure stays held and climbs) | `tests/test_eth_timeout_reset.py::test_the_full_check_after_the_reset_gates_the_release`, `tests/test_eth_timeout_reset.py::test_a_failed_post_reset_check_stays_held_and_climbs`, `tests/test_eth_timeout_reset.py::test_a_failed_post_reset_check_without_a_host_rung_stays_held` |
-| I61 (one reset per episode, latch shared with I55, re-armed at release) | `tests/test_eth_timeout_reset.py::test_a_second_timeout_in_the_episode_gets_no_second_reset`, `tests/test_eth_timeout_reset.py::test_a_spent_dispatch_reset_leaves_the_timeout_on_todays_path`, `tests/test_eth_timeout_reset.py::test_a_healed_reset_rearms_the_latch_at_the_next_admission` |
-| I61 (every other shape keeps today's path) | `tests/test_eth_timeout_reset.py::test_other_no_verdict_reads_keep_todays_fabric_pass`, `tests/test_eth_timeout_reset.py::test_a_frozen_read_keeps_todays_hold`, `tests/test_eth_timeout_reset.py::test_an_off_bus_chip_or_unhealthy_arc_keeps_todays_path`, `tests/test_eth_timeout_reset.py::test_host_pci_not_ok_keeps_todays_fabric_pass`, `tests/test_eth_timeout_reset.py::test_a_dirty_exit_still_runs_the_fabric_pass` |
+| I55 (a rung fired from a clean exit opens the hold episode first; a failed post-reset check never releases) | `tests/test_dispatch_failure_reset.py::test_a_clean_exit_dispatch_failure_whose_reset_fails_stays_held` |
+| I61 (a timed-out read is read once more after the settle; a measured retry carries on as a first-try measurement, no reset, no fabric pass) | `tests/test_eth_timeout_retry.py::test_a_timed_out_read_that_measures_on_retry_needs_no_reset_or_fabric_pass`, `tests/test_eth_timeout_retry.py::test_a_frozen_retry_holds_as_a_first_try_frozen_read_does` |
+| I61 (a retry still unmeasured runs the fabric pass: a pass releases with no reset, a fail holds with today's reset path; the goal-11 release rule) | `tests/test_eth_timeout_retry.py::test_two_timeouts_then_a_passing_fabric_pass_releases_with_no_reset`, `tests/test_eth_timeout_retry.py::test_two_timeouts_then_a_failing_fabric_pass_stays_held`, `tests/test_eth_timeout_retry.py::test_nothing_releases_the_device_without_a_passed_fabric_pass` |
+| I61 (the readers are stopped for the post-job read and restored on every exit | `tests/test_eth_timeout_retry.py::test_the_readers_are_stopped_for_the_read_and_restored`, `tests/test_eth_timeout_retry.py::test_the_readers_are_restored_when_the_read_raises` |
+| I61 (every other shape keeps today's path) | `tests/test_eth_timeout_retry.py::test_other_no_verdict_reads_are_not_retried`, `tests/test_eth_timeout_retry.py::test_host_pci_not_ok_is_not_retried` |
 | I68 (a dirty job_killed/foreign_holder hold with nothing queued gets the post-job gate, fabric forced, once per episode; a dirty I42-latched hold gets the present-mesh rung with no grace instead, an unlatched one does not; a failure keeps the hold; anything else owning the device defers it) | `tests/test_holder_release_wait.py::test_a_dirty_killed_hold_with_an_empty_queue_runs_the_full_post_job_gate_once`, `tests/test_holder_release_wait.py::test_a_failed_idle_gate_keeps_the_hold_and_runs_once_per_episode`, `tests/test_holder_release_wait.py::test_an_idle_gate_that_raises_keeps_the_device_held`, `tests/test_holder_release_wait.py::test_the_idle_gate_is_rate_limited`, `tests/test_holder_release_wait.py::test_no_idle_gate_while_anything_else_owns_the_device`, `tests/test_fabric_links_missing.py::test_a_dirty_latched_hold_with_an_empty_queue_takes_the_idle_gate_at_once`, `tests/test_fabric_links_missing.py::test_a_paced_present_rung_does_not_spend_the_dirty_latched_idle_gate`, `tests/test_fabric_links_missing.py::test_an_unlatched_dirty_fabric_hold_does_not_take_the_idle_gate` |
 | I72 (each fault class is named, with its start and per-tray presence by bus group) | `tests/test_health_hold_report.py::test_class_a_whole_tray_reports_its_tray_by_bus_and_the_ceiling_window`, `tests/test_health_hold_report.py::test_class_b1_isolated_chips_report_the_off_bus_one_shot`, `tests/test_health_hold_report.py::test_class_b2_part_of_one_tray`, `tests/test_health_hold_report.py::test_class_c_all_off_lists_every_tray_empty`, `tests/test_health_hold_report.py::test_class_d_present_mesh_with_a_dead_arc`, `tests/test_health_hold_report.py::test_class_d_arc_not_ready_chip_is_present_but_not_alive`, `tests/test_health_hold_report.py::test_ac_needed_reports_the_recheck`, `tests/test_health_hold_report.py::test_classify_hold`, `tests/test_health_hold_report.py::test_classify_hold_with_no_baseline`, `tests/test_health_hold_report.py::test_trays_group_by_bus_never_by_index` |
 | I72 (a chip off the bus, missing or all-ones with its node present, is in no tray's `chips_present`) | `tests/test_health_hold_report.py::test_an_all_ones_chip_is_in_no_tray_row`, `tests/test_health_hold_report.py::test_class_d_present_mesh_with_a_dead_arc` |
@@ -2683,7 +2683,7 @@ refuses.
 | I72 (read-only: no rung clock moves, the hold and FSM state stay, no job admitted, never called healthy) | `tests/test_health_hold_report.py::test_the_report_is_read_only` |
 | I69 (a timeout always resets with no pre-reset fabric pass, then the full check, fabric included, before release) | `tests/test_job_kill_reset.py::test_a_timeout_resets_then_runs_the_full_check_before_release`, `tests/test_job_kill_reset.py::test_a_requested_kill_of_a_running_job_owes_the_reset` |
 | I69 (a failed post-kill check stays held and climbs the bounded ladder, never released) | `tests/test_job_kill_reset.py::test_a_failed_post_kill_check_stays_held_and_climbs`, `tests/test_job_kill_reset.py::test_a_failed_post_kill_check_without_a_host_rung_stays_held`, `tests/test_job_kill_reset.py::test_a_preemption_debt_whose_full_check_fails_stays_held` |
-| I69 (latch shared with I55/I61; a spent latch skips it onto today's path; a reset since settles it; a reset-killed or completed job owes none) | `tests/test_job_kill_reset.py::test_a_spent_latch_skips_the_kill_reset_onto_todays_path`, `tests/test_job_kill_reset.py::test_a_reset_since_the_kill_settles_the_debt`, `tests/test_job_kill_reset.py::test_no_debt_for_a_reset_killed_or_completed_job` |
+| I69 (latch shared with I55; a spent latch skips it onto today's path; a reset since settles it; a reset-killed or completed job owes none) | `tests/test_job_kill_reset.py::test_a_spent_latch_skips_the_kill_reset_onto_todays_path`, `tests/test_job_kill_reset.py::test_a_reset_since_the_kill_settles_the_debt`, `tests/test_job_kill_reset.py::test_no_debt_for_a_reset_killed_or_completed_job` |
 | I69 (router: the kill reset takes STAGE_SMI_RESET only on a present, unfrozen mesh) | `tests/test_job_kill_reset.py::test_router_kill_reset_needs_a_present_unfrozen_mesh` |
 | I69 (HUNG, runner and REST run-bg timeouts, and a re-adopted job's timeout or requested kill each owe the reset; the re-adopted path leaves no requested-kill id) | `tests/test_job_kill_reset.py::test_a_hung_job_owes_the_reset`, `tests/test_job_kill_reset.py::test_a_runner_timeout_owes_the_reset`, `tests/test_job_kill_reset.py::test_a_rest_run_bg_timeout_owes_the_reset`, `tests/test_job_kill_reset.py::test_a_readopted_job_past_its_timeout_owes_the_reset`, `tests/test_job_kill_reset.py::test_a_requested_kill_of_a_readopted_job_owes_the_reset_and_leaves_no_id` |
 | I69 (a debt open at the next job is paid by the post-job gate before its door, the job still QUEUED) | `tests/test_job_kill_reset.py::test_the_runner_pays_an_owed_debt_before_a_queued_job` |

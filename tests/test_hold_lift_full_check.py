@@ -16,8 +16,8 @@ import pytest
 from tests import test_device_safety as safety
 from tests.conftest import fsm_dirty, fsm_healthy, patch_health_event, patch_recovery
 from tests.test_device_safety import _fast_verify_setup, _setup_down_offbus, _setup_selfheal_hold
-from tests.test_eth_timeout_reset import ADVANCING
-from tests.test_eth_timeout_reset import mesh as eth_mesh  # noqa: F401  (fixture)
+from tests.test_eth_timeout_retry import ADVANCING
+from tests.test_eth_timeout_retry import mesh as eth_mesh  # noqa: F401  (fixture)
 from tests.test_fabric_topology_mismatch import _LOST
 from tests.test_post_reset_gate import mesh  # noqa: F401
 from tests.test_reset_full_check_goal8 import PATHS as RESET_PATHS

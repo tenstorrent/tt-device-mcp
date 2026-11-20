@@ -17,9 +17,9 @@ import json
 
 import pytest
 
-from tests import test_eth_timeout_reset as etr
+from tests import test_eth_timeout_retry as etr
 from tests.conftest import fsm_dirty
-from tests.test_eth_timeout_reset import mesh  # noqa: F401  (fixture)
+from tests.test_eth_timeout_retry import mesh  # noqa: F401  (fixture)
 from tests.test_fabric_topology_mismatch import _LOST, _LOST_PORT
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState

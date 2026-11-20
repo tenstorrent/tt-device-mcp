@@ -12,7 +12,7 @@ only the leaf probes stubbed. Device-free."""
 import pytest
 
 from tests.conftest import fsm_dirty
-from tests.test_eth_timeout_reset import ADVANCING, mesh  # noqa: F401 (fixture)
+from tests.test_eth_timeout_retry import ADVANCING, mesh  # noqa: F401 (fixture)
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
 from tt_device_mcp.health.monitors import fabric
