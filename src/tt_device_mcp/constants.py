@@ -13,6 +13,7 @@ SERVICE_NAME = "tt-device-mcp"
 # Canonical host broker socket (root, multi-tenant). Present → clients use it
 # automatically; override with TT_DEVICE_MCP_SOCKET.
 DEFAULT_SOCKET = "/run/tt-device-broker/broker.sock"
+BROKER_UNIT_PATH = "/etc/systemd/system/tt-device-broker.service"
 JOB_RETENTION_SEC = 300  # 5 minutes - grace period before removing finished jobs from memory
 STATS_UPDATE_SEC = 30  # How often to persist stats to disk
 
@@ -279,13 +280,19 @@ def user_socket_path() -> str:
     return str(user_state_dir() / "daemon.sock")
 
 
+def system_broker_installed() -> bool:
+    """True on a broker host: the system unit is installed, whether or not it is running."""
+    return os.path.exists(BROKER_UNIT_PATH)
+
+
 def resolve_socket(explicit=None) -> str:
     """The socket to reach a server, in priority order: explicit/env override,
-    the host broker, then this user's standalone daemon. None if nothing's up."""
+    the host broker, then this user's standalone daemon (never on a broker host,
+    where jobs go to the system broker only). None if nothing's up."""
     cand = explicit or os.environ.get("TT_DEVICE_MCP_SOCKET")
     if cand:
         return cand
-    for p in (DEFAULT_SOCKET, user_socket_path()):
+    for p in (DEFAULT_SOCKET,) if system_broker_installed() else (DEFAULT_SOCKET, user_socket_path()):
         if os.path.exists(p):
             return p
     return None

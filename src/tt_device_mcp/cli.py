@@ -38,6 +38,7 @@ from typing import Optional
 
 from tt_device_mcp import __version__, device_lock
 from tt_device_mcp.constants import (
+    BROKER_UNIT_PATH,
     DEFAULT_PORT,
     DEFAULT_SOCKET,
     HUNG_IO_CAP_SEC,
@@ -106,6 +107,10 @@ def _server_down_message() -> str:
             f"Error: the device server at {sock} isn't responding (overloaded "
             f"or wedged). It may self-recover — retry shortly. If it persists, "
             f"an admin can restart it: sudo systemctl restart tt-device-broker"
+        )
+    if os.path.exists(_BROKER_UNIT):
+        return (
+            "Error: the system broker is not running. Ask an admin to start it: sudo systemctl start tt-device-broker"
         )
     return (
         "Error: no device server reachable. On a shared/broker host, ask an "
@@ -210,6 +215,12 @@ def cmd_daemon_start(args) -> int:
     # On a broker host the system broker serves everyone and the CLI prefers its
     # socket, so a per-user daemon would be shadowed (never used) — refuse to start
     # one. (Skipped under --log-dir, i.e. tests/isolated instances.)
+    if not args.log_dir and os.path.exists(_BROKER_UNIT) and not os.path.exists(DEFAULT_SOCKET):
+        print(
+            "This host runs the system broker, which serves all users; a per-user daemon would not be used. "
+            "Ask an admin to start it: sudo systemctl start tt-device-broker"
+        )
+        return 1
     if not args.log_dir and os.path.exists(DEFAULT_SOCKET):
         if is_daemon_running(args.port, retries=1):
             print(
@@ -1376,7 +1387,7 @@ _UDEV_RULE = (
     'KERNEL=="tenstorrent!*", GROUP:="ttdev", MODE:="0660"\n'
 )
 _LOCK_GROUP = "ttdev"
-_BROKER_UNIT = "/etc/systemd/system/tt-device-broker.service"
+_BROKER_UNIT = BROKER_UNIT_PATH
 # The host config auto-update re-renders the unit from: TTDEV_LOCK=1 there re-applies the lock.
 _BROKER_DEFAULTS = "/etc/default/tt-device-broker"
 # Unit lines the lock owns: the job gid and the broker's between-jobs flip switch.
@@ -1697,7 +1708,9 @@ def cmd_unlock(args) -> int:
         Path(_LOCK_BANNER).unlink()
     except FileNotFoundError:
         pass
-    subprocess.run(["systemctl", "restart", "tt-device-broker"], check=False)
+    # Restart only a running broker to drop the lock; never start one an admin stopped or disabled.
+    if subprocess.run(["systemctl", "is-active", "--quiet", "tt-device-broker"], check=False).returncode == 0:
+        subprocess.run(["systemctl", "restart", "tt-device-broker"], check=False)
     _remove_smi_ro_wrapper()
     print("UNLOCKED: /dev/tenstorrent restored to world-rw (cooperative); bare-metal allowed.")
     return 0

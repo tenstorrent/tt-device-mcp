@@ -106,6 +106,28 @@ def test_a_job_running_when_the_broker_stopped_reads_lost(restarted, clear_job_s
     assert _rest("/api/tt_device_job_logs", {"job_id": "031"})["content"].endswith("step 1\n")
 
 
+def test_an_older_log_with_a_recycled_id_never_reads_live(restarted, monkeypatch, clear_job_state):
+    """A live job or broker action answers for its own log only: an older footerless log with the
+    same id is a pre-restart orphan, never that job's running status."""
+    old = restarted / "2026-10-25_221655_035.log"
+    old.write_text(_header("035") + "[22:18:00] [stdout] step 1\n")
+    job = srv.Job(id="035", owner="other", workspace="/tmp", command="bash new.sh", queued_at="2026-11-01T10:00:00")
+    job.status = srv.JobStatus.RUNNING
+    job.started_at = "2026-11-01T10:00:05"
+    job.log_file = str(restarted / "2026-11-01_100000_035.log")
+    monkeypatch.setitem(srv.jobs, "035", job)
+    assert srv._recent_jobs(files=[old])[0]["status"] == "interrupted"
+
+    monkeypatch.delitem(srv.jobs, "035")
+    monkeypatch.setattr(
+        srv, "_action_row", {"id": "035", "started_at": "2026-11-01T10:00:05", "owner": "[broker]x", "command": "c"}
+    )
+    assert srv._recent_jobs(files=[old])[0]["status"] == "interrupted"
+    own = restarted / "2026-11-01_100005_035.log"
+    own.write_text(_header("035"))
+    assert srv._recent_jobs(files=[own])[0]["status"] == "running"
+
+
 def test_the_journals_cause_beats_the_generic_lost(restarted, monkeypatch, clear_job_state):
     (restarted / "2026-10-25_221655_032.log").write_text(_header("032"))
     monkeypatch.setattr(srv, "_explain_interruption", lambda *a, **k: "host reboot by auto-recovery")

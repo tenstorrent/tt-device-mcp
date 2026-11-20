@@ -2896,8 +2896,11 @@ def _reset_for_testing():
     _hold_bound_tenant_blocker = None
 
 
+_ENV_LINE_RE = re.compile(r"^(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=")
+
+
 def load_env_file(env_path: str, workspace: str) -> dict[str, str]:
-    """Load environment variables from a YAML file.
+    """Load environment variables from a YAML mapping or shell-style KEY=VAL lines.
 
     Args:
         env_path: Path to env file (relative to workspace or absolute)
@@ -2916,7 +2919,16 @@ def load_env_file(env_path: str, workspace: str) -> dict[str, str]:
         env_path = os.path.join(workspace, env_path)
 
     with open(env_path, "r") as f:
-        env_vars = yaml.safe_load(f)
+        text = f.read()
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    if lines and all(_ENV_LINE_RE.match(ln) for ln in lines):
+        # Shell-style KEY=VAL lines (what a `.env` file holds); no YAML quoting rules apply.
+        env_vars = {}
+        for ln in lines:
+            key, _, value = ln.removeprefix("export ").lstrip().partition("=")
+            env_vars[key.strip()] = value.strip().strip("\"'")
+    else:
+        env_vars = yaml.safe_load(text)
 
     # Handle empty file or non-dict content
     if env_vars is None:
@@ -2940,17 +2952,18 @@ def get_activation_script(
         workspace: Path to workspace directory
         env_file: Optional path to env file (relative to workspace or absolute)
         inherited_env: Optional dict of env vars inherited from caller (CLI captures these)
-        validate: If True, check that python_env exists and raise FileNotFoundError if not
+        validate: If True, raise FileNotFoundError when an explicitly set PYTHON_ENV_DIR is missing
 
     Returns:
         Tuple of (shell script string, resolved env vars dict)
 
     Raises:
-        FileNotFoundError: If validate=True and python_env doesn't exist
+        FileNotFoundError: If validate=True and an explicit PYTHON_ENV_DIR doesn't exist
     """
     env_vars: dict[str, str] = {}
 
     # Priority: env_file > inherited_env > workspace defaults
+    explicit_python_env = False
     if env_file:
         env_vars = load_env_file(env_file, workspace)
     elif inherited_env:
@@ -2977,6 +2990,7 @@ def get_activation_script(
     # 4. {workspace}/tt-metal/python_env
     if "PYTHON_ENV_DIR" in env_vars:
         python_env = env_vars["PYTHON_ENV_DIR"]
+        explicit_python_env = bool(env_file or inherited_env)
     elif inherited_env and "VIRTUAL_ENV" in inherited_env:
         python_env = inherited_env["VIRTUAL_ENV"]
     elif "TT_METAL_HOME" in env_vars:
@@ -2984,8 +2998,10 @@ def get_activation_script(
     else:
         python_env = f"{workspace}/tt-metal/python_env"
 
-    # Validate python env exists
-    if validate and not os.path.exists(python_env):
+    # A missing env is a refusal only when the submitter named it; a host without the
+    # default env runs the job with no activation.
+    env_exists = os.path.exists(python_env)
+    if validate and not env_exists and explicit_python_env:
         raise FileNotFoundError(
             f"Python env not found at {python_env}. Set PYTHON_ENV_DIR in your env file or activate a virtualenv."
         )
@@ -2997,13 +3013,10 @@ def get_activation_script(
         if key != "VIRTUAL_ENV":
             lines.append(f'export {key}="{value}"')
 
-    # Activate python env and cd to workspace
-    lines.extend(
-        [
-            f'source "{python_env}/bin/activate"',
-            f'cd "{workspace}"',
-        ]
-    )
+    # Activate python env (when there is one) and cd to workspace
+    if env_exists:
+        lines.append(f'source "{python_env}/bin/activate"')
+    lines.append(f'cd "{workspace}"')
 
     return "\n".join(lines), env_vars
 
@@ -12862,6 +12875,10 @@ def _recent_jobs(limit: int = 20, files: Optional[list[Path]] = None) -> list[di
 
         # No footer: classify against the live queue or active action.
         job = inmem.get(rec["job_id"])
+        # Ids are recycled: a live job or action answers only for its own log, never an older
+        # footerless one with the same id (a pre-restart orphan reads interrupted, spec 01 I71).
+        if job is not None and job.log_file and Path(job.log_file) != f:
+            job = None
         if job is not None and job.status == JobStatus.RUNNING:
             rec["status"] = "running"
             start = job.started_at or started_at
@@ -12871,7 +12888,7 @@ def _recent_jobs(limit: int = 20, files: Optional[list[Path]] = None) -> list[di
         elif job is not None and job.status == JobStatus.QUEUED:
             rec["status"] = "queued"
             rec["wait"] = _span_str(job.queued_at or rec["queued_at"], now)  # waiting up to now
-        elif job is not None and started_at and (not job.log_file or Path(job.log_file) == f):
+        elif job is not None and started_at:
             # Spec 01 I70: terminal in memory, footer not yet written (the scope stop and sweep run
             # between the two). Say what the broker decided, never "interrupted".
             start = job.started_at or started_at
@@ -12883,7 +12900,11 @@ def _recent_jobs(limit: int = 20, files: Optional[list[Path]] = None) -> list[di
             rec["wait"] = _span_str(job.queued_at or rec["queued_at"], start)
             if rec.get("recovery_killed"):
                 _label_recovery_killed(rec)
-        elif _action_row is not None and rec["job_id"] == _action_row["id"]:
+        elif (
+            _action_row is not None
+            and rec["job_id"] == _action_row["id"]
+            and f.name.startswith(datetime.fromisoformat(_action_row["started_at"]).strftime("%Y-%m-%d_%H%M%S"))
+        ):
             rec["status"] = "running"
             rec["started_at"] = _action_row["started_at"]
             rec["runtime"] = _span_str(_action_row["started_at"], now)
