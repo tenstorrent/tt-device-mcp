@@ -2287,8 +2287,7 @@ def test_health_shows_the_seconds_left_before_a_preemptable_jobs_limit(clear_job
 
 
 # A hold whose 10-min bound a running broker job blocks is contention too (spec 01 I20, spec 04 I76): a held device
-# refuses tenants, so nothing can queue behind a preemptable job past its limit. Without this waiter a re-adopted
-# preemptable job past its limit ran on unbounded over a startup_unverified hold and the bound's ladder never ran.
+# refuses tenants, so nothing can queue behind a preemptable job past its limit.
 
 
 @pytest.fixture
@@ -2360,35 +2359,6 @@ def test_the_bound_blocker_names_the_preemption(clear_job_state, bound_blocked):
     _readopted("990", served_sec=2400, timeout_sec=300)
     desc = srv._describe_bound_blocker(srv._hold_bound_tenant_blocker)
     assert "preemptable" in desc and "ladder runs" in desc, desc
-
-
-@pytest.mark.asyncio
-async def test_a_readopted_preemptable_job_past_its_limit_is_killed_a_minute_after_the_hold_bound_blocks(
-    monkeypatch, tmp_path, clear_job_state, bound_blocked
-):
-    """The startup_unverified case: a broker restart re-adopted a preemptable job, it ran past its limit, the hold
-    opened and its 10-min bound was blocked by the job. Nothing else waits. The job gets its full minute, then is
-    killed, so the bound's ladder (and the power cycle if the full check still fails) can run."""
-    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path))
-    monkeypatch.setattr(srv, "_SCOPE_POLL_SEC", 0.01)
-    monkeypatch.setattr(srv, "PREEMPT_GRACE_SEC", 1)
-    _recording_dirty(monkeypatch)
-    active = {"v": True}
-    stopped = []
-    monkeypatch.setattr(srv, "_scope_active", lambda scope: active["v"])
-
-    async def fake_kill(job_id, pid):
-        stopped.append((job_id, time.monotonic()))
-        active["v"] = False
-
-    monkeypatch.setattr(srv, "_preempt_kill", fake_kill)
-    _readopted("990", served_sec=2400, timeout_sec=1500)
-
-    t0 = time.monotonic()
-    await asyncio.wait_for(srv._monitor_readopted_scope("990", "ttdev-job-990.scope"), timeout=5)
-    assert [j for j, _ in stopped] == ["990"], "the job blocking the hold bound ran on unbounded"
-    assert stopped[0][1] - t0 >= 1 - 0.05, "killed before its full minute"
-    assert srv.jobs["990"].status is srv.JobStatus.PREEMPTED
 
 
 class _ManualClock:

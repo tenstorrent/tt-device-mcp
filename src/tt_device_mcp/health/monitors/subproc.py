@@ -70,8 +70,6 @@ async def _wait_or_abort(aw: Awaitable, abort: Optional[Abort], timeout: Optiona
         await asyncio.wait({main, watch}, return_when=asyncio.FIRST_COMPLETED)
         if main.done():
             return "", main.result()
-        main.cancel()
-        await asyncio.gather(main, return_exceptions=True)
         return watch.result(), None
     finally:
         for t in (main, watch):
@@ -117,7 +115,7 @@ async def run_probe(
 
     ``abort`` (polled every :data:`ABORT_POLL_SEC`) ends the wait early, also inside the timeout path's wait and
     ``terminate``: the group is SIGSTOPped, never killed, and ``(None, output)`` returns at once. The caller reads
-    ``abort`` again to tell it from a timeout (spec 04 I114: PCI-wedged, no fd of a reader may close before the power
+    ``abort`` again to tell it from a timeout (spec 04 I76: PCI-wedged, no fd of a reader may close before the power
     cycle)."""
     proc: Optional[asyncio.subprocess.Process] = None
     try:

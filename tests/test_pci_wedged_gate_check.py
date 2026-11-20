@@ -1,14 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""Spec 04 I114: a PCI-wedged latch set while the gate's full check runs ends that check at once, no verdict.
-
-The gate holds the device op for its whole full check, and the watchdog's PCI-wedged host rung waits on
-that op. A check reader the dead-chip valve SIGSTOPped never ends on its own, so before this the request
-waited out the check's own timeout and then its SIGINT/SIGTERM grace: minutes, not seconds. Now the
-check stops waiting the moment the latch sets, leaves its reader stopped (never killed: spec 03 I84, a
-stop issues no reads and closes no fd, and the power cycle ends it), records no verdict, and the host
-rung is asked within seconds. No hold lifts on it: only a just-passed full check with fabric does.
+"""Spec 04 I76: a PCI-wedged latch set while the gate's full check runs ends that check at once, no verdict.
 
 Each check here is a real ``sleep`` in its own session, run through the real ``run_probe``; no device.
 """

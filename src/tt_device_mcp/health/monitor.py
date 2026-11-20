@@ -1232,7 +1232,7 @@ class HealthMonitor:
 
     async def _verify_fabric_health_body(self, timeout_sec: float) -> tuple[Optional[bool], str]:
         self._fabric_killed = ""
-        # Spec 04 I114: a PCI-wedged latch set while this pass runs ends it at once, no verdict. Only the
+        # Spec 04 I76: a PCI-wedged latch set while this pass runs ends it at once, no verdict. Only the
         # power cycle recovers the mesh, and it waits on the device op this check holds. A latch already
         # set at the start does not: a pass then is what may clear it.
         latched_at = PCI_WRITER.latched_at
@@ -1300,9 +1300,9 @@ class HealthMonitor:
         self.last_fabric_output = text
         self.last_fabric_output_at = _t0
         if wedged["why"]:
-            return self._fabric_wedged_no_verdict(cmd, text, dt, wedged["why"])
+            return self._fabric_no_verdict(cmd, None, text, dt, wedged["why"])
         if self._fabric_killed:
-            return self._fabric_killed_no_verdict(cmd, rc, text, dt)
+            return self._fabric_no_verdict(cmd, rc, text, dt)
         last = text.splitlines()[-1][:200] if text else "(no output)"
         if override:
             # An operator's own wrapper has already done its own interpretation and reports it
@@ -1323,11 +1323,11 @@ class HealthMonitor:
                 self.last_fabric_output = text
                 self.last_fabric_output_at = _t0
         if wedged["why"]:
-            return self._fabric_wedged_no_verdict(cmd, text, (datetime.now() - _t0).total_seconds(), wedged["why"])
+            return self._fabric_no_verdict(cmd, None, text, (datetime.now() - _t0).total_seconds(), wedged["why"])
         if self._fabric_killed:
             # Read again after the traffic-only rerun (I45): a kill there is no verdict either (I82),
             # never a link fault or a missing-cable verdict (I47) from whatever the killed run printed.
-            return self._fabric_killed_no_verdict(cmd, rc, text, (datetime.now() - _t0).total_seconds())
+            return self._fabric_no_verdict(cmd, rc, text, (datetime.now() - _t0).total_seconds())
         # Traffic crossed every discovered link but ports of the descriptor are missing: a FAILED
         # check, never a lift (I71). The cached mismatch goes, so the next pass runs the descriptor
         # again and a reset that brought the link back reads clean.
@@ -1413,35 +1413,29 @@ class HealthMonitor:
             return False, f"fabric check timed out after {timeout_sec:.0f}s; last line: {last}"
         return False, f"fabric check exited {rc} ({dt:.0f}s): {reason[:400]}"
 
-    def _fabric_killed_no_verdict(self, cmd: str, rc: Optional[int], text: str, dt: float) -> tuple[None, str]:
-        """A pass the dead-chip isolation killed (spec 03 I82): neither a pass nor a link fault, nor a
-        77. No failed verdict, no 77 streak (I46) and no cover from an earlier pass: the fabric is
-        unknown until a later pass measures it."""
+    def _fabric_no_verdict(
+        self, cmd: str, rc: Optional[int], text: str, dt: float, wedged: str = ""
+    ) -> tuple[None, str]:
+        """A pass the dead-chip isolation killed (spec 03 I82), or, with ``wedged``, one a PCI-wedged latch ended (spec 04
+        I76): neither a pass nor a link fault, nor a 77. No failed verdict, no 77 streak (I46) and no cover from an
+        earlier pass: the fabric is unknown until a later pass measures it. A wedged pass's readers are left SIGSTOPped,
+        never killed: a chip under them may be off the bus and still attached (spec 03 I84), and the power cycle ends
+        them."""
         why, self._fabric_killed = self._fabric_killed, ""
-        self._write_action_log("[broker]fabric-check", cmd, dt, "killed", rc, output=_action_log_output(text))
+        status = "stopped" if wedged else "killed"
+        self._write_action_log("[broker]fabric-check", cmd, dt, status, rc, output=_action_log_output(text))
         self.last_fabric_ok = None
         self.last_fabric_skipped = False
-        detail = (
-            f"{FABRIC_KILLED_BY_ISOLATION} ({dt:.0f}s, exit {rc}): {why}; no verdict, "
-            "fabric unknown, a full pass is owed after recovery"
-        )
-        health_event("fabric_check_no_verdict", cause="killed_by_dead_chip_isolation", reason=why[:400], rc=rc)
-        log = self._logger()
-        if log:
-            log.warning(f"FABRIC-CHECK {detail}")
-        return None, detail
-
-    def _fabric_wedged_no_verdict(self, cmd: str, text: str, dt: float, why: str) -> tuple[None, str]:
-        """A pass a PCI-wedged latch ended (spec 04 I114): no verdict, never a pass or a link fault. Its readers are left
-        SIGSTOPped, never killed: a chip under them may be off the bus and still attached (spec 03 I84), and the power
-        cycle ends them."""
-        self._fabric_killed = ""
-        self._write_action_log("[broker]fabric-check", cmd, dt, "stopped", None, output=_action_log_output(text))
-        self.last_fabric_ok = None
-        self.last_fabric_skipped = False
-        FABRIC_DEBT.note_fabric_killed(f"fabric check stopped ({why})")
-        detail = f"fabric check stopped after {dt:.0f}s: {why}; no verdict, the power cycle is next"
-        health_event("fabric_check_no_verdict", cause="pci_wedged", reason=why[:400])
+        if wedged:
+            FABRIC_DEBT.note_fabric_killed(f"fabric check stopped ({wedged})")
+            detail = f"fabric check stopped after {dt:.0f}s: {wedged}; no verdict, the power cycle is next"
+            health_event("fabric_check_no_verdict", cause="pci_wedged", reason=wedged[:400])
+        else:
+            detail = (
+                f"{FABRIC_KILLED_BY_ISOLATION} ({dt:.0f}s, exit {rc}): {why}; no verdict, "
+                "fabric unknown, a full pass is owed after recovery"
+            )
+            health_event("fabric_check_no_verdict", cause="killed_by_dead_chip_isolation", reason=why[:400], rc=rc)
         log = self._logger()
         if log:
             log.warning(f"FABRIC-CHECK {detail}")

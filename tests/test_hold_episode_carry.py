@@ -856,7 +856,6 @@ async def test_a_startup_hold_that_deferred_a_carry_lifts_only_on_a_full_check_p
     srv._note_hold_carry_job("start")
     _restart_broker(monkeypatch)
     _ledger_dir(monkeypatch, tmp_path)
-    monkeypatch.setenv("TT_DEVICE_MCP_HEALTH_CHECK", "1")  # the runner's harness turned the gate off
     short = (False, {"snapshot": {"ok": True}, "fabric": {"ok": False, "detail": f"what(): {MISMATCH}"}})
     fresh = ServerFsm(tmp_path / "fsmdir" / "fsm.json", current_boot_id="boot-a")
     fresh.boot_merge(None)
@@ -920,7 +919,6 @@ async def test_a_startup_hold_whose_real_startup_check_fails_takes_the_carry(mon
     srv._note_hold_carry_job("start")
     _restart_broker(monkeypatch)
     _ledger_dir(monkeypatch, tmp_path)
-    monkeypatch.setenv("TT_DEVICE_MCP_HEALTH_CHECK", "1")  # the runner's harness turned the gate off
     short = (False, {"snapshot": {"ok": True}, "fabric": {"ok": False, "detail": f"what(): {MISMATCH}"}})
     fresh = ServerFsm(tmp_path / "fsmdir" / "fsm.json", current_boot_id="boot-a")
     fresh.boot_merge(None)
@@ -1098,7 +1096,6 @@ async def test_a_slow_real_startup_gate_after_a_failed_readopted_job_goes_to_the
     )
     _gate_ran_for(srv._HOLD_CARRY_SEC + 10)
     _ledger_dir(monkeypatch, tmp_path)
-    monkeypatch.setenv("TT_DEVICE_MCP_HEALTH_CHECK", "1")  # the runner's harness turned the gate off
     short = (False, {"snapshot": {"ok": True}, "fabric": {"ok": False, "detail": f"what(): {MISMATCH}"}})
     fresh = ServerFsm(tmp_path / "fsmdir" / "fsm.json", current_boot_id="boot-a")
     fresh.boot_merge(None)
@@ -1174,9 +1171,9 @@ def _kill_reset_hold(monkeypatch, job_id="494"):
 async def test_replay_an_owner_stop_of_the_first_job_after_a_verified_release_starts_a_fresh_episode(
     runner_env, monkeypatch, tmp_path, how  # noqa: F811
 ):
-    """A Galaxy host: a hold was released on a full check whose fabric pass found every cabled link, no bound ladder
-    run. Its owner killed the next job within the carry window, no fault on record. The kill-reset hold after it must
-    start at its own start, so its fast path (one reset, then the full check) runs, not the old episode's full ladder.
+    """A hold was released on a full check whose fabric pass found every cabled link, no bound ladder run. Its owner
+    killed the next job within the carry window, no fault on record. The kill-reset hold after it must start at its own
+    start, so its fast path (one reset, then the full check) runs, not the old episode's full ladder.
     """
     old = _verified_carry(monkeypatch, tmp_path)
     job = await _first_job_stopped(how)
