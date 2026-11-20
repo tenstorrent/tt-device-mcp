@@ -153,19 +153,26 @@ async def test_one_chip_still_out_goes_to_the_check_and_the_power_cycle_with_no_
     """Only chip 30 is back after the rescan: no second mesh reset and no settle of the step's own."""
     order, events, counters = _late(monkeypatch, tmp_path, back=1)
     sleeps = []
+    settles = []
     real_sleep = galaxy.asyncio.sleep
 
     async def sleep(sec, *a, **k):
         sleeps.append((len(order), sec))
         return await real_sleep(0)
 
+    async def settle(self, expected, bound_sec, log, *, phase):
+        settles.append((len(order), bound_sec))  # the sweep's own settle: a poll of the chips (spec 04 I86)
+        return {}
+
     monkeypatch.setattr(galaxy.asyncio, "sleep", sleep)
+    monkeypatch.setattr(galaxy, "_settle_before_host_rung_sec", lambda: 7)
+    monkeypatch.setattr(galaxy.GalaxyRecovery, "_settle_until_chips_answer", settle)
     assert await _bound_ladder() == OUTCOME_TERMINAL
     tail = ["mesh reset", "rescan", "readers stopped", "present reinit", "full check", "power cycle"]
     assert _after_sweep_mesh(order) == tail
     reinit_at = len(order) - len(tail) + 4  # order's length once the re-init ran
-    after = [sec for at, sec in sleeps if at == reinit_at]
-    assert after == [galaxy._settle_before_host_rung_sec()], "the sweep's own settle only: the steps add no wait"
+    assert [sec for at, sec in settles if at == reinit_at] == [7], "the sweep's own settle once"
+    assert [sec for at, sec in sleeps if at == reinit_at] == [], "the steps add no wait of their own"
     step = _step(events)
     assert len(step) == 1 and step[0]["fired"] is False and (step[0]["on_bus"], step[0]["expected"]) == (31, 32)
     assert counters["dirty_cleared"] == 0
