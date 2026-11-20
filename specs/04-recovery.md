@@ -1415,8 +1415,13 @@ each rung fires only when the gentler one failed or cannot apply.
   blocker (pid, user, command), `/health` shows `next_step` `tenant_blocked` with `blocked_by`, and
   on the first sampler tick after the tenant leaves the ladder runs, then the host rung if the full
   check fails. With the power cycle
-  opted out (`TT_DEVICE_MCP_AUTO_POWER_CYCLE=0`) the hold pages
-  `hold_bound_no_host_rung` once per episode. The operator kill switch
+  opted out (`TT_DEVICE_MCP_AUTO_POWER_CYCLE=0`), or not fireable on this server (no reset or
+  power-cycle rights: no ipmitool or no openable `/dev/ipmi*`, e.g. a per-user server), the hold pages
+  `hold_bound_no_host_rung` once per episode, its `why` naming which. A server without those rights
+  that did not opt out says so, never as an operator opt-out: the `RUNG OFF auto-power-cycle`
+  line in the boot rung inventory and `/health` `recovery_unavailable` (its cause; null where the host
+  rung can fire or the operator opted out). The hold stays; the bound
+  still runs the ladder and its full check, and only a pass releases. The operator kill switch
   `TT_DEVICE_MCP_FORCE_ESCALATE=0` turns off only the forced runs below the bound; the bound's ladder
   and host rung ignore it, no env or config switches the bound off, and the boot rung inventory's
   `RUNG OFF forced-escalation` warning says so. `/health` carries `hold_bound` while a hold is open:
@@ -3066,6 +3071,41 @@ each rung fires only when the gentler one failed or cannot apply.
   Recovery is unchanged: ladder order, timings, thresholds, gates, and the full check with fabric
   before any hold lifts (I32) are not touched; the record only describes the request.
 
+- **I115 — A non-root server reaches the BMC through `sudo -n ipmitool`, never a prompt.** A per-user
+  server (not root) usually cannot open `/dev/ipmi0`, so its mesh reset's preflight `ipmitool mc info`
+  failed with "could not open /dev/ipmi0" and the mesh reset never ran, and I91's `unshare` guard
+  cannot arm without root. Now, when the euid is not 0 and no local IPMI node opens for it, every
+  local-interface ipmitool call the broker makes goes through `sudo -n` (stdin closed, so it never
+  waits on a password): the mesh reset preflight, the restart-cause and SEL reads, and the BMC
+  capture. A LAN (`-I lanplus`) call and any other command run as before. A
+  non-root mesh reset runs under a wrapper that writes a copy of the guard as `sudo` into a fresh
+  0700 directory first on the reset's PATH. tt-smi's tray reset (`sudo ipmitool raw 0x30 0x8B ...`)
+  reaches that copy, which applies I91's refusal (op_mode `0x0` never reaches the BMC), passes only
+  `ipmitool`, and runs the real ipmitool from sudo's secure path through the real `sudo -n`. A
+  wrapper that cannot write, read back or run its copy (a `noexec` temp directory) runs no reset
+  (I91's not-armed case). It execs into
+  the reset and never returns to remove its copy, so each run first removes this user's earlier copies
+  older than an hour (never another user's, never one a running reset still uses).
+
+  The one sudoers rule a per-user install needs is `<user> ALL=(root) NOPASSWD: /usr/bin/ipmitool`
+  (ipmitool only). The privilege probe reads it with `sudo -n -l ipmitool` at boot (never running
+  ipmitool); the boot line prints it as `ipmi_sudo`. The rule serves the mesh reset and the BMC reads
+  only: it never arms the host rung. The OS-first power cycle writes its root-owned request file under
+  `/run` and starts a system unit, so a non-root server's `auto-power-cycle` rung reads OFF whatever the
+  rule allows or whether it opens the node (I14), the inventory names that cause (not root; the sudo
+  rule does not enable it), and the 10-minute bound journals `hold_bound_no_host_rung`. A power cycle
+  asked of a non-root server (the off-bus path with a configured command) is not launched, with "needs
+  root" as its reason. When sudo refuses (no rule, a password or terminal required), the preflight
+  refusal names the missing rule plainly; the refusal is a rung that did not fire: the hold stays, the ladder climbs, I76's
+  10-minute escalation and the power-cycle request still run.
+
+  Unchanged: root (and a user who can open the node) calls plain ipmitool, and root's mesh reset
+  keeps the `unshare` guard. The power-cycle argv written to the request file stays plain ipmitool:
+  the shutdown hook and the fallback unit fire it as root. A per-user server that cannot write the
+  request file or start the system fallback unit is never asked to fire it, since its host rung is
+  OFF. Nothing here lifts a hold: only a full health check with fabric over
+  every cabled link that has just passed does (I32).
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -3555,6 +3595,7 @@ sees a silent fabric pass.
 | I76 a bound ladder that brings the mesh back but whose full check ends with no pass (77-only, topology mismatch / I42 latch, known fabric fault, generic) does not release and asks for the host rung in the same run; a relift check that fails after the ladder asks for it on the next tick; a check that passes asks for none | `tests/test_hold_bound.py::test_a_failed_check_after_the_bound_ladder_asks_for_the_host_rung_at_once`, `::test_a_relift_that_fails_after_the_bound_ladder_cycles_on_the_next_tick`, `::test_a_passing_check_after_the_bound_ladder_asks_for_no_host_rung` |
 | I76 a check still waiting on hugepages (or hanging) after the bound ladder gets the 300 s check bound, then the host rung; another run inside that bound does not cut the check short | `tests/test_hold_bound.py::test_a_check_still_waiting_on_hugepages_is_bounded_by_the_check_window`, `::test_a_check_still_waiting_on_hugepages_is_bounded_by_the_check_window` |
 | I76 a failed full check in any idle lift after the bound ladder (eth_frozen, off-bus floor, foreign holder) asks for the host rung on the next tick; one still waiting on hugepages asks for none | `tests/test_hold_bound.py::test_a_failed_lift_check_after_the_bound_ladder_asks_for_the_host_rung`, `::test_a_lift_check_still_waiting_on_hugepages_asks_for_no_host_rung`, `::test_a_failed_foreign_holder_check_after_the_bound_ladder_asks_for_the_host_rung` |
+| I76 a server without power-cycle rights that did not opt out names it at startup and in the `hold_bound_no_host_rung` event's `why` and log line; an opt-out or a fireable rung reads as no such cause | `tests/test_fabric_nonroot_scratch.py::test_no_rights_is_reported_at_startup_health_and_hold_bound` |
 | I76 /health shows the bound; the env shortens it, never lengthens it; a stuck-hold event past the bound never reads `escalated` false | `tests/test_hold_bound.py::test_health_shows_the_bound`, `::test_env_shortens_the_bound_never_lengthens_it`, `::test_a_stuck_hold_event_past_the_bound_never_reads_escalated_false` |
 | I76 the latch set by a fabric failure of the first job after a topology-mismatch lift: at the bound (watchdog window or tenant-hold bound) the full ladder runs, the full check with fabric still fails, the broker asks for the power cycle once, the latch stands; a tenant job parked at the gate behind that hold (holding no device fd) never dispatches, and its own tenant-hold bound refuses it with no second power cycle | `tests/test_hold_bound.py::test_replay_the_lift_then_job_fabric_failure_latch_gets_the_ladder_check_and_power_cycle`, `::test_replay_post_reset_lift_latch_with_gated_queued_job_runs_the_ladder_at_the_bound`; walked tick by tick with no idle relift reset, no rung runs below the bound, and the deadline event reads escalated: `tests/test_hold_bound.py::test_replay_a_disproven_lift_hold_gets_the_ladder_and_power_cycle_within_the_class_d_budget` |
 | I76 a disproven I42 lift's bound is one sampler tick and the FORCE_ESCALATE=0 kill switch does not stop it; a hold with no disproven lift keeps the 600 s bound and (77-only) its no-reset fast path, while an unlatched mismatch gets I83's at-start ladder; the early ladder does not count as the 10-min one, so a hold still standing at 600 s with no host action pending gets the full ladder again | `tests/test_hold_bound.py::test_a_disproven_lift_runs_the_bound_ladder_after_one_tick_whatever_the_kill_switch`, `::test_a_hold_with_no_disproven_lift_keeps_the_600s_bound_and_its_fast_path`, `::test_the_10_min_mark_reruns_the_full_ladder_after_an_early_disproven_lift_run` |
@@ -3797,4 +3838,8 @@ sees a silent fabric pass.
 | I109 error path: the DIAG ends before the index is restored, only read indexes are restored, the lock is released, the error is named | `tests/test_cpld_dump.py::test_a_failed_output_write_ends_the_diag_and_restores_the_index`, `::test_a_failed_pipe_read_ends_the_diag_and_restores_the_index`, `::test_an_error_before_the_diag_restores_only_what_was_read` |
 | I109 a silent BMC costs one call: before the DIAG it is skipped, after it the remaining restores and the PSU read are skipped, the event names why | `tests/test_cpld_dump.py::test_a_silent_bmc_before_the_diag_skips_it_after_one_call`, `::test_a_bmc_silent_after_the_diag_keeps_the_dump_and_skips_the_rest`, `::test_an_ipmitool_past_the_brokers_own_bound_is_a_silent_bmc` |
 | I109 the dump and the episode's incident folders are cross-linked both ways | `tests/test_cpld_dump.py::test_a_chip_dead_incident_and_its_dump_are_linked`, `::test_an_incident_after_the_dump_links_to_it`, `::test_an_incident_just_before_the_episode_opened_is_linked`, `::test_no_link_outside_the_episode` |
+| I115 root and a user who opens the IPMI node call plain ipmitool (root's mesh reset keeps the unshare guard); a non-root server without the node sends every local BMC call through `sudo -n` with stdin closed, LAN calls and other commands unchanged | `tests/test_ipmi_guard.py::test_root_calls_ipmitool_directly`, `tests/test_ipmi_guard.py::test_a_non_root_server_that_opens_the_node_calls_ipmitool_directly`, `tests/test_ipmi_guard.py::test_a_non_root_local_bmc_call_goes_through_sudo_n`, `tests/test_ipmi_guard.py::test_the_non_root_preflight_runs_sudo_n_ipmitool_without_a_terminal` |
+| I115 a non-root mesh reset runs under the `sudo` guard copy, which refuses op_mode `0x0` and anything but ipmitool and runs the real ipmitool through the real `sudo -n` | `tests/test_ipmi_guard.py::test_the_non_root_mesh_reset_runs_under_the_sudo_shim`, `tests/test_ipmi_guard.py::test_the_user_wrapper_puts_the_guard_first_on_path_as_sudo`, `tests/test_ipmi_guard.py::test_the_user_wrapper_refuses_to_run_when_the_shim_cannot_be_executed`, `tests/test_ipmi_guard.py::test_the_sudo_shim_refuses_the_legacy_retimer_reset`, `tests/test_ipmi_guard.py::test_the_sudo_shim_refuses_anything_but_ipmitool`, `tests/test_ipmi_guard.py::test_the_sudo_shim_sends_the_tray_reset_through_sudo_n`, `tests/test_ipmi_guard.py::test_the_sudo_shim_runs_ipmitool_directly_when_the_node_opens`, `tests/test_ipmi_guard.py::test_the_user_wrapper_removes_its_stale_guard_copies`, `tests/test_ipmi_guard.py::test_the_user_wrapper_prunes_before_each_new_copy` |
+| I115 with I14 a non-root server's host rung reads OFF whatever the sudo rule or the node allows: the inventory names "not root", and the 10-min bound pages `hold_bound_no_host_rung` and fires no cycle | `tests/test_rung_privilege.py::test_a_non_root_server_with_the_sudo_rule_has_no_host_rung`, `tests/test_privileges.py::test_a_non_root_server_with_the_sudo_rule_keeps_the_host_rung_off`, `tests/test_privileges.py::test_a_non_root_server_that_opens_the_node_still_has_no_host_rung` |
+| I115 a refused `sudo -n` names the one sudoers rule, keeps the hold, climbs the ladder and never reboots; the probe reads the rule with `sudo -n -l ipmitool` and root is never asked | `tests/test_ipmi_guard.py::test_a_refused_sudo_names_the_one_rule_it_needs`, `tests/test_ipmi_guard.py::test_a_bmc_error_is_not_read_as_a_sudo_refusal`, `tests/test_ipmi_guard.py::test_a_non_root_server_without_the_sudo_rule_keeps_the_hold_and_climbs`, `tests/test_power_cycle_os_first.py::test_a_non_root_server_never_starts_the_os_first_cycle`, `tests/test_privileges.py::test_a_non_root_server_with_the_sudo_rule_keeps_the_host_rung_off`, `tests/test_privileges.py::test_a_non_root_server_without_the_sudo_rule_cannot_reach_the_bmc`, `tests/test_privileges.py::test_root_is_never_asked_for_sudo` |
 | I102 with I103: the late-chip second mesh reset runs in the pre-cycle sweep, so its pre-reset scan clears a holder outside every broker scope and runs (at the 10-min bound, on the I97 path, and in the sweep outside the bound); its wait still ends at the step's start plus `LATE_CHIP_STEP_SEC`; a failed full check keeps the hold and the cycle journals the holder; a holder in a broker job's scope or the running job's own process still refuses it, nothing lifts and the hold goes on to the cycle | `tests/test_late_chips_after_driver_wait.py::test_the_late_chip_second_reset_clears_a_foreign_holder_and_keeps_its_bound`, `::test_a_job_holder_still_refuses_the_late_chip_second_reset_and_the_hold_goes_on_to_the_cycle` |

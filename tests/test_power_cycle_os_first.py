@@ -638,6 +638,15 @@ def test_a_bmc_that_fails_the_preflight_never_reboots(os_first, rc):
     assert _steps(os_first) == ["preflight"]
 
 
+def test_a_non_root_server_never_starts_the_os_first_cycle(os_first, monkeypatch):
+    """Spec 04 I115/I14: the request file under /run and the system unit need root, whatever sudo allows."""
+    from tt_device_mcp import privileges
+
+    monkeypatch.setattr(privileges, "_LATCHED", {**privileges._state(), "root": False})
+    assert "needs root" in _not_launched(os_first)
+    assert _steps(os_first) == []
+
+
 def test_the_preflight_keeps_the_configured_commands_bmc_options(os_first):
     _real_fire_command(["ipmitool", "-I", "lanplus", "-H", "bmc", "chassis", "power", "cycle"], REASON)
     assert os_first["calls"][0][1] == ["/usr/bin/ipmitool", "-I", "lanplus", "-H", "bmc", "mc", "info"]
