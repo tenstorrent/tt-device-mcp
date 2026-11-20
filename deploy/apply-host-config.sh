@@ -89,6 +89,8 @@ fi
 # install-tt-device-broker.sh, but auto-update never re-runs the installer, only this script,
 # so a host that had it staged before retirement would otherwise keep the file forever.
 [ -n "$RENDER_ONLY" ] || rm -f "$ROOT/eth-heartbeat-check.sh"
+# Likewise the retired aiclk-ceiling helper that an older updater staged.
+[ -n "$RENDER_ONLY" ] || rm -f "$ROOT/aiclk-ceiling.py"
 # The reset-path activation knobs. server.py reads TT_DEVICE_MCP_RESET_MIN_DEAD_FRAC (a below-floor
 # off-bus drop HOLDS instead of resetting) and TT_DEVICE_MCP_SELFHEAL_RELIFT (a self-healed hold
 # lifts from the idle sampler). Both are OFF when unset, so this wiring renders no line until a host
