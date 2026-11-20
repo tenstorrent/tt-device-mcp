@@ -109,7 +109,9 @@ def _server_down_message() -> str:
             f"an admin can restart it: sudo systemctl restart tt-device-broker"
         )
     if os.path.exists(_BROKER_UNIT):
-        return "Error: the system broker is not running. Ask an admin to start it: sudo systemctl start tt-device-broker"
+        return (
+            "Error: the system broker is not running. Ask an admin to start it: sudo systemctl start tt-device-broker"
+        )
     return (
         "Error: no device server reachable. On a shared/broker host, ask an "
         "admin to start it (sudo systemctl start tt-device-broker); on a "

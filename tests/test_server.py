@@ -410,7 +410,7 @@ class TestEnvFile:
         with tempfile.TemporaryDirectory() as tmpdir:
             env_file = os.path.join(tmpdir, ".env")
             with open(env_file, "w") as f:
-                f.write("# a comment\n\nTT_METAL_HOME=/path/to/tt-metal\nexport DEBUG=1\nNAME=\"two words\"\nEMPTY=\n")
+                f.write('# a comment\n\nTT_METAL_HOME=/path/to/tt-metal\nexport DEBUG=1\nNAME="two words"\nEMPTY=\n')
 
             assert load_env_file(env_file, tmpdir) == {
                 "TT_METAL_HOME": "/path/to/tt-metal",
