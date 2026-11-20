@@ -1671,7 +1671,6 @@ async def test_a_waiter_after_the_limit_shows_the_countdown_then_sigkills_at_the
             if row:
                 labels.append(row["preempt"])
             await asyncio.sleep(0.1)
-        elapsed = time.monotonic() - t0
         for _ in range(20):
             await asyncio.sleep(0.05)
     finally:
@@ -1680,7 +1679,14 @@ async def test_a_waiter_after_the_limit_shows_the_countdown_then_sigkills_at_the
 
     assert job.status is srv.JobStatus.PREEMPTED
     assert job.exit_code in (-9, 137), f"expected a SIGKILL, got exit {job.exit_code}"
-    assert 3.3 <= elapsed <= 4.5, f"SIGKILL {elapsed:.1f}s after the waiter arrived; minute 3 s + kill 0.5 s"
+    # The kill must sit exactly on the server's own clocks, not the runner's wall time:
+    # the SIGTERM goes out on the grace minute the server computed (the SIGKILL's own
+    # ladder — drain, SIGTERM, kill grace, reap — is bounded by its sleeps and waits).
+    assert job.preempt_killed_monotonic is not None, "the minute ran out without a kill"
+    minute = job.contention_since_monotonic + srv.PREEMPT_GRACE_SEC
+    assert (
+        minute <= job.preempt_killed_monotonic <= minute + 0.5
+    ), f"kill began {job.preempt_killed_monotonic - minute:+.2f}s off the waiter's grace minute"
     counting = [lbl for lbl in labels if lbl.startswith("PREEMPTING ")]
     assert counting and counting[0] in ("PREEMPTING 3s", "PREEMPTING 2s"), labels
     secs = [int(lbl.split()[1][:-1]) for lbl in counting]
