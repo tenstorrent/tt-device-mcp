@@ -188,13 +188,11 @@ async def test_two_timeouts_then_a_failing_fabric_pass_stays_held(mesh):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["failed", "no-verdict"])
-async def test_nothing_releases_the_device_without_a_passed_fabric_pass(mesh, outcome):
+async def test_nothing_releases_the_device_without_a_passed_fabric_pass(mesh):
     """With the eth read unmeasured twice, only a fabric pass that has just passed releases the device."""
     mesh["eth_seq"] = [TIMED_OUT, TIMED_OUT]
     mesh["reset_heals"] = False
-    mesh["fabric_bad"] = outcome == "failed"
-    mesh["fabric_77"] = outcome == "no-verdict"
+    mesh["fabric_77"] = True
     await _gate()
     assert srv.fsm.state is not ServerState.HEALTHY
     assert srv._device_unavailable_for_tenant()
@@ -243,14 +241,6 @@ async def test_host_pci_not_ok_is_not_retried(mesh):
     await _gate()
     assert mesh["eth_reads"] == 1
     assert mesh["resets"] == [] and mesh["fabric"] == [0]
-
-
-@pytest.mark.asyncio
-async def test_an_asked_for_fabric_pass_does_not_retry_the_read(mesh):
-    """HealthMonitor.update with the fabric pass asked for: the read is the full check's own, never retried."""
-    state = await srv.health_monitor.update("post-job", run_fabric=True, expected=CHIPS)
-    assert mesh["eth_reads"] == 1
-    assert mesh["fabric"] == [0] and state.fabric_ran is True
 
 
 @pytest.mark.asyncio

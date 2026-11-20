@@ -930,16 +930,55 @@ def test_the_witness_on_a_real_tree():
                 p.wait()
 
 
-class _BoundedConnector:
+class _EventPipe:
+    """A selectable stand-in for the connector socket: the test writes crafted events into the
+    other end of a datagram socketpair. Records what the witness sends (its subscription)."""
+
+    def __init__(self, end):
+        self._end, self.sent = end, []
+
+    def setsockopt(self, *a):
+        pass
+
+    def bind(self, addr):
+        pass
+
+    def send(self, msg):
+        self.sent.append(struct.unpack_from("=I", msg, len(msg) - 4)[0])
+        return len(msg)
+
+    def setblocking(self, flag):
+        self._end.setblocking(flag)
+
+    def recv(self, n):
+        return self._end.recv(n)
+
+    def fileno(self):
+        return self._end.fileno()
+
+    def close(self):
+        self._end.close()
+
+
+def _fake_sockets(conn):
+    """A stand-in for the ``socket`` module in exit_witness whose socket() returns ``conn``."""
+    fake = type("_Sockets", (), {"socket": staticmethod(lambda *a: conn)})
+    for name in ("AF_NETLINK", "SOCK_DGRAM", "SOL_SOCKET", "SO_RCVBUF"):
+        setattr(fake, name, getattr(socket, name))
+    return fake
+
+
+class _BoundedConnector(_EventPipe):
     """A connector socket with a receive queue of ``k`` datagrams, fed by the test: a push onto a full queue loses the
     event and the next recv raises ENOBUFS, as the kernel does when a listener falls behind. A real socketpair end is
     readable exactly while the queue holds an event, so the witness's select() wakes as it would on the real socket."""
 
     def __init__(self, k):
-        self.k, self.sent, self._q, self._lost = k, [], [], False
+        r, self._w = socket.socketpair()
+        r.setblocking(False)
+        super().__init__(r)
+        self.k, self._q, self._lost = k, [], False
         self._lock = threading.Lock()
-        self._r, self._w = socket.socketpair()
-        self._r.setblocking(False)
         self.drained = threading.Event()
         self.drained.set()
 
@@ -961,31 +1000,12 @@ class _BoundedConnector:
                 raise BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN))
             msg = self._q.pop(0)
             if not self._q:
-                self._r.recv(1)
+                self._end.recv(1)
                 self.drained.set()
             return msg
 
-    def setsockopt(self, *a):
-        pass
-
-    def bind(self, addr):
-        pass
-
-    def send(self, msg):
-        self.sent.append(struct.unpack_from("=I", msg, len(msg) - 4)[0])
-        return len(msg)
-
-    def setblocking(self, flag):
-        pass
-
-    def fileno(self):
-        return self._r.fileno()
-
-    def close(self):
-        pass
-
     def shut(self):
-        self._r.close()
+        self._end.close()
         self._w.close()
 
 
@@ -995,10 +1015,7 @@ def test_the_witness_keeps_up_with_a_busy_host_between_polls(monkeypatch):
     bounded fake that loses events like the kernel's, so the burst is the test's own and not the host's churn."""
     k, job = 64, 4_000_000  # no such process: the tree is the test's
     conn = _BoundedConnector(k)
-    fake = type("_Sockets", (), {"socket": staticmethod(lambda *a: conn)})
-    for name in ("AF_NETLINK", "SOCK_DGRAM", "SOL_SOCKET", "SO_RCVBUF"):
-        setattr(fake, name, getattr(socket, name))
-    monkeypatch.setattr(exit_witness, "socket", fake)
+    monkeypatch.setattr(exit_witness, "socket", _fake_sockets(conn))
     monkeypatch.setattr(exit_witness, "_in_child_pid_namespace", lambda: False)
     monkeypatch.setattr(exit_witness, "_tree", lambda pgid, scope: {job})
     try:
@@ -1065,36 +1082,6 @@ def test_the_witness_fails_safe_in_a_pid_namespace(monkeypatch, tmp_path):
     w.close()
 
 
-class _EventPipe:
-    """A selectable stand-in for the connector socket: the test writes crafted events into the
-    other end of a datagram socketpair. Records what the witness sends (its subscription)."""
-
-    def __init__(self, end):
-        self._end, self.sent = end, []
-
-    def setsockopt(self, *a):
-        pass
-
-    def bind(self, addr):
-        pass
-
-    def send(self, msg):
-        self.sent.append(struct.unpack_from("=I", msg, len(msg) - 4)[0])
-        return len(msg)
-
-    def setblocking(self, flag):
-        self._end.setblocking(flag)
-
-    def recv(self, n):
-        return self._end.recv(n)
-
-    def fileno(self):
-        return self._end.fileno()
-
-    def close(self):
-        self._end.close()
-
-
 def test_the_witness_matches_a_real_tree_against_injected_events(monkeypatch):
     """The witness's own setup and matching on a real process tree, with the kernel's connector
     replaced by injected events, so it runs anywhere (PID namespaces included, where the real
@@ -1106,10 +1093,7 @@ def test_the_witness_matches_a_real_tree_against_injected_events(monkeypatch):
     for argv, want in ((reads_stdin, True), (["sleep", "30"], False)):
         ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
         pipe = _EventPipe(ours)
-        fake = type("_Sockets", (), {"socket": staticmethod(lambda *a: pipe)})
-        for name in ("AF_NETLINK", "SOCK_DGRAM", "SOL_SOCKET", "SO_RCVBUF"):
-            setattr(fake, name, getattr(socket, name))
-        monkeypatch.setattr(exit_witness, "socket", fake)
+        monkeypatch.setattr(exit_witness, "socket", _fake_sockets(pipe))
         p = subprocess.Popen(argv, stdin=subprocess.PIPE, start_new_session=True)
         try:
             w = ExitWitness(p.pid, None)
