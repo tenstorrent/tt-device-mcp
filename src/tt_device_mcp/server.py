@@ -12875,6 +12875,10 @@ def _recent_jobs(limit: int = 20, files: Optional[list[Path]] = None) -> list[di
 
         # No footer: classify against the live queue or active action.
         job = inmem.get(rec["job_id"])
+        # Ids are recycled: a live job or action answers only for its own log, never an older
+        # footerless one with the same id (a pre-restart orphan reads interrupted, spec 01 I71).
+        if job is not None and job.log_file and Path(job.log_file) != f:
+            job = None
         if job is not None and job.status == JobStatus.RUNNING:
             rec["status"] = "running"
             start = job.started_at or started_at
@@ -12884,7 +12888,7 @@ def _recent_jobs(limit: int = 20, files: Optional[list[Path]] = None) -> list[di
         elif job is not None and job.status == JobStatus.QUEUED:
             rec["status"] = "queued"
             rec["wait"] = _span_str(job.queued_at or rec["queued_at"], now)  # waiting up to now
-        elif job is not None and started_at and (not job.log_file or Path(job.log_file) == f):
+        elif job is not None and started_at:
             # Spec 01 I70: terminal in memory, footer not yet written (the scope stop and sweep run
             # between the two). Say what the broker decided, never "interrupted".
             start = job.started_at or started_at
@@ -12896,7 +12900,11 @@ def _recent_jobs(limit: int = 20, files: Optional[list[Path]] = None) -> list[di
             rec["wait"] = _span_str(job.queued_at or rec["queued_at"], start)
             if rec.get("recovery_killed"):
                 _label_recovery_killed(rec)
-        elif _action_row is not None and rec["job_id"] == _action_row["id"]:
+        elif (
+            _action_row is not None
+            and rec["job_id"] == _action_row["id"]
+            and f.name.startswith(datetime.fromisoformat(_action_row["started_at"]).strftime("%Y-%m-%d_%H%M%S"))
+        ):
             rec["status"] = "running"
             rec["started_at"] = _action_row["started_at"]
             rec["runtime"] = _span_str(_action_row["started_at"], now)
