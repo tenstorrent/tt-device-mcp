@@ -3142,6 +3142,26 @@ each rung fires only when the gentler one failed or cannot apply.
   OFF. Nothing here lifts a hold: only a full health check with fabric over
   every cabled link that has just passed does (I32).
 
+- **I111 — An idle hold whose fabric check the dead-chip isolation killed, with every chip on the
+  bus, runs the forced ladder at the present-mesh grace.** Seen on a 32-chip Galaxy: a chip left the
+  bus, the isolation killed the post-job fabric pass (spec 03 I82) and the chip came back. The gate
+  kept the hold dirty, as I82 requires, but nothing else reset it: the hold is dirty, so the idle
+  relift does not re-check it, and no chip is off the bus, so the off-bus one-shot does not arm. It
+  sat idle until the ceiling window forced a glx_reset at 608 s, which healed it in 33 s; its full
+  check passed 54 s later, about 709 s in all. Now the gate marks such a hold (its unverified reason
+  is the isolation kill and no chip is isolated), and `_check_hold_deadline` runs one forced ladder
+  for it (`isolation_kill_grace`) on the first sampler tick at or past
+  `_present_mesh_reset_grace_sec()` (120 s by default), below the bound, once per episode. That is
+  the present-mesh mesh reset, then the full check with fabric. `_hold_next_rung` reports it at the
+  same time (I75). A chip isolated or counted off the bus leaves the hold to the off-bus one-shot
+  (I96). A run that stands down on a tenant gives the latch back, so the next idle tick retries it.
+  The run claims no ceiling window and is not the bound's ladder (`_note_hold_bound_ladder` ignores
+  a run below the bound): if the hold stands, the ceiling window, the I76 10-min ladder, its full
+  check and the host rung run on their own clocks, unchanged. Nothing here lifts a hold: only a
+  full check with fabric over every cabled link that has just passed does (I32); a 77, a check
+  with no fabric verdict, or fewer links than the cabling expects keeps the hold. Cost: one mesh
+  reset and its check (about 90 s) at 2 min instead of 10 min on this hold class.
+
 ## Interfaces
 
 Class structure: see the diagram in 03-health.md.
@@ -3881,4 +3901,6 @@ sees a silent fabric pass.
 | I115 a non-root mesh reset runs under the `sudo` guard copy, which refuses op_mode `0x0` and anything but ipmitool and runs the real ipmitool through the real `sudo -n` | `tests/test_ipmi_guard.py::test_the_non_root_mesh_reset_runs_under_the_sudo_shim`, `tests/test_ipmi_guard.py::test_the_user_wrapper_puts_the_guard_first_on_path_as_sudo`, `tests/test_ipmi_guard.py::test_the_user_wrapper_refuses_to_run_when_the_shim_cannot_be_executed`, `tests/test_ipmi_guard.py::test_the_sudo_shim_refuses_the_legacy_retimer_reset`, `tests/test_ipmi_guard.py::test_the_sudo_shim_refuses_anything_but_ipmitool`, `tests/test_ipmi_guard.py::test_the_sudo_shim_sends_the_tray_reset_through_sudo_n`, `tests/test_ipmi_guard.py::test_the_sudo_shim_runs_ipmitool_directly_when_the_node_opens`, `tests/test_ipmi_guard.py::test_the_user_wrapper_removes_its_stale_guard_copies`, `tests/test_ipmi_guard.py::test_the_user_wrapper_prunes_before_each_new_copy` |
 | I115 with I14 a non-root server's host rung reads OFF whatever the sudo rule or the node allows: the inventory names "not root", and the 10-min bound pages `hold_bound_no_host_rung` and fires no cycle | `tests/test_rung_privilege.py::test_a_non_root_server_with_the_sudo_rule_has_no_host_rung`, `tests/test_privileges.py::test_a_non_root_server_with_the_sudo_rule_keeps_the_host_rung_off`, `tests/test_privileges.py::test_a_non_root_server_that_opens_the_node_still_has_no_host_rung` |
 | I115 a refused `sudo -n` names the one sudoers rule, keeps the hold, climbs the ladder and never reboots; the probe reads the rule with `sudo -n -l ipmitool` and root is never asked | `tests/test_ipmi_guard.py::test_a_refused_sudo_names_the_one_rule_it_needs`, `tests/test_ipmi_guard.py::test_a_bmc_error_is_not_read_as_a_sudo_refusal`, `tests/test_ipmi_guard.py::test_a_non_root_server_without_the_sudo_rule_keeps_the_hold_and_climbs`, `tests/test_power_cycle_os_first.py::test_a_non_root_server_never_starts_the_os_first_cycle`, `tests/test_privileges.py::test_a_non_root_server_with_the_sudo_rule_keeps_the_host_rung_off`, `tests/test_privileges.py::test_a_non_root_server_without_the_sudo_rule_cannot_reach_the_bmc`, `tests/test_privileges.py::test_root_is_never_asked_for_sudo` |
+| I111 an isolation-killed hold with every chip on the bus runs the forced ladder on the first tick past the present-mesh grace, not at the ceiling; once per episode; /health reports it; the ceiling window still runs | `tests/test_isolation_kill_grace.py::test_an_isolation_killed_hold_runs_the_forced_ladder_at_the_present_mesh_grace`, `::test_an_isolated_chip_leaves_the_hold_to_the_off_bus_one_shot`, `::test_a_dirty_hold_the_isolation_did_not_kill_keeps_its_own_clock` |
+| I111 the grace run releases only on a just-passed full check with fabric; a 77 or no fabric verdict keeps the hold | `tests/test_isolation_kill_grace.py::test_the_grace_run_releases_only_on_a_just_passed_fabric_check` |
 | I102 with I103: the late-chip second mesh reset runs in the pre-cycle sweep, so its pre-reset scan clears a holder outside every broker scope and runs (at the 10-min bound, on the I97 path, and in the sweep outside the bound); its wait still ends at the step's start plus `LATE_CHIP_STEP_SEC`; a failed full check keeps the hold and the cycle journals the holder; a holder in a broker job's scope or the running job's own process still refuses it, nothing lifts and the hold goes on to the cycle | `tests/test_late_chips_after_driver_wait.py::test_the_late_chip_second_reset_clears_a_foreign_holder_and_keeps_its_bound`, `::test_a_job_holder_still_refuses_the_late_chip_second_reset_and_the_hold_goes_on_to_the_cycle` |

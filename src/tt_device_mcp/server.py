@@ -1142,6 +1142,11 @@ device_hold_escalate_bucket: int = 0
 # One early forced escalation per off-bus episode, tracked apart from the ceiling windows so it adds
 # an attempt rather than consuming one (see _offbus_hold_ceiling_sec).
 device_hold_offbus_escalated: bool = False
+# Spec 04 I111: the gate kept the hold dirty because the dead-chip isolation killed its fabric check while no
+# chip was isolated, and the episode whose forced ladder at the present-mesh grace already started ("" none).
+# Both re-arm with the episode.
+_isolation_kill_hold: bool = False
+_isolation_kill_escalated: str = ""
 # Whether the early one-shot (see _offbus_one_shot_sec) found a live tenant: the hold then keeps the
 # tenant's _offbus_hold_ceiling_sec wait for its one-shot. Re-arms (False) with the episode.
 device_hold_offbus_tenant_wait: bool = False
@@ -2856,6 +2861,7 @@ def _reset_for_testing():
     global device_hold_escalate_bucket, device_hold_offbus_escalated, device_hold_offbus_tenant_wait
     global device_hold_offbus_idle_early, device_hold_offbus_prior_bucket, device_hold_tenant_deferred
     global device_hold_job_bound_escalated, device_hold_escalation_trigger, device_hold_escalation_kind
+    global _isolation_kill_hold, _isolation_kill_escalated
     global _forced_escalation_task, _host_action_suppressed_logged, exec_scope_seq
     global _idle_holder_task, _idle_holder_last_scan
     global _hold_bound_episode, _hold_bound_ladder_age, _hold_bound_ladder_recovered, _hold_bound_cycle_age
@@ -2901,6 +2907,7 @@ def _reset_for_testing():
     device_hold_offbus_tenant_wait = False
     device_hold_offbus_idle_early = False
     device_hold_offbus_prior_bucket = None
+    _isolation_kill_hold, _isolation_kill_escalated = False, ""
     _offbus_hold_chips.clear()
     device_hold_tenant_deferred = False
     device_hold_job_bound_escalated = False
@@ -4293,6 +4300,10 @@ def _hold_device_fabric_unverified(why: str) -> None:
     fsm.on_fault("fabric_unverified", detail=why, dirty=False)
 
 
+# Spec 03 I82: the gate's reason when the isolation killed the fabric run and no chip is isolated.
+ISOLATION_KILLED_UNVERIFIED = "fabric check killed by dead-chip isolation"
+
+
 def _isolation_unverified_reason(evidence: "dict | None") -> str:
     """Why an enum+ARC healthy read proves nothing (spec 03 I82), or ''. A chip the dead-chip
     isolation took off the bus, or a fabric run in ``evidence`` that isolation killed, leaves the
@@ -4301,7 +4312,7 @@ def _isolation_unverified_reason(evidence: "dict | None") -> str:
         return f"chip(s) {sorted(isolated_chips, key=int)} isolated off the bus"
     detail = str(((evidence or {}).get("fabric") or {}).get("detail") or "")
     if detail.startswith(FABRIC_KILLED_BY_ISOLATION):
-        return "fabric check killed by dead-chip isolation"
+        return ISOLATION_KILLED_UNVERIFIED
     return ""
 
 
@@ -7634,7 +7645,7 @@ async def device_health_gate(
     exit (see ``_clean_software_exit_code``). On a HEALTHY, clean device whose last fabric verdict was OK, with the eth
     rung armed and no device event during the job, the forced pass becomes the passive eth read of a clean exit
     (spec 03 I36)."""
-    global _dispatch_reset_spent
+    global _dispatch_reset_spent, _isolation_kill_hold
     # Fabric output from before this pass is another pass's transcript: an incident bundle names
     # it stale instead of presenting it as this pass's (spec 03 I57).
     pass_started = datetime.now()
@@ -8156,6 +8167,8 @@ async def device_health_gate(
             _log(f"enum+ARC healthy but {unverified} — device stays held dirty; no release")
             if not fsm.record.dirty or fsm.state is ServerState.HEALTHY:
                 _mark_device_dirty(f"gate/{phase}: {unverified}", why="heartbeat")
+            if unverified == ISOLATION_KILLED_UNVERIFIED:
+                _isolation_kill_hold = True  # spec 04 I111: the watchdog's present-mesh grace owns it
             _note_tenant_gate_verdict(f"device unverified: gate/{phase}: {unverified}")
             return
 
@@ -9219,6 +9232,12 @@ def _hold_next_rung(now_epoch: float) -> Optional[hold_report.RungCandidate]:
         )
         if acts and age >= _offbus_one_shot_sec():
             return done(candidates)  # due: the watchdog's chain stops at it
+    grace = _present_mesh_reset_grace_sec()
+    if _isolation_kill_grace_due(max(age, grace)):
+        # Spec 04 I111: the watchdog's next branch, the isolation-killed hold's forced ladder at the grace.
+        at_grace = hold_report.RungCandidate(started + grace, "forced ladder", "isolation-kill present-mesh grace")
+        if add(candidates, at_grace, "isolation_kill_grace") and age >= grace:
+            return done(candidates)  # due: the watchdog's chain stops at it
     if _disproven_lift_bound_due(max(age, bound_sec)):
         # Spec 03 I42: the bound's early ladder, owed from one sampler tick in until a bound ladder ran.
         early = hold_report.RungCandidate(started + bound_sec, "forced ladder", "disproven lift bound")
@@ -9568,7 +9587,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
     only durable trace of when the device went bad. Latched so a queue's worth of refusals
     onto one degraded device writes a single ``device_held`` event, not one per job."""
     global device_hold_logged, device_hold_episode_since, device_hold_episode_reason
-    global device_hold_deadline_bucket, device_hold_escalate_bucket
+    global device_hold_deadline_bucket, device_hold_escalate_bucket, _isolation_kill_hold
     global device_hold_offbus_escalated
     global device_hold_tenant_deferred, device_hold_offbus_prior_bucket, device_hold_offbus_tenant_wait
     global device_hold_escalated_monotonic, _hold_row, _hold_episode_restorable
@@ -9696,6 +9715,7 @@ def _note_tenant_gate_verdict(reason: str) -> None:
             _save_hold_carry(device_hold_episode_since, device_hold_episode_reason)
         _hold_episode_neutral = False
         device_hold_episode_since = ""
+        _isolation_kill_hold = False  # spec 04 I111: a verified release ends the class with the episode
         clear_pending_marker()  # spec 04 I88: the hold lifted, no cycle is pending
         # Spec 03 I80: a clock latched inside an op belongs to this episode; the next hold starts its own.
         device_held_since = ""
@@ -9892,7 +9912,11 @@ async def _force_escalate_stuck_hold() -> None:
             window_sec=int(
                 _offbus_one_shot_sec()
                 if device_hold_escalation_kind == "offbus_one_shot"
-                else _stuck_hold_ceiling_sec()
+                else (
+                    _present_mesh_reset_grace_sec()
+                    if device_hold_escalation_kind == "isolation_kill_grace"
+                    else _stuck_hold_ceiling_sec()
+                )
             ),
             ceiling_sec=int(_stuck_hold_ceiling_sec()),
             deadline_sec=int(_hold_deadline_sec()),
@@ -10609,11 +10633,13 @@ def _rearm_tenant_deferred_window(kind: str) -> bool:
     no rung (spec 03 I23): the next idle sampler tick retries it. Spending it left an off-bus hold
     waiting out the whole general ceiling once the tenant had gone. Only the one-shot and the ceiling
     windows are given back; the other kinds keep their own once-per-episode bookkeeping."""
-    global device_hold_escalate_bucket, device_hold_tenant_deferred
+    global device_hold_escalate_bucket, device_hold_tenant_deferred, _isolation_kill_escalated
     if kind == "offbus_one_shot":
         _give_back_offbus_one_shot()
     elif kind == "ceiling_window":
         device_hold_escalate_bucket = max(0, device_hold_escalate_bucket - 1)
+    elif kind == "isolation_kill_grace":
+        _isolation_kill_escalated = ""  # spec 04 I111: no rung ran, so it is still due on the next idle tick
     elif kind != "fabric_link_short":  # spec 04 I83: no ladder ran, so it is still due on the next tick
         return False
     device_hold_tenant_deferred = True
@@ -10730,6 +10756,20 @@ def _offbus_one_shot_chips() -> set:
     return isolated_chips | _offbus_hold_chips
 
 
+def _isolation_kill_grace_due(age: float) -> bool:
+    """Spec 04 I111: whether the hold the gate kept dirty because the dead-chip isolation killed its fabric check, with
+    no chip isolated or counted off the bus, is due its forced ladder: it is _present_mesh_reset_grace_sec() old, below
+    the 10-min bound, and none ran this episode. Such a hold is idle and dirty, so no relift re-checks it and nothing
+    else resets it before the ceiling window. An off-bus chip leaves it to the off-bus one-shot; the bound's own ladder,
+    full check and host rung are unchanged (an early run is not the bound's, see _note_hold_bound_ladder)."""
+    return (
+        _isolation_kill_hold
+        and _isolation_kill_escalated != device_hold_episode_since
+        and not _offbus_one_shot_chips()
+        and _present_mesh_reset_grace_sec() <= age < _hold_bound_sec()
+    )
+
+
 def _offbus_one_shot_sec() -> float:
     """Seconds an off-bus hold waits before its one-shot forced escalation. On a tenant-free box, one sampler interval:
     the first sampler tick at or past it is the second since the hold opened, so two samples have seen the chip still
@@ -10801,6 +10841,7 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
     global device_hold_deadline_bucket, device_hold_escalate_bucket, device_hold_offbus_escalated
     global device_hold_risky_escalated, device_hold_escalation_trigger, device_hold_escalation_kind
     global device_hold_offbus_prior_bucket, device_hold_offbus_idle_early, _pci_wedged_asked
+    global _isolation_kill_escalated
     if not device_hold_episode_since:
         return
     if _hold_episode_tenant and not _hold_is_tenant_held():
@@ -10898,6 +10939,17 @@ def _check_hold_deadline(now: Optional[datetime] = None) -> None:
             # forced climb, not two back to back. Remember what it claimed over, to give back with it.
             device_hold_offbus_prior_bucket = device_hold_escalate_bucket
             device_hold_escalate_bucket = max(device_hold_escalate_bucket, int(age // ceiling))
+    elif _isolation_kill_grace_due(age):
+        # Spec 04 I111: every chip answers and the fabric check never gave a verdict, so the present-mesh
+        # reset and the full check with fabric after it run at the grace, not at the ceiling window. It
+        # claims no window: the ceiling and the bound's ladder still run if the hold stands.
+        device_hold_escalation_kind = "isolation_kill_grace"
+        device_hold_escalation_trigger = (
+            f"the {int(_present_mesh_reset_grace_sec())}s present-mesh grace after a fabric check the "
+            "dead-chip isolation killed"
+        )
+        if _maybe_spawn_forced_escalation():
+            _isolation_kill_escalated = device_hold_episode_since
     elif _disproven_lift_bound_due(age):
         # Spec 03 I42: the first job after a topology-mismatch lift failed on the fabric and the latch stands, so
         # waiting out the ceiling only delays the rung. The bound's ladder, its full check and the host rung run now

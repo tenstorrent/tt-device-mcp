@@ -1549,7 +1549,8 @@ cooldown (spec 04 I65) holds longer.
   left as it is. A plain 77 with no isolation keeps its clean fabric-unverified hold. Time to
   recover: off-bus classes (whole-tray drop, partial off-bus) are unchanged, as their recovery is
   driven by the off-bus evidence and the I76 bound, not by this verdict; the fabric/health-check
-  failure class no longer opens on a run the broker killed; every other class is unchanged.
+  failure class no longer opens on a run the broker killed; every other class is unchanged. Such a
+  hold with no chip still isolated gets its forced ladder at the present-mesh grace (spec 04 I111).
 - **I83 — A chip that failed POST_RESET and reads all-ones after a mesh reset is detached before
   any of its readers is killed, and never killed without a detach.** Driver facts (tt-kmd 2.11.0)
   this rests on: `tt-smi -glx_reset` issues USER_RESET on every chip before the BMC re-power; it
