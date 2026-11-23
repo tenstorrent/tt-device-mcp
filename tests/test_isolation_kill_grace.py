@@ -31,17 +31,6 @@ async def _killed_hold(monkeypatch, *, run_gate=True):
     monkeypatch.setenv("TT_DEVICE_MCP_RESET_MODE", "galaxy")
     monkeypatch.setattr(srv, "read_heartbeats", lambda *a, **k: {str(i): 100 + i for i in range(32)})
     monkeypatch.setattr(srv, "isolated_chips", set())
-    monkeypatch.setattr(srv, "_offbus_hold_chips", set(), raising=False)
-    for name, value in (
-        ("_isolation_kill_hold", False),
-        ("_isolation_kill_escalated", ""),
-        ("device_hold_offbus_escalated", False),
-        ("device_hold_escalate_bucket", 0),
-        ("device_hold_deadline_bucket", 0),
-        ("device_hold_tenant_deferred", False),
-        ("_forced_escalation_task", None),
-    ):
-        monkeypatch.setattr(srv, name, value)
     fsm_dirty(srv, fk.REASON, why="heartbeat")
     if run_gate:
         await srv._device_health_gate(None, phase="post-job", run_fabric=True)
