@@ -228,8 +228,7 @@ async def test_a_fabric_check_with_no_reader_installed_starts_no_process(monkeyp
     assert (await srv.health_monitor.verify_fabric_health(1))[0] is True
     assert ran == [True]
     assert spawned == []
-    # A host with none of the readers installed has nothing to quiesce: no false alarm (the
-    # no-unit-installed case is now a once-per-process log line, not a health event).
+    # A host with none of the readers installed has nothing to quiesce: no false alarm.
     assert health.read_health_events(kinds={"pollers_none_active"}) == []
 
 
