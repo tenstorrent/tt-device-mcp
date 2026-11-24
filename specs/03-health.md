@@ -153,7 +153,7 @@ cooldown (spec 04 I65) holds longer.
   no pass is fresher than `FABRIC_CHECK_MIN_INTERVAL_SEC` (default 1200s), and post-job on a
   clean exit only when that exit's eth read reached no verdict (I30; a link-count-drop skip only
   when no passing pass is fresher than that interval). The post-job traffic pass itself runs light
-  when it cannot decide a hold lift (I115).
+  after a job that ended with exit 0, when it cannot decide a hold lift (I115).
 - **I13 — The gate never resets over a tenant.** A foreign holder (uid ≥ `MIN_TENANT_UID`,
   1000, or below it in a broker job/exec scope or named in `TT_DEVICE_MCP_TENANT_UIDS`; 04 I6)
   skips the gate untouched: verification is deferred, an existing hold outlives the skip
@@ -2024,7 +2024,9 @@ cooldown (spec 04 I65) holds longer.
   (`TTDEV_FABRIC_DESCRIPTOR`); fewer links than expected still fails the check and the device stays
   held with the existing bounded recovery. With no descriptor the light run has nothing to count
   against and keeps the traffic pass. The gate's own probes still confirm every expected chip
-  is on PCIe with a live ARC heartbeat. The light shape applies only while the check cannot decide
+  is on PCIe with a live ARC heartbeat. The light shape applies only after a tenant job that ended
+  with exit 0 — a failed, killed, timed-out, reaped or preempted job keeps the traffic pass, even when
+  its clean software exit drops the forced pass (I36) — and only while the check cannot decide
   a hold lift: a HEALTHY device (no hold, dirty or clean), no kill-reset debt, no deferred kill reset, no
   runtime-reported device fault, and the last fabric verdict not UNHEALTHY. Any check that can
   release or refuse a hold — a dirty or failed-job gate, the dirty-idle gate, startup, the
@@ -2765,7 +2767,7 @@ refuses.
 | I99 | `tests/test_containment_off_loop.py::test_a_remove_still_running_at_the_hard_bound_latches_pci_wedged`, `tests/test_containment_off_loop.py::test_slow_journal_state_and_log_writes_never_delay_the_stop_or_the_remove`, `tests/test_containment_off_loop.py::test_the_periodic_stats_write_runs_off_the_event_loop`, `tests/test_containment_off_loop.py::test_the_stats_write_keeps_its_file_and_current_link`, `tests/test_health_hold_report.py::test_a_fenced_chip_link_is_never_read_and_none_while_the_dead_chip_watch_is_armed`, `tests/test_removed_chip_rescan.py::test_the_records_file_write_never_holds_up_the_remove`, `tests/test_dead_chip_watch.py::test_a_remove_that_times_out_latches_pci_wedged_and_asks_for_the_power_cycle` |
 | I101 | `tests/test_pcie_quiet.py` (all), `tests/test_health_hold_report.py::test_health_during_a_device_op_reads_no_chip_link_whoever_calls` |
 | I101 the host-PCI stage of a check right after a reset step reads the links live (a link that retrained degraded fails it) while another task's reader is still served the cache | `tests/test_pcie_quiet.py::test_the_post_reset_check_reads_the_links_live_inside_the_settle_window`, `tests/test_pcie_quiet.py::test_a_check_pass_owns_the_window_from_its_start_host_pci_stage_included` |
-| I115 | `tests/test_device_safety.py::test_a_clean_post_job_gate_runs_the_fabric_check_light`, `tests/test_device_safety.py::test_a_dirty_post_job_gate_keeps_the_traffic_pass`, `tests/test_device_safety.py::test_a_clean_hold_post_job_gate_keeps_the_traffic_pass`, `tests/test_device_safety.py::test_a_failed_job_keeps_the_traffic_pass`, `tests/test_device_safety.py::test_the_startup_gate_keeps_the_traffic_pass`, `tests/test_device_safety.py::test_a_light_fabric_run_drops_the_traffic_pass`, `tests/test_device_safety.py::test_a_light_fabric_run_signals_the_operator_override_env`, `tests/test_device_safety.py::test_a_light_fabric_run_fails_on_fewer_links_than_the_cabling_expects` |
+| I115 | `tests/test_device_safety.py::test_a_clean_post_job_gate_runs_the_fabric_check_light`, `tests/test_device_safety.py::test_a_dirty_post_job_gate_keeps_the_traffic_pass`, `tests/test_device_safety.py::test_a_clean_hold_post_job_gate_keeps_the_traffic_pass`, `tests/test_device_safety.py::test_a_failed_job_keeps_the_traffic_pass`, `tests/test_device_safety.py::test_a_failed_job_with_a_clean_software_exit_keeps_the_traffic_pass`, `tests/test_device_safety.py::test_the_startup_gate_keeps_the_traffic_pass`, `tests/test_device_safety.py::test_a_light_fabric_run_drops_the_traffic_pass`, `tests/test_device_safety.py::test_a_light_fabric_run_signals_the_operator_override_env`, `tests/test_device_safety.py::test_a_light_fabric_run_fails_on_fewer_links_than_the_cabling_expects` |
 
 Env vars named here (`TT_DEVICE_MCP_HEALTH_CHECK`, `TT_DEVICE_MCP_EXPECTED_CHIPS`,
 `TT_DEVICE_MCP_FABRIC_CHECK_CMD`, `TT_DEVICE_MCP_ETH_HEARTBEAT_CMD`, `TT_DEVICE_MCP_RESET_MODE`,

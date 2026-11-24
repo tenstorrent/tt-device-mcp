@@ -7527,6 +7527,7 @@ async def device_health_gate(
     force_fabric: bool = False,
     with_recover: bool = True,
     clean_exit_code: Optional[int] = None,
+    job_exit0: bool = False,
 ) -> None:
     """Unified health gate run while the device is IDLE around a job.
 
@@ -7547,7 +7548,10 @@ async def device_health_gate(
     ``clean_exit_code`` is the exit code of the failed job behind ``force_fabric`` when it ended in a clean software
     exit (see ``_clean_software_exit_code``). On a HEALTHY, clean device whose last fabric verdict was OK, with the eth
     rung armed and no device event during the job, the forced pass becomes the passive eth read of a clean exit
-    (spec 03 I36)."""
+    (spec 03 I36).
+
+    ``job_exit0`` says the job behind a post-job pass ended with exit 0; only then may its fabric check run light
+    (spec 03 I115)."""
     global _dispatch_reset_spent
     # Fabric output from before this pass is another pass's transcript: an incident bundle names
     # it stale instead of presenting it as this pass's (spec 03 I57).
@@ -7800,11 +7804,11 @@ async def device_health_gate(
         pcie_before = await _pcie_snapshot() if pcie_on else {}
         # Spec 03 I115: the post-job gate's fabric check runs light — the all-link traffic
         # pass is skipped, the validator still opens the fabric and counts every inter-chip
-        # link against the cabling — but only on a HEALTHY device, where the pass cannot decide
-        # a hold lift: any hold (dirty or clean), a failed job, a kill-reset debt or a deferred
-        # kill reset release (or refuse to release) on this check's verdict and keep traffic.
+        # link against the cabling — but only after a job that ended with exit 0, on a HEALTHY
+        # device, where the pass cannot decide a hold lift: any hold (dirty or clean), a failed,
+        # killed or preempted job, a kill-reset debt or a deferred kill reset keep traffic.
         fabric_light = (
-            phase == "post-job"
+            job_exit0
             and fsm.state is ServerState.HEALTHY
             and not full
             and not kill_reset
@@ -12504,7 +12508,10 @@ def _clean_software_exit_code(job: "Job") -> Optional[int]:
 
 
 async def _verify_device_after_job(
-    job_log_file: Optional[Path], job_failed: bool = False, clean_exit_code: Optional[int] = None
+    job_log_file: Optional[Path],
+    job_failed: bool = False,
+    clean_exit_code: Optional[int] = None,
+    job_exit0: bool = False,
 ) -> None:
     """Post-job gate — runs at the END of every run (the finished job's caller has already been released, so this never
     delays their terminal/result): the enum/ARC snapshot always runs, so a chip that left the bus is flagged here — as
@@ -12518,7 +12525,7 @@ async def _verify_device_after_job(
     wedged eth core: a frozen core holds the door, and a read that reaches no verdict runs the traffic pass in the same
     gate. ``job_failed`` forces a CHECK, not a reset — an exit 1 from a pytest assertion is not evidence of broken
     silicon, and a clean software exit (``clean_exit_code``) whose quick checks all pass drops the forced pass
-    (spec 03 I36).
+    (spec 03 I36). After a job that ended with exit 0 (``job_exit0``) that pass runs light (spec 03 I115).
 
     Never raises."""
     try:
@@ -12528,6 +12535,7 @@ async def _verify_device_after_job(
             run_fabric=False,
             force_fabric=job_failed,
             clean_exit_code=clean_exit_code,
+            job_exit0=job_exit0,
         )
     except Exception as e:  # noqa: BLE001 - must never crash the runner
         # The gate threw before it could clear the device, so its state is unknown. Leaving it
@@ -14986,6 +14994,7 @@ export {JOB_TAG_ENV}={job_tag}
                             clean_exit_code=(
                                 _clean_software_exit_code(job) if job_failed and not runner_error else None
                             ),
+                            job_exit0=job.status == JobStatus.COMPLETED and job.exit_code == 0,
                         )
                 except Exception as e:  # noqa: BLE001 - never crash the runner
                     if logger:

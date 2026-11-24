@@ -4633,7 +4633,7 @@ async def test_broker_row_times_the_stage_it_names(monkeypatch):
 def _quiet_post_job_gate(monkeypatch):
     """The post-job gate is not what these tests are about; keep the runner off the device."""
 
-    async def _noop(job_log_file, job_failed=False, clean_exit_code=None):
+    async def _noop(job_log_file, job_failed=False, clean_exit_code=None, **_):
         return None
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _noop)
@@ -6292,7 +6292,7 @@ async def test_a_full_log_disk_ends_neither_the_job_nor_the_runner(monkeypatch, 
     _no_workspace_activation(monkeypatch)
     gates = []
 
-    async def _gate(job_log_file, job_failed=False, clean_exit_code=None):
+    async def _gate(job_log_file, job_failed=False, clean_exit_code=None, **_):
         gates.append(job_failed)
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
@@ -6341,7 +6341,7 @@ async def test_a_full_log_disk_still_gates_a_failed_job_before_the_next(monkeypa
     _no_workspace_activation(monkeypatch)
     gates = []
 
-    async def _gate(job_log_file, job_failed=False, clean_exit_code=None):
+    async def _gate(job_log_file, job_failed=False, clean_exit_code=None, **_):
         gates.append((job_failed, second.status))
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
@@ -6400,7 +6400,7 @@ async def test_an_error_escaping_job_cleanup_fails_closed(monkeypatch, clear_job
     monkeypatch.setattr(srv, "chip_snapshot_event", lambda *a, **k: None)
     gates = []
 
-    async def _gate(job_log_file, job_failed=False, clean_exit_code=None):
+    async def _gate(job_log_file, job_failed=False, clean_exit_code=None, **_):
         gates.append((job_failed, srv.fsm.record.dirty, second.status))
         srv._clear_device_dirty(verified=True, why="test gate: verified healthy")
 
@@ -6441,7 +6441,7 @@ async def test_an_error_escaping_before_spawn_forgets_the_queued_spec(monkeypatc
     monkeypatch.setattr(srv, "get_activation_script", _boom)
     gates = []
 
-    async def _gate(job_log_file, job_failed=False, clean_exit_code=None):
+    async def _gate(job_log_file, job_failed=False, clean_exit_code=None, **_):
         gates.append(job_failed)
         srv._clear_device_dirty(verified=True, why="test gate: verified healthy")
 
@@ -6493,7 +6493,7 @@ async def test_a_fail_closed_gate_holds_the_idle_self_test_off_until_it_ends(mon
         monkeypatch.setattr(srv, "get_activation_script", _boom)
     seen = []
 
-    async def _gate(job_log_file, job_failed=False, clean_exit_code=None):
+    async def _gate(job_log_file, job_failed=False, clean_exit_code=None, **_):
         seen.append(srv.post_job_gate_pending)
         srv._clear_device_dirty(verified=True, why="test gate: verified healthy")
 
@@ -15247,7 +15247,7 @@ async def test_the_runner_tells_the_post_job_gate_when_a_failed_job_ended_in_a_c
     _no_workspace_activation(monkeypatch)
     gates = []
 
-    async def _gate(job_log_file, job_failed=False, clean_exit_code=None):
+    async def _gate(job_log_file, job_failed=False, clean_exit_code=None, **_):
         gates.append((job_failed, clean_exit_code))
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
@@ -15314,7 +15314,7 @@ async def test_a_runner_error_still_forces_the_post_job_fabric_pass(monkeypatch,
         command = "trap 'kill $! 2>/dev/null || true; exit 7' INT; echo hi; sleep 30 & wait"
     gates = []
 
-    async def _gate(job_log_file, job_failed=False, clean_exit_code=None):
+    async def _gate(job_log_file, job_failed=False, clean_exit_code=None, **_):
         gates.append((job_failed, clean_exit_code))
 
     monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
@@ -16636,7 +16636,7 @@ async def test_a_clean_post_job_gate_runs_the_fabric_check_light(monkeypatch, tm
         return None, "the read reached no verdict"
 
     monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", stuck_eth)
-    await srv._device_health_gate(None, phase="post-job", run_fabric=False, force_fabric=False)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False, force_fabric=False, job_exit0=True)
     assert calls["eth"] == 1
     assert calls["light"] is True, "the post-job fabric check did not run light"
 
@@ -16673,6 +16673,24 @@ async def test_a_failed_job_keeps_the_traffic_pass(monkeypatch, tmp_path):
     calls = _light_gate_stubs(monkeypatch, tmp_path)
     await srv._verify_device_after_job(None, job_failed=True)
     assert calls["light"] is False, "a failed job's fabric check ran light"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_job_with_a_clean_software_exit_keeps_the_traffic_pass(monkeypatch, tmp_path):
+    """Spec 03 I115: light only after a job that ended with exit 0. A failed job whose clean
+    software exit drops the forced pass (I36) still keeps the traffic pass when its eth read
+    reaches no verdict, and so does a post-job gate that is not told the job ended with exit 0."""
+    calls = _light_gate_stubs(monkeypatch, tmp_path)
+
+    async def stuck_eth(timeout_sec=60.0):
+        return None, "the read reached no verdict"
+
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", stuck_eth)
+    await srv._verify_device_after_job(None, job_failed=True, clean_exit_code=1)
+    assert calls["light"] is False, "a failed job's fabric check ran light"
+    calls["light"] = None
+    await srv._verify_device_after_job(None)
+    assert calls["light"] is False, "a job not known to end with exit 0 ran the light check"
 
 
 @pytest.mark.asyncio
@@ -16748,10 +16766,10 @@ async def test_a_light_fabric_run_fails_on_fewer_links_than_the_cabling_expects(
     # A fail on the light check must reach the ladder: stub the rung so nothing real fires.
     monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
     monkeypatch.setattr(srv.per_target_recovery, "escalate", escalate)
-    await srv._device_health_gate(None, phase="post-job", run_fabric=False, force_fabric=False)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False, force_fabric=False, job_exit0=True)
     assert calls["fabric"] == 1, "the light fabric check never ran"
     assert calls["light"] is True, "the light check ran with the traffic pass"
     assert srv.fsm.state is not ServerState.HEALTHY, "a light check with fewer links than the cabling expects passed"
     # The failed light check takes a failed full check's path: the next gate, which decides the lift, runs traffic.
-    await srv._device_health_gate(None, phase="post-job", run_fabric=False, force_fabric=False)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False, force_fabric=False, job_exit0=True)
     assert calls["fabric"] == 2 and calls["light"] is False, "the check after a failed light check ran light"
