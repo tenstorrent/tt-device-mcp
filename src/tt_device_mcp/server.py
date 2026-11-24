@@ -24,6 +24,7 @@ import contextvars
 import errno
 import fcntl
 import functools
+import heapq
 import json
 import logging
 import math
@@ -891,6 +892,7 @@ class Job:
     preempt_yielded: bool = False  # it ended itself under contention (past its limit, a job waiting)
     stopped_clean: bool = False  # the broker's stop ladder saw the whole tree gone before any SIGKILL (03 I69)
     started_at: Optional[str] = None
+    started_monotonic: Optional[float] = None  # time.monotonic() at RUNNING: the fair_time charge's start
     finished_at: Optional[str] = None
     log_file: Optional[str] = None
     idle_total_sec: Optional[float] = None  # DEVICE IDLE time over the run (spec 03 I54)
@@ -2689,11 +2691,16 @@ def _set_device_op_detail(detail: str) -> None:
 
 
 QUEUE_POLICY_ENV = "TT_DEVICE_MCP_QUEUE_POLICY"
-QUEUE_POLICIES = ("fifo", "fair")
+QUEUE_POLICIES = ("fifo", "fair", "fair_time")
+# fair_time: what an unseen person's job is predicted to cost, for positions only (spec 01 I73).
+FAIR_TIME_DEFAULT_EST_SEC = 300.0
+# fair_time: weight of a person's newest charge in their running cost estimate.
+FAIR_TIME_EST_ALPHA = 0.5
 
 
 def queue_policy() -> str:
-    """The host's tenant-queue ordering policy (spec 01 I72): ``fifo`` (default) or ``fair``.
+    """The host's tenant-queue ordering policy (spec 01 I72/I73): ``fifo`` (default), ``fair``
+    (round-robin by person, one job per turn) or ``fair_time`` (fair by device time).
 
     Read on every call, not cached at import, so an operator flips it with a broker restart and a
     test with monkeypatch.setenv. Anything unrecognised is ``fifo``: an unknown policy must not
@@ -2729,6 +2736,15 @@ class JobQueue(asyncio.Queue):
     per person, ``fair`` IS ``fifo``; it only reorders when a person has a backlog while someone
     else waits, and then it only moves that backlog back.
 
+    ``fair_time`` (spec 01 I73): start-time fair queuing by person, charged in device seconds. Each
+    person has a virtual finish time ``F`` that grows by the device time their jobs actually used
+    (``charge``, from the runner: run time plus the post-job gate, so a reset a job causes is billed
+    to it). A person's head job starts at ``max(F, V)`` where ``V`` is the virtual time when they last
+    joined the queue; the runner takes the smallest start. Short jobs come out of it with no
+    shortest-first rule: a person running 30 s jobs gets many in while a 25 min job is paid for.
+    Dispatch uses actual charges only; estimates (a person's recent average, capped by the job's
+    enforced timeout) only predict the positions of jobs behind the heads.
+
     ``_queue`` itself always stays in arrival order (head/hand-back first), so persistence and
     restore are policy-blind; the policy is applied as a view (``dispatch_order``) at ``_get``.
     """
@@ -2744,6 +2760,12 @@ class JobQueue(asyncio.Queue):
         # The lane whose job the runner last took. Its turn lasts until the runner comes back for
         # the next job (the runner is serial), so someone who arrives while it runs goes first.
         self._serving: Optional[str] = None
+        # fair_time state (spec 01 I73). Virtual time is in device seconds.
+        self._vtime = 0.0  # V: the start tag of the last tenant job dispatched (or the busy period's end)
+        self._finish: dict[str, float] = {}  # lane -> F, the virtual end of its last charged job
+        self._joined: dict[str, float] = {}  # lane -> V when it last went from no backlog to one
+        self._est: dict[str, float] = {}  # lane -> running estimate of one job's device seconds
+        self._inflight: Optional[tuple] = None  # (job id, lane, start tag) dispatched, not yet charged
 
     def _stamp(self) -> int:
         self._tick += 1
@@ -2763,6 +2785,15 @@ class JobQueue(asyncio.Queue):
         n = 0
         while n < len(self._queue) and self._queue[n] in self._head:
             n += 1
+        if item not in self._head and item not in self._back:
+            lane = fair_share_key(item)
+            backlogged = (self._inflight is not None and self._inflight[1] == lane) or any(
+                fair_share_key(i) == lane for i in self._queue if i not in self._head and self._still_waiting(i)
+            )
+            if not backlogged:
+                # A person (re)joining starts at the current virtual time: no credit banked while
+                # away, and no debt either once V has passed their last finish.
+                self._joined[lane] = self._vtime
         self._arrived.setdefault(item, self._stamp())
         if item in self._head or item in self._back:
             if item in self._back:
@@ -2778,10 +2809,40 @@ class JobQueue(asyncio.Queue):
         job = jobs.get(item)
         return job is None or job.status == JobStatus.QUEUED
 
+    def _estimate(self, item) -> float:
+        """Predicted device seconds of a queued job, for positions only: its person's running
+        average, never above the job's own enforced timeout."""
+        est = self._est.get(fair_share_key(item), FAIR_TIME_DEFAULT_EST_SEC)
+        job = jobs.get(item)
+        return min(est, float(job.timeout_sec)) if job is not None else est
+
+    def _start_tag(self, lane: str) -> float:
+        """Virtual start of ``lane``'s head job. A lane whose job is still running has no charge
+        yet, so its next start is predicted from the estimate; at dispatch nothing is running."""
+        if self._inflight is not None and self._inflight[1] == lane:
+            return self._inflight[2] + self._estimate(self._inflight[0])
+        return max(self._finish.get(lane, 0.0), self._joined.get(lane, self._vtime))
+
+    def _fair_time_order(self, lanes: dict[str, list]) -> list:
+        heap = [(self._start_tag(lane), self._arrived.get(q[0], 0), lane) for lane, q in lanes.items()]
+        heapq.heapify(heap)
+        nxt = {lane: 0 for lane in lanes}
+        out = []
+        while heap:
+            tag, _, lane = heapq.heappop(heap)
+            item = lanes[lane][nxt[lane]]
+            out.append(item)
+            nxt[lane] += 1
+            if nxt[lane] < len(lanes[lane]):
+                follower = lanes[lane][nxt[lane]]
+                heapq.heappush(heap, (tag + self._estimate(item), self._arrived.get(follower, 0), lane))
+        return out
+
     def dispatch_order(self) -> list:
         """Every queued id, in the order the runner will take them if nothing else arrives."""
         items = list(self._queue)
-        if queue_policy() != "fair":
+        policy = queue_policy()
+        if policy == "fifo":
             return items
         front = [i for i in items if i in self._head or i in self._pinned]
         fixed = set(front)
@@ -2792,6 +2853,9 @@ class JobQueue(asyncio.Queue):
         for i in items:
             if i not in fixed:
                 lanes.setdefault(fair_share_key(i), []).append(i)
+
+        if policy == "fair_time":
+            return front + dead + self._fair_time_order(lanes)
 
         def rotation(lane: str) -> int:
             if lane == self._serving:
@@ -2817,17 +2881,54 @@ class JobQueue(asyncio.Queue):
         if self._serving is not None:
             self._last_served[self._serving] = self._stamp()
             self._serving = None
-        if queue_policy() == "fair":
+        if self._inflight is not None and self._inflight[0] not in self._queue:
+            # The last tenant job was dispatched but never charged (refused at the door, cancelled
+            # while held): it used no device time. A handed-back job is still queued and keeps it.
+            self._settle(0.0)
+        policy = queue_policy()
+        if policy == "fifo":
+            item = self._queue.popleft()
+        else:
             item = self.dispatch_order()[0]
             self._queue.remove(item)
-        else:
-            item = self._queue.popleft()
         if item not in self._head and self._still_waiting(item):
-            self._serving = fair_share_key(item)
+            lane = fair_share_key(item)
+            self._serving = lane
+            if self._inflight is not None and self._inflight[0] == item:
+                pass  # a held job handed back and taken again: same dispatch, same start tag
+            else:
+                if self._inflight is not None:
+                    self._settle(0.0)  # a hand-back overtaken by another tenant job: never ran
+                start = self._start_tag(lane)
+                self._vtime = max(self._vtime, start)
+                self._inflight = (item, lane, start)
         self._head.discard(item)
         self._pinned.discard(item)
         self._arrived.pop(item, None)
         return item
+
+    def _settle(self, device_sec: float) -> None:
+        item, lane, start = self._inflight
+        self._inflight = None
+        self._finish[lane] = start + device_sec
+        if not any(i not in self._head and self._still_waiting(i) for i in self._queue):
+            # The busy period is over: nobody carries credit or debt into the next one.
+            self._vtime = max([self._vtime, *self._finish.values()])
+
+    def charge(self, item, device_sec: float) -> None:
+        """Bill the job the runner just finished for the device seconds it used (spec 01 I73):
+        from RUNNING to the end of its post-job gate. Tracked under every policy, so the estimate
+        is warm when a host switches. A job this queue did not dispatch (a verification job, a
+        re-adopted one) is not billed."""
+        if self._inflight is None or self._inflight[0] != item:
+            return
+        device_sec = max(0.0, float(device_sec))
+        lane = self._inflight[1]
+        prev = self._est.get(lane)
+        self._est[lane] = device_sec if prev is None else (
+            FAIR_TIME_EST_ALPHA * device_sec + (1 - FAIR_TIME_EST_ALPHA) * prev
+        )
+        self._settle(device_sec)
 
     def verification_waiting(self) -> bool:
         """A verification job is queued (it sits at the head)."""
@@ -14244,6 +14345,7 @@ async def _job_runner_loop():
             if not killed_while_waiting:
                 job.status = JobStatus.RUNNING
                 job.started_at = datetime.now().isoformat()
+                job.started_monotonic = time.monotonic()
                 _note_hold_carry_job("start")  # spec 04 I82
                 if job.verification:
                     job.reset_clock_at_start = recovery_mechanism.last_reset_monotonic
@@ -15101,6 +15203,11 @@ export {JOB_TAG_ENV}={job_tag}
                 # post-job fabric pass, the last traffic the silicon saw. The next job's
                 # cooldown measures from here.
                 last_job_end_monotonic = time.monotonic()
+                # Bill the job's person for the device time it held, gate and any reset included
+                # (spec 01 I73). Every policy tracks it; only fair_time orders by it.
+                q = get_job_queue()
+                if isinstance(q, JobQueue) and job.started_monotonic is not None:
+                    q.charge(job_id, last_job_end_monotonic - job.started_monotonic)
 
                 # Clean up old finished jobs from memory
                 await cleanup_finished_jobs()

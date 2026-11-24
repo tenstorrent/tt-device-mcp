@@ -205,9 +205,9 @@ def test_prejob_dispatch_set_reaches_the_unit(tmp_path):
     assert unit.index(line) < unit.index("ExecStart=")
 
 
-@pytest.mark.parametrize("policy", ["fair", "fifo"])
+@pytest.mark.parametrize("policy", ["fair", "fair_time", "fifo"])
 def test_queue_policy_set_reaches_the_unit(tmp_path, policy):
-    # The queue policy is host-wide (spec 01 I72): one /etc/default line must reach the unit under
+    # The queue policy is host-wide (spec 01 I72/I73): one /etc/default line must reach the unit under
     # the name queue_policy() reads, before ExecStart, or the only way to turn it on is a hand-edited
     # unit or drop-in the fleet's config path never sees. fifo renders too: it is how a host that
     # opted in turns it back off, since the unit-read fallback keeps an earlier opt-in sticky.

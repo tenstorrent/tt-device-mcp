@@ -214,7 +214,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_JOB_COOLDOWN_SEC` | 0 | Minimum idle gap between jobs | 01 |
 | `TT_DEVICE_MCP_JOB_BURST_MAX` | 0 (off) | Per-owner burst ceiling | 01 |
 | `TT_DEVICE_MCP_JOB_BURST_WINDOW_SEC` | 60 | Window for the burst ceiling | 01 |
-| `TT_DEVICE_MCP_QUEUE_POLICY` | `fifo` | Tenant queue order: `fifo` or `fair` (round-robin by person) | 01 |
+| `TT_DEVICE_MCP_QUEUE_POLICY` | `fifo` | Tenant queue order: `fifo`, `fair` (round-robin by person) or `fair_time` (fair by device seconds) | 01 |
 | `TT_DEVICE_MCP_HUNG_SILENCE_SEC` | 300 | Output silence before a job is called hung | 01 |
 | `TT_DEVICE_MCP_HUNG_NOTICE_SEC` | 60 | Cadence of hung-job notices | 01 |
 | `TT_DEVICE_MCP_DOOMED_GRACE_SEC` | 45 | Grace before a doomed job is reaped | 01 |

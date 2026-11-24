@@ -144,8 +144,8 @@ AUTO_POWER_CYCLE="${TTDEV_AUTO_POWER_CYCLE:-}"
 # never drops an opt-in an operator already made.
 PREJOB_DISPATCH="${TTDEV_PREJOB_DISPATCH:-}"
 [ -z "$PREJOB_DISPATCH" ] && [ -r "$UNIT" ] && PREJOB_DISPATCH="$(sed -n 's/^Environment=TT_DEVICE_MCP_PREJOB_DISPATCH=//p' "$UNIT" 2>/dev/null | head -1)"
-# The tenant queue policy (spec 01 I72). server.py reads TT_DEVICE_MCP_QUEUE_POLICY: fifo (its
-# default) or fair (round-robin by person). It is a host-wide
+# The tenant queue policy (spec 01 I72/I73). server.py reads TT_DEVICE_MCP_QUEUE_POLICY: fifo (its
+# default), fair (round-robin by person) or fair_time (fair by device seconds). It is a host-wide
 # choice, never a per-job one, so it lives here with the other per-host knobs. Unset renders no line
 # and the code default rules; the unit-read fallback keeps an opt-in across updates, so turning it
 # back off is TTDEV_QUEUE_POLICY=fifo, not deleting the key.
