@@ -82,7 +82,7 @@ def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
         st["eth_reads"] += 1
         return st["eth"]
 
-    async def fabric_pass(light=False):
+    async def fabric_pass():
         st["fabric"].append(len(st["resets"]))
         if st["fabric_77"]:
             return None, "fabric check could not check (77)"

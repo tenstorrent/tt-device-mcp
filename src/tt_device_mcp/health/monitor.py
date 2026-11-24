@@ -440,8 +440,8 @@ class HealthMonitor:
 
         ``fabric_light`` drops the all-link Ethernet traffic pass from the fabric check this pass runs:
         the validator still opens the fabric and counts every inter-chip link against the cabling
-        descriptor (or the eth link baseline when there is no descriptor), so fewer links than
-        expected still fails. Only the gate's post-job phase on a healthy device sets it (spec 03
+        descriptor, so fewer links than expected still fails; with no descriptor the run keeps the
+        traffic pass. Only the gate's post-job phase on a healthy device sets it (spec 03
         I115); every caller that can release a hold runs the traffic pass.
 
         Mirrors ``Recovery._verify_device``'s gentlest-first short-circuiting (a frozen heartbeat or a failed snapshot
@@ -631,13 +631,12 @@ class HealthMonitor:
             elif eok is not False and (fabric_asked or eok is None) and not link_drop_held and not reset_due:
                 # Spec 03 I115: the gate asks for light only on a post-job pass that cannot decide a
                 # hold lift; every other pass keeps the traffic.
-                light = fabric_light
                 self._deps.set_device_op_detail(
                     "health check: fabric traffic pass across all links (~45s)"
-                    if not light
+                    if not fabric_light
                     else "health check: light fabric open (links counted against the cabling)"
                 )
-                fok, fdetail = await self.verify_fabric_health(**({"light": True} if light else {}))
+                fok, fdetail = await self.verify_fabric_health(**({"light": True} if fabric_light else {}))
                 if log:
                     log(f"fabric: {'SKIPPED' if fok is None else ('OK' if fok else 'UNHEALTHY')} — {fdetail}")
                 _record("fabric", fok, fdetail)
@@ -1148,7 +1147,9 @@ class HealthMonitor:
         if log:
             log.info(f"HEALTH {line}")
 
-    async def _verify_fabric_health_timed(self, timeout_sec: float, *, light: bool = False) -> tuple[Optional[bool], str]:
+    async def _verify_fabric_health_timed(
+        self, timeout_sec: float, *, light: bool = False
+    ) -> tuple[Optional[bool], str]:
         _t0 = time.monotonic()
         _fabric_inflight_begin(self._fabric_check_cmd() or "built-in")
         try:
@@ -1253,7 +1254,9 @@ class HealthMonitor:
         health_event("snapshot_no_verdict", cause="killed_by_dead_chip_isolation", reason=why[:400])
         return f"{SNAPSHOT_KILLED_BY_ISOLATION}: {why}; no verdict, a full pass is owed after recovery"
 
-    async def _verify_fabric_health_body(self, timeout_sec: float, *, light: bool = False) -> tuple[Optional[bool], str]:
+    async def _verify_fabric_health_body(
+        self, timeout_sec: float, *, light: bool = False
+    ) -> tuple[Optional[bool], str]:
         self._fabric_killed = ""
         override = self._fabric_check_cmd()
         built = fabric.build_command(**({"traffic": False} if light else {}))
