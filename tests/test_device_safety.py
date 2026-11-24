@@ -10602,12 +10602,7 @@ async def test_idle_relift_escalates_an_all_arc_frozen_present_mesh(monkeypatch,
     the ceiling it must now escalate a confirmed mass wedge to the present-mesh galaxy reset."""
     _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
     counters = _arm_stuck_hold(monkeypatch)
-    stalled = [str(i) for i in range(32)]
-
-    async def all_arc_frozen(expected, log, run_fabric=True, **_):
-        return False, {"heartbeat": {"verdict": "unhealthy", "detail": "all 32 ARC frozen", "stalled": stalled}}
-
-    patch_recovery(monkeypatch, "_verify_device", all_arc_frozen)
+    _hung_chip_verify(monkeypatch, [str(i) for i in range(32)])
 
     await srv._attempt_idle_relift()
 
@@ -10655,6 +10650,29 @@ async def test_idle_relift_resets_a_hung_chip_once_per_hold_and_a_failed_check_k
     assert counters["resets"] == 1, "one mesh reset per hold episode"
     assert counters["fault_cleared"] == 0 and counters["dirty_cleared"] == 0
     assert srv.fsm.state is not ServerState.HEALTHY, "the failed check keeps the hold"
+
+
+@pytest.mark.asyncio
+async def test_a_relift_tick_before_the_grace_re_arms_the_next_one_at_the_grace(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 04 I116: the hung-chip reset fires at the grace, not up to one relift interval after it.
+    A tick before the grace gets not-due from the escalator's age gate, so it must re-arm the
+    relift timer for the grace — the same _relift_at_present_grace() the generic branch uses —
+not a full 120 s interval later. Fails without the re-arm: the reset would land one interval late."""
+    _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
+    counters = _arm_stuck_hold(monkeypatch, held_minutes_ago=100 / 60)  # hold age 100 s, grace at 120 s
+    _hung_chip_verify(monkeypatch, ["11"])
+
+    await srv._attempt_idle_relift()
+
+    assert counters["resets"] == 0, "inside the grace, no reset fires"
+    due_in = srv.SELFHEAL_RELIFT_INTERVAL_SEC - (srv.time.monotonic() - srv.last_relift_monotonic)
+    grace = galaxy._present_mesh_reset_grace_sec()
+    assert 0 < due_in <= grace - 100 + 5, (
+        "the next relift must land at the grace (the tick ran at hold age 100 s, grace 120 s),"
+        " not one full interval after the tick"
+    )
 
 
 # --- A2 (off-bus): the escalation must reach an OFF-BUS hold that never self-returns ------------

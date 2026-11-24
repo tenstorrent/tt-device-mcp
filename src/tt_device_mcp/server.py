@@ -5718,20 +5718,21 @@ async def _attempt_idle_relift() -> None:
                 # unverified hold is a present mesh and never routes through the off-bus cascade.
                 if selfheal and await _escalate("offbus"):
                     return
-                # A present mesh (nothing off the bus) can still verify UNHEALTHY on a MASS ARC
-                # wedge — every chip present but its heartbeat frozen. The off-bus escalator above
+                # A present mesh (nothing off the bus) can still verify UNHEALTHY with its
+                # heartbeats frozen — every chip present but wedged. The off-bus escalator above
                 # cannot see it (off_bus==0) and the frozen-eth branch below is unreachable (that
                 # needs enum+ARC HEALTHY), so read-only this held forever (box D, 37h). It is the one
                 # present-mesh fault a galaxy reset both cures and cannot invert — every chip is
                 # present — so route it to the present-mesh reset the eth strand runs. Spec 04 I116: any
                 # frozen chip takes it, a count below the mass-drop floor too, at the present-mesh grace
                 # (the escalator's own age gate, once per hold): a hung chip does not self-clear.
-                floor = _galaxy_reset_min_dead_chips(expected)
-                if selfheal and (floor is None or _frozen_chip_count(evidence) >= 1) and await _escalate("present"):
-                    return
-                _log(
-                    "still degraded — holding; the wedge clears on its own or the next gate resets, never a reset here"
-                )
+                if selfheal and (
+                    _galaxy_reset_min_dead_chips(expected) is None or _frozen_chip_count(evidence) >= 1
+                ):
+                    if await _escalate("present"):
+                        return
+                    _relift_at_present_grace()  # a tick before the grace must not delay the rung to the next one
+                _log("still degraded — holding; the reset ladder owns the recovery")
                 return
             if fabric:
                 # _verify_device returns healthy=True even when the fabric pass SKIPS (77 -> ok None),
