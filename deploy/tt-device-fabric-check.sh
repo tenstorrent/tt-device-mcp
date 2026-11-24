@@ -287,13 +287,6 @@ case "$rc" in "$EXIT_CANNOT_CHECK" | "$EXIT_HARDWARE_FAULT") rc=1 ;; esac
 [ "$rc" -eq 0 ] || exit "$rc"
 
 # ---- dispatch ----------------------------------------------------------------------------------
-# Light mode stops at the green fabric: the dispatch probe ENQUEUES A PROGRAM — exactly the
-# device perturbation a light check exists to avoid. The link count stands on its own.
-if [ -n "$LIGHT" ]; then
-    log "light run: links counted against the cabling; dispatch probe skipped (it enqueues)"
-    topo_ok
-    exit 0
-fi
 # A green fabric is not a usable mesh. The validator drives inter-chip ETHERNET traffic and never
 # enqueues a program, so it returns 0 on a mesh whose DISPATCH path is dead — measured: exit 0
 # seventy seconds before a cold worker hung in warmup, and again with all 8 chips throwing at

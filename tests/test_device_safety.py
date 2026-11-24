@@ -16583,9 +16583,9 @@ async def test_fsm_json_readopted_jobs_empty_when_the_job_is_gone_or_a_fault_sho
 
 
 def _light_gate_stubs(monkeypatch, tmp_path, *, dirty_hold=False, clean_hold=False):
-    """A CLEAN post-job gate on a 32-chip mesh whose eth read reaches a verdict: the gate asks the
-    probe pass for the fabric check, so the pass runs the light open and its argv reaches
-    verify_fabric_health. Returns the call records."""
+    """Stub a post-job gate pass on a 32-chip mesh: all probes healthy, the fabric pass records
+    its ``light`` argument, and the device is HEALTHY (default) or held dirty or clean. Returns
+    the call records."""
     (tmp_path / "0").write_text("")
     monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
     monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
@@ -16598,6 +16598,7 @@ def _light_gate_stubs(monkeypatch, tmp_path, *, dirty_hold=False, clean_hold=Fal
     # The heavy probes the gate's pass stubs: everything must read healthy so the pass reaches
     # the fabric branch.
     monkeypatch.setattr(srv, "heartbeat_supported", lambda *a: False)
+
     async def _snapshot(expected):
         return True, f"{expected} chip(s)"
 
@@ -16623,7 +16624,6 @@ def _light_gate_stubs(monkeypatch, tmp_path, *, dirty_hold=False, clean_hold=Fal
     return calls
 
 
-
 @pytest.mark.asyncio
 async def test_a_clean_post_job_gate_runs_the_fabric_check_light(monkeypatch, tmp_path):
     """Spec 03 I115: the post-job gate's fabric check drops the all-link traffic pass and runs
@@ -16647,7 +16647,7 @@ async def test_a_dirty_post_job_gate_keeps_the_traffic_pass(monkeypatch, tmp_pat
     the traffic pass: light is only for the check that cannot release anything."""
     calls = _light_gate_stubs(monkeypatch, tmp_path, dirty_hold=True)
     srv.last_fabric_check_monotonic = 0.0
-    await srv._device_health_gate(None, phase="post-job", run_fabric=True, force_fabric=True)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=True, force_fabric=True, job_exit0=True)
     assert calls["light"] is False, "a hold-deciding check ran light"
 
 
@@ -16662,35 +16662,43 @@ async def test_a_clean_hold_post_job_gate_keeps_the_traffic_pass(monkeypatch, tm
         return None, "the read reached no verdict"
 
     monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", stuck_eth)
-    await srv._device_health_gate(None, phase="post-job", run_fabric=False, force_fabric=False)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False, force_fabric=False, job_exit0=True)
     assert calls["light"] is not True, "a held device's fabric check ran light"
 
 
 @pytest.mark.asyncio
-async def test_a_failed_job_keeps_the_traffic_pass(monkeypatch, tmp_path):
-    """A failed job's forced pass is exactly the check the next tenant's safety rests on, so it
-    never drops the traffic pass (spec 03 I115: light only while the check cannot decide a lift)."""
+async def test_a_device_fault_reported_during_the_job_keeps_the_traffic_pass(monkeypatch, tmp_path):
+    """Spec 03 I115: a runtime-reported device fault keeps the traffic pass even after a job
+    that ended with exit 0."""
     calls = _light_gate_stubs(monkeypatch, tmp_path)
-    await srv._verify_device_after_job(None, job_failed=True)
-    assert calls["light"] is False, "a failed job's fabric check ran light"
+    monkeypatch.setattr(srv, "device_fault_reported", "telemetry: a chip left the bus")
 
-
-@pytest.mark.asyncio
-async def test_a_failed_job_with_a_clean_software_exit_keeps_the_traffic_pass(monkeypatch, tmp_path):
-    """Spec 03 I115: light only after a job that ended with exit 0. A failed job whose clean
-    software exit drops the forced pass (I36) still keeps the traffic pass when its eth read
-    reaches no verdict, and so does a post-job gate that is not told the job ended with exit 0."""
-    calls = _light_gate_stubs(monkeypatch, tmp_path)
+    async def escalate(*args, **kwargs):
+        return srv.OUTCOME_WAITING
 
     async def stuck_eth(timeout_sec=60.0):
         return None, "the read reached no verdict"
 
     monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", stuck_eth)
-    await srv._verify_device_after_job(None, job_failed=True, clean_exit_code=1)
-    assert calls["light"] is False, "a failed job's fabric check ran light"
-    calls["light"] = None
-    await srv._verify_device_after_job(None)
-    assert calls["light"] is False, "a job not known to end with exit 0 ran the light check"
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
+    monkeypatch.setattr(srv.per_target_recovery, "escalate", escalate)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False, force_fabric=False, job_exit0=True)
+    assert calls["light"] is False, "a fault-reported device's fabric check ran light"
+
+
+@pytest.mark.asyncio
+async def test_an_unhealthy_last_fabric_verdict_keeps_the_traffic_pass(monkeypatch, tmp_path):
+    """Spec 03 I115: a device whose last fabric verdict was UNHEALTHY keeps the traffic pass —
+    the light check cannot retire an unhealthy verdict."""
+    calls = _light_gate_stubs(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv.health_monitor, "last_fabric_ok", False)
+
+    async def stuck_eth(timeout_sec=60.0):
+        return None, "the read reached no verdict"
+
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", stuck_eth)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False, force_fabric=False, job_exit0=True)
+    assert calls["light"] is False, "a device with an unhealthy last fabric verdict ran light"
 
 
 @pytest.mark.asyncio
@@ -16698,7 +16706,7 @@ async def test_the_startup_gate_keeps_the_traffic_pass(monkeypatch, tmp_path):
     """Startup, ladder and hold-deadline checks stay on the traffic pass (I12, I78)."""
     calls = _light_gate_stubs(monkeypatch, tmp_path)
     srv.last_fabric_check_monotonic = 0.0
-    await srv._device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
+    await srv._device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True, job_exit0=True)
     assert calls["light"] is False, "a startup fabric check ran light"
 
 

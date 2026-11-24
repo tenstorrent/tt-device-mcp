@@ -150,6 +150,18 @@ def test_wrapper_runs_the_validator_when_no_hugepage_is_owed(tmp_path, iommu_typ
     assert "ran" in r.stderr
 
 
+def test_a_light_wrapper_run_still_reaches_the_dispatch_probe(tmp_path):
+    """Spec 03 I115: light mode drops only the all-link traffic pass; the dispatch probe still
+    runs — a wrapper that exits 0 before the probe would weaken the post-job check."""
+    fake_dispatch = tmp_path / "dispatch"
+    fake_dispatch.write_text("#!/bin/sh\necho dispatch-probe-ran >&2\nexit 0\n")
+    fake_dispatch.chmod(0o755)
+    r = _run_wrapper(tmp_path, "ran\n", 0, TT_DEVICE_MCP_FABRIC_LIGHT="1", TTDEV_DISPATCH_BIN=str(fake_dispatch))
+    assert r.returncode == 0, r.stderr
+    assert "dispatch OK: every chip ran a program" in r.stderr
+    assert "light run: links counted against the cabling; dispatch probe skipped" not in r.stderr
+
+
 def test_wrapper_names_a_failed_hugepage_pin_as_the_pool_not_ready(tmp_path):
     out = (
         "terminate called after throwing an instance of 'std::runtime_error'\n"
