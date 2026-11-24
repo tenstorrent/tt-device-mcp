@@ -4078,7 +4078,7 @@ async def test_a_link_drop_after_clean_jobs_pays_at_most_one_fabric_pass_per_int
     calls = _clean_post_job_gate(monkeypatch, tmp_path, eth=None, chips=4)
     stub_fabric = srv.health_monitor.verify_fabric_health
 
-    async def fabric_pass():
+    async def fabric_pass(light=False):
         ok, detail = await stub_fabric()
         srv.health_monitor.last_fabric_ok = ok  # as the real pass records its verdict
         return ok, detail
@@ -16733,3 +16733,6 @@ async def test_a_light_fabric_run_fails_on_fewer_links_than_the_cabling_expects(
     assert calls["fabric"] == 1, "the light fabric check never ran"
     assert calls["light"] is True, "the light check ran with the traffic pass"
     assert srv.fsm.state is not ServerState.HEALTHY, "a light check with fewer links than the cabling expects passed"
+    # The failed light check takes a failed full check's path: the next gate, which decides the lift, runs traffic.
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False, force_fabric=False)
+    assert calls["fabric"] == 2 and calls["light"] is False, "the check after a failed light check ran light"

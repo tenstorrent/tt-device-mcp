@@ -629,18 +629,15 @@ class HealthMonitor:
                     log(f"fabric: UNHEALTHY — {fdetail}")
                 _record("fabric", fok, fdetail)
             elif eok is not False and (fabric_asked or eok is None) and not link_drop_held and not reset_due:
-                # Spec 03 I115: the post-job check that cannot decide a hold lift runs light —
-                # the stuck-read fallback (or the gate's run_fabric ask) opens the fabric and
-                # counts every inter-chip link against the cabling without the traffic pass.
-                # Any pass the gate asked for WITH run_fabric/full (a dirty or failed-job gate)
-                # keeps the traffic: its verdict lifts or refuses a hold (I78).
-                light = fabric_light or (phase == "post-job" and not fabric_asked and eok is None)
+                # Spec 03 I115: the gate asks for light only on a post-job pass that cannot decide a
+                # hold lift; every other pass keeps the traffic.
+                light = fabric_light
                 self._deps.set_device_op_detail(
                     "health check: fabric traffic pass across all links (~45s)"
                     if not light
                     else "health check: light fabric open (links counted against the cabling)"
                 )
-                fok, fdetail = await self.verify_fabric_health(light=light)
+                fok, fdetail = await self.verify_fabric_health(**({"light": True} if light else {}))
                 if log:
                     log(f"fabric: {'SKIPPED' if fok is None else ('OK' if fok else 'UNHEALTHY')} — {fdetail}")
                 _record("fabric", fok, fdetail)
@@ -1107,7 +1104,7 @@ class HealthMonitor:
         the validator opens the fabric, every expected chip stays covered by the gate's own
         enum+ARC probes, and every inter-chip link is still counted against the cabling
         descriptor, so fewer links than the cabling expects still fails the check. An operator's
-        override is never asked for a light run: its contract is the traffic pass (spec 03 I115).
+        override gets ``TT_DEVICE_MCP_FABRIC_LIGHT=1`` in its env and decides itself (spec 03 I115).
 
         Returns ``(ok, detail)``:
           * ``None`` => SKIPPED (not configured, no built-in validator installed, the command
@@ -1144,7 +1141,7 @@ class HealthMonitor:
         async with scope:
             # Spec 03 I101: the traffic pass starts the device; no gated chip config read until it ends.
             with pcie_quiet.window("fabric"):
-                return await self._verify_fabric_health_timed(timeout_sec, light=light)
+                return await self._verify_fabric_health_timed(timeout_sec, **({"light": True} if light else {}))
 
     def _readers_log(self, line: str) -> None:
         log = self._logger()
@@ -1155,7 +1152,7 @@ class HealthMonitor:
         _t0 = time.monotonic()
         _fabric_inflight_begin(self._fabric_check_cmd() or "built-in")
         try:
-            ok, detail = await self._verify_fabric_health_body(timeout_sec, light=light)
+            ok, detail = await self._verify_fabric_health_body(timeout_sec, **({"light": True} if light else {}))
         except asyncio.CancelledError as e:
             # Cancelled under us (a shutdown that unwinds the loop), or the validator itself killed
             # by the shutdown (I63): say so now, the mark goes.
@@ -1259,7 +1256,7 @@ class HealthMonitor:
     async def _verify_fabric_health_body(self, timeout_sec: float, *, light: bool = False) -> tuple[Optional[bool], str]:
         self._fabric_killed = ""
         override = self._fabric_check_cmd()
-        built = fabric.build_command(traffic=not light and not override)
+        built = fabric.build_command(**({"traffic": False} if light else {}))
         if built is None:
             # The authoritative fabric verdict, and preflight hard-requires it — so reaching here means
             # the mesh goes entirely unvalidated on the one check that proves it moves data. Journal it.
