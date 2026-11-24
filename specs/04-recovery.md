@@ -3168,14 +3168,13 @@ each rung fires only when the gentler one failed or cannot apply.
   reset and its check (about 90 s) at 2 min instead of 10 min on this hold class.
 
 - **I116 — A hung chip below the floor takes the present-mesh reset at the grace, not at the ceiling.**
-  Seen on a 32-chip Galaxy: one chip hung (its ARC heartbeat frozen across two samples) with every chip
-  on the bus, below the mass floor (I8). The gate holds that, as it must, and the idle relift's
-  not-healthy branch held it read-only ("never a reset here") until the 10-min ceiling window reset it,
-  12.4 min against a 6 min budget. A frozen chip does not self-clear, and with nothing off the bus a
-  mesh reset has no mesh to invert (I105). So the idle relift now escalates one or more frozen chips,
-  whatever the floor, to the present-mesh reset: `_escalate("present")`, whose own gate admits it at
+  A chip whose ARC heartbeat is frozen across two samples, with every chip on the bus and the count
+  below the mass floor (I8), does not self-clear, and with nothing off the bus a mesh reset has no
+  mesh to invert (I105). So the idle relift escalates one or more frozen chips, whatever the floor,
+  to the present-mesh reset: `_escalate("present")`, whose own gate admits it at
   `_present_mesh_reset_grace_sec()` (120 s by default) of hold age, with `off_bus` 0, no tenant and the
-  retry spacing. It is once per hold (I87): a failed reset climbs to the sweep and the power cycle, and the
+  retry spacing. A relift tick before the grace re-arms the next one for the grace (I62's
+  `_relift_at_present_grace()`), so the reset is not a relift interval late. It is once per hold (I87): a failed reset climbs to the sweep and the power cycle, and the
   mesh reset repeats only in the 10-min bound's ladder (I89, I76). The hold lifts only on the full check with fabric that follows the reset
   (I32); a failed one keeps the hold and the bounded recovery of I76 goes on. A chip off the bus
   keeps the off-bus routing, and a chip count at or above the floor takes the same path as before.
@@ -3932,5 +3931,6 @@ sees a silent fabric pass.
 | I111 an isolation-killed hold with every chip on the bus runs the forced ladder on the first tick past the present-mesh grace, not at the ceiling; once per episode; /health reports it; the ceiling window still runs | `tests/test_isolation_kill_grace.py::test_an_isolation_killed_hold_runs_the_forced_ladder_at_the_present_mesh_grace`, `::test_an_isolated_chip_leaves_the_hold_to_the_off_bus_one_shot`, `::test_a_dirty_hold_the_isolation_did_not_kill_keeps_its_own_clock` |
 | I111 the grace run releases only on a just-passed full check with fabric; a 77 or no fabric verdict keeps the hold | `tests/test_isolation_kill_grace.py::test_the_grace_run_releases_only_on_a_just_passed_fabric_check` |
 | I116 a hung chip below the floor with every chip on the bus takes the present-mesh reset at the grace and not before; a mass wedge takes it as before | `tests/test_device_safety.py::test_idle_relift_resets_a_hung_chip_below_the_floor_at_the_present_mesh_grace`, `tests/test_device_safety.py::test_idle_relift_escalates_an_all_arc_frozen_present_mesh` |
+| I116 a relift tick before the grace makes the next relift due at the grace | `tests/test_device_safety.py::test_a_relift_tick_before_the_grace_re_arms_the_next_one_at_the_grace` |
 | I116 the reset runs once per hold, and a failed full check keeps the hold and releases nothing | `tests/test_device_safety.py::test_idle_relift_resets_a_hung_chip_once_per_hold_and_a_failed_check_keeps_the_hold` |
 | I102 with I103: the late-chip second mesh reset runs in the pre-cycle sweep, so its pre-reset scan clears a holder outside every broker scope and runs (at the 10-min bound, on the I97 path, and in the sweep outside the bound); its wait still ends at the step's start plus `LATE_CHIP_STEP_SEC`; a failed full check keeps the hold and the cycle journals the holder; a holder in a broker job's scope or the running job's own process still refuses it, nothing lifts and the hold goes on to the cycle | `tests/test_late_chips_after_driver_wait.py::test_the_late_chip_second_reset_clears_a_foreign_holder_and_keeps_its_bound`, `::test_a_job_holder_still_refuses_the_late_chip_second_reset_and_the_hold_goes_on_to_the_cycle` |

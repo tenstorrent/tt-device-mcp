@@ -10659,7 +10659,7 @@ async def test_a_relift_tick_before_the_grace_re_arms_the_next_one_at_the_grace(
     """Spec 04 I116: the hung-chip reset fires at the grace, not up to one relift interval after it.
     A tick before the grace gets not-due from the escalator's age gate, so it must re-arm the
     relift timer for the grace — the same _relift_at_present_grace() the generic branch uses —
-not a full 120 s interval later. Fails without the re-arm: the reset would land one interval late."""
+    not a full 120 s interval later. Fails without the re-arm: the reset would land one interval late."""
     _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
     counters = _arm_stuck_hold(monkeypatch, held_minutes_ago=100 / 60)  # hold age 100 s, grace at 120 s
     _hung_chip_verify(monkeypatch, ["11"])
