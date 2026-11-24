@@ -5726,9 +5726,7 @@ async def _attempt_idle_relift() -> None:
                 # present — so route it to the present-mesh reset the eth strand runs. Spec 04 I116: any
                 # frozen chip takes it, a count below the mass-drop floor too, at the present-mesh grace
                 # (the escalator's own age gate, once per hold): a hung chip does not self-clear.
-                if selfheal and (
-                    _galaxy_reset_min_dead_chips(expected) is None or _frozen_chip_count(evidence) >= 1
-                ):
+                if selfheal and (_galaxy_reset_min_dead_chips(expected) is None or _frozen_chip_count(evidence) >= 1):
                     if await _escalate("present"):
                         return
                     _relift_at_present_grace()  # a tick before the grace must not delay the rung to the next one

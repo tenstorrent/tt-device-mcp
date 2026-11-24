@@ -10653,9 +10653,7 @@ async def test_idle_relift_resets_a_hung_chip_once_per_hold_and_a_failed_check_k
 
 
 @pytest.mark.asyncio
-async def test_a_relift_tick_before_the_grace_re_arms_the_next_one_at_the_grace(
-    monkeypatch, tmp_path, clear_job_state
-):
+async def test_a_relift_tick_before_the_grace_re_arms_the_next_one_at_the_grace(monkeypatch, tmp_path, clear_job_state):
     """Spec 04 I116: the hung-chip reset fires at the grace, not up to one relift interval after it.
     A tick before the grace gets not-due from the escalator's age gate, so it must re-arm the
     relift timer for the grace — the same _relift_at_present_grace() the generic branch uses —
