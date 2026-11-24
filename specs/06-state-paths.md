@@ -214,6 +214,7 @@ The index of every `TT_DEVICE_MCP_*` variable in `src/` plus the two deploy-defi
 | `TT_DEVICE_MCP_JOB_COOLDOWN_SEC` | 0 | Minimum idle gap between jobs | 01 |
 | `TT_DEVICE_MCP_JOB_BURST_MAX` | 0 (off) | Per-owner burst ceiling | 01 |
 | `TT_DEVICE_MCP_JOB_BURST_WINDOW_SEC` | 60 | Window for the burst ceiling | 01 |
+| `TT_DEVICE_MCP_QUEUE_POLICY` | `fifo` | Tenant queue order: `fifo` or `fair` (round-robin by person) | 01 |
 | `TT_DEVICE_MCP_HUNG_SILENCE_SEC` | 300 | Output silence before a job is called hung | 01 |
 | `TT_DEVICE_MCP_HUNG_NOTICE_SEC` | 60 | Cadence of hung-job notices | 01 |
 | `TT_DEVICE_MCP_DOOMED_GRACE_SEC` | 45 | Grace before a doomed job is reaped | 01 |
@@ -306,7 +307,7 @@ Behavior).
 | `TTDEV_HEALTH_PROBE` | 1 | Read by `apply-host-config.sh` from the config file: `0` disables `tt-device-health-probe.timer` (spec 08 I17), anything else enables it |
 | `TTDEV_NO_LOCK` | unset | Back-compat: force cooperative (no lock) |
 | `TTDEV_LOCK` | unset (0) | Read by `apply-host-config.sh`: `1` opts the host into the device lock (spec 05 I9) — renders `TT_DEVICE_MCP_DEVICE_GROUP=ttdev` and `TT_DEVICE_MCP_DEVICE_LOCK=1` into the unit, empties `ttdev` of people and installs the udev rule; unset or `0` leaves the host as it was; `tt-device-mcp unlock` sets it to `0` |
-| `TTDEV_RESET_MODE`, `TTDEV_FABRIC_CHECK_CMD`, `TTDEV_ETH_HEARTBEAT_CMD`, `TTDEV_RESET_MIN_DEAD_FRAC`, `TTDEV_SELFHEAL_RELIFT`, `TTDEV_EXPECTED_CHIPS`, `TTDEV_AUTO_POWER_CYCLE`, `TTDEV_PREJOB_DISPATCH`, `TTDEV_POLLER_SERVICES` | unset | Per-host config keys; each renders the same-named `TT_DEVICE_MCP_*` unit env line (values already in the unit survive an update; an unset `TTDEV_EXPECTED_CHIPS` is derived from the machine type, spec 08 I28) |
+| `TTDEV_RESET_MODE`, `TTDEV_FABRIC_CHECK_CMD`, `TTDEV_ETH_HEARTBEAT_CMD`, `TTDEV_RESET_MIN_DEAD_FRAC`, `TTDEV_SELFHEAL_RELIFT`, `TTDEV_EXPECTED_CHIPS`, `TTDEV_AUTO_POWER_CYCLE`, `TTDEV_PREJOB_DISPATCH`, `TTDEV_POLLER_SERVICES`, `TTDEV_QUEUE_POLICY` | unset | Per-host config keys; each renders the same-named `TT_DEVICE_MCP_*` unit env line (values already in the unit survive an update; an unset `TTDEV_EXPECTED_CHIPS` is derived from the machine type, spec 08 I28) |
 | `TTDEV_FABRIC_DESCRIPTOR` | galaxy: shipped descriptor; else unset | Cabling descriptor for the fabric check (src, fabric.py) |
 | `TTDEV_FABRIC_BIN` | validator `run_cluster_validation` | Fabric validator binary override (src) |
 | `TTDEV_FABRIC_RUNTIME_ROOT` | validator `current/` | `TT_METAL_HOME` for the fabric check (src) |

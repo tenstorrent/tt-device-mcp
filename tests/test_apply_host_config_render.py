@@ -184,6 +184,8 @@ def test_a_stale_reboot_setting_renders_no_line(tmp_path):
         # Default: no line, so server.py's built-in poller list (no clock-cap keeper) rules.
         "TT_DEVICE_MCP_POLLER_SERVICES",
         "TTDEV_ETH_CHECK_PYTHON",
+        # Default: no line, so server.py's queue_policy() reads fifo and the queue order is unchanged.
+        "TT_DEVICE_MCP_QUEUE_POLICY",
     ],
 )
 def test_an_unset_knob_renders_no_line(tmp_path, name):
@@ -199,6 +201,18 @@ def test_prejob_dispatch_set_reaches_the_unit(tmp_path):
     opted = dict(_GALAXY, TTDEV_PREJOB_DISPATCH="1")
     unit = _render(tmp_path, opted)
     line = "Environment=TT_DEVICE_MCP_PREJOB_DISPATCH=1"
+    assert line in unit
+    assert unit.index(line) < unit.index("ExecStart=")
+
+
+@pytest.mark.parametrize("policy", ["fair", "fifo"])
+def test_queue_policy_set_reaches_the_unit(tmp_path, policy):
+    # The queue policy is host-wide (spec 01 I72): one /etc/default line must reach the unit under
+    # the name queue_policy() reads, before ExecStart, or the only way to turn it on is a hand-edited
+    # unit or drop-in the fleet's config path never sees. fifo renders too: it is how a host that
+    # opted in turns it back off, since the unit-read fallback keeps an earlier opt-in sticky.
+    unit = _render(tmp_path, dict(_GALAXY, TTDEV_QUEUE_POLICY=policy))
+    line = f"Environment=TT_DEVICE_MCP_QUEUE_POLICY={policy}\n"
     assert line in unit
     assert unit.index(line) < unit.index("ExecStart=")
 

@@ -144,6 +144,13 @@ AUTO_POWER_CYCLE="${TTDEV_AUTO_POWER_CYCLE:-}"
 # never drops an opt-in an operator already made.
 PREJOB_DISPATCH="${TTDEV_PREJOB_DISPATCH:-}"
 [ -z "$PREJOB_DISPATCH" ] && [ -r "$UNIT" ] && PREJOB_DISPATCH="$(sed -n 's/^Environment=TT_DEVICE_MCP_PREJOB_DISPATCH=//p' "$UNIT" 2>/dev/null | head -1)"
+# The tenant queue policy (spec 01 I72). server.py reads TT_DEVICE_MCP_QUEUE_POLICY: fifo (its
+# default) or fair (round-robin by person). It is a host-wide
+# choice, never a per-job one, so it lives here with the other per-host knobs. Unset renders no line
+# and the code default rules; the unit-read fallback keeps an opt-in across updates, so turning it
+# back off is TTDEV_QUEUE_POLICY=fifo, not deleting the key.
+QUEUE_POLICY="${TTDEV_QUEUE_POLICY:-}"
+[ -z "$QUEUE_POLICY" ] && [ -r "$UNIT" ] && QUEUE_POLICY="$(sed -n 's/^Environment=TT_DEVICE_MCP_QUEUE_POLICY=//p' "$UNIT" 2>/dev/null | head -1)"
 # Device pollers to quiesce around a reset. server.py reads TT_DEVICE_MCP_POLLER_SERVICES (a comma
 # list; its default covers tt-telemetry and tt-metrics-exporter, and a unit a host lacks
 # is skipped). A host running yet another unit that reads the device overrides it with the full list
@@ -166,6 +173,7 @@ relift_env=""; [ -n "$RELIFT" ] && relift_env="Environment=TT_DEVICE_MCP_SELFHEA
 expected_env=""; [ -n "$EXPECTED_CHIPS" ] && expected_env="Environment=TT_DEVICE_MCP_EXPECTED_CHIPS=$EXPECTED_CHIPS"
 autopc_env=""; [ -n "$AUTO_POWER_CYCLE" ] && autopc_env="Environment=TT_DEVICE_MCP_AUTO_POWER_CYCLE=$AUTO_POWER_CYCLE"
 prejobdispatch_env=""; [ -n "$PREJOB_DISPATCH" ] && prejobdispatch_env="Environment=TT_DEVICE_MCP_PREJOB_DISPATCH=$PREJOB_DISPATCH"
+queuepolicy_env=""; [ -n "$QUEUE_POLICY" ] && queuepolicy_env="Environment=TT_DEVICE_MCP_QUEUE_POLICY=$QUEUE_POLICY"
 pollers_env=""; [ -n "$POLLER_SERVICES" ] && pollers_env="Environment=TT_DEVICE_MCP_POLLER_SERVICES=$POLLER_SERVICES"
 ethpython_env=""; [ -n "$ETH_PYTHON" ] && ethpython_env="Environment=TTDEV_ETH_CHECK_PYTHON=$ETH_PYTHON"
 
@@ -197,6 +205,7 @@ if [ -z "$RENDER_ONLY" ]; then
     sed -i '/^TTDEV_AUTO_REBOOT=/d' /etc/default/tt-device-broker 2>/dev/null || true
     ensure_default TTDEV_AUTO_POWER_CYCLE "$AUTO_POWER_CYCLE"
     ensure_default TTDEV_PREJOB_DISPATCH "$PREJOB_DISPATCH"
+    ensure_default TTDEV_QUEUE_POLICY "$QUEUE_POLICY"
     ensure_default TTDEV_ETH_CHECK_PYTHON "$ETH_PYTHON"
     ensure_default TTDEV_POLLER_SERVICES "$POLLER_SERVICES"
 fi
@@ -257,6 +266,7 @@ $relift_env
 $expected_env
 $autopc_env
 $prejobdispatch_env
+$queuepolicy_env
 $pollers_env
 $ethpython_env
 $group_env

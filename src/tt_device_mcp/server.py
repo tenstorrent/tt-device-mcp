@@ -2688,18 +2688,66 @@ def _set_device_op_detail(detail: str) -> None:
     device_op_stage_started_at = datetime.now().isoformat()
 
 
+QUEUE_POLICY_ENV = "TT_DEVICE_MCP_QUEUE_POLICY"
+QUEUE_POLICIES = ("fifo", "fair")
+
+
+def queue_policy() -> str:
+    """The host's tenant-queue ordering policy (spec 01 I72): ``fifo`` (default) or ``fair``.
+
+    Read on every call, not cached at import, so an operator flips it with a broker restart and a
+    test with monkeypatch.setenv. Anything unrecognised is ``fifo``: an unknown policy must not
+    reorder anyone's work."""
+    value = os.environ.get(QUEUE_POLICY_ENV, "fifo").strip().lower()
+    return value if value in QUEUE_POLICIES else "fifo"
+
+
+def fair_share_key(job_id) -> str:
+    """The fair-share lane a queued job belongs to: the submitting *person*, not the surface.
+
+    ``[agent]alice`` and ``alice`` are one lane: fifty agent jobs and one CLI job from the same
+    person are that person's share, and splitting them would hand a heavy agent user a second
+    slot in the rotation. An id the broker does not track (a hand-back in a test) is its own lane."""
+    job = jobs.get(job_id)
+    if job is None:
+        return f"?{job_id}"
+    owner = job.owner or "unknown"
+    return owner[len(AGENT_OWNER_PREFIX) :] if owner.startswith(AGENT_OWNER_PREFIX) else owner
+
+
 class JobQueue(asyncio.Queue):
-    """The job queue: FIFO, except that an operator verification job goes to the head, ahead of
-    every tenant job and FIFO among its own kind (spec 01 I21).
+    """The job queue. An operator verification job goes to the head, ahead of every tenant job and
+    FIFO among its own kind (spec 01 I21); a held tenant job handed back goes first behind it.
 
     A held queue is where that matters: a fabric_unverified hold can only be lifted by a fabric
     pass, and the operator's own run of that pass sat behind the tenant jobs the hold was holding.
+
+    Behind those, tenant jobs are ordered by the host policy (spec 01 I72). ``fifo``: arrival
+    order. ``fair``: round-robin across people (``fair_share_key``) — one job per person per turn,
+    the rotation ordered by when each person last moved to its tail (their last dispatch, or the
+    arrival of their oldest waiting job, whichever is later). With one person waiting, or one job
+    per person, ``fair`` IS ``fifo``; it only reorders when a person has a backlog while someone
+    else waits, and then it only moves that backlog back.
+
+    ``_queue`` itself always stays in arrival order (head/hand-back first), so persistence and
+    restore are policy-blind; the policy is applied as a view (``dispatch_order``) at ``_get``.
     """
 
     def _init(self, maxsize):
         super()._init(maxsize)
         self._head: set = set()  # queued verification job ids
         self._back: set = set()  # a held tenant job handed back, pending its _put
+        self._pinned: set = set()  # handed-back jobs sitting at the front, outside the rotation
+        self._tick = 0  # one counter for arrivals and dispatches, so every stamp is unique
+        self._arrived: dict = {}  # job id -> arrival stamp
+        self._last_served: dict[str, int] = {}  # fair-share lane -> stamp of the end of its last turn
+        # The lane whose job the runner last took. Its turn lasts until the runner comes back for
+        # the next job (the runner is serial), so someone who arrives while it runs goes first.
+        self._serving: Optional[str] = None
+
+    def _stamp(self) -> int:
+        self._tick += 1
+        return self._tick
 
     def put_head_nowait(self, item) -> None:
         """Queue a verification job behind the verification jobs already at the head."""
@@ -2715,15 +2763,72 @@ class JobQueue(asyncio.Queue):
         n = 0
         while n < len(self._queue) and self._queue[n] in self._head:
             n += 1
+        self._arrived.setdefault(item, self._stamp())
         if item in self._head or item in self._back:
+            if item in self._back:
+                self._pinned.add(item)
             self._back.discard(item)
             self._queue.insert(n, item)
         else:
             self._queue.append(item)
 
+    @staticmethod
+    def _still_waiting(item) -> bool:
+        """A job cancelled while queued stays in ``_queue`` until the runner pops and skips it."""
+        job = jobs.get(item)
+        return job is None or job.status == JobStatus.QUEUED
+
+    def dispatch_order(self) -> list:
+        """Every queued id, in the order the runner will take them if nothing else arrives."""
+        items = list(self._queue)
+        if queue_policy() != "fair":
+            return items
+        front = [i for i in items if i in self._head or i in self._pinned]
+        fixed = set(front)
+        # Cancelled jobs cost the device nothing; drain them first so they skew no rotation.
+        dead = [i for i in items if i not in fixed and not self._still_waiting(i)]
+        fixed.update(dead)
+        lanes: dict[str, list] = {}
+        for i in items:
+            if i not in fixed:
+                lanes.setdefault(fair_share_key(i), []).append(i)
+        # A handed-back tenant job runs from the front, and running it is its person's turn: once it
+        # ends, that person goes to the tail, behind the lane now serving and behind anyone already
+        # waiting. Predict that, in front order, or the listing disagrees with what the runner does.
+        front_turns: dict[str, int] = {}
+        for n, i in enumerate(front):
+            if i in self._pinned and self._still_waiting(i):
+                front_turns.setdefault(fair_share_key(i), n)
+
+        def rotation(lane: str) -> int:
+            if lane in front_turns:
+                return self._tick + 2 + front_turns[lane]  # its turn comes first, from the front
+            if lane == self._serving:
+                return self._tick + 1  # mid-turn: the tail of the rotation
+            return max(self._last_served.get(lane, 0), self._arrived.get(lanes[lane][0], 0))
+
+        order = sorted(lanes, key=rotation)
+        out = front + dead
+        for turn in range(max((len(v) for v in lanes.values()), default=0)):
+            out.extend(lanes[lane][turn] for lane in order if turn < len(lanes[lane]))
+        return out
+
     def _get(self):
-        item = self._queue.popleft()
+        # The runner is back for another job, so the last one's turn is over: that lane moves to
+        # the tail now, behind anyone who arrived while it ran. Tracked under both policies.
+        if self._serving is not None:
+            self._last_served[self._serving] = self._stamp()
+            self._serving = None
+        if queue_policy() == "fair":
+            item = self.dispatch_order()[0]
+            self._queue.remove(item)
+        else:
+            item = self._queue.popleft()
+        if item not in self._head and self._still_waiting(item):
+            self._serving = fair_share_key(item)
         self._head.discard(item)
+        self._pinned.discard(item)
+        self._arrived.pop(item, None)
         return item
 
     def verification_waiting(self) -> bool:
@@ -12623,6 +12728,20 @@ def _explain_interruption(
     return None
 
 
+def _queued_jobs_in_dispatch_order() -> list["Job"]:
+    """Every QUEUED job, in the order the runner will start them (spec 01 I72).
+
+    A job the runner has already dequeued but not yet started (held at admission) is QUEUED and no
+    longer in the deque; it is next, so it leads. ``status`` and a submit's reported position both
+    read this one view, so they cannot disagree."""
+    queued = [j for j in jobs.values() if j.status == JobStatus.QUEUED]
+    q = get_job_queue()
+    order = q.dispatch_order() if isinstance(q, JobQueue) else list(q._queue)
+    rank = {jid: n for n, jid in enumerate(order)}
+    queued.sort(key=lambda j: rank.get(j.id, -1))  # stable: the dequeued ones keep their order
+    return queued
+
+
 def _get_queue_status() -> dict:
     """Get queue status (shared by REST API and MCP tool).
 
@@ -12632,7 +12751,9 @@ def _get_queue_status() -> dict:
     "[broker]" and the test that should have caught it passed against the other one.
     """
     running = [j for j in jobs.values() if j.status == JobStatus.RUNNING]
-    queued = [j for j in jobs.values() if j.status == JobStatus.QUEUED]
+    # In the order the runner will take them (spec 01 I72), not submission order: under the fair
+    # policy the two differ, and a position that lies is worse than none.
+    queued = _queued_jobs_in_dispatch_order()
     rows = [
         {
             "id": j.id,
@@ -17028,9 +17149,14 @@ def create_mcp_server() -> MCPServer:
             if logger:
                 logger.info("JOB_RUNNER started (triggered by first job queue)")
 
-        # Determine if job will run immediately or be queued
-        running_jobs = [j for j in jobs.values() if j.status == JobStatus.RUNNING]
-        queue_size = get_job_queue().qsize()
+        # Determine if job will run immediately or be queued. The awaits above (log pruning) can let
+        # the runner take this job already: then it is not waiting behind anyone, itself included.
+        started = job.status != JobStatus.QUEUED
+        running_jobs = [j for j in jobs.values() if j.status == JobStatus.RUNNING and j.id != job_id]
+        # Where this job sits in the same ordered view `status` lists (spec 01 I72), counting a job
+        # the runner already holds at admission; under fifo that is the tail, as before.
+        waiting = [j.id for j in _queued_jobs_in_dispatch_order()]
+        queue_size = waiting.index(job_id) + 1 if job_id in waiting else len(waiting)
         # A broker op holding the device, or a device flagged dirty, blocks this job just
         # as surely as another tenant does — the gate makes it wait for the reset+verify.
         # Reporting "starting (device idle)" through that window told a submitter their job
@@ -17038,7 +17164,13 @@ def create_mcp_server() -> MCPServer:
         # reads exactly like a job dispatched onto a device the broker had marked dirty.
         blocked = _device_unavailable_for_tenant()
 
-        if running_jobs:
+        if started:
+            # Already dispatched (or ended at the door) while this request was still answering.
+            queue_position = 0
+            status_msg = (
+                "starting (device idle)" if job.status == JobStatus.RUNNING else f"left the queue: {job.status.value}"
+            )
+        elif running_jobs:
             # Device busy - job is queued
             queue_position = queue_size  # Position in queue (1 = next after current)
             status_msg = f"queued (position {queue_position} - waiting for {running_jobs[0].id})"
@@ -17055,7 +17187,7 @@ def create_mcp_server() -> MCPServer:
 
         return {
             "job_id": job_id,
-            "status": "queued" if (running_jobs or blocked) else "starting",
+            "status": "queued" if not started and (running_jobs or blocked) else "starting",
             "message": status_msg,
             "position": queue_position,
             "log_file": job_log_file,
