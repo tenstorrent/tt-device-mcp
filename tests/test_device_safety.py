@@ -16582,7 +16582,7 @@ async def test_fsm_json_readopted_jobs_empty_when_the_job_is_gone_or_a_fault_sho
 # ---- spec 03 I115: the post-job fabric check runs light ---------------------------------------------
 
 
-def _light_gate_stubs(monkeypatch, tmp_path, *, dirty_hold=False):
+def _light_gate_stubs(monkeypatch, tmp_path, *, dirty_hold=False, clean_hold=False):
     """A CLEAN post-job gate on a 32-chip mesh whose eth read reaches a verdict: the gate asks the
     probe pass for the fabric check, so the pass runs the light open and its argv reaches
     verify_fabric_health. Returns the call records."""
@@ -16604,6 +16604,8 @@ def _light_gate_stubs(monkeypatch, tmp_path, *, dirty_hold=False):
     monkeypatch.setattr(srv.health_monitor, "_verify_device", _snapshot)
     if dirty_hold:
         fsm_dirty(srv, "a job reset the mesh")
+    elif clean_hold:
+        fsm_dirty(srv, "fabric unverified", why=srv.FABRIC_RELIFT_WHY)
     else:
         fsm_healthy(srv)
     calls = {"light": None, "eth": 0}
@@ -16650,6 +16652,21 @@ async def test_a_dirty_post_job_gate_keeps_the_traffic_pass(monkeypatch, tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_a_clean_hold_post_job_gate_keeps_the_traffic_pass(monkeypatch, tmp_path):
+    """A clean (not dirty) hold also lifts on the gate's verdict, so a post-job gate on a
+    held device keeps the traffic pass even when the eth read reaches no verdict."""
+    calls = _light_gate_stubs(monkeypatch, tmp_path, clean_hold=True)
+    assert srv.fsm.record.dirty is False
+
+    async def stuck_eth(timeout_sec=60.0):
+        return None, "the read reached no verdict"
+
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", stuck_eth)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False, force_fabric=False)
+    assert calls["light"] is not True, "a held device's fabric check ran light"
+
+
+@pytest.mark.asyncio
 async def test_a_failed_job_keeps_the_traffic_pass(monkeypatch, tmp_path):
     """A failed job's forced pass is exactly the check the next tenant's safety rests on, so it
     never drops the traffic pass (spec 03 I115: light only while the check cannot decide a lift)."""
@@ -16673,11 +16690,10 @@ def test_a_light_fabric_run_drops_the_traffic_pass(monkeypatch, tmp_path):
     inter-chip link against the cabling; the traffic argv never changes."""
     fake_root = tmp_path / "validator"
     (fake_root / "current").mkdir(parents=True, exist_ok=True)  # runtime root must be a dir
-    for bin_dir in ("build/tools/scaleout",):
-        exe = fake_root / "current" / bin_dir / "run_cluster_validation"
-        exe.parent.mkdir(parents=True, exist_ok=True)
-        exe.write_text("#!/bin/sh\nexit 0\n")
-        exe.chmod(0o755)
+    exe = fake_root / "current" / "build/tools/scaleout" / "run_cluster_validation"
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    exe.write_text("#!/bin/sh\nexit 0\n")
+    exe.chmod(0o755)
     (tmp_path / "cabling.textproto").write_text("")  # validator_missing checks it exists
     monkeypatch.setenv("TTDEV_VALIDATOR_ROOT", str(fake_root))
     monkeypatch.setenv("TTDEV_FABRIC_DESCRIPTOR", str(tmp_path / "cabling.textproto"))

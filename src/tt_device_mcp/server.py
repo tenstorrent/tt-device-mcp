@@ -7800,11 +7800,12 @@ async def device_health_gate(
         pcie_before = await _pcie_snapshot() if pcie_on else {}
         # Spec 03 I115: the post-job gate's fabric check runs light — the all-link traffic
         # pass is skipped, the validator still opens the fabric and counts every inter-chip
-        # link against the cabling — but only while the pass cannot decide a hold lift: a
-        # dirty device, a failed job, a kill-reset debt or a deferred kill reset all release
-        # (or refuse to release) a hold on this check's verdict, and those keep the traffic pass.
+        # link against the cabling — but only on a HEALTHY device, where the pass cannot decide
+        # a hold lift: any hold (dirty or clean), a failed job, a kill-reset debt or a deferred
+        # kill reset release (or refuse to release) on this check's verdict and keep traffic.
         fabric_light = (
             phase == "post-job"
+            and fsm.state is ServerState.HEALTHY
             and not full
             and not kill_reset
             and not deferral
