@@ -55,6 +55,11 @@ class FabricDebt:
         self.reset_monotonic: float = 0.0
         # The reset_monotonic whose settle a gate already waited out: one reset is waited for once.
         self.settle_served: float = 0.0
+        # The job whose own reset is the only reset behind the open debt ("" when a broker reset is in it
+        # too, or nothing is owed), and the wall-clock time of the newest such reset: what a job's
+        # fabric-ok marker is judged against (spec 04 I32).
+        self.tenant_job: str = ""
+        self.tenant_wall: float = 0.0
         # Run on every settle (owed -> clear): see add_settle_listener.
         self._settle_listeners: "list[Callable[[], None]]" = []
 
@@ -65,13 +70,24 @@ class FabricDebt:
         if callback not in self._settle_listeners:
             self._settle_listeners.append(callback)
 
-    def note_reset(self, what: str, journal: Optional[Callable[..., None]] = None, at: Optional[float] = None) -> None:
+    def note_reset(
+        self,
+        what: str,
+        journal: Optional[Callable[..., None]] = None,
+        at: Optional[float] = None,
+        tenant_job: str = "",
+    ) -> None:
         """A reset (or a broker start) happened: the fabric is unproven until a pass clears it.
         Journaled on the transition only; a newer reset while owed just renames it. ``journal``
         replaces the synchronous append (spec 03 I92 passes the detached writer). ``at`` is when the
-        reset happened (time.monotonic(); default now, 0.0 unknown); the latest one is kept."""
+        reset happened (time.monotonic(); default now, 0.0 unknown); the latest one is kept. ``tenant_job`` names
+        the running job that reset its own chips: the debt stays that job's only while every reset behind it is."""
         at = time.monotonic() if at is None else at
         was, self.owed = self.owed, what
+        if tenant_job and (not was or self.tenant_job == tenant_job):
+            self.tenant_job, self.tenant_wall = tenant_job, time.time()
+        else:
+            self.tenant_job, self.tenant_wall = "", 0.0
         self.reset_monotonic = max(self.reset_monotonic, at) if was else at
         if not was:
             (journal or health_event)("post_reset_fabric_owed", reset=what)
@@ -104,7 +120,8 @@ class FabricDebt:
             self.pass_monotonic = 0.0
         if ok is True and self.owed:
             health_event("post_reset_fabric_settled", reset=self.owed)
-            self.owed = ""
+            self.owed = self.tenant_job = ""
+            self.tenant_wall = 0.0
             for listener in list(self._settle_listeners):
                 try:
                     listener()

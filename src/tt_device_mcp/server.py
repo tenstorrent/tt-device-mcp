@@ -1982,6 +1982,23 @@ def job_exit_file(job_id: str) -> Path:
     return job_exit_dir() / f"{job_id}.exit"
 
 
+# Spec 04 I32: where a job that proved the fabric itself after its last reset says so; the env var carries the path.
+FABRIC_OK_ENV = "TT_DEVICE_MCP_FABRIC_OK"
+# Seconds a marker's checked_at may lie outside the job's start..end window (clock rounding between the two writers).
+FABRIC_OK_WINDOW_SLACK_SEC = 5.0
+
+
+def job_fabric_ok_file(job_id: str) -> Path:
+    return job_exit_dir() / f"{job_id}.fabric-ok"
+
+
+def clear_job_fabric_ok_file(job_id: str) -> None:
+    try:
+        job_fabric_ok_file(job_id).unlink()
+    except OSError:
+        pass
+
+
 def _exit_trap_preamble(exit_file: str) -> str:
     """Shell preamble that makes a job record its OWN exit status, honestly.
 
@@ -3977,7 +3994,7 @@ def _note_tenant_reset(chips: list, job: str = "") -> None:
     if not job:
         return
     health_event_detached("tenant_reset_detected", chips=chips, job=job)
-    FABRIC_DEBT.note_reset(f"tenant job {job}", health_event_detached)
+    FABRIC_DEBT.note_reset(f"tenant job {job}", health_event_detached, tenant_job=job)
 
 
 def _post_reset_settle_left(expected: int, recovery) -> float:
@@ -4059,6 +4076,59 @@ async def _check_tenant_reset_at_job_end(job_id: str) -> None:
     back = s.tenant_reset_at_job_end(beats)
     if back:
         _note_tenant_reset(back, job=job_id)
+
+
+def _fabric_ok_rejection(job: Job) -> str:
+    """Why the job's fabric-ok marker may not settle its tenant reset (spec 04 I32), or "" when it may: the job
+    exited 0, the open debt is its own tenant reset alone, and its marker is the job's own plain file that parses, with
+    a passing check after both its last reset and the last tenant reset the broker noted, inside the job's run,
+    covering every chip."""
+    if job.status != JobStatus.COMPLETED or job.exit_code != 0:
+        return "the job did not exit 0"
+    if FABRIC_DEBT.tenant_job != job.id:
+        return "a broker reset, or another job's, is owed too"
+    try:
+        fd = os.open(job_fabric_ok_file(job.id), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return "no marker"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid not in (os.geteuid(), job.peer_uid):
+            return "the marker is not the job's own plain file"
+        marker = json.loads(os.read(fd, 4096))
+        reset_at, checked_at, chips = float(marker["reset_at"]), float(marker["checked_at"]), int(marker["chips"])
+    except (OSError, ValueError, KeyError, TypeError, OverflowError):
+        return "the marker does not parse"
+    finally:
+        os.close(fd)
+    try:
+        start, end = (datetime.fromisoformat(t).timestamp() for t in (job.started_at, job.finished_at))
+    except (TypeError, ValueError):
+        return "the job's run window is unknown"
+    if checked_at <= reset_at:
+        return "checked_at is not after reset_at"
+    if checked_at <= FABRIC_DEBT.tenant_wall:
+        return "checked_at is not after the last tenant reset the broker saw"
+    slack = FABRIC_OK_WINDOW_SLACK_SEC
+    if not start - slack <= checked_at <= end + slack:
+        return "checked_at is outside the job's run"
+    expected = health_monitor.expected(len(_present_chip_indices())) if health_monitor is not None else 0
+    if chips != expected:
+        return f"the marker covers {chips} chips, the box has {expected}"
+    return ""
+
+
+def _trust_fabric_ok(job: Job) -> str:
+    """The job's id when its fabric-ok marker may settle the check its tenant reset owes (spec 04 I32), else "". One
+    health event says which, with the reason when rejected. Nothing is judged while no debt is owed."""
+    if not FABRIC_DEBT.owed:
+        return ""
+    why = _fabric_ok_rejection(job)
+    if why:
+        health_event_detached("tenant_fabric_ok_rejected", job=job.id, why=why)
+        return ""
+    health_event_detached("tenant_fabric_ok_trusted", job=job.id)
+    return job.id
 
 
 # Spec 03 I78: how old the passing fabric verdict a hold lifts on may be. The full check ends with the
@@ -7528,6 +7598,7 @@ async def device_health_gate(
     with_recover: bool = True,
     clean_exit_code: Optional[int] = None,
     job_exit0: bool = False,
+    fabric_ok_job: str = "",
 ) -> None:
     """Unified health gate run while the device is IDLE around a job.
 
@@ -7551,7 +7622,8 @@ async def device_health_gate(
     (spec 03 I36).
 
     ``job_exit0`` says the job behind a post-job pass ended with exit 0; only then may its fabric check run light
-    (spec 03 I115)."""
+    (spec 03 I115). ``fabric_ok_job`` is the job whose trusted fabric-ok marker settles its own tenant reset's
+    check choice: that debt alone then runs the check light (spec 04 I32)."""
     global _dispatch_reset_spent
     # Fabric output from before this pass is another pass's transcript: an incident bundle names
     # it stale instead of presenting it as this pass's (spec 03 I57).
@@ -7764,14 +7836,13 @@ async def device_health_gate(
         # function that costs real time, and a read-only pass has no rung to spend it on.
         # A reset with no passing fabric pass since (04 I32) runs the pass here too, so the gate
         # settles it in place; a job boundary that followed no reset adds no time.
-        full = deferral is not None or (
+        owed_full = with_recover and not kill_reset and not prejob and bool(_post_reset_debt())
+        other_full = deferral is not None or (
             with_recover
             and not kill_reset
-            and (
-                held_unproven
-                or ((not prejob) and (dirty or force_fabric or (run_fabric and stale) or bool(_post_reset_debt())))
-            )
+            and (held_unproven or ((not prejob) and (dirty or force_fabric or (run_fabric and stale))))
         )
+        full = other_full or owed_full
         # A clean post-job exit still gets the passive eth read when the rung is armed (I30): chips that all tick say
         # nothing about a wedged eth core, and the next tenant is the one who finds it. The read costs ~1s and pushes no
         # traffic. A frozen verdict holds below; a read that reaches no verdict runs the full pass inside this same
@@ -7807,7 +7878,8 @@ async def device_health_gate(
         fabric_light = (
             job_exit0
             and fsm.state is ServerState.HEALTHY
-            and not full
+            and not other_full
+            and (not owed_full or (bool(fabric_ok_job) and FABRIC_DEBT.tenant_job == fabric_ok_job))
             and not device_fault_reported
             and health_monitor.last_fabric_ok is not False
         )
@@ -12505,6 +12577,7 @@ async def _verify_device_after_job(
     job_failed: bool = False,
     clean_exit_code: Optional[int] = None,
     job_exit0: bool = False,
+    fabric_ok_job: str = "",
 ) -> None:
     """Post-job gate — runs at the END of every run (the finished job's caller has already been released, so this never
     delays their terminal/result): the enum/ARC snapshot always runs, so a chip that left the bus is flagged here — as
@@ -12529,6 +12602,7 @@ async def _verify_device_after_job(
             force_fabric=job_failed,
             clean_exit_code=clean_exit_code,
             job_exit0=job_exit0,
+            fabric_ok_job=fabric_ok_job,
         )
     except Exception as e:  # noqa: BLE001 - must never crash the runner
         # The gate threw before it could clear the device, so its state is unknown. Leaving it
@@ -14210,10 +14284,12 @@ async def _job_runner_loop():
             # Under privsep the job runs as its submitter, else as this broker's own uid.
             privsep_prefix = privsep_prefix_for(job.peer_uid, unit=job_scope_unit(job_id))
             await asyncio.to_thread(prepare_job_exit_file, job_id, job.peer_uid if privsep_prefix else os.geteuid())
+            await asyncio.to_thread(clear_job_fabric_ok_file, job_id)
             full_command = f"""
 {_exit_trap_preamble(str(exit_file))}set -e
 {activation_script}
 export {JOB_TAG_ENV}={job_tag}
+export {FABRIC_OK_ENV}={shlex.quote(str(job_fabric_ok_file(job_id)))}
 {job.command}
 """
 
@@ -14988,12 +15064,14 @@ export {JOB_TAG_ENV}={job_tag}
                                 _clean_software_exit_code(job) if job_failed and not runner_error else None
                             ),
                             job_exit0=job.status == JobStatus.COMPLETED and job.exit_code == 0,
+                            fabric_ok_job=_trust_fabric_ok(job),
                         )
                 except Exception as e:  # noqa: BLE001 - never crash the runner
                     if logger:
                         logger.error(f"JOB_RUNNER post-job health gate error for job_id={job_id}: {e}")
                 finally:
                     post_job_gate_pending = False
+                    clear_job_fabric_ok_file(job_id)
 
                 # A job that did not finish cleanly may not have closed the device, which leaves
                 # its chips at the busy clock. Record it so the timeline shows it, blamed on the job

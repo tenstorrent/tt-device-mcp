@@ -2029,7 +2029,9 @@ cooldown (spec 04 I65) holds longer.
   with exit 0 — a failed, killed, timed-out, reaped or preempted job keeps the traffic pass, even when
   its clean software exit drops the forced pass (I36) — and only while the check cannot decide
   a hold lift: a HEALTHY device (no hold, dirty or clean), no kill-reset debt, no deferred kill reset, no
-  runtime-reported device fault, and the last fabric verdict not UNHEALTHY. Any check that can
+  runtime-reported device fault, and the last fabric verdict not UNHEALTHY. A reset the job ran itself
+  owes the full pass (spec 04 I32) unless the job's trusted fabric-ok marker vouches for it: then the
+  light open runs and settles that debt, and a broker reset in the debt keeps the full pass. Any check that can
   release or refuse a hold — a dirty or failed-job gate, the dirty-idle gate, startup, the
   recovery ladder, hold-deadline and post-reset checks, an operator reset — keeps the traffic pass
   unchanged. An operator's `TT_DEVICE_MCP_FABRIC_CHECK_CMD` wrapper gets
