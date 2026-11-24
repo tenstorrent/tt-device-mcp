@@ -7798,6 +7798,21 @@ async def device_health_gate(
         # or a step only. Read-only telemetry: the verdict below never reads them.
         pcie_on = phase in ("post-job", "post-step")
         pcie_before = await _pcie_snapshot() if pcie_on else {}
+        # Spec 03 I115: the post-job gate's fabric check runs light — the all-link traffic
+        # pass is skipped, the validator still opens the fabric and counts every inter-chip
+        # link against the cabling — but only while the pass cannot decide a hold lift: a
+        # dirty device, a failed job, a kill-reset debt or a deferred kill reset all release
+        # (or refuse to release) a hold on this check's verdict, and those keep the traffic pass.
+        fabric_light = (
+            phase == "post-job"
+            and not full
+            and not kill_reset
+            and not deferral
+            and not dirty
+            and not device_fault_reported
+            and with_recover
+            and health_monitor.last_fabric_ok is not False
+        )
         healthy, evidence = await fsm.observe(
             expected,
             _log,
@@ -7805,6 +7820,7 @@ async def device_health_gate(
             run_eth=run_eth,
             fabric_stale=stale or skip_forced,
             eth_timeout_reset=eth_timeout_reset,
+            fabric_light=fabric_light,
             phase=phase,
             recovery=recovery,
         )

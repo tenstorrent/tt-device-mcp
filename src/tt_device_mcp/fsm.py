@@ -360,6 +360,7 @@ class ServerFsm:
         run_eth: bool = False,
         fabric_stale: bool = True,
         eth_timeout_reset: bool = False,
+        fabric_light: bool = False,
         recovery: "Optional[Recovery]" = None,
     ) -> tuple[bool, dict]:
         """Trigger one probe pass of the system — the root's read of the mesh, routed through the
@@ -381,7 +382,9 @@ class ServerFsm:
                 expected, log, run_fabric=run_fabric, phase=phase, run_eth=True, fabric_stale=fabric_stale, **extra
             )
         else:
-            healthy, evidence = await r._verify_device(expected, log, run_fabric=run_fabric, phase=phase)
+            healthy, evidence = await r._verify_device(
+                expected, log, run_fabric=run_fabric, phase=phase, **({"fabric_light": True} if fabric_light else {})
+            )
         FABRIC_DEBT.note_evidence(evidence)
         return healthy, evidence
 

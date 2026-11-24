@@ -415,6 +415,7 @@ class HealthMonitor:
         run_eth: bool = False,
         fabric_stale: bool = True,
         eth_timeout_reset: bool = False,
+        fabric_light: bool = False,
         indices: Optional[list] = None,
         expected: Optional[int] = None,
         log: Optional[Callable[[str], None]] = None,
@@ -436,6 +437,12 @@ class HealthMonitor:
         I61). A ``run_eth`` read that then TIMED OUT with no verdict, on a pass whose host-pci read is OK and whose
         snapshot found every chip with a healthy ARC, skips the fabric pass: the gate resets next, and the full check
         after the reset runs the pass. Any guard that fails keeps the pass.
+
+        ``fabric_light`` drops the all-link Ethernet traffic pass from the fabric check this pass runs:
+        the validator still opens the fabric and counts every inter-chip link against the cabling
+        descriptor (or the eth link baseline when there is no descriptor), so fewer links than
+        expected still fails. Only the gate's post-job phase on a healthy device sets it (spec 03
+        I115); every caller that can release a hold runs the traffic pass.
 
         Mirrors ``Recovery._verify_device``'s gentlest-first short-circuiting (a frozen heartbeat or a failed snapshot
         skips every heavier, more perturbing check below it — the traffic pass is only safe to run once nothing is known
@@ -470,6 +477,7 @@ class HealthMonitor:
                 run_eth=run_eth,
                 fabric_stale=fabric_stale,
                 eth_timeout_reset=eth_timeout_reset,
+                fabric_light=fabric_light,
                 indices=indices,
                 expected=expected,
                 log=log,
@@ -494,6 +502,7 @@ class HealthMonitor:
         run_eth: bool,
         fabric_stale: bool,
         eth_timeout_reset: bool,
+        fabric_light: bool,
         indices: Optional[list],
         expected: Optional[int],
         log: Optional[Callable[[str], None]],
@@ -620,8 +629,13 @@ class HealthMonitor:
                     log(f"fabric: UNHEALTHY — {fdetail}")
                 _record("fabric", fok, fdetail)
             elif eok is not False and (fabric_asked or eok is None) and not link_drop_held and not reset_due:
-                self._deps.set_device_op_detail("health check: fabric traffic pass across all links (~45s)")
-                fok, fdetail = await self.verify_fabric_health()
+                light = fabric_asked and run_light
+                self._deps.set_device_op_detail(
+                    "health check: fabric traffic pass across all links (~45s)"
+                    if not light
+                    else "health check: light fabric open (links counted against the cabling)"
+                )
+                fok, fdetail = await self.verify_fabric_health(light=light)
                 if log:
                     log(f"fabric: {'SKIPPED' if fok is None else ('OK' if fok else 'UNHEALTHY')} — {fdetail}")
                 _record("fabric", fok, fdetail)

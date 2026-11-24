@@ -503,6 +503,7 @@ class Recovery(ABC):
         run_eth: bool = False,
         fabric_stale: bool = True,
         eth_timeout_reset: bool = False,
+        fabric_light: bool = False,
     ) -> tuple[bool, dict]:
         """Is the mesh usable? A thin adapter over :meth:`HealthMonitor.update` — the ONE probe
         pass implementation (see monitor.py); this method exists only as the seam
@@ -524,6 +525,7 @@ class Recovery(ABC):
             run_eth=run_eth,
             fabric_stale=fabric_stale,
             eth_timeout_reset=eth_timeout_reset,
+            fabric_light=fabric_light,
             expected=expected,
             log=log,
         )
