@@ -1004,7 +1004,8 @@ def test_refuted_cycles_count_toward_the_backstop(booted, monkeypatch):
         at += 1500
     allowed, why = mech.auto_recovery_allowed("power-cycle", tenant_active=False, now_epoch=at)
     assert not allowed and "backstop" in why
-    assert mech.power_cycle_cooldown_state["until"] == first_at + recovery_base.POWER_CYCLE_BACKSTOP_WINDOW_SEC
+    assert mech.power_cycle_cooldown_state["until"] == at - 1500 + recovery_base.POWER_CYCLE_MIN_INTERVAL_SEC
+    assert first_at + recovery_base.POWER_CYCLE_BACKSTOP_WINDOW_SEC > mech.power_cycle_cooldown_state["until"]
 
 
 # IPMI 2.0 table 28-11, every code of the low nibble: (name, whether the power went off and on).

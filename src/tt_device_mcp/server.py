@@ -5723,12 +5723,11 @@ async def _attempt_idle_relift() -> None:
                 # cannot see it (off_bus==0) and the frozen-eth branch below is unreachable (that
                 # needs enum+ARC HEALTHY), so read-only this held forever (box D, 37h). It is the one
                 # present-mesh fault a galaxy reset both cures and cannot invert — every chip is
-                # present — so route a confirmed mass wedge (frozen chips >= the same mass-drop floor
-                # the gate keys on) to the present-mesh reset the eth strand runs. A sub-floor frozen
-                # count is a single self-healing chip and still holds, exactly as the gate does.
+                # present — so route it to the present-mesh reset the eth strand runs. Spec 04 I116: any
+                # frozen chip takes it, a count below the mass-drop floor too, at the present-mesh grace
+                # (the escalator's own age gate, once per hold): a hung chip does not self-clear.
                 floor = _galaxy_reset_min_dead_chips(expected)
-                mass_wedge = floor is None or _frozen_chip_count(evidence) >= floor
-                if selfheal and mass_wedge and await _escalate("present"):
+                if selfheal and (floor is None or _frozen_chip_count(evidence) >= 1) and await _escalate("present"):
                     return
                 _log(
                     "still degraded — holding; the wedge clears on its own or the next gate resets, never a reset here"

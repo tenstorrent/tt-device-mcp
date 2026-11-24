@@ -176,8 +176,9 @@ each rung fires only when the gentler one failed or cannot apply.
   power cycle is refused, journalled `power_cycle_backstop` (`host_at_risk`, `allowed_at_epoch`)
   once per cap reached, so a flapping tray reaches its owners
   instead of cycling a serving host forever. The refusal is bounded like every I65 denial: it holds
-  until the oldest counted cycle leaves the window (at most 2 h), names that time, shows on `/health`
-  as `power_cycle_cooldown` with cause `power-cycle backstop`, and is asked again then. A NaN,
+  until the oldest counted cycle leaves the window or `POWER_CYCLE_MIN_INTERVAL_SEC` (I65) after the
+  newest cycle, whichever is sooner (I117), names that time, shows on `/health` as
+  `power_cycle_cooldown` with cause `power-cycle backstop`, and is asked again then. A NaN,
   infinite or future stamp counts as nothing, so no corrupt record holds the cycle for good.
   A host death is never a cycle: only the broker's own requested escalations write the ledger, so a
   boot the broker did not request neither gates a rung nor spends the per-boot cap, and it proves
@@ -1034,7 +1035,7 @@ each rung fires only when the gentler one failed or cannot apply.
   cooldown. Class A or C after a
   cycle a later boot verified, at
   once (0 s), for at most `POWER_CYCLE_BACKSTOP_MAX` cycles in 2 h; past that, when the oldest leaves
-  the window (at most 2 h).
+  the window or one interval after the newest cycle, whichever is sooner (I117).
   For one hold episode the power-cycle deadline set at the first cooldown denial never moves later (beyond the stated post-boot settle).
   The first denial writes that deadline (`power_cycle_deadline.json` in the health dir: `until`,
   `set_at`, the anchor, its cause and the interval), so it outlives a broker restart and a host boot;
@@ -2835,7 +2836,8 @@ each rung fires only when the gentler one failed or cannot apply.
   proven: the bridge rung needs a chip off the bus and gives no POST_RESET (I94), and the I104
   present-chip re-init is measured only after a tray re-power, never on this class. A chip off the
   bus beside ARC-not-ready ones keeps the off-bus routing (bridge rung, floor, I37/I73). A frozen
-  ARC (a heartbeat that stalls between two reads) is not this class and keeps the floor. A fabric or
+  ARC (a heartbeat that stalls between two reads) is not this class: it keeps the floor at the gate and
+  takes the idle relift's present-mesh reset at the grace instead (I116). A fabric or
   eth wedge with every ARC ticking keeps today's path: the frozen-eth hold (`WAIT`), or the
   below-floor hold for the I76 ladder. The guards before the rule are unchanged: the frozen-eth hold,
   the cooling hold, a live reset scope (`DEFER`) and the bridge rung come first; the tenant guard (I7,
@@ -3164,6 +3166,28 @@ each rung fires only when the gentler one failed or cannot apply.
   full check with fabric over every cabled link that has just passed does (I32); a 77, a check
   with no fabric verdict, or fewer links than the cabling expects keeps the hold. Cost: one mesh
   reset and its check (about 90 s) at 2 min instead of 10 min on this hold class.
+
+- **I116 — A hung chip below the floor takes the present-mesh reset at the grace, not at the ceiling.**
+  Seen on a 32-chip Galaxy: one chip hung (its ARC heartbeat frozen across two samples) with every chip
+  on the bus, below the mass floor (I8). The gate holds that, as it must, and the idle relift's
+  not-healthy branch held it read-only ("never a reset here") until the 10-min ceiling window reset it,
+  12.4 min against a 6 min budget. A frozen chip does not self-clear, and with nothing off the bus a
+  mesh reset has no mesh to invert (I105). So the idle relift now escalates one or more frozen chips,
+  whatever the floor, to the present-mesh reset: `_escalate("present")`, whose own gate admits it at
+  `_present_mesh_reset_grace_sec()` (120 s by default) of hold age, with `off_bus` 0, no tenant and the
+  retry spacing. It is once per hold (I87): a failed reset climbs to the sweep and the power cycle, and the
+  mesh reset repeats only in the 10-min bound's ladder (I89, I76). The hold lifts only on the full check with fabric that follows the reset
+  (I32); a failed one keeps the hold and the bounded recovery of I76 goes on. A chip off the bus
+  keeps the off-bus routing, and a chip count at or above the floor takes the same path as before.
+- **I117 — The power-cycle backstop never waits past one cooldown interval after the last cycle.** The
+  I9 backstop used to hold a third or later cycle until the oldest counted cycle left the 2 h window:
+  measured 740 s on a tray that had already cycled twice, each cycle verified healthy. The cooldown
+  after a power cycle (I65, `POWER_CYCLE_MIN_INTERVAL_SEC`) is the spacing a flapping tray gets, so the
+  backstop's end is the sooner of the oldest cycle leaving the window and `POWER_CYCLE_MIN_INTERVAL_SEC`
+  after the newest cycle. Still journalled once per cap reached (`power_cycle_backstop`), still paged,
+  still stated as "holding the cycle until <time>" with that end, shown on `/health` and asked again at
+  it (I10). Cycles in a storm are spaced one interval apart; the full ladder still runs before each (I76)
+  and nothing releases but a passing full check with fabric (I32).
 
 ## Interfaces
 
@@ -3526,6 +3550,7 @@ sees a silent fabric pass.
 | I8 galaxy floor holds below / resets at floor; keys on frozen chips too | `tests/test_device_safety.py::test_galaxy_reset_floor_holds_a_single_chip_wedge`, `tests/test_device_safety.py::test_galaxy_reset_floor_holds_just_below_the_floor`, `tests/test_device_safety.py::test_galaxy_reset_floor_still_resets_a_mass_drop`, `tests/test_device_safety.py::test_cascade_router_keys_the_galaxy_floor_on_frozen_chips_too`, `tests/test_device_safety.py::test_a_reset_frac_above_one_fails_safe_to_the_default_floor_not_disabled` |
 | I9 ledger durable-before-fire, abort on unwritable, fail-closed read, retract | `tests/test_device_safety.py::test_auto_power_cycle_records_durably_before_it_fires`, `tests/test_device_safety.py::test_auto_power_cycle_aborts_when_the_ledger_cannot_be_written`, `tests/test_device_safety.py::test_governor_fails_closed_when_the_ledger_is_unreadable`, `tests/test_device_safety.py::test_record_auto_recovery_round_trips_through_the_durable_ledger`, `tests/test_device_safety.py::test_ledger_skips_a_corrupt_line_without_losing_the_rest`, `tests/test_device_safety.py::test_a_power_cycle_that_fails_to_launch_retracts_its_ledger_entry` |
 | I9 a power cycle a later boot verified healthy does not gate the next; an unverified one still does; the backstop refuses and journals once at the cap, for a stated time asked again at its end; a NaN, infinite or future stamp never feeds it; a host boot this boot verified does not gate | `tests/test_power_cycle_verified_interval.py::test_a_verified_cycle_does_not_gate_a_new_drop`, `::test_an_unverified_cycle_inside_the_interval_is_still_refused`, `::test_a_stamp_that_cannot_prove_a_later_boot_keeps_the_guard`, `::test_the_backstop_is_a_stated_bounded_wait_retried_at_its_end`, `::test_a_corrupt_cycle_stamp_never_feeds_the_backstop`, `::test_a_host_boot_this_boot_verified_does_not_gate_a_new_drop`, `::test_the_gate_stamps_only_a_release_whose_fabric_passed`, `::test_a_relift_stamps_only_on_a_passing_fabric_check` |
+| I117 the backstop's wait ends one cooldown interval after the newest cycle, never later, with the page, the journal and "holding the cycle until <time>" kept; storm cycles are spaced one interval apart | `tests/test_power_cycle_verified_interval.py::test_the_backstop_never_waits_past_the_cooldown_after_the_last_cycle`, `tests/test_power_cycle_verified_interval.py::test_a_storm_of_cycles_is_spaced_one_interval_apart_not_a_window`, `tests/test_power_cycle_verified_interval.py::test_the_backstop_is_a_stated_bounded_wait_retried_at_its_end`, `tests/test_power_cycle_os_first.py::test_refuted_cycles_count_toward_the_backstop` |
 | I9 G8 replay: a new episode after a verified cycle takes one power cycle at once; a host death is never a cycle; the cycle it takes still gates until verified | `tests/test_power_cycle_new_episode_g8.py::test_g8_a_cycle_a_later_boot_verified_does_not_hold_off_the_next_episodes_cycle`, `::test_g8_a_host_death_is_never_counted_as_a_cycle`, `::test_g8_the_loop_bound_stands_for_an_unverified_cycle`, `::test_g8_the_ladder_takes_the_power_cycle_instead_of_holding_for_the_interval` |
 | I10 the power cycle is the only automatic action; a reboot row or a recent cycle spaces it | `tests/test_ladder_v2.py::test_only_the_power_cycle_is_an_automatic_action`, `tests/test_device_safety.py::test_power_cycle_after_a_recent_reboot_waits_out_the_cooldown`, `tests/test_device_safety.py::test_power_cycle_does_not_escalate_past_a_recent_power_cycle` |
 | I10 a power cycle refused by its cooldown (or also by the per-boot cap) is retried as that wait ends, once per refusal, and releases only after a passing fabric check | `tests/test_power_cycle_interval_retry.py::test_a_cycle_refused_by_its_interval_is_due_again_at_expiry`, `::test_the_interval_is_still_enforced`, `::test_no_retry_for_a_reboot_or_outside_the_refused_episode`, `::test_a_cycle_the_per_boot_cap_also_refuses_is_still_asked_again_at_its_end`, `::test_the_watchdog_forces_one_pass_at_expiry_not_at_the_next_window`, `::test_the_retried_pass_releases_only_after_a_passing_fabric_check` |
@@ -3906,4 +3931,6 @@ sees a silent fabric pass.
 | I115 a refused `sudo -n` names the one sudoers rule, keeps the hold, climbs the ladder and never reboots; the probe reads the rule with `sudo -n -l ipmitool` and root is never asked | `tests/test_ipmi_guard.py::test_a_refused_sudo_names_the_one_rule_it_needs`, `tests/test_ipmi_guard.py::test_a_bmc_error_is_not_read_as_a_sudo_refusal`, `tests/test_ipmi_guard.py::test_a_non_root_server_without_the_sudo_rule_keeps_the_hold_and_climbs`, `tests/test_power_cycle_os_first.py::test_a_non_root_server_never_starts_the_os_first_cycle`, `tests/test_privileges.py::test_a_non_root_server_with_the_sudo_rule_keeps_the_host_rung_off`, `tests/test_privileges.py::test_a_non_root_server_without_the_sudo_rule_cannot_reach_the_bmc`, `tests/test_privileges.py::test_root_is_never_asked_for_sudo` |
 | I111 an isolation-killed hold with every chip on the bus runs the forced ladder on the first tick past the present-mesh grace, not at the ceiling; once per episode; /health reports it; the ceiling window still runs | `tests/test_isolation_kill_grace.py::test_an_isolation_killed_hold_runs_the_forced_ladder_at_the_present_mesh_grace`, `::test_an_isolated_chip_leaves_the_hold_to_the_off_bus_one_shot`, `::test_a_dirty_hold_the_isolation_did_not_kill_keeps_its_own_clock` |
 | I111 the grace run releases only on a just-passed full check with fabric; a 77 or no fabric verdict keeps the hold | `tests/test_isolation_kill_grace.py::test_the_grace_run_releases_only_on_a_just_passed_fabric_check` |
+| I116 a hung chip below the floor with every chip on the bus takes the present-mesh reset at the grace and not before; a mass wedge takes it as before | `tests/test_device_safety.py::test_idle_relift_resets_a_hung_chip_below_the_floor_at_the_present_mesh_grace`, `tests/test_device_safety.py::test_idle_relift_escalates_an_all_arc_frozen_present_mesh` |
+| I116 the reset runs once per hold, and a failed full check keeps the hold and releases nothing | `tests/test_device_safety.py::test_idle_relift_resets_a_hung_chip_once_per_hold_and_a_failed_check_keeps_the_hold` |
 | I102 with I103: the late-chip second mesh reset runs in the pre-cycle sweep, so its pre-reset scan clears a holder outside every broker scope and runs (at the 10-min bound, on the I97 path, and in the sweep outside the bound); its wait still ends at the step's start plus `LATE_CHIP_STEP_SEC`; a failed full check keeps the hold and the cycle journals the holder; a holder in a broker job's scope or the running job's own process still refuses it, nothing lifts and the hold goes on to the cycle | `tests/test_late_chips_after_driver_wait.py::test_the_late_chip_second_reset_clears_a_foreign_holder_and_keeps_its_bound`, `::test_a_job_holder_still_refuses_the_late_chip_second_reset_and_the_hold_goes_on_to_the_cycle` |

@@ -10614,24 +10614,47 @@ async def test_idle_relift_escalates_an_all_arc_frozen_present_mesh(monkeypatch,
     assert counters["resets"] == 1, "the relift must escalate an all-ARC-frozen present mesh to a reset"
 
 
+def _hung_chip_verify(monkeypatch, stalled):
+    async def verify(expected, log, run_fabric=True, **_):
+        return False, {
+            "heartbeat": {"verdict": "unhealthy", "detail": f"{len(stalled)} ARC frozen", "stalled": stalled}
+        }
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+
+
 @pytest.mark.asyncio
-async def test_idle_relift_holds_a_below_floor_arc_frozen_present_mesh(monkeypatch, tmp_path, clear_job_state):
-    """The relift boundary mirroring the gate's: a FEW frozen chips (below the mass floor) self-heal,
-    so the relift must still HOLD read-only — a galaxy reset for them is the drop the floor guards
-    against. Locks the mass-vs-sub-mass split on the idle path."""
+@pytest.mark.parametrize("held_minutes_ago, resets", [(1, 0), (3, 1)])
+async def test_idle_relift_resets_a_hung_chip_below_the_floor_at_the_present_mesh_grace(
+    monkeypatch, tmp_path, clear_job_state, held_minutes_ago, resets
+):
+    """Spec 04 I116: one frozen chip with every chip on the bus is below the mass floor, yet it does not self-clear.
+    The relift takes the present-mesh reset at the grace (120 s), not at the 10-min ceiling, and not before it."""
     _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
-    counters = _arm_stuck_hold(monkeypatch)
-    stalled = ["3", "8", "17"]
-
-    async def few_arc_frozen(expected, log, run_fabric=True, **_):
-        return False, {"heartbeat": {"verdict": "unhealthy", "detail": "3 ARC frozen", "stalled": stalled}}
-
-    patch_recovery(monkeypatch, "_verify_device", few_arc_frozen)
+    counters = _arm_stuck_hold(monkeypatch, held_minutes_ago=held_minutes_ago)
+    _hung_chip_verify(monkeypatch, ["11"])
 
     await srv._attempt_idle_relift()
 
-    assert counters["resets"] == 0, "a below-floor frozen count self-heals — the relift must hold, not reset"
-    assert srv.fsm.state is not ServerState.HEALTHY, "the hold must stand"
+    assert counters["resets"] == resets
+
+
+@pytest.mark.asyncio
+async def test_idle_relift_resets_a_hung_chip_once_per_hold_and_a_failed_check_keeps_the_hold(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 04 I116 with I87/I32: the reset runs once per hold, and its failed full check releases nothing: the hold
+    stands, the fault and the dirty latch stay, and the next tick climbs rather than repeating the mesh reset."""
+    _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
+    counters = _arm_stuck_hold(monkeypatch, held_minutes_ago=3, reset_result=False)
+    _hung_chip_verify(monkeypatch, ["11"])
+
+    await srv._attempt_idle_relift()
+    await srv._attempt_idle_relift()
+
+    assert counters["resets"] == 1, "one mesh reset per hold episode"
+    assert counters["fault_cleared"] == 0 and counters["dirty_cleared"] == 0
+    assert srv.fsm.state is not ServerState.HEALTHY, "the failed check keeps the hold"
 
 
 # --- A2 (off-bus): the escalation must reach an OFF-BUS hold that never self-returns ------------

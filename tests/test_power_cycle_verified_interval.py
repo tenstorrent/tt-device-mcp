@@ -95,13 +95,50 @@ def test_the_backstop_is_a_stated_bounded_wait_retried_at_its_end(ledger, tmp_pa
     monkeypatch.setattr(srv, "device_hold_episode_since", "2026-10-15T09:00:00")
     rm = srv.recovery_mechanism
     allowed, why = _allowed(at=CYCLED_AT + 3000)
-    until = CYCLED_AT + recovery_base.POWER_CYCLE_BACKSTOP_WINDOW_SEC
+    until = CYCLED_AT + 2000 + INTERVAL  # one interval after the newest cycle: sooner than the window's end
     assert allowed is False and "backstop" in why
     assert rm.power_cycle_cooldown_state["until"] == until
     assert rm.power_cycle_cooldown_state["cause"] == "power-cycle backstop"
     assert not rm.power_cycle_retry_cooldown, "no cycle ran: the 10-min bound's ladder is not deferred (I76)"
     assert not rm.power_cycle_retry_due(until - 1)
     assert rm.power_cycle_retry_due(until)
+
+
+def test_the_backstop_never_waits_past_the_cooldown_after_the_last_cycle(ledger, tmp_path, monkeypatch):
+    # Spec 04 I117: the oldest of three cycles is still far inside the 2 h window, which used to hold the
+    # fourth for most of it. The wait ends one cooldown interval after the newest cycle, and the page and
+    # the "holding the cycle until <time>" wording stay.
+    _three_cycles_all_verified(ledger, tmp_path, monkeypatch)
+    events = []
+    monkeypatch.setattr(recovery_base, "health_event", lambda kind, **f: events.append((kind, f)))
+    monkeypatch.setattr(srv.recovery_mechanism, "_power_cycle_backstop_logged", 0.0)
+    last = CYCLED_AT + 2000
+    now = last + 600
+    allowed, why = _allowed(at=now)
+    assert allowed is False and f"holding the cycle until {recovery_base._local_time(last + INTERVAL)} " in why
+    assert f"(epoch {int(last + INTERVAL)})" in why
+    assert [(k, f["allowed_at_epoch"], f["host_at_risk"]) for k, f in events] == [
+        ("power_cycle_backstop", last + INTERVAL, True)
+    ]
+    assert _allowed(at=last + INTERVAL)[0] is True
+    assert last + INTERVAL < CYCLED_AT + recovery_base.POWER_CYCLE_BACKSTOP_WINDOW_SEC
+
+
+def test_a_storm_of_cycles_is_spaced_one_interval_apart_not_a_window(ledger, tmp_path, monkeypatch):
+    # Spec 04 I117: each further cycle in a flapping episode waits the cooldown after the last one, never
+    # longer, and a cycle whose oldest neighbours already left the window keeps the window's sooner end.
+    _three_cycles_all_verified(ledger, tmp_path, monkeypatch)
+    monkeypatch.setattr(recovery_base, "health_event", lambda kind, **f: None)
+    ledgers = [json.loads(ln) for ln in ledger.read_text().splitlines()]
+    t = CYCLED_AT + 2000
+    for _ in range(3):  # a fourth, fifth and sixth cycle, each at the end of the previous wait
+        t += INTERVAL
+        assert recovery_base._power_cycle_backstop_until(ledgers, t - 1) == t
+        ledgers.append({"action": "power-cycle", "boot_id": "boot-X", "at_epoch": t})
+    # The window's own end is the sooner bound once the newest cycle is far behind the oldest counted one.
+    old = [{"action": "power-cycle", "at_epoch": a} for a in (100.0, 7000.0, 7200.0)]
+    window_end = 100.0 + recovery_base.POWER_CYCLE_BACKSTOP_WINDOW_SEC
+    assert recovery_base._power_cycle_backstop_until(old, 7250.0) == min(window_end, 7200.0 + INTERVAL) == window_end
 
 
 @pytest.mark.parametrize("bad", ["nan", "inf", "future"])
