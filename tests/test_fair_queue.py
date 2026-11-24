@@ -179,7 +179,9 @@ def submit(monkeypatch, tmp_path):
     async def _go(command="true"):
         tok, mtok = srv.current_peer_uid.set(os.getuid()), srv.current_via_mcp.set(False)
         try:
-            res = await mcp.call_tool("tt_device_job_run_bg", {"params": {"workspace": str(tmp_path), "command": command}})
+            res = await mcp.call_tool(
+                "tt_device_job_run_bg", {"params": {"workspace": str(tmp_path), "command": command}}
+            )
         finally:
             srv.current_peer_uid.reset(tok)
             srv.current_via_mcp.reset(mtok)
@@ -204,9 +206,7 @@ async def test_a_submit_reports_the_position_status_lists(clear_job_state, fair,
 
 
 @pytest.mark.asyncio
-async def test_a_submit_the_runner_took_during_the_prune_reports_it_started(
-    clear_job_state, fair, submit, monkeypatch
-):
+async def test_a_submit_the_runner_took_during_the_prune_reports_it_started(clear_job_state, fair, submit, monkeypatch):
     """PR #271 review: the submit answers after an await (log pruning). A job the runner started in
     that window is not queued behind anyone, itself included."""
     running = _job("800", "carol")
