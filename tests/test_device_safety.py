@@ -16642,6 +16642,20 @@ async def test_a_clean_post_job_gate_runs_the_fabric_check_light(monkeypatch, tm
 
 
 @pytest.mark.asyncio
+async def test_a_post_job_gate_after_a_job_that_did_not_exit_0_keeps_the_traffic_pass(monkeypatch, tmp_path):
+    """Spec 03 I115: the same clean HEALTHY post-job gate runs the traffic pass when the job
+    behind it did not end with exit 0."""
+    calls = _light_gate_stubs(monkeypatch, tmp_path)
+
+    async def stuck_eth(timeout_sec=60.0):
+        return None, "the read reached no verdict"
+
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", stuck_eth)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False, force_fabric=False)
+    assert calls["light"] is False, "a post-job fabric check ran light after a job that did not exit 0"
+
+
+@pytest.mark.asyncio
 async def test_a_dirty_post_job_gate_keeps_the_traffic_pass(monkeypatch, tmp_path):
     """A dirty device's full check decides a hold lift (spec 03 I78), so its fabric check keeps
     the traffic pass: light is only for the check that cannot release anything."""
