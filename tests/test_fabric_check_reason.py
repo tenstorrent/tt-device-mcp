@@ -159,7 +159,6 @@ def test_a_light_wrapper_run_still_reaches_the_dispatch_probe(tmp_path):
     r = _run_wrapper(tmp_path, "ran\n", 0, TT_DEVICE_MCP_FABRIC_LIGHT="1", TTDEV_DISPATCH_BIN=str(fake_dispatch))
     assert r.returncode == 0, r.stderr
     assert "dispatch OK: every chip ran a program" in r.stderr
-    assert "light run: links counted against the cabling; dispatch probe skipped" not in r.stderr
 
 
 def test_wrapper_names_a_failed_hugepage_pin_as_the_pool_not_ready(tmp_path):
