@@ -629,7 +629,12 @@ class HealthMonitor:
                     log(f"fabric: UNHEALTHY — {fdetail}")
                 _record("fabric", fok, fdetail)
             elif eok is not False and (fabric_asked or eok is None) and not link_drop_held and not reset_due:
-                light = fabric_asked and run_light
+                # Spec 03 I115: the post-job check that cannot decide a hold lift runs light —
+                # the stuck-read fallback (or the gate's run_fabric ask) opens the fabric and
+                # counts every inter-chip link against the cabling without the traffic pass.
+                # Any pass the gate asked for WITH run_fabric/full (a dirty or failed-job gate)
+                # keeps the traffic: its verdict lifts or refuses a hold (I78).
+                light = fabric_light or (phase == "post-job" and not fabric_asked and eok is None)
                 self._deps.set_device_op_detail(
                     "health check: fabric traffic pass across all links (~45s)"
                     if not light

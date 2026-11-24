@@ -390,7 +390,10 @@ def build_command(descriptor: bool = True, traffic: bool = True) -> Optional[tup
     """The argv + env to run the fabric check with, or ``None`` when nothing is configured/available to run at all.
 
     ``TT_DEVICE_MCP_FABRIC_CHECK_CMD`` set names an operator's own wrapper, run through ``/bin/bash -c`` exactly as
-    before — unchanged semantics for anyone pointed at ``deploy/tt-device-fabric-check.sh`` or an equivalent.
+    before — unchanged semantics for anyone pointed at ``deploy/tt-device-fabric-check.sh`` or an equivalent. A light
+    run (``traffic=False``) exports ``TT_DEVICE_MCP_FABRIC_LIGHT=1`` in the wrapper's env so a wrapper that understands
+    it (the shipped ``deploy/tt-device-fabric-check.sh`` does) can drop its own traffic pass; the argv for an override
+    is always the traffic-pass one.
 
     Unset, this resolves the pinned validator under ``TTDEV_VALIDATOR_ROOT`` (default
     ``/opt/tt-device-broker/validator``) the same way that script did: the binary at
@@ -408,7 +411,11 @@ def build_command(descriptor: bool = True, traffic: bool = True) -> Optional[tup
 
     override = os.environ.get("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "").strip()
     if override:
-        return ["/bin/bash", "-c", override], {**os.environ, "PYTHONUNBUFFERED": "1"}
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        if not traffic:
+            # The shipped wrapper reads this to drop its own --send-traffic (spec 03 I115).
+            env["TT_DEVICE_MCP_FABRIC_LIGHT"] = "1"
+        return ["/bin/bash", "-c", override], env
 
     if validator_missing() is not None:
         return None

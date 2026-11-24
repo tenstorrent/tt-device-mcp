@@ -152,7 +152,8 @@ cooldown (spec 04 I65) holds longer.
   (spec 04 I13 — the operator's clock, not a submitter's), on a `run_fabric` caller only when
   no pass is fresher than `FABRIC_CHECK_MIN_INTERVAL_SEC` (default 1200s), and post-job on a
   clean exit only when that exit's eth read reached no verdict (I30; a link-count-drop skip only
-  when no passing pass is fresher than that interval).
+  when no passing pass is fresher than that interval). The post-job traffic pass itself runs light
+  when it cannot decide a hold lift (I115).
 - **I13 — The gate never resets over a tenant.** A foreign holder (uid ≥ `MIN_TENANT_UID`,
   1000, or below it in a broker job/exec scope or named in `TT_DEVICE_MCP_TENANT_UIDS`; 04 I6)
   skips the gate untouched: verification is deferred, an existing hold outlives the skip
@@ -2016,6 +2017,20 @@ cooldown (spec 04 I65) holds longer.
   decision taken there from a stale cache could read a dead chip or power-cycle a live one. A job's start window has
   no such owner. Nothing here lifts a hold: the full check with fabric (I78) still decides, and a fabric pass that
   finds fewer links than the cabling expects still fails.
+
+- **I115 — The post-job fabric check runs light; every hold-deciding check keeps the traffic pass.**
+  The post-job gate's fabric check drops the all-link Ethernet traffic pass and runs the validator
+  light: it opens the fabric and counts every inter-chip link against the cabling descriptor
+  (`TTDEV_FABRIC_DESCRIPTOR`) or, with no descriptor, against the eth link baseline
+  (`eth_link_baseline.json`); fewer links than expected still fails the check and the device stays
+  held with the existing bounded recovery. The gate's own probes still confirm every expected chip
+  is on PCIe with a live ARC heartbeat. The light shape applies only while the check cannot decide
+  a hold lift: a clean device (`not dirty`), no kill-reset debt, no deferred kill reset, no
+  runtime-reported device fault, and the last fabric verdict not UNHEALTHY. Any check that can
+  release or refuse a hold — a dirty or failed-job gate, the dirty-idle gate, startup, the
+  recovery ladder, hold-deadline and post-reset checks, an operator reset — keeps the traffic pass
+  unchanged. An operator's `TT_DEVICE_MCP_FABRIC_CHECK_CMD` wrapper is never asked for a light
+  run: its contract is the traffic pass, so it always receives the traffic-pass environment.
 
 ## Interfaces
 

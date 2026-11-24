@@ -40,6 +40,7 @@ from tt_device_mcp.health import recovery as recovery_pkg
 from tt_device_mcp.health.core import HealthState, Verdict
 from tt_device_mcp.health.evidence import health_event
 from tt_device_mcp.health.monitors import eth, heartbeat, pci
+from tt_device_mcp.health.monitors import fabric as fabric_mod
 from tt_device_mcp.health.monitors.heartbeat import heartbeat_verdict, read_heartbeats
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.recovery import (
@@ -16576,3 +16577,159 @@ async def test_fsm_json_readopted_jobs_empty_when_the_job_is_gone_or_a_fault_sho
     assert _fsm_file_readopted_jobs() == [], "a re-adopted job that disappeared holds nothing"
     assert srv._device_unavailable_for_tenant(), "the hold itself stands"
     srv._startup_verify_task.cancel()
+
+
+# ---- spec 03 I115: the post-job fabric check runs light ---------------------------------------------
+
+
+def _light_gate_stubs(monkeypatch, tmp_path, *, dirty_hold=False):
+    """A CLEAN post-job gate on a 32-chip mesh whose eth read reaches a verdict: the gate asks the
+    probe pass for the fabric check, so the pass runs the light open and its argv reaches
+    verify_fabric_health. Returns the call records."""
+    (tmp_path / "0").write_text("")
+    monkeypatch.setattr(srv, "TT_DEV_DIR", str(tmp_path))
+    monkeypatch.setenv("TT_DEVICE_MCP_EXPECTED_CHIPS", "32")
+    _no_holders(monkeypatch)
+    srv.device_op_lock = None
+    monkeypatch.setenv("TT_DEVICE_MCP_DEVICE_OP_LOCK", "/proc/nonexistent/nope")
+    monkeypatch.setattr(srv, "device_fault_reported", "")
+    monkeypatch.setattr(srv, "eth_check_armed", True)
+    monkeypatch.setattr(srv.health_monitor, "expected", lambda present: 32)
+    # The heavy probes the gate's pass stubs: everything must read healthy so the pass reaches
+    # the fabric branch.
+    monkeypatch.setattr(srv, "heartbeat_supported", lambda *a: False)
+    async def _snapshot(expected):
+        return True, f"{expected} chip(s)"
+
+    monkeypatch.setattr(srv.health_monitor, "_verify_device", _snapshot)
+    if dirty_hold:
+        fsm_dirty(srv, "a job reset the mesh")
+    else:
+        fsm_healthy(srv)
+    calls = {"light": None, "eth": 0}
+
+    async def eth_read(timeout_sec=60.0):
+        calls["eth"] += 1
+        return True, "all active-eth cores advancing"
+
+    async def fabric(timeout_sec=60.0, *, light=False):
+        calls["light"] = light
+        return True, "links healthy"
+
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", eth_read)
+    monkeypatch.setattr(srv.health_monitor, "verify_fabric_health", fabric)
+    return calls
+
+
+
+@pytest.mark.asyncio
+async def test_a_clean_post_job_gate_runs_the_fabric_check_light(monkeypatch, tmp_path):
+    """Spec 03 I115: the post-job gate's fabric check drops the all-link traffic pass and runs
+    the light open — the validator still opens the fabric and counts every inter-chip link against
+    the cabling — whenever the check cannot decide a hold lift."""
+    calls = _light_gate_stubs(monkeypatch, tmp_path)
+
+    async def stuck_eth(timeout_sec=60.0):
+        calls["eth"] += 1
+        return None, "the read reached no verdict"
+
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", stuck_eth)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False, force_fabric=False)
+    assert calls["eth"] == 1
+    assert calls["light"] is True, "the post-job fabric check did not run light"
+
+
+@pytest.mark.asyncio
+async def test_a_dirty_post_job_gate_keeps_the_traffic_pass(monkeypatch, tmp_path):
+    """A dirty device's full check decides a hold lift (spec 03 I78), so its fabric check keeps
+    the traffic pass: light is only for the check that cannot release anything."""
+    calls = _light_gate_stubs(monkeypatch, tmp_path, dirty_hold=True)
+    srv.last_fabric_check_monotonic = 0.0
+    await srv._device_health_gate(None, phase="post-job", run_fabric=True, force_fabric=True)
+    assert calls["light"] is False, "a hold-deciding check ran light"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_job_keeps_the_traffic_pass(monkeypatch, tmp_path):
+    """A failed job's forced pass is exactly the check the next tenant's safety rests on, so it
+    never drops the traffic pass (spec 03 I115: light only while the check cannot decide a lift)."""
+    calls = _light_gate_stubs(monkeypatch, tmp_path)
+    await srv._verify_device_after_job(None, job_failed=True)
+    assert calls["light"] is False, "a failed job's fabric check ran light"
+
+
+@pytest.mark.asyncio
+async def test_the_startup_gate_keeps_the_traffic_pass(monkeypatch, tmp_path):
+    """Startup, ladder and hold-deadline checks stay on the traffic pass (I12, I78)."""
+    calls = _light_gate_stubs(monkeypatch, tmp_path)
+    srv.last_fabric_check_monotonic = 0.0
+    await srv._device_health_gate(None, phase="startup", run_fabric=True, force_fabric=True)
+    assert calls["light"] is False, "a startup fabric check ran light"
+
+
+def test_a_light_fabric_run_drops_the_traffic_pass(monkeypatch, tmp_path):
+    """Spec 03 I115: ``build_command(traffic=False)`` drops ``--send-traffic`` from the
+    built-in validator's argv — the light check still opens the fabric and counts every
+    inter-chip link against the cabling; the traffic argv never changes."""
+    fake_root = tmp_path / "validator"
+    (fake_root / "current").mkdir(parents=True, exist_ok=True)  # runtime root must be a dir
+    for bin_dir in ("build/tools/scaleout",):
+        exe = fake_root / "current" / bin_dir / "run_cluster_validation"
+        exe.parent.mkdir(parents=True, exist_ok=True)
+        exe.write_text("#!/bin/sh\nexit 0\n")
+        exe.chmod(0o755)
+    (tmp_path / "cabling.textproto").write_text("")  # validator_missing checks it exists
+    monkeypatch.setenv("TTDEV_VALIDATOR_ROOT", str(fake_root))
+    monkeypatch.setenv("TTDEV_FABRIC_DESCRIPTOR", str(tmp_path / "cabling.textproto"))
+    heavy = fabric_mod.build_command()
+    light = fabric_mod.build_command(traffic=False)
+    argv, _ = heavy
+    assert "--send-traffic" in argv and "--num-iterations" in argv
+    argv, _ = light
+    assert "--send-traffic" not in argv and "--num-iterations" not in argv
+    assert "--cabling-descriptor-path" in argv and "--hard-fail" in argv
+
+
+def test_a_light_fabric_run_signals_the_operator_override_env(monkeypatch):
+    """Spec 03 I115: an operator's override (``TT_DEVICE_MCP_FABRIC_CHECK_CMD``) keeps its
+    traffic-pass argv, but a light run exports ``TT_DEVICE_MCP_FABRIC_LIGHT=1`` so a wrapper
+    that understands it (the shipped one does) can drop its own traffic pass."""
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "/opt/tt-device-broker/fabric-check.sh")
+    argv, env = fabric_mod.build_command()
+    assert argv == ["/bin/bash", "-c", "/opt/tt-device-broker/fabric-check.sh"]
+    assert "TT_DEVICE_MCP_FABRIC_LIGHT" not in env
+    argv, env = fabric_mod.build_command(traffic=False)
+    assert argv == ["/bin/bash", "-c", "/opt/tt-device-broker/fabric-check.sh"]
+    assert env.get("TT_DEVICE_MCP_FABRIC_LIGHT") == "1"
+
+
+@pytest.mark.asyncio
+async def test_a_light_fabric_run_fails_on_fewer_links_than_the_cabling_expects(monkeypatch, tmp_path):
+    """Spec 03 I115: the light check has no traffic pass to hide behind — the link count
+    against the cabling descriptor IS the verdict. A discovered topology with fewer links
+    than the descriptor names fails the check, never passes it."""
+    calls = _light_gate_stubs(monkeypatch, tmp_path)
+    calls["fabric"] = 0
+
+    async def escalate(*args, **kwargs):
+        return srv.OUTCOME_WAITING
+
+    async def stuck_eth(timeout_sec=60.0):
+        calls["eth"] += 1
+        return None, "the read reached no verdict"
+
+    monkeypatch.setattr(srv.health_monitor, "verify_eth_heartbeat", stuck_eth)
+
+    async def light_fabric(timeout_sec=60.0, *, light=False):
+        calls["fabric"] += 1
+        calls["light"] = light
+        return False, "topology mismatch: 4 missing, 0 extra port connections vs the cabling"
+
+    monkeypatch.setattr(srv.health_monitor, "verify_fabric_health", light_fabric)
+    # A fail on the light check must reach the ladder: stub the rung so nothing real fires.
+    monkeypatch.setattr(srv.galaxy_recovery, "escalate", escalate)
+    monkeypatch.setattr(srv.per_target_recovery, "escalate", escalate)
+    await srv._device_health_gate(None, phase="post-job", run_fabric=False, force_fabric=False)
+    assert calls["fabric"] == 1, "the light fabric check never ran"
+    assert calls["light"] is True, "the light check ran with the traffic pass"
+    assert srv.fsm.state is not ServerState.HEALTHY, "a light check with fewer links than the cabling expects passed"
