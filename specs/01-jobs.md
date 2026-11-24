@@ -472,6 +472,19 @@ the queue and a running job outlive the broker process.
   while the log was intact on disk. This adds no device access and changes no gate, hold, reset
   or recovery step.
 
+- **I72** — Tenant job order is the host's queue policy (`TT_DEVICE_MCP_QUEUE_POLICY`, read by
+  `queue_policy`): `fifo` (default; anything unrecognised is `fifo`) or `fair`. Under `fair` the
+  runner takes one tenant job per person per turn, round-robin; a person is the job's owner with
+  the `[agent]` tag stripped (`fair_share_key`), so one person's agent and CLI jobs share a turn.
+  The rotation is ordered by when each person last went to its tail: the end of their last turn
+  (the runner's next dequeue) or the arrival of their oldest waiting job, whichever is later; a
+  person whose job is running is at the tail. With one person waiting, or one job per person,
+  `fair` dispatches in exactly `fifo` order. Verification jobs (I21) and a handed-back held job
+  stay ahead of the rotation in both policies; a job cancelled while queued drains first and
+  costs its owner no turn. The policy is a view: the persisted queue and restore (I6) stay in
+  arrival order, and the rotation's memory does not survive a restart. `status` lists queued
+  jobs, and a submit reports its position, in the order the runner will take them.
+
 ## Interfaces
 
 Other subsystems and tenants may rely on:
@@ -567,7 +580,8 @@ flowchart LR
 
 ### Queueing and dispatch
 
-- The queue is FIFO (`asyncio.Queue` of job ids). Each queued job's spec is persisted as
+- The queue is FIFO (`asyncio.Queue` of job ids) unless the host runs the `fair` policy (I72),
+  which reorders tenant jobs round-robin by person at dequeue. Each queued job's spec is persisted as
   `<log_dir>/queued/<id>.json` (I6) and forgotten only after its process is live — a
   broker dying between dispatch and spawn must not lose the job; one dying after spawn
   must not run it twice. A spawn that fails with an error is terminal (FAILED) and
@@ -764,6 +778,7 @@ flowchart LR
 | I69 (a job cancelled while queued: footer `STATUS: killed` after a marker; the recent list says killed, not abandoned) | `tests/test_recent_jobs.py::test_a_job_cancelled_while_queued_gets_a_footer_and_reads_killed_everywhere`, `tests/test_recent_jobs.py::test_a_running_job_that_prints_the_cancel_marker_is_not_read_as_cancelled` |
 | I70 (a recovery-killed job is `KILLED` with recovery's cause, its log line written, before the sweep; a re-adopted one too, not "the broker restarted"; the recent list reads both kill lines as `broker-kill` and a footerless terminal job by its in-memory status; the per-test reset drops the causes; every clean-gate branch drops the marker; a recovery-killed exit 0 is no clean job) | `tests/test_job_kill_reset.py::test_a_recovery_kill_is_killed_with_its_cause_before_the_sweep`, `tests/test_job_kill_reset.py::test_a_recycled_id_after_a_fault_branch_recovery_kill_owes_its_reset`, `tests/test_job_kill_reset.py::test_a_recovery_killed_job_that_exited_0_is_no_clean_job`, `tests/test_reset.py::test_a_readopted_job_recovery_killed_ends_killed_with_its_cause`, `tests/test_recent_jobs.py::test_job_killed_by_a_device_reset_gets_broker_kill_status_and_cause`, `tests/test_recent_jobs.py::test_a_terminal_job_before_its_footer_shows_its_status_and_cause`, `tests/test_recent_jobs.py::test_job_killed_by_recovery_gets_broker_kill_status_and_cause`, `tests/test_test_isolation.py::test_the_per_test_reset_clears_every_hold_bound_and_escalation_global` |
 | I71 (status, logs and wait answer from the log after a restart or the retention purge; running-at-restart reads lost; a truncated or binary log reads; newest log per recycled id; SIGNAL in the footer; retention by count and size spares tracked and fresh logs) | `tests/test_job_log_store.py::test_status_and_logs_of_a_job_from_before_the_restart`, `tests/test_job_log_store.py::test_job_wait_returns_the_final_record_of_a_pre_restart_job`, `tests/test_job_log_store.py::test_a_job_purged_after_retention_still_answers`, `tests/test_job_log_store.py::test_a_job_running_when_the_broker_stopped_reads_lost`, `tests/test_job_log_store.py::test_the_journals_cause_beats_the_generic_lost`, `tests/test_job_log_store.py::test_a_queued_job_never_started_reads_abandoned_not_lost`, `tests/test_job_log_store.py::test_a_truncated_or_unflushed_log_still_reads`, `tests/test_job_log_store.py::test_an_in_memory_job_with_binary_output_reads_too`, `tests/test_job_log_store.py::test_a_recycled_id_answers_with_its_newest_log`, `tests/test_job_log_store.py::test_an_unknown_id_is_still_not_found`, `tests/test_job_log_store.py::test_the_footer_names_the_signal_and_is_parsed_back`, `tests/test_job_log_store.py::test_retention_keeps_the_newest_n`, `tests/test_job_log_store.py::test_retention_bounds_bytes_and_keeps_only_the_newest`, `tests/test_job_log_store.py::test_retention_never_prunes_a_tracked_or_fresh_log` |
+| I72 | `tests/test_fair_queue.py::test_the_policy_defaults_to_fifo_and_an_unknown_value_reorders_nothing`, `tests/test_fair_queue.py::test_fifo_keeps_a_batch_in_front_of_a_later_single_job`, `tests/test_fair_queue.py::test_fair_interleaves_a_batch_with_a_later_single_job`, `tests/test_fair_queue.py::test_fair_puts_a_newcomer_next_when_the_batch_owner_was_just_served`, `tests/test_fair_queue.py::test_fair_is_fifo_with_one_job_per_person`, `tests/test_fair_queue.py::test_fair_is_fifo_with_one_person`, `tests/test_fair_queue.py::test_a_persons_agent_and_cli_jobs_share_one_turn`, `tests/test_fair_queue.py::test_three_people_rotate_in_the_order_they_joined`, `tests/test_fair_queue.py::test_fair_keeps_verification_at_the_head_and_a_hand_back_behind_it`, `tests/test_fair_queue.py::test_a_job_killed_while_queued_drains_first_and_costs_its_owner_no_turn`, `tests/test_fair_queue.py::test_status_lists_and_submit_reports_the_fair_position` |
 | I68 | `tests/test_job_preflight.py::test_a_root_owned_existing_dir_is_refused_with_its_owner_and_mode`, `tests/test_job_preflight.py::test_a_writable_dir_passes`, `tests/test_job_preflight.py::test_a_missing_dir_with_a_writable_parent_passes_and_is_not_created`, `tests/test_job_preflight.py::test_a_missing_dir_with_an_unwritable_parent_is_refused_naming_the_parent`, `tests/test_job_preflight.py::test_tt_metal_logs_path_overrides_the_workspace`, `tests/test_job_preflight.py::test_a_missing_workspace_is_left_to_the_job_not_called_an_output_dir_problem`, `tests/test_job_preflight.py::test_the_override_is_what_gets_checked`, `tests/test_job_preflight.py::test_the_runner_fails_the_job_at_the_door_and_spawns_nothing`, `tests/test_job_preflight.py::test_the_runner_checks_as_the_privsep_submitter_with_only_its_env`, `tests/test_job_preflight.py::test_a_preflight_that_errors_or_hangs_lets_the_job_through` |
 | B-Submission (burst cap) | `tests/test_device_safety.py::test_an_armed_burst_cap_refuses_one_owners_flood_but_not_another`, `tests/test_device_safety.py::test_the_default_off_burst_cap_admits_every_submit`, `tests/test_device_safety.py::test_job_burst_decision_prunes_the_window_and_gates_on_the_cap[2-60.0-recent2-110.0-False-50.0-expect_kept2]` |
 | B-Submission (owner derived from the peer uid and the surface) | `tests/test_device_safety.py::test_the_owner_comes_from_the_peer_uid_and_the_surface` |
