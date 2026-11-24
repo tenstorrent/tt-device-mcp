@@ -2792,8 +2792,17 @@ class JobQueue(asyncio.Queue):
         for i in items:
             if i not in fixed:
                 lanes.setdefault(fair_share_key(i), []).append(i)
+        # A handed-back tenant job runs from the front, and running it is its person's turn: once it
+        # ends, that person goes to the tail, behind the lane now serving and behind anyone already
+        # waiting. Predict that, in front order, or the listing disagrees with what the runner does.
+        front_turns: dict[str, int] = {}
+        for n, i in enumerate(front):
+            if i in self._pinned and self._still_waiting(i):
+                front_turns.setdefault(fair_share_key(i), n)
 
         def rotation(lane: str) -> int:
+            if lane in front_turns:
+                return self._tick + 2 + front_turns[lane]  # its turn comes first, from the front
             if lane == self._serving:
                 return self._tick + 1  # mid-turn: the tail of the rotation
             return max(self._last_served.get(lane, 0), self._arrived.get(lanes[lane][0], 0))
@@ -2803,13 +2812,6 @@ class JobQueue(asyncio.Queue):
         for turn in range(max((len(v) for v in lanes.values()), default=0)):
             out.extend(lanes[lane][turn] for lane in order if turn < len(lanes[lane]))
         return out
-
-    def position(self, item) -> int:
-        """1-based place of ``item`` in ``dispatch_order``; 0 when it is not queued."""
-        try:
-            return self.dispatch_order().index(item) + 1
-        except ValueError:
-            return 0
 
     def _get(self):
         # The runner is back for another job, so the last one's turn is over: that lane moves to
@@ -12726,6 +12728,20 @@ def _explain_interruption(
     return None
 
 
+def _queued_jobs_in_dispatch_order() -> list["Job"]:
+    """Every QUEUED job, in the order the runner will start them (spec 01 I72).
+
+    A job the runner has already dequeued but not yet started (held at admission) is QUEUED and no
+    longer in the deque; it is next, so it leads. ``status`` and a submit's reported position both
+    read this one view, so they cannot disagree."""
+    queued = [j for j in jobs.values() if j.status == JobStatus.QUEUED]
+    q = get_job_queue()
+    order = q.dispatch_order() if isinstance(q, JobQueue) else list(q._queue)
+    rank = {jid: n for n, jid in enumerate(order)}
+    queued.sort(key=lambda j: rank.get(j.id, -1))  # stable: the dequeued ones keep their order
+    return queued
+
+
 def _get_queue_status() -> dict:
     """Get queue status (shared by REST API and MCP tool).
 
@@ -12735,13 +12751,9 @@ def _get_queue_status() -> dict:
     "[broker]" and the test that should have caught it passed against the other one.
     """
     running = [j for j in jobs.values() if j.status == JobStatus.RUNNING]
-    queued = [j for j in jobs.values() if j.status == JobStatus.QUEUED]
-    # List in the order the runner will take them (spec 01 I72), not submission order: under the
-    # fair policy the two differ, and a position that lies is worse than none. A QUEUED job the
-    # runner has already dequeued (waiting at the door) is next, so it leads.
-    q = get_job_queue()
-    rank = {jid: n for n, jid in enumerate(q.dispatch_order() if isinstance(q, JobQueue) else list(q._queue))}
-    queued.sort(key=lambda j: rank.get(j.id, -1))
+    # In the order the runner will take them (spec 01 I72), not submission order: under the fair
+    # policy the two differ, and a position that lies is worse than none.
+    queued = _queued_jobs_in_dispatch_order()
     rows = [
         {
             "id": j.id,
@@ -17137,12 +17149,14 @@ def create_mcp_server() -> MCPServer:
             if logger:
                 logger.info("JOB_RUNNER started (triggered by first job queue)")
 
-        # Determine if job will run immediately or be queued
-        running_jobs = [j for j in jobs.values() if j.status == JobStatus.RUNNING]
-        # Where this job actually sits under the queue policy (spec 01 I72); under fifo that is
-        # the tail, i.e. the queue size, as before.
-        q = get_job_queue()
-        queue_size = (q.position(job_id) if isinstance(q, JobQueue) else 0) or q.qsize()
+        # Determine if job will run immediately or be queued. The awaits above (log pruning) can let
+        # the runner take this job already: then it is not waiting behind anyone, itself included.
+        started = job.status != JobStatus.QUEUED
+        running_jobs = [j for j in jobs.values() if j.status == JobStatus.RUNNING and j.id != job_id]
+        # Where this job sits in the same ordered view `status` lists (spec 01 I72), counting a job
+        # the runner already holds at admission; under fifo that is the tail, as before.
+        waiting = [j.id for j in _queued_jobs_in_dispatch_order()]
+        queue_size = waiting.index(job_id) + 1 if job_id in waiting else len(waiting)
         # A broker op holding the device, or a device flagged dirty, blocks this job just
         # as surely as another tenant does — the gate makes it wait for the reset+verify.
         # Reporting "starting (device idle)" through that window told a submitter their job
@@ -17150,7 +17164,13 @@ def create_mcp_server() -> MCPServer:
         # reads exactly like a job dispatched onto a device the broker had marked dirty.
         blocked = _device_unavailable_for_tenant()
 
-        if running_jobs:
+        if started:
+            # Already dispatched (or ended at the door) while this request was still answering.
+            queue_position = 0
+            status_msg = (
+                "starting (device idle)" if job.status == JobStatus.RUNNING else f"left the queue: {job.status.value}"
+            )
+        elif running_jobs:
             # Device busy - job is queued
             queue_position = queue_size  # Position in queue (1 = next after current)
             status_msg = f"queued (position {queue_position} - waiting for {running_jobs[0].id})"
@@ -17167,7 +17187,7 @@ def create_mcp_server() -> MCPServer:
 
         return {
             "job_id": job_id,
-            "status": "queued" if (running_jobs or blocked) else "starting",
+            "status": "queued" if not started and (running_jobs or blocked) else "starting",
             "message": status_msg,
             "position": queue_position,
             "log_file": job_log_file,
