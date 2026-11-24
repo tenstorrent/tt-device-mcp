@@ -1076,11 +1076,19 @@ class HealthMonitor:
             return False, f"chip(s) [{','.join(silent)}] returned no board_id/telemetry (ARC wedged)"
         return True, f"all {len(devs)} chips enumerated with live ARC telemetry"
 
-    async def verify_fabric_health(self, timeout_sec: float = FABRIC_CHECK_TIMEOUT_SEC) -> tuple[Optional[bool], str]:
+    async def verify_fabric_health(
+        self, timeout_sec: float = FABRIC_CHECK_TIMEOUT_SEC, *, light: bool = False
+    ) -> tuple[Optional[bool], str]:
         """Run the fabric traffic check (see ``health.monitors.fabric``), which pushes packets
         across every inter-chip ethernet link and reports non-zero if any link is unhealthy.
         This is the only check that proves the FABRIC actually moves data — the tt-smi snapshot
         only proves chips enumerate + ARC is alive.
+
+        ``light=True`` drops the all-link traffic pass and keeps everything else the check owes:
+        the validator opens the fabric, every expected chip stays covered by the gate's own
+        enum+ARC probes, and every inter-chip link is still counted against the cabling
+        descriptor, so fewer links than the cabling expects still fails the check. An operator's
+        override is never asked for a light run: its contract is the traffic pass (spec 03 I115).
 
         Returns ``(ok, detail)``:
           * ``None`` => SKIPPED (not configured, no built-in validator installed, the command
@@ -1117,18 +1125,18 @@ class HealthMonitor:
         async with scope:
             # Spec 03 I101: the traffic pass starts the device; no gated chip config read until it ends.
             with pcie_quiet.window("fabric"):
-                return await self._verify_fabric_health_timed(timeout_sec)
+                return await self._verify_fabric_health_timed(timeout_sec, light=light)
 
     def _readers_log(self, line: str) -> None:
         log = self._logger()
         if log:
             log.info(f"HEALTH {line}")
 
-    async def _verify_fabric_health_timed(self, timeout_sec: float) -> tuple[Optional[bool], str]:
+    async def _verify_fabric_health_timed(self, timeout_sec: float, *, light: bool = False) -> tuple[Optional[bool], str]:
         _t0 = time.monotonic()
         _fabric_inflight_begin(self._fabric_check_cmd() or "built-in")
         try:
-            ok, detail = await self._verify_fabric_health_body(timeout_sec)
+            ok, detail = await self._verify_fabric_health_body(timeout_sec, light=light)
         except asyncio.CancelledError as e:
             # Cancelled under us (a shutdown that unwinds the loop), or the validator itself killed
             # by the shutdown (I63): say so now, the mark goes.
@@ -1229,10 +1237,10 @@ class HealthMonitor:
         health_event("snapshot_no_verdict", cause="killed_by_dead_chip_isolation", reason=why[:400])
         return f"{SNAPSHOT_KILLED_BY_ISOLATION}: {why}; no verdict, a full pass is owed after recovery"
 
-    async def _verify_fabric_health_body(self, timeout_sec: float) -> tuple[Optional[bool], str]:
+    async def _verify_fabric_health_body(self, timeout_sec: float, *, light: bool = False) -> tuple[Optional[bool], str]:
         self._fabric_killed = ""
         override = self._fabric_check_cmd()
-        built = fabric.build_command()
+        built = fabric.build_command(traffic=not light and not override)
         if built is None:
             # The authoritative fabric verdict, and preflight hard-requires it — so reaching here means
             # the mesh goes entirely unvalidated on the one check that proves it moves data. Journal it.

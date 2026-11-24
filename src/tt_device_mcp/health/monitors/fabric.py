@@ -386,7 +386,7 @@ def validator_not_built() -> Optional[str]:
     return validator_missing()
 
 
-def build_command(descriptor: bool = True) -> Optional[tuple[list[str], dict[str, str]]]:
+def build_command(descriptor: bool = True, traffic: bool = True) -> Optional[tuple[list[str], dict[str, str]]]:
     """The argv + env to run the fabric check with, or ``None`` when nothing is configured/available to run at all.
 
     ``TT_DEVICE_MCP_FABRIC_CHECK_CMD`` set names an operator's own wrapper, run through ``/bin/bash -c`` exactly as
@@ -400,7 +400,12 @@ def build_command(descriptor: bool = True) -> Optional[tuple[list[str], dict[str
     every host gets a traffic-only check without it. A binary that has not been published yet is exactly as unavailable
     as no override at all, so both collapse to the same ``None``.
 
-    ``descriptor=False`` drops the cabling descriptor: the traffic-only rerun after a topology mismatch."""
+    ``descriptor=False`` drops the cabling descriptor: the traffic-only rerun after a topology mismatch.
+    ``traffic=False`` drops the all-link Ethernet traffic pass: the validator still discovers the mesh, opens the
+    fabric and counts every inter-chip link against the descriptor, and its verdict keeps its usual meaning —
+    fewer links than the cabling expects still fails the check. An operator's override always gets
+    ``traffic=True``'s argv: the wrapper's own contract is the traffic pass."""
+
     override = os.environ.get("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "").strip()
     if override:
         return ["/bin/bash", "-c", override], {**os.environ, "PYTHONUNBUFFERED": "1"}
@@ -424,7 +429,8 @@ def build_command(descriptor: bool = True) -> Optional[tuple[list[str], dict[str
         pass
     iters = os.environ.get("TTDEV_FABRIC_ITERS", "").strip() or "1"
 
-    argv = [binpath, *desc_argv, "--output-path", out, "--hard-fail", "--send-traffic", "--num-iterations", iters]
+    traffic_argv = ["--send-traffic", "--num-iterations", iters] if traffic else []
+    argv = [binpath, *desc_argv, "--output-path", out, "--hard-fail", *traffic_argv]
     env = {
         **os.environ,
         "PYTHONUNBUFFERED": "1",
