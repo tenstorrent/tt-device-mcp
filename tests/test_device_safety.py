@@ -16688,6 +16688,9 @@ def test_a_light_fabric_run_drops_the_traffic_pass(monkeypatch, tmp_path):
     argv, _ = light
     assert "--send-traffic" not in argv and "--num-iterations" not in argv
     assert "--cabling-descriptor-path" in argv and "--hard-fail" in argv
+    # No descriptor, nothing to count against: the light run keeps the traffic pass.
+    argv, _ = fabric_mod.build_command(descriptor=False, traffic=False)
+    assert "--send-traffic" in argv
 
 
 def test_a_light_fabric_run_signals_the_operator_override_env(monkeypatch):

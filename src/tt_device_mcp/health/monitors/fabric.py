@@ -406,8 +406,8 @@ def build_command(descriptor: bool = True, traffic: bool = True) -> Optional[tup
     ``descriptor=False`` drops the cabling descriptor: the traffic-only rerun after a topology mismatch.
     ``traffic=False`` drops the all-link Ethernet traffic pass: the validator still discovers the mesh, opens the
     fabric and counts every inter-chip link against the descriptor, and its verdict keeps its usual meaning —
-    fewer links than the cabling expects still fails the check. An operator's override always gets
-    ``traffic=True``'s argv: the wrapper's own contract is the traffic pass."""
+    fewer links than the cabling expects still fails the check. With no descriptor there is nothing to count against,
+    so the run keeps the traffic pass."""
 
     override = os.environ.get("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "").strip()
     if override:
@@ -436,7 +436,8 @@ def build_command(descriptor: bool = True, traffic: bool = True) -> Optional[tup
         pass
     iters = os.environ.get("TTDEV_FABRIC_ITERS", "").strip() or "1"
 
-    traffic_argv = ["--send-traffic", "--num-iterations", iters] if traffic else []
+    # A light run with no descriptor has no link count to check against: it keeps the traffic pass.
+    traffic_argv = ["--send-traffic", "--num-iterations", iters] if traffic or not desc_argv else []
     argv = [binpath, *desc_argv, "--output-path", out, "--hard-fail", *traffic_argv]
     env = {
         **os.environ,
