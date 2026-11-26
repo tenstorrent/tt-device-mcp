@@ -190,7 +190,12 @@ async def test_the_runner_gives_every_job_a_fabric_ok_path_and_clears_a_stale_ma
     marker.write_text("{}")  # an earlier job 971's claim
 
     # Exits 7 if the variable is not the path or the earlier job's marker is still there.
-    job = _job(tmp_path, ws, "971", f'test "$TT_DEVICE_MCP_FABRIC_OK" = {marker} && test ! -e {marker} || exit 7; echo {{}} > {marker}; exit 3')
+    job = _job(
+        tmp_path,
+        ws,
+        "971",
+        f'test "$TT_DEVICE_MCP_FABRIC_OK" = {marker} && test ! -e {marker} || exit 7; echo {{}} > {marker}; exit 3',
+    )
     await srv.get_job_queue().put("971")
     job.queued_at = _ago(1)  # the runner's bookkeeping parses it
     runner = asyncio.create_task(srv.job_runner())

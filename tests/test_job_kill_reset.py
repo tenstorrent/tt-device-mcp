@@ -214,7 +214,9 @@ _PRE_PASS = "HEALTH-GATE[post-job] pre-pass reset: "
 def pre_pass(fw_init_failed, monkeypatch, caplog):
     """The fw_init mesh with every fabric-event field recorded and the server log captured."""
     rows = []
-    patch_health_event(monkeypatch, lambda name, *a, **k: (fw_init_failed["events"].append(name), rows.append((name, k))))
+    patch_health_event(
+        monkeypatch, lambda name, *a, **k: (fw_init_failed["events"].append(name), rows.append((name, k)))
+    )
     log = logging.getLogger("tt-device-mcp-test-pre-pass")
     monkeypatch.setattr(srv, "logger", log)
     caplog.set_level(logging.INFO, logger=log.name)
