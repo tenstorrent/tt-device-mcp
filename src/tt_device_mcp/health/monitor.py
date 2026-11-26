@@ -415,6 +415,7 @@ class HealthMonitor:
         run_eth: bool = False,
         fabric_stale: bool = True,
         eth_timeout_reset: bool = False,
+        eth_no_verdict_reset: bool = False,
         fabric_light: bool = False,
         indices: Optional[list] = None,
         expected: Optional[int] = None,
@@ -436,7 +437,9 @@ class HealthMonitor:
         ``eth_timeout_reset`` says the post-job gate can still grant this hold episode's one present-mesh reset (spec 03
         I61). A ``run_eth`` read that then TIMED OUT with no verdict, on a pass whose host-pci read is OK and whose
         snapshot found every chip with a healthy ARC, skips the fabric pass: the gate resets next, and the full check
-        after the reset runs the pass. Any guard that fails keeps the pass.
+        after the reset runs the pass. Any guard that fails keeps the pass. ``eth_no_verdict_reset`` (spec 03 I116)
+        widens that skip to every read with no verdict, a link-drop skip included: the gate owes the reset to a failed
+        job whose clean exit took the shortcut.
 
         ``fabric_light`` drops the all-link Ethernet traffic pass from the fabric check this pass runs:
         the validator still opens the fabric and counts every inter-chip link against the cabling
@@ -477,6 +480,7 @@ class HealthMonitor:
                 run_eth=run_eth,
                 fabric_stale=fabric_stale,
                 eth_timeout_reset=eth_timeout_reset,
+                eth_no_verdict_reset=eth_no_verdict_reset,
                 fabric_light=fabric_light,
                 indices=indices,
                 expected=expected,
@@ -502,6 +506,7 @@ class HealthMonitor:
         run_eth: bool,
         fabric_stale: bool,
         eth_timeout_reset: bool,
+        eth_no_verdict_reset: bool,
         fabric_light: bool,
         indices: Optional[list],
         expected: Optional[int],
@@ -604,7 +609,12 @@ class HealthMonitor:
             # Spec 03 I61: a timed-out read on a present mesh goes straight to the gate's one
             # present-mesh reset. The pass here failed or skipped after every such timeout measured.
             reset_due = (
-                eth_timeout_reset and not fabric_asked and eok is None and eth_read_timed_out(edetail) and hp_ok is True
+                eth_timeout_reset
+                and not fabric_asked
+                and eok is None
+                and (eth_no_verdict_reset or eth_read_timed_out(edetail))
+                and not unseen
+                and hp_ok is True
             )
             if link_drop_held and log and self.last_fabric_skipped:
                 # A 77 since the green pass (it leaves last_fabric_ok alone) reached no verdict: no cover.
@@ -618,7 +628,7 @@ class HealthMonitor:
                 )
             elif reset_due and log:
                 log(
-                    "eth-heartbeat read timed out after a clean exit on a present mesh — skipping the "
+                    "eth-heartbeat read reached no verdict after a clean exit on a present mesh — skipping the "
                     "pre-reset fabric pass; the full check runs after the present-mesh reset"
                 )
             elif not fabric_asked and eok is None and log:

@@ -186,7 +186,7 @@ async def test_a_fw_init_failure_resets_then_runs_the_full_check_before_release(
 
 
 @pytest.mark.asyncio
-async def test_a_plain_exit_1_with_no_debt_keeps_the_clean_exit_shortcut(fw_init_failed):
+async def test_a_clean_software_exit_with_no_debt_runs_no_forced_pass_and_no_reset(fw_init_failed):
     await _clean_exit_1_gate()
     assert fw_init_failed["resets"] == [] and fw_init_failed["fabric"] == [], "a plain failure is not a device event"
     assert "post_job_fabric_skipped" in fw_init_failed["events"]
@@ -275,6 +275,32 @@ async def test_a_plain_exit_that_takes_the_clean_exit_shortcut_runs_no_reset(pre
     assert srv._kill_reset_debt() == ""
     assert _pre_pass_lines(caplog) == [f"{_PRE_PASS}skipped (job exit 8, 0s)"]
     assert _pre_pass_row(pre_pass)["ran"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "read",
+    [
+        (None, f"{monitor_mod.ETH_LINK_DROP_SKIP}: 31 of 32 links up"),
+        (None, f"{monitor_mod.ETH_COULD_NOT_CHECK}: the read crashed"),
+    ],
+    ids=["link-drop-skip", "could-not-check"],
+)
+async def test_a_plain_exit_whose_eth_read_has_no_verdict_resets_before_the_full_pass(pre_pass, caplog, read):
+    """The shortcut keeps the debt open through the read. A read with no verdict would run the traffic pass with no
+    reset ahead of it, so the gate pays the debt with the present-mesh reset first, then runs the one pass."""
+    pre_pass["eth"] = read
+    srv._owe_kill_reset(_PLAIN_DEBT)
+    srv._note_plain_exit_debt(False)
+    await srv._verify_device_after_job(None, job_failed=True, clean_exit_code=8, job_exit=8)
+    assert pre_pass["resets"] == [["tt-smi", "-glx_reset"]], "one present-mesh reset"
+    assert pre_pass["fabric"] == [1], "the only fabric pass ran after the reset"
+    assert pre_pass["events"].count("kill_mesh_reset") == 1
+    assert srv.fsm.state is ServerState.HEALTHY, "released only on the post-reset full check"
+    assert srv._kill_reset_debt() == ""
+    (line,) = _pre_pass_lines(caplog)
+    assert line.startswith(f"{_PRE_PASS}ran (job exit 8, ")
+    assert _pre_pass_row(pre_pass)["ran"] is True
 
 
 @pytest.mark.asyncio

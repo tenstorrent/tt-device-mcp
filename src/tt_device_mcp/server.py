@@ -5049,13 +5049,14 @@ def _names_topology_mismatch(text: str) -> bool:
     return text.startswith(_TOPOLOGY_HOLD) or _TOPOLOGY_VALIDATOR_LINE in text
 
 
-def _eth_timeout_reset_shape(evidence: dict) -> bool:
+def _eth_timeout_reset_shape(evidence: dict, any_cause: bool = False) -> bool:
     """Whether a probe pass took the spec 03 I61 skip: its eth read timed out with no verdict, host-pci
-    and the snapshot were OK, and no fabric pass ran. Any other shape keeps today's path."""
+    and the snapshot were OK, and no fabric pass ran. Any other shape keeps today's path. ``any_cause``
+    (spec 03 I116) drops the timeout from the shape: any read with no verdict counts."""
     eth_ev = evidence.get("eth_heartbeat") or {}
     return (
         eth_ev.get("ok") is None
-        and eth_read_timed_out(str(eth_ev.get("detail") or ""))
+        and (any_cause or eth_read_timed_out(str(eth_ev.get("detail") or "")))
         and (evidence.get("hostpci") or {}).get("ok") is True
         and (evidence.get("snapshot") or {}).get("ok") is True
         and "fabric" not in evidence
@@ -7787,10 +7788,10 @@ async def device_health_gate(
             and (not _kill_reset_debt() or _kill_reset_plain)
             and not _post_reset_debt()
         )
+        # Spec 03 I116: a plain debt stays open through the eth read; only a read with no verdict, which runs the traffic
+        # pass, pays it with the present-mesh reset first.
+        plain_shortcut = _kill_reset_debt() if skip_forced and _kill_reset_plain else ""
         if skip_forced:
-            if _kill_reset_plain:
-                # Spec 03 I116: no traffic pass runs here, so there is none for a reset to precede.
-                _clear_kill_reset_debt()
             _log(
                 f"the failed job ended in a clean software exit (exit {clean_exit_code}) and no device event: "
                 f"reading the eth heartbeat instead of forcing a fabric pass"
@@ -7812,7 +7813,9 @@ async def device_health_gate(
         # today's path (the dirty exit's pass). The startup gate pays a debt it finds the same way (I74): a re-adopted
         # job the broker stopped before it ran. Its one full check, fabric included, then follows the reset instead of a
         # pass before it, and the post-job gate owes nothing after. A debt owed after this gate stays open.
-        kill_debt = _kill_reset_debt() if with_recover and phase in ("post-job", "startup") else ""
+        kill_debt = (
+            _kill_reset_debt() if with_recover and phase in ("post-job", "startup") and not plain_shortcut else ""
+        )
         if kill_debt:
             refused = (
                 "this hold episode's present-mesh reset is spent"
@@ -7913,6 +7916,7 @@ async def device_health_gate(
             run_eth=run_eth,
             fabric_stale=stale or skip_forced,
             eth_timeout_reset=eth_timeout_reset,
+            eth_no_verdict_reset=eth_timeout_reset and bool(plain_shortcut),
             fabric_light=fabric_light,
             phase=phase,
             recovery=recovery,
@@ -7946,7 +7950,13 @@ async def device_health_gate(
             last_fabric_check_monotonic = time.monotonic()
         # The probe pass took the I61 skip: the read timed out, host-pci and the snapshot (every chip,
         # ARC healthy) were OK, and no fabric pass ran. The mesh is not proven, so it is not healthy.
-        eth_timeout_due = eth_timeout_reset and healthy and _eth_timeout_reset_shape(evidence)
+        owed_reset = (
+            eth_timeout_reset
+            and bool(plain_shortcut)
+            and healthy
+            and _eth_timeout_reset_shape(evidence, any_cause=True)
+        )
+        eth_timeout_due = eth_timeout_reset and healthy and not owed_reset and _eth_timeout_reset_shape(evidence)
         if eth_timeout_due:
             healthy = False
             eth_reason = str((evidence.get("eth_heartbeat") or {}).get("detail") or "")
@@ -7964,8 +7974,14 @@ async def device_health_gate(
         if deferral is not None:
             kill_reset_due = not kill_check_passed and _fast_checks_ok(state)
         else:
-            kill_reset_due = kill_reset and healthy
-        if kill_reset:
+            kill_reset_due = (kill_reset and healthy) or owed_reset
+        if owed_reset:
+            kill_debt = plain_shortcut
+            _log(
+                f"eth-heartbeat reached no verdict after a clean exit with all {expected} chips present, host-pci OK "
+                f"and ARC healthy — paying the reset the failed job owes before the full check"
+            )
+        if kill_reset or plain_shortcut:
             _clear_kill_reset_debt()
         if kill_check_passed:
             _log(f"{kill_debt}: the full check passed after a clean stop — no reset needed")
@@ -14988,15 +15004,14 @@ export {FABRIC_OK_ENV}={shlex.quote(str(job_fabric_ok_file(job_id)))}
                 # Same debt for a job that failed on its own because the runtime could not bring the device up
                 # (its firmware init timed out on the cores) or said the device is unrecoverable before the reaper's
                 # grace ran out: it exits with a plain code, so the clean-exit shortcut (03 I36) would hand the same
-                # wedged mesh to the next job, and every job fails the same way. A plain nonzero exit owes only the plain debt, which still yields to the shortcut.
+                # wedged mesh to the next job, and every job fails the same way.
                 init_fault = None
                 if not killed_by_reset and not known and not topo and job.status == JobStatus.FAILED:
                     init_fault = _scan_output_for_runtime_init_fault(job_log_file)
                     if init_fault is None and job.doomed_monotonic is not None:
                         init_fault = "runtime reported the device unrecoverable"
                 # Spec 03 I116: a job that ended without exit 0 on its own (a plain nonzero exit, or a signal death
-                # that left no other trace) owes the same one reset before the full traffic pass: that pass started on
-                # the mesh such a job left behind is what chips fell off the bus in.
+                # that left no other trace) owes the same one reset before the full traffic pass.
                 nonzero_end = (
                     job.status in (JobStatus.FAILED, JobStatus.KILLED)
                     and isinstance(job.exit_code, int)
