@@ -15,9 +15,12 @@ Four things make it safe to run from the broker:
   CPLD debug indexes, and two dumps interleaving their selects read each other's registers.
 - The UBB debug index (register 0x50 on each tray CPLD) is saved before and restored after, then
   read back: other readers expect the index they left.
-- A hard cap on the whole thing, enforced on the root side: every privileged command runs as
-  ``timeout -s KILL <cap> ...`` under sudo, so the kill reaches the root DIAG and its ipmitool
-  children, which a per-user broker cannot signal itself. A dump that cannot take the lock, cannot
+- A hard cap on the whole thing, enforced on the root side, which a per-user broker cannot signal.
+  Every privileged command runs as ``timeout -s KILL <cap> ...`` under sudo. The DIAG has children
+  of its own, and coreutils differ in whether ``timeout`` kills them (GNU does, the Rust uutils
+  build does not), so it runs under a small root-side shell wrapper (``DIAG_BOUND``) that starts it
+  in a process group of its own and kills that whole group at the cap; the ``timeout`` around the
+  wrapper, two seconds later, only backs up a wedged wrapper. A dump that cannot take the lock, cannot
   find its script, runs past the cap or fails is skipped or killed with a logged reason, and
   recovery always follows. The broker's own kill reaches only sudo, so the dump then waits, bounded
   (the cap from when the root side started, plus one grace), until the DIAG's whole process tree is
@@ -34,10 +37,11 @@ cross-linked: each incident folder of the episode gets a ``cpld_dump.json`` nami
 incident folders.
 
 A broker that is not root needs these sudoers lines (the caps are the defaults; a changed
-``TT_DEVICE_MCP_CPLD_DUMP_CAP_SEC`` changes the DIAG line's number)::
+``TT_DEVICE_MCP_CPLD_DUMP_CAP_SEC`` changes the two numbers on the DIAG lines; ``<DIAG_BOUND>``
+is the wrapper text in ``DIAG_BOUND`` below, written out in full)::
 
-    <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 40 bash /usr/local/bin/cpld-dump.sh DIAG
-    <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 40 bash /usr/local/lib/tt-device-mcp/BH_s7t_cpld_dump_V1.03.01.sh DIAG
+    <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 42 bash -c <DIAG_BOUND> 40 bash /usr/local/bin/cpld-dump.sh DIAG
+    <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 42 bash -c <DIAG_BOUND> 40 bash /usr/local/lib/tt-device-mcp/BH_s7t_cpld_dump_V1.03.01.sh DIAG
     <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 5 ipmitool raw 0x06 0x52 *
     <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 20 ipmitool sdr elist full
 
@@ -71,8 +75,18 @@ PINNED_SCRIPT = "/usr/local/lib/tt-device-mcp/BH_s7t_cpld_dump_V1.03.01.sh"
 PINNED_SHA256 = "ad0f966b78ba9f810f8add56e0942bad2b9bd02c434d0d66eb3ba687de89fc14"
 IPMITOOL = "ipmitool"
 SUDO = ("sudo", "-n")
-# coreutils timeout, run as root: it kills the command's whole process group at the bound.
 TIMEOUT = ("timeout", "-s", "KILL")
+# Runs the DIAG as a job of its own, so it leads a process group, and kills that group at the
+# cap, whatever ``timeout`` does to a command's children. $0 is the cap, the rest of the argv the
+# DIAG. Its own stderr is dropped so a kill notice never lands in the saved dump; the DIAG's stderr
+# passes through. The timer is a job too, so ending it leaves no sleep behind. The text has none of
+# the characters sudoers needs escaped, so a sudoers line pins it as it stands.
+DIAG_BOUND = (
+    'exec 3>&2 2>/dev/null; set -m; "$@" 2>&3 3>&- & (sleep $0; kill -KILL -- -$!) & '
+    "wait %1; set -- $?; kill -KILL %2; exit $1"
+)
+# The root-side timeout around the wrapper runs this long past the cap: a backstop for a wedged wrapper.
+DIAG_BACKSTOP_SEC = 2
 DUMPS_DIR = "cpld_dumps"
 # The four UBB tray CPLDs (I2C bus, 8-bit address) and their debug index register. The vendor's
 # UBB swap only relabels these buses, so saving and restoring all four needs no swap logic.
@@ -170,10 +184,18 @@ def _take_lock(path: str, wait_sec: float) -> tuple[Optional[int], str, float]:
 
 
 def _privileged(argv: list[str], bound_sec: float) -> list[str]:
-    """``argv`` bounded by a root-side ``timeout -s KILL``. /dev/ipmi0 is root-only: a per-user
-    broker goes through sudo -n, which fails fast, never prompts. The timeout runs inside sudo, so
-    its kill reaches the root command and its children; the broker's own kill reaches only sudo."""
+    """``argv`` (a single command that starts no children) bounded by a root-side ``timeout -s KILL``.
+    /dev/ipmi0 is root-only: a per-user broker goes through sudo -n, which fails fast, never prompts.
+    The timeout runs inside sudo; the broker's own kill reaches only sudo."""
     bounded = [*TIMEOUT, str(int(math.ceil(bound_sec))), *argv]
+    return bounded if os.geteuid() == 0 else [*SUDO, *bounded]
+
+
+def _diag_argv(script: str, cap_sec: float) -> list[str]:
+    """The DIAG under :data:`DIAG_BOUND`, itself under the root-side ``timeout`` (see :func:`_privileged`)."""
+    cap = int(math.ceil(cap_sec))
+    bounded = [*TIMEOUT, str(cap + DIAG_BACKSTOP_SEC), "bash", "-c", DIAG_BOUND, str(cap)]
+    bounded += ["bash", script, "DIAG"]
     return bounded if os.geteuid() == 0 else [*SUDO, *bounded]
 
 
@@ -304,7 +326,7 @@ def _run_diag(
     nlines = 0
     try:
         p = subprocess.Popen(
-            _privileged(["bash", script, "DIAG"], cap_sec),
+            _diag_argv(script, cap_sec),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,

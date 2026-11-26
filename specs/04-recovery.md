@@ -2912,9 +2912,13 @@ each rung fires only when the gentler one failed or cannot apply.
   event carries its path and the PSU and 12 V lines, or the read's error, which never fails the
   dump. Bounds: a lock wait, a DIAG cap (about 5 s per tray x 4 trays, doubled), per-call IPMI
   timeouts and a sensor-read cap. Each bound is enforced root-side: every privileged command
-  runs as `sudo -n timeout -s KILL <bound> ...` (no sudo when the broker is root), so the kill
-  reaches the root DIAG and its children, which a non-root broker's own kill cannot; the broker's
-  killpg stays as a backup and the pipe is always closed. Whatever ends the dump (EOF, the cap, a
+  runs as `sudo -n timeout -s KILL <bound> ...` (no sudo when the broker is root), which a
+  non-root broker's own kill cannot reach; the broker's killpg stays as a backup and the pipe is
+  always closed. The DIAG has children, and coreutils differ in whether `timeout` kills them (GNU
+  does, uutils, the default on Ubuntu 26.04, kills only its direct child), so the DIAG runs under
+  a short `bash -c` wrapper inside that root-side `timeout`: it starts the DIAG as a job of its own
+  (its own process group) and kills that whole group at the cap. The `timeout` around it, two
+  seconds later, only backs up a wedged wrapper. Whatever ends the dump (EOF, the cap, a
   failed output write or pipe read, any other error), the DIAG's whole process tree has ended
   before the index is restored: the broker follows the tree in `/proc` (sudo, the root-side
   timeout, the DIAG and any child, even one orphaned or one sudo started late) and waits, bounded
@@ -2933,12 +2937,13 @@ each rung fires only when the gentler one failed or cannot apply.
   the dump never resets, releases or lifts a hold. A
   non-root broker needs these sudoers lines (`<user>` is the broker's account):
 
-      <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 40 bash /usr/local/bin/cpld-dump.sh DIAG
-      <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 40 bash /usr/local/lib/tt-device-mcp/BH_s7t_cpld_dump_V1.03.01.sh DIAG
+      <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 42 bash -c <DIAG_BOUND> 40 bash /usr/local/bin/cpld-dump.sh DIAG
+      <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 42 bash -c <DIAG_BOUND> 40 bash /usr/local/lib/tt-device-mcp/BH_s7t_cpld_dump_V1.03.01.sh DIAG
       <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 5 ipmitool raw 0x06 0x52 *
       <user> ALL=(root) NOPASSWD: /usr/bin/timeout -s KILL 20 ipmitool sdr elist full
 
-  The dump and the episode's incident folders (`evidence.capture_incident`) are cross-linked both
+  (`<DIAG_BOUND>` is the wrapper text, `DIAG_BOUND` in `health/cpld_dump.py`, written out in full;
+  a changed cap changes the two numbers on the DIAG lines.) The dump and the episode's incident folders (`evidence.capture_incident`) are cross-linked both
   ways: each incident folder of the episode (stamped from episode start minus 120 s on) gets
   `cpld_dump.json` naming the dump, and the `cpld_dump` event lists those folders under
   `incidents`; an incident captured after the dump started gets the same file and journals
@@ -3781,8 +3786,8 @@ sees a silent fabric pass.
 | I109 PSU and 12 V readings beside the dump; a failed read keeps the dump | `tests/test_cpld_dump.py::test_psu_readings_saved_beside_the_dump`, `::test_psu_read_failure_keeps_the_dump` |
 | I109 index 0x50 saved, restored, verified | `tests/test_cpld_dump.py::test_the_debug_index_is_restored_and_verified`, `::test_an_index_that_does_not_restore_is_named` |
 | I109 a refused host rung still starts the dump, once per episode, without waiting | `tests/test_cpld_dump.py::test_a_refused_host_rung_starts_the_dump`, `::test_a_refusal_starts_the_dump_once_per_episode` |
-| I109 root-side bound: every privileged call runs under `timeout -s KILL`; a hung DIAG, ipmitool or sensor read behind sudo is gone when the dump returns | `tests/test_cpld_dump.py::test_privileged_commands_carry_a_root_side_kill`, `::test_a_hung_diag_behind_sudo_is_gone_when_the_dump_returns`, `::test_a_hung_ipmitool_behind_sudo_is_killed_at_its_bound`, `::test_a_slow_psu_read_behind_sudo_is_killed_at_its_bound` |
-| I109 the DIAG's whole process tree is gone before the index restore and the return, bounded: a root-side timeout that starts late, a background child; a tree that outlives the bound is named and the indexes are left alone | `tests/test_cpld_dump.py::test_a_late_starting_root_side_timeout_is_waited_for`, `::test_a_background_child_of_the_diag_is_waited_for`, `::test_a_straggler_that_never_ends_is_named_and_the_indexes_are_left_alone` |
+| I109 root-side bound: every privileged call runs under `timeout -s KILL`; a hung DIAG, ipmitool or sensor read behind sudo is gone when the dump returns | `tests/test_cpld_dump.py::test_privileged_commands_carry_a_root_side_kill`, `::test_the_diag_runs_under_a_wrapper_that_owns_its_process_group`, `::test_a_hung_diag_behind_sudo_is_gone_when_the_dump_returns`, `::test_a_hung_ipmitool_behind_sudo_is_killed_at_its_bound`, `::test_a_slow_psu_read_behind_sudo_is_killed_at_its_bound` |
+| I109 the DIAG's whole process tree is gone before the index restore and the return, bounded: a root-side timeout that starts late or kills only its direct child (uutils), a background child; a tree that outlives the bound is named and the indexes are left alone | `tests/test_cpld_dump.py::test_a_late_starting_root_side_timeout_is_waited_for`, `::test_a_background_child_of_the_diag_is_waited_for`, `::test_a_straggler_that_never_ends_is_named_and_the_indexes_are_left_alone` |
 | I109 error path: the DIAG ends before the index is restored, only read indexes are restored, the lock is released, the error is named | `tests/test_cpld_dump.py::test_a_failed_output_write_ends_the_diag_and_restores_the_index`, `::test_a_failed_pipe_read_ends_the_diag_and_restores_the_index`, `::test_an_error_before_the_diag_restores_only_what_was_read` |
 | I109 a silent BMC costs one call: before the DIAG it is skipped, after it the remaining restores and the PSU read are skipped, the event names why | `tests/test_cpld_dump.py::test_a_silent_bmc_before_the_diag_skips_it_after_one_call`, `::test_a_bmc_silent_after_the_diag_keeps_the_dump_and_skips_the_rest`, `::test_an_ipmitool_past_the_brokers_own_bound_is_a_silent_bmc` |
 | I109 the dump and the episode's incident folders are cross-linked both ways | `tests/test_cpld_dump.py::test_a_chip_dead_incident_and_its_dump_are_linked`, `::test_an_incident_after_the_dump_links_to_it`, `::test_an_incident_just_before_the_episode_opened_is_linked`, `::test_no_link_outside_the_episode` |
