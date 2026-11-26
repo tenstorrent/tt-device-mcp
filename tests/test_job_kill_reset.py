@@ -20,7 +20,7 @@ import httpx2
 import pytest
 
 from tests.conftest import fsm_dirty, patch_health_event
-from tests.test_eth_timeout_reset import ADVANCING, mesh  # noqa: F401 (fixture)
+from tests.test_eth_timeout_reset import ADVANCING, TIMED_OUT, mesh  # noqa: F401 (fixture)
 from tt_device_mcp import constants
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
@@ -283,8 +283,9 @@ async def test_a_plain_exit_that_takes_the_clean_exit_shortcut_runs_no_reset(pre
     [
         (None, f"{monitor_mod.ETH_LINK_DROP_SKIP}: 31 of 32 links up"),
         (None, f"{monitor_mod.ETH_COULD_NOT_CHECK}: the read crashed"),
+        TIMED_OUT,
     ],
-    ids=["link-drop-skip", "could-not-check"],
+    ids=["link-drop-skip", "could-not-check", "timed-out"],
 )
 async def test_a_plain_exit_whose_eth_read_has_no_verdict_resets_before_the_full_pass(pre_pass, caplog, read):
     """The shortcut keeps the debt open through the read. A read with no verdict would run the traffic pass with no
@@ -296,6 +297,7 @@ async def test_a_plain_exit_whose_eth_read_has_no_verdict_resets_before_the_full
     assert pre_pass["resets"] == [["tt-smi", "-glx_reset"]], "one present-mesh reset"
     assert pre_pass["fabric"] == [1], "the only fabric pass ran after the reset"
     assert pre_pass["events"].count("kill_mesh_reset") == 1
+    assert pre_pass["events"].count("eth_timeout_mesh_reset") == (read is TIMED_OUT), "a timeout keeps its own row"
     assert srv.fsm.state is ServerState.HEALTHY, "released only on the post-reset full check"
     assert srv._kill_reset_debt() == ""
     (line,) = _pre_pass_lines(caplog)

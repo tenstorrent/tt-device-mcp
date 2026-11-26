@@ -2056,9 +2056,10 @@ cooldown (spec 04 I65) holds longer.
   and a read with a verdict that ends the gate with no traffic pass settles it with no reset. A
   read with no verdict (a link-drop skip, a read stopped by isolation, a crash or a timeout) would
   run the full pass in the same gate, so the gate skips that pass and pays the debt with the
-  present-mesh reset, then runs the full check, as above; the log line says `ran`. The reset's own
-  guards (I61: a multi-tray mesh, no dirty flag, no fault, no isolated chip, an unspent latch, no
-  cooldown) apply; where one refuses it, the full check decides, as in I69. A debt with any
+  present-mesh reset, then runs the full check, as above; the log line says `ran`. A timeout also
+  keeps I61's incident and journal row. The reset's own guards (I61: a multi-tray mesh, no dirty
+  flag, no fault, no isolated chip, an unspent latch, no cooldown) apply; where one refuses it, the
+  full check decides, as in I69. A debt with any
   broker-stop term (or an I69 runtime-init, clock or preemption term) is never given up for the
   shortcut, and a plain debt never replaces one that is already open. A job the broker re-adopted owes no plain debt (its end is I69's), and a runner
   error with no exit code owes none. Every post-job gate that follows a job logs one `server.log` line

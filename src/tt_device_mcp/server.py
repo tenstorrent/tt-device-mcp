@@ -7771,8 +7771,8 @@ async def device_health_gate(
         # a job that failed on a Python PermissionError. Only a clean HEALTHY device with a green last verdict skips it,
         # only on an armed host, and only when nothing touched the device's health during the job: no AER, link or bus
         # change, no contained chip, no reported fault, no reset owed. The eth read still runs below (run_eth), a
-        # frozen core still holds, and a read with no verdict, a link-drop skip included, still runs the full pass
-        # (fabric_stale is forced for it).
+        # frozen core still holds, and a read with no verdict, a link-drop skip included, runs the full pass (fabric_stale
+        # is forced for it), after the present-mesh reset when a plain nonzero-exit debt is open (I116).
         skip_forced = (
             force_fabric
             and clean_exit_code is not None
@@ -7948,15 +7948,16 @@ async def device_health_gate(
                 dirty_job = {**dirty_job, "pcie": pcie}
         if fabric_ok is not None:
             last_fabric_check_monotonic = time.monotonic()
-        # The probe pass took the I61 skip: the read timed out, host-pci and the snapshot (every chip,
-        # ARC healthy) were OK, and no fabric pass ran. The mesh is not proven, so it is not healthy.
+        # The probe pass skipped the fabric pass for a reset: the read had no verdict, host-pci and the snapshot (every
+        # chip, ARC healthy) were OK, and no fabric pass ran. The mesh is not proven, so it is not healthy. An open plain
+        # debt (I116) takes any no-verdict read; I61 takes the timeout alone, and both may name the same read.
         owed_reset = (
             eth_timeout_reset
             and bool(plain_shortcut)
             and healthy
             and _eth_timeout_reset_shape(evidence, any_cause=True)
         )
-        eth_timeout_due = eth_timeout_reset and healthy and not owed_reset and _eth_timeout_reset_shape(evidence)
+        eth_timeout_due = eth_timeout_reset and healthy and _eth_timeout_reset_shape(evidence)
         if eth_timeout_due:
             healthy = False
             eth_reason = str((evidence.get("eth_heartbeat") or {}).get("detail") or "")
@@ -7977,10 +7978,11 @@ async def device_health_gate(
             kill_reset_due = (kill_reset and healthy) or owed_reset
         if owed_reset:
             kill_debt = plain_shortcut
-            _log(
-                f"eth-heartbeat reached no verdict after a clean exit with all {expected} chips present, host-pci OK "
-                f"and ARC healthy — paying the reset the failed job owes before the full check"
-            )
+            if not eth_timeout_due:
+                _log(
+                    f"eth-heartbeat reached no verdict after a clean exit with all {expected} chips present, host-pci "
+                    f"OK and ARC healthy — paying the reset the failed job owes before the full check"
+                )
         if kill_reset or plain_shortcut:
             _clear_kill_reset_debt()
         if kill_check_passed:
