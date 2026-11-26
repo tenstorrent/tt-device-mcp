@@ -177,6 +177,41 @@ async def test_the_runner_starts_every_job_on_a_fresh_exit_file_its_trap_writes(
     assert not exit_file.exists()
 
 
+@pytest.mark.asyncio
+async def test_the_runner_gives_every_job_a_fabric_ok_path_and_clears_a_stale_marker(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 04 I32: a job is told where to leave its fabric-ok marker, and an earlier job's file at that
+    path is gone before it starts and after its gate."""
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path / "exit"))
+    (tmp_path / "exit").mkdir()
+    ws = _quiet_runner(monkeypatch, tmp_path)
+    marker = tmp_path / "exit" / "971.fabric-ok"
+    marker.write_text("{}")  # an earlier job 971's claim
+
+    # Exits 7 if the variable is not the path or the earlier job's marker is still there.
+    job = _job(
+        tmp_path,
+        ws,
+        "971",
+        f'test "$TT_DEVICE_MCP_FABRIC_OK" = {marker} && test ! -e {marker} || exit 7; echo {{}} > {marker}; exit 3',
+    )
+    await srv.get_job_queue().put("971")
+    job.queued_at = _ago(1)  # the runner's bookkeeping parses it
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        for _ in range(500):  # past the job's end: the file goes with its post-job gate
+            if job.finished_at and not marker.exists():
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+    assert job.exit_code == 3, f"the job did not get its own fresh marker path (exit {job.exit_code})"
+    assert not marker.exists(), "the job's marker outlived its post-job gate"
+
+
 # --- startup ------------------------------------------------------------------------------------
 
 

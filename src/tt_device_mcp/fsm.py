@@ -359,6 +359,8 @@ class ServerFsm:
         run_fabric: bool = True,
         run_eth: bool = False,
         fabric_stale: bool = True,
+        eth_no_verdict_reset: bool = False,
+        fabric_light: bool = False,
         recovery: "Optional[Recovery]" = None,
     ) -> tuple[bool, dict]:
         """Trigger one probe pass of the system — the root's read of the mesh, routed through the
@@ -371,14 +373,25 @@ class ServerFsm:
         ``recovery`` lets a caller that already chose its pass-scoped platform keep every read of that pass on the same
         choice; omitted, the platform is selected fresh. ``run_eth`` asks for the passive eth read without the traffic
         pass (spec 03 I30); it and ``fabric_stale`` (may a link-drop skip of that read buy the traffic pass) are passed
-        on only when ``run_eth`` is set, so a ``_verify_device`` test fake that predates them keeps its signature."""
+        on only when ``run_eth`` is set, so a ``_verify_device`` test fake that predates them keeps its signature.
+        ``eth_no_verdict_reset`` (spec 03 I116) and ``fabric_light`` (I115) are passed on only when set, for the same
+        reason."""
         r = recovery if recovery is not None else self.select_recovery()
+        light = {"fabric_light": True} if fabric_light else {}
         if run_eth:
+            extra = {"eth_no_verdict_reset": True} if eth_no_verdict_reset else {}
             healthy, evidence = await r._verify_device(
-                expected, log, run_fabric=run_fabric, phase=phase, run_eth=True, fabric_stale=fabric_stale
+                expected,
+                log,
+                run_fabric=run_fabric,
+                phase=phase,
+                run_eth=True,
+                fabric_stale=fabric_stale,
+                **extra,
+                **light,
             )
         else:
-            healthy, evidence = await r._verify_device(expected, log, run_fabric=run_fabric, phase=phase)
+            healthy, evidence = await r._verify_device(expected, log, run_fabric=run_fabric, phase=phase, **light)
         FABRIC_DEBT.note_evidence(evidence)
         return healthy, evidence
 

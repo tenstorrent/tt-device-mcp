@@ -435,11 +435,14 @@ def _no_core_dump() -> None:
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 
-def build_command(descriptor: bool = True) -> Optional[tuple[list[str], dict[str, str]]]:
+def build_command(descriptor: bool = True, traffic: bool = True) -> Optional[tuple[list[str], dict[str, str]]]:
     """The argv + env to run the fabric check with, or ``None`` when nothing is configured/available to run at all.
 
     ``TT_DEVICE_MCP_FABRIC_CHECK_CMD`` set names an operator's own wrapper, run through ``/bin/bash -c`` exactly as
-    before — unchanged semantics for anyone pointed at ``deploy/tt-device-fabric-check.sh`` or an equivalent.
+    before — unchanged semantics for anyone pointed at ``deploy/tt-device-fabric-check.sh`` or an equivalent. A light
+    run (``traffic=False``) exports ``TT_DEVICE_MCP_FABRIC_LIGHT=1`` in the wrapper's env so a wrapper that understands
+    it (the shipped ``deploy/tt-device-fabric-check.sh`` does) can drop its own traffic pass; the argv for an override
+    is always the traffic-pass one.
 
     Unset, this resolves the pinned validator under ``TTDEV_VALIDATOR_ROOT`` (default
     ``/opt/tt-device-broker/validator``) the same way that script did: the binary at
@@ -451,13 +454,23 @@ def build_command(descriptor: bool = True) -> Optional[tuple[list[str], dict[str
 
     ``descriptor=False`` drops the cabling descriptor: the traffic-only rerun after a topology mismatch.
 
+    ``traffic=False`` drops the all-link Ethernet traffic pass: the validator still discovers the mesh, opens the
+    fabric and counts every inter-chip link against the descriptor, and its verdict keeps its usual meaning —
+    fewer links than the cabling expects still fails the check. With no descriptor there is nothing to count against,
+    so the run keeps the traffic pass.
+
     Run by a non-root server, the cache, output and runtime root move to ``fabric-check/`` under its own
     state dir (``_scratch_runtime_root``), with ``TT_METAL_LOGS_PATH`` there too. If that cannot be made
     writable the command is still returned, marked ``NOT_WRITABLE_ENV``: the check is configured but
     cannot run, which ``check()`` reports without starting the validator (a skip, never a pass)."""
+
     override = os.environ.get("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "").strip()
     if override:
-        return ["/bin/bash", "-c", override], {**os.environ, "PYTHONUNBUFFERED": "1"}
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        if not traffic:
+            # The shipped wrapper reads this to drop its own --send-traffic (spec 03 I115).
+            env["TT_DEVICE_MCP_FABRIC_LIGHT"] = "1"
+        return ["/bin/bash", "-c", override], env
 
     if validator_missing() is not None:
         return None
@@ -480,7 +493,9 @@ def build_command(descriptor: bool = True) -> Optional[tuple[list[str], dict[str
         pass
     iters = os.environ.get("TTDEV_FABRIC_ITERS", "").strip() or "1"
 
-    argv = [binpath, *desc_argv, "--output-path", out, "--hard-fail", "--send-traffic", "--num-iterations", iters]
+    # A light run with no descriptor has no link count to check against: it keeps the traffic pass.
+    traffic_argv = ["--send-traffic", "--num-iterations", iters] if traffic or not desc_argv else []
+    argv = [binpath, *desc_argv, "--output-path", out, "--hard-fail", *traffic_argv]
     env = {
         **os.environ,
         "PYTHONUNBUFFERED": "1",

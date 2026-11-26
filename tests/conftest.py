@@ -113,10 +113,12 @@ def reset_post_reset_fabric_debt():
     FABRIC_DEBT.owed = ""
     FABRIC_DEBT.pass_monotonic = 0.0
     FABRIC_DEBT.reset_monotonic = FABRIC_DEBT.settle_served = 0.0
+    FABRIC_DEBT.tenant_job, FABRIC_DEBT.tenant_wall = "", 0.0
     yield
     FABRIC_DEBT.owed = ""
     FABRIC_DEBT.pass_monotonic = 0.0
     FABRIC_DEBT.reset_monotonic = FABRIC_DEBT.settle_served = 0.0
+    FABRIC_DEBT.tenant_job, FABRIC_DEBT.tenant_wall = "", 0.0
 
 
 @pytest.fixture(autouse=True)

@@ -1194,6 +1194,13 @@ preempt_forced_job_ids: set = set()
 # and why, and when the debt was taken (monotonic); 0.0 is none. Any reset since settles it.
 _kill_reset_owed: str = ""
 _kill_reset_owed_at: float = 0.0
+# Spec 03 I116: the open debt was taken only because the job ended without exit 0 (a plain nonzero exit or a
+# signal death); no broker stop, hang or leftover clock stands behind it. Such a debt gives way to the I36
+# shortcut, which runs no traffic pass for the reset to precede.
+_kill_reset_plain: bool = False
+# Spec 03 I116: seconds the current post-job gate spent on its pre-pass reset (the reset and the full check
+# after it), or None when it ran none. The gate sets it; the post-job caller logs it once and clears it.
+_pre_pass_reset_sec: Optional[float] = None
 # Spec 03 I89: the stopped job behind the debt, so the reset can wait for it to be gone: its scope,
 # its tag, the (pid, starttime) of every process its end's sweep left alive, and when that sweep
 # ended (monotonic). Empty for a debt with no job record (a re-adopted job): only holders are waited on.
@@ -2019,6 +2026,23 @@ def job_exit_dir() -> Path:
 
 def job_exit_file(job_id: str) -> Path:
     return job_exit_dir() / f"{job_id}.exit"
+
+
+# Spec 04 I32: where a job that proved the fabric itself after its last reset says so; the env var carries the path.
+FABRIC_OK_ENV = "TT_DEVICE_MCP_FABRIC_OK"
+# Seconds a marker's checked_at may lie outside the job's start..end window (clock rounding between the two writers).
+FABRIC_OK_WINDOW_SLACK_SEC = 5.0
+
+
+def job_fabric_ok_file(job_id: str) -> Path:
+    return job_exit_dir() / f"{job_id}.fabric-ok"
+
+
+def clear_job_fabric_ok_file(job_id: str) -> None:
+    try:
+        job_fabric_ok_file(job_id).unlink()
+    except OSError:
+        pass
 
 
 def _exit_trap_preamble(exit_file: str) -> str:
@@ -2857,6 +2881,7 @@ def _reset_for_testing():
     global _hold_episode_neutral
     global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic
     global _dispatch_reset_spent, _kill_reset_owed, _kill_reset_owed_at, _pre_reset_blocker
+    global _kill_reset_plain, _pre_pass_reset_sec
     global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
     global device_op_stage_started_at, device_held_since, device_hold_escalated_monotonic, tenant_job_degraded_since
     global device_hold_deadline_bucket
@@ -2880,6 +2905,8 @@ def _reset_for_testing():
     _dispatch_reset_spent = False
     _kill_reset_owed = ""
     _kill_reset_owed_at = 0.0
+    _kill_reset_plain = False
+    _pre_pass_reset_sec = None
     request_killed_job_ids.clear()
     reset_killed_job_ids.clear()
     preempt_forced_job_ids.clear()
@@ -4066,7 +4093,7 @@ def _note_tenant_reset(chips: list, job: str = "") -> None:
     if not job:
         return
     health_event_detached("tenant_reset_detected", chips=chips, job=job)
-    FABRIC_DEBT.note_reset(f"tenant job {job}", health_event_detached)
+    FABRIC_DEBT.note_reset(f"tenant job {job}", health_event_detached, tenant_job=job)
 
 
 def _post_reset_settle_left(expected: int, recovery) -> float:
@@ -4148,6 +4175,59 @@ async def _check_tenant_reset_at_job_end(job_id: str) -> None:
     back = s.tenant_reset_at_job_end(beats)
     if back:
         _note_tenant_reset(back, job=job_id)
+
+
+def _fabric_ok_rejection(job: Job) -> str:
+    """Why the job's fabric-ok marker may not settle its tenant reset (spec 04 I32), or "" when it may: the job
+    exited 0, the open debt is its own tenant reset alone, and its marker is the job's own plain file that parses, with
+    a passing check after both its last reset and the last tenant reset the broker noted, inside the job's run,
+    covering every chip."""
+    if job.status != JobStatus.COMPLETED or job.exit_code != 0:
+        return "the job did not exit 0"
+    if FABRIC_DEBT.tenant_job != job.id:
+        return "a broker reset, or another job's, is owed too"
+    try:
+        fd = os.open(job_fabric_ok_file(job.id), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return "no marker"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid not in (os.geteuid(), job.peer_uid):
+            return "the marker is not the job's own plain file"
+        marker = json.loads(os.read(fd, 4096))
+        reset_at, checked_at, chips = float(marker["reset_at"]), float(marker["checked_at"]), int(marker["chips"])
+    except (OSError, ValueError, KeyError, TypeError, OverflowError):
+        return "the marker does not parse"
+    finally:
+        os.close(fd)
+    try:
+        start, end = (datetime.fromisoformat(t).timestamp() for t in (job.started_at, job.finished_at))
+    except (TypeError, ValueError):
+        return "the job's run window is unknown"
+    if checked_at <= reset_at:
+        return "checked_at is not after reset_at"
+    if checked_at <= FABRIC_DEBT.tenant_wall:
+        return "checked_at is not after the last tenant reset the broker saw"
+    slack = FABRIC_OK_WINDOW_SLACK_SEC
+    if not start - slack <= checked_at <= end + slack:
+        return "checked_at is outside the job's run"
+    expected = health_monitor.expected(len(_present_chip_indices())) if health_monitor is not None else 0
+    if chips != expected:
+        return f"the marker covers {chips} chips, the box has {expected}"
+    return ""
+
+
+def _trust_fabric_ok(job: Job) -> str:
+    """The job's id when its fabric-ok marker may settle the check its tenant reset owes (spec 04 I32), else "". One
+    health event says which, with the reason when rejected. Nothing is judged while no debt is owed."""
+    if not FABRIC_DEBT.owed:
+        return ""
+    why = _fabric_ok_rejection(job)
+    if why:
+        health_event_detached("tenant_fabric_ok_rejected", job=job.id, why=why)
+        return ""
+    health_event_detached("tenant_fabric_ok_trusted", job=job.id)
+    return job.id
 
 
 # Spec 03 I78: how old the passing fabric verdict a hold lifts on may be. The full check ends with the
@@ -5081,15 +5161,36 @@ def _names_topology_mismatch(text: str) -> bool:
     return text.startswith(_TOPOLOGY_HOLD) or _TOPOLOGY_VALIDATOR_LINE in text
 
 
+def _eth_no_verdict_reset_shape(evidence: dict) -> bool:
+    """Whether a probe pass took the spec 03 I116 skip: its eth read reached no verdict, host-pci and the
+    snapshot were OK, and no fabric pass ran. Any other shape keeps the pass."""
+    eth_ev = evidence.get("eth_heartbeat") or {}
+    return (
+        eth_ev.get("ok") is None
+        and (evidence.get("hostpci") or {}).get("ok") is True
+        and (evidence.get("snapshot") or {}).get("ok") is True
+        and "fabric" not in evidence
+    )
+
+
 def _owe_kill_reset(why: str) -> None:
-    """Spec 03 I69: a job the broker stopped mid-run owes the mesh one reset, then the full check."""
-    global _kill_reset_owed, _kill_reset_owed_at, _kill_reset_job
+    """Spec 03 I69: a job the broker stopped mid-run owes the mesh one reset, then the full check. Spec 03 I116:
+    so does a job that ended without exit 0."""
+    global _kill_reset_owed, _kill_reset_owed_at, _kill_reset_job, _kill_reset_plain
     _kill_reset_owed = why
+    _kill_reset_plain = False
     _kill_reset_owed_at = time.monotonic()
     _kill_reset_job = {}
     if logger:
         logger.info(f"CLEAN-GATE {why}: the mesh owes one reset, then the full check, before release")
     health_event("kill_reset_owed", why=why)
+
+
+def _note_plain_exit_debt(stronger_debt_open: bool) -> None:
+    """Spec 03 I116: the debt just owed stands for the job's nonzero exit alone, unless a broker-stop debt was
+    already open: that one is replaced by this entry and must stay one the clean-exit shortcut never settles."""
+    global _kill_reset_plain
+    _kill_reset_plain = bool(_kill_reset_owed) and not stronger_debt_open
 
 
 def _note_kill_reset_job(job: dict) -> None:
@@ -5101,8 +5202,9 @@ def _note_kill_reset_job(job: dict) -> None:
 
 
 def _clear_kill_reset_debt() -> None:
-    global _kill_reset_owed, _kill_reset_owed_at, _kill_reset_job
+    global _kill_reset_owed, _kill_reset_owed_at, _kill_reset_job, _kill_reset_plain
     _kill_reset_owed = ""
+    _kill_reset_plain = False
     _kill_reset_owed_at = 0.0
     _kill_reset_job = {}
 
@@ -7637,6 +7739,8 @@ async def device_health_gate(
     force_fabric: bool = False,
     with_recover: bool = True,
     clean_exit_code: Optional[int] = None,
+    job_exit0: bool = False,
+    fabric_ok_job: str = "",
 ) -> None:
     """Unified health gate run while the device is IDLE around a job.
 
@@ -7657,8 +7761,12 @@ async def device_health_gate(
     ``clean_exit_code`` is the exit code of the failed job behind ``force_fabric`` when it ended in a clean software
     exit (see ``_clean_software_exit_code``). On a HEALTHY, clean device whose last fabric verdict was OK, with the eth
     rung armed and no device event during the job, the forced pass becomes the passive eth read of a clean exit
-    (spec 03 I36)."""
-    global _dispatch_reset_spent, _isolation_kill_hold
+    (spec 03 I36).
+
+    ``job_exit0`` says the job behind a post-job pass ended with exit 0; only then may its fabric check run light
+    (spec 03 I115). ``fabric_ok_job`` is the job whose trusted fabric-ok marker settles its own tenant reset's
+    check choice: that debt alone then runs the check light (spec 04 I32)."""
+    global _dispatch_reset_spent, _isolation_kill_hold, _pre_pass_reset_sec
     # Fabric output from before this pass is another pass's transcript: an incident bundle names
     # it stale instead of presenting it as this pass's (spec 03 I57).
     pass_started = datetime.now()
@@ -7784,8 +7892,8 @@ async def device_health_gate(
         # a job that failed on a Python PermissionError. Only a clean HEALTHY device with a green last verdict skips it,
         # only on an armed host, and only when nothing touched the device's health during the job: no AER, link or bus
         # change, no contained chip, no reported fault, no reset owed. The eth read still runs below (run_eth), a
-        # frozen core still holds, and a read with no verdict, a link-drop skip included, still runs the full pass
-        # (fabric_stale is forced for it).
+        # frozen core still holds, and a read with no verdict, a link-drop skip included, runs the full pass (fabric_stale
+        # is forced for it), after the present-mesh reset when a plain nonzero-exit debt is open (I116).
         skip_forced = (
             force_fabric
             and clean_exit_code is not None
@@ -7798,9 +7906,12 @@ async def device_health_gate(
             and not _pcie_cycle.get("job_rows")
             and not isolated_chips
             and not device_fault_reported
-            and not _kill_reset_debt()
+            and (not _kill_reset_debt() or _kill_reset_plain)
             and not _post_reset_debt()
         )
+        # Spec 03 I116: a plain debt stays open through the eth read; only a read with no verdict, which runs the traffic
+        # pass, pays it with the present-mesh reset first.
+        plain_shortcut = _kill_reset_debt() if skip_forced and _kill_reset_plain else ""
         if skip_forced:
             _log(
                 f"the failed job ended in a clean software exit (exit {clean_exit_code}) and no device event: "
@@ -7823,7 +7934,9 @@ async def device_health_gate(
         # today's path (the dirty exit's pass). The startup gate pays a debt it finds the same way (I74): a re-adopted
         # job the broker stopped before it ran. Its one full check, fabric included, then follows the reset instead of a
         # pass before it, and the post-job gate owes nothing after. A debt owed after this gate stays open.
-        kill_debt = _kill_reset_debt() if with_recover and phase in ("post-job", "startup") else ""
+        kill_debt = (
+            _kill_reset_debt() if with_recover and phase in ("post-job", "startup") and not plain_shortcut else ""
+        )
         if kill_debt:
             refused = (
                 "this hold episode's present-mesh reset is spent"
@@ -7870,14 +7983,13 @@ async def device_health_gate(
         # function that costs real time, and a read-only pass has no rung to spend it on.
         # A reset with no passing fabric pass since (04 I32) runs the pass here too, so the gate
         # settles it in place; a job boundary that followed no reset adds no time.
-        full = deferral is not None or (
+        owed_full = with_recover and not kill_reset and not prejob and bool(_post_reset_debt())
+        other_full = deferral is not None or (
             with_recover
             and not kill_reset
-            and (
-                held_unproven
-                or ((not prejob) and (dirty or force_fabric or (run_fabric and stale) or bool(_post_reset_debt())))
-            )
+            and (held_unproven or ((not prejob) and (dirty or force_fabric or (run_fabric and stale))))
         )
+        full = other_full or owed_full
         # A clean post-job exit still gets the passive eth read when the rung is armed (I30): chips that all tick say
         # nothing about a wedged eth core, and the next tenant is the one who finds it. The read costs ~1s and pushes no
         # traffic. A frozen verdict holds below; a read that reaches no verdict runs the full pass inside this same
@@ -7888,6 +8000,21 @@ async def device_health_gate(
         run_eth = (
             with_recover and phase in ("post-job", "post-step") and not full and not kill_reset and eth_check_armed
         )
+        # Spec 03 I116: a job that ended without exit 0 owes this episode's one present-mesh reset before the full
+        # check, so a read that reaches no verdict may skip the pre-reset fabric pass. A clean exit (exit 0) owes none:
+        # its read is tried again and a no-verdict read runs the pass (I61). Each guard here is one a reset would
+        # otherwise trip on; any that fails keeps the pass.
+        plain_reset_first = (
+            run_eth
+            and bool(plain_shortcut)
+            and phase == "post-job"
+            and expected > 1
+            and not dirty
+            and not device_fault_reported
+            and not isolated_chips
+            and not _dispatch_reset_spent
+            and not recovery_mechanism.cooling()
+        )
         # Spec 04 I32: a multi-tray mesh settles after the reset the full check is owed for, held.
         if full:
             await _post_reset_settle(expected, recovery, _log)
@@ -7895,12 +8022,24 @@ async def device_health_gate(
         # or a step only. Read-only telemetry: the verdict below never reads them.
         pcie_on = phase in ("post-job", "post-step")
         pcie_before = await _pcie_snapshot() if pcie_on else {}
+        # Spec 03 I115: the post-job gate's fabric check runs light, but only after a job that
+        # ended with exit 0, on a HEALTHY device, where the pass cannot decide a hold lift.
+        fabric_light = (
+            job_exit0
+            and fsm.state is ServerState.HEALTHY
+            and not other_full
+            and (not owed_full or (bool(fabric_ok_job) and FABRIC_DEBT.tenant_job == fabric_ok_job))
+            and not device_fault_reported
+            and health_monitor.last_fabric_ok is not False
+        )
         healthy, evidence = await fsm.observe(
             expected,
             _log,
             run_fabric=full,
             run_eth=run_eth,
             fabric_stale=stale or skip_forced,
+            eth_no_verdict_reset=plain_reset_first,
+            fabric_light=fabric_light,
             phase=phase,
             recovery=recovery,
         )
@@ -7931,6 +8070,9 @@ async def device_health_gate(
                 dirty_job = {**dirty_job, "pcie": pcie}
         if fabric_ok is not None:
             last_fabric_check_monotonic = time.monotonic()
+        # The probe pass skipped the fabric pass for a reset: the read had no verdict, host-pci and the snapshot (every
+        # chip, ARC healthy) were OK, and no fabric pass ran. The mesh is not proven, so it is not healthy.
+        owed_reset = plain_reset_first and healthy and _eth_no_verdict_reset_shape(evidence)
         # Spec 03 I69: the gate has taken the debt. With every chip present and ARC healthy it is paid
         # by the present-mesh reset below; anything else is another fault, whose own rung (and the
         # full check that rung's verify runs) decides. Either way it is not owed twice.
@@ -7940,8 +8082,14 @@ async def device_health_gate(
         if deferral is not None:
             kill_reset_due = not kill_check_passed and _fast_checks_ok(state)
         else:
-            kill_reset_due = kill_reset and healthy
-        if kill_reset:
+            kill_reset_due = (kill_reset and healthy) or owed_reset
+        if owed_reset:
+            kill_debt = plain_shortcut
+            _log(
+                f"eth-heartbeat reached no verdict after a failed job with all {expected} chips present, host-pci "
+                f"OK and ARC healthy — paying the reset the failed job owes before the full check"
+            )
+        if kill_reset or plain_shortcut:
             _clear_kill_reset_debt()
         if kill_check_passed:
             _log(f"{kill_debt}: the full check passed after a clean stop — no reset needed")
@@ -8531,6 +8679,7 @@ async def device_health_gate(
             metrics.stage_fired("smi_reset", "blocked")
         else:
             reset_clock = recovery_mechanism.last_reset_monotonic
+            fire_began = time.monotonic()
             recovered = await _fire(stage)
             # The latch is spent only once a reset actually started (the clock moves at reset begin):
             # one the per-host gate refused leaves the episode's reset unspent.
@@ -8540,6 +8689,9 @@ async def device_health_gate(
                 and recovery_mechanism.last_reset_monotonic != reset_clock
             ):
                 _dispatch_reset_spent = True
+                if ev.kill_reset_due and phase == "post-job":
+                    # Spec 03 I116: the reset the debt owed ran, ahead of the full check that releases the device.
+                    _pre_pass_reset_sec = time.monotonic() - fire_began
             if recovered:
                 return
 
@@ -12648,7 +12800,12 @@ def _clean_software_exit_code(job: "Job") -> Optional[int]:
 
 
 async def _verify_device_after_job(
-    job_log_file: Optional[Path], job_failed: bool = False, clean_exit_code: Optional[int] = None
+    job_log_file: Optional[Path],
+    job_failed: bool = False,
+    clean_exit_code: Optional[int] = None,
+    job_exit0: bool = False,
+    fabric_ok_job: str = "",
+    job_exit: Optional[int] = None,
 ) -> None:
     """Post-job gate — runs at the END of every run (the finished job's caller has already been released, so this never
     delays their terminal/result): the enum/ARC snapshot always runs, so a chip that left the bus is flagged here — as
@@ -12662,9 +12819,15 @@ async def _verify_device_after_job(
     wedged eth core: a frozen core holds the door, and a read that reaches no verdict runs the traffic pass in the same
     gate. ``job_failed`` forces a CHECK, not a reset — an exit 1 from a pytest assertion is not evidence of broken
     silicon, and a clean software exit (``clean_exit_code``) whose quick checks all pass drops the forced pass
-    (spec 03 I36).
+    (spec 03 I36). After a job that ended with exit 0 (``job_exit0``) that pass runs light (spec 03 I115).
+
+    Spec 03 I116: one line and one journal row per gate say whether the pre-pass reset ran, with the job's exit code
+    (``job_exit``, None when no job record stands behind the gate).
 
     Never raises."""
+    global _pre_pass_reset_sec
+    _pre_pass_reset_sec = None
+    began = time.monotonic()
     try:
         await _device_health_gate(
             job_log_file,
@@ -12672,6 +12835,8 @@ async def _verify_device_after_job(
             run_fabric=False,
             force_fabric=job_failed,
             clean_exit_code=clean_exit_code,
+            job_exit0=job_exit0,
+            fabric_ok_job=fabric_ok_job,
         )
     except Exception as e:  # noqa: BLE001 - must never crash the runner
         # The gate threw before it could clear the device, so its state is unknown. Leaving it
@@ -12680,6 +12845,24 @@ async def _verify_device_after_job(
         _mark_device_dirty(f"post-job health gate error: {e}", why="gate_error")
         if logger:
             logger.error(f"post-job health gate error: {e}")
+    try:
+        reset_sec, _pre_pass_reset_sec = _pre_pass_reset_sec, None
+        ran = reset_sec is not None
+        exit_text = "n/a" if job_exit is None else str(job_exit)
+        if logger:
+            logger.info(
+                f"HEALTH-GATE[post-job] pre-pass reset: {'ran' if ran else 'skipped'} "
+                f"(job exit {exit_text}, {reset_sec if ran else 0.0:.0f}s)"
+            )
+        health_event(
+            "post_job_pre_pass_reset",
+            ran=ran,
+            job_exit=job_exit,
+            reset_sec=round(reset_sec, 1) if ran else 0.0,
+            gate_sec=round(time.monotonic() - began, 1),
+        )
+    except Exception:  # noqa: BLE001 - a log line must never end the runner
+        pass
 
 
 def _pty_read(fd: int) -> bytes:
@@ -14361,10 +14544,12 @@ async def _job_runner_loop():
             # Under privsep the job runs as its submitter, else as this broker's own uid.
             privsep_prefix = privsep_prefix_for(job.peer_uid, unit=job_scope_unit(job_id))
             await asyncio.to_thread(prepare_job_exit_file, job_id, job.peer_uid if privsep_prefix else os.geteuid())
+            await asyncio.to_thread(clear_job_fabric_ok_file, job_id)
             full_command = f"""
 {_exit_trap_preamble(str(exit_file))}set -e
 {activation_script}
 export {JOB_TAG_ENV}={job_tag}
+export {FABRIC_OK_ENV}={shlex.quote(str(job_fabric_ok_file(job_id)))}
 {job.command}
 """
 
@@ -15039,26 +15224,31 @@ export {JOB_TAG_ENV}={job_tag}
                 # Same debt for a job that failed on its own because the runtime could not bring the device up
                 # (its firmware init timed out on the cores) or said the device is unrecoverable before the reaper's
                 # grace ran out: it exits with a plain code, so the clean-exit shortcut (03 I36) would hand the same
-                # wedged mesh to the next job, and every job fails the same way. A plain failure keeps the shortcut.
+                # wedged mesh to the next job, and every job fails the same way.
                 init_fault = None
                 if not killed_by_reset and not known and not topo and job.status == JobStatus.FAILED:
                     init_fault = _scan_output_for_runtime_init_fault(job_log_file)
                     if init_fault is None and job.doomed_monotonic is not None:
                         init_fault = "runtime reported the device unrecoverable"
-                if (
-                    not killed_by_reset
-                    and not known
-                    and not topo
-                    and (
-                        job.status in (JobStatus.TIMEOUT, JobStatus.HUNG)
-                        or job_id in request_killed_job_ids
-                        or job_id in preempt_forced_job_ids
-                        or left_busy
-                        or init_fault
-                    )
-                ):
+                # Spec 03 I116: a job that ended without exit 0 on its own (a plain nonzero exit, or a signal death
+                # that left no other trace) owes the same one reset before the full traffic pass.
+                nonzero_end = (
+                    job.status in (JobStatus.FAILED, JobStatus.KILLED)
+                    and isinstance(job.exit_code, int)
+                    and job.exit_code != 0
+                )
+                broker_stop = bool(
+                    job.status in (JobStatus.TIMEOUT, JobStatus.HUNG)
+                    or job_id in request_killed_job_ids
+                    or job_id in preempt_forced_job_ids
+                    or left_busy
+                    or init_fault
+                )
+                if not killed_by_reset and not known and not topo and (broker_stop or nonzero_end):
+                    stronger_debt_open = bool(_kill_reset_debt()) and not _kill_reset_plain
                     _owe_kill_reset(
                         f"job {job_id} {job.status.value}"
+                        + (f" (exit {job.exit_code})" if nonzero_end and not broker_stop else "")
                         + (
                             f" with {len(left_busy)} chip(s) left at the busy AI clock "
                             f"(max {max(left_busy.values())} MHz)"
@@ -15067,6 +15257,8 @@ export {JOB_TAG_ENV}={job_tag}
                         )
                         + (f": {init_fault}" if init_fault else "")
                     )
+                    if not broker_stop:
+                        _note_plain_exit_debt(stronger_debt_open)
                     _note_kill_reset_job(
                         {
                             "scope": job_scope_unit(job_id) if privsep_prefix else None,
@@ -15166,12 +15358,16 @@ export {JOB_TAG_ENV}={job_tag}
                             clean_exit_code=(
                                 _clean_software_exit_code(job) if job_failed and not runner_error else None
                             ),
+                            job_exit0=job.status == JobStatus.COMPLETED and job.exit_code == 0,
+                            job_exit=job.exit_code if isinstance(job.exit_code, int) else None,
+                            fabric_ok_job=_trust_fabric_ok(job),
                         )
                 except Exception as e:  # noqa: BLE001 - never crash the runner
                     if logger:
                         logger.error(f"JOB_RUNNER post-job health gate error for job_id={job_id}: {e}")
                 finally:
                     post_job_gate_pending = False
+                    clear_job_fabric_ok_file(job_id)
 
                 # A job that did not finish cleanly may not have closed the device, which leaves
                 # its chips at the busy clock. Record it so the timeline shows it, blamed on the job

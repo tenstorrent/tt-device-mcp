@@ -2604,3 +2604,25 @@ async def test_one_hold_bound_tick_ends_a_readopted_preemptable_job_end_to_end(m
         if p.poll() is None:
             _REAL_KILLPG(p.pid, signal.SIGKILL)
         reaper.join(timeout=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command,exit0", [("true", True), ("exit 1", False)])
+async def test_the_runner_marks_only_an_exit_0_job_for_the_light_fabric_check(
+    monkeypatch, clear_job_state, command, exit0
+):
+    """Spec 03 I115: the runner tells the post-job gate the job ended with exit 0 only when it
+    completed with exit 0; a failed job's gate keeps the traffic pass."""
+    _free_device_lock(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    seen = []
+
+    async def _gate(job_log_file, job_failed=False, job_exit0=False, **_):
+        seen.append(job_exit0)
+
+    monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
+    job = srv.Job(id="990", owner="tenant", workspace="/tmp", command=command, queued_at="t", timeout_sec=30)
+    srv.jobs["990"] = job
+    await srv.get_job_queue().put("990")
+    await _run_until_finished(job, limit_sec=10)
+    assert seen == [exit0], seen

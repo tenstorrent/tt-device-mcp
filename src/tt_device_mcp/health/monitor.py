@@ -416,6 +416,8 @@ class HealthMonitor:
         force_fabric: bool = False,
         run_eth: bool = False,
         fabric_stale: bool = True,
+        eth_no_verdict_reset: bool = False,
+        fabric_light: bool = False,
         indices: Optional[list] = None,
         expected: Optional[int] = None,
         log: Optional[Callable[[str], None]] = None,
@@ -436,6 +438,16 @@ class HealthMonitor:
         A ``run_eth`` read that TIMED OUT with no verdict, on a pass whose host-pci read is OK, is read once more after a
         short settle (``_post_job_eth_read``, spec 03 I61). Still unmeasured, it runs the fabric pass in this same pass,
         like any other no-verdict read: a pass releases the device, a fail holds it and the bounded recovery takes over.
+
+        ``eth_no_verdict_reset`` (spec 03 I116) says the gate owes a failed job's present-mesh reset: a read that still
+        reaches no verdict (a link-drop skip included), on a pass whose host-pci read is OK, skips the fabric pass,
+        the gate resets next, and the full check after the reset runs the pass.
+
+        ``fabric_light`` drops the all-link Ethernet traffic pass from the fabric check this pass runs:
+        the validator still opens the fabric and counts every inter-chip link against the cabling
+        descriptor, so fewer links than expected still fails; with no descriptor the run keeps the
+        traffic pass. Only the gate's post-job phase on a healthy device sets it (spec 03
+        I115); every caller that can release a hold runs the traffic pass.
 
         Mirrors ``Recovery._verify_device``'s gentlest-first short-circuiting (a frozen heartbeat or a failed snapshot
         skips every heavier, more perturbing check below it — the traffic pass is only safe to run once nothing is known
@@ -469,6 +481,8 @@ class HealthMonitor:
                 force_fabric=force_fabric,
                 run_eth=run_eth,
                 fabric_stale=fabric_stale,
+                eth_no_verdict_reset=eth_no_verdict_reset,
+                fabric_light=fabric_light,
                 indices=indices,
                 expected=expected,
                 log=log,
@@ -492,6 +506,8 @@ class HealthMonitor:
         force_fabric: bool,
         run_eth: bool,
         fabric_stale: bool,
+        eth_no_verdict_reset: bool,
+        fabric_light: bool,
         indices: Optional[list],
         expected: Optional[int],
         log: Optional[Callable[[str], None]],
@@ -590,6 +606,9 @@ class HealthMonitor:
             link_drop_held = (
                 not fabric_asked and link_drop and not unseen and not fabric_stale and self.last_fabric_ok is True
             )
+            # Spec 03 I116: a failed job's owed present-mesh reset comes before the full pass, so a read
+            # that reached no verdict skips the pass here; the gate resets next and the full check follows.
+            reset_due = eth_no_verdict_reset and not fabric_asked and eok is None and not unseen and hp_ok is True
             if link_drop_held and log and self.last_fabric_skipped:
                 # A 77 since the green pass (it leaves last_fabric_ok alone) reached no verdict: no cover.
                 log(
@@ -600,6 +619,11 @@ class HealthMonitor:
                 log(
                     "eth links unverified after a clean exit — a recent passing fabric pass covers it, not repeating it"
                 )
+            elif reset_due and log:
+                log(
+                    "eth-heartbeat read reached no verdict after a failed job on a present mesh — skipping the "
+                    "pre-reset fabric pass; the full check runs after the present-mesh reset"
+                )
             elif not fabric_asked and eok is None and log:
                 log("eth-heartbeat reached no verdict after a clean exit — running the fabric traffic pass")
             if unseen:
@@ -607,9 +631,15 @@ class HealthMonitor:
                 if log:
                     log(f"fabric: UNHEALTHY — {fdetail}")
                 _record("fabric", fok, fdetail)
-            elif eok is not False and (fabric_asked or eok is None) and not link_drop_held:
-                self._deps.set_device_op_detail("health check: fabric traffic pass across all links (~45s)")
-                fok, fdetail = await self.verify_fabric_health()
+            elif eok is not False and (fabric_asked or eok is None) and not link_drop_held and not reset_due:
+                # Spec 03 I115: the gate asks for light only on a post-job pass that cannot decide a
+                # hold lift; every other pass keeps the traffic.
+                self._deps.set_device_op_detail(
+                    "health check: fabric traffic pass across all links (~45s)"
+                    if not fabric_light
+                    else "health check: light fabric open (links counted against the cabling)"
+                )
+                fok, fdetail = await self.verify_fabric_health(**({"light": True} if fabric_light else {}))
                 if log:
                     log(f"fabric: {'SKIPPED' if fok is None else ('OK' if fok else 'UNHEALTHY')} — {fdetail}")
                 _record("fabric", fok, fdetail)
@@ -1090,11 +1120,19 @@ class HealthMonitor:
             return False, f"chip(s) [{','.join(silent)}] returned no board_id/telemetry (ARC wedged)"
         return True, f"all {len(devs)} chips enumerated with live ARC telemetry"
 
-    async def verify_fabric_health(self, timeout_sec: float = FABRIC_CHECK_TIMEOUT_SEC) -> tuple[Optional[bool], str]:
+    async def verify_fabric_health(
+        self, timeout_sec: float = FABRIC_CHECK_TIMEOUT_SEC, *, light: bool = False
+    ) -> tuple[Optional[bool], str]:
         """Run the fabric traffic check (see ``health.monitors.fabric``), which pushes packets
         across every inter-chip ethernet link and reports non-zero if any link is unhealthy.
         This is the only check that proves the FABRIC actually moves data — the tt-smi snapshot
         only proves chips enumerate + ARC is alive.
+
+        ``light=True`` drops the all-link traffic pass and keeps everything else the check owes:
+        the validator opens the fabric, every expected chip stays covered by the gate's own
+        enum+ARC probes, and every inter-chip link is still counted against the cabling
+        descriptor, so fewer links than the cabling expects still fails the check. An operator's
+        override gets ``TT_DEVICE_MCP_FABRIC_LIGHT=1`` in its env and decides itself (spec 03 I115).
 
         Returns ``(ok, detail)``:
           * ``None`` => SKIPPED (not configured, no built-in validator installed, the command
@@ -1131,18 +1169,20 @@ class HealthMonitor:
         async with scope:
             # Spec 03 I101: the traffic pass starts the device; no gated chip config read until it ends.
             with pcie_quiet.window("fabric"):
-                return await self._verify_fabric_health_timed(timeout_sec)
+                return await self._verify_fabric_health_timed(timeout_sec, **({"light": True} if light else {}))
 
     def _readers_log(self, line: str) -> None:
         log = self._logger()
         if log:
             log.info(f"HEALTH {line}")
 
-    async def _verify_fabric_health_timed(self, timeout_sec: float) -> tuple[Optional[bool], str]:
+    async def _verify_fabric_health_timed(
+        self, timeout_sec: float, *, light: bool = False
+    ) -> tuple[Optional[bool], str]:
         _t0 = time.monotonic()
         _fabric_inflight_begin(self._fabric_check_cmd() or "built-in")
         try:
-            ok, detail = await self._verify_fabric_health_body(timeout_sec)
+            ok, detail = await self._verify_fabric_health_body(timeout_sec, **({"light": True} if light else {}))
         except asyncio.CancelledError as e:
             # Cancelled under us (a shutdown that unwinds the loop), or the validator itself killed
             # by the shutdown (I63): say so now, the mark goes.
@@ -1243,7 +1283,9 @@ class HealthMonitor:
         health_event("snapshot_no_verdict", cause="killed_by_dead_chip_isolation", reason=why[:400])
         return f"{SNAPSHOT_KILLED_BY_ISOLATION}: {why}; no verdict, a full pass is owed after recovery"
 
-    async def _verify_fabric_health_body(self, timeout_sec: float) -> tuple[Optional[bool], str]:
+    async def _verify_fabric_health_body(
+        self, timeout_sec: float, *, light: bool = False
+    ) -> tuple[Optional[bool], str]:
         self._fabric_killed = ""
         # Spec 04 I76: a PCI-wedged latch set while this pass runs ends it at once, no verdict. Only the
         # power cycle recovers the mesh, and it waits on the device op this check holds. A latch already
@@ -1257,7 +1299,7 @@ class HealthMonitor:
             return wedged["why"]
 
         override = self._fabric_check_cmd()
-        built = fabric.build_command()
+        built = fabric.build_command(**({"traffic": False} if light else {}))
         if built is None:
             # The authoritative fabric verdict, and preflight hard-requires it — so reaching here means
             # the mesh goes entirely unvalidated on the one check that proves it moves data. Journal it.
