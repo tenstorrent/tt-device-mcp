@@ -270,6 +270,21 @@ async def test_a_plain_exit_reset_says_so_and_a_kill_reset_says_kill(pre_pass, c
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("exit_code", [8, 137], ids=["plain-nonzero", "oom-killed"])
+async def test_a_plain_exit_debt_paid_outside_the_shortcut_says_plain_exit(pre_pass, caplog, exit_code):
+    """No clean-exit shortcut here: the plain debt goes through the kill-debt reset, and its text and cause still say
+    the job ended without exit 0, not that a kill left the mesh wedged."""
+    srv._owe_kill_reset(_PLAIN_DEBT)
+    srv._note_plain_exit_debt(False)
+    await srv._verify_device_after_job(None, job_failed=True, job_exit=exit_code)
+    (row,) = _kill_mesh_reset_rows(pre_pass)
+    assert row["cause"] == "plain_exit"
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "a job that ended without exit 0 owes the mesh one reset" in text
+    assert "a kill mid-run can leave the mesh wedged" not in text
+
+
+@pytest.mark.asyncio
 async def test_a_kill_reset_keeps_its_kill_text_and_cause(pre_pass, caplog):
     srv._owe_kill_reset("job 7 timeout")
     await srv._verify_device_after_job(None, job_failed=True, job_exit=-9)

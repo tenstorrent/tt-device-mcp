@@ -7949,6 +7949,8 @@ async def device_health_gate(
                 _clear_kill_reset_debt()
                 kill_debt = ""
         kill_reset = bool(kill_debt)
+        # The debt's kind, read before the clear below: a plain nonzero-exit debt is told apart from a kill debt.
+        plain_exit_debt = kill_reset and _kill_reset_plain
         # Spec 03 I89: on a multi-tray mesh the reset waits until the stopped job is gone and the mesh
         # has settled; the chips read after the settle route it (observe below reads them again).
         post_kill = await _post_kill_quiesce(expected, _log) if kill_reset and expected >= 2 * UBB_CHIP_COUNT else None
@@ -8106,7 +8108,7 @@ async def device_health_gate(
                     f"{kill_debt}: all {expected} chip(s) present and ARC healthy, but "
                     + (
                         "a job that ended without exit 0 owes the mesh one reset"
-                        if owed_reset
+                        if owed_reset or plain_exit_debt
                         else "a kill mid-run can leave the mesh wedged"
                     )
                     + " — one reset, then the full check, before release"
@@ -8117,7 +8119,7 @@ async def device_health_gate(
                 phase=phase,
                 expected=expected,
                 why=why[:200],
-                cause="plain_exit" if owed_reset else "kill",
+                cause="plain_exit" if owed_reset or plain_exit_debt else "kill",
             )
         if post_kill is not None:
             route = _post_kill_route(post_kill, expected, kill_reset_due, kill_check_passed)
