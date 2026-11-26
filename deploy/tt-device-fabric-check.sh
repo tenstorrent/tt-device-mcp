@@ -53,6 +53,12 @@ set -u
 EXIT_CANNOT_CHECK=77
 EXIT_HARDWARE_FAULT=78
 
+# Spec 03 I115: the broker's post-job fabric check runs light — the fabric is opened and every
+# inter-chip link is counted against the cabling, without the all-link traffic pass (which
+# power-cycled these very hosts). Only a wrapper the broker can signal with
+# TT_DEVICE_MCP_FABRIC_LIGHT=1 gets here; anything else runs the full traffic pass.
+LIGHT="${TT_DEVICE_MCP_FABRIC_LIGHT:-}"
+
 # Once $OUT exists, every log line also goes to $LAST: a file overwritten each run that keeps the last
 # run's verdict and its whole output where an operator can read it after the journal rotated.
 LAST=""
@@ -154,12 +160,23 @@ if [ "$hp_need" -gt 0 ] && [[ "$hp_have" =~ ^[0-9]+$ ]] && [ "$hp_have" -lt "$hp
     cannot_check "hugepage pool not ready: $hp_have/$hp_need 1G pages allocated ($HP_NR)"
 fi
 
-log "running run_cluster_validation --send-traffic --num-iterations $ITERS"
 cd "$RUNTIME_ROOT" || cannot_check "cannot cd to '$RUNTIME_ROOT'"
 RUNLOG="$(mktemp)" || cannot_check "cannot create a temp file for the validator output"
 trap 'rm -f "$RUNLOG"' EXIT
 run_validator() {
-    "$BIN" "$@" --output-path "$OUT" --hard-fail --send-traffic --num-iterations "$ITERS" >"$RUNLOG" 2>&1
+    # Light mode (TT_DEVICE_MCP_FABRIC_LIGHT=1): the broker's post-job check opens the fabric
+    # and counts every inter-chip link against the cabling without pushing traffic — the traffic
+    # pass is what has been power-cycling these hosts (spec 03 I115). With no descriptor the
+    # light run is meaningless (nothing left to check), so it falls back to the traffic pass.
+    light_ran=""
+    if [ -n "$LIGHT" ] && [ "$#" -gt 0 ]; then
+        light_ran=1
+        log "running run_cluster_validation (light: no traffic pass)"
+        "$BIN" "$@" --output-path "$OUT" --hard-fail >"$RUNLOG" 2>&1
+    else
+        log "running run_cluster_validation --num-iterations $ITERS"
+        "$BIN" "$@" --output-path "$OUT" --hard-fail --send-traffic --num-iterations "$ITERS" >"$RUNLOG" 2>&1
+    fi
     rc=$?
     cat "$RUNLOG" >&2
     save_to_last "$RUNLOG"
@@ -203,7 +220,7 @@ topo_ok() { [ -z "$TOPO" ] || log "$TOPO"; }
 # So: measured-bad is UNHEALTHY; did-not-measure is CANNOT CHECK. Anything the script cannot place in
 # the first bucket belongs in the second.
 if [ "$rc" -eq 0 ]; then
-    log "fabric healthy"
+    log "fabric healthy${light_ran:+ (light: links counted, no traffic pass)}"
 elif grep -q "unhealthy ethernet connections" "$RUNLOG"; then
     log "fabric UNHEALTHY (rc=$rc): the validator measured bad links -> the broker will reset"
     [ "$rc" -eq "$EXIT_CANNOT_CHECK" ] && rc=1   # never collide with the cannot-check sentinel

@@ -405,6 +405,29 @@ class TestEnvFile:
             assert env_vars["PYTHONPATH"] == "/path/to/python"
             assert env_vars["DEBUG"] == "1"
 
+    def test_load_env_file_key_val_lines(self):
+        """KEY=VAL lines load like a YAML mapping: comments, blanks, export and quotes handled."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_file = os.path.join(tmpdir, ".env")
+            with open(env_file, "w") as f:
+                f.write('# a comment\n\nTT_METAL_HOME=/path/to/tt-metal\nexport DEBUG=1\nNAME="two words"\nEMPTY=\n')
+
+            assert load_env_file(env_file, tmpdir) == {
+                "TT_METAL_HOME": "/path/to/tt-metal",
+                "DEBUG": "1",
+                "NAME": "two words",
+                "EMPTY": "",
+            }
+
+    def test_load_env_file_yaml_value_with_equals_stays_yaml(self):
+        """A YAML mapping whose value holds '=' is not mistaken for KEY=VAL lines."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_file = os.path.join(tmpdir, "envs.yaml")
+            with open(env_file, "w") as f:
+                f.write("OPTS: a=b\n")
+
+            assert load_env_file(env_file, tmpdir) == {"OPTS": "a=b"}
+
     def test_load_env_file_relative_path(self):
         """Test loading env file with path relative to workspace."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -473,12 +496,20 @@ class TestEnvFile:
                 load_env_file(env_file, tmpdir)
 
 
+def _make_venv(path: str) -> str:
+    """Create the bin/activate a real venv has, so the script sources it."""
+    os.makedirs(os.path.join(path, "bin"))
+    open(os.path.join(path, "bin", "activate"), "w").close()
+    return path
+
+
 class TestActivationScript:
     """Tests for workspace activation script generation."""
 
     def test_activation_script_default(self):
         """Test default activation script (no env file)."""
         with tempfile.TemporaryDirectory() as tmpdir:
+            _make_venv(f"{tmpdir}/tt-metal/python_env")
             script, env_vars = get_activation_script(tmpdir)
 
             tt_metal = f"{tmpdir}/tt-metal"
@@ -494,6 +525,7 @@ class TestActivationScript:
     def test_activation_script_default_paths(self):
         """Test that default paths are correctly constructed."""
         with tempfile.TemporaryDirectory() as tmpdir:
+            _make_venv(f"{tmpdir}/tt-metal/python_env")
             script, env_vars = get_activation_script(tmpdir)
 
             assert f"{tmpdir}/tt-metal" in script
@@ -507,6 +539,7 @@ class TestActivationScript:
         """Test activation script using env file."""
         with tempfile.TemporaryDirectory() as tmpdir:
             tt_metal_dir = os.path.join(tmpdir, "custom-tt-metal")
+            _make_venv(os.path.join(tt_metal_dir, "python_env"))
             env_file = os.path.join(tmpdir, ".tt-env.yaml")
             with open(env_file, "w") as f:
                 yaml.dump(
@@ -567,7 +600,7 @@ class TestActivationScript:
         """Test that PYTHON_ENV_DIR in env file is used for activation."""
         with tempfile.TemporaryDirectory() as tmpdir:
             tt_metal_dir = os.path.join(tmpdir, "tt-metal")
-            python_env_dir = os.path.join(tmpdir, "custom_python_env")
+            python_env_dir = _make_venv(os.path.join(tmpdir, "custom_python_env"))
 
             env_file = os.path.join(tmpdir, ".tt-env.yaml")
             with open(env_file, "w") as f:
@@ -590,7 +623,7 @@ class TestActivationScript:
         """Test that PYTHON_ENV_DIR in inherited env is used for activation."""
         with tempfile.TemporaryDirectory() as tmpdir:
             tt_metal_dir = os.path.join(tmpdir, "tt-metal")
-            python_env_dir = os.path.join(tmpdir, "custom_python_env")
+            python_env_dir = _make_venv(os.path.join(tmpdir, "custom_python_env"))
 
             inherited = {
                 "TT_METAL_HOME": tt_metal_dir,
@@ -607,7 +640,7 @@ class TestActivationScript:
         """Test that VIRTUAL_ENV is used as fallback when no PYTHON_ENV_DIR."""
         with tempfile.TemporaryDirectory() as tmpdir:
             tt_metal_dir = os.path.join(tmpdir, "tt-metal")
-            venv_dir = os.path.join(tmpdir, "activated_venv")
+            venv_dir = _make_venv(os.path.join(tmpdir, "activated_venv"))
 
             inherited = {
                 "TT_METAL_HOME": tt_metal_dir,
@@ -624,7 +657,7 @@ class TestActivationScript:
         """Test that PYTHON_ENV_DIR takes priority over VIRTUAL_ENV."""
         with tempfile.TemporaryDirectory() as tmpdir:
             tt_metal_dir = os.path.join(tmpdir, "tt-metal")
-            python_env_dir = os.path.join(tmpdir, "explicit_python_env")
+            python_env_dir = _make_venv(os.path.join(tmpdir, "explicit_python_env"))
             venv_dir = os.path.join(tmpdir, "activated_venv")
 
             inherited = {
@@ -639,19 +672,21 @@ class TestActivationScript:
             assert venv_dir not in script
 
     def test_activation_script_validate_missing_env(self):
-        """Test that validate=True raises FileNotFoundError for missing python env."""
+        """validate=True refuses an explicit PYTHON_ENV_DIR that does not exist."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            # tt_metal_dir exists but python_env inside it does not
-            tt_metal_dir = os.path.join(tmpdir, "tt-metal")
-            os.makedirs(tt_metal_dir)
-
-            inherited = {
-                "TT_METAL_HOME": tt_metal_dir,
-            }
+            python_env_dir = os.path.join(tmpdir, "no_such_env")
             with pytest.raises(FileNotFoundError) as exc_info:
-                get_activation_script(tmpdir, inherited_env=inherited, validate=True)
+                get_activation_script(tmpdir, inherited_env={"PYTHON_ENV_DIR": python_env_dir}, validate=True)
 
-            assert f"{tt_metal_dir}/python_env" in str(exc_info.value)
+            assert python_env_dir in str(exc_info.value)
+
+    def test_activation_script_missing_default_env_skips_activation(self):
+        """A host without the default env still gets a script, just without the source line."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for inherited in (None, {"TT_METAL_HOME": os.path.join(tmpdir, "tt-metal")}):
+                script, _ = get_activation_script(tmpdir, inherited_env=inherited, validate=True)
+                assert "activate" not in script
+                assert script.endswith(f'cd "{tmpdir}"')
 
     def test_activation_script_validate_existing_env(self):
         """Test that validate=True succeeds when python env exists."""

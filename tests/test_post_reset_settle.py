@@ -76,20 +76,14 @@ def test_settle_left(reset_at, now, served, want):
     assert d.settle_left(POST_RESET_SETTLE_SEC, now=now) == 0.0, "nothing owed waits for nothing"
 
 
-@pytest.mark.parametrize("uptime, recent", [("40.0 100.0\n", True), ("86400.0 1.0\n", False)])
-def test_a_broker_start_owes_from_the_boot(monkeypatch, tmp_path, uptime, recent):
-    f = tmp_path / "uptime"
-    f.write_text(uptime)
-    monkeypatch.setattr(post_reset, "_UPTIME", str(f))
+def test_a_broker_start_owes_the_pass_and_never_the_settle():
+    """Spec 04 I32: a broker start's debt has no reset time, so it owes the startup fabric pass but
+    no POST_RESET_SETTLE_SEC wait; a real reset after it still settles."""
     d = FabricDebt()
-    d.note_reset("broker start", lambda *a, **k: None, at=post_reset.boot_monotonic())
-    left = d.settle_left(POST_RESET_SETTLE_SEC)
-    assert left == (pytest.approx(POST_RESET_SETTLE_SEC - 40.0, abs=1.0) if recent else 0.0)
-
-
-def test_an_unreadable_uptime_reads_as_unknown(monkeypatch, tmp_path):
-    monkeypatch.setattr(post_reset, "_UPTIME", str(tmp_path / "missing"))
-    assert post_reset.boot_monotonic() == 0.0
+    d.note_reset("broker start", lambda *a, **k: None, at=0.0)
+    assert d.owed == "broker start" and d.settle_left(POST_RESET_SETTLE_SEC) == 0.0
+    d.note_reset("tt-smi -glx_reset", lambda *a, **k: None)
+    assert d.settle_left(POST_RESET_SETTLE_SEC) > 0.0, "a real reset still settles"
 
 
 # ---- the gate ----

@@ -19,8 +19,8 @@ from pathlib import Path
 import httpx2
 import pytest
 
-from tests.conftest import fsm_dirty
-from tests.test_eth_timeout_reset import ADVANCING, mesh  # noqa: F401 (fixture)
+from tests.conftest import fsm_dirty, patch_health_event
+from tests.test_eth_timeout_retry import ADVANCING, TIMED_OUT, mesh  # noqa: F401 (fixture)
 from tt_device_mcp import constants
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
@@ -54,7 +54,7 @@ async def test_a_timeout_resets_then_runs_the_full_check_before_release(killed):
     assert killed["events"].count("kill_mesh_reset") == 1
     assert killed["captured"][0][0] == "job_killed"
     assert srv.fsm.state is ServerState.HEALTHY, "the full check after the reset released it"
-    assert srv._dispatch_reset_spent is True, "the reset spends the shared I55/I61 latch"
+    assert srv._dispatch_reset_spent is True, "the reset spends the shared I55/I69 latch"
     assert srv._kill_reset_debt() == ""
 
 
@@ -186,7 +186,7 @@ async def test_a_fw_init_failure_resets_then_runs_the_full_check_before_release(
 
 
 @pytest.mark.asyncio
-async def test_a_plain_exit_1_with_no_debt_keeps_the_clean_exit_shortcut(fw_init_failed):
+async def test_a_clean_software_exit_with_no_debt_runs_no_forced_pass_and_no_reset(fw_init_failed):
     await _clean_exit_1_gate()
     assert fw_init_failed["resets"] == [] and fw_init_failed["fabric"] == [], "a plain failure is not a device event"
     assert "post_job_fabric_skipped" in fw_init_failed["events"]
@@ -202,6 +202,197 @@ async def test_a_failed_check_after_the_fw_init_reset_stays_held(fw_init_failed)
     assert fw_init_failed["fabric"] and min(fw_init_failed["fabric"]) >= 1, "every fabric pass ran after the reset"
     assert srv.fsm.state is ServerState.RECOVERING, "a failed post-reset check never releases"
     assert srv._device_unavailable_for_tenant()
+
+
+# ---------------------------------------------------------------- spec 03 I116: a job that did not exit 0
+
+_PLAIN_DEBT = "job 7 failed (exit 8)"
+_PRE_PASS = "HEALTH-GATE[post-job] pre-pass reset: "
+
+
+@pytest.fixture
+def pre_pass(fw_init_failed, monkeypatch, caplog):
+    """The fw_init mesh with every fabric-event field recorded and the server log captured."""
+    rows = []
+    patch_health_event(
+        monkeypatch, lambda name, *a, **k: (fw_init_failed["events"].append(name), rows.append((name, k)))
+    )
+    log = logging.getLogger("tt-device-mcp-test-pre-pass")
+    monkeypatch.setattr(srv, "logger", log)
+    caplog.set_level(logging.INFO, logger=log.name)
+    fw_init_failed["rows"] = rows
+    return fw_init_failed
+
+
+def _pre_pass_lines(caplog):
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith(_PRE_PASS)]
+
+
+def _pre_pass_row(pre_pass):
+    rows = [k for n, k in pre_pass["rows"] if n == "post_job_pre_pass_reset"]
+    assert len(rows) == 1, "one journal row per post-job gate"
+    return rows[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_code", [8, 137], ids=["plain-nonzero", "oom-killed"])
+async def test_a_failed_job_resets_before_the_full_pass_and_logs_it(pre_pass, caplog, exit_code):
+    """A job that exited nonzero with no other trace: the forced pass is kept (no clean-exit shortcut here, as after
+    a signal death), and the one present-mesh reset runs before it."""
+    srv._owe_kill_reset(_PLAIN_DEBT)
+    srv._note_plain_exit_debt(False)
+    await srv._verify_device_after_job(None, job_failed=True, job_exit=exit_code)
+    assert pre_pass["resets"] == [["tt-smi", "-glx_reset"]], "one present-mesh reset"
+    assert pre_pass["fabric"] == [1], "the only fabric pass ran after the reset"
+    assert srv.fsm.state is ServerState.HEALTHY, "released only on the post-reset full check"
+    (line,) = _pre_pass_lines(caplog)
+    assert line.startswith(f"{_PRE_PASS}ran (job exit {exit_code}, ") and line.endswith("s)")
+    row = _pre_pass_row(pre_pass)
+    assert row["ran"] is True and row["job_exit"] == exit_code and row["reset_sec"] >= 0
+
+
+def _kill_mesh_reset_rows(pre_pass):
+    return [k for n, k in pre_pass["rows"] if n == "kill_mesh_reset"]
+
+
+@pytest.mark.asyncio
+async def test_a_plain_exit_reset_says_so_and_a_kill_reset_says_kill(pre_pass, caplog):
+    """The operator log and the journal row name the cause: a plain nonzero exit is not described as a kill."""
+    pre_pass["eth"] = TIMED_OUT
+    srv._owe_kill_reset(_PLAIN_DEBT)
+    srv._note_plain_exit_debt(False)
+    await srv._verify_device_after_job(None, job_failed=True, clean_exit_code=8, job_exit=8)
+    (row,) = _kill_mesh_reset_rows(pre_pass)
+    assert row["cause"] == "plain_exit"
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "a job that ended without exit 0 owes the mesh one reset" in text
+    assert "a kill mid-run can leave the mesh wedged" not in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_code", [8, 137], ids=["plain-nonzero", "oom-killed"])
+async def test_a_plain_exit_debt_paid_outside_the_shortcut_says_plain_exit(pre_pass, caplog, exit_code):
+    """No clean-exit shortcut here: the plain debt goes through the kill-debt reset, and its text and cause still say
+    the job ended without exit 0, not that a kill left the mesh wedged."""
+    srv._owe_kill_reset(_PLAIN_DEBT)
+    srv._note_plain_exit_debt(False)
+    await srv._verify_device_after_job(None, job_failed=True, job_exit=exit_code)
+    (row,) = _kill_mesh_reset_rows(pre_pass)
+    assert row["cause"] == "plain_exit"
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "a job that ended without exit 0 owes the mesh one reset" in text
+    assert "a kill mid-run can leave the mesh wedged" not in text
+
+
+@pytest.mark.asyncio
+async def test_a_kill_reset_keeps_its_kill_text_and_cause(pre_pass, caplog):
+    srv._owe_kill_reset("job 7 timeout")
+    await srv._verify_device_after_job(None, job_failed=True, job_exit=-9)
+    (row,) = _kill_mesh_reset_rows(pre_pass)
+    assert row["cause"] == "kill"
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "a kill mid-run can leave the mesh wedged" in text
+    assert "owes the mesh one reset" not in text
+
+
+@pytest.mark.asyncio
+async def test_a_failed_check_after_the_pre_pass_reset_stays_held(pre_pass):
+    pre_pass["reset_heals"] = False
+    srv._owe_kill_reset(_PLAIN_DEBT)
+    srv._note_plain_exit_debt(False)
+    await srv._verify_device_after_job(None, job_failed=True, job_exit=8)
+    assert pre_pass["resets"][0] == ["tt-smi", "-glx_reset"]
+    assert pre_pass["fabric"] and min(pre_pass["fabric"]) >= 1, "no fabric pass ran before the reset"
+    assert srv.fsm.state is ServerState.RECOVERING, "a failed post-reset check never releases"
+    assert srv._device_unavailable_for_tenant()
+
+
+@pytest.mark.asyncio
+async def test_a_plain_exit_that_takes_the_clean_exit_shortcut_runs_no_reset(pre_pass, caplog):
+    """No traffic pass runs, so there is none for a reset to precede: the shortcut settles the debt and the gate
+    says the pre-pass reset was skipped."""
+    srv._owe_kill_reset(_PLAIN_DEBT)
+    srv._note_plain_exit_debt(False)
+    await srv._verify_device_after_job(None, job_failed=True, clean_exit_code=8, job_exit=8)
+    assert pre_pass["resets"] == [] and pre_pass["fabric"] == []
+    assert "post_job_fabric_skipped" in pre_pass["events"]
+    assert srv._kill_reset_debt() == ""
+    assert _pre_pass_lines(caplog) == [f"{_PRE_PASS}skipped (job exit 8, 0s)"]
+    assert _pre_pass_row(pre_pass)["ran"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "read",
+    [
+        (None, f"{monitor_mod.ETH_LINK_DROP_SKIP}: 31 of 32 links up"),
+        (None, f"{monitor_mod.ETH_COULD_NOT_CHECK}: the read crashed"),
+        TIMED_OUT,
+    ],
+    ids=["link-drop-skip", "could-not-check", "timed-out"],
+)
+async def test_a_plain_exit_whose_eth_read_has_no_verdict_resets_before_the_full_pass(pre_pass, caplog, read):
+    """The shortcut keeps the debt open through the read. A read with no verdict would run the traffic pass with no
+    reset ahead of it, so the gate pays the debt with the present-mesh reset first, then runs the one pass."""
+    pre_pass["eth"] = read
+    srv._owe_kill_reset(_PLAIN_DEBT)
+    srv._note_plain_exit_debt(False)
+    await srv._verify_device_after_job(None, job_failed=True, clean_exit_code=8, job_exit=8)
+    assert pre_pass["resets"] == [["tt-smi", "-glx_reset"]], "one present-mesh reset"
+    assert pre_pass["fabric"] == [1], "the only fabric pass ran after the reset"
+    assert pre_pass["events"].count("kill_mesh_reset") == 1
+    assert srv.fsm.state is ServerState.HEALTHY, "released only on the post-reset full check"
+    assert srv._kill_reset_debt() == ""
+    (line,) = _pre_pass_lines(caplog)
+    assert line.startswith(f"{_PRE_PASS}ran (job exit 8, ")
+    assert _pre_pass_row(pre_pass)["ran"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_broker_stop_debt_is_never_given_up_for_the_shortcut(pre_pass):
+    srv._owe_kill_reset(_FW_INIT_DEBT)
+    await srv._verify_device_after_job(None, job_failed=True, clean_exit_code=1, job_exit=1)
+    assert pre_pass["resets"] == [["tt-smi", "-glx_reset"]]
+    assert "post_job_fabric_skipped" not in pre_pass["events"]
+
+
+@pytest.mark.asyncio
+async def test_an_exit_0_gate_runs_no_reset_and_logs_skipped(pre_pass, caplog):
+    await srv._verify_device_after_job(None, job_exit0=True, job_exit=0)
+    assert pre_pass["resets"] == []
+    assert _pre_pass_lines(caplog) == [f"{_PRE_PASS}skipped (job exit 0, 0s)"]
+    row = _pre_pass_row(pre_pass)
+    assert row["ran"] is False and row["job_exit"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command, owed",
+    [("exit 8", True), ("kill -KILL $$", True), ("true", False)],
+    ids=["exit-8", "signal-death", "exit-0"],
+)
+async def test_the_runner_owes_the_reset_for_every_job_end_without_exit_0(runner_env, monkeypatch, command, owed):
+    monkeypatch.setattr(srv, "_aiclk_left_busy", lambda *a, **k: {})
+    job, runner = await _start("943", command)
+    try:
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert bool(srv._kill_reset_debt()) == owed
+    assert srv._kill_reset_plain == owed, "owed for the exit alone, so the clean-exit shortcut still settles it"
+    assert ("kill_reset_owed" in runner_env["events"]) == owed
+
+
+@pytest.mark.asyncio
+async def test_a_plain_exit_keeps_a_broker_stop_debt_still_open(runner_env, monkeypatch):
+    monkeypatch.setattr(srv, "_aiclk_left_busy", lambda *a, **k: {})
+    srv._owe_kill_reset(_FW_INIT_DEBT)
+    job, runner = await _start("944", "exit 8")
+    try:
+        assert await _until(lambda: _runner_done(job))
+    finally:
+        await _stop(runner)
+    assert srv._kill_reset_debt() and not srv._kill_reset_plain, "the open debt is not downgraded to the plain one"
 
 
 _PRESENT = dict(
@@ -845,13 +1036,14 @@ async def test_a_failed_job_that_left_the_clock_busy_owes_the_reset(runner_env, 
             "Timeout detected (metal_context.cpp:100): device timeout, potential hang detected, the device is unrecoverable",
             "job 940 failed: runtime reported the device unrecoverable",
         ),
-        ("AssertionError: expected 3, got 4", ""),
+        ("AssertionError: expected 3, got 4", "job 940 failed (exit 1)"),
     ],
     ids=["cores-timeout", "fw-init", "unrecoverable-marker", "plain-exit-1"],
 )
 async def test_a_job_that_could_not_initialize_the_device_owes_the_reset(runner_env, monkeypatch, output, want):
     """A job that exits 1 because the runtime could not bring the device up (or said it is unrecoverable) owes one
-    reset and the full check (03 I69); a plain exit 1 owes nothing and keeps the clean-exit shortcut (03 I36)."""
+    reset and the full check (03 I69); a plain exit 1 owes the plain-exit debt (03 I116), which the clean-exit
+    shortcut (03 I36) still settles."""
     monkeypatch.setattr(srv, "_aiclk_left_busy", lambda *a, **k: {})
     job, runner = await _start("940", f"echo '{output}'; exit 1", log_file=str(runner_env["tmp"] / "940.log"))
     try:
@@ -860,7 +1052,8 @@ async def test_a_job_that_could_not_initialize_the_device_owes_the_reset(runner_
         await _stop(runner)
     assert job.status is srv.JobStatus.FAILED and job.exit_code == 1
     assert srv._kill_reset_debt() == want
-    assert ("kill_reset_owed" in runner_env["events"]) == bool(want)
+    assert srv._kill_reset_plain == (want == "job 940 failed (exit 1)")
+    assert "kill_reset_owed" in runner_env["events"]
 
 
 @pytest.mark.asyncio
@@ -919,40 +1112,46 @@ OFF_BUS = 0xFFFFFFFF
 @pytest.mark.parametrize(
     "clocks, want_debt",
     [
-        ({"0": OFF_BUS, "1": 800}, ""),
-        ({"0": 6000, "1": 800}, ""),
+        ({"0": OFF_BUS, "1": 800}, "job 938 failed (exit 1)"),
+        ({"0": 6000, "1": 800}, "job 938 failed (exit 1)"),
         ({"0": OFF_BUS, "1": 1350}, "job 938 failed with 1 chip(s) left at the busy AI clock (max 1350 MHz)"),
     ],
     ids=["off-bus-chip", "implausible-clock", "off-bus-beside-a-busy-chip"],
 )
 async def test_an_off_bus_clock_read_is_not_a_busy_clock(runner_env, monkeypatch, clocks, want_debt):
-    """An off-bus chip reads 0xFFFFFFFF for its AI clock. That is not a chip left open: it owes no kill reset and no
-    aiclk_busy_after_job record, and takes the off-bus path instead."""
+    """An off-bus chip reads 0xFFFFFFFF for its AI clock. That is not a chip left open: it owes no busy-clock debt and
+    no aiclk_busy_after_job record (the job's own nonzero exit still owes the plain one, 03 I116)."""
     monkeypatch.setattr(srv, "chip_snapshot", lambda: {i: {"tt_aiclk": v} for i, v in clocks.items()})
     job, runner = await _start("938", "exit 1")
     try:
         assert await _until(lambda: _runner_done(job))
-        if want_debt:
+        if "busy" in want_debt:
             assert await _until(lambda: "aiclk_busy_after_job" in runner_env["events"])
+        else:
+            assert await _until(lambda: "kill_reset_owed" in runner_env["events"])
     finally:
         await _stop(runner)
     assert job.status is srv.JobStatus.FAILED and job.exit_code == 1
-    assert srv._kill_reset_debt().startswith(want_debt) and bool(srv._kill_reset_debt()) == bool(want_debt)
-    assert ("kill_reset_owed" in runner_env["events"]) == bool(want_debt)
-    assert ("aiclk_busy_after_job" in runner_env["events"]) == bool(want_debt)
+    assert srv._kill_reset_debt() == want_debt
+    assert "kill_reset_owed" in runner_env["events"]
+    assert ("aiclk_busy_after_job" in runner_env["events"]) == ("busy" in want_debt)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "command, busy, reset_killed",
-    [("exit 1", {}, False), ("true", {"0": 1350}, False), ("exit 1", {"0": 1350}, True)],
+    "command, busy, reset_killed, want_debt",
+    [
+        ("exit 1", {}, False, "job 937 failed (exit 1)"),
+        ("true", {"0": 1350}, False, ""),
+        ("exit 1", {"0": 1350}, True, ""),
+    ],
     ids=["failed-idle-clock", "exit0-busy-clock", "our-reset-killed-it"],
 )
 async def test_no_clock_debt_for_a_closed_device_an_exit0_or_our_own_kill(
-    runner_env, monkeypatch, command, busy, reset_killed
+    runner_env, monkeypatch, command, busy, reset_killed, want_debt
 ):
-    """An idle clock means the job closed the device (the forced pass stays); an exit-0 job is never
-    read and owes no reset; a death our own reset caused owes no second reset."""
+    """An idle clock means the job closed the device (only the plain-exit debt of 03 I116 stands); an exit-0 job is
+    never read and owes no reset; a death our own reset caused owes no second reset."""
     reads = []
     monkeypatch.setattr(srv, "_aiclk_left_busy", lambda *a, **k: reads.append(1) or dict(busy))
     if reset_killed:
@@ -962,7 +1161,7 @@ async def test_no_clock_debt_for_a_closed_device_an_exit0_or_our_own_kill(
         assert await _until(lambda: _runner_done(job))
     finally:
         await _stop(runner)
-    assert srv._kill_reset_debt() == ""
+    assert srv._kill_reset_debt() == want_debt
     if command == "true":
         assert reads == [], "an exit-0 job's clock is never read"
 

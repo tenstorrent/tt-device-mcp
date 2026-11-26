@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Spec 03 I61: a clean post-job eth read that timed out with no verdict, on a present mesh, skips the
-pre-reset fabric pass and takes the one present-mesh reset of the hold episode (shared with I55's
-dispatch reset). Only the full check after it releases the device. Every other shape keeps the pass.
+"""Spec 03 I61: a clean post-job eth read that timed out with no verdict is read once more after a short
+settle. A measured retry carries on as a first-try measurement; a retry still unmeasured runs the fabric
+pass instead of a present-mesh reset, and only that pass's pass releases the device. The device's readers
+are stopped for the reads and restored on every exit.
 
 The real probe pass runs here (HealthMonitor.update); only its leaf probes are stubbed."""
 
@@ -12,6 +13,7 @@ from tests.conftest import fsm_dirty, patch_health_event
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.fsm import ServerState
+from tt_device_mcp.health import monitor as monitor_mod
 from tt_device_mcp.health.monitor import ETH_COULD_NOT_CHECK, ETH_LINK_DROP_SKIP
 from tt_device_mcp.health.monitors import eth, hostpci
 from tt_device_mcp.health.recovery import pcie_guard
@@ -19,6 +21,7 @@ from tt_device_mcp.health.recovery import pcie_guard
 CHIPS = 32
 TIMED_OUT = (None, f"{ETH_COULD_NOT_CHECK}: {eth.READ_TIMED_OUT}")
 ADVANCING = (True, "all active-eth cores advancing (1s)")
+FROZEN = (False, "a frozen active-eth core (2s): heartbeat not advancing")
 
 
 class _Logger:
@@ -39,6 +42,9 @@ def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
     """A 32-chip Galaxy, every chip on the bus and ARC healthy, after a clean job exit whose eth read times out."""
     st = {
         "eth": TIMED_OUT,
+        "eth_seq": [],
+        "pollers": [],
+        "eth_raises": False,
         "fabric_bad": False,
         "fabric_77": False,
         "snapshot": (True, "32/32 chips, ARC ok"),
@@ -80,9 +86,22 @@ def mesh(monkeypatch, tmp_path, clear_job_state, galaxy_trays):
 
     async def eth_read(timeout_sec=None):
         st["eth_reads"] += 1
-        return st["eth"]
+        st["pollers"].append("read")
+        if st["eth_raises"]:
+            raise RuntimeError("probe blew up")
+        return st["eth_seq"].pop(0) if st["eth_seq"] else st["eth"]
+
+    async def pollers(active, log):
+        st["pollers"].append("start" if active else "stop")
+        return [] if active else ["tt-telemetry"]
+
+    # The production wiring: the broker's own quiesce around a reader's work.
+    monkeypatch.setattr(srv, "_set_device_pollers", pollers)
+    monkeypatch.setattr(srv._recovery_deps, "quiesce_readers", lambda what, log: srv._pollers_quiesced_for(what, log))
+    monkeypatch.setattr(monitor_mod, "ETH_POST_JOB_RETRY_SETTLE_SEC", 0.0)
 
     async def fabric_pass():
+        st["pollers"].append("fabric")
         st["fabric"].append(len(st["resets"]))
         if st["fabric_77"]:
             return None, "fabric check could not check (77)"
@@ -124,102 +143,78 @@ async def _gate():
 
 
 @pytest.mark.asyncio
-async def test_a_timed_out_eth_read_resets_once_with_no_pre_reset_fabric_pass(mesh):
-    """Base ran the ~45-100 s fabric pass first, which failed or skipped after every such timeout
-    measured. Now no pass runs before the one glx_reset; the full check after it releases."""
+async def test_a_timed_out_read_that_measures_on_retry_needs_no_reset_or_fabric_pass(mesh):
+    """The healthy-mesh case: the read timed out once and answers on the retry. Nothing resets, no fabric pass
+    runs, the gate goes on as for a first-try measurement."""
+    mesh["eth_seq"] = [TIMED_OUT, ADVANCING]
     await _gate()
-    assert mesh["resets"] == [["tt-smi", "-glx_reset"]], "one present-mesh reset"
-    assert mesh["fabric"] and min(mesh["fabric"]) == 1, "no fabric pass ran before the reset"
-    assert mesh["events"].count("eth_timeout_mesh_reset") == 1
-    assert "eth-heartbeat timed out after a clean exit" in mesh["log"].text()
-    assert srv.fsm.state is ServerState.HEALTHY, "the full check after the reset passed"
-    assert srv._dispatch_reset_spent is True, "the reset spends the episode's shared latch"
-
-
-@pytest.mark.asyncio
-async def test_the_incident_is_captured_with_the_eth_reason_before_the_reset(mesh):
-    await _gate()
-    kind, evidence = mesh["captured"][0]
-    assert kind == "eth_timeout"
-    assert eth.READ_TIMED_OUT in evidence["eth_heartbeat"]["detail"]
-    assert evidence["snapshot"]["ok"] is True and "fabric" not in evidence
-
-
-@pytest.mark.asyncio
-async def test_the_full_check_after_the_reset_gates_the_release(mesh):
-    """The post-reset check reads the eth cores and runs the fabric pass; only its pass releases."""
-    await _gate()
-    assert mesh["eth_reads"] == 2, "the clean-exit read, then the full check's own read"
-    assert mesh["fabric"] == [1], "the full check after the reset ran the fabric pass"
+    assert mesh["eth_reads"] == 2, "the timed-out read, then one retry"
+    assert mesh["resets"] == [] and mesh["fabric"] == []
     assert srv.fsm.state is ServerState.HEALTHY
+    assert srv._dispatch_reset_spent is False, "no present-mesh reset was spent"
+    assert "reading once more" in mesh["log"].text()
 
 
 @pytest.mark.asyncio
-async def test_a_failed_post_reset_check_stays_held_and_climbs(mesh, armed_power_cycle):
-    mesh["reset_heals"] = False
-    srv.recovery_mechanism.last_reset_failed = True  # a prior cycle failed: the host rung is due
+async def test_a_frozen_retry_holds_as_a_first_try_frozen_read_does(mesh):
+    mesh["eth_seq"] = [TIMED_OUT, FROZEN]
     await _gate()
-    assert mesh["resets"][0] == ["tt-smi", "-glx_reset"]
-    assert mesh["events"].count("eth_timeout_mesh_reset") == 1
-    assert mesh["fabric"] and min(mesh["fabric"]) >= 1, "every fabric pass ran after the reset"
-    assert srv.fsm.state is ServerState.RECOVERING, "a failed post-reset check never releases"
-    assert armed_power_cycle == ["power-cycle"], "it climbs to the power cycle"
+    assert mesh["eth_reads"] == 2
+    assert mesh["resets"] == [] and mesh["fabric"] == [], "a frozen core never gets the traffic pass"
+    assert srv.fsm.state is ServerState.RECOVERING
 
 
 @pytest.mark.asyncio
-async def test_a_failed_post_reset_check_without_a_host_rung_stays_held(mesh):
-    mesh["reset_heals"] = False
+async def test_two_timeouts_then_a_passing_fabric_pass_releases_with_no_reset(mesh):
+    mesh["eth_seq"] = [TIMED_OUT, TIMED_OUT]
     await _gate()
-    assert len(mesh["resets"]) == 1
-    assert srv.fsm.state is ServerState.RECOVERING, "held, never released"
-
-
-@pytest.mark.asyncio
-async def test_a_second_timeout_in_the_episode_gets_no_second_reset(mesh):
-    mesh["reset_heals"] = False
-    await _gate()
-    assert len(mesh["resets"]) == 1 and srv._dispatch_reset_spent is True
-    # Same episode, cooldown elapsed, a clean exit times out again.
-    srv.recovery_mechanism.last_reset_monotonic = srv.time.monotonic() - 100_000.0
-    srv.recovery_mechanism.last_reset_failed = False
-    mesh["eth"] = TIMED_OUT
-    fabric_before = len(mesh["fabric"])
-    await _gate()
-    assert mesh["events"].count("eth_timeout_mesh_reset") == 1, "no second eth-timeout reset"
-    assert len(mesh["fabric"]) > fabric_before
-
-
-@pytest.mark.asyncio
-async def test_a_spent_dispatch_reset_leaves_the_timeout_on_todays_path(mesh, monkeypatch):
-    """The latch is shared with spec 03 I55: a dispatch reset this episode leaves none for the
-    timeout, which then runs the fabric pass as before."""
-    monkeypatch.setattr(srv, "_dispatch_reset_spent", True)
-    await _gate()
-    assert mesh["resets"] == [] and "eth_timeout_mesh_reset" not in mesh["events"]
-    assert mesh["fabric"] == [0], "the timeout ran today's fabric pass"
+    assert mesh["eth_reads"] == 2, "the read is retried once, never twice"
+    assert mesh["fabric"] == [0], "the fabric pass ran, with no reset before it"
+    assert mesh["resets"] == [], "no glx_reset"
     assert srv.fsm.state is ServerState.HEALTHY
-
-
-@pytest.mark.asyncio
-async def test_a_healed_reset_rearms_the_latch_at_the_next_admission(mesh):
-    """The reset held the door (the episode opened before it fired); the next admission ends that
-    episode (device_released) and re-arms the next one's reset."""
-    await _gate()
-    assert srv._dispatch_reset_spent is True and srv.device_hold_logged is True
-    assert srv.fsm.state is ServerState.HEALTHY
-    srv._note_tenant_gate_verdict("")
-    assert "device_released" in mesh["events"]
     assert srv._dispatch_reset_spent is False
 
 
 @pytest.mark.asyncio
-async def test_the_door_is_shut_while_the_reset_is_unproven(mesh):
-    """Goal: a clean exit has no episode open, so the gate opens one before the reset fires. A failed
-    post-reset check then refuses the next tenant instead of dispatching onto the unproven mesh."""
+async def test_two_timeouts_then_a_failing_fabric_pass_stays_held(mesh):
+    """A failed pass takes today's reset path; a reset that does not heal leaves the device held."""
+    mesh["eth_seq"] = [TIMED_OUT, TIMED_OUT]
+    mesh["fabric_bad"] = True
     mesh["reset_heals"] = False
     await _gate()
-    assert srv.fsm.record.why == "probe_unhealthy"
-    assert srv._device_unavailable_for_tenant(), "no tenant runs on a mesh the post-reset check failed"
+    assert mesh["fabric"][0] == 0, "the fabric pass ran before any reset"
+    assert srv.fsm.state is ServerState.RECOVERING, "a failed check never releases"
+    assert srv._device_unavailable_for_tenant(), "no tenant runs on a mesh the check failed"
+
+
+@pytest.mark.asyncio
+async def test_nothing_releases_the_device_without_a_passed_fabric_pass(mesh):
+    """With the eth read unmeasured twice, only a fabric pass that has just passed releases the device."""
+    mesh["eth_seq"] = [TIMED_OUT, TIMED_OUT]
+    mesh["reset_heals"] = False
+    mesh["fabric_77"] = True
+    await _gate()
+    assert srv.fsm.state is not ServerState.HEALTHY
+    assert srv._device_unavailable_for_tenant()
+
+
+@pytest.mark.asyncio
+async def test_the_readers_are_stopped_for_the_read_and_restored(mesh):
+    """The telemetry poller is stopped before the post-job read and started again after it (and its
+    retry), as for the fabric check."""
+    mesh["eth_seq"] = [TIMED_OUT, ADVANCING]
+    await _gate()
+    events = mesh["pollers"]
+    assert events[:4] == ["stop", "read", "read", "start"], events
+    assert events.count("stop") == events.count("start"), "every stop is paired with a start"
+
+
+@pytest.mark.asyncio
+async def test_the_readers_are_restored_when_the_read_raises(mesh):
+    mesh["eth_raises"] = True
+    with pytest.raises(RuntimeError, match="probe blew up"):
+        await srv.health_monitor.update("post-job", run_fabric=False, run_eth=True, expected=CHIPS)
+    assert mesh["pollers"] == ["stop", "read", "start"]
 
 
 @pytest.mark.asyncio
@@ -232,20 +227,28 @@ async def test_the_door_is_shut_while_the_reset_is_unproven(mesh):
     ],
     ids=["link-drop-skip", "crash", "probe-77"],
 )
-async def test_other_no_verdict_reads_keep_todays_fabric_pass(mesh, monkeypatch, eth_read):
+async def test_other_no_verdict_reads_are_not_retried(mesh, monkeypatch, eth_read):
     monkeypatch.setattr(srv, "last_fabric_check_monotonic", 0.0)  # stale: the link-drop skip may run it
     mesh["eth"] = eth_read
     await _gate()
-    assert mesh["resets"] == [] and "eth_timeout_mesh_reset" not in mesh["events"]
-    assert mesh["fabric"] == [0], "today's pass ran"
+    assert mesh["eth_reads"] == 1
+    assert mesh["resets"] == [] and mesh["fabric"] == [0], "today's pass ran"
+
+
+@pytest.mark.asyncio
+async def test_host_pci_not_ok_is_not_retried(mesh):
+    mesh["hostpci"] = (None, "host-pci read skipped")
+    await _gate()
+    assert mesh["eth_reads"] == 1
+    assert mesh["resets"] == [] and mesh["fabric"] == [0]
 
 
 @pytest.mark.asyncio
 async def test_a_frozen_read_keeps_todays_hold(mesh):
-    mesh["eth"] = (False, "a frozen active-eth core (2s): heartbeat not advancing")
+    mesh["eth"] = FROZEN
     await _gate()
+    assert mesh["eth_reads"] == 1, "a measured read is never retried"
     assert mesh["resets"] == [] and mesh["fabric"] == []
-    assert "eth_timeout_mesh_reset" not in mesh["events"]
     assert srv.fsm.state is ServerState.RECOVERING, "held, not reset"
 
 
@@ -255,19 +258,10 @@ async def test_a_frozen_read_keeps_todays_hold(mesh):
     [(False, "31 of 32 chips enumerated"), (False, "chip 7: ARC not responding")],
     ids=["off-bus-chip", "arc-unhealthy"],
 )
-async def test_an_off_bus_chip_or_unhealthy_arc_keeps_todays_path(mesh, snapshot):
+async def test_an_off_bus_chip_or_unhealthy_arc_reads_no_eth(mesh, snapshot):
     mesh["snapshot"] = snapshot
     await _gate()
-    assert "eth_timeout_mesh_reset" not in mesh["events"]
-    assert all(c == 0 for c in mesh["fabric"][:1]), "nothing fabric-related was skipped for a reset"
-
-
-@pytest.mark.asyncio
-async def test_host_pci_not_ok_keeps_todays_fabric_pass(mesh):
-    mesh["hostpci"] = (None, "host-pci read skipped")
-    await _gate()
-    assert mesh["resets"] == [] and "eth_timeout_mesh_reset" not in mesh["events"]
-    assert mesh["fabric"] == [0]
+    assert mesh["eth_reads"] == 0
 
 
 @pytest.mark.asyncio
@@ -285,16 +279,4 @@ async def test_a_degraded_pcie_link_holds_and_never_releases(mesh):
 async def test_a_dirty_exit_still_runs_the_fabric_pass(mesh):
     fsm_dirty(srv, "job failed: Timed out while waiting for active ethernet core 27-25")
     await _gate()
-    assert "eth_timeout_mesh_reset" not in mesh["events"]
     assert mesh["fabric"] and mesh["fabric"][0] == 0, "the dirty exit's fabric pass ran first"
-
-
-@pytest.mark.asyncio
-async def test_the_probe_pass_skips_the_fabric_pass_only_when_asked(mesh):
-    """HealthMonitor.update alone: the timed-out read skips the pass with eth_timeout_reset, and
-    runs it without (today's path)."""
-    mon = srv.health_monitor
-    state = await mon.update("post-job", run_fabric=False, run_eth=True, eth_timeout_reset=True, expected=CHIPS)
-    assert mesh["fabric"] == [] and state.fabric_ran is False
-    state = await mon.update("post-job", run_fabric=False, run_eth=True, expected=CHIPS)
-    assert mesh["fabric"] == [0] and state.fabric_ran is True

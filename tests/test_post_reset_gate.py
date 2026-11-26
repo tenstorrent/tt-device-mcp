@@ -8,6 +8,9 @@ pass, that funnel holds the device fabric-unverified instead of releasing it.
 """
 
 import asyncio
+import json
+import os
+import time
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -867,3 +870,164 @@ def test_the_wrapper_reason_names_the_dispatch_cap_over_a_validator_error_line()
     )
     assert fabric.names_dispatch_cap(_override_reason(text))
     assert not fabric.names_dispatch_cap("no link was tested (77)")
+
+
+# --- a job's fabric-ok marker (spec 04 I32) ---------------------------------------------------------------------------
+
+
+def _marker_gate(monkeypatch, tmp_path, *, fabric=(True, "links healthy")):
+    """A 32-chip post-job gate that owes job-7's own tenant reset a fabric pass; returns the list of
+    ``light`` flags the fabric pass saw, the health events and the job (it ran for the 100 s up to now)."""
+    monkeypatch.setenv("TT_DEVICE_MCP_FABRIC_CHECK_CMD", "true")
+    monkeypatch.setenv("TT_DEVICE_MCP_JOB_EXIT_DIR", str(tmp_path / "exit"))
+    (tmp_path / "exit").mkdir()
+    calls = _clean_post_job_gate(monkeypatch, tmp_path, eth=(True, "all active eth cores advancing"), chips=32)
+    events, lights = [], []
+    patch_health_event(monkeypatch, lambda kind, **f: events.append((kind, f)))
+
+    async def fabric_pass(*a, light=False, **k):
+        calls["fabric"] += 1
+        lights.append(light)
+        return fabric
+
+    monkeypatch.setattr(srv.health_monitor, "verify_fabric_health", fabric_pass)
+    now = time.time()
+    job = SimpleNamespace(
+        id="job-7",
+        status=srv.JobStatus.COMPLETED,
+        exit_code=0,
+        started_at=datetime.fromtimestamp(now - 100).isoformat(),
+        finished_at=datetime.fromtimestamp(now).isoformat(),
+        peer_uid=None,
+    )
+    FABRIC_DEBT.note_reset("tenant job job-7", tenant_job="job-7")
+    FABRIC_DEBT.tenant_wall = now - 50  # the broker saw the reset 50 s ago
+    return lights, events, job
+
+
+def _write_marker(tmp_path, body=None, **over):
+    now = time.time()
+    body = body or json.dumps({"reset_at": now - 80, "checked_at": now - 40, "chips": 32, **over})
+    (tmp_path / "exit" / "job-7.fabric-ok").write_text(body)
+
+
+async def _post_job_gate(job):
+    await srv._verify_device_after_job(None, job_exit0=job.exit_code == 0, fabric_ok_job=srv._trust_fabric_ok(job))
+
+
+def _rejected(events):
+    return [f["why"] for k, f in events if k == "tenant_fabric_ok_rejected"]
+
+
+@pytest.mark.asyncio
+async def test_a_trusted_fabric_ok_marker_runs_the_light_check_and_settles_the_tenant_reset(monkeypatch, tmp_path):
+    lights, events, job = _marker_gate(monkeypatch, tmp_path)
+    _write_marker(tmp_path)
+    await _post_job_gate(job)
+    assert lights == [True], "a job that proved its fabric after its own reset paid the traffic pass"
+    assert FABRIC_DEBT.owed == "" and srv.fsm.state is ServerState.HEALTHY
+    assert ("tenant_fabric_ok_trusted", {"job": "job-7"}) in events and not _rejected(events)
+
+
+def _symlinked(tp):
+    _write_marker(tp)
+    (tp / "exit" / "job-7.fabric-ok").rename(tp / "real")
+    os.symlink(tp / "real", tp / "exit" / "job-7.fabric-ok")
+
+
+def _hardlinked(tp):
+    _write_marker(tp)
+    os.link(tp / "exit" / "job-7.fabric-ok", tp / "elsewhere")
+
+
+def _before_the_run(tp):
+    _write_marker(tp, reset_at=time.time() - 250, checked_at=time.time() - 200)
+    FABRIC_DEBT.tenant_wall = time.time() - 300
+
+
+# name: (write the marker, exit code, a tweak of the world, the reason the event gives)
+REJECTIONS = {
+    "no-marker": (lambda tp: None, 0, None, "no marker"),
+    "malformed": (lambda tp: _write_marker(tp, "{"), 0, None, "does not parse"),
+    "missing-key": (lambda tp: _write_marker(tp, "{}"), 0, None, "does not parse"),
+    "exit-not-0": (_write_marker, 1, None, "did not exit 0"),
+    "not-after-the-brokers-reset": (_write_marker, 0, "tenant_wall", "last tenant reset"),
+    "not-after-reset_at": (lambda tp: _write_marker(tp, reset_at=time.time() - 30), 0, None, "not after reset_at"),
+    "before-the-run": (_before_the_run, 0, None, "outside the job's run"),
+    "after-the-run": (lambda tp: _write_marker(tp, checked_at=time.time() + 60), 0, None, "outside the job's run"),
+    "fewer-chips": (lambda tp: _write_marker(tp, chips=31), 0, None, "31 chips"),
+    "a-symlink": (_symlinked, 0, None, "no marker"),
+    "a-hard-link": (_hardlinked, 0, None, "not the job's own"),
+    "another-users-file": (_write_marker, 0, "euid", "not the job's own"),
+    "another-jobs-debt": (_write_marker, 0, "debt_job", "a broker reset, or another job's"),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", REJECTIONS)
+async def test_a_fabric_ok_marker_that_fails_any_check_leaves_the_full_traffic_pass(monkeypatch, tmp_path, name):
+    write, exit_code, tweak, why = REJECTIONS[name]
+    lights, events, job = _marker_gate(monkeypatch, tmp_path)
+    write(tmp_path)
+    job.exit_code = exit_code
+    if tweak == "tenant_wall":
+        FABRIC_DEBT.tenant_wall = time.time() - 30
+    elif tweak == "debt_job":
+        FABRIC_DEBT.tenant_job = "job-6"
+    elif tweak == "euid":
+        monkeypatch.setattr(srv.os, "geteuid", lambda: 4242)
+    await _post_job_gate(job)
+    assert lights == [False], f"{name}: the traffic pass was skipped"
+    assert len(_rejected(events)) == 1 and why in _rejected(events)[0], _rejected(events)
+    assert FABRIC_DEBT.owed == "" and srv.fsm.state is ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order", ["broker-then-tenant", "tenant-then-broker", "other-job-then-tenant"])
+async def test_a_broker_or_another_jobs_reset_in_the_debt_forces_the_full_traffic_pass_whatever_the_marker_says(
+    monkeypatch, tmp_path, order
+):
+    lights, events, job = _marker_gate(monkeypatch, tmp_path)
+    _write_marker(tmp_path)
+    if order != "tenant-then-broker":
+        FABRIC_DEBT.owed = FABRIC_DEBT.tenant_job = ""
+        if order == "broker-then-tenant":
+            FABRIC_DEBT.note_reset("tt-smi -glx_reset")
+        else:
+            FABRIC_DEBT.note_reset("tenant job job-6", tenant_job="job-6")
+        FABRIC_DEBT.note_reset("tenant job job-7", tenant_job="job-7")
+    else:
+        FABRIC_DEBT.note_reset("tt-smi -glx_reset")
+    FABRIC_DEBT.tenant_wall = time.time() - 50  # so only the debt's owner can reject the marker
+    await _post_job_gate(job)
+    assert lights == [False]
+    assert len(_rejected(events)) == 1 and "a broker reset" in _rejected(events)[0]
+    assert FABRIC_DEBT.owed == ""
+
+
+@pytest.mark.asyncio
+async def test_the_gate_runs_light_only_for_the_job_whose_marker_was_trusted(monkeypatch, tmp_path):
+    lights, events, job = _marker_gate(monkeypatch, tmp_path)
+    await srv._verify_device_after_job(None, job_exit0=True, fabric_ok_job="job-6")
+    assert lights == [False]
+
+
+@pytest.mark.asyncio
+async def test_a_light_check_that_finds_fewer_links_keeps_the_debt_and_the_hold(monkeypatch, tmp_path):
+    """A trusted marker only picks the check: the light open still counts every link against the cabling, and a
+    failure escalates like a failed full check; the debt clears only on a pass."""
+    lights, events, job = _marker_gate(monkeypatch, tmp_path, fabric=(False, "fewer links than the cabling"))
+    _write_marker(tmp_path)
+    await _post_job_gate(job)
+    assert lights[0] is True
+    assert FABRIC_DEBT.owed == "tenant job job-7"
+    assert srv.fsm.state is not ServerState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_a_job_that_reset_nothing_judges_no_marker(monkeypatch, tmp_path):
+    lights, events, job = _marker_gate(monkeypatch, tmp_path)
+    FABRIC_DEBT.owed = FABRIC_DEBT.tenant_job = ""
+    _write_marker(tmp_path)
+    assert srv._trust_fabric_ok(job) == ""
+    assert not [k for k, _ in events if k.startswith("tenant_fabric_ok")]

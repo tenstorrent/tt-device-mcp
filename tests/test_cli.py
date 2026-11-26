@@ -345,7 +345,14 @@ def test_server_down_message_distinguishes_wedged_from_absent(monkeypatch, tmp_p
     assert "isn't responding" in cli._server_down_message()
 
     monkeypatch.setattr(cli, "resolve_socket", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "_BROKER_UNIT", str(tmp_path / "no-such.service"))
     assert "daemon start" in cli._server_down_message()
+
+    unit = tmp_path / "tt-device-broker.service"
+    unit.write_text("")
+    monkeypatch.setattr(cli, "_BROKER_UNIT", str(unit))
+    msg = cli._server_down_message()
+    assert "systemctl start tt-device-broker" in msg and "daemon start" not in msg
 
 
 def test_refresh_banner_tracks_lock_state(monkeypatch, tmp_path):
@@ -639,6 +646,25 @@ def test_daemon_start_refuses_on_broker_host(monkeypatch, tmp_path):
         port = 9
 
     assert cli.cmd_daemon_start(Args()) == 0
+
+
+def test_daemon_start_refuses_when_system_broker_installed_but_stopped(monkeypatch, tmp_path, capsys):
+    """Unit installed, socket absent (broker stopped): no per-user daemon, point at the system broker."""
+    sys.path.insert(0, SRC_PATH)
+    from tt_device_mcp import cli
+
+    unit = tmp_path / "tt-device-broker.service"
+    unit.write_text("")
+    monkeypatch.setattr(cli, "_BROKER_UNIT", str(unit))
+    monkeypatch.setattr(cli, "DEFAULT_SOCKET", str(tmp_path / "absent.sock"))
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **k: pytest.fail("spawned a per-user daemon"))
+
+    class Args:
+        log_dir = None
+        port = 9
+
+    assert cli.cmd_daemon_start(Args()) == 1
+    assert "sudo systemctl start tt-device-broker" in capsys.readouterr().out
 
 
 def test_main_bare_piped_stdin_runs_stdio_adapter(monkeypatch):

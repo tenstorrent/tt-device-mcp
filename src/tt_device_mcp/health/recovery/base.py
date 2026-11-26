@@ -503,11 +503,14 @@ def _power_cycle_backstop_stamps(ledger: list[dict], now_epoch: float) -> list[f
 
 def _power_cycle_backstop_until(ledger: list[dict], now_epoch: float) -> Optional[float]:
     """The epoch at which the backstop allows a power cycle again, or None when it is under the cap.
-    That is when enough of the oldest cycles left the window to bring the count below the cap."""
+    That is when enough of the oldest cycles left the window to bring the count below the cap, and never
+    later than one cooldown interval (I65) after the newest cycle (spec 04 I117)."""
     stamps = _power_cycle_backstop_stamps(ledger, now_epoch)
     if len(stamps) < POWER_CYCLE_BACKSTOP_MAX:
         return None
-    return stamps[-POWER_CYCLE_BACKSTOP_MAX] + POWER_CYCLE_BACKSTOP_WINDOW_SEC
+    leaves_window = stamps[-POWER_CYCLE_BACKSTOP_MAX] + POWER_CYCLE_BACKSTOP_WINDOW_SEC
+    until = min(leaves_window, stamps[-1] + POWER_CYCLE_MIN_INTERVAL_SEC)
+    return until if until > now_epoch else None
 
 
 class RecoveryMechanism:
@@ -2942,7 +2945,7 @@ class RecoveryMechanism:
             ran = self._cycles_that_ran(requests, now)
             gates = []
             backstop = _power_cycle_backstop_until(ran + [r for r in requests if r.get("cycle_refuted")], now)
-            if backstop is not None and backstop > now:
+            if backstop is not None:
                 gates.append((backstop, "power-cycle backstop"))
             cooldown = self.power_cycle_cooldown(now_epoch=now, ledger=ran, requests=requests)
             if cooldown is not None:
@@ -2955,7 +2958,8 @@ class RecoveryMechanism:
         """The refusal when POWER_CYCLE_BACKSTOP_MAX power cycles already ran inside the backstop window, verified or
         not (a refuted one, I88, restarted the host warm and counts too); None otherwise. Journals once per cap reached:
         a tray that keeps dropping after cycles is a hardware fault for its owners. The hold is bounded all the same
-        (spec 04 I65): ``until`` is when the oldest counted cycle leaves the window, and the cycle is asked again then.
+        (spec 04 I65, I117): ``until`` is when the oldest counted cycle leaves the window or one cooldown interval after
+        the newest cycle, whichever is sooner, and the cycle is asked again then.
         A missing, non-finite or future stamp counts as nothing here (the interval loop fails closed on an unreadable
         one), so no corrupt record can hold the cycle for good."""
         until = _power_cycle_backstop_until(ledger, now_epoch)
@@ -2965,8 +2969,8 @@ class RecoveryMechanism:
         why = (
             f"{len(stamps)} power cycles, verified or not, in the last {POWER_CYCLE_BACKSTOP_WINDOW_SEC}s "
             f"(backstop {POWER_CYCLE_BACKSTOP_MAX}): paging an operator and holding the cycle until "
-            f"{_local_time(until)} (epoch {int(until)}), {int(until - now_epoch) + 1}s more, once the "
-            f"oldest leaves the window"
+            f"{_local_time(until)} (epoch {int(until)}), {int(until - now_epoch) + 1}s more, one cooldown "
+            f"interval after the last cycle at most"
         )
         newest = stamps[-1]
         if newest != self._power_cycle_backstop_logged:
@@ -2978,7 +2982,7 @@ class RecoveryMechanism:
             "until": until,
             "last": newest,
             "cause": "power-cycle backstop",
-            "interval_sec": POWER_CYCLE_BACKSTOP_WINDOW_SEC,
+            "interval_sec": int(until - newest),
             "why": why,
         }
 

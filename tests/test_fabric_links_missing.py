@@ -17,7 +17,13 @@ import pytest
 
 from tests import test_dispatch_failure_reset as dfr
 from tests.test_dispatch_failure_reset import _gate, mesh  # noqa: F401  (fixture)
-from tests.test_fabric_topology_mismatch import _LOST, _LOST_PORT, _MISMATCH, topo  # noqa: F401  (fixture)
+from tests.test_fabric_topology_mismatch import (  # noqa: F401  (fixture)
+    _LOST,
+    _LOST_PORT,
+    _MISMATCH,
+    _MOVED_TRAY,
+    topo,
+)
 from tt_device_mcp import server as srv
 from tt_device_mcp.device_holders import HolderScan
 from tt_device_mcp.fsm import ServerState
@@ -36,6 +42,8 @@ def _baseline(tmp_path) -> dict:
 def test_topology_ports_names_each_missing_and_extra_connection():
     assert fabric.topology_ports(_LOST) == ([_LOST_PORT], [])
     missing, extra = fabric.topology_ports(_MISMATCH)
+    assert missing == [] and extra == ["tray 3 port ?", "tray 4 port ?"]
+    missing, extra = fabric.topology_ports(_MOVED_TRAY)
     assert missing == ["tray 1 port ?", "tray 2 port ?"] and extra == ["tray 3 port ?", "tray 4 port ?"]
 
 
@@ -63,12 +71,25 @@ def test_a_wrapper_marker_without_names_takes_them_from_the_validator_output():
 # --- the verdict ----------------------------------------------------------------------------------
 
 
-def test_more_missing_than_extra_is_links_missing_and_a_moved_tray_is_not():
+def test_a_lost_link_is_links_missing():
     lost = fabric.topology_marker("d", 1, 0, ([_LOST_PORT], []))
-    moved = fabric.topology_marker("d", 2, 2, (["a", "b"], ["c", "d"]))
     assert fabric.links_missing(lost).startswith(fabric.LINKS_MISSING)
     assert _LOST_PORT in fabric.links_missing(lost)
-    assert fabric.links_missing(moved) == ""
+
+
+def test_missing_links_fail_even_with_extra_links_to_spare():
+    """I71: any missing port connection fails the check, whatever the extras: a box with more
+    cables than its descriptor must not pass a short fabric off as a relabelling."""
+    hidden = fabric.topology_marker("d", 2, 3, (["a", "b"], ["c", "d", "e"]))
+    assert fabric.links_missing(hidden).startswith(fabric.LINKS_MISSING)
+    assert "2 port connection(s) of the cabling descriptor missing, 3 extra" in fabric.links_missing(hidden)
+
+
+def test_extra_links_alone_pass():
+    extra = fabric.topology_marker("d", 0, 2, ([], ["c", "d"]))
+    assert fabric.links_missing(extra) == ""
+    none = fabric.topology_marker("d", 0, 0)
+    assert fabric.links_missing(none) == ""
 
 
 # --- the monitor ----------------------------------------------------------------------------------
@@ -116,14 +137,18 @@ async def test_an_override_wrapper_that_exits_0_on_a_lost_link_still_fails(topo,
 
 
 @pytest.mark.asyncio
-async def test_a_moved_tray_still_lifts_and_never_lowers_the_mark(topo, tmp_path, monkeypatch):  # noqa: F811
+async def test_a_lift_never_lowers_the_mark(topo, tmp_path, monkeypatch):  # noqa: F811
+    """An extras-only mismatch lifts and never lowers the eth link mark."""
     m, state = topo
     m.eth_link_drop(256)
     ok, _ = await m._verify_fabric_health_body(60)
     assert ok is True and m.topology_lift_pending is True
     assert m.fabric_topology["verdict"] == "lift"
-    assert m.fabric_topology["extra_ports"] == ["tray 3 port ?", "tray 4 port ?"]
-    assert "252 of 256" in m.eth_link_drop(252), "a moved-tray lift keeps the mark"
+    assert m.fabric_topology["missing_ports"] == [] and m.fabric_topology["extra_ports"] == [
+        "tray 3 port ?",
+        "tray 4 port ?",
+    ]
+    assert "252 of 256" in m.eth_link_drop(252), "a lift keeps the mark"
     assert _baseline(tmp_path)["links"] == 256
 
 
