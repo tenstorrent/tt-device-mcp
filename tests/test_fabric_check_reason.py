@@ -269,7 +269,7 @@ def test_an_ok_carrying_the_topology_marker_stays_ok_and_names_the_mismatch():
     assert marker in detail
 
 
-def _run_wrapper_topology(tmp_path, rerun_output: str, rerun_rc: int):
+def _run_wrapper_topology(tmp_path, rerun_output: str, rerun_rc: int, **extra_env):
     """The wrapper with a descriptor set: the stand-in validator mismatches whenever it is handed the
     descriptor, and prints ``rerun_output`` (exit ``rerun_rc``) on the run without it."""
     root = tmp_path / "root"
@@ -296,6 +296,7 @@ def _run_wrapper_topology(tmp_path, rerun_output: str, rerun_rc: int):
         "TTDEV_FABRIC_DESCRIPTOR": str(desc),
         "TTDEV_DISPATCH_BIN": str(tmp_path / "absent"),
         "TTDEV_PCI_DEVICES_DIR": str(tmp_path / "no-pci"),
+        **extra_env,
     }
     r = subprocess.run(["bash", str(_SCRIPT)], env=env, capture_output=True, text=True, timeout=30)
     return r, calls.read_text().splitlines(), desc
@@ -325,3 +326,51 @@ def test_wrapper_topology_rerun_that_cannot_measure_is_77_and_says_so(tmp_path):
     assert r.returncode == FABRIC_CHECK_CANNOT_CHECK_RC, r.stderr
     last = [ln for ln in r.stderr.splitlines() if ln.strip()][-1]
     assert "topology mismatch, traffic-only rerun: what():  Hugepages are not allocated" in last
+
+
+_LIGHT_LOG = "(light: no traffic pass)"
+_LIGHT_OK = "(light: links counted, no traffic pass)"
+
+
+def _calls_of(tmp_path):
+    return (tmp_path / "calls").read_text().splitlines()
+
+
+def test_a_light_run_with_a_descriptor_sends_no_traffic_and_says_so(tmp_path):
+    """Spec 03 I115: the light pass runs only with a descriptor: no --send-traffic, and the log says light."""
+    desc = tmp_path / "desc.textproto"
+    desc.write_text("# cabling\n")
+    fake = tmp_path / "recording_validator"
+    fake.write_text(f"#!/bin/bash\necho \"$*\" >> '{tmp_path / 'calls'}'\necho links ok\nexit 0\n")
+    fake.chmod(0o755)
+    r = _run_wrapper(
+        tmp_path,
+        "",
+        0,
+        TT_DEVICE_MCP_FABRIC_LIGHT="1",
+        TTDEV_FABRIC_DESCRIPTOR=str(desc),
+        TTDEV_FABRIC_BIN=str(fake),
+    )
+    assert r.returncode == 0, r.stderr
+    (call,) = _calls_of(tmp_path)
+    assert "--cabling-descriptor-path" in call and "--send-traffic" not in call
+    assert _LIGHT_LOG in r.stderr and _LIGHT_OK in r.stderr
+
+
+def test_a_light_run_with_no_descriptor_keeps_traffic_and_does_not_claim_light(tmp_path):
+    fake = tmp_path / "recording_validator"
+    fake.write_text(f"#!/bin/bash\necho \"$*\" >> '{tmp_path / 'calls'}'\necho links ok\nexit 0\n")
+    fake.chmod(0o755)
+    r = _run_wrapper(tmp_path, "", 0, TT_DEVICE_MCP_FABRIC_LIGHT="1", TTDEV_FABRIC_BIN=str(fake))
+    assert r.returncode == 0, r.stderr
+    (call,) = _calls_of(tmp_path)
+    assert "--send-traffic" in call
+    assert _LIGHT_LOG not in r.stderr and _LIGHT_OK not in r.stderr
+
+
+def test_a_light_topology_mismatch_reruns_with_traffic_and_does_not_claim_light(tmp_path):
+    r, calls, _ = _run_wrapper_topology(tmp_path, "all links ok\n", 0, TT_DEVICE_MCP_FABRIC_LIGHT="1")
+    assert r.returncode == 0, r.stderr
+    assert len(calls) == 2
+    assert "--send-traffic" not in calls[0] and "--send-traffic" in calls[1]
+    assert r.stderr.count(_LIGHT_LOG) == 1 and _LIGHT_OK not in r.stderr

@@ -5190,7 +5190,7 @@ def _note_plain_exit_debt(stronger_debt_open: bool) -> None:
     """Spec 03 I116: the debt just owed stands for the job's nonzero exit alone, unless a broker-stop debt was
     already open: that one is replaced by this entry and must stay one the clean-exit shortcut never settles."""
     global _kill_reset_plain
-    _kill_reset_plain = bool(_kill_reset_owed) and not stronger_debt_open
+    _kill_reset_plain = not stronger_debt_open
 
 
 def _note_kill_reset_job(job: dict) -> None:
@@ -8103,11 +8103,22 @@ async def device_health_gate(
                 why = f"full check failed after a clean stop: {kill_debt}"
             else:
                 _log(
-                    f"{kill_debt}: all {expected} chip(s) present and ARC healthy, but a kill mid-run can "
-                    f"leave the mesh wedged — one reset, then the full check, before release"
+                    f"{kill_debt}: all {expected} chip(s) present and ARC healthy, but "
+                    + (
+                        "a job that ended without exit 0 owes the mesh one reset"
+                        if owed_reset
+                        else "a kill mid-run can leave the mesh wedged"
+                    )
+                    + " — one reset, then the full check, before release"
                 )
                 why = kill_debt
-            health_event("kill_mesh_reset", phase=phase, expected=expected, why=why[:200])
+            health_event(
+                "kill_mesh_reset",
+                phase=phase,
+                expected=expected,
+                why=why[:200],
+                cause="plain_exit" if owed_reset else "kill",
+            )
         if post_kill is not None:
             route = _post_kill_route(post_kill, expected, kill_reset_due, kill_check_passed)
             off = post_kill["off"]

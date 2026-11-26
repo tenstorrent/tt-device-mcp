@@ -251,6 +251,35 @@ async def test_a_failed_job_resets_before_the_full_pass_and_logs_it(pre_pass, ca
     assert row["ran"] is True and row["job_exit"] == exit_code and row["reset_sec"] >= 0
 
 
+def _kill_mesh_reset_rows(pre_pass):
+    return [k for n, k in pre_pass["rows"] if n == "kill_mesh_reset"]
+
+
+@pytest.mark.asyncio
+async def test_a_plain_exit_reset_says_so_and_a_kill_reset_says_kill(pre_pass, caplog):
+    """The operator log and the journal row name the cause: a plain nonzero exit is not described as a kill."""
+    pre_pass["eth"] = TIMED_OUT
+    srv._owe_kill_reset(_PLAIN_DEBT)
+    srv._note_plain_exit_debt(False)
+    await srv._verify_device_after_job(None, job_failed=True, clean_exit_code=8, job_exit=8)
+    (row,) = _kill_mesh_reset_rows(pre_pass)
+    assert row["cause"] == "plain_exit"
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "a job that ended without exit 0 owes the mesh one reset" in text
+    assert "a kill mid-run can leave the mesh wedged" not in text
+
+
+@pytest.mark.asyncio
+async def test_a_kill_reset_keeps_its_kill_text_and_cause(pre_pass, caplog):
+    srv._owe_kill_reset("job 7 timeout")
+    await srv._verify_device_after_job(None, job_failed=True, job_exit=-9)
+    (row,) = _kill_mesh_reset_rows(pre_pass)
+    assert row["cause"] == "kill"
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "a kill mid-run can leave the mesh wedged" in text
+    assert "owes the mesh one reset" not in text
+
+
 @pytest.mark.asyncio
 async def test_a_failed_check_after_the_pre_pass_reset_stays_held(pre_pass):
     pre_pass["reset_heals"] = False
