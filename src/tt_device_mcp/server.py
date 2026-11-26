@@ -1188,6 +1188,13 @@ preempt_forced_job_ids: set = set()
 # and why, and when the debt was taken (monotonic); 0.0 is none. Any reset since settles it.
 _kill_reset_owed: str = ""
 _kill_reset_owed_at: float = 0.0
+# Spec 03 I116: the open debt was taken only because the job ended without exit 0 (a plain nonzero exit or a
+# signal death); no broker stop, hang or leftover clock stands behind it. Such a debt gives way to the I36
+# shortcut, which runs no traffic pass for the reset to precede.
+_kill_reset_plain: bool = False
+# Spec 03 I116: seconds the current post-job gate spent on its pre-pass reset (the reset and the full check
+# after it), or None when it ran none. The gate sets it; the post-job caller logs it once and clears it.
+_pre_pass_reset_sec: Optional[float] = None
 # Spec 03 I89: the stopped job behind the debt, so the reset can wait for it to be gone: its scope,
 # its tag, the (pid, starttime) of every process its end's sweep left alive, and when that sweep
 # ended (monotonic). Empty for a debt with no job record (a re-adopted job): only holders are waited on.
@@ -2834,6 +2841,7 @@ def _reset_for_testing():
     global _hold_episode_restorable, _hold_episode_tenant, _hold_episode_startup, _hold_carry, _hold_carry_loaded
     global _fabric_77_streak_since, _fabric_77_streak, _fabric_77_fallback_release_monotonic
     global _dispatch_reset_spent, _kill_reset_owed, _kill_reset_owed_at, _pre_reset_blocker
+    global _kill_reset_plain, _pre_pass_reset_sec
     global _fabric_77_recheck_since, _fabric_77_rechecks, _fabric_77_recheck_monotonic
     global device_op_stage_started_at, device_held_since, device_hold_escalated_monotonic, tenant_job_degraded_since
     global device_hold_deadline_bucket
@@ -2856,6 +2864,8 @@ def _reset_for_testing():
     _dispatch_reset_spent = False
     _kill_reset_owed = ""
     _kill_reset_owed_at = 0.0
+    _kill_reset_plain = False
+    _pre_pass_reset_sec = None
     request_killed_job_ids.clear()
     reset_killed_job_ids.clear()
     preempt_forced_job_ids.clear()
@@ -5053,14 +5063,23 @@ def _eth_timeout_reset_shape(evidence: dict) -> bool:
 
 
 def _owe_kill_reset(why: str) -> None:
-    """Spec 03 I69: a job the broker stopped mid-run owes the mesh one reset, then the full check."""
-    global _kill_reset_owed, _kill_reset_owed_at, _kill_reset_job
+    """Spec 03 I69: a job the broker stopped mid-run owes the mesh one reset, then the full check. Spec 03 I116:
+    so does a job that ended without exit 0."""
+    global _kill_reset_owed, _kill_reset_owed_at, _kill_reset_job, _kill_reset_plain
     _kill_reset_owed = why
+    _kill_reset_plain = False
     _kill_reset_owed_at = time.monotonic()
     _kill_reset_job = {}
     if logger:
         logger.info(f"CLEAN-GATE {why}: the mesh owes one reset, then the full check, before release")
     health_event("kill_reset_owed", why=why)
+
+
+def _note_plain_exit_debt(stronger_debt_open: bool) -> None:
+    """Spec 03 I116: the debt just owed stands for the job's nonzero exit alone, unless a broker-stop debt was
+    already open: that one is replaced by this entry and must stay one the clean-exit shortcut never settles."""
+    global _kill_reset_plain
+    _kill_reset_plain = bool(_kill_reset_owed) and not stronger_debt_open
 
 
 def _note_kill_reset_job(job: dict) -> None:
@@ -5072,8 +5091,9 @@ def _note_kill_reset_job(job: dict) -> None:
 
 
 def _clear_kill_reset_debt() -> None:
-    global _kill_reset_owed, _kill_reset_owed_at, _kill_reset_job
+    global _kill_reset_owed, _kill_reset_owed_at, _kill_reset_job, _kill_reset_plain
     _kill_reset_owed = ""
+    _kill_reset_plain = False
     _kill_reset_owed_at = 0.0
     _kill_reset_job = {}
 
@@ -7624,7 +7644,7 @@ async def device_health_gate(
     ``job_exit0`` says the job behind a post-job pass ended with exit 0; only then may its fabric check run light
     (spec 03 I115). ``fabric_ok_job`` is the job whose trusted fabric-ok marker settles its own tenant reset's
     check choice: that debt alone then runs the check light (spec 04 I32)."""
-    global _dispatch_reset_spent
+    global _dispatch_reset_spent, _pre_pass_reset_sec
     # Fabric output from before this pass is another pass's transcript: an incident bundle names
     # it stale instead of presenting it as this pass's (spec 03 I57).
     pass_started = datetime.now()
@@ -7764,10 +7784,13 @@ async def device_health_gate(
             and not _pcie_cycle.get("job_rows")
             and not isolated_chips
             and not device_fault_reported
-            and not _kill_reset_debt()
+            and (not _kill_reset_debt() or _kill_reset_plain)
             and not _post_reset_debt()
         )
         if skip_forced:
+            if _kill_reset_plain:
+                # Spec 03 I116: no traffic pass runs here, so there is none for a reset to precede.
+                _clear_kill_reset_debt()
             _log(
                 f"the failed job ended in a clean software exit (exit {clean_exit_code}) and no device event: "
                 f"reading the eth heartbeat instead of forcing a fabric pass"
@@ -8539,6 +8562,7 @@ async def device_health_gate(
             metrics.stage_fired("smi_reset", "blocked")
         else:
             reset_clock = recovery_mechanism.last_reset_monotonic
+            fire_began = time.monotonic()
             recovered = await _fire(stage)
             # The latch is spent only once a reset actually started (the clock moves at reset begin):
             # one the per-host gate refused leaves the episode's reset unspent.
@@ -8548,6 +8572,9 @@ async def device_health_gate(
                 and recovery_mechanism.last_reset_monotonic != reset_clock
             ):
                 _dispatch_reset_spent = True
+                if ev.kill_reset_due and phase == "post-job":
+                    # Spec 03 I116: the reset the debt owed ran, ahead of the full check that releases the device.
+                    _pre_pass_reset_sec = time.monotonic() - fire_began
             if recovered:
                 return
 
@@ -12578,6 +12605,7 @@ async def _verify_device_after_job(
     clean_exit_code: Optional[int] = None,
     job_exit0: bool = False,
     fabric_ok_job: str = "",
+    job_exit: Optional[int] = None,
 ) -> None:
     """Post-job gate — runs at the END of every run (the finished job's caller has already been released, so this never
     delays their terminal/result): the enum/ARC snapshot always runs, so a chip that left the bus is flagged here — as
@@ -12593,7 +12621,13 @@ async def _verify_device_after_job(
     silicon, and a clean software exit (``clean_exit_code``) whose quick checks all pass drops the forced pass
     (spec 03 I36). After a job that ended with exit 0 (``job_exit0``) that pass runs light (spec 03 I115).
 
+    Spec 03 I116: one line and one journal row per gate say whether the pre-pass reset ran, with the job's exit code
+    (``job_exit``, None when no job record stands behind the gate).
+
     Never raises."""
+    global _pre_pass_reset_sec
+    _pre_pass_reset_sec = None
+    began = time.monotonic()
     try:
         await _device_health_gate(
             job_log_file,
@@ -12611,6 +12645,24 @@ async def _verify_device_after_job(
         _mark_device_dirty(f"post-job health gate error: {e}", why="gate_error")
         if logger:
             logger.error(f"post-job health gate error: {e}")
+    try:
+        reset_sec, _pre_pass_reset_sec = _pre_pass_reset_sec, None
+        ran = reset_sec is not None
+        exit_text = "n/a" if job_exit is None else str(job_exit)
+        if logger:
+            logger.info(
+                f"HEALTH-GATE[post-job] pre-pass reset: {'ran' if ran else 'skipped'} "
+                f"(job exit {exit_text}, {reset_sec if ran else 0.0:.0f}s)"
+            )
+        health_event(
+            "post_job_pre_pass_reset",
+            ran=ran,
+            job_exit=job_exit,
+            reset_sec=round(reset_sec, 1) if ran else 0.0,
+            gate_sec=round(time.monotonic() - began, 1),
+        )
+    except Exception:  # noqa: BLE001 - a log line must never end the runner
+        pass
 
 
 def _pty_read(fd: int) -> bytes:
@@ -14936,26 +14988,32 @@ export {FABRIC_OK_ENV}={shlex.quote(str(job_fabric_ok_file(job_id)))}
                 # Same debt for a job that failed on its own because the runtime could not bring the device up
                 # (its firmware init timed out on the cores) or said the device is unrecoverable before the reaper's
                 # grace ran out: it exits with a plain code, so the clean-exit shortcut (03 I36) would hand the same
-                # wedged mesh to the next job, and every job fails the same way. A plain failure keeps the shortcut.
+                # wedged mesh to the next job, and every job fails the same way. A plain nonzero exit owes only the plain debt, which still yields to the shortcut.
                 init_fault = None
                 if not killed_by_reset and not known and not topo and job.status == JobStatus.FAILED:
                     init_fault = _scan_output_for_runtime_init_fault(job_log_file)
                     if init_fault is None and job.doomed_monotonic is not None:
                         init_fault = "runtime reported the device unrecoverable"
-                if (
-                    not killed_by_reset
-                    and not known
-                    and not topo
-                    and (
-                        job.status in (JobStatus.TIMEOUT, JobStatus.HUNG)
-                        or job_id in request_killed_job_ids
-                        or job_id in preempt_forced_job_ids
-                        or left_busy
-                        or init_fault
-                    )
-                ):
+                # Spec 03 I116: a job that ended without exit 0 on its own (a plain nonzero exit, or a signal death
+                # that left no other trace) owes the same one reset before the full traffic pass: that pass started on
+                # the mesh such a job left behind is what chips fell off the bus in.
+                nonzero_end = (
+                    job.status in (JobStatus.FAILED, JobStatus.KILLED)
+                    and isinstance(job.exit_code, int)
+                    and job.exit_code != 0
+                )
+                broker_stop = bool(
+                    job.status in (JobStatus.TIMEOUT, JobStatus.HUNG)
+                    or job_id in request_killed_job_ids
+                    or job_id in preempt_forced_job_ids
+                    or left_busy
+                    or init_fault
+                )
+                if not killed_by_reset and not known and not topo and (broker_stop or nonzero_end):
+                    stronger_debt_open = bool(_kill_reset_debt()) and not _kill_reset_plain
                     _owe_kill_reset(
                         f"job {job_id} {job.status.value}"
+                        + (f" (exit {job.exit_code})" if nonzero_end and not broker_stop else "")
                         + (
                             f" with {len(left_busy)} chip(s) left at the busy AI clock "
                             f"(max {max(left_busy.values())} MHz)"
@@ -14964,6 +15022,8 @@ export {FABRIC_OK_ENV}={shlex.quote(str(job_fabric_ok_file(job_id)))}
                         )
                         + (f": {init_fault}" if init_fault else "")
                     )
+                    if not broker_stop:
+                        _note_plain_exit_debt(stronger_debt_open)
                     _note_kill_reset_job(
                         {
                             "scope": job_scope_unit(job_id) if privsep_prefix else None,
@@ -15064,6 +15124,7 @@ export {FABRIC_OK_ENV}={shlex.quote(str(job_fabric_ok_file(job_id)))}
                                 _clean_software_exit_code(job) if job_failed and not runner_error else None
                             ),
                             job_exit0=job.status == JobStatus.COMPLETED and job.exit_code == 0,
+                            job_exit=job.exit_code if isinstance(job.exit_code, int) else None,
                             fabric_ok_job=_trust_fabric_ok(job),
                         )
                 except Exception as e:  # noqa: BLE001 - never crash the runner
