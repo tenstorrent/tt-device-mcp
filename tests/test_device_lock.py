@@ -459,6 +459,21 @@ def test_lock_with_the_group_in_a_drop_in_adds_no_duplicate(tmp_path, monkeypatc
     assert _GROUP_LINE not in lines and lines.count(_LOCK_LINE) == 1
 
 
+@pytest.mark.parametrize("active,restarts", [(0, 1), (3, 0)])
+def test_unlock_restarts_only_an_active_broker(tmp_path, monkeypatch, active, restarts):
+    _unlock_sandbox(tmp_path, monkeypatch, "TTDEV_LOCK=1\n")
+    calls = []
+
+    def run(argv, **_kw):
+        calls.append(argv)
+        return SimpleNamespace(returncode=active if "is-active" in argv else 0)
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    assert cli.cmd_unlock(SimpleNamespace()) == 0
+    assert sum(a[:2] == ["systemctl", "restart"] for a in calls) == restarts
+    assert not any(a[:2] == ["systemctl", "start"] for a in calls)
+
+
 def test_unlock_leaves_a_host_without_the_opt_in_alone(tmp_path, monkeypatch):
     conf, _ = _unlock_sandbox(tmp_path, monkeypatch, "TTDEV_VENV=/v\n")
     assert cli.cmd_unlock(SimpleNamespace()) == 0

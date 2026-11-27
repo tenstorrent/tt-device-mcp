@@ -26,6 +26,7 @@ from typing import Callable, Optional
 
 from tt_device_mcp import aio, metrics
 from tt_device_mcp.constants import (
+    ETH_POST_JOB_RETRY_SETTLE_SEC,
     ETH_POST_JOB_TIMEOUT_SEC,
     ETH_REAP_SEC,
     FABRIC_CHECK_CANNOT_CHECK_RC,
@@ -37,6 +38,7 @@ from tt_device_mcp.health import chip_state, pcie_quiet
 from tt_device_mcp.health.core import HealthState, Observation, Verdict
 from tt_device_mcp.health.evidence import capture_incident, health_dir, health_event
 from tt_device_mcp.health.monitors import eth, fabric, hostpci, pci
+from tt_device_mcp.health.pci_writer import PCI_WRITER
 from tt_device_mcp.health.post_reset import FABRIC_DEBT
 from tt_device_mcp.health.shutdown import CheckInterruptedByShutdown, interrupted_by_shutdown
 
@@ -263,7 +265,7 @@ FABRIC_LINKS_UNSEEN = "eth links below the high-water mark, which a traffic pass
 
 def eth_read_timed_out(detail: str) -> bool:
     """Whether an eth read's detail is a could-not-check whose cause was the read's own timeout —
-    the stuck read the post-job present-mesh reset answers (spec 03 I61), never a crash or a 77."""
+    the stuck read the post-job gate reads once more (spec 03 I61), never a crash or a 77."""
     return (detail or "").startswith(ETH_COULD_NOT_CHECK) and eth.READ_TIMED_OUT in detail
 
 
@@ -414,7 +416,6 @@ class HealthMonitor:
         force_fabric: bool = False,
         run_eth: bool = False,
         fabric_stale: bool = True,
-        eth_timeout_reset: bool = False,
         eth_no_verdict_reset: bool = False,
         fabric_light: bool = False,
         indices: Optional[list] = None,
@@ -434,12 +435,13 @@ class HealthMonitor:
         caller's interval): the drop persists until an operator re-baselines, so running the pass on it would charge
         every clean job ~45-100s. Otherwise the skip is recorded and the pass ends.
 
-        ``eth_timeout_reset`` says the post-job gate can still grant this hold episode's one present-mesh reset (spec 03
-        I61). A ``run_eth`` read that then TIMED OUT with no verdict, on a pass whose host-pci read is OK and whose
-        snapshot found every chip with a healthy ARC, skips the fabric pass: the gate resets next, and the full check
-        after the reset runs the pass. Any guard that fails keeps the pass. ``eth_no_verdict_reset`` (spec 03 I116)
-        widens that skip to every read with no verdict, a link-drop skip included: the gate owes the reset to a failed
-        job whose clean exit took the shortcut.
+        A ``run_eth`` read that TIMED OUT with no verdict, on a pass whose host-pci read is OK, is read once more after a
+        short settle (``_post_job_eth_read``, spec 03 I61). Still unmeasured, it runs the fabric pass in this same pass,
+        like any other no-verdict read: a pass releases the device, a fail holds it and the bounded recovery takes over.
+
+        ``eth_no_verdict_reset`` (spec 03 I116) says the gate owes a failed job's present-mesh reset: a read that still
+        reaches no verdict (a link-drop skip included), on a pass whose host-pci read is OK, skips the fabric pass,
+        the gate resets next, and the full check after the reset runs the pass.
 
         ``fabric_light`` drops the all-link Ethernet traffic pass from the fabric check this pass runs:
         the validator still opens the fabric and counts every inter-chip link against the cabling
@@ -479,7 +481,6 @@ class HealthMonitor:
                 force_fabric=force_fabric,
                 run_eth=run_eth,
                 fabric_stale=fabric_stale,
-                eth_timeout_reset=eth_timeout_reset,
                 eth_no_verdict_reset=eth_no_verdict_reset,
                 fabric_light=fabric_light,
                 indices=indices,
@@ -505,7 +506,6 @@ class HealthMonitor:
         force_fabric: bool,
         run_eth: bool,
         fabric_stale: bool,
-        eth_timeout_reset: bool,
         eth_no_verdict_reset: bool,
         fabric_light: bool,
         indices: Optional[list],
@@ -590,7 +590,7 @@ class HealthMonitor:
             elif fabric_asked:
                 eok, edetail = await self.verify_eth_heartbeat()
             else:
-                eok, edetail = await self.verify_eth_heartbeat(timeout_sec=ETH_POST_JOB_TIMEOUT_SEC)
+                eok, edetail = await self._post_job_eth_read(hp_ok, log)
             if log:
                 log(f"eth-heartbeat: {'SKIPPED' if eok is None else ('OK' if eok else 'FROZEN')} — {edetail}")
             _record("eth_heartbeat", eok, edetail)
@@ -606,16 +606,9 @@ class HealthMonitor:
             link_drop_held = (
                 not fabric_asked and link_drop and not unseen and not fabric_stale and self.last_fabric_ok is True
             )
-            # Spec 03 I61: a timed-out read on a present mesh goes straight to the gate's one
-            # present-mesh reset. The pass here failed or skipped after every such timeout measured.
-            reset_due = (
-                eth_timeout_reset
-                and not fabric_asked
-                and eok is None
-                and (eth_no_verdict_reset or eth_read_timed_out(edetail))
-                and not unseen
-                and hp_ok is True
-            )
+            # Spec 03 I116: a failed job's owed present-mesh reset comes before the full pass, so a read
+            # that reached no verdict skips the pass here; the gate resets next and the full check follows.
+            reset_due = eth_no_verdict_reset and not fabric_asked and eok is None and not unseen and hp_ok is True
             if link_drop_held and log and self.last_fabric_skipped:
                 # A 77 since the green pass (it leaves last_fabric_ok alone) reached no verdict: no cover.
                 log(
@@ -628,7 +621,7 @@ class HealthMonitor:
                 )
             elif reset_due and log:
                 log(
-                    "eth-heartbeat read reached no verdict after a clean exit on a present mesh — skipping the "
+                    "eth-heartbeat read reached no verdict after a failed job on a present mesh — skipping the "
                     "pre-reset fabric pass; the full check runs after the present-mesh reset"
                 )
             elif not fabric_asked and eok is None and log:
@@ -652,6 +645,32 @@ class HealthMonitor:
                 _record("fabric", fok, fdetail)
 
         return _store()
+
+    async def _post_job_eth_read(
+        self, hp_ok: Optional[bool], log: Optional[Callable[[str], None]]
+    ) -> tuple[Optional[bool], str]:
+        """The clean post-job eth read (spec 03 I61), with the device's readers stopped as for the fabric check.
+
+        A read that timed out with no verdict while host-pci is OK is tried once more after
+        ``ETH_POST_JOB_RETRY_SETTLE_SEC``: the timeouts cluster on the first job after a mesh reset, on a mesh
+        the later read finds healthy. The retry's verdict, measured or not, stands; an unmeasured one runs the
+        fabric pass. Any other first result, and a read whose host-pci is not OK, is returned as it came.
+        The readers are restored on every exit."""
+        quiesce = getattr(self._deps, "quiesce_readers", None)
+        scope = (
+            quiesce("the eth-heartbeat read", self._readers_log) if quiesce is not None else contextlib.nullcontext()
+        )
+        async with scope:
+            eok, edetail = await self.verify_eth_heartbeat(timeout_sec=ETH_POST_JOB_TIMEOUT_SEC)
+            if eok is None and eth_read_timed_out(edetail) and hp_ok is True:
+                if log:
+                    log(
+                        f"eth-heartbeat read timed out after a clean exit ({edetail}) — reading once more "
+                        f"after {ETH_POST_JOB_RETRY_SETTLE_SEC:g}s"
+                    )
+                await asyncio.sleep(ETH_POST_JOB_RETRY_SETTLE_SEC)
+                eok, edetail = await self.verify_eth_heartbeat(timeout_sec=ETH_POST_JOB_TIMEOUT_SEC)
+            return eok, edetail
 
     async def _verify_device(self, expected: int) -> tuple[bool, str]:
         """The tt-smi snapshot probe, off the event loop. A thin seam ``update()`` calls through,
@@ -1208,7 +1227,7 @@ class HealthMonitor:
         """The last fabric verdict, for the detail of every hold-lift and release event (spec 03 I78): ``result``
         (pass/fail/skipped/none), ``missing_vs_cabling``/``extra_vs_cabling`` (port connections the links found lack, or
         add, against the cabling descriptor: 0/0 on a clean pass means every cabled link was found), ``links_short``
-        (True when more are missing than extra, which FAILS the check, I71) and ``age_s``. Only the shortfall is logged:
+        (True when any are missing, which FAILS the check, I71) and ``age_s``. Only the shortfall is logged:
         the validator prints no link totals. ``result`` "none" once a reset voided it or before any check ran."""
         v = dict(self._fabric_verdict)
         if not v or self.last_fabric_ok is None and v["result"] != "skipped":
@@ -1268,6 +1287,17 @@ class HealthMonitor:
         self, timeout_sec: float, *, light: bool = False
     ) -> tuple[Optional[bool], str]:
         self._fabric_killed = ""
+        # Spec 04 I76: a PCI-wedged latch set while this pass runs ends it at once, no verdict. Only the
+        # power cycle recovers the mesh, and it waits on the device op this check holds. A latch already
+        # set at the start does not: a pass then is what may clear it.
+        latched_at = PCI_WRITER.latched_at
+        wedged = {"why": ""}
+
+        def _abort() -> str:
+            if PCI_WRITER.latched and PCI_WRITER.latched_at != latched_at:
+                wedged["why"] = wedged["why"] or f"PCI-wedged during the check: {PCI_WRITER.reason}"
+            return wedged["why"]
+
         override = self._fabric_check_cmd()
         built = fabric.build_command(**({"traffic": False} if light else {}))
         if built is None:
@@ -1302,12 +1332,18 @@ class HealthMonitor:
             # This chip-to-bus map already mismatched the descriptor: that run would only throw the
             # same mismatch again, so go straight to the traffic-only rerun (I45).
             rc, text, ok, reason = await self._fabric_traffic_only_rerun(
-                desc, "", timeout_sec=timeout_sec, track=_track, cwd=cwd, marker=cached
+                desc, "", timeout_sec=timeout_sec, track=_track, cwd=cwd, marker=cached, abort=_abort
             )
         else:
             try:
                 rc, text = await fabric.check(
-                    argv, env, timeout_sec=timeout_sec, track=_track, terminate=self._terminate_process_group, cwd=cwd
+                    argv,
+                    env,
+                    timeout_sec=timeout_sec,
+                    track=_track,
+                    terminate=self._terminate_process_group,
+                    cwd=cwd,
+                    abort=_abort,
                 )
             except Exception as e:  # noqa: BLE001 - configured but could not spawn; never raise into the gate
                 self._journal_skip_once("fabric_check_unavailable", "not_runnable", detail=str(e)[:400])
@@ -1318,8 +1354,10 @@ class HealthMonitor:
         # the journal carries truncates exactly the part naming them.
         self.last_fabric_output = text
         self.last_fabric_output_at = _t0
+        if wedged["why"]:
+            return self._fabric_no_verdict(cmd, None, text, dt, wedged["why"])
         if self._fabric_killed:
-            return self._fabric_killed_no_verdict(cmd, rc, text, dt)
+            return self._fabric_no_verdict(cmd, rc, text, dt)
         last = text.splitlines()[-1][:200] if text else "(no output)"
         if override:
             # An operator's own wrapper has already done its own interpretation and reports it
@@ -1335,14 +1373,16 @@ class HealthMonitor:
             ok, reason = fabric.classify(rc, text)
             if ok is None and desc and fabric.is_topology_mismatch(text):
                 rc, text, ok, reason = await self._fabric_traffic_only_rerun(
-                    desc, text, timeout_sec=timeout_sec, track=_track, cwd=cwd
+                    desc, text, timeout_sec=timeout_sec, track=_track, cwd=cwd, abort=_abort
                 )
                 self.last_fabric_output = text
                 self.last_fabric_output_at = _t0
+        if wedged["why"]:
+            return self._fabric_no_verdict(cmd, None, text, (datetime.now() - _t0).total_seconds(), wedged["why"])
         if self._fabric_killed:
             # Read again after the traffic-only rerun (I45): a kill there is no verdict either (I82),
             # never a link fault or a missing-cable verdict (I47) from whatever the killed run printed.
-            return self._fabric_killed_no_verdict(cmd, rc, text, (datetime.now() - _t0).total_seconds())
+            return self._fabric_no_verdict(cmd, rc, text, (datetime.now() - _t0).total_seconds())
         # Traffic crossed every discovered link but ports of the descriptor are missing: a FAILED
         # check, never a lift (I71). The cached mismatch goes, so the next pass runs the descriptor
         # again and a reset that brought the link back reads clean.
@@ -1428,19 +1468,29 @@ class HealthMonitor:
             return False, f"fabric check timed out after {timeout_sec:.0f}s; last line: {last}"
         return False, f"fabric check exited {rc} ({dt:.0f}s): {reason[:400]}"
 
-    def _fabric_killed_no_verdict(self, cmd: str, rc: Optional[int], text: str, dt: float) -> tuple[None, str]:
-        """A pass the dead-chip isolation killed (spec 03 I82): neither a pass nor a link fault, nor a
-        77. No failed verdict, no 77 streak (I46) and no cover from an earlier pass: the fabric is
-        unknown until a later pass measures it."""
+    def _fabric_no_verdict(
+        self, cmd: str, rc: Optional[int], text: str, dt: float, wedged: str = ""
+    ) -> tuple[None, str]:
+        """A pass the dead-chip isolation killed (spec 03 I82), or, with ``wedged``, one a PCI-wedged latch ended (spec 04
+        I76): neither a pass nor a link fault, nor a 77. No failed verdict, no 77 streak (I46) and no cover from an
+        earlier pass: the fabric is unknown until a later pass measures it. A wedged pass's readers are left SIGSTOPped,
+        never killed: a chip under them may be off the bus and still attached (spec 03 I84), and the power cycle ends
+        them."""
         why, self._fabric_killed = self._fabric_killed, ""
-        self._write_action_log("[broker]fabric-check", cmd, dt, "killed", rc, output=_action_log_output(text))
+        status = "stopped" if wedged else "killed"
+        self._write_action_log("[broker]fabric-check", cmd, dt, status, rc, output=_action_log_output(text))
         self.last_fabric_ok = None
         self.last_fabric_skipped = False
-        detail = (
-            f"{FABRIC_KILLED_BY_ISOLATION} ({dt:.0f}s, exit {rc}): {why}; no verdict, "
-            "fabric unknown, a full pass is owed after recovery"
-        )
-        health_event("fabric_check_no_verdict", cause="killed_by_dead_chip_isolation", reason=why[:400], rc=rc)
+        if wedged:
+            FABRIC_DEBT.note_fabric_killed(f"fabric check stopped ({wedged})")
+            detail = f"fabric check stopped after {dt:.0f}s: {wedged}; no verdict, the power cycle is next"
+            health_event("fabric_check_no_verdict", cause="pci_wedged", reason=wedged[:400])
+        else:
+            detail = (
+                f"{FABRIC_KILLED_BY_ISOLATION} ({dt:.0f}s, exit {rc}): {why}; no verdict, "
+                "fabric unknown, a full pass is owed after recovery"
+            )
+            health_event("fabric_check_no_verdict", cause="killed_by_dead_chip_isolation", reason=why[:400], rc=rc)
         log = self._logger()
         if log:
             log.warning(f"FABRIC-CHECK {detail}")
@@ -1475,6 +1525,7 @@ class HealthMonitor:
         track,
         cwd: Optional[str],
         marker: Optional[str] = None,
+        abort=None,
     ) -> tuple[Optional[int], str, Optional[bool], str]:
         """The validator stopped on its descriptor comparison: rerun it once without the descriptor
         so traffic still crosses every link it discovered. Same verdict table as the first run; a
@@ -1506,6 +1557,7 @@ class HealthMonitor:
                 track=track,
                 terminate=self._terminate_process_group,
                 cwd=cwd,
+                abort=abort,
             )
         except Exception as e:  # noqa: BLE001 - never raise into the gate
             return None, first, None, no_verdict(f"traffic-only rerun not runnable: {e}")

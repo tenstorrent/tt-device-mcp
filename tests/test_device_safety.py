@@ -2999,28 +2999,25 @@ async def test_pollers_are_restarted_even_if_the_reset_raises(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_pollers_quiesce_journals_none_active_when_configured_units_resolve_to_nothing(monkeypatch):
-    """Configured poller units that resolve to no active unit make the quiesce a no-op: the reset
-    then lands on a bus the broker only ASSUMES is quiet, while the real pollers may still hammer
-    MMIO under a name it was never told — the exact condition that reboots the host. A no-op quiesce
-    must land in the journal loud, not read as a clean one."""
+async def test_pollers_quiesce_journals_none_active_when_an_installed_poller_will_not_stop(monkeypatch):
+    """Installed poller units whose stop fails make the quiesce a no-op: the reset then lands on a
+    bus the broker only ASSUMES is quiet, while the pollers may still hammer MMIO — the exact
+    condition that reboots the host. A no-op quiesce must land in the journal loud, not read as a
+    clean one. A listed unit the host does not have does not excuse another that is installed and
+    whose stop failed: it is named in the event's not_installed, never read as the all-clear."""
     monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service", "tt-metrics-exporter.service"))
-
-    class _NotLoaded:
-        returncode = 5  # `systemctl stop` against a unit not loaded on this host
-
-        async def wait(self):
-            return self.returncode
-
-        async def communicate(self):
-            return b"inactive\n", b""
+    monkeypatch.setattr(srv, "_poller_unit_installed", lambda svc: svc == "tt-metrics-exporter.service")
 
     async def _exec(*argv, **kw):
-        return _NotLoaded()
+        proc = await _systemctl_with_units(set(), [])(*argv, **kw)
+        if argv[-1] == "tt-metrics-exporter.service" and argv[1] == "stop":
+            proc.returncode = 1  # the unit is installed, but its stop failed
+        return proc
 
     monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _exec)
+    lines = []
 
-    touched = await srv._set_device_pollers(False, lambda m: None)
+    touched = await srv._set_device_pollers(False, lines.append)
 
     assert touched == []
     events = health.read_health_events(kinds={"pollers_none_active"})
@@ -3028,6 +3025,25 @@ async def test_pollers_quiesce_journals_none_active_when_configured_units_resolv
     assert events[0]["verb"] == "stop"
     assert events[0]["host_at_risk"] is True
     assert events[0]["configured"] == ["tt-telemetry.service", "tt-metrics-exporter.service"]
+    assert events[0]["not_installed"] == ["tt-telemetry.service"]
+    assert any(line.startswith("WARNING: no configured device poller") for line in lines), lines
+
+
+@pytest.mark.asyncio
+async def test_pollers_quiesce_logs_once_and_flags_nothing_when_no_poller_unit_is_installed(monkeypatch):
+    """A host with none of the listed units installed has nothing to quiesce: no WARNING and no
+    host_at_risk event on any quiesce, and one plain log line per broker process."""
+    monkeypatch.setattr(srv, "DEVICE_POLLER_SERVICES", ("tt-telemetry.service", "tt-metrics-exporter.service"))
+    monkeypatch.setattr(srv, "_poller_unit_installed", lambda svc: False)
+    lines = []
+
+    for _ in range(3):
+        assert await srv._set_device_pollers(False, lines.append) == []
+
+    assert health.read_health_events(kinds={"pollers_none_active"}) == []
+    assert lines == [
+        "no configured device poller unit is installed on this host: tt-telemetry.service, tt-metrics-exporter.service"
+    ]
 
 
 @pytest.mark.asyncio
@@ -10587,36 +10603,75 @@ async def test_idle_relift_escalates_an_all_arc_frozen_present_mesh(monkeypatch,
     the ceiling it must now escalate a confirmed mass wedge to the present-mesh galaxy reset."""
     _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
     counters = _arm_stuck_hold(monkeypatch)
-    stalled = [str(i) for i in range(32)]
-
-    async def all_arc_frozen(expected, log, run_fabric=True, **_):
-        return False, {"heartbeat": {"verdict": "unhealthy", "detail": "all 32 ARC frozen", "stalled": stalled}}
-
-    patch_recovery(monkeypatch, "_verify_device", all_arc_frozen)
+    _hung_chip_verify(monkeypatch, [str(i) for i in range(32)])
 
     await srv._attempt_idle_relift()
 
     assert counters["resets"] == 1, "the relift must escalate an all-ARC-frozen present mesh to a reset"
 
 
+def _hung_chip_verify(monkeypatch, stalled):
+    async def verify(expected, log, run_fabric=True, **_):
+        return False, {
+            "heartbeat": {"verdict": "unhealthy", "detail": f"{len(stalled)} ARC frozen", "stalled": stalled}
+        }
+
+    patch_recovery(monkeypatch, "_verify_device", verify)
+
+
 @pytest.mark.asyncio
-async def test_idle_relift_holds_a_below_floor_arc_frozen_present_mesh(monkeypatch, tmp_path, clear_job_state):
-    """The relift boundary mirroring the gate's: a FEW frozen chips (below the mass floor) self-heal,
-    so the relift must still HOLD read-only — a galaxy reset for them is the drop the floor guards
-    against. Locks the mass-vs-sub-mass split on the idle path."""
+@pytest.mark.parametrize("held_minutes_ago, resets", [(1, 0), (3, 1)])
+async def test_idle_relift_resets_a_hung_chip_below_the_floor_at_the_present_mesh_grace(
+    monkeypatch, tmp_path, clear_job_state, held_minutes_ago, resets
+):
+    """Spec 04 I116: one frozen chip with every chip on the bus is below the mass floor, yet it does not self-clear.
+    The relift takes the present-mesh reset at the grace (120 s), not at the 10-min ceiling, and not before it."""
     _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
-    counters = _arm_stuck_hold(monkeypatch)
-    stalled = ["3", "8", "17"]
-
-    async def few_arc_frozen(expected, log, run_fabric=True, **_):
-        return False, {"heartbeat": {"verdict": "unhealthy", "detail": "3 ARC frozen", "stalled": stalled}}
-
-    patch_recovery(monkeypatch, "_verify_device", few_arc_frozen)
+    counters = _arm_stuck_hold(monkeypatch, held_minutes_ago=held_minutes_ago)
+    _hung_chip_verify(monkeypatch, ["11"])
 
     await srv._attempt_idle_relift()
 
-    assert counters["resets"] == 0, "a below-floor frozen count self-heals — the relift must hold, not reset"
-    assert srv.fsm.state is not ServerState.HEALTHY, "the hold must stand"
+    assert counters["resets"] == resets
+
+
+@pytest.mark.asyncio
+async def test_idle_relift_resets_a_hung_chip_once_per_hold_and_a_failed_check_keeps_the_hold(
+    monkeypatch, tmp_path, clear_job_state
+):
+    """Spec 04 I116 with I87/I32: the reset runs once per hold, and its failed full check releases nothing: the hold
+    stands, the fault and the dirty latch stay, and the next tick climbs rather than repeating the mesh reset."""
+    _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
+    counters = _arm_stuck_hold(monkeypatch, held_minutes_ago=3, reset_result=False)
+    _hung_chip_verify(monkeypatch, ["11"])
+
+    await srv._attempt_idle_relift()
+    await srv._attempt_idle_relift()
+
+    assert counters["resets"] == 1, "one mesh reset per hold episode"
+    assert counters["fault_cleared"] == 0 and counters["dirty_cleared"] == 0
+    assert srv.fsm.state is not ServerState.HEALTHY, "the failed check keeps the hold"
+
+
+@pytest.mark.asyncio
+async def test_a_relift_tick_before_the_grace_re_arms_the_next_one_at_the_grace(monkeypatch, tmp_path, clear_job_state):
+    """Spec 04 I116: the hung-chip reset fires at the grace, not up to one relift interval after it.
+    A tick before the grace gets not-due from the escalator's age gate, so it must re-arm the
+    relift timer for the grace — the same _relift_at_present_grace() the generic branch uses —
+    not a full 120 s interval later. Fails without the re-arm: the reset would land one interval late."""
+    _setup_selfheal_hold(monkeypatch, tmp_path, n_present=32)
+    counters = _arm_stuck_hold(monkeypatch, held_minutes_ago=100 / 60)  # hold age 100 s, grace at 120 s
+    _hung_chip_verify(monkeypatch, ["11"])
+
+    await srv._attempt_idle_relift()
+
+    assert counters["resets"] == 0, "inside the grace, no reset fires"
+    due_in = srv.SELFHEAL_RELIFT_INTERVAL_SEC - (srv.time.monotonic() - srv.last_relift_monotonic)
+    grace = galaxy._present_mesh_reset_grace_sec()
+    assert 0 < due_in <= grace - 100 + 5, (
+        "the next relift must land at the grace (the tick ran at hold age 100 s, grace 120 s),"
+        " not one full interval after the tick"
+    )
 
 
 # --- A2 (off-bus): the escalation must reach an OFF-BUS hold that never self-returns ------------
@@ -15331,6 +15386,82 @@ async def test_a_runner_error_still_forces_the_post_job_fabric_pass(monkeypatch,
             assert job.exit_code == 7, "precondition: the job exited on its own code inside the bound"
         assert "broker cleanup" not in (job.error or ""), "the runner's own completion path did not run"
         assert gates == [(True, None)], "a runner error was handed to the gate as a clean software exit"
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
+class _LateExitStatus:
+    """A spawned job whose exit status reaches the event loop only after the reap, as with a child watcher thread
+    that posts it with call_soon_threadsafe: the group is gone (killpg says ESRCH) while returncode still reads None."""
+
+    def __init__(self, proc, delay_sec):
+        self._proc = proc
+        self._delay_sec = delay_sec
+        self._posted = False
+
+    def __getattr__(self, name):
+        return getattr(self._proc, name)
+
+    @property
+    def returncode(self):
+        return self._proc.returncode if self._posted else None
+
+    async def wait(self):
+        await self._proc.wait()
+        await asyncio.sleep(self._delay_sec)
+        self._posted = True
+        return self._proc.returncode
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        ("own-exit", "trap 'kill $! 2>/dev/null || true; exit 7' INT; echo hi; sleep 30 & wait", 7),
+        ("sigkill", "trap '' INT TERM; echo hi; sleep 30 & wait", -9),  # SIGKILL
+    ],
+    ids=lambda c: c[0],
+)
+async def test_a_runner_error_keeps_the_exit_status_the_loop_learns_after_the_reap(
+    monkeypatch, clear_job_state, tmp_path, case
+):
+    """Spec 03 I36 with the wedge check: after a runner error's kill ladder, the job keeps its own exit code (or the
+    SIGKILL death the ladder ended in) even when the loop learns it only after the process group is gone."""
+    _, command, want = case
+    _free_device_lock(monkeypatch)
+    _no_workspace_activation(monkeypatch)
+    monkeypatch.setattr(srv, "DOOMED_PATTERNS", _BrokerFault())
+    monkeypatch.setattr(srv, "SIGTERM_GRACE_SEC", 0.5)
+    grace = 30 if want == 7 else 0.5
+
+    async def _ladder(job_id, pid, grace_sec=srv.GRACEFUL_KILL_GRACE_SEC):
+        await srv._terminate_process_group(pid, grace_sec=grace)  # no scope off privsep
+
+    monkeypatch.setattr(srv, "_terminate_job", _ladder)
+    real_spawn = asyncio.create_subprocess_shell
+
+    async def _spawn(*a, **k):
+        return _LateExitStatus(await real_spawn(*a, **k), delay_sec=0.3)
+
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_shell", _spawn)
+    gates = []
+
+    async def _gate(job_log_file, job_failed=False, clean_exit_code=None, **_):
+        gates.append((job_failed, clean_exit_code))
+
+    monkeypatch.setattr(srv, "_verify_device_after_job", _gate)
+    job = srv.Job(id="093", owner="tenant", workspace="/tmp", command=command, queued_at=datetime.now().isoformat())
+    job.log_file = str(tmp_path / "093.log")
+    srv.jobs[job.id] = job
+    await srv.get_job_queue().put(job.id)
+
+    runner = asyncio.create_task(srv.job_runner())
+    try:
+        await _wait_until(lambda: len(gates) == 1)
+        assert job.status is srv.JobStatus.FAILED and "EXCEPTION" in (job.error or "")
+        assert job.exit_code == want, "the job's exit status was lost to a returncode the loop had not seen yet"
+        assert gates == [(True, None)]
     finally:
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)

@@ -178,9 +178,6 @@ class Evidence:
     off_bus_before: Optional[int]
     reset_exit_nonzero: bool
     holding_fabric_unverified: bool = False
-    # Spec 03 I61: a clean post-job eth read timed out on a present mesh, and this hold episode's one
-    # present-mesh reset is unspent. Routed like dispatch_reset_due.
-    eth_timeout_reset_due: bool = False
     # Spec 03 I69: a job the broker stopped mid-run (its timeout, or a requested kill) owes the mesh
     # one reset before release, on the same unspent latch. Routed like dispatch_reset_due.
     kill_reset_due: bool = False
@@ -502,7 +499,6 @@ class Recovery(ABC):
         phase: str = "verify_device",
         run_eth: bool = False,
         fabric_stale: bool = True,
-        eth_timeout_reset: bool = False,
         eth_no_verdict_reset: bool = False,
         fabric_light: bool = False,
     ) -> tuple[bool, dict]:
@@ -525,7 +521,6 @@ class Recovery(ABC):
             run_fabric=run_fabric,
             run_eth=run_eth,
             fabric_stale=fabric_stale,
-            eth_timeout_reset=eth_timeout_reset,
             eth_no_verdict_reset=eth_no_verdict_reset,
             fabric_light=fabric_light,
             expected=expected,

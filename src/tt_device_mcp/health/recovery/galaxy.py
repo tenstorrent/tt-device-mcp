@@ -59,6 +59,7 @@ from tt_device_mcp.health.recovery import (
     WAIT,
     Evidence,
     Recovery,
+    arc_live_chips,
     ipmi_guard,
     mesh_repeat,
     offbus_power_cycle,
@@ -258,6 +259,11 @@ def _settle_before_host_rung_sec() -> int:
     except ValueError:
         return 60
     return v if v > 0 else 60
+
+
+# How often the settle before the verify looks at whether every expected chip answers (enumerated, ARC heartbeat
+# counting). Only the poll's step, never a deadline: the poll ends at the settle's own bound.
+SETTLE_POLL_SEC = 2.0
 
 
 # The two off-bus fault classes that go to the power cycle with no further reset (spec 04 I37). A: one or more whole UBB
@@ -473,7 +479,6 @@ def _route(
     reboot_blocked: bool,
     holding_fabric_unverified: bool = False,
     dispatch_reset_due: bool = False,
-    eth_timeout_reset_due: bool = False,
     kill_reset_due: bool = False,
     arc_not_ready: int = 0,
 ) -> str:
@@ -535,9 +540,8 @@ def _route(
     * ``dispatch_reset_due`` with every chip present and none frozen -> ``STAGE_SMI_RESET``: the
       fabric passed traffic but mesh dispatch failed, which no self-heal clears; the caller grants
       this once per hold episode, and the full check, fabric included, decides the release
-      (spec 03 I55). ``eth_timeout_reset_due`` takes the same rung: a clean post-job eth read timed
-      out with no verdict on a present mesh (spec 03 I61), and so does ``kill_reset_due``: a job the
-      broker stopped mid-run, by its timeout or a requested kill (spec 03 I69).
+      (spec 03 I55). ``kill_reset_due`` takes the same rung: a job the broker stopped mid-run, by
+      its timeout or a requested kill (spec 03 I69).
     * ``arc_not_ready > 0`` with nothing off the bus -> ``STAGE_SMI_RESET`` (spec 04 I105): every
       chip is on the bus and at least one reads ENODATA on a bound, link-up endpoint (I24), so the
       driver is waiting for the post-reset init only the mesh reset (POST_RESET, board re-init)
@@ -588,7 +592,7 @@ def _route(
         return DEFER
     if sbr_candidates > 0 and last_action != STAGE_BRIDGE_RESET:
         return STAGE_BRIDGE_RESET
-    if (dispatch_reset_due or eth_timeout_reset_due or kill_reset_due) and off_bus == 0 and frozen_chips == 0:
+    if (dispatch_reset_due or kill_reset_due) and off_bus == 0 and frozen_chips == 0:
         return STAGE_SMI_RESET
     if arc_not_ready > 0 and off_bus == 0:
         return STAGE_SMI_RESET
@@ -1088,7 +1092,6 @@ class GalaxyRecovery(Recovery):
             reboot_blocked=reboot_blocked,
             holding_fabric_unverified=ev.holding_fabric_unverified,
             dispatch_reset_due=ev.dispatch_reset_due,
-            eth_timeout_reset_due=ev.eth_timeout_reset_due,
             kill_reset_due=ev.kill_reset_due,
             arc_not_ready=ev.arc_not_ready,
         )
@@ -2962,6 +2965,29 @@ class GalaxyRecovery(Recovery):
             return False
         return off_bus == 0 and not isolated
 
+    async def _settle_until_chips_answer(self, expected: int, bound_sec: int, log, *, phase: str) -> None:
+        """Poll until every expected chip answers (enumerated, live ARC) or ``bound_sec`` passes (spec 04 I86)."""
+        t0 = time.monotonic()
+        deadline = t0 + bound_sec
+        while True:
+            live = await asyncio.to_thread(lambda: arc_live_chips(self.deps.present_chip_indices()))
+            left = max(0, expected - len(live))
+            remaining = deadline - time.monotonic()
+            if left == 0 or remaining <= 0:
+                break
+            await asyncio.sleep(min(SETTLE_POLL_SEC, remaining))
+        waited = time.monotonic() - t0
+        how = "all answer" if left == 0 else f"{left} still not answering at the bound"
+        log(f"settle poll: {expected - left}/{expected} chips answer after {waited:.1f}s of {bound_sec}s ({how})")
+        health_event(
+            "settle_poll",
+            phase=phase,
+            waited_sec=round(waited, 1),
+            bound_sec=bound_sec,
+            not_answering=left,
+            expected=expected,
+        )
+
     async def _settle_and_verify_sweep(
         self, expected: int, log, gate_phase: str, settle: int, *, context: str, fabric_77_unverified: bool
     ) -> tuple:
@@ -2982,10 +3008,10 @@ class GalaxyRecovery(Recovery):
                 "sweep_verify_skipped", context=context or gate_phase, reason="reset_scope_active", scope=scope
             )
             return False, {"skipped": "reset_scope_active", "scope": scope}
-        if settle:
-            log(f"settling {settle}s for re-enumeration, then one verify before the host rung")
         try:
-            await asyncio.sleep(settle)
+            if settle:
+                log(f"settling up to {settle}s for re-enumeration, then one verify before the host rung")
+                await self._settle_until_chips_answer(expected, settle, log, phase=gate_phase)
             healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase=gate_phase)
             FABRIC_DEBT.note_evidence(evidence)
         finally:
@@ -3026,7 +3052,7 @@ class GalaxyRecovery(Recovery):
         settle = _settle_before_host_rung_sec()
         log(
             f"whole tray(s) {trays} off and the power cycle in cooldown at the 10-min hold bound "
-            f"— SBR then the mesh reset, one {settle}s settle and one full check; the "
+            f"— SBR then the mesh reset, one settle of up to {settle}s and one full check; the "
             f"cycle follows at the cooldown's end if it fails"
         )
         health_event("class_a_cooldown_ladder", off_bus=sorted(offbus, key=int), expected=expected, trays=trays)
@@ -3036,7 +3062,7 @@ class GalaxyRecovery(Recovery):
             log("class A 10-min sweep refused (reset gate) — holding; the cycle follows at the cooldown's end")
             return OUTCOME_WAITING
         try:
-            await asyncio.sleep(settle)
+            await self._settle_until_chips_answer(expected, settle, log, phase="class-a-10min")
             healthy, evidence = await self._verify_device(expected, log, run_fabric=True, phase="class-a-10min")
             FABRIC_DEBT.note_evidence(evidence)
         finally:

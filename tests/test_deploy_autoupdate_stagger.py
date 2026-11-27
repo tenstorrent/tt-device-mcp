@@ -83,6 +83,37 @@ def test_a_window_of_0_turns_the_stagger_off(tmp_path):
     assert not (root / "pending-head").exists()
 
 
+@pytest.mark.parametrize("offset", [0, 100, 2000])
+def test_the_offset_moves_the_slot_by_that_much_mod_the_window(tmp_path, offset):
+    host = "galaxy-01"
+    (d,) = _stagger([host])
+    want = (d + offset) % WINDOW
+    _box(tmp_path)
+    done, restarts, _ = _lap(tmp_path, now=T0, sha="b2", stagger=WINDOW, offset=offset, host=host)
+    if want:
+        assert restarts == [], done.stderr
+        assert f"host stagger {want}s; applies in {want}s" in done.stderr, done.stderr
+        _, restarts, _ = _lap(tmp_path, now=T0 + want - 1, sha="b2", stagger=WINDOW, offset=offset, host=host)
+        assert restarts == []
+        _, restarts, _ = _lap(tmp_path, now=T0 + want, sha="b2", stagger=WINDOW, offset=offset, host=host)
+    assert restarts == [f"{T0 + want} b2"], done.stderr
+
+
+@pytest.mark.parametrize("offset", ["", "abc", "-5", "1.5"])
+def test_a_non_number_offset_counts_as_0(tmp_path, offset):
+    host = "galaxy-01"
+    (d,) = _stagger([host])
+    _box(tmp_path)
+    done, restarts, _ = _lap(tmp_path, now=T0, sha="b2", stagger=WINDOW, offset=offset, host=host)
+    assert f"host stagger {d}s; applies in {d}s" in done.stderr, done.stderr
+
+
+def test_the_offset_does_nothing_when_the_stagger_is_off(tmp_path):
+    _box(tmp_path)
+    done, restarts, _ = _lap(tmp_path, now=T0, sha="b2", stagger=0, offset=500, host="galaxy-01")
+    assert restarts == [f"{T0} b2"], done.stderr
+
+
 @pytest.mark.parametrize(
     "broken",
     [dict(active="failed"), dict(health='{"held":true,"fsm_state":"down"}')],

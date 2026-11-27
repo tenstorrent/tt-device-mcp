@@ -47,7 +47,6 @@ from tt_device_mcp.health.monitor import (
     FABRIC_KILLED_BY_ISOLATION,
     HealthMonitor,
     _normalized_board,
-    eth_read_timed_out,
     journal_interrupted_fabric_check,
 )
 
@@ -111,7 +110,7 @@ from tt_device_mcp.health.monitors.pci import (
     sysfs_chip_ids,
 )
 from tt_device_mcp.health.pci_writer import PCI_WRITER, PciWedged
-from tt_device_mcp.health.post_reset import FABRIC_DEBT, POST_RESET_SETTLE_SEC, boot_monotonic
+from tt_device_mcp.health.post_reset import FABRIC_DEBT, POST_RESET_SETTLE_SEC
 from tt_device_mcp.health.recovery import (
     BELOW_FLOOR,
     BLOCKED,
@@ -161,6 +160,7 @@ from tt_device_mcp.health.recovery.galaxy import (
     _ubb_bus_id_tables,
     _whole_trays_off,
 )
+from tt_device_mcp.health.recovery.ipmi_guard import SUDO_RULE as IPMI_SUDO_RULE
 from tt_device_mcp.health.recovery.pcie_guard import pcie_guard_at_start
 from tt_device_mcp.health.recovery.per_target import PerTargetRecovery
 from tt_device_mcp.health.recovery.power_cycle_reason import PowerCycleReason
@@ -214,7 +214,6 @@ __all__ = [
     "FABRIC_KILLED_BY_ISOLATION",  # spec 03 I82: the gate holds a pass the isolation killed dirty
     "journal_interrupted_fabric_check",
     "note_broker_stopping",
-    "eth_read_timed_out",  # spec 03 I61: the stuck eth read the post-job present-mesh reset answers
     "RecoveryMechanism",
     "RecoveryDeps",
     "GalaxyRecovery",
@@ -257,6 +256,7 @@ __all__ = [
     "read_heartbeats",
     "hugepages_counts",
     "hugepages_shortfall",
+    "IPMI_SUDO_RULE",
     "version_floor_warnings",
     "SAMPLE_INTERVAL_SEC",
     "SAMPLE_RING_SIZE",
@@ -325,5 +325,4 @@ __all__ = [
     "FABRIC_DEBT",
     # and the settle a multi-tray mesh gets after a reset before that pass runs
     "POST_RESET_SETTLE_SEC",
-    "boot_monotonic",
 ]

@@ -228,10 +228,8 @@ async def test_a_fabric_check_with_no_reader_installed_starts_no_process(monkeyp
     assert (await srv.health_monitor.verify_fabric_health(1))[0] is True
     assert ran == [True]
     assert spawned == []
-    # Still flagged: none of the configured readers was there to stop (the bus may not be quiet).
-    assert [e["configured"] for e in health.read_health_events(kinds={"pollers_none_active"})] == [
-        list(srv.DEVICE_POLLER_SERVICES)
-    ]
+    # A host with none of the readers installed has nothing to quiesce: no false alarm.
+    assert health.read_health_events(kinds={"pollers_none_active"}) == []
 
 
 @pytest.mark.asyncio

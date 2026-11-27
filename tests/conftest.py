@@ -52,7 +52,12 @@ from tt_device_mcp.server import (
 # the subsystem it builds, because srv.health_monitor / srv.recovery_mechanism / the two platform
 # aliases are the seams almost every test monkeypatches. probe_platform stays off: a test that
 # cares about the platform declares TT_DEVICE_MCP_RESET_MODE or drives resolve_platform itself.
+# Boot latches the privilege probes; the sudoers listing (`sudo -n -l ipmitool`) never reaches the host
+# from the suite, not even at import. test_privileges drives the real probe against a stub.
+_real_sudo_probe = privileges._ipmi_sudo_allowed
+privileges._ipmi_sudo_allowed = lambda: False
 srv.boot_broker()
+privileges._ipmi_sudo_allowed = _real_sudo_probe
 
 
 def power_cycle_reason(text="test power cycle", **fields):
@@ -687,6 +692,12 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
             ["ipmitool", "mc", "info"], 0, "Firmware Revision : 0.05\nAux Firmware Rev Info : 0x23 0x00 0x00 0x00\n", ""
         ),
     )
+    # Spec 04 I115: the suite runs the root BMC path (plain ipmitool, the unshare guard) whatever uid
+    # runs pytest; the non-root sudo path is covered by its own tests.
+    monkeypatch.setattr(ipmi_guard, "is_root", lambda: True)
+    # A boot re-latches the privilege probes; the sudoers listing (`sudo -n -l ipmitool`) never
+    # reaches the host from the suite. test_privileges drives the real probe against a stub.
+    monkeypatch.setattr(privileges, "_ipmi_sudo_allowed", lambda: False)
     monkeypatch.setattr(heartbeat, "_heartbeat_supported", None)
     # raising=False so a base tree without the re-arm latch (a fails-on-base stash) still sets up.
     monkeypatch.setattr(heartbeat, "_heartbeat_absent_journaled", False, raising=False)
@@ -722,6 +733,7 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
     # A poller restart one test deferred must not fire on the next test's close to HEALTHY.
     monkeypatch.setattr(srv, "_pollers_owed", None)
     monkeypatch.setattr(srv, "_pollers_owed_loop", None)
+    monkeypatch.setattr(srv, "_pollers_not_installed_logged", False)
 
     # No board types seen yet: the conservative default, and the machine type reads as unknown.
     # Nothing here can shell out — the cache is only ever filled by a health snapshot — so the
@@ -818,6 +830,7 @@ def isolate_device_state(monkeypatch, isolation_tmp_root, device_marked, device_
         ("_hold_bound_denied_why", ""),
         ("_hold_bound_tenant_paged", ""),
         ("_hold_bound_tenant_blocker", None),
+        ("_hold_bound_waiter_seen", None),
         # The holders the dead-chip valve refused to kill (spec 03 I84), which the bound routes.
         ("_kill_refused_pids", {}),
         ("_kill_refused_job_pid", None),
@@ -1238,7 +1251,7 @@ def health_deps():
         glx_board_types_provider=lambda: srv.health_monitor._glx_board_types(),
         chip_buses_provider=lambda: srv.health_monitor._chip_buses,
         journal_skip_once=lambda kind, reason, **f: srv.health_monitor._journal_skip_once(kind, reason, **f),
-        terminate_process_group=lambda pid: srv._terminate_process_group(pid),
+        terminate_process_group=lambda pid: srv._terminate_check_reader(pid),
         logger=lambda: srv.logger,
         present_chip_indices=lambda: srv._present_chip_indices(),
         enumerate_device_holders=lambda: srv.enumerate_device_holders(),

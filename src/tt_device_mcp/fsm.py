@@ -359,7 +359,6 @@ class ServerFsm:
         run_fabric: bool = True,
         run_eth: bool = False,
         fabric_stale: bool = True,
-        eth_timeout_reset: bool = False,
         eth_no_verdict_reset: bool = False,
         fabric_light: bool = False,
         recovery: "Optional[Recovery]" = None,
@@ -375,14 +374,12 @@ class ServerFsm:
         choice; omitted, the platform is selected fresh. ``run_eth`` asks for the passive eth read without the traffic
         pass (spec 03 I30); it and ``fabric_stale`` (may a link-drop skip of that read buy the traffic pass) are passed
         on only when ``run_eth`` is set, so a ``_verify_device`` test fake that predates them keeps its signature.
-        ``eth_timeout_reset`` (spec 03 I61), ``eth_no_verdict_reset`` (I116) and ``fabric_light`` (I115) are passed on only
-        when set, for the same reason."""
+        ``eth_no_verdict_reset`` (spec 03 I116) and ``fabric_light`` (I115) are passed on only when set, for the same
+        reason."""
         r = recovery if recovery is not None else self.select_recovery()
         light = {"fabric_light": True} if fabric_light else {}
         if run_eth:
-            extra = {"eth_timeout_reset": True} if eth_timeout_reset else {}
-            if eth_no_verdict_reset:
-                extra["eth_no_verdict_reset"] = True
+            extra = {"eth_no_verdict_reset": True} if eth_no_verdict_reset else {}
             healthy, evidence = await r._verify_device(
                 expected,
                 log,

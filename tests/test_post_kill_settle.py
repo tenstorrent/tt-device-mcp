@@ -18,7 +18,7 @@ import time
 import pytest
 
 from tests.conftest import patch_health_event
-from tests.test_eth_timeout_reset import ADVANCING, mesh  # noqa: F401 (fixture)
+from tests.test_eth_timeout_retry import ADVANCING, mesh  # noqa: F401 (fixture)
 from tests.test_job_kill_reset import killed  # noqa: F401 (fixture)
 from tt_device_mcp import constants, device_holders, job_reap
 from tt_device_mcp import server as srv

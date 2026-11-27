@@ -14,8 +14,16 @@ from tt_device_mcp.health import monitor as monitor_mod
 from tt_device_mcp.health.monitor import HealthMonitor, moved_trays
 from tt_device_mcp.health.monitors import fabric
 
-# A moved tray renames its links: as many extra port connections as missing ones (I42).
+# The default mismatch lifts: extra port connections with nothing missing (I42).
 _MISMATCH = (
+    "Physical Discovery found 0 missing port/cable connections:\n"
+    "Physical Discovery found 2 extra port/cable connections:\n"
+    "  PhysicalPortEndpoint{tray_id=3}\n"
+    "  PhysicalPortEndpoint{tray_id=4}\n"
+    "  what():  Connection mismatch detected. Check the log above for details.\n"
+)
+# A moved tray renames its links: as many extra port connections as missing ones (I42/I71).
+_MOVED_TRAY = (
     "Physical Discovery found 2 missing port/cable connections:\n"
     "  PhysicalPortEndpoint{tray_id=1}\n"
     "  PhysicalPortEndpoint{tray_id=2}\n"
@@ -72,11 +80,26 @@ def topo(monkeypatch, health_deps, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a_moved_tray_fails(topo):
+    """I71: any missing port connection fails the check even when extras account for all of it
+    (a moved tray), because the tray's ports of the descriptor are still missing: the check
+    never vouches for a short fabric."""
+    m, state = topo
+    state["first"] = _MOVED_TRAY
+    m.eth_link_drop(256)
+    ok, detail = await m._verify_fabric_health_body(60)
+    assert ok is False and fabric.names_links_missing(detail)
+    assert m.topology_lift_pending is False and m.fabric_topology["verdict"] == "failed"
+    # The eth link mark is never lowered to the links that are left (I45).
+    assert "252 of 256" in m.eth_link_drop(252)
+
+
+@pytest.mark.asyncio
 async def test_a_mismatch_reruns_traffic_only_and_an_ok_names_it_and_pages_once(topo):
     m, state = topo
     ok, detail = await m._verify_fabric_health_body(60)
     assert ok is True
-    assert "TOPOLOGY MISMATCH vs /x/desc.textproto: 2 missing, 2 extra" in detail
+    assert "TOPOLOGY MISMATCH vs /x/desc.textproto: 0 missing, 2 extra" in detail
     assert [("--cabling-descriptor-path" in c) for c in state["calls"]] == [True, False]
     assert m.topology_lift_pending is True
     assert state["events"][0][0] == "fabric_topology_mismatch"
@@ -235,7 +258,7 @@ async def test_a_cached_mismatch_skips_the_descriptor_run_on_the_same_bus_map_on
     # Cached even when its rerun could not measure: later gates skip the doomed descriptor run.
     state["rerun"] = (0, "all links ok\n")
     ok, detail = await m._verify_fabric_health_body(60)
-    assert ok is True and "TOPOLOGY MISMATCH vs /x/desc.textproto: 2 missing, 2 extra" in detail
+    assert ok is True and "TOPOLOGY MISMATCH vs /x/desc.textproto: 0 missing, 2 extra" in detail
     assert [("--cabling-descriptor-path" in c) for c in state["calls"]] == [True, False, False]
     assert m.topology_lift_pending is True
     # Another bus map, or another descriptor, runs the descriptor again.

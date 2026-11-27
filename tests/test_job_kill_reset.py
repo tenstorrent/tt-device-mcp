@@ -20,7 +20,7 @@ import httpx2
 import pytest
 
 from tests.conftest import fsm_dirty, patch_health_event
-from tests.test_eth_timeout_reset import ADVANCING, TIMED_OUT, mesh  # noqa: F401 (fixture)
+from tests.test_eth_timeout_retry import ADVANCING, TIMED_OUT, mesh  # noqa: F401 (fixture)
 from tt_device_mcp import constants
 from tt_device_mcp import server as srv
 from tt_device_mcp.fsm import ServerState
@@ -54,7 +54,7 @@ async def test_a_timeout_resets_then_runs_the_full_check_before_release(killed):
     assert killed["events"].count("kill_mesh_reset") == 1
     assert killed["captured"][0][0] == "job_killed"
     assert srv.fsm.state is ServerState.HEALTHY, "the full check after the reset released it"
-    assert srv._dispatch_reset_spent is True, "the reset spends the shared I55/I61 latch"
+    assert srv._dispatch_reset_spent is True, "the reset spends the shared I55/I69 latch"
     assert srv._kill_reset_debt() == ""
 
 
@@ -251,6 +251,50 @@ async def test_a_failed_job_resets_before_the_full_pass_and_logs_it(pre_pass, ca
     assert row["ran"] is True and row["job_exit"] == exit_code and row["reset_sec"] >= 0
 
 
+def _kill_mesh_reset_rows(pre_pass):
+    return [k for n, k in pre_pass["rows"] if n == "kill_mesh_reset"]
+
+
+@pytest.mark.asyncio
+async def test_a_plain_exit_reset_says_so_and_a_kill_reset_says_kill(pre_pass, caplog):
+    """The operator log and the journal row name the cause: a plain nonzero exit is not described as a kill."""
+    pre_pass["eth"] = TIMED_OUT
+    srv._owe_kill_reset(_PLAIN_DEBT)
+    srv._note_plain_exit_debt(False)
+    await srv._verify_device_after_job(None, job_failed=True, clean_exit_code=8, job_exit=8)
+    (row,) = _kill_mesh_reset_rows(pre_pass)
+    assert row["cause"] == "plain_exit"
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "a job that ended without exit 0 owes the mesh one reset" in text
+    assert "a kill mid-run can leave the mesh wedged" not in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_code", [8, 137], ids=["plain-nonzero", "oom-killed"])
+async def test_a_plain_exit_debt_paid_outside_the_shortcut_says_plain_exit(pre_pass, caplog, exit_code):
+    """No clean-exit shortcut here: the plain debt goes through the kill-debt reset, and its text and cause still say
+    the job ended without exit 0, not that a kill left the mesh wedged."""
+    srv._owe_kill_reset(_PLAIN_DEBT)
+    srv._note_plain_exit_debt(False)
+    await srv._verify_device_after_job(None, job_failed=True, job_exit=exit_code)
+    (row,) = _kill_mesh_reset_rows(pre_pass)
+    assert row["cause"] == "plain_exit"
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "a job that ended without exit 0 owes the mesh one reset" in text
+    assert "a kill mid-run can leave the mesh wedged" not in text
+
+
+@pytest.mark.asyncio
+async def test_a_kill_reset_keeps_its_kill_text_and_cause(pre_pass, caplog):
+    srv._owe_kill_reset("job 7 timeout")
+    await srv._verify_device_after_job(None, job_failed=True, job_exit=-9)
+    (row,) = _kill_mesh_reset_rows(pre_pass)
+    assert row["cause"] == "kill"
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "a kill mid-run can leave the mesh wedged" in text
+    assert "owes the mesh one reset" not in text
+
+
 @pytest.mark.asyncio
 async def test_a_failed_check_after_the_pre_pass_reset_stays_held(pre_pass):
     pre_pass["reset_heals"] = False
@@ -297,7 +341,6 @@ async def test_a_plain_exit_whose_eth_read_has_no_verdict_resets_before_the_full
     assert pre_pass["resets"] == [["tt-smi", "-glx_reset"]], "one present-mesh reset"
     assert pre_pass["fabric"] == [1], "the only fabric pass ran after the reset"
     assert pre_pass["events"].count("kill_mesh_reset") == 1
-    assert pre_pass["events"].count("eth_timeout_mesh_reset") == (read is TIMED_OUT), "a timeout keeps its own row"
     assert srv.fsm.state is ServerState.HEALTHY, "released only on the post-reset full check"
     assert srv._kill_reset_debt() == ""
     (line,) = _pre_pass_lines(caplog)
